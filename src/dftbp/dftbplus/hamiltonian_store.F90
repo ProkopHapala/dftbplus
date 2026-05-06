@@ -7,11 +7,14 @@ module dftbp_dftbplus_hamiltonian_store
   public :: set_store_hamiltonian, store_hamiltonian, get_stored_hamiltonian
   public :: store_overlap, get_stored_overlap
   public :: store_dm, get_stored_dm
+  public :: store_eigvecs, get_stored_eigvecs
   public :: clear_stored_matrices
 
   real(dp), allocatable, save :: storedH(:,:)
   real(dp), allocatable, save :: storedS(:,:)
   real(dp), allocatable, save :: storedDM(:,:)
+  real(dp), allocatable, save :: storedEigvecs(:,:)   ! (norb, nstates) for iKS=1, iSpin=1
+  real(dp), allocatable, save :: storedEigenvals(:)   ! (nstates) for iKS=1, iSpin=1
   logical,  save :: tStoreMatrices = .false.
   integer,  save :: storedSize = 0
 
@@ -93,10 +96,44 @@ contains
     end if
   end subroutine
 
+  !> Store eigenvectors and eigenvalues for iKS=1 after diagonalization.
+  !> eigvecs_in: (norb, norb) where columns are MOs (Fortran convention after diagDenseMtx)
+  !> eigenvals_in: (norb) eigenvalues
+  subroutine store_eigvecs(eigvecs_in, eigenvals_in, norb)
+    real(dp), intent(in) :: eigvecs_in(:,:)
+    real(dp), intent(in) :: eigenvals_in(:)
+    integer,  intent(in) :: norb
+    if (.not. tStoreMatrices) return
+    if (allocated(storedEigvecs))  deallocate(storedEigvecs)
+    if (allocated(storedEigenvals)) deallocate(storedEigenvals)
+    allocate(storedEigvecs(norb, norb), source=0.0_dp)
+    allocate(storedEigenvals(norb), source=0.0_dp)
+    storedEigvecs  = eigvecs_in(1:norb, 1:norb)
+    storedEigenvals = eigenvals_in(1:norb)
+    storedSize = norb
+  end subroutine
+
+  subroutine get_stored_eigvecs(eigvecs_out, eigenvals_out, norb)
+    real(dp), intent(out) :: eigvecs_out(:,:)
+    real(dp), intent(out) :: eigenvals_out(:)
+    integer,  intent(out) :: norb
+    if (allocated(storedEigvecs)) then
+      norb = storedSize
+      eigvecs_out = storedEigvecs
+      eigenvals_out = storedEigenvals
+    else
+      norb = 0
+      eigvecs_out  = 0.0_dp
+      eigenvals_out = 0.0_dp
+    end if
+  end subroutine
+
   subroutine clear_stored_matrices()
-    if (allocated(storedH))  deallocate(storedH)
-    if (allocated(storedS))  deallocate(storedS)
-    if (allocated(storedDM)) deallocate(storedDM)
+    if (allocated(storedH))        deallocate(storedH)
+    if (allocated(storedS))        deallocate(storedS)
+    if (allocated(storedDM))       deallocate(storedDM)
+    if (allocated(storedEigvecs))  deallocate(storedEigvecs)
+    if (allocated(storedEigenvals)) deallocate(storedEigenvals)
     storedSize = 0
   end subroutine
 

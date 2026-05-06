@@ -18,7 +18,7 @@ module libdftbcore
   use dftbp_dftbplus_main, only: runDftbPlus
   use dftbp_io_formatout, only: printDftbHeader
   use dftbp_dftbplus_hamiltonian_store, only: set_store_hamiltonian, get_stored_hamiltonian,&
-      & get_stored_overlap, get_stored_dm, clear_stored_matrices
+      & get_stored_overlap, get_stored_dm, get_stored_eigvecs, clear_stored_matrices
   implicit none
   private
 
@@ -35,9 +35,9 @@ module libdftbcore
   real(dp), allocatable, save :: storedEigenvals(:)  ! Eigenvalues
   
   ! Settings
-  logical, save :: tCollectH = .true.
-  logical, save :: tCollectS = .true.
-  logical, save :: tCollectDM = .true.
+  logical, save :: tCollectH = .false.
+  logical, save :: tCollectS = .false.
+  logical, save :: tCollectDM = .false.
   logical, save :: tDebug = .false.
   logical, save :: isInitialized = .false.
   integer, save :: basisSize = 0
@@ -100,6 +100,8 @@ contains
     ! Deallocate input (no longer needed after init)
     deallocate(input)
     
+    ! Always enable storage so store_eigvecs (and optional H/S/DM) can capture data during SCF
+    call set_store_hamiltonian(.true.)
     isInitialized = .true.
     print *, '[DFTBcore] Initialization complete'
   end subroutine
@@ -184,67 +186,33 @@ contains
     ! Get basis size from the main object
     basisSize = main%nOrb
     
-    ! Allocate and store matrices if requested
+    ! Always extract eigenvectors (stored in hamiltonian_store during SCF via store_eigvecs)
+    if (allocated(storedEigvecs))  deallocate(storedEigvecs)
+    if (allocated(storedEigenvals)) deallocate(storedEigenvals)
+    allocate(storedEigvecs(basisSize, basisSize), source=0.0_dp)
+    allocate(storedEigenvals(basisSize), source=0.0_dp)
+    call get_stored_eigvecs(storedEigvecs, storedEigenvals, iSpin)
+    if (iSpin > 0) then
+      print *, '[DFTBcore] Eigenvectors extracted from hamiltonian_store'
+    else
+      print *, '[DFTBcore] WARNING: Eigenvectors not available in hamiltonian_store'
+    end if
+
+    ! Optionally collect H, S, DM
     if (tCollectH .or. tCollectS .or. tCollectDM) then
-      if (allocated(storedH)) deallocate(storedH)
-      if (allocated(storedS)) deallocate(storedS)
+      if (allocated(storedH))  deallocate(storedH)
+      if (allocated(storedS))  deallocate(storedS)
       if (allocated(storedDM)) deallocate(storedDM)
-      if (allocated(storedEigvecs)) deallocate(storedEigvecs)
-      if (allocated(storedEigenvals)) deallocate(storedEigenvals)
-      
       allocate(storedH(basisSize, basisSize), source=0.0_dp)
       allocate(storedS(basisSize, basisSize), source=0.0_dp)
       allocate(storedDM(basisSize, basisSize), source=0.0_dp)
-      allocate(storedEigvecs(basisSize, basisSize), source=0.0_dp)
-      allocate(storedEigenvals(basisSize), source=0.0_dp)
       
-      ! Extract matrices from DFTB+ internal storage
-      ! Note: Arrays are column-major in Fortran, Python will transpose to row-major
-      ! Try to get Hamiltonian from storage (before diagonalization)
-      call get_stored_hamiltonian(storedH, basisSize)
-      if (any(storedH /= 0.0_dp)) then
-        print *, '[DFTBcore] Using stored Hamiltonian (before diagonalization)'
-      else if (allocated(main%HSqrReal)) then
-        if (size(main%HSqrReal, 1) >= basisSize .and. size(main%HSqrReal, 2) >= basisSize) then
-          storedH = main%HSqrReal(1:basisSize, 1:basisSize)
-          print *, '[DFTBcore] Using main%HSqrReal (may contain eigenvectors)'
-        end if
-      end if
-      
-      ! Overlap and DM: retrieved from hamiltonian_store (stored at valid points in SCF loop)
+      call get_stored_hamiltonian(storedH, iSpin)
       call get_stored_overlap(storedS, iSpin)
-      if (iSpin > 0) then
-        print *, '[DFTBcore] S from hamiltonian_store'
-      else
-        print *, '[DFTBcore] WARNING: S not available in hamiltonian_store'
-      end if
       call get_stored_dm(storedDM, iSpin)
-      if (iSpin > 0) then
-        print *, '[DFTBcore] DM from hamiltonian_store'
-      else
-        print *, '[DFTBcore] WARNING: DM not available in hamiltonian_store'
-      end if
-      
-      ! Extract eigenvectors and eigenvalues
-      if (allocated(main%eigVecsReal)) then
-        if (size(main%eigVecsReal, 1) >= basisSize .and. size(main%eigVecsReal, 2) >= basisSize) then
-          storedEigvecs = main%eigVecsReal(1:basisSize, 1:basisSize, 1)
-          print *, '[DFTBcore] Eigenvectors extracted'
-        end if
-      end if
-      
-      if (allocated(main%eigen)) then
-        if (size(main%eigen, 1) >= basisSize) then
-          storedEigenvals = main%eigen(1:basisSize, 1, 1)
-          print *, '[DFTBcore] Eigenvalues extracted'
-        end if
-      end if
-      
-      ! Symmetrize matrices (unpackHS only fills lower triangle)
       storedH = 0.5_dp * (storedH + transpose(storedH))
       storedS = 0.5_dp * (storedS + transpose(storedS))
-      
-      print *, '[DFTBcore] Matrices extracted: basis=', basisSize
+      print *, '[DFTBcore] H/S/DM extracted: basis=', basisSize
     end if
     
     print *, '[DFTBcore] SCF complete: E=', energy, 'Hartree'

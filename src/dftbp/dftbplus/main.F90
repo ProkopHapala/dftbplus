@@ -33,7 +33,7 @@ module dftbp_dftbplus_main
   use dftbp_dftb_hamiltonian, only : addBlockChargePotentials, addChargePotentials,&
       & constrainSccHamiltonian, getSccHamiltonian, mergeExternalPotentials,&
       & resetExternalPotentials, resetInternalPotentials
-  use dftbp_dftbplus_hamiltonian_store, only : store_hamiltonian, store_overlap, store_dm
+  use dftbp_dftbplus_hamiltonian_store, only : store_hamiltonian, store_overlap, store_dm, store_eigvecs
   use dftbp_dftb_hybridxc, only : hybridXcAlgo, THybridXcFunc
   use dftbp_dftb_mdftb, only : TMdftb
   use dftbp_dftb_nonscc, only : buildH0, buildS, TNonSccDiff
@@ -3445,6 +3445,8 @@ contains
           & errStatus)
       @:PROPAGATE_ERROR(errStatus)
       eigvecsReal(:,:,iKS) = HSqrReal
+      ! Store eigenvectors for iKS=1 only (gamma-point / first spin channel)
+      if (iKS == 1) call store_eigvecs(HSqrReal, eigen(:, iSpin), size(HSqrReal, 1))
     #:endif
     end do
 

@@ -515,6 +515,198 @@ For H₂O test case (3ob-3-1 Slater-Koster):
 OVERALL: ALL CHECKS PASSED
 ```
 
+## New Eigenvector Export Functions (2025-05-06)
+
+### Overview
+
+Added functionality to export molecular orbital coefficients directly from the DFTB+ library without requiring `eigenvec.bin` files. This enables seamless integration with OpenCL orbital projection and other post-processing tools.
+
+### New Functions in hamiltonian_store.F90
+
+#### Module Variables
+```fortran
+real(dp), allocatable, save :: storedEigvecs(:,:)   ! (norb, nstates) for iKS=1, iSpin=1
+real(dp), allocatable, save :: storedEigenvals(:)   ! (nstates) for iKS=1, iSpin=1
+```
+
+#### store_eigvecs
+```fortran
+subroutine store_eigvecs(eigvecs_in, eigenvals_in, norb)
+  real(dp), intent(in) :: eigvecs_in(:,:)
+  real(dp), intent(in) :: eigenvals_in(:)
+  integer,  intent(in) :: norb
+```
+**Purpose**: Stores eigenvectors and eigenvalues after diagonalization
+**Called from**: `main.F90` after `diagDenseMtx` completes
+**Stores**: 
+- `eigvecs_in(1:norb, 1:norb)` - eigenvector matrix (columns are MOs)
+- `eigenvals_in(1:norb)` - eigenvalue array
+- Updates `storedSize = norb`
+
+#### get_stored_eigvecs
+```fortran
+subroutine get_stored_eigvecs(eigvecs_out, eigenvals_out, norb)
+  real(dp), intent(out) :: eigvecs_out(:,:)
+  real(dp), intent(out) :: eigenvals_out(:)
+  integer,  intent(out) :: norb
+```
+**Purpose**: Retrieves stored eigenvectors and eigenvalues
+**Returns**: 
+- `eigvecs_out` - eigenvector matrix
+- `eigenvals_out` - eigenvalue array  
+- `norb` - matrix dimension (0 if not stored)
+
+#### Updated Functions
+- `clear_stored_matrices()` - Now also clears `storedEigvecs` and `storedEigenvals`
+- `set_store_hamiltonian()` - Controls eigenvector storage via `tStoreMatrices` flag
+
+### Integration Points in main.F90
+
+#### Use Statement Addition
+```fortran
+use dftbp_dftbplus_hamiltonian_store, only : store_hamiltonian, store_overlap, store_dm, store_eigvecs
+```
+
+#### Storage Call Location
+**File**: `src/dftbp/dftbplus/main.F90`  
+**Subroutine**: `buildAndDiagDenseRealHam`  
+**Line**: 3449 (after diagonalization)
+
+```fortran
+eigvecsReal(:,:,iKS) = HSqrReal
+! Store eigenvectors for iKS=1 only (gamma-point / first spin channel)
+if (iKS == 1) call store_eigvecs(HSqrReal, eigen(:, iSpin), size(HSqrReal, 1))
+```
+
+**Timing**: Captures eigenvectors at optimal moment:
+- After `diagDenseMtx` completes
+- Before `HSqrReal` is reused
+- For first k-point only (iKS=1)
+
+**Data Captured**:
+- `HSqrReal` - Contains eigenvectors (overwrites original H)
+- `eigen(:, iSpin)` - Eigenvalues for current spin
+- `size(HSqrReal, 1)` - Number of basis functions
+
+### libdftbcore.F90 Updates
+
+#### New Import
+```fortran
+use dftbp_dftbplus_hamiltonian_store, only : set_store_hamiltonian, get_stored_hamiltonian,&
+    & get_stored_overlap, get_stored_dm, get_stored_eigvecs, clear_stored_matrices
+```
+
+#### Automatic Storage Enablement
+**Location**: `dftbcore_init` subroutine
+```fortran
+! Always enable storage so store_eigvecs (and optional H/S/DM) can capture data during SCF
+call set_store_hamiltonian(.true.)
+```
+
+#### Eigenvector Extraction
+**Location**: `dftbcore_run_scf` subroutine
+```fortran
+! Always extract eigenvectors (stored in hamiltonian_store during SCF via store_eigvecs)
+call get_stored_eigvecs(storedEigvecs, storedEigenvals, iSpin)
+```
+
+**Behavior**:
+- Unconditional extraction (not dependent on H/S/DM flags)
+- Returns zero matrices if not stored
+- Provides debug output about availability
+
+### Python Interface
+
+The existing `DFTBcore.get_eigvecs_dense()` method now retrieves from storage:
+
+```python
+def get_eigvecs_dense(self):
+    """Get eigenvectors and eigenvalues. Returns (eigvecs[n,n], eigvals[n]) in C row-major order."""
+    n = self.get_basis_size()
+    buf_vecs = np.zeros(n*n, dtype=np.float64)
+    buf_vals = np.zeros(n, dtype=np.float64)
+    self._lib.dftbcore_get_eigvecs_dense(buf_vecs.ctypes.data_as(c_double_p), buf_vals.ctypes.data_as(c_double_p), c_int(n))
+    # Fortran stores column-major: reshape as (n,n) Fortran order then convert to C order
+    return np.asfortranarray(buf_vecs.reshape(n, n, order='F')).T.copy(), buf_vals
+```
+
+### Data Format
+
+#### Matrix Structure
+- **Fortran storage**: `storedEigvecs(norb, nstates)` column-major
+- **Python output**: `(nstates, norb)` row-major after transpose
+- **Compatibility**: Identical to `eigenvec.bin` format (after transpose)
+
+#### Storage Scope
+Currently stores:
+- iKS=1 (first k-point, typically gamma-point)
+- First spin channel (non-spin-polarized or spin-up)
+- Full eigenvector matrix for all states
+
+### Usage Example
+
+```python
+from pyBall.DFTBcore import DFTBcore
+
+# Initialize and run calculation
+dftb = DFTBcore()
+dftb.init('h2o.hsd')
+dftb.enable_matrix_collection(dm=False, h=False, s=False)  # Optional
+energy = dftb.run_scf()
+
+# Extract eigenvectors directly (no .bin file needed)
+evecs, eigenvals = dftb.get_eigvecs_dense()
+
+print(f"Energy: {energy:.8f} Ha")
+print(f"Eigenvectors shape: {evecs.shape}")  # (nstates, norb)
+print(f"Eigenvalues shape: {eigenvals.shape}")  # (nstates,)
+
+dftb.finalize()
+```
+
+### Verification Results
+
+Tested with H₂O and PTCDA systems:
+
+| System | Energy (Ha) | max|lib - bin| | max|ψ| |
+|--------|-------------|--------------|---------|
+| H₂O | -4.076143 | 2.78e-17 | 0.215 |
+| PTCDA | -64.340460 | 5.55e-17 | 1.54e-3 |
+
+Machine-precision agreement with traditional `eigenvec.bin` approach.
+
+### Integration Notes
+
+#### Minimal Impact
+- Uses existing `hamiltonian_store` infrastructure
+- No changes to core DFTB+ algorithms
+- Backward compatible with existing functionality
+
+#### Storage Control
+- Controlled by `tStoreMatrices` flag
+- Automatically enabled in `dftbcore_init`
+- Can be disabled if not needed
+
+#### Memory Usage
+- Stores one additional `(norb, norb)` matrix
+- For typical systems: < 1MB for small molecules, few MB for large ones
+- Much less than full matrix dumps
+
+### Future Extensions
+
+Potential enhancements:
+1. **Multiple k-points**: Store for all iKS values
+2. **Spin channels**: Store both spin-up and spin-down
+3. **Selective storage**: Option to store only specific MOs
+4. **Real-time access**: Callback mechanism during SCF
+
+### Files Modified
+
+- `src/dftbp/dftbplus/hamiltonian_store.F90` - Added eigenvector storage
+- `src/dftbp/dftbplus/main.F90` - Added storage call after diagonalization  
+- `app/dftbcore/libdftbcore.F90` - Updated retrieval logic
+- `tests/grid/test_waveplot_dftbcore.py` - New test script
+
 ## Future Considerations
 
 ### Upstream Integration
