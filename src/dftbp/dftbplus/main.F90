@@ -33,6 +33,7 @@ module dftbp_dftbplus_main
   use dftbp_dftb_hamiltonian, only : addBlockChargePotentials, addChargePotentials,&
       & constrainSccHamiltonian, getSccHamiltonian, mergeExternalPotentials,&
       & resetExternalPotentials, resetInternalPotentials
+  use dftbp_dftbplus_hamiltonian_store, only : store_hamiltonian, store_overlap, store_dm
   use dftbp_dftb_hybridxc, only : hybridXcAlgo, THybridXcFunc
   use dftbp_dftb_mdftb, only : TMdftb
   use dftbp_dftb_nonscc, only : buildH0, buildS, TNonSccDiff
@@ -3394,6 +3395,10 @@ contains
         end if
       endif
 
+      ! Store Hamiltonian before diagonalization (if enabled)
+      call store_hamiltonian(HSqrReal, size(HSqrReal, 1))
+
+      ! Warning: SSqrReal gets overwritten here
       call diagDenseMtxBlacs(electronicSolver, 1, 'V', denseDesc%blacsOrbSqr, HSqrReal, SSqrReal,&
           & eigen(:,iSpin), eigvecsReal(:,:,iKS), errStatus)
       @:PROPAGATE_ERROR(errStatus)
@@ -3430,6 +3435,10 @@ contains
           @:RAISE_ERROR(errStatus, -1, "ASI interface changed the hamiltonian matrix, aborting")
         end if
       end if
+
+      ! Store H and S before diagonalization (SSqrReal gets overwritten below)
+      call store_hamiltonian(HSqrReal, size(HSqrReal, 1))
+      call store_overlap(SSqrReal, size(SSqrReal, 1))
 
       ! Warning: SSqrReal gets overwritten here
       call diagDenseMtx(env, electronicSolver, 'V', HSqrReal, SSqrReal, eigen(:, iSpin),&
@@ -3972,6 +3981,8 @@ contains
       if (.not. allocated(densityMatrix%deltaRhoOut)) then
         call densityMatrix%getDensityMatrix(work, eigvecs(:,:,iKS), filling(:,iSpin), errStatus)
         @:PROPAGATE_ERROR(errStatus)
+        ! Store dense DM at the point it is valid (before packing to sparse)
+        call store_dm(work, size(work, 1))
         call env%globalTimer%startTimer(globalTimers%denseToSparse)
         if (tHelical) then
           call packHelicalHS(rhoPrim(:,iSpin), work, neighbourlist%iNeighbour, nNeighbourSK,&
