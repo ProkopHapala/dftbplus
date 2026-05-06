@@ -786,5 +786,159 @@ f"""
                 pov.write('b( {:10.5f}, {:10.5f}, {:10.5f}, {:10.5f}, {:10.5f}, {:10.5f}, {:10.5f}, {:10.5f}, {:10.5f}, {:10.5f}, {:10.5f}, 0.0 )\n'.format( 
                               pos1[0], pos1[1], pos1[2], bond_width, 
                               pos2[0], pos2[1], pos2[2], bond_width, 
-                              bond_clr[0],  bond_clr[1], bond_clr[2]  ))
+                              bond_clr[0],  bond_clr[1], bond_clr[2] ))
+
+
+#############################
+#   Orbital comparison plotting   #
+#############################
+
+def plot_comparison_2d(wp_vals, ocl_vals, diff_vals, extent, title_prefix, plane_desc, 
+                      method_tag, mo_indices, energies, homo, output_path, dpi=150):
+    """
+    Plot 2D orbital comparison: libwaveplot vs OpenCL vs difference.
+    
+    Args:
+        wp_vals: (nstates, npoints, npoints) libwaveplot values
+        ocl_vals: (nstates, npoints, npoints) OpenCL values
+        diff_vals: (nstates, npoints, npoints) difference (wp - ocl)
+        extent: [xmin, xmax, ymin, ymax] for imshow
+        title_prefix: e.g., "H2O"
+        plane_desc: e.g., "XY plane  z=0.000 Å"
+        method_tag: e.g., "orb2points"
+        mo_indices: list of MO indices
+        energies: list of energies (eV)
+        homo: HOMO index
+        output_path: path to save PNG
+        dpi: resolution
+    """
+    import matplotlib.pyplot as plt
+    nstates = len(mo_indices)
+    s2 = wp_vals.shape[1:]
+    ncols = 3
+    fig, axes = plt.subplots(nstates, ncols, figsize=(5*ncols, 4*nstates))
+    if nstates == 1: axes = axes[np.newaxis, :]
+    
+    for i in range(nstates):
+        wp2  = wp_vals[i]
+        oc2  = ocl_vals[i]
+        df2  = diff_vals[i]
+        clim = max(np.abs(wp2).max(), np.abs(oc2).max()) or 1e-12
+        mo_idx = mo_indices[i]
+        tag  = " [HOMO]" if mo_idx == homo else (" [LUMO]" if mo_idx == homo+1 else "")
+        plane_title = f"{plane_desc}  [{method_tag}]"
+        
+        for ax, dat, ttl, cm, vl, vh in [
+            (axes[i,0], wp2, f"libwaveplot MO{mo_idx}{tag}\nE={energies[i]:.2f}eV  {plane_title}", 'RdBu_r', -clim, clim),
+            (axes[i,1], oc2, f"OpenCL MO{mo_idx}{tag}\n{plane_title}",                              'RdBu_r', -clim, clim),
+            (axes[i,2], df2, f"diff (lib−OCL)\nRMS={np.sqrt(np.mean(diff_vals[i]**2)):.2e}", 'bwr', -clim*0.1, clim*0.1),
+        ]:
+            im = ax.imshow(dat, origin='lower', cmap=cm, vmin=vl, vmax=vh,
+                           extent=extent, aspect='equal')
+            ax.set_xlabel(extent[0] if extent[0] == extent[2] else 'x (Å)')
+            ax.set_ylabel('y (Å)' if extent[0] == extent[2] else 'z (Å)')
+            ax.set_title(ttl, fontsize=7)
+            plt.colorbar(im, ax=ax, fraction=0.046)
+    
+    fig.suptitle(f"{title_prefix}: libwaveplot vs OpenCL  [{method_tag}]  {plane_desc}  (MO{mo_indices[0]}–{mo_indices[-1]})", fontsize=9)
+    fig.tight_layout()
+    fig.savefig(str(output_path), dpi=dpi)
+    plt.close(fig)
+
+
+def plot_comparison_1d(z_vals, wp_vals, ocl_vals, title_prefix, plane_desc, method_tag,
+                      mo_indices, energies, homo, output_path, dpi=150):
+    """
+    Plot 1D orbital comparison: libwaveplot vs OpenCL along z-axis.
+    
+    Args:
+        z_vals: (npoints,) z coordinates (Å)
+        wp_vals: (nstates, npoints) libwaveplot values
+        ocl_vals: (nstates, npoints) OpenCL values
+        title_prefix: e.g., "H2O"
+        plane_desc: e.g., "1D z-scan  x=0  y=0"
+        method_tag: e.g., "orb2points"
+        mo_indices: list of MO indices
+        energies: list of energies (eV)
+        homo: HOMO index
+        output_path: path to save PNG
+        dpi: resolution
+    """
+    import matplotlib.pyplot as plt
+    nstates = len(mo_indices)
+    fig, axes = plt.subplots(nstates, 2, figsize=(14, 3*nstates))
+    if nstates == 1: axes = axes[np.newaxis, :]
+    
+    for i in range(nstates):
+        mo_idx = mo_indices[i]
+        tag = " [HOMO]" if mo_idx == homo else (" [LUMO]" if mo_idx == homo+1 else "")
+        axes[i,0].plot(z_vals, wp_vals[i],  'b-',  lw=2,   label='libwaveplot')
+        axes[i,0].plot(z_vals, ocl_vals[i], 'r--', lw=1.5, label='OpenCL')
+        axes[i,0].axhline(0, c='gray', lw=0.5)
+        axes[i,0].set_title(f"MO{mo_idx}{tag} E={energies[i]:.2f}eV  [{method_tag}]  {plane_desc}", fontsize=8)
+        axes[i,0].set_xlabel('z (Å)');  axes[i,0].set_ylabel('ψ')
+        axes[i,0].legend(fontsize=7)
+        mask = z_vals >= 0;  eps = 1e-12
+        axes[i,1].semilogy(z_vals[mask], np.abs(wp_vals[i,mask]).clip(eps), 'b-', lw=2)
+        axes[i,1].semilogy(z_vals[mask], np.abs(ocl_vals[i,mask]).clip(eps),'r--',lw=1.5)
+        axes[i,1].set_title(f"MO{mo_idx}{tag} — log  [{method_tag}]", fontsize=8)
+        axes[i,1].set_xlabel('z (Å)');  axes[i,1].set_ylabel('|ψ|')
+    
+    fig.suptitle(f"{title_prefix}: libwaveplot vs OpenCL  [{method_tag}]  {plane_desc}  (MO{mo_indices[0]}–{mo_indices[-1]})", fontsize=9)
+    fig.tight_layout()
+    fig.savefig(str(output_path), dpi=dpi)
+    plt.close(fig)
+
+
+def plot_grid_slice_comparison(grid_ref, grid_lib, slice_idx, extent, z_ang, iz,
+                             title_prefix, method_tag, mo_indices, energies, homo,
+                             output_path, dpi=150):
+    """
+    Plot 3D grid slice comparison: WAVEPLOT cube vs libwaveplot.
+    
+    Args:
+        grid_ref: (nx, ny, nz) reference cube values
+        grid_lib: (nx, ny, nz) libwaveplot values
+        slice_idx: z-slice index
+        extent: [xmin, xmax, ymin, ymax] for imshow
+        z_ang: z-coordinate in Å
+        iz: slice index
+        title_prefix: e.g., "H2O"
+        method_tag: e.g., "orb2grid"
+        mo_indices: list of MO indices
+        energies: list of energies (eV)
+        homo: HOMO index
+        output_path: path to save PNG
+        dpi: resolution
+    """
+    import matplotlib.pyplot as plt
+    nstates = len(mo_indices)
+    ncols = 3
+    fig, axes = plt.subplots(nstates, ncols, figsize=(13, 4*nstates))
+    if nstates == 1: axes = axes[np.newaxis, :]
+    
+    slice_desc = f"XY slice  iz={iz}  z={z_ang:.3f} Å  [{method_tag}]"
+    
+    for i in range(nstates):
+        ref  = grid_ref[i]; lib  = grid_lib[i]; diff = lib - ref
+        rs   = ref[:,:,slice_idx]; ls  = lib[:,:,slice_idx]; ds = diff[:,:,slice_idx]
+        clim = max(np.abs(rs).max(), np.abs(ls).max()) or 1.0
+        mo_idx = mo_indices[i]
+        tag  = " [HOMO]" if mo_idx == homo else (" [LUMO]" if mo_idx == homo+1 else "")
+        
+        for ax, dat, ttl, cm, vl, vh in [
+            (axes[i,0], rs, f"WAVEPLOT cube MO{mo_idx}{tag}\nE={energies[i]:.2f}eV  {slice_desc}", 'RdBu_r', -clim, clim),
+            (axes[i,1], ls, f"libwaveplot.so MO{mo_idx}{tag}\n{slice_desc}",                        'RdBu_r', -clim, clim),
+            (axes[i,2], ds, f"diff (lib−cube)\nRMS={np.sqrt(np.mean(diff**2)):.2e}",                    'bwr',    -clim*0.05, clim*0.05),
+        ]:
+            im = ax.imshow(dat.T, origin='lower', cmap=cm, vmin=vl, vmax=vh,
+                           extent=extent, interpolation='bilinear')
+            ax.set_xlabel('x (Å)'); ax.set_ylabel('y (Å)')
+            ax.set_title(ttl, fontsize=7)
+            plt.colorbar(im, ax=ax, fraction=0.046)
+    
+    fig.suptitle(f"{title_prefix}: libwaveplot vs WAVEPLOT cube  [{method_tag}]  {slice_desc}  (MO{mo_indices[0]}–{mo_indices[-1]})", fontsize=9)
+    fig.tight_layout()
+    fig.savefig(str(output_path), dpi=dpi)
+    plt.close(fig)
 

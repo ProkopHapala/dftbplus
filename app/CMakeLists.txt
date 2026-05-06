@@ -1,4 +1,5 @@
 add_subdirectory(dftb+)
+add_subdirectory(dftbcore)
 if(NOT BUILD_EXPORTED_TARGETS_ONLY)
   add_subdirectory(misc)
   add_subdirectory(modes)

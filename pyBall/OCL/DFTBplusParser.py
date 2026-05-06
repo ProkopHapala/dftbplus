@@ -526,3 +526,216 @@ def _spline_d2_uniform(y, h):
     d2[1:-1] = d2_inner.astype(np.float32)
     
     return d2
+
+
+# ================================================================
+# Standalone parsers for DFTB+ output files (compare_waveplot_lib.py)
+# These handle the actual DFTB+ XML format (lowercase tags)
+# ================================================================
+
+def parse_detailed_xml_custom(xml_path):
+    """
+    Parse DFTB+ detailed.xml (actual format with lowercase tags).
+    
+    Returns dict with:
+        species_names: list of unique species in order
+        species_per_atom: 0-based index into species_names (natoms,)
+        coords_bohr: (natoms, 3) array in Bohr
+        nstates, norb, nkpoints, nspin
+        occupations: (nstates, nkpoints, nspin)
+    """
+    import xml.etree.ElementTree as ET
+    tree = ET.parse(xml_path)
+    root = tree.getroot()
+    
+    # Parse geometry
+    geo = root.find('geometry')
+    typenames = geo.find('typenames').text.strip().split()
+    # Remove quotes if present
+    species_names = [s.strip('"\'') for s in typenames]
+    
+    # Parse typesandcoordinates: format: type_index x y z (Bohr)
+    typesandcoords = geo.find('typesandcoordinates').text.strip().split()
+    nlines = len(typesandcoords) // 4
+    coords_bohr = []
+    species_per_atom = []
+    for i in range(nlines):
+        idx = int(typesandcoords[i*4]) - 1  # 1-based -> 0-based
+        x = float(typesandcoords[i*4 + 1])
+        y = float(typesandcoords[i*4 + 2])
+        z = float(typesandcoords[i*4 + 3])
+        coords_bohr.append([x, y, z])
+        species_per_atom.append(idx)
+    
+    coords_bohr = np.array(coords_bohr)
+    species_per_atom = np.array(species_per_atom, dtype=np.int32)
+    
+    # Parse dimensions
+    nstates = int(root.find('nrofstates').text)
+    norb = int(root.find('nroforbitals').text)
+    nkpoints = int(root.find('nrofkpoints').text)
+    nspin = int(root.find('nrofspins').text)
+    
+    # Parse occupations
+    occ = root.find('occupations')
+    occ_data = occ.find('spin1').find('k1').text.strip().split()
+    occupations_1d = np.array([float(x) for x in occ_data])
+    # Reshape to (nstates, nkpoints, nspin) for compatibility
+    occupations = occupations_1d.reshape(nstates, nkpoints, nspin)
+    
+    natoms = coords_bohr.shape[0]
+    return {
+        'species_names': species_names,
+        'species_per_atom': species_per_atom,
+        'coords_bohr': coords_bohr,
+        'natoms': natoms,
+        'nstates': nstates,
+        'norb': norb,
+        'nkpoints': nkpoints,
+        'nspin': nspin,
+        'occupations': occupations,
+    }
+
+
+def parse_eigenvec_bin_custom(bin_path, nstates, norb, nkpoints=1, nspin=1):
+    """
+    Parse DFTB+ eigenvec.bin (flat binary format, no Fortran record markers).
+    
+    Format: [4-byte identity int] [nstates * norb * 8-byte float64]
+    
+    Returns: evecs[nstates, norb] (float64)
+    """
+    import struct
+    with open(bin_path, 'rb') as f:
+        raw = f.read()
+    
+    # Read identity (first 4 bytes)
+    identity = struct.unpack_from('i', raw, 0)[0]
+    
+    # Read eigenvectors (rest of file)
+    evecs = np.frombuffer(raw[4:], dtype=np.float64).reshape(nstates, norb).copy()
+    
+    return evecs
+
+
+def read_cube(path):
+    """
+    Read Gaussian cube file.
+    
+    Returns: (grid_data, origin, step, nPoints)
+        grid_data: (nx, ny, nz) array
+        origin: (3,) array in Bohr
+        step: (3,) array in Bohr
+        nPoints: (3,) tuple
+    """
+    import numpy as np
+    with open(path, 'r') as f:
+        lines = f.readlines()
+    
+    # Line 1: comment
+    # Line 2: comment
+    # Line 3: natoms origin_x origin_y origin_z
+    natoms = int(lines[2].split()[0])
+    origin = np.array([float(x) for x in lines[2].split()[1:4]])
+    
+    # Lines 4-6: nPoints and step vectors
+    nPoints = []
+    step = np.zeros(3)
+    for i in range(3):
+        parts = lines[3+i].split()
+        nPoints.append(int(parts[0]))
+        step[i] = float(parts[1+i])  # diagonal element only
+    
+    nPoints = tuple(nPoints)
+    
+    # Lines 7-7+natoms: atomic numbers and coordinates
+    # Skip for now
+    
+    # Remaining lines: grid data (starts after atom section)
+    # Atom section is lines 7-9 (0-indexed: 6-8), so data starts from index 6+natoms
+    data_lines = lines[6+natoms:]
+    data = []
+    for line in data_lines:
+        data.extend([float(x) for x in line.split()])
+    
+    grid_data = np.array(data).reshape(nPoints)
+    
+    # Parse atom section
+    atoms = []
+    for i in range(natoms):
+        line = lines[6+i].split()
+        z = int(line[0])
+        x = float(line[1])
+        y = float(line[2])
+        z_coord = float(line[3])
+        atoms.append((z, x, y, z_coord))
+    
+    return grid_data, origin, step, nPoints, atoms
+
+
+def build_wp_basis(species_list_ang, species_names_ordered):
+    """
+    Convert Å-normalized basis (from parse_basis_hsd_ang) back to Bohr for libwaveplot.
+    
+    Args:
+        species_list_ang: list from parse_basis_hsd_ang (Å units)
+        species_names_ordered: list of species names in atom order
+    
+    Returns:
+        basis: list of dicts with angMoms, cutoffs (Bohr), occupations, stos
+        resoln_b: resolution in Bohr
+    """
+    B = BOHR2ANG
+    sp_by_name = {sp['name']: sp for sp in species_list_ang}
+    basis = []
+    for sp_name in species_names_ordered:
+        sp = sp_by_name[sp_name]
+        angMoms   = [orb['l'] for orb in sp['orbitals']]
+        cutoffs_b = [orb['cutoff'] / B for orb in sp['orbitals']]
+        occs      = [1.0] * len(sp['orbitals'])
+        stos = []
+        for orb in sp['orbitals']:
+            l = orb['l']
+            alpha_b = list(np.array(orb['exponents']) * B)       # Å^-1 -> Bohr^-1
+            coef_b  = np.array(orb['coefficients']) * (B ** l)   # Å-normalised -> Bohr
+            aa = coef_b.tolist() if hasattr(coef_b, 'tolist') else list(coef_b)
+            stos.append({'alpha': alpha_b, 'aa': aa})
+        basis.append({'angMoms': angMoms, 'cutoffs': cutoffs_b,
+                      'occupations': occs, 'stos': stos})
+    resoln_b = species_list_ang[0]['resolution'] / B
+    return basis, resoln_b
+
+
+def evec_to_kernel_coeffs(evec_row, natoms, species_per_atom, species_names, species_list_ang):
+    """
+    Convert eigenvector row [norb] -> (natoms,4) kernel coeffs [px,py,pz,s].
+    
+    Args:
+        evec_row: [norb] array
+        natoms: number of atoms
+        species_per_atom: [natoms] 0-based species indices
+        species_names: list of species names
+        species_list_ang: list from parse_basis_hsd_ang
+    
+    Returns:
+        coeffs: (natoms, 4) float32 array [px, py, pz, s]
+    """
+    sp_by_name = {sp['name']: sp for sp in species_list_ang}
+    c = np.zeros((natoms, 4), dtype=np.float32)
+    offset = 0
+    for ia in range(natoms):
+        si = species_per_atom[ia]
+        sp_name = species_names[si]
+        sp = sp_by_name[sp_name]
+        for orb in sp['orbitals']:
+            l = orb['l']
+            nm = 2 * l + 1
+            chunk = evec_row[offset:offset+nm]
+            if l == 0:
+                c[ia, 3] = chunk[0]  # s -> slot 3
+            elif l == 1:
+                c[ia, 1] = chunk[0]  # py -> slot 1
+                c[ia, 2] = chunk[1]  # pz -> slot 2
+                c[ia, 0] = chunk[2]  # px -> slot 0
+            offset += nm
+    return c

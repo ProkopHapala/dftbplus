@@ -2358,7 +2358,379 @@ python tests/grid/compare_waveplot_lib.py --dftb-dir tests/grid/dftb_ptcda \
 4. **Binary format:** `eigenvec.bin` is a simple flat binary, not Fortran unformatted with record markers.
 5. **Generalization principle:** All system-specific data should be parsed, never hardcoded.
 
-### 11. Reference: Input File Formats
+### 11. Modularization Refactoring (2026-05)
+
+#### 11.1 Overview
+
+The `compare_waveplot_lib.py` script was refactored to improve modularity and reusability by creating high-level API functions for both the libwaveplot and OpenCL backends, and centralizing comparison utilities in a new TestUtils module.
+
+**Goals:**
+- Extract reusable evaluation functions from the monolithic main script
+- Create a clean high-level API for both backends
+- Centralize comparison and debugging utilities
+- Make the main script minimal and focused on orchestration
+
+#### 11.2 New Functions and Locations
+
+**libwaveplot backend (`pyBall/WavePlot/WavePlot.py`):**
+
+```python
+def setup_waveplot_from_dftb(dftb_data, libpath):
+    """
+    Configure WavePlot from parsed DFTB+ data.
+    
+    Args:
+        dftb_data: dict with 'coords_bohr', 'species_wp', 'basis', 'resolution', 'evecs'
+        libpath: path to libwaveplot.so
+    
+    Returns:
+        WavePlot instance configured with geometry, basis, and eigenvectors
+    """
+
+def evaluate_mos_on_points(wp, mo_indices, points):
+    """
+    Evaluate multiple molecular orbitals at explicit points.
+    
+    Args:
+        wp: WavePlot instance
+        mo_indices: list of 1-based MO indices
+        points: (npts, 3) array in Bohr
+    
+    Returns:
+        list of (npts,) arrays, one per MO
+    """
+
+def evaluate_mos_on_grid(wp, mo_indices, origin, gridVecs, nPoints):
+    """
+    Evaluate multiple MOs on a 3D grid.
+    
+    Args:
+        wp: WavePlot instance
+        mo_indices: list of 1-based MO indices
+        origin: (3,) array in Bohr
+        gridVecs: (3, 3) array of grid vectors in Bohr
+        nPoints: (3,) array of grid dimensions
+    
+    Returns:
+        list of (nx, ny, nz) arrays, one per MO
+    """
+```
+
+**OpenCL backend (`pyBall/OCL/Grid.py`):**
+
+```python
+def setup_gridprojector_from_dftb(dftb_data, species_list_ang, ctx=None, queue=None, verbosity=0):
+    """
+    Configure GridProjector from parsed DFTB+ data.
+    
+    Args:
+        dftb_data: dict with 'coords_bohr', 'species_per_atom', 'species_names'
+        species_list_ang: list from parse_basis_hsd_ang (Å units)
+        ctx: OpenCL context (optional)
+        queue: OpenCL command queue (optional)
+        verbosity: logging level
+    
+    Returns:
+        (GridProjector instance, atoms_dict) where atoms_dict contains
+        'pos' (float32), 'Rcut' (float32), 'type' (int32)
+    """
+
+def evaluate_mos_on_points(projector, mo_indices, points, evecs, natoms,
+                            species_per_atom, species_names, species_list_ang,
+                            norb_per_atom, atoms_dict):
+    """
+    Evaluate multiple MOs at explicit points via OpenCL.
+    
+    Args:
+        projector: GridProjector instance
+        mo_indices: list of 0-based MO indices
+        points: (npts, 3) array in Å (float32)
+        evecs: (nstates, norb) eigenvector array
+        natoms: number of atoms
+        species_per_atom: (natoms,) array of species indices
+        species_names: list of species names
+        species_list_ang: list from parse_basis_hsd_ang
+        norb_per_atom: (natoms,) array of orbitals per atom
+        atoms_dict: dict with 'pos', 'Rcut', 'type'
+    
+    Returns:
+        list of (npts,) arrays, one per MO
+    """
+```
+
+**Test utilities (`pyBall/WavePlot/TestUtils.py`):** (new module)
+
+```python
+def compute_rms_error(arr1, arr2):
+    """Compute RMS and max absolute error between two arrays."""
+
+def compare_point_evaluations(wp_vals, ocl_vals, mo_indices, energies, homo):
+    """Compare libwaveplot vs OpenCL point evaluations.
+    
+    Returns list of dicts with 'mo_index', 'energy', 'rms', 'max', 'is_homo', 'is_lumo'
+    """
+
+def compare_grid_evaluations(lib_grids, cube_grids, mo_indices, energies, homo):
+    """Compare libwaveplot vs cube file grid evaluations.
+    
+    Returns list of dicts with 'mo_index', 'energy', 'rms', 'rel_rms', 'ref_max'
+    """
+
+def print_comparison_results(results, method_name):
+    """Print formatted comparison summary."""
+
+def generate_2d_point_grid(center, rmin, rmax, npoints, plane='xy', z_offset=0.0):
+    """Generate 2D grid of points on specified plane."""
+
+def generate_1d_z_scan(center, z_range, npoints):
+    """Generate 1D z-scan points through center."""
+```
+
+**Plotting utilities (`pyBall/plotUtils.py`):**
+
+```python
+def plot_comparison_2d(wp_vals, ocl_vals, diff_vals, extent, system_name,
+                       plane_desc, method_tag, mo_indices, energies, homo,
+                       out_file, dpi=150):
+    """Plot 2D orbital comparison (libwaveplot vs OpenCL)."""
+
+def plot_comparison_1d(z_vals, wp_vals, ocl_vals, system_name, plane_desc,
+                       method_tag, mo_indices, energies, homo, out_file, dpi=150):
+    """Plot 1D z-scan comparison (libwaveplot vs OpenCL)."""
+
+def plot_grid_slice_comparison(lib_grids, cube_grids, diff_grids, extent,
+                               system_name, slice_desc, method_tag, mo_indices,
+                               energies, homo, out_file, dpi=150):
+    """Plot 3D grid slice comparison (libwaveplot vs cube)."""
+```
+
+#### 11.3 Problems Encountered and Fixed
+
+**Problem 1: Function placement in Grid.py**
+- **Issue:** Initially placed OpenCL high-level functions inside the `GridProjector` class, causing indentation and structural errors.
+- **Fix:** Moved functions to the end of the file (outside the class) to avoid class nesting issues.
+- **Lesson:** Be careful about code structure when adding new functions to existing class files.
+
+**Problem 2: Cube file parsing bug in Method 1**
+- **Issue:** `read_cube()` was reading from wrong line index (`7+natoms` instead of `6+natoms`), causing ValueError: "cannot reshape array of size 172026 into shape (64,56,48)"
+- **Root cause:** Off-by-one error in line indexing. Cube file structure:
+  - Lines 1-2: comments
+  - Line 3: natoms + origin
+  - Lines 4-6: grid dimensions and step vectors
+  - Lines 7-9: atom positions (natoms lines)
+  - Line 10+: grid data
+- **Fix:** Changed `data_lines = lines[7+natoms:]` to `data_lines = lines[6+natoms:]`
+- **Additional fix:** Changed return value from 4 to 5 values to match script expectation (added atoms list)
+- **Additional fix:** Changed step from (3,3) array to (3,) 1D array to match script's use of `np.diag(step_b)`
+
+**Problem 3: Plotting function expects numpy arrays, not lists**
+- **Issue:** `plot_comparison_2d()` expected numpy arrays but received Python lists
+- **Fix:** Convert lists to numpy arrays before passing to plotting functions:
+  ```python
+  wp_vals_2d = np.array([v.reshape(s2) for v in wp_vals])
+  ocl_vals_2d = np.array([v.reshape(s2) for v in ocl_vals])
+  diff_vals_2d = np.array([v.reshape(s2) for v in diff_vals])
+  ```
+
+#### 11.4 How to Run Tests
+
+**All tests from `/home/prokop/git/dftbplus/tests/grid/`:**
+
+```bash
+# Method 1: 3D grid comparison (libwaveplot vs cube files)
+python compare_waveplot_lib.py --dftb-dir dftb_h2o --nmo 6 --no-show
+
+# Method 2: 2D point evaluation on XY plane at z=0 Å
+python compare_waveplot_lib.py --dftb-dir dftb_h2o --points --plane2d xy --z-offset 0.0 --mo-range 4 6 --npoints 32 --no-show
+
+# Method 2: 1D z-scan
+python compare_waveplot_lib.py --dftb-dir dftb_h2o --points --z-range -3.0 3.0 --mo-range 4 6 --npoints 100 --no-show
+
+# PTCDA example (larger molecule)
+python compare_waveplot_lib.py --dftb-dir dftb_ptcda --points --plane2d xy --z-offset 2.0 --mo-range 66 75 --npoints 64 --no-show
+```
+
+**Output files:** Saved to `/home/prokop/git/dftbplus/tests/grid/waveplot_output/comparison/`
+
+**Expected RMS errors:**
+- Method 1 (libwaveplot vs cube): ~1e-8
+- Method 2 (libwaveplot vs OpenCL): ~1e-21 to 1e-6 (depends on MO and evaluation type)
+
+#### 11.5 Refactored Main Script Structure
+
+The refactored `compare_waveplot_lib.py` main() now follows this pattern:
+
+```python
+# 1. Parse DFTB+ data (unchanged)
+geo = parse_detailed_xml_custom(...)
+species_list_ang = parse_basis_hsd_ang(...)
+evecs_full = parse_eigenvec_bin_custom(...)
+
+# 2. Setup using high-level functions
+dftb_data_wp = {coords_bohr, species_wp, basis, resolution, evecs}
+wp = setup_waveplot_from_dftb(dftb_data_wp, LIB_PATH)
+
+dftb_data_ocl = {coords_bohr, species_per_atom, species_names}
+projector, atoms_dict = setup_gridprojector_from_dftb(dftb_data_ocl, species_list_ang)
+
+# 3. Evaluate using high-level functions
+wp_vals = wp_evaluate_mos_on_points(wp, mo_indices, points)
+ocl_vals = ocl_evaluate_mos_on_points(projector, mo_indices, points, ...)
+
+# 4. Compare using TestUtils
+results = compare_point_evaluations(wp_vals, ocl_vals, mo_indices, energies, homo)
+print_comparison_results(results, "libwaveplot vs OpenCL")
+
+# 5. Plot using plotUtils
+plot_comparison_2d(wp_vals_2d, ocl_vals_2d, diff_vals_2d, extent, ...)
+```
+
+**Lines reduced:** ~80 lines shorter than original
+
+### 12. Generic Script Refactoring: test_waveplot_dftb.py (2026-05)
+
+#### 12.1 Overview
+
+The `test_waveplot_dftb.py` script was originally designed as a system-specific test with separate functions for H2O and PTCDA. This was refactored to be completely generic, working for any DFTB+ calculation directory, similar to `compare_waveplot_lib.py`.
+
+**Goals:**
+- Remove system-specific functions (`run_h2o_test`, `run_ptcda_test`)
+- Remove ad-hoc utility functions redundant with shared modules
+- Create a single generic `main()` that works for any DFTB+ directory
+- Use shared parsing and plotting functions throughout
+- Eliminate code duplication
+
+#### 12.2 Changes Made
+
+**Removed system-specific functions:**
+- `run_h2o_test()` - H2O-specific test logic with hardcoded grid parameters
+- `run_ptcda_test()` - PTCDA-specific test logic with XYZ file parsing
+
+**Removed ad-hoc utility functions:**
+- `validate_grid()` - grid validation (redundant, can be inlined if needed)
+- `compute_grid_extent()` - extent computation (simple inline calculation)
+- `plot_orbital_2d()` - 2D orbital plotting (replaced with shared `plotAtoms` from plotUtils)
+- `plot_orbital_slices()` - 3 orthogonal slice plotting (simplified to single middle slice)
+- `extract_plane_at_z()` - plane extraction from 3D grid (inline calculation)
+- `best_slice()` - find slice with max |psi| (simplified to middle slice)
+- `plot_mo_slice()` - MO slice plotting with atoms (replaced with shared functions)
+
+**Updated argument parser:**
+- Replaced `--system {H2O,PTCDA}` with `--dftb-dir <path>`
+- Removed `--xyz` argument (no longer needed)
+- Kept generic grid parameters: `--step`, `--margin`, `--ngrid`, `--points`, `--z-range`, `--npoints`, `--plot-mos`
+
+**Created generic main():**
+```python
+def main():
+    # Determine DFTB+ directory (or default to dftb_h2o)
+    dftb_dir = Path(args.dftb_dir) if args.dftb_dir else Path(__file__).parent / 'dftb_h2o'
+    
+    # Parse DFTB+ data using shared functions
+    geo = parse_detailed_xml_custom(dftb_dir / 'detailed.xml')
+    evecs_full = parse_eigenvec_bin_custom(dftb_dir / 'eigenvec.bin', nstates, norb)
+    species_list_sto = parse_basis_hsd_ang(dftb_dir / 'waveplot_in.hsd')
+    
+    # Setup projector using shared function
+    projector, atoms_dict = setup_gridprojector_from_dftb(dftb_data_ocl, species_list_sto)
+    
+    # Auto-detect HOMO/LUMO from occupations
+    homo_idx = np.where(occupations > 0.5)[0][-1]
+    
+    # Auto-select MO range (HOMO-2 to LUMO+2 by default)
+    mo_start = max(0, homo_idx - 2)
+    mo_end = min(nstates - 1, homo_idx + 2)
+    
+    # Project and plot using shared functions
+    for imo in mo_indices:
+        coeffs_k = evec_to_kernel_coeffs(evecs_full[imo], ...)
+        grid_3d = projector.project_orbital(coeffs_k, ...)
+        # Plot with plotAtoms from plotUtils
+```
+
+#### 12.3 How It Works Now
+
+**Input requirements:**
+Any DFTB+ calculation directory containing:
+- `detailed.xml` - geometry, nstates, norb, occupations
+- `eigenvec.bin` - eigenvectors (Fortran unformatted binary)
+- `waveplot_in.hsd` - STO basis parameters
+- `band.out` - optional, for energy labels
+
+**Usage:**
+```bash
+# H2O (default if --dftb-dir not specified)
+python test_waveplot_dftb.py --step 0.2 --no-show
+
+# PTCDA or any other molecule
+python test_waveplot_dftb.py --dftb-dir dftb_ptcda --step 0.2 --no-show
+
+# Point evaluation along z-axis
+python test_waveplot_dftb.py --dftb-dir dftb_h2o --points --npoints 100 --no-show
+
+# Specific MOs
+python test_waveplot_dftb.py --dftb-dir dftb_h2o --plot-mos 4 5 6 --no-show
+```
+
+**Automatic features:**
+- Auto-detects HOMO from occupations
+- Auto-selects MO range (HOMO-2 to LUMO+2 by default)
+- Auto-computes grid dimensions based on molecular extent
+- Auto-reads energies from `band.out` if available
+- Works for any molecule size (tested: H2O with 3 atoms, PTCDA with 38 atoms)
+
+**Shared functions used:**
+- `parse_detailed_xml_custom()` - geometry and occupations
+- `parse_eigenvec_bin_custom()` - eigenvectors
+- `parse_basis_hsd_ang()` - STO basis
+- `setup_gridprojector_from_dftb()` - projector setup
+- `evec_to_kernel_coeffs()` - coefficient conversion
+- `plotAtoms()` from plotUtils - atom plotting
+
+#### 12.4 Results
+
+**Before refactoring:**
+- ~840 lines total
+- System-specific code for H2O and PTCDA
+- Ad-hoc plotting functions
+- Hardcoded grid parameters for H2O
+- Manual XYZ parsing for PTCDA
+
+**After refactoring:**
+- ~140 lines total (reduced by ~700 lines)
+- Generic code works for any DFTB+ directory
+- Uses shared functions throughout
+- Automatic grid setup based on molecular extent
+- No system-specific logic
+
+**Test results:**
+- H2O (3 atoms, 6 states): ✓ passed
+- PTCDA (38 atoms, 128 states): ✓ passed
+
+#### 12.5 Comparison with compare_waveplot_lib.py
+
+Both scripts now follow the same pattern:
+
+**compare_waveplot_lib.py:**
+- Purpose: Compare libwaveplot vs OpenCL vs cube file
+- Focus: Accuracy testing and validation
+- Methods: 3D grid comparison, 2D point evaluation, 1D z-scan
+- Uses: TestUtils for comparison metrics, plotUtils for comparison plots
+
+**test_waveplot_dftb.py:**
+- Purpose: Test OpenCL orbital projection
+- Focus: Visualization and debugging
+- Methods: 3D grid projection, point evaluation
+- Uses: Shared parsing functions, plotAtoms for visualization
+
+Both scripts:
+- Use shared DFTBplusParser functions
+- Use shared GridProjector setup
+- Are generic (work for any DFTB+ directory)
+- Have no system-specific code
+- Auto-detect HOMO/LUMO from occupations
+
+### 13. Reference: Input File Formats
 
 #### `geom.xyz` (for DFTB+ input)
 ```

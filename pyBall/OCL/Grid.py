@@ -757,18 +757,20 @@ class GridProjector(OpenCLBase):
         return out
 
 
+
+
     def mo_overlap_points_exp_sk(
-        self,
-        tip_centers,
-        tip_pos_rel,
-        smp_pos,
-        coeffs_tip,
-        coeffs_smp,
-        tip_quat=None,
-        beta=1.0,
-        r0=3.0,
-        rcut=8.0,
-    ):
+            self,
+            tip_centers,
+            tip_pos_rel,
+            smp_pos,
+            coeffs_tip,
+            coeffs_smp,
+            tip_quat=None,
+            beta=1.0,
+            r0=3.0,
+            rcut=8.0,
+        ):
         """GPU orbital-overlap scan map for molecular tip vs sample using exp+SK.
 
         Each work-item computes one scan pixel corresponding to one tip-center position.
@@ -856,18 +858,18 @@ class GridProjector(OpenCLBase):
 
 
     def stm_dyson_wg_scan(
-        self,
-        tip_centers,
-        tip_pos_rel,
-        smp_pos,
-        GT_global=None,
-        GS_global=None,
-        uT_source=None,
-        beta=1.0,
-        r0=3.0,
-        rcut=8.0,
-        local_size=32,
-    ):
+            self,
+            tip_centers,
+            tip_pos_rel,
+            smp_pos,
+            GT_global=None,
+            GS_global=None,
+            uT_source=None,
+            beta=1.0,
+            r0=3.0,
+            rcut=8.0,
+            local_size=32,
+        ):
         import numpy as np
         import pyopencl as cl
 
@@ -956,27 +958,27 @@ class GridProjector(OpenCLBase):
         return out
 
     def stm_gf_dyson_2mol_mo_scan(
-        self,
-        tip_centers,
-        tip_pos_rel,
-        smp_pos,
-        GT_global,
-        GS_global,
-        c_tip,
-        c_smp,
-        tip_norb_per,
-        smp_norb_per,
-        beta=1.0,
-        r0=3.0,
-        rcut=8.0,
-    ):
+            self,
+            tip_centers,
+            tip_pos_rel,
+            smp_pos,
+            GT_global,
+            GS_global,
+            c_tip,
+            c_smp,
+            tip_norb_per,
+            smp_norb_per,
+            beta=1.0,
+            r0=3.0,
+            rcut=8.0,
+        ):
         """GPU GF-Dyson MO scan for 2-molecule STM (work-item per pixel).
 
         Math: amp(p) = c_tip^H · GT · M_ts(p) · GS · c_smp
 
         Precomputes on CPU:
-          v_S = GS @ c_smp   (remapped Fortran→OCL [px,py,pz,s] order)
-          u_T = c_tip^H @ GT (remapped Fortran→OCL [px,py,pz,s] order)
+            v_S = GS @ c_smp   (remapped Fortran→OCL [px,py,pz,s] order)
+            u_T = c_tip^H @ GT (remapped Fortran→OCL [px,py,pz,s] order)
 
         GPU kernel computes M_ts via simplified exponential SK hopping and
         accumulates amp = Σ_{it,is} u_T[it] * V_{it,is} * v_S[is].
@@ -1100,17 +1102,17 @@ class GridProjector(OpenCLBase):
         return out
 
     def mo_overlap_points_exp_sk_2mol(
-        self,
-        tip_centers,
-        tip_pos_rel,
-        smp_pos,
-        coeffs_tip,
-        coeffs_smp,
-        tip_quat=None,
-        beta=1.0,
-        r0=3.0,
-        rcut=8.0,
-    ):
+            self,
+            tip_centers,
+            tip_pos_rel,
+            smp_pos,
+            coeffs_tip,
+            coeffs_smp,
+            tip_quat=None,
+            beta=1.0,
+            r0=3.0,
+            rcut=8.0,
+        ):
         """Same as mo_overlap_points_exp_sk, but calls an explicit two-molecule kernel entrypoint.
 
         This is intended for workflows where the tip and sample are different molecules.
@@ -1328,7 +1330,7 @@ class GridProjector(OpenCLBase):
 
         mf = cl.mem_flags
         d_points = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR,
-                             hostbuf=np.c_[points, np.zeros((npts, 1), np.float32)].astype(np.float32))
+                                hostbuf=np.c_[points, np.zeros((npts, 1), np.float32)].astype(np.float32))
         d_atoms = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=atom_data)
         d_starts = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=starts_s)
         d_vre = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=v.real.astype(np.float32))
@@ -1433,17 +1435,17 @@ class GridProjector(OpenCLBase):
 
         # Grid spec
         d_grid = cl.Buffer(self.ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR,
-                         hostbuf=self.grid_to_np(grid_spec))
+                            hostbuf=self.grid_to_np(grid_spec))
 
         # Tasks
         if len(tasks_np) > 0:
             d_tasks = cl.Buffer(self.ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR,
-                             hostbuf=tasks_np)
+                                hostbuf=tasks_np)
         else:
             d_tasks = cl.Buffer(self.ctx, cl.mem_flags.READ_ONLY, size=32)
 
         d_atoms = cl.Buffer(self.ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR,
-                          hostbuf=atom_data)
+                            hostbuf=atom_data)
 
         if len(task_atoms_np) > 0:
             d_task_atoms = cl.Buffer(self.ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR,
@@ -1452,7 +1454,7 @@ class GridProjector(OpenCLBase):
             d_task_atoms = cl.Buffer(self.ctx, cl.mem_flags.READ_ONLY, size=nMaxAtom * 4)
 
         d_coeffs = cl.Buffer(self.ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR,
-                           hostbuf=coeffs_flat.astype(np.float32))
+                            hostbuf=coeffs_flat.astype(np.float32))
 
         # Output grid
         nx, ny, nz = grid_spec['ngrid'][:3]
@@ -1492,3 +1494,84 @@ class GridProjector(OpenCLBase):
         self.queue.finish()
 
         return res
+
+
+
+
+
+
+
+# ================================================================
+# High-level evaluation functions
+# ================================================================
+
+def evaluate_mos_on_points(projector, mo_indices, points, evecs, natoms, species_per_atom,
+                          species_names, species_list_ang, norb_per_atom, atoms_dict):
+    """
+    Evaluate multiple MOs at arbitrary points using OpenCL.
+    
+    Args:
+        projector: GridProjector instance (already configured with load_basis_sto)
+        mo_indices: list of 0-indexed MO indices
+        points: array [npoints, 3] in Angstrom
+        evecs: (nstates, norb) eigenvector array
+        natoms: number of atoms
+        species_per_atom: (natoms,) 0-based species indices
+        species_names: list of species names
+        species_list_ang: list from parse_basis_hsd_ang
+        norb_per_atom: (natoms,) number of orbitals per atom
+        atoms_dict: dict with 'pos', 'Rcut', 'type' for atoms
+    
+    Returns:
+        point_vals: list of arrays, each [npoints]
+    """
+    from .DFTBplusParser import evec_to_kernel_coeffs
+    
+    point_vals = []
+    for imo in mo_indices:
+        coeffs = evec_to_kernel_coeffs(evecs[imo], natoms, species_per_atom,
+                                      species_names, species_list_ang)
+        psi = projector.project_orbital_points(points, coeffs, norb_per_atom, atoms_dict)
+        point_vals.append(psi)
+    
+    return point_vals
+
+
+def setup_gridprojector_from_dftb(dftb_data, species_list_ang, ctx=None, queue=None, verbosity=0):
+    """
+    Configure GridProjector instance from parsed DFTB+ data.
+    
+    Args:
+        dftb_data: dict with keys:
+            - coords_bohr: (natoms, 3) array (Bohr)
+            - species_per_atom: (natoms,) 0-based species indices
+            - species_names: list of species names
+        species_list_ang: list from parse_basis_hsd_ang (Å units)
+        ctx: OpenCL context (optional)
+        queue: OpenCL command queue (optional)
+        verbosity: verbosity level
+    
+    Returns:
+        projector: configured GridProjector instance
+        atoms_dict: dict with 'pos', 'Rcut', 'type' for projection
+    """
+    projector = GridProjector(fdata_dir=None, ctx=ctx, queue=queue, verbosity=verbosity)
+    projector.load_basis_sto(species_list_ang)
+    
+    # Build atoms dict
+    coords_ang = dftb_data['coords_bohr'] * 0.5291772109  # Bohr -> Angstrom
+    sp_by_name = {sp['name']: sp for sp in species_list_ang}
+    
+    natoms = len(coords_ang)
+    atomic_numbers = np.array([sp_by_name[dftb_data['species_names'][si]]['atomic_number']
+                              for si in dftb_data['species_per_atom']])
+    cutoffs = np.array([sp_by_name[dftb_data['species_names'][si]]['orbitals'][0]['cutoff']
+                       for si in dftb_data['species_per_atom']])
+    
+    atoms_dict = {
+        'pos': coords_ang,
+        'Rcut': cutoffs,
+        'type': atomic_numbers
+    }
+    
+    return projector, atoms_dict

@@ -289,3 +289,70 @@ class WavePlot:
             ctypes.c_int(istate), p_orig, p_gv, p_np, p_out
         )
         return out.reshape((n1, n2, n3), order='F')
+
+
+# ================================================================
+# High-level evaluation functions
+# ================================================================
+
+def evaluate_mos_on_grid(wp, mo_indices, origin, gridVecs, nPoints):
+    """
+    Evaluate multiple MOs on a 3D grid.
+    
+    Args:
+        wp: WavePlot instance (already configured with geometry, basis, eigenvectors)
+        mo_indices: list of 1-indexed MO indices to evaluate
+        origin: array [3] in Bohr
+        gridVecs: array [3,3] step vectors (Bohr)
+        nPoints: tuple (n1, n2, n3)
+    
+    Returns:
+        grid_vals: list of arrays, each [n1, n2, n3] in Fortran order
+    """
+    grid_vals = []
+    for istate in mo_indices:
+        val = wp.orb2grid(istate, origin, gridVecs, nPoints)
+        grid_vals.append(val)
+    return grid_vals
+
+
+def evaluate_mos_on_points(wp, mo_indices, points):
+    """
+    Evaluate multiple MOs at arbitrary points.
+    
+    Args:
+        wp: WavePlot instance (already configured)
+        mo_indices: list of 1-indexed MO indices
+        points: array [npoints, 3] in Bohr
+    
+    Returns:
+        point_vals: list of arrays, each [npoints]
+    """
+    point_vals = []
+    for istate in mo_indices:
+        val = wp.orb2points(istate, points)
+        point_vals.append(val)
+    return point_vals
+
+
+def setup_waveplot_from_dftb(dftb_data, libpath=None):
+    """
+    Configure WavePlot instance from parsed DFTB+ data.
+    
+    Args:
+        dftb_data: dict with keys:
+            - coords_bohr: (natoms, 3) array
+            - species_wp: (natoms,) 1-indexed species indices
+            - basis: list of basis dicts (for set_basis)
+            - resolution: float (Bohr)
+            - evecs: (nstates, norb) array
+        libpath: path to libwaveplot.so (optional)
+    
+    Returns:
+        wp: configured WavePlot instance
+    """
+    wp = WavePlot(libpath)
+    wp.set_geometry(dftb_data['coords_bohr'], dftb_data['species_wp'])
+    wp.set_basis(dftb_data['basis'], dftb_data['resolution'])
+    wp.set_eigenvectors(dftb_data['evecs'])
+    return wp
