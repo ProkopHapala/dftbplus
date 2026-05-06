@@ -1,0 +1,27 @@
+Geometry = xyzFormat {
+<<< "geom.xyz"
+}
+
+Driver = {}
+
+Hamiltonian = DFTB {
+  SCC = Yes
+  SCCTolerance = 1.0E-8
+  MaxSCCIterations = 100
+  SlaterKosterFiles = Type2FileNames {
+    Prefix = "/home/prokop/SIMULATIONS/dftbplus/slakos/mio-1-1/"
+    Separator = "-"
+    Suffix = ".skf"
+  }
+  MaxAngularMomentum {
+    H = "s"
+  }
+}
+
+Analysis {
+  WriteEigenvectors = Yes
+}
+
+Options {
+  WriteDetailedXml = Yes
+}

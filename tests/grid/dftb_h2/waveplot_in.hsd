@@ -1,0 +1,35 @@
+Options = {
+    PlottedLevels = { 1 2 }
+    PlottedKPoints = { 1 }
+    PlottedSpins = { 1 }
+    PlottedRegion = {
+        Box [Angstrom] = {
+            8.0    0.0    0.0
+            0.0    8.0    0.0
+            0.0    0.0    8.0
+        }
+        Origin [Angstrom] = { -4.0 -4.0 -4.0 }
+    }
+    NrOfPoints = { 64 64 64 }
+    RealComponent = Yes
+    Verbose = Yes
+}
+
+DetailedXML = "detailed.xml"
+EigenvecBin = "eigenvec.bin"
+
+GroundState = Yes
+
+Basis = {
+    Resolution = 0.04
+    H = {
+        AtomicNumber = 1
+        Orbital = {
+            AngularMomentum = 0
+            Occupation = 1.0
+            Cutoff = 6.0
+            Exponents = { 0.967 }
+            Coefficients = { 1.0 }
+        }
+    }
+}

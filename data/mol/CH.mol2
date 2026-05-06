@@ -1,0 +1,12 @@
+@<TRIPOS>MOLECULE
+*****
+ 2 1 0 0 0
+SMALL
+GASTEIGER
+
+@<TRIPOS>ATOM
+      1 C           0.0     0.0    0.0    C.2     1  UNL1        0.0
+      5 H           1.5     0.0    0.0    H       1  UNL1        0.0
+@<TRIPOS>BOND
+     1     1     2    2
+
