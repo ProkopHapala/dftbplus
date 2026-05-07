@@ -104,6 +104,7 @@ def main():
     parser = argparse.ArgumentParser(description='DFTB+ Parity Test')
     parser.add_argument('--debug', action='store_true', help='Print orbital coefficients')
     parser.add_argument('--print-eigenvec', action='store_true', help='Print eigenvectors from eigenvec.bin and exit')
+    parser.add_argument('--sk-set', type=str, default='3ob-3-1', help='Slater-Koster parameter set (3ob-3-1 or mio-1-1)')
     args = parser.parse_args()
 
     sk_path  = os.environ.get('DFTB_SK_PATH', os.path.expanduser('~/SIMULATIONS/dftbplus/slakos/library/'))
@@ -116,14 +117,15 @@ def main():
         return
 
     print("="*70)
-    print("DFTB+ Parity Test: Library vs Executable (H2O, 3ob-3-1)")
+    print(f"DFTB+ Parity Test: Library vs Executable (H2O, {args.sk_set})")
     print("="*70)
     print(f"  SK path:    {sk_path}")
+    print(f"  SK set:     {args.sk_set}")
     print(f"  Library:    {libpath or '(auto)'}")
     print(f"  Executable: {dftb_exe or '(not set)'}")
     print(f"  Debug mode: {args.debug}")
 
-    make_h2o_input(sk_path)
+    make_h2o_input(sk_path, args.sk_set)
 
     # ---- 0. Run executable FIRST (before library loads, avoid shared-lib conflicts) ----
     energy_exe = None

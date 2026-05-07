@@ -424,22 +424,22 @@ def parse_wfc_hsd(wfc_path):
             i += 1
             continue
 
-        # Extract species name
+        # Extract species name (until we hit '=', '{', or whitespace)
         species_start = i
-        while i < n and content[i] != '=' and not content[i].isspace():
+        while i < n and content[i] not in ('=', '{') and not content[i].isspace():
             i += 1
         species_name = content[species_start:i].strip()
-
-        # Skip to '='
-        while i < n and content[i] != '=':
-            i += 1
-        if i >= n:
-            break
-        i += 1
 
         # Skip whitespace
         while i < n and content[i].isspace():
             i += 1
+
+        # Skip optional '=' (some wfc files use 'Species = {', others use 'Species {')
+        if i < n and content[i] == '=':
+            i += 1
+            # Skip whitespace after '='
+            while i < n and content[i].isspace():
+                i += 1
 
         # Expect '{'
         if i >= n or content[i] != '{':
@@ -476,13 +476,8 @@ def parse_wfc_hsd(wfc_path):
             if orbital_match == -1:
                 break
 
-            # Find '=' after Orbital
-            eq_match = species_block.find('=', orbital_match)
-            if eq_match == -1:
-                break
-
-            # Find '{' after '='
-            brace_start = species_block.find('{', eq_match)
+            # Find '{' after Orbital (handle both 'Orbital = {' and 'Orbital {' formats)
+            brace_start = species_block.find('{', orbital_match)
             if brace_start == -1:
                 break
 
@@ -510,15 +505,15 @@ def parse_wfc_hsd(wfc_path):
             cutoff_match = re.search(r'Cutoff\s*=\s*([\d.]+)', orbital_block)
             cutoff = float(cutoff_match.group(1)) if cutoff_match else 5.0
 
-            # Extract exponents
-            exp_match = re.search(r'Exponents\s*=\s*\{([^}]+)\}', orbital_block, re.DOTALL)
+            # Extract exponents (handle both 'Exponents = {' and 'Exponents {' formats)
+            exp_match = re.search(r'Exponents\s*=?\s*\{([^}]+)\}', orbital_block, re.DOTALL)
             if exp_match:
                 exps = [float(x) for x in exp_match.group(1).split()]
             else:
                 exps = []
 
-            # Extract coefficients
-            coeff_match = re.search(r'Coefficients\s*=\s*\{([^}]+)\}', orbital_block, re.DOTALL)
+            # Extract coefficients (handle both 'Coefficients = {' and 'Coefficients {' formats)
+            coeff_match = re.search(r'Coefficients\s*=?\s*\{([^}]+)\}', orbital_block, re.DOTALL)
             if coeff_match:
                 coeff_lines = [line.strip() for line in coeff_match.group(1).split('\n') if line.strip()]
                 coeffs = []

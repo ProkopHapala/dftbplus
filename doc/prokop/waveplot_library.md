@@ -1297,6 +1297,27 @@ When testing on the laptop (prokophapala), we observed that the overlap matrix S
 - **WAVEPLOT will show different bonding/antibonding character for different SK parameter sets** - this is because the Hamiltonian and overlap matrices are genuinely different, not just different sign conventions
 - Cube file comparison showed negative correlation (-0.280) between 3ob-3-1 and mio-1-1 for the same H2O geometry
 
+**VERIFICATION: Direct S-matrix comparison (2026-05-07)**
+- Ran `tests/dftb/test_parity.py --sk-set 3ob-3-1` and `--sk-set mio-1-1` on identical H2O geometry
+- **Confirmed opposite signs in O-H overlap elements:**
+
+  **3ob-3-1 S-matrix:**
+  ```
+  S[0,4] = S[4,0] = -0.436977  (O s - H1 s)
+  S[0,5] = S[5,0] = -0.437561  (O s - H2 s)
+  ```
+
+  **mio-1-1 S-matrix:**
+  ```
+  S[0,4] = S[4,0] = +0.425088  (O s - H1 s)
+  S[0,5] = S[5,0] = +0.425668  (O s - H2 s)
+  ```
+
+- This is a **genuine difference in the Slater-Koster parameter files**, not just a sign convention
+- The sign difference propagates through diagonalization, causing eigenvectors to have opposite signs on H atoms
+- This explains why waveplot shows different bonding/antibonding character for different SK sets with the same geometry
+- **Test script:** `tests/dftb/test_parity.py --sk-set <3ob-3-1|mio-1-1>`
+
 **CRITICAL FRAGILITY: waveplot basis parameters**
 - waveplot_in.hsd contains hard-coded STO basis parameters (Exponents, Coefficients, Cutoff) for orbital projection
 - These parameters (e.g., H: 0.967, O: 2.779/2.247, C: 1.608/1.567) are NOT extracted from the Slater-Koster files used in the DFTB+ calculation
