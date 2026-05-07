@@ -178,14 +178,8 @@ def get_pyopencl_results(dftb_dir, points_ang):
     # Project each occupied orbital
     mo_values = []
     for imo in occupied_idx:
-        coeffs = evec_to_kernel_coeffs(evecs[imo], natoms, species_per_atom,
-                                       species_names, basis)
-        psi = projector.project_orbital_points(
-            points_ang.astype(np.float32),
-            coeffs,
-            np.array(norb_per_atom, dtype=np.int32),
-            atoms_dict
-        ).reshape(npoints, npoints)
+        coeffs = evec_to_kernel_coeffs(evecs[imo], natoms, species_per_atom, species_names, basis)
+        psi = projector.project_orbital_points(points_ang.astype(np.float32), coeffs, np.array(norb_per_atom, dtype=np.int32), atoms_dict).reshape(npoints, npoints)
         mo_values.append(psi)
     
     # Compute density using sum of orbitals
@@ -342,24 +336,31 @@ def create_density_comparison_figure(lib_data, ocl_data, output_path, dpi=150):
 def main():
     """Main function with CLI argument parsing."""
     parser = argparse.ArgumentParser(description='Parity check between libwaveplot and pyOpenCL')
-    parser.add_argument('--basis', choices=['mio-1-1', '3ob-3-1'], required=True,
-                        help='Basis set to use (mio-1-1 or 3ob-3-1)')
-    parser.add_argument('--step', type=float, default=0.1,
-                        help='Grid step in Angstrom (default: 0.1)')
-    parser.add_argument('--z-offset', type=float, default=0.0,
-                        help='Z offset in Angstrom for XY plane (default: 0.0)')
-    parser.add_argument('--dpi', type=int, default=150,
-                        help='DPI for output images (default: 150)')
+    parser.add_argument('--system', choices=['h2o-mio', 'h2o-3ob', 'ptcda-mio', 'ptcda-3ob'], required=True,
+                        help='System to use (h2o-mio, h2o-3ob, ptcda-mio, or ptcda-3ob)')
+    parser.add_argument('--step', type=float, default=0.1, help='Grid step in Angstrom (default: 0.1)')
+    parser.add_argument('--z-offset', type=float, default=0.0, help='Z offset in Angstrom for XY plane (default: 0.0)')
+    parser.add_argument('--dpi', type=int, default=150, help='DPI for output images (default: 150)')
+    parser.add_argument('--no-mo-plot', action='store_true',
+                        help='Skip MO comparison figure (useful for systems with many orbitals)')
     args = parser.parse_args()
     
-    # Set directory based on basis
-    if args.basis == 'mio-1-1':
+    # Set directory based on system
+    if args.system == 'h2o-mio':
         dftb_dir = 'dftb_h2o'
-    else:
+        basis_name = 'mio-1-1'
+    elif args.system == 'h2o-3ob':
         dftb_dir = 'dftb_h2o_3ob'
+        basis_name = '3ob-3-1'
+    elif args.system == 'ptcda-mio':
+        dftb_dir = 'dftb_ptcda'
+        basis_name = 'mio-1-1'
+    else:  # ptcda-3ob
+        dftb_dir = 'dftb_ptcda_3ob'
+        basis_name = '3ob-3-1'
     
     print("=" * 70)
-    print(f"PARITY CHECK: libwaveplot vs pyOpenCL ({args.basis})")
+    print(f"PARITY CHECK: libwaveplot vs pyOpenCL ({args.system})")
     print("=" * 70)
     
     # Parse detailed.xml to get geometry for extent calculation
@@ -407,26 +408,32 @@ def main():
     print(f"  Density max error: {density_max_err:.6e}")
     print(f"  Density correlation: {density_corr:.6f}")
     
-    # Create Figure 1: MO comparison
-    print("\n--- Creating Figure 1: MO comparison ---")
-    fig1_path = Path(f'density_parity_{args.basis}_z{args.z_offset:.1f}_fig1_mo.png')
-    create_mo_comparison_figure(lib_data, ocl_data, fig1_path, dpi=args.dpi)
+    # Create Figure 1: MO comparison (skip if --no-mo-plot or too many orbitals)
+    if not args.no_mo_plot and len(lib_data['occupied_idx']) <= 10:
+        print("\n--- Creating Figure 1: MO comparison ---")
+        fig1_path = Path(f'density_parity_{args.system}_z{args.z_offset:.1f}_fig1_mo.png')
+        create_mo_comparison_figure(lib_data, ocl_data, fig1_path, dpi=args.dpi)
+    else:
+        print(f"\n--- Skipping Figure 1 (MO comparison) - {len(lib_data['occupied_idx'])} orbitals, use --no-mo-plot to suppress this message ---")
+        fig1_path = None
     
     # Create Figure 2: Density comparison
     print("\n--- Creating Figure 2: Density comparison ---")
-    fig2_path = Path(f'density_parity_{args.basis}_z{args.z_offset:.1f}_fig2_density.png')
+    fig2_path = Path(f'density_parity_{args.system}_z{args.z_offset:.1f}_fig2_density.png')
     create_density_comparison_figure(lib_data, ocl_data, fig2_path, dpi=args.dpi)
     
     print("\n" + "=" * 70)
     print("SUMMARY")
     print("=" * 70)
-    print(f"Basis set: {args.basis}")
+    print(f"System: {args.system}")
     print(f"  Z offset: {args.z_offset} Å")
+    print(f"  Occupied orbitals: {len(lib_data['occupied_idx'])}")
     print(f"  MO max errors: {mo_errors}")
     print(f"  Density max error: {density_max_err:.6e}")
     print(f"  Density correlation: {density_corr:.6f}")
     print(f"\nOutput files:")
-    print(f"  Figure 1 (MO comparison): {fig1_path.absolute()}")
+    if fig1_path:
+        print(f"  Figure 1 (MO comparison): {fig1_path.absolute()}")
     print(f"  Figure 2 (Density comparison): {fig2_path.absolute()}")
     
     if density_max_err < 0.01:

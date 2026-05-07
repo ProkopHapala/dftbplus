@@ -27,9 +27,7 @@ import time
 REPO_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from pyBall.OCL.DFTBplusParser import (
-    parse_basis_hsd_ang, parse_detailed_xml_custom, evec_to_kernel_coeffs
-)
+from pyBall.OCL.DFTBplusParser import ( parse_basis_hsd_ang, parse_detailed_xml_custom, evec_to_kernel_coeffs)
 from pyBall.OCL.Grid import GridProjector, setup_gridprojector_from_dftb
 from pyBall.DFTBcore import DFTBcore
 from pyBall.WavePlot.TestUtils import print_eigenvecs
