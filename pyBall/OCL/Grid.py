@@ -1300,27 +1300,22 @@ class GridProjector(OpenCLBase):
             atom_data[ia]['i0orb'] = ia * numorb_max
 
         # Grid spec
-        d_grid = cl.Buffer(self.ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR,
-                            hostbuf=self.grid_to_np(grid_spec))
+        d_grid = cl.Buffer(self.ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, hostbuf=self.grid_to_np(grid_spec))
 
         # Tasks
         if len(tasks_np) > 0:
-            d_tasks = cl.Buffer(self.ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR,
-                                hostbuf=tasks_np)
+            d_tasks = cl.Buffer(self.ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR,  hostbuf=tasks_np)
         else:
             d_tasks = cl.Buffer(self.ctx, cl.mem_flags.READ_ONLY, size=32)
 
-        d_atoms = cl.Buffer(self.ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR,
-                            hostbuf=atom_data)
+        d_atoms = cl.Buffer(self.ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, hostbuf=atom_data)
 
         if len(task_atoms_np) > 0:
-            d_task_atoms = cl.Buffer(self.ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR,
-                                    hostbuf=task_atoms_np)
+            d_task_atoms = cl.Buffer(self.ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR,  hostbuf=task_atoms_np)
         else:
             d_task_atoms = cl.Buffer(self.ctx, cl.mem_flags.READ_ONLY, size=nMaxAtom * 4)
 
-        d_coeffs = cl.Buffer(self.ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR,
-                            hostbuf=coeffs_flat.astype(np.float32))
+        d_coeffs = cl.Buffer(self.ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, hostbuf=coeffs_flat.astype(np.float32))
 
         # Output grid
         nx, ny, nz = grid_spec['ngrid'][:3]
@@ -1360,12 +1355,6 @@ class GridProjector(OpenCLBase):
         self.queue.finish()
 
         return res
-
-
-
-
-
-
 
 # ================================================================
 # High-level evaluation functions
@@ -1429,10 +1418,8 @@ def setup_gridprojector_from_dftb(dftb_data, species_list_ang, ctx=None, queue=N
     sp_by_name = {sp['name']: sp for sp in species_list_ang}
     
     natoms = len(coords_ang)
-    atomic_numbers = np.array([sp_by_name[dftb_data['species_names'][si]]['atomic_number']
-                              for si in dftb_data['species_per_atom']])
-    cutoffs = np.array([sp_by_name[dftb_data['species_names'][si]]['orbitals'][0]['cutoff']
-                       for si in dftb_data['species_per_atom']])
+    atomic_numbers = np.array([sp_by_name[dftb_data['species_names'][si]]['atomic_number'] for si in dftb_data['species_per_atom']])
+    cutoffs = np.array([sp_by_name[dftb_data['species_names'][si]]['orbitals'][0]['cutoff'] for si in dftb_data['species_per_atom']])
     
     atoms_dict = {
         'pos': coords_ang,

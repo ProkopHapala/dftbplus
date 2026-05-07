@@ -25,6 +25,8 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent.parent / 'pyBall' / 'WavePlot'))
+from TestUtils import generate_2d_point_grid
 
 REPO_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(REPO_ROOT))
@@ -32,7 +34,7 @@ sys.path.insert(0, str(REPO_ROOT))
 from pyBall.WavePlot.WavePlot import WavePlot, setup_waveplot_from_dftb, evaluate_mos_on_points as wp_evaluate_mos_on_points
 from pyBall.OCL.DFTBplusParser import ( parse_basis_hsd_ang, parse_detailed_xml_custom, parse_eigenvec_bin_custom, read_cube, build_wp_basis,evec_to_kernel_coeffs)
 from pyBall.OCL.Grid import GridProjector, setup_gridprojector_from_dftb, evaluate_mos_on_points as ocl_evaluate_mos_on_points
-from pyBall.WavePlot.TestUtils import (compare_point_evaluations, print_comparison_results, generate_2d_point_grid, generate_1d_z_scan, print_eigenvecs)
+from pyBall.WavePlot.TestUtils import ( compare_point_evaluations, print_comparison_results, generate_1d_z_scan, print_eigenvecs)
 from pyBall.plotUtils import ( plot_comparison_2d,  plot_comparison_1d)
 
 LIB_PATH   = str(REPO_ROOT / '_build' / 'app' / 'waveplot' / 'libwaveplot.so')
@@ -52,10 +54,13 @@ def parse_args():
     p.add_argument('--nmo',       type=int, default=6, help='Number of MOs (Method 1, or default range if --mo-range not set)')
     p.add_argument('--mo-range',  type=int, nargs=2, default=None, metavar=('START','END'), help='1-based inclusive MO index range')
     p.add_argument('--points',    action='store_true', help='Method 2: evaluate at explicit points (libwaveplot + OpenCL)')
-    p.add_argument('--plane2d',   type=str, choices=['xy','xz','yz'], default=None, help='2D plane for --points; omit for 1D z-scan')
+    p.add_argument('--plane2d',   type=str, choices=['xy','xz','yz'], default=None, help='2D plane for --points; omit for 1D scan')
+    p.add_argument('--line-scan', type=str, choices=['z','bond'], default=None, help='1D line scan: z (along z-axis at origin) or bond (through two atoms)')
+    p.add_argument('--atoms',     type=int, nargs=2, default=None, metavar=('I','J'), help='Atom indices (0-based) for bond line scan')
     p.add_argument('--z-offset',  type=float, default=0.0,  help='Fixed coordinate value for out-of-plane axis (Å)')
     p.add_argument('--xy-range',  type=float, nargs=2, default=None, metavar=('MIN','MAX'), help='Coordinate range for 2D plane (Å); default: mol extent + 3 Å')
     p.add_argument('--z-range',   type=float, nargs=2, default=[-3.0, 3.0],  metavar=('ZMIN','ZMAX'), help='Range for 1D z-scan (Å)')
+    p.add_argument('--line-range', type=float, nargs=2, default=None, metavar=('RMIN','RMAX'), help='Range for bond line scan (Å); default: bond length + 3 Å each side')
     p.add_argument('--npoints',   type=int, default=64, help='Grid points per axis')
     p.add_argument('--print-eigenvec', action='store_true', help='Print eigenvectors from eigenvec.bin and exit')
     return p.parse_args()
@@ -162,7 +167,8 @@ def main():
     # ================================================================
     if args.points:
         print("\n" + "=" * 60)
-        print(f"Method 2: {'2D '+args.plane2d.upper() if args.plane2d else '1D z-scan'}")
+        scan_type = args.plane2d.upper() if args.plane2d else (args.line_scan.upper() if args.line_scan else 'z-scan')
+        print(f"Method 2: {scan_type}")
         print("=" * 60)
 
         atom_ang = atom_coords_b * BOHR2ANG
@@ -172,26 +178,41 @@ def main():
             rmin  = float(atom_ang.min()) - 3.0
             rmax_r = float(atom_ang.max()) + 3.0
 
-        # indexing='ij': uu[i,j] = u[i] (x-axis), vv[i,j] = u[j] (y-axis)
-        # reshape to (npoints,npoints) then imshow with no .T needed for [x,y] layout
-        u = np.linspace(rmin, rmax_r, args.npoints)
-        if args.plane2d == 'xy':
-            uu, vv = np.meshgrid(u, u, indexing='ij')
-            ww = np.full_like(uu, args.z_offset)
-            points_ang = np.column_stack([uu.ravel(), vv.ravel(), ww.ravel()])
-            ax_labels = ('x (Å)', 'y (Å)')
-            plane_desc = f"XY plane  z={args.z_offset:.3f} Å"
-        elif args.plane2d == 'xz':
-            uu, vv = np.meshgrid(u, u, indexing='ij')
-            points_ang = np.column_stack([uu.ravel(), np.full(uu.size, args.z_offset), vv.ravel()])
-            ax_labels = ('x (Å)', 'z (Å)')
-            plane_desc = f"XZ plane  y={args.z_offset:.3f} Å"
-        elif args.plane2d == 'yz':
-            uu, vv = np.meshgrid(u, u, indexing='ij')
-            points_ang = np.column_stack([np.full(uu.size, args.z_offset), uu.ravel(), vv.ravel()])
-            ax_labels = ('y (Å)', 'z (Å)')
-            plane_desc = f"YZ plane  x={args.z_offset:.3f} Å"
-        else:  # 1D z-scan
+        if args.plane2d:
+            points_ang, extent = generate_2d_point_grid(args.plane2d, args.npoints, args.z_offset, (rmin, rmax_r))
+            if args.plane2d == 'xy':
+                plane_desc = f"XY plane  z={args.z_offset:.3f} Å"
+            elif args.plane2d == 'xz':
+                plane_desc = f"XZ plane  y={args.z_offset:.3f} Å"
+            elif args.plane2d == 'yz':
+                plane_desc = f"YZ plane  x={args.z_offset:.3f} Å"
+        elif args.line_scan == 'bond':
+            # Line scan through two atoms
+            if args.atoms is None:
+                # Default: use first two atoms
+                i_atom, j_atom = 0, 1
+            else:
+                i_atom, j_atom = args.atoms
+            print(f"  Bond line scan: atom {i_atom} -> atom {j_atom}")
+            pos_i = atom_ang[i_atom]
+            pos_j = atom_ang[j_atom]
+            bond_vec = pos_j - pos_i
+            bond_len = np.linalg.norm(bond_vec)
+            bond_dir = bond_vec / bond_len
+            print(f"  Bond length: {bond_len:.3f} Å")
+            print(f"  Bond direction: ({bond_dir[0]:.3f}, {bond_dir[1]:.3f}, {bond_dir[2]:.3f})")
+            
+            if args.line_range:
+                rmin, rmax_r = args.line_range
+            else:
+                rmin = -3.0
+                rmax_r = bond_len + 3.0
+            
+            t_vals = np.linspace(rmin, rmax_r, args.npoints)  # distance along bond from atom i
+            points_ang = np.array([pos_i + t * bond_dir for t in t_vals])
+            ax_labels = ('distance along bond (Å)', 'ψ')
+            plane_desc = f"Bond line scan  atom{i_atom}→atom{j_atom}  bond_len={bond_len:.3f}Å"
+        else:  # 1D z-scan (default)
             z_vals = np.linspace(args.z_range[0], args.z_range[1], args.npoints)
             points_ang = np.column_stack([np.zeros(args.npoints), np.zeros(args.npoints), z_vals])
             ax_labels = ('z (Å)', 'ψ')
@@ -231,16 +252,21 @@ def main():
             wp_vals_2d = np.array([v.reshape(s2) for v in wp_vals])
             ocl_vals_2d = np.array([v.reshape(s2) for v in ocl_vals])
             diff_vals_2d = np.array([v.reshape(s2) for v in diff_vals])
-            extent = [rmin, rmax_r, rmin, rmax_r]
             suffix = f"{system_name}_{method_tag}_{args.plane2d}_z{args.z_offset:.2f}A_n{args.npoints}_MO{mo_start}-{mo_end}"
             out_file = OUTPUT_DIR / f'comparison_points_{suffix}.png'
-            plot_comparison_2d(wp_vals_2d, ocl_vals_2d, diff_vals_2d, extent, system_name, plane_desc, method_tag, mo_indices, energies, homo, out_file, args.dpi)
+            # Convert atom coordinates to Angstrom for overlay
+            atom_coords_ang = atom_coords_b * BOHR2ANG
+            plot_comparison_2d(wp_vals_2d, ocl_vals_2d, diff_vals_2d, extent, system_name, plane_desc, method_tag, mo_indices, energies, homo, out_file, args.dpi, atom_coords_ang)
         else:
             wp_vals_1d = wp_vals
             ocl_vals_1d = ocl_vals
-            suffix = f"{system_name}_{method_tag}_1d_n{args.npoints}_MO{mo_start}-{mo_end}"
+            if args.line_scan == 'bond':
+                x_vals = t_vals
+            else:
+                x_vals = z_vals
+            suffix = f"{system_name}_{method_tag}_{args.line_scan if args.line_scan else 'zscan'}_n{args.npoints}_MO{mo_start}-{mo_end}"
             out_file = OUTPUT_DIR / f'comparison_points_{suffix}.png'
-            plot_comparison_1d(z_vals, wp_vals_1d, ocl_vals_1d,system_name, plane_desc, method_tag, mo_indices, energies, homo, out_file, args.dpi)
+            plot_comparison_1d(x_vals, wp_vals_1d, ocl_vals_1d, system_name, plane_desc, method_tag, mo_indices, energies, homo, out_file, args.dpi)
         print(f"\nSaved: {out_file}")
         if not args.no_show: plt.show()
         return

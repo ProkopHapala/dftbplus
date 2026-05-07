@@ -327,14 +327,33 @@ class DFTBcore:
         self._lib.dftbcore_get_energy(ctypes.byref(energy))
         return energy.value
 
-    def get_eigvecs_dense(self):
-        """Get eigenvectors and eigenvalues. Returns (eigvecs[n,n], eigvals[n]) in C row-major order."""
+    def get_eigvecs_dense(self, apply_inverse_lowdin=False):
+        """
+        Get eigenvectors and eigenvalues.
+        
+        Args:
+            apply_inverse_lowdin: If True, apply S^(-1/2) transform to get atomic basis coefficients
+        
+        Returns:
+            (eigvecs[n,n], eigvals[n]) in C row-major order
+        """
         n = self.get_basis_size()
         buf_vecs = np.zeros(n*n, dtype=np.float64)
         buf_vals = np.zeros(n, dtype=np.float64)
         self._lib.dftbcore_get_eigvecs_dense(buf_vecs.ctypes.data_as(c_double_p), buf_vals.ctypes.data_as(c_double_p), c_int(n))
         # Fortran stores column-major: reshape as (n,n) Fortran order then convert to C order
-        return np.asfortranarray(buf_vecs.reshape(n, n, order='F')).T.copy(), buf_vals
+        C = np.asfortranarray(buf_vecs.reshape(n, n, order='F')).T.copy()
+        
+        if apply_inverse_lowdin:
+            S = self.get_s_dense()
+            # Compute S^(-1/2) via eigendecomposition: S = X * s * X^T
+            eigvals_S, eigvecs_S = np.linalg.eigh(S)
+            s_inv_sqrt = 1.0 / np.sqrt(np.maximum(eigvals_S, 1e-12))
+            S_inv_sqrt = eigvecs_S @ np.diag(s_inv_sqrt) @ eigvecs_S.T
+            # Apply transform: C_atomic = S^(-1/2) * C_lowdin
+            C = S_inv_sqrt @ C
+        
+        return C, buf_vals
 
     def _get_matrix(self, func_name):
         """Helper: call a Fortran matrix getter (flat Fortran-order buffer, n by value) -> C-order numpy array."""

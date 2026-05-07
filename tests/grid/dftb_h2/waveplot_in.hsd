@@ -22,14 +22,5 @@ GroundState = Yes
 
 Basis = {
     Resolution = 0.04
-    H = {
-        AtomicNumber = 1
-        Orbital = {
-            AngularMomentum = 0
-            Occupation = 1.0
-            Cutoff = 6.0
-            Exponents = { 0.967 }
-            Coefficients = { 1.0 }
-        }
-    }
+    <<+ "wfc.mio-1-1.hsd"
 }

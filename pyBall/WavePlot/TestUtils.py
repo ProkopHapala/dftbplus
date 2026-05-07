@@ -113,12 +113,10 @@ def generate_2d_point_grid(plane='xy', npoints=64, z_offset=0.0, xy_range=None):
         extent: [xmin, xmax, ymin, ymax] for plotting
     """
     if xy_range is None:
-        xy_range = (-3.0, 3.0)
-    
+        xy_range = (-3.0, 8.0)
     x = np.linspace(xy_range[0], xy_range[1], npoints)
     y = np.linspace(xy_range[0], xy_range[1], npoints)
-    X, Y = np.meshgrid(x, y)
-    
+    X, Y = np.meshgrid(y, x)    
     if plane == 'xy':
         points = np.column_stack([X.ravel(), Y.ravel(), np.full(X.size, z_offset)])
         extent = [xy_range[0], xy_range[1], xy_range[0], xy_range[1]]
@@ -130,7 +128,6 @@ def generate_2d_point_grid(plane='xy', npoints=64, z_offset=0.0, xy_range=None):
         extent = [xy_range[0], xy_range[1], xy_range[0], xy_range[1]]
     else:
         raise ValueError(f"Unknown plane: {plane}")
-    
     return points, extent
 
 

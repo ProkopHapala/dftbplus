@@ -163,7 +163,8 @@ def main():
     H_lib   = dftb.get_h_dense()
     S_lib   = dftb.get_s_dense()
     DM_lib  = dftb.get_dm_dense()
-    C_lib, eigvals_lib = dftb.get_eigvecs_dense()
+    C_lib_lowdin, eigvals_lib = dftb.get_eigvecs_dense(apply_inverse_lowdin=False)
+    C_lib_atomic, eigvals_lib_atomic = dftb.get_eigvecs_dense(apply_inverse_lowdin=True)
     
     # Print orbital coefficients if debug mode is enabled
     if args.debug:
@@ -173,7 +174,10 @@ def main():
             ('H (atom 1)', ['s']),
             ('H (atom 2)', ['s'])
         ]
-        dftb.print_orbital_coeffs(C_lib, eigvals_lib, atom_orbital_map=atom_orbital_map, max_orbitals=6)
+        print("\n  Lowdin basis eigenvectors (from diagonalization):")
+        dftb.print_orbital_coeffs(C_lib_lowdin, eigvals_lib, atom_orbital_map=atom_orbital_map, max_orbitals=6)
+        print("\n  Atomic basis eigenvectors (after S^(-1/2) transform):")
+        dftb.print_orbital_coeffs(C_lib_atomic, eigvals_lib_atomic, atom_orbital_map=atom_orbital_map, max_orbitals=6)
     
     dftb.finalize()
 
@@ -190,12 +194,51 @@ def main():
     print_mat("H_lib", H_lib)
     print_mat("S_lib", S_lib)
     print_mat("DM_lib", DM_lib)
-    print_mat("C_lib (eigvecs)", C_lib)
+    print_mat("C_lib_lowdin (Lowdin basis)", C_lib_lowdin)
+    print_mat("C_lib_atomic (atomic basis)", C_lib_atomic)
     print(f"\n  Eigenvalues (library):")
     for i,e in enumerate(eigvals_lib):
         print(f"    MO {i+1:2d}: {e:12.6f} Ha = {e*27.2114:12.6f} eV")
 
-    # ---- 2. Show executable results (already computed in step 0) -------------
+    # ---- 2. Compare with eigenvec.bin (if available) -------------
+    print("\n" + "="*70)
+    print("STEP 2: Compare with eigenvec.bin")
+    print("="*70)
+    
+    if os.path.exists('eigenvec.bin'):
+        # Parse eigenvec.bin using the utility function
+        from pyBall.OCL.DFTBplusParser import parse_eigenvec_bin_custom, parse_detailed_xml_custom
+        geo = parse_detailed_xml_custom('detailed.xml')
+        nstates_xml = geo['nstates']
+        norb_xml = geo['norb']
+        evecs_exe = parse_eigenvec_bin_custom('eigenvec.bin', nstates_xml, norb_xml)
+        
+        print(f"  eigenvec.bin shape: {evecs_exe.shape}")
+        print(f"  C_lib_atomic shape:  {C_lib_atomic.shape}")
+        
+        # Compare atomic basis eigenvectors with eigenvec.bin
+        if evecs_exe.shape == C_lib_atomic.shape:
+            diff = np.max(np.abs(evecs_exe - C_lib_atomic))
+            print(f"\n  Comparing atomic basis eigenvectors with eigenvec.bin:")
+            print(f"    max|C_lib - C_exe| = {diff:.3e}")
+            
+            # Print first few MO coefficients for comparison
+            n_show = min(3, nstates_xml)
+            print(f"\n  First {n_show} MO coefficients comparison:")
+            for i in range(n_show):
+                print(f"    MO {i+1}:")
+                print(f"      eigenvec.bin:  {evecs_exe[i,:3]}")
+                print(f"      C_lib_atomic:  {C_lib_atomic[i,:3]}")
+                print(f"      diff:           {np.abs(evecs_exe[i,:3] - C_lib_atomic[i,:3])}")
+            
+            status = "PASS" if diff < 1e-4 else "FAIL"
+            print(f"\n  [{status}] Atomic basis eigenvectors match eigenvec.bin: max diff = {diff:.3e}")
+        else:
+            print(f"  Shape mismatch: eigenvec.bin {evecs_exe.shape} vs C_lib_atomic {C_lib_atomic.shape}")
+    else:
+        print("  eigenvec.bin not found (run dftb+ executable with WriteEigenvectors=Yes)")
+    
+    # ---- 3. Show executable results (already computed in step 0) -------------
     print("\n" + "="*70)
     print("STEP 2: Executable reference results")
     print("="*70)

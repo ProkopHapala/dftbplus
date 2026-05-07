@@ -316,6 +316,302 @@ class DFTBplusParser:
 BOHR2ANG = 0.5291772109  # Bohr -> Angstrom
 
 
+def parse_skf_xml(skf_path):
+    """
+    Parse SK file XML documentation to extract multi-zeta basis parameters.
+
+    SK files contain embedded XML documentation with the actual basis parameters
+    used in DFTB+ calculations (multi-zeta STO basis sets).
+
+    Args:
+        skf_path: Path to SK file (e.g., H-O.skf)
+
+    Returns:
+        dict with basis parameters for each atom:
+        {
+            'atom1': {
+                'shells': list of shell types (e.g., ['1s']),
+                'exponents': list of exponents (multi-zeta),
+                'power': power parameter,
+                'wavefunction': wavefunction parameter
+            },
+            'atom2': { ... }
+        }
+    """
+    import xml.etree.ElementTree as ET
+    import re
+
+    with open(skf_path, 'r') as f:
+        content = f.read()
+
+    # Find XML documentation block
+    match = re.search(r'<Documentation>(.*?)</Documentation>', content, re.DOTALL)
+    if not match:
+        raise ValueError("No XML documentation found in SK file")
+
+    xml_content = match.group(1)
+    root = ET.fromstring("<Documentation>" + xml_content + "</Documentation>")
+
+    basis_info = {}
+
+    # Extract basis information for each atom
+    for basis in root.findall('.//Basis'):
+        atom_num = basis.get('atom')
+        shells = basis.find('Shells').text.strip().split()
+        exponents = [float(x) for x in basis.find('Exponents').text.split()]
+        power = int(basis.find('Power').text)
+        wavefunction = [float(x) for x in basis.find('Wavefunction').text.split()]
+
+        basis_info[f'atom{atom_num}'] = {
+            'shells': shells,
+            'exponents': exponents,
+            'power': power,
+            'wavefunction': wavefunction
+        }
+
+    return basis_info
+
+
+def parse_wfc_hsd(wfc_path):
+    """
+    Parse wfc.*.hsd file to extract multi-zeta STO basis parameters.
+
+    The wfc.*.hsd files are in atomic units (Bohr). This function keeps
+    them in Bohr units for STO evaluation, and the evaluate_sto_1d function
+    should be called with r in Bohr.
+
+    Args:
+        wfc_path: Path to wfc.*.hsd file
+
+    Returns:
+        dict with structure:
+        {
+            'H': {
+                'AtomicNumber': 1,
+                'orbitals': [
+                    {
+                        'AngularMomentum': 0,
+                        'Occupation': 1.0,
+                        'Cutoff': 5.0,  # in Bohr
+                        'Exponents': [0.5, 1.0, 2.0],  # in Bohr^-1
+                        'Coefficients': [[...], [...], [...]]  # nPow x nAlpha
+                    }
+                ]
+            },
+            ...
+        }
+    """
+    import re
+
+    with open(wfc_path, 'r') as f:
+        content = f.read()
+
+    # Parse using brace counting to handle nested structures
+    basis_data = {}
+    i = 0
+    n = len(content)
+
+    while i < n:
+        # Skip whitespace
+        while i < n and content[i].isspace():
+            i += 1
+
+        if i >= n:
+            break
+
+        # Find species name (before '=')
+        if content[i] == '}':
+            i += 1
+            continue
+
+        # Extract species name
+        species_start = i
+        while i < n and content[i] != '=' and not content[i].isspace():
+            i += 1
+        species_name = content[species_start:i].strip()
+
+        # Skip to '='
+        while i < n and content[i] != '=':
+            i += 1
+        if i >= n:
+            break
+        i += 1
+
+        # Skip whitespace
+        while i < n and content[i].isspace():
+            i += 1
+
+        # Expect '{'
+        if i >= n or content[i] != '{':
+            print(f"Warning: Expected '{{' after species {species_name}")
+            continue
+        i += 1
+
+        # Extract species block (count braces)
+        brace_count = 1
+        block_start = i
+        while i < n and brace_count > 0:
+            if content[i] == '{':
+                brace_count += 1
+            elif content[i] == '}':
+                brace_count -= 1
+            i += 1
+
+        species_block = content[block_start:i-1]
+
+        # Parse species block
+        atomic_num = None
+        orbitals = []
+
+        # Extract atomic number
+        atomic_match = re.search(r'AtomicNumber\s*=\s*(\d+)', species_block)
+        if atomic_match:
+            atomic_num = int(atomic_match.group(1))
+
+        # Extract orbital blocks using brace counting
+        orbital_idx = 0
+        while orbital_idx < len(species_block):
+            # Find next Orbital
+            orbital_match = species_block.find('Orbital', orbital_idx)
+            if orbital_match == -1:
+                break
+
+            # Find '=' after Orbital
+            eq_match = species_block.find('=', orbital_match)
+            if eq_match == -1:
+                break
+
+            # Find '{' after '='
+            brace_start = species_block.find('{', eq_match)
+            if brace_start == -1:
+                break
+
+            # Extract orbital block
+            brace_count = 1
+            block_start = brace_start + 1
+            j = block_start
+            while j < len(species_block) and brace_count > 0:
+                if species_block[j] == '{':
+                    brace_count += 1
+                elif species_block[j] == '}':
+                    brace_count -= 1
+                j += 1
+
+            orbital_block = species_block[block_start:j-1]
+            orbital_idx = j
+
+            # Parse orbital block
+            l_match = re.search(r'AngularMomentum\s*=\s*(\d+)', orbital_block)
+            l = int(l_match.group(1)) if l_match else 0
+
+            occ_match = re.search(r'Occupation\s*=\s*([\d.]+)', orbital_block)
+            occ = float(occ_match.group(1)) if occ_match else 0.0
+
+            cutoff_match = re.search(r'Cutoff\s*=\s*([\d.]+)', orbital_block)
+            cutoff = float(cutoff_match.group(1)) if cutoff_match else 5.0
+
+            # Extract exponents
+            exp_match = re.search(r'Exponents\s*=\s*\{([^}]+)\}', orbital_block, re.DOTALL)
+            if exp_match:
+                exps = [float(x) for x in exp_match.group(1).split()]
+            else:
+                exps = []
+
+            # Extract coefficients
+            coeff_match = re.search(r'Coefficients\s*=\s*\{([^}]+)\}', orbital_block, re.DOTALL)
+            if coeff_match:
+                coeff_lines = [line.strip() for line in coeff_match.group(1).split('\n') if line.strip()]
+                coeffs = []
+                for line in coeff_lines:
+                    coeffs.extend([float(x) for x in line.split()])
+                # Fortran reads: reshape(coeffs, [nPow, nAlpha]) with column-major order
+                # i.e. fills aa(1,1),aa(2,1),...,aa(nPow,1),aa(1,2),... 
+                n_alpha = len(exps)
+                n_pow = len(coeffs) // n_alpha
+                coeffs = np.array(coeffs).reshape(n_pow, n_alpha, order='F')  # (nPow, nAlpha)
+            else:
+                coeffs = np.array([[1.0]])
+
+            orbitals.append({
+                'AngularMomentum': l,
+                'Occupation': occ,
+                'Cutoff': cutoff,
+                'Exponents': exps,
+                'Coefficients': coeffs
+            })
+
+        basis_data[species_name] = {
+            'AtomicNumber': atomic_num,
+            'orbitals': orbitals
+        }
+
+    return basis_data
+
+
+def evaluate_sto_1d(r, l, exps, coeffs):
+    """
+    Evaluate multi-zeta STO function at distance r using numpy vectorization.
+
+    STO(r) = sum_{i=1}^{nAlpha} exp(-exps[i] * r) * sum_{j=1}^{nPow} coeffs[j,i] * r^{l + j - 1}
+
+    This matches the waveplot implementation in slater.F90.
+    All units are in Bohr (atomic units).
+
+    Args:
+        r: distance array in Bohr (can be scalar or array)
+        l: angular momentum
+        exps: array of exponents in Bohr^-1 (nAlpha,)
+        coeffs: coefficient matrix (nPow, nAlpha)
+
+    Returns:
+        STO values at r (same shape as r)
+    """
+    r = np.asarray(r, dtype=float)
+    n_alpha = len(exps)
+    n_pow = coeffs.shape[0]  # coeffs shape: (nPow, nAlpha)
+
+    # Build r^l, r^(l+1), ..., r^(l+nPow-1) = pows array
+    # Matching Fortran: pows(1)=r^ll, pows(ii+1)=pows(ii)*rr
+    # For l=0 at r=0: rTmp=1 (Fortran avoids 0^0)
+    r0 = np.where((l == 0) & (r < 1e-12), 1.0, r ** l)
+    r_powers = r0[:, None] * r[:, None] ** np.arange(n_pow)[None, :]  # (N, nPow)
+    # Fix: first column should be r^l, not r^(l+1)
+    # Actually: pows[0]=r^l, pows[1]=r^l*r=r^(l+1), etc.
+    # r0 = r^l already, so: r_powers[:,j] = r0 * r^j = r^(l+j)
+    # But that gives r^l * r^0=r^l for j=0: correct!
+
+    # Compute exponentials: exp(-exps[i] * r)
+    exp_terms = np.exp(-np.outer(r, exps))  # (N, nAlpha)
+
+    # sum_j coeffs[j,i] * r_powers[:,j] for each i -> (N, nAlpha)
+    radial_sum = r_powers @ coeffs   # (N, nPow) @ (nPow, nAlpha) = (N, nAlpha)
+
+    # sum over i: sto[n] = sum_i exp_terms[n,i] * radial_sum[n,i]
+    sto = (exp_terms * radial_sum).sum(axis=1)  # (N,)
+
+    return sto
+
+
+def evaluate_sto_2d(x_grid, y_grid, l, exps, coeffs, origin=(0, 0)):
+    """
+    Evaluate multi-zeta STO function on 2D grid (s-orbital radial part).
+
+    For s-orbitals (l=0), this is just the radial function evaluated at distance from origin.
+
+    Args:
+        x_grid, y_grid: 2D meshgrid arrays
+        l: angular momentum
+        exps: array of exponents (nAlpha,)
+        coeffs: coefficient matrix (nPow, nAlpha)
+        origin: (x0, y0) center of the orbital
+
+    Returns:
+        STO values on 2D grid
+    """
+    r = np.sqrt((x_grid - origin[0])**2 + (y_grid - origin[1])**2)
+    return evaluate_sto_1d(r, l, exps, coeffs)
+
+
 def parse_basis_hsd_ang(hsd_path):
     """
     Parse waveplot_in.hsd Basis block and return species_list ready for load_basis_sto().
@@ -327,12 +623,57 @@ def parse_basis_hsd_ang(hsd_path):
       res_Ang    = res_Bohr    * BOHR2ANG
       coeff_Ang  = coeff_Bohr  / BOHR2ANG^l   (r^l carries units)
 
+    Handles <<+ "filename.hsd" include directive to use official wfc files.
+
     Returns list of species dicts compatible with GridProjector.load_basis_sto().
     """
     import re
     B = BOHR2ANG
     with open(hsd_path, 'r') as f:
         content = f.read()
+
+    # Check for <<+ include directive (use official wfc file)
+    include_match = re.search(r'<<\+\s*"([^"]+)"', content)
+    if include_match:
+        wfc_path = Path(hsd_path).parent / include_match.group(1)
+        if wfc_path.exists():
+            print(f"[parse_basis_hsd_ang] Using included wfc file: {wfc_path}")
+            basis_data = parse_wfc_hsd(str(wfc_path))
+            # Convert from Bohr to Angstrom for OCL kernels
+            species_list = []
+            for sp_name, sp_data in basis_data.items():
+                orbitals = []
+                for orb in sp_data['orbitals']:
+                    l = orb['AngularMomentum']
+                    exps_b = np.asarray(orb['Exponents'], dtype=np.float64)  # in Bohr^-1
+                    coeffs_b = np.asarray(orb['Coefficients'], dtype=np.float64)  # (nPow, nAlpha) in Bohr
+                    cutoff_b = orb['Cutoff']  # in Bohr
+                    nPow = coeffs_b.shape[0]
+                    # Each power term j contributes r^(l+j), so scale by B^(l+j)
+                    scale_factors = np.array([B ** (l + j) for j in range(nPow)])
+                    coeffs_scaled = coeffs_b / scale_factors[:, None]  # (nPow, 1) broadcasting
+                    orbitals.append({
+                        'l': l,
+                        'cutoff': cutoff_b * B,
+                        'exponents': exps_b / B,
+                        'coefficients': coeffs_scaled,
+                    })
+                species_list.append({
+                    'name': sp_name,
+                    'atomic_number': sp_data['AtomicNumber'],
+                    'orbitals': orbitals,
+                    'resolution': 0.04 * B,  # Default resolution, convert to Angstrom
+                })
+            # Parse top-level Resolution from original HSD
+            res_match = re.search(r'Basis\s*\{[^}]*Resolution\s*=\s*(\S+)', content, re.DOTALL)
+            res_bohr = float(res_match.group(1)) if res_match else 0.04
+            for sp in species_list:
+                sp['resolution'] = res_bohr * B
+            return species_list
+        else:
+            print(f"[WARNING] wfc file not found: {wfc_path}, falling back to inline HSD parsing")
+    else:
+        print(f"[parse_basis_hsd_ang] No <<+ include directive found, using inline HSD parsing")
 
     # Parse top-level Resolution
     res_match = re.search(r'Basis\s*\{[^}]*Resolution\s*=\s*(\S+)', content, re.DOTALL)
@@ -405,12 +746,15 @@ def parse_basis_hsd_ang(hsd_path):
             else:
                 coef_b = np.ones((1, len(exps_b)))
 
-            # Convert Bohr -> Angstrom
+            # Convert Bohr -> Angstrom with proper power term scaling
+            nPow = coef_b.shape[0]
+            scale_factors = np.array([B ** (l + j) for j in range(nPow)])
+            coef_scaled = coef_b / scale_factors[:, None]
             orbitals.append({
                 'l':            l,
                 'cutoff':       cutoff_b * B,
                 'exponents':    exps_b   / B,
-                'coefficients': coef_b   / (B ** l),   # r^l unit correction
+                'coefficients': coef_scaled,
             })
 
         species_list.append({
@@ -697,7 +1041,11 @@ def build_wp_basis(species_list_ang, species_names_ordered):
         for orb in sp['orbitals']:
             l = orb['l']
             alpha_b = list(np.array(orb['exponents']) * B)       # Å^-1 -> Bohr^-1
-            coef_b  = np.array(orb['coefficients']) * (B ** l)   # Å-normalised -> Bohr
+            coeffs = np.array(orb['coefficients'])
+            nPow = coeffs.shape[0]
+            # Reverse the power term scaling: multiply by B^(l+j) for each row
+            scale_factors = np.array([B ** (l + j) for j in range(nPow)])
+            coef_b = coeffs * scale_factors[:, None]
             aa = coef_b.tolist() if hasattr(coef_b, 'tolist') else list(coef_b)
             stos.append({'alpha': alpha_b, 'aa': aa})
         basis.append({'angMoms': angMoms, 'cutoffs': cutoffs_b,
@@ -739,3 +1087,120 @@ def evec_to_kernel_coeffs(evec_row, natoms, species_per_atom, species_names, spe
                 c[ia, 0] = chunk[2]  # px -> slot 0
             offset += nm
     return c
+
+
+def mask_sto_coefficients(species_list_ang, species_name, orbital_idx, active_pow, active_alpha):
+    """
+    Debug utility: Mask all coefficients to zero except one specific (nPow, nAlpha) term.
+    
+    For testing individual STO components against SLATER.F90 reference.
+    Creates a deep copy of species_list_ang with masked coefficients.
+    
+    Args:
+        species_list_ang: Original species list from parse_basis_hsd_ang
+        species_name: Species to mask (e.g., 'H', 'O')
+        orbital_idx: Which orbital to mask (0 for first s-orbital, etc.)
+        active_pow: Which power term to keep non-zero (0, 1, 2, ...)
+        active_alpha: Which exponent to keep non-zero (0, 1, 2, ...)
+    
+    Returns:
+        masked_species_list: Deep copy with masked coefficients
+        original_coeff: The original coefficient value at (active_pow, active_alpha)
+    """
+    import copy
+    
+    masked_list = copy.deepcopy(species_list_ang)
+    original_coeff = None
+    
+    for sp in masked_list:
+        if sp['name'] == species_name:
+            if orbital_idx < len(sp['orbitals']):
+                orb = sp['orbitals'][orbital_idx]
+                coeffs = orb['coefficients'].copy()
+                
+                # Store original value before masking
+                if active_pow < coeffs.shape[0] and active_alpha < coeffs.shape[1]:
+                    original_coeff = coeffs[active_pow, active_alpha]
+                
+                # Mask all to zero
+                coeffs[:, :] = 0.0
+                
+                # Set only active term to 1.0 (unity for testing)
+                if active_pow < coeffs.shape[0] and active_alpha < coeffs.shape[1]:
+                    coeffs[active_pow, active_alpha] = 1.0
+                
+                orb['coefficients'] = coeffs
+                print(f"[mask_sto_coefficients] {species_name} orbital {orbital_idx}: "
+                      f"masked all coeffs to 0, set ({active_pow},{active_alpha})=1.0 "
+                      f"(was {original_coeff:.6f})")
+    
+    return masked_list, original_coeff
+
+
+def test_single_sto_component(species_list_ang, species_name, orbital_idx, pow_idx, alpha_idx, 
+                               r_max_ang=5.0, n_points=100):
+    """
+    Evaluate a single STO component (one term: r^(l+pow) * exp(-alpha*r)) 
+    and compare with analytical formula.
+    
+    For debugging: each coefficient corresponds to one term in the STO expansion.
+    This isolates individual terms for perfect parity testing.
+    
+    Args:
+        species_list_ang: Species list (will be masked)
+        species_name: Species to test
+        orbital_idx: Which orbital (0 for s, etc.)
+        pow_idx: Power index (j in r^(l+j))
+        alpha_idx: Exponent index
+        r_max_ang: Max radius in Angstrom
+        n_points: Number of radial points
+    
+    Returns:
+        r_ang, values: Radial grid and evaluated STO values
+    """
+    from .DFTBplusParser import evaluate_sto_1d
+    
+    # Mask to only test this component
+    masked_list, orig_coeff = mask_sto_coefficients(
+        species_list_ang, species_name, orbital_idx, pow_idx, alpha_idx
+    )
+    
+    # Get the orbital parameters
+    sp = None
+    for s in masked_list:
+        if s['name'] == species_name:
+            sp = s
+            break
+    
+    if sp is None:
+        raise ValueError(f"Species {species_name} not found")
+    
+    orb = sp['orbitals'][orbital_idx]
+    l = orb['l']
+    exps = orb['exponents']
+    coeffs = orb['coefficients']
+    
+    # Create radial grid
+    r_ang = np.linspace(0, r_max_ang, n_points)
+    r_bohr = r_ang / 0.5291772109
+    
+    # Evaluate (masked coefficients will give single term)
+    values = evaluate_sto_1d(r_bohr, l, exps, coeffs)
+    
+    # Expected analytical form for this single component:
+    # R(r) = r^(l + pow_idx) * exp(-exps[alpha_idx] * r)
+    # (coefficient is 1.0 due to masking)
+    alpha_bohr = exps[alpha_idx] * 0.5291772109  # convert back to Bohr^-1
+    expected = r_bohr**(l + pow_idx) * np.exp(-alpha_bohr * r_bohr)
+    
+    # Handle r=0 case
+    if l == 0 and pow_idx == 0:
+        expected[0] = 1.0  # r^0 = 1 at r=0
+    
+    print(f"[test_single_sto_component] {species_name} l={l} pow={pow_idx} alpha_idx={alpha_idx}")
+    print(f"  alpha = {alpha_bohr:.4f} Bohr^-1")
+    print(f"  max|evaluated| = {np.abs(values).max():.6f}")
+    print(f"  max|expected| = {np.abs(expected).max():.6f}")
+    print(f"  RMS diff = {np.sqrt(np.mean((values - expected)**2)):.2e}")
+    
+    return r_ang, values, expected

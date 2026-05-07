@@ -227,11 +227,24 @@ __kernel void project_density_sparse(
                     // rho_ij[3]  * drj.w   ) );  
                     
 
-                    den += dot( dri.wxyz,  (
-                    rho_ij[0]  * drj.w +     // <-- GLOBAL READ
-                    rho_ij[1]  * drj.x + 
-                    rho_ij[2]  * drj.y + 
-                    rho_ij[3]  * drj.z   ) );  
+                    // Correct formula: Σ_αβ ρ_ij[α,β] φ_i[α] φ_j[β]
+                    // Compute full 4x4 matrix multiplication
+                    float4 rho_i0 = rho_ij[0];  // [ρ_sx, ρ_sy, ρ_sz, ρ_ss] or similar
+                    float4 rho_i1 = rho_ij[1];
+                    float4 rho_i2 = rho_ij[2];
+                    float4 rho_i3 = rho_ij[3];
+                    
+                    // den = dri · (ρ_ij · drj)
+                    // where ρ_ij is 4x4 block, dri and drj are 4-vectors
+                    // den = Σ_α (Σ_β ρ_ij[α,β] * drj[β]) * dri[α]
+                    
+                    float4 rho_dot_drj;
+                    rho_dot_drj.x = rho_i0.x * drj.x + rho_i0.y * drj.y + rho_i0.z * drj.z + rho_i0.w * drj.w;
+                    rho_dot_drj.y = rho_i1.x * drj.x + rho_i1.y * drj.y + rho_i1.z * drj.z + rho_i1.w * drj.w;
+                    rho_dot_drj.z = rho_i2.x * drj.x + rho_i2.y * drj.y + rho_i2.z * drj.z + rho_i2.w * drj.w;
+                    rho_dot_drj.w = rho_i3.x * drj.x + rho_i3.y * drj.y + rho_i3.z * drj.z + rho_i3.w * drj.w;
+                    
+                    den += dot(dri.wxyz, rho_dot_drj);  
                 }
             }
         }

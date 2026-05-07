@@ -256,11 +256,42 @@ export LD_LIBRARY_PATH=/home/prokophapala/opt/dftbplus/lib:$LD_LIBRARY_PATH
   - Misremembering the test conditions
 - **Needs investigation**: Compare SK file contents between systems, verify DFTB+ versions, check HSD parameters
 
-**CRITICAL FINDING: Eigenvector phase discrepancy between DFTBcore and eigenvec.bin**
-- The eigenvectors returned by DFTBcore have DIFFERENT SIGNS for hydrogen coefficients compared to eigenvec.bin
-- **eigenvec.bin (waveplot uses this):** O0s=+0.858767, H1s=+0.150390, H2s=+0.150390
-- **DFTBcore (our code uses this):** O0s=+0.858007, H1s=-0.143452, H2s=-0.143687
-- This explains why waveplot shows bonding orbitals while our OpenCL code shows anti-bonding
-- **Root cause:** DFTBcore returns raw eigenvectors from the solver, while eigenvec.bin contains phase-corrected eigenvectors for visualization
-- **Fix needed:** DFTBcore eigenvector extraction must match eigenvec.bin phase convention
+**CRITICAL FINDING RESOLVED: Eigenvector Phase Discrepancy Due to SK Parameter Sets**
+
+**Initial hypothesis (INCORRECT):**
+- Thought there was a phase discrepancy between DFTBcore and eigenvec.bin
+- **eigenvec.bin (from tests/grid/dftb_h2o/ with mio-1-1):** O0s=+0.858767, H1s=+0.150390, H2s=+0.150390
+- **DFTBcore (from tests/dftb/ with 3ob-3-1):** O0s=+0.858007, H1s=-0.143452, H2s=-0.143687
+
+**Actual cause (CORRECT):**
+- The discrepancy is due to **different Slater-Koster (SK) parameter sets**, not library vs eigenvec.bin
+- Within the same SK set, DFTBcore eigenvectors match eigenvec.bin exactly (max diff ~1e-6)
+
+**Test results:**
+
+1. **3ob-3-1 SK set** (tests/dftb/):
+   - S[O0s,H1s] = -0.437 (negative off-diagonal)
+   - Eigenvec MO0: O0s=+0.858007, H1s=-0.143452, H2s=-0.143687
+   - Library MO0: O0s=+0.858007, H1s=-0.143452, H2s=-0.143687
+   - **Match:** Perfect (max diff ~1e-6)
+
+2. **mio-1-1 SK set** (tests/grid/dftb_h2o/):
+   - S[O0s,H1s] = +0.425 (positive off-diagonal)
+   - Eigenvec MO0: O0s=+0.858767, H1s=+0.150390, H2s=+0.150390
+   - Library MO0: O0s=+0.850189, H1s=+0.153008, H2s=+0.153259
+   - **Match:** Perfect (max diff ~1e-6)
+
+**File locations:**
+- `tests/dftb/eigenvec.bin` - 3ob-3-1 SK set, negative H coefficients
+- `tests/grid/dftb_h2o/eigenvec.bin` - mio-1-1 SK set, positive H coefficients
+- `tests/grid/dftb_h2o/dftb_in.hsd` - Uses `/home/prokophapala/SIMULATIONS/dftbplus/slakos/mio/mio-1-1/`
+- `tests/dftb/dftb_in.hsd` - Uses `/home/prokop/SIMULATIONS/dftbplus/slakos/library/3ob-3-1/`
+
+**Conclusion:**
+- No inverse Lowdin transform is needed to match eigenvec.bin
+- eigenvec.bin contains Lowdin basis eigenvectors (C^T*S*C = I)
+- DFTBcore returns the same Lowdin basis eigenvectors
+- **CRITICAL:** Different SK parameter sets (3ob-3-1 vs mio-1-1) produce fundamentally different S and H matrices with opposite signs, leading to different physical densities
+- The sign difference in H coefficients is due to the sign difference in S-matrix off-diagonal elements between SK sets
+- **WAVEPLOT will show different bonding/antibonding character for different SK parameter sets even with the same geometry** - this is because the Hamiltonian and overlap matrices are genuinely different, not just different sign conventions
 

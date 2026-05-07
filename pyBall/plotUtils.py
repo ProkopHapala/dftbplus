@@ -794,7 +794,8 @@ f"""
 #############################
 
 def plot_comparison_2d(wp_vals, ocl_vals, diff_vals, extent, title_prefix, plane_desc, 
-                      method_tag, mo_indices, energies, homo, output_path, dpi=150):
+                      method_tag, mo_indices, energies, homo, output_path, dpi=150, 
+                      atom_coords=None):
     """
     Plot 2D orbital comparison: libwaveplot vs OpenCL vs difference.
     
@@ -811,6 +812,7 @@ def plot_comparison_2d(wp_vals, ocl_vals, diff_vals, extent, title_prefix, plane
         homo: HOMO index
         output_path: path to save PNG
         dpi: resolution
+        atom_coords: (natoms, 3) atomic positions in Å (optional, for overlay)
     """
     import matplotlib.pyplot as plt
     nstates = len(mo_indices)
@@ -818,6 +820,14 @@ def plot_comparison_2d(wp_vals, ocl_vals, diff_vals, extent, title_prefix, plane
     ncols = 3
     fig, axes = plt.subplots(nstates, ncols, figsize=(5*ncols, 4*nstates))
     if nstates == 1: axes = axes[np.newaxis, :]
+    
+    # Determine which axes to plot from plane_desc
+    if 'xy' in plane_desc.lower():
+        x_idx, y_idx = 0, 1
+    elif 'xz' in plane_desc.lower():
+        x_idx, y_idx = 0, 2
+    else:  # yz
+        x_idx, y_idx = 1, 2
     
     for i in range(nstates):
         wp2  = wp_vals[i]
@@ -839,11 +849,229 @@ def plot_comparison_2d(wp_vals, ocl_vals, diff_vals, extent, title_prefix, plane
             ax.set_ylabel('y (Å)' if extent[0] == extent[2] else 'z (Å)')
             ax.set_title(ttl, fontsize=7)
             plt.colorbar(im, ax=ax, fraction=0.046)
+            
+            # Overlay atomic positions if provided
+            if atom_coords is not None:
+                ax.scatter(atom_coords[:, x_idx], atom_coords[:, y_idx], 
+                          c='black', marker='.', s=10, alpha=0.5, zorder=10)
     
     fig.suptitle(f"{title_prefix}: libwaveplot vs OpenCL  [{method_tag}]  {plane_desc}  (MO{mo_indices[0]}–{mo_indices[-1]})", fontsize=9)
     fig.tight_layout()
     fig.savefig(str(output_path), dpi=dpi)
     plt.close(fig)
+
+
+#############################
+#   STO basis function plotting   #
+#############################
+
+def plot_sto_1d(r, sto, l, cutoff, title, output_path=None, dpi=150):
+    """
+    Plot 1D radial STO function.
+    
+    Args:
+        r: distance array (Å)
+        sto: STO values at r
+        l: angular momentum
+        cutoff: cutoff distance (Å)
+        title: plot title
+        output_path: path to save PNG (if None, show plot)
+        dpi: resolution for saved image
+    """
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.plot(r, sto, linewidth=2)
+    ax.axvline(cutoff, color='r', linestyle='--', label=f'Cutoff = {cutoff} Å')
+    ax.set_xlabel('Distance r (Å)')
+    ax.set_ylabel('STO value')
+    ax.set_title(title)
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    
+    if output_path:
+        fig.savefig(output_path, dpi=dpi, bbox_inches='tight')
+        plt.close(fig)
+    else:
+        plt.show()
+    
+    return fig, ax
+
+
+def plot_sto_2d(X, Y, sto, l, origin, title, output_path=None, dpi=150):
+    """
+    Plot 2D STO function as contour plot.
+    
+    Args:
+        X, Y: 2D meshgrid arrays
+        sto: STO values on grid
+        l: angular momentum
+        origin: (x0, y0) center of orbital
+        title: plot title
+        output_path: path to save PNG (if None, show plot)
+        dpi: resolution for saved image
+    """
+    fig, ax = plt.subplots(figsize=(8, 6))
+    im = ax.contourf(X, Y, sto, levels=50, cmap='RdBu_r')
+    ax.scatter([origin[0]], [origin[1]], c='k', marker='x', s=100, label='Atom center')
+    ax.set_xlabel('x (Å)')
+    ax.set_ylabel('y (Å)')
+    ax.set_title(title)
+    ax.legend()
+    ax.set_aspect('equal')
+    plt.colorbar(im, ax=ax, label='STO value')
+    fig.tight_layout()
+    
+    if output_path:
+        fig.savefig(output_path, dpi=dpi, bbox_inches='tight')
+        plt.close(fig)
+    else:
+        plt.show()
+    
+    return fig, ax
+
+
+def plot_sto_2d_separate(X, Y, sto_list, l_list, origin_list, title_list, output_path=None, dpi=150):
+    """
+    Plot multiple STO functions on separate 2D subplots.
+    
+    Args:
+        X, Y: 2D meshgrid arrays
+        sto_list: list of STO value arrays
+        l_list: list of angular momenta
+        origin_list: list of (x0, y0) positions
+        title_list: list of plot titles
+        output_path: path to save PNG (if None, show plot)
+        dpi: resolution for saved image
+    """
+    n_plots = len(sto_list)
+    fig, axes = plt.subplots(1, n_plots, figsize=(6*n_plots, 5), squeeze=False)
+    
+    for i, (sto, l, origin, title) in enumerate(zip(sto_list, l_list, origin_list, title_list)):
+        ax = axes[0, i]
+        im = ax.contourf(X, Y, sto, levels=50, cmap='RdBu_r')
+        ax.scatter([origin[0]], [origin[1]], c='k', marker='x', s=100, label='Atom center')
+        ax.set_xlabel('x (Å)')
+        ax.set_ylabel('y (Å)')
+        ax.set_title(title)
+        ax.legend()
+        ax.set_aspect('equal')
+        plt.colorbar(im, ax=ax, label='STO value')
+    
+    fig.tight_layout()
+    
+    if output_path:
+        fig.savefig(output_path, dpi=dpi, bbox_inches='tight')
+        plt.close(fig)
+    else:
+        plt.show()
+    
+    return fig, axes
+
+
+def plot_sto_2d_overlay(X, Y, sto_list, l_list, origin_list, title_list, output_path=None, dpi=150):
+    """
+    Plot multiple STO functions on the same 2D grid (overlay).
+    
+    Args:
+        X, Y: 2D meshgrid arrays
+        sto_list: list of STO value arrays
+        l_list: list of angular momenta
+        origin_list: list of (x0, y0) positions
+        title_list: list of legend labels
+        output_path: path to save PNG (if None, show plot)
+        dpi: resolution for saved image
+    """
+    fig, ax = plt.subplots(figsize=(10, 8))
+    
+    colors = plt.cm.tab10(np.linspace(0, 1, len(sto_list)))
+    
+    for i, (sto, l, origin, title) in enumerate(zip(sto_list, l_list, origin_list, title_list)):
+        # Plot contours with different line styles
+        cs = ax.contour(X, Y, sto, levels=10, colors=[colors[i]], linewidths=1.5, alpha=0.7)
+        ax.scatter([origin[0]], [origin[1]], c=[colors[i]], marker='o', s=100, 
+                   label=title, zorder=10)
+    
+    ax.set_xlabel('x (Å)')
+    ax.set_ylabel('y (Å)')
+    ax.set_title('STO Basis Functions Overlay')
+    ax.legend()
+    ax.set_aspect('equal')
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    
+    if output_path:
+        fig.savefig(output_path, dpi=dpi, bbox_inches='tight')
+        plt.close(fig)
+    else:
+        plt.show()
+    
+    return fig, ax
+
+def plot_sto_radial_comparison(basis_data, species_orbitals, r_max=5.0, n_points=500, 
+                               output_path=None, dpi=150):
+    """
+    Plot radial STO functions for multiple atoms/orbitals on the same 1D plot.
+    
+    Args:
+        basis_data: parsed wfc data from parse_wfc_hsd (units in Bohr)
+        species_orbitals: list of tuples (species_name, orbital_idx, label)
+                         e.g., [('H', 0, 'H s'), ('O', 0, 'O s'), ('O', 1, 'O p')]
+        r_max: maximum distance in Angstrom
+        n_points: number of grid points
+        output_path: path to save PNG (if None, show plot)
+        dpi: resolution for saved image
+    """
+    import matplotlib.pyplot as plt
+    from pyBall.OCL.DFTBplusParser import evaluate_sto_1d
+    
+    BOHR2ANG = 0.5291772109
+    
+    fig, ax = plt.subplots(figsize=(12, 8))
+    
+    # Convert r_max from Angstrom to Bohr for STO evaluation
+    r_bohr = np.linspace(0, r_max / BOHR2ANG, n_points)
+    r_ang = r_bohr * BOHR2ANG  # Convert back to Angstrom for plotting
+    
+    colors = plt.cm.tab10(np.linspace(0, 1, len(species_orbitals)))
+    
+    for (species_name, orbital_idx, label), color in zip(species_orbitals, colors):
+        if species_name not in basis_data:
+            print(f"Warning: Species {species_name} not found, skipping")
+            continue
+        
+        species = basis_data[species_name]
+        if orbital_idx >= len(species['orbitals']):
+            print(f"Warning: Orbital index {orbital_idx} out of range for {species_name}, skipping")
+            continue
+        
+        orbital = species['orbitals'][orbital_idx]
+        l = orbital['AngularMomentum']
+        exps = orbital['Exponents']  # in Bohr^-1
+        coeffs = orbital['Coefficients']
+        cutoff_bohr = orbital['Cutoff']  # in Bohr
+        cutoff_ang = cutoff_bohr * BOHR2ANG  # Convert to Angstrom
+        
+        # Evaluate STO (r in Bohr) - handle each orbital separately due to different nAlpha
+        sto = evaluate_sto_1d(r_bohr, l, exps, coeffs)
+        
+        # Plot (r in Angstrom, cutoff in Angstrom)
+        ax.plot(r_ang, sto, linewidth=2, label=label, color=color)
+        ax.axvline(cutoff_ang, color=color, linestyle='--', alpha=0.3, linewidth=1)
+    
+    ax.set_xlabel('Distance r (Å)')
+    ax.set_ylabel('STO value')
+    ax.set_title('STO Radial Functions Comparison')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    
+    if output_path:
+        fig.savefig(output_path, dpi=dpi, bbox_inches='tight')
+        plt.close(fig)
+    else:
+        plt.show()
+    
+    return fig, ax
 
 
 def plot_comparison_1d(z_vals, wp_vals, ocl_vals, title_prefix, plane_desc, method_tag,
