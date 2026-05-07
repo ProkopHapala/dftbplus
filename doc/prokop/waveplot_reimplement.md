@@ -2804,3 +2804,22 @@ Basis {
 **This is the authoritative source** for all STO parameters. Values are in Bohr.
 
 The plan provides specific file references, data structure mappings, and success criteria to guide the implementation.
+
+
+---
+
+**IMPORTANT NOTE: Negative S-matrix elements and orbital phase convention**
+
+When testing on the laptop (prokophapala), we observed that the overlap matrix S has **negative elements between s-orbitals** (e.g., S[O0s-H1s] = -0.437). This is unusual since s-s overlaps are typically positive by convention. This appears to be a convention in the Slater-Koster (SK) parameter files used (mio/mio-1-1 set).
+
+**Implications for manual implementation:**
+- The bonding condition in LCAO is `c_i * c_j * S_ij > 0`. With negative S_ij, opposite signs on coefficients give bonding.
+- For H2O MO0: O0s=+0.858, H1s=-0.143, S_OH=-0.437 → (+0.858)*(-0.143)*(-0.437) = +0.053 > 0 → bonding
+- **Visualization issue**: If you assume basis functions are positive by convention in your implementation, the real-space plot may appear as anti-bonding when it's actually bonding.
+- This should be tested on different machines with different SK parameter sets to confirm if this is a mio/mio-1-1 convention or a broader issue.
+
+**Slater orbital coefficients in waveplot_in.hsd:**
+- The waveplot_in.hsd file specifies Slater orbital exponents and coefficients for radial basis functions
+- Default coefficient if not specified: +1.0 (set in `DFTBplusParser.py` line 406: `coef_b = np.ones((1, len(exps_b)))`)
+- The negative S-matrix elements come from the SK files themselves, not from these coefficients
+- Example from dftb_h2o/waveplot_in.hsd: `Coefficients = { 1.0 }` for both H and O orbitals

@@ -28,6 +28,7 @@ from pyBall.OCL.DFTBplusParser import (
 )
 from pyBall.OCL.Grid import GridProjector, setup_gridprojector_from_dftb
 from pyBall import plotUtils as pu
+from pyBall.WavePlot.TestUtils import print_eigenvecs
 
 
 def parse_args():
@@ -73,6 +74,7 @@ def parse_args():
     # Verbosity
     parser.add_argument('-v', '--verbose', action='count', default=0,  help='Increase verbosity (use -v, -vv, or -vvv)')
     parser.add_argument('--debug', action='store_true',  help='Enable debug mode')
+    parser.add_argument('--print-eigenvec', action='store_true', help='Print eigenvectors from eigenvec.bin and exit')
     
     return parser.parse_args()
 
@@ -85,6 +87,11 @@ def main():
     dftb_dir = Path(args.dftb_dir) if args.dftb_dir else Path(__file__).parent / 'dftb_h2o'
     assert dftb_dir.exists(), f"DFTB+ directory not found: {dftb_dir}"
     system_name = dftb_dir.name
+    
+    # Print eigenvectors if requested
+    if args.print_eigenvec:
+        print_eigenvecs(dftb_dir / 'eigenvec.bin', dftb_dir / 'detailed.xml', dftb_dir / 'waveplot_in.hsd', max_orbitals=6)
+        return
     output_dir = Path(args.output_dir) / system_name
     output_dir.mkdir(parents=True, exist_ok=True)
     

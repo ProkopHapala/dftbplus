@@ -5,6 +5,7 @@ Parity check: compare H, S, DM, eigenvectors between DFTBcore library and DFTB+ 
 Usage:
     cd /home/prokop/git/dftbplus/tests/dftb
     python test_parity.py
+    python test_parity.py --debug    # Print orbital coefficients
 
 Requires:
     export DFTB_EXE=/path/to/dftb+
@@ -15,11 +16,14 @@ Requires:
 import sys, os
 import numpy as np
 import subprocess
+import argparse
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / 'pyBall'))
 
 from DFTBcore import DFTBcore
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+from pyBall.WavePlot.TestUtils import print_eigenvecs
 
 # ---- helpers ----------------------------------------------------------------
 
@@ -57,19 +61,30 @@ def make_h2o_input(sk_path, sk_set='3ob-3-1'):
         f.write(f"""Geometry = xyzFormat {{
   <<< "h2o.xyz"
 }}
-ParserOptions {{ ParserVersion = 15 }}
+
+Driver = {{}}
+
 Hamiltonian = DFTB {{
-  Scc = Yes
-  MaxAngularMomentum {{ O = "p"  H = "s" }}
+  SCC = Yes
+  SCCTolerance = 1.0E-8
+  MaxAngularMomentum {{
+    O = "p"
+    H = "s"
+  }}
   SlaterKosterFiles = Type2FileNames {{
     Prefix = "{sk_path}{sk_set}/"
     Separator = "-"
     Suffix = ".skf"
   }}
 }}
-Options {{ WriteResultsTag = Yes  WriteDetailedOut = Yes }}
-Analysis {{ CalculateForces = Yes }}
+
+Options {{
+  WriteDetailedOut = Yes
+}}
 """)
+    # Also create as dftb_in.hsd for library compatibility
+    import shutil
+    shutil.copy('h2o.hsd', 'dftb_in.hsd')
 
 def parity_check(name, lib_val, exe_val, tol=1e-5):
     diff = np.max(np.abs(lib_val - exe_val))
@@ -86,9 +101,19 @@ def print_mat(name, M, n=6):
 # ---- main -------------------------------------------------------------------
 
 def main():
+    parser = argparse.ArgumentParser(description='DFTB+ Parity Test')
+    parser.add_argument('--debug', action='store_true', help='Print orbital coefficients')
+    parser.add_argument('--print-eigenvec', action='store_true', help='Print eigenvectors from eigenvec.bin and exit')
+    args = parser.parse_args()
+
     sk_path  = os.environ.get('DFTB_SK_PATH', os.path.expanduser('~/SIMULATIONS/dftbplus/slakos/library/'))
     libpath  = os.environ.get('DFTB_LIB_PATH', None)
     dftb_exe = os.environ.get('DFTB_EXE', None)
+
+    # Print eigenvectors if requested
+    if args.print_eigenvec:
+        print_eigenvecs('eigenvec.bin', 'detailed.xml', 'waveplot_in.hsd', max_orbitals=6)
+        return
 
     print("="*70)
     print("DFTB+ Parity Test: Library vs Executable (H2O, 3ob-3-1)")
@@ -96,6 +121,7 @@ def main():
     print(f"  SK path:    {sk_path}")
     print(f"  Library:    {libpath or '(auto)'}")
     print(f"  Executable: {dftb_exe or '(not set)'}")
+    print(f"  Debug mode: {args.debug}")
 
     make_h2o_input(sk_path)
 
@@ -114,10 +140,13 @@ def main():
             print(f"  Executable failed:\n{ret.stderr[-500:]}")
             print("  Continuing with library-only check...")
         else:
-            energy_exe = parse_energy_detailed('detailed.out')
-            eigvals_exe_eV = parse_band_out('band.out')
-            print(f"  Energy: {energy_exe:.8f} Ha")
-            print(f"  Eigenvalues (eV): {eigvals_exe_eV}")
+            try:
+                energy_exe = parse_energy_detailed('detailed.out')
+                eigvals_exe_eV = parse_band_out('band.out')
+                print(f"  Energy: {energy_exe:.8f} Ha")
+                print(f"  Eigenvalues (eV): {eigvals_exe_eV}")
+            except:
+                print("  Could not parse output files, continuing with library-only check...")
 
     # ---- 1. Run via DFTBcore library -----------------------------------------
     print("\n" + "="*70)
@@ -135,6 +164,17 @@ def main():
     S_lib   = dftb.get_s_dense()
     DM_lib  = dftb.get_dm_dense()
     C_lib, eigvals_lib = dftb.get_eigvecs_dense()
+    
+    # Print orbital coefficients if debug mode is enabled
+    if args.debug:
+        # Atom-orbital map for H2O: O (s, px, py, pz), H1 (s), H2 (s)
+        atom_orbital_map = [
+            ('O (atom 0)', ['s', 'px', 'py', 'pz']),
+            ('H (atom 1)', ['s']),
+            ('H (atom 2)', ['s'])
+        ]
+        dftb.print_orbital_coeffs(C_lib, eigvals_lib, atom_orbital_map=atom_orbital_map, max_orbitals=6)
+    
     dftb.finalize()
 
     print(f"  Energy:     {energy_lib:.8f} Ha")

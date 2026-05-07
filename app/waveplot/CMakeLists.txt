@@ -30,13 +30,16 @@ target_link_libraries(waveplot PRIVATE dftbplus)
 install(TARGETS waveplot DESTINATION "${CMAKE_INSTALL_BINDIR}")
 
 # Shared library target for Python ctypes interface
-add_library(waveplotlib SHARED ${sources-lib-f90-preproc})
-set_target_properties(waveplotlib PROPERTIES
-  OUTPUT_NAME "waveplot"
-  POSITION_INDEPENDENT_CODE ON)
-target_link_libraries(waveplotlib PRIVATE dftbplus)
-if(WITH_MPI)
-  target_link_libraries(waveplotlib PRIVATE MPI::MPI_Fortran)
-endif()
-install(TARGETS waveplotlib
-  LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}")
+
+# =================== WARRNING ------ We forget to add libwaveplot.F90 to the repository (by git add, do it on machine at work)
+# NOTE: libwaveplot.F90 is missing from repository, disabling this build
+# add_library(waveplotlib SHARED ${sources-lib-f90-preproc})
+# set_target_properties(waveplotlib PROPERTIES
+#   OUTPUT_NAME "waveplot"
+#   POSITION_INDEPENDENT_CODE ON)
+# target_link_libraries(waveplotlib PRIVATE dftbplus)
+# if(WITH_MPI)
+#   target_link_libraries(waveplotlib PRIVATE MPI::MPI_Fortran)
+# endif()
+# install(TARGETS waveplotlib
+#   LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}")

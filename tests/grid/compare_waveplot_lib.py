@@ -32,7 +32,7 @@ sys.path.insert(0, str(REPO_ROOT))
 from pyBall.WavePlot.WavePlot import WavePlot, setup_waveplot_from_dftb, evaluate_mos_on_points as wp_evaluate_mos_on_points
 from pyBall.OCL.DFTBplusParser import ( parse_basis_hsd_ang, parse_detailed_xml_custom, parse_eigenvec_bin_custom, read_cube, build_wp_basis,evec_to_kernel_coeffs)
 from pyBall.OCL.Grid import GridProjector, setup_gridprojector_from_dftb, evaluate_mos_on_points as ocl_evaluate_mos_on_points
-from pyBall.WavePlot.TestUtils import (compare_point_evaluations, print_comparison_results, generate_2d_point_grid, generate_1d_z_scan)
+from pyBall.WavePlot.TestUtils import (compare_point_evaluations, print_comparison_results, generate_2d_point_grid, generate_1d_z_scan, print_eigenvecs)
 from pyBall.plotUtils import ( plot_comparison_2d,  plot_comparison_1d)
 
 LIB_PATH   = str(REPO_ROOT / '_build' / 'app' / 'waveplot' / 'libwaveplot.so')
@@ -54,9 +54,10 @@ def parse_args():
     p.add_argument('--points',    action='store_true', help='Method 2: evaluate at explicit points (libwaveplot + OpenCL)')
     p.add_argument('--plane2d',   type=str, choices=['xy','xz','yz'], default=None, help='2D plane for --points; omit for 1D z-scan')
     p.add_argument('--z-offset',  type=float, default=0.0,  help='Fixed coordinate value for out-of-plane axis (Å)')
-    p.add_argument('--xy-range',  type=float, nargs=2, default=None,  metavar=('MIN','MAX'), help='Coordinate range for 2D plane (Å); default: mol extent + 3 Å')
+    p.add_argument('--xy-range',  type=float, nargs=2, default=None, metavar=('MIN','MAX'), help='Coordinate range for 2D plane (Å); default: mol extent + 3 Å')
     p.add_argument('--z-range',   type=float, nargs=2, default=[-3.0, 3.0],  metavar=('ZMIN','ZMAX'), help='Range for 1D z-scan (Å)')
     p.add_argument('--npoints',   type=int, default=64, help='Grid points per axis')
+    p.add_argument('--print-eigenvec', action='store_true', help='Print eigenvectors from eigenvec.bin and exit')
     return p.parse_args()
 
 
@@ -71,6 +72,12 @@ def main():
     dftb_dir = Path(args.dftb_dir) if args.dftb_dir else Path(__file__).parent / 'dftb_h2o'
     assert dftb_dir.exists(), f"Not found: {dftb_dir}"
     system_name = dftb_dir.name
+    
+    # Print eigenvectors if requested
+    if args.print_eigenvec:
+        print_eigenvecs(dftb_dir / 'eigenvec.bin', dftb_dir / 'detailed.xml', dftb_dir / 'waveplot_in.hsd', max_orbitals=args.nmo if args.nmo else None)
+        return
+    
     print("=" * 60)
     print(f"System: {system_name}  ({dftb_dir})")
     print("=" * 60)

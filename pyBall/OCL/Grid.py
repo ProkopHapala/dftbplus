@@ -5,7 +5,6 @@ import os
 import pyopencl.array as cl_array
 import time
 from ..OCL.OpenCLBase import OpenCLBase
-from .FdataParser import FdataParser
 
 class GridProjector(OpenCLBase):
     """
@@ -14,19 +13,12 @@ class GridProjector(OpenCLBase):
     def __init__(self, fdata_dir, ctx=None, queue=None, nloc=32, debug_early_exit=False, debug_clear_only=False, debug_return0=False, debug_read_task=False, debug_read_grid=False, verbosity=0):
         super().__init__(nloc=nloc)
         self.fdata_dir = fdata_dir
-        self.parser = FdataParser(fdata_dir)
         self.debug_early_exit = bool(debug_early_exit)
         self.debug_clear_only = bool(debug_clear_only)
         self.debug_return0 = bool(debug_return0)
         self.debug_read_task = bool(debug_read_task)
         self.debug_read_grid = bool(debug_read_grid)
         self.verbosity = int(verbosity)
-        if not hasattr(self.parser, "species_info"):
-            try:
-                self.parser.parse_info()
-            except Exception as e:
-                # Keep going; parse_info will be invoked lazily later if needed
-                pass
         if ctx:
             self.ctx = ctx
             self.queue = queue if queue else cl.CommandQueue(self.ctx)
@@ -37,132 +29,6 @@ class GridProjector(OpenCLBase):
         self.task_dtype_np = np.dtype(self.task_dtype)
         self._load_kernels()
         self.basis_data = {}
-
-    def load_basis(self, species_nz):
-        """Loads radial basis functions for given species."""
-        missing = []
-        for nz in species_nz:
-            if nz in self.basis_data: continue
-            wfs = self.parser.find_wf(nz)
-            if len(wfs)==0:
-                missing.append(nz); continue
-            wfs_ok = []
-            for f in wfs:
-                wf = self.parser.read_wf(f)
-                # Defensive filter: glob patterns can match unrelated files (e.g. '001' substring).
-                if int(wf.get('nzx', -1)) != int(nz):
-                    if self.verbosity > 0:
-                        print(f"[DEBUG] load_basis: skipping wf file '{f}' because header nzx={wf.get('nzx')} != requested nz={nz}")
-                    continue
-                wf['_fname'] = f
-                wfs_ok.append(wf)
-            if len(wfs_ok) == 0:
-                missing.append(nz); continue
-            # Sort shells by angular momentum (match Fortran order: s then p then d...)
-            wfs_ok.sort(key=lambda w: (int(w.get('l', 0)), str(w.get('_fname',''))))
-            self.basis_data[nz] = wfs_ok
-        if missing:
-            raise RuntimeError(f"No .wf files found for species {missing} under {self.fdata_dir}; ensure Fdata dir has *.ZZ.wf")
-        
-        # Prepare for GPU: pack into a single buffer
-        # Resample all wavefunctions to a common uniform grid (finest dr, largest rcutoff)
-        all_nz = sorted(self.basis_data.keys())
-        if len(all_nz)==0:
-            raise RuntimeError("load_basis called with empty species list (species_nz).")
-        max_shells = max(len(v) for v in self.basis_data.values())
-        if max_shells==0:
-            raise RuntimeError(f"No wavefunctions loaded for species {all_nz}")
-        # Find finest dr and largest rcutoff across all shells/species
-        # IMPORTANT: .wf files store rcutoff in Bohr. Convert to Angstrom via abohr.
-        # See Fortran read_wf.f90 line 208: drr_wf = abohr * rcutoffwf / (mesh-1)
-        ABOHR = 0.529177       # Bohr -> Angstrom
-        all_dr = []
-        all_rc_ang = []
-        for nz in all_nz:
-            for wf in self.basis_data[nz]:
-                wf_dr_ang = ABOHR * wf['rcutoff'] / (wf['mesh'] - 1)
-                all_dr.append(wf_dr_ang)
-                all_rc_ang.append(ABOHR * wf['rcutoff'])
-        dr = min(all_dr)                   # finest spacing in Angstrom
-        rc_max_ang = max(all_rc_ang)       # largest cutoff in Angstrom
-        n_nodes = int(np.ceil(rc_max_ang / dr)) + 1
-        if self.verbosity > 0: print(f"[DEBUG] load_basis: common grid dr={dr:.6f} Å  rc_max={rc_max_ang:.3f} Å  n_nodes={n_nodes}")
-        
-        def _spline_d2_uniform(y, h):
-            """Natural cubic spline second derivatives for uniform grid.
-            Matches the form used by Fortran getpsi() with wf_spline.
-            """
-            n = len(y)
-            if n < 3:
-                return np.zeros(n, dtype=np.float32)
-            # Tridiagonal system for natural spline on uniform grid
-            # d2[0]=d2[n-1]=0
-            a = np.ones(n-3, dtype=np.float64)
-            b = np.full(n-2, 4.0, dtype=np.float64)
-            c = np.ones(n-3, dtype=np.float64)
-            rhs = np.zeros(n-2, dtype=np.float64)
-            rhs[:] = 6.0 * (y[2:] - 2.0*y[1:-1] + y[:-2]) / (h*h)
-            # Thomas algorithm
-            for i in range(1, n-2):
-                w = a[i-1] / b[i-1]
-                b[i] -= w * c[i-1]
-                rhs[i] -= w * rhs[i-1]
-            d2_inner = np.zeros(n-2, dtype=np.float64)
-            d2_inner[-1] = rhs[-1] / b[-1]
-            for i in range(n-4, -1, -1):
-                d2_inner[i] = (rhs[i] - c[i] * d2_inner[i+1]) / b[i]
-            d2 = np.zeros(n, dtype=np.float32)
-            d2[1:-1] = d2_inner.astype(np.float32)
-            return d2
-
-        # We store (wf, wf_spline) as float2 per node
-        packed_basis = np.zeros((len(all_nz), max_shells, n_nodes, 2), dtype=np.float32)
-        for i, nz in enumerate(all_nz):
-            for ish, wf in enumerate(self.basis_data[nz]):
-                wf_mesh = wf['mesh']
-                wf_rc_bohr = wf['rcutoff']
-                wf_dr_ang  = ABOHR * wf_rc_bohr / (wf_mesh - 1)
-                wf_data    = wf['data']
-                # Resample from wf's own grid (Angstrom) to common grid using Fortran-compatible
-                # natural cubic spline (matches getpsi.f90).
-                r_common = np.arange(n_nodes) * dr
-                d2_orig = _spline_d2_uniform(wf_data.astype(np.float64), wf_dr_ang)
-                resampled = np.zeros_like(r_common, dtype=np.float64)
-                xmax = (wf_mesh - 1) * wf_dr_ang
-                for ir, rr in enumerate(r_common):
-                    if rr <= 0.0:
-                        resampled[ir] = float(wf_data[0])
-                        continue
-                    if rr >= xmax:
-                        resampled[ir] = float(wf_data[-1])
-                        continue
-                    x = rr / wf_dr_ang
-                    ii = int(np.floor(x))
-                    if ii < 0: ii = 0
-                    if ii > (wf_mesh - 2): ii = wf_mesh - 2
-                    t = x - ii
-                    a = 1.0 - t
-                    b = t
-                    ylo = wf_data[ii]
-                    yhi = wf_data[ii+1]
-                    d2lo = d2_orig[ii]
-                    d2hi = d2_orig[ii+1]
-                    resampled[ir] = a*ylo + b*yhi + ((a*a*a-a)*d2lo + (b*b*b-b)*d2hi) * (wf_dr_ang*wf_dr_ang) / 6.0
-                resampled = resampled.astype(np.float32)
-                # Verify normalization: ∫ R² r² dr should be ~1.0 with correct Angstrom grid
-                S_rad = np.trapz(resampled.astype(np.float64)**2 * r_common**2, r_common)
-                if S_rad <= 0:
-                    raise RuntimeError(f"load_basis: non-positive radial norm S_rad={S_rad} for species {nz} shell {ish}")
-
-                d2 = _spline_d2_uniform(resampled.astype(np.float64), dr)
-                packed_basis[i, ish, :, 0] = resampled.astype(np.float32)
-                packed_basis[i, ish, :, 1] = d2
-
-                if self.verbosity > 0: print(f"[DEBUG]   species {nz} shell {ish} (l={wf.get('l','?')}): mesh={wf_mesh} rc={wf_rc_bohr:.3f} Bohr = {ABOHR*wf_rc_bohr:.3f} Å  S_rad={S_rad:.6f}")
-        
-        self.d_basis = cl.Buffer(self.ctx, cl.mem_flags.READ_ONLY | cl.mem_flags.COPY_HOST_PTR, hostbuf=packed_basis)
-        self.basis_meta = {'n_species': len(all_nz), 'max_shells': max_shells, 'n_nodes': n_nodes, 'dr': dr, 'nz_map': {nz: i for i, nz in enumerate(all_nz)}}
-        return packed_basis
 
     def load_basis_sto(self, species_list, dr=None, rc_max=None):
         """

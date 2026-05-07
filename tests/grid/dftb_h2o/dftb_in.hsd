@@ -9,7 +9,9 @@ Hamiltonian = DFTB {
   SCCTolerance = 1.0E-8
   MaxSCCIterations = 100
   SlaterKosterFiles = Type2FileNames {
-    Prefix = "/home/prokop/SIMULATIONS/dftbplus/slakos/mio-1-1/"
+    Prefix = "/home/prokophapala/SIMULATIONS/dftbplus/slakos/mio/mio-1-1/"
+    #Prefix = "/home/prokop/SIMULATIONS/dftbplus/slakos/mio-1-1/"
+    #Prefix = "$DFTB_SK_PATH/mio/mio-1-1/"
     Separator = "-"
     Suffix = ".skf"
   }

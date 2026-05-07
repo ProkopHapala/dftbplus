@@ -355,6 +355,60 @@ class DFTBcore:
         """
         self._lib.dftbcore_write_debug_matrices()
 
+    def print_orbital_coeffs(self, eigvecs, eigenvals, atom_orbital_map=None, max_orbitals=None):
+        """
+        Print orbital coefficients in tabular format with column headers.
+        
+        Args:
+            eigvecs: (nStates, nOrb) matrix - columns are MOs
+            eigenvals: (nStates,) array
+            atom_orbital_map: Optional list of (atom_name, orbital_names) tuples.
+                            If None, prints without atom labels.
+            max_orbitals: Maximum number of orbitals to print (None for all)
+        """
+        nStates, nOrb = eigvecs.shape
+        if max_orbitals is not None:
+            nStates = min(nStates, max_orbitals)
+        
+        print(f"\n{'='*80}")
+        print(f"ORBITAL COEFFICIENTS (nStates={nStates}, nOrb={nOrb})")
+        print(f"{'='*80}\n")
+        
+        # Build column headers with zero-padded indices
+        if atom_orbital_map is not None:
+            col_headers = []
+            orb_idx = 0
+            for atom_name, orbital_names in atom_orbital_map:
+                # Extract element and atom index from "O (atom 0)" -> "O", "0"
+                parts = atom_name.split()
+                elem = parts[0]
+                atom_idx = parts[2].strip(')')
+                for orb_name in orbital_names:
+                    if orb_idx >= nOrb:
+                        break
+                    # Create compact header like "O000s", "O000px", etc. with zero-padding
+                    header = f"{elem}{int(atom_idx):03d}{orb_name}"
+                    col_headers.append(header)
+                    orb_idx += 1
+        else:
+            col_headers = [f"AO{i:03d}" for i in range(nOrb)]
+        
+        # Calculate column width based on header length
+        col_width = max(12, max(len(h) for h in col_headers))
+        
+        # Print header row
+        header_str = f"{'MOs':<6}  {'E[eV]':<12}  |  " + "  ".join(f"{h:>{col_width}s}" for h in col_headers)
+        print(header_str)
+        print("-" * len(header_str))
+        
+        # Print each MO row (single line)
+        for istate in range(nStates):
+            mo_label = f"MO{istate:03d}"
+            energy_ev = eigenvals[istate] * 27.2114
+            coeffs = [f"{coeff:{col_width}.6f}" for coeff in eigvecs[istate, :]]
+            row_str = f"{mo_label:<6}  {energy_ev:12.6f}  |  " + "  ".join(coeffs)
+            print(row_str)
+
     def finalize(self):
         """Finalize DFTB+ and free resources."""
         self._lib.dftbcore_finalize()

@@ -39,11 +39,9 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from pyBall.OCL.DFTBplusParser import (
-    parse_basis_hsd_ang, parse_detailed_xml_custom, parse_eigenvec_bin_custom,
-    evec_to_kernel_coeffs
-)
+from pyBall.OCL.DFTBplusParser import ( parse_basis_hsd_ang, parse_detailed_xml_custom, parse_eigenvec_bin_custom, build_wp_basis, evec_to_kernel_coeffs)
 from pyBall.OCL.Grid import GridProjector, setup_gridprojector_from_dftb, evaluate_mos_on_points as ocl_evaluate_mos_on_points
+from pyBall.WavePlot.TestUtils import print_eigenvecs
 from pyBall.DFTBcore import DFTBcore
 
 BOHR2ANG = 0.5291772109
@@ -55,39 +53,26 @@ OUTPUT_DIR = Path(__file__).parent / 'waveplot_output' / 'dftbcore'
 # ================================================================
 
 def parse_args():
-    p = argparse.ArgumentParser(
-        description='DFTBcore orbital projection test (no eigenvec.bin needed)',
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
-    )
-    p.add_argument('--dftb-dir',  type=str, default=None,
-                   help='DFTB+ run dir containing dftb_in.hsd, waveplot_in.hsd, detailed.xml')
-    p.add_argument('--lib-path',  type=str, default=None,
-                   help='Path to libdftbcore.so (auto-detected if absent)')
+    p = argparse.ArgumentParser( description='DFTBcore orbital projection test (no eigenvec.bin needed)', formatter_class=argparse.ArgumentDefaultsHelpFormatter )
+    p.add_argument('--dftb-dir',  type=str, default=None, help='DFTB+ run dir containing dftb_in.hsd, waveplot_in.hsd, detailed.xml')
+    p.add_argument('--lib-path',  type=str, default=None,  help='Path to libdftbcore.so (auto-detected if absent)')
     p.add_argument('--no-show',   action='store_true')
     p.add_argument('--dpi',       type=int, default=150)
-    p.add_argument('--nmo',       type=int, default=6,
-                   help='Number of MOs around HOMO (default range if --mo-range not set)')
-    p.add_argument('--mo-range',  type=int, nargs=2, default=None, metavar=('START','END'),
-                   help='1-based inclusive MO index range')
-    p.add_argument('--compare-bin', action='store_true',
-                   help='Compare library eigenvectors against eigenvec.bin (validation)')
+    p.add_argument('--nmo',       type=int, default=6,   help='Number of MOs around HOMO (default range if --mo-range not set)')
+    p.add_argument('--mo-range',  type=int, nargs=2, default=None, metavar=('START','END'),   help='1-based inclusive MO index range')
+    p.add_argument('--compare-bin', action='store_true',  help='Compare library eigenvectors against eigenvec.bin (validation)')
     # Point evaluation
-    p.add_argument('--points',    action='store_true',
-                   help='Evaluate at explicit points instead of full 3D grid')
-    p.add_argument('--plane2d',   type=str, choices=['xy','xz','yz'], default=None,
-                   help='2D plane for --points; omit for 1D z-scan')
-    p.add_argument('--z-offset',  type=float, default=0.0,
-                   help='Fixed coordinate value for out-of-plane axis (Å)')
-    p.add_argument('--xy-range',  type=float, nargs=2, default=None, metavar=('MIN','MAX'),
-                   help='Coordinate range for 2D scan (Å); default: mol extent + 3 Å')
+    p.add_argument('--points',    action='store_true',  help='Evaluate at explicit points instead of full 3D grid')
+    p.add_argument('--plane2d',   type=str, choices=['xy','xz','yz'], default=None,  help='2D plane for --points; omit for 1D z-scan')
+    p.add_argument('--z-offset',  type=float, default=0.0,  help='Fixed coordinate value for out-of-plane axis (Å)')
+    p.add_argument('--xy-range',  type=float, nargs=2, default=None, metavar=('MIN','MAX'),  help='Coordinate range for 2D scan (Å); default: mol extent + 3 Å')
     p.add_argument('--z-range',   type=float, nargs=2, default=[-3.0, 3.0])
     p.add_argument('--npoints',   type=int, default=64)
     # 3D grid
-    p.add_argument('--step',      type=float, default=0.2,
-                   help='Grid spacing in Å (3D grid mode)')
-    p.add_argument('--margin',    type=float, default=3.0,
-                   help='Grid margin around molecule in Å (3D grid mode)')
+    p.add_argument('--step',      type=float, default=0.2,  help='Grid spacing in Å (3D grid mode)')
+    p.add_argument('--margin',    type=float, default=3.0,  help='Grid margin around molecule in Å (3D grid mode)')
     p.add_argument('--nmax-atom', type=int, default=64)
+    p.add_argument('--print-eigenvec', action='store_true',  help='Print eigenvectors from eigenvec.bin and exit')
     return p.parse_args()
 
 
@@ -162,6 +147,12 @@ def main():
     dftb_dir = Path(args.dftb_dir) if args.dftb_dir else Path(__file__).parent / 'dftb_h2o'
     assert dftb_dir.exists(), f"DFTB+ directory not found: {dftb_dir}"
     system_name = dftb_dir.name
+    
+    # Print eigenvectors if requested
+    if args.print_eigenvec:
+        print_eigenvecs(dftb_dir / 'eigenvec.bin', dftb_dir / 'detailed.xml', dftb_dir / 'waveplot_in.hsd', max_orbitals=args.nmo if args.nmo else None)
+        return
+    
     print("=" * 60)
     print(f"test_waveplot_dftbcore.py — {system_name}")
     print(f"Directory: {dftb_dir}")

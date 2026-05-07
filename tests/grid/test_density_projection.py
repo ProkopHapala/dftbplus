@@ -32,6 +32,7 @@ from pyBall.OCL.DFTBplusParser import (
 )
 from pyBall.OCL.Grid import GridProjector, setup_gridprojector_from_dftb
 from pyBall.DFTBcore import DFTBcore
+from pyBall.WavePlot.TestUtils import print_eigenvecs
 
 BOHR2ANG = 0.5291772109
 OUTPUT_DIR = Path(__file__).parent / 'waveplot_output' / 'density'
@@ -58,6 +59,7 @@ def parse_args():
     # 3D grid
     p.add_argument('--step', type=float, default=0.3, help='Grid spacing in Å (3D grid mode)')
     p.add_argument('--margin', type=float, default=3.0,   help='Grid margin around molecule in Å')
+    p.add_argument('--print-eigenvec', action='store_true', help='Print eigenvectors from eigenvec.bin and exit')
     return p.parse_args()
 
 
@@ -554,6 +556,13 @@ def main():
 
     if args.dftb_dir is None:
         args.dftb_dir = Path(__file__).parent / 'dftb_h2o'
+
+    dftb_dir = Path(args.dftb_dir)
+    
+    # Print eigenvectors if requested
+    if args.print_eigenvec:
+        print_eigenvecs(dftb_dir / 'eigenvec.bin', dftb_dir / 'detailed.xml', dftb_dir / 'waveplot_in.hsd', max_orbitals=6)
+        return
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
