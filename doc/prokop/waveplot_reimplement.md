@@ -2730,7 +2730,136 @@ Both scripts:
 - Have no system-specific code
 - Auto-detect HOMO/LUMO from occupations
 
-### 13. Reference: Input File Formats
+### 13. Dense-Matrix Kernels for d-Orbital Support
+
+#### 13.1 Overview
+
+The original OpenCL kernels in `Grid.cl` used a **sparse** representation optimized for s and p orbitals only, using `float4` blocks for 4x4 matrix operations. This limited support to systems with only s and p shells (e.g., H, C, N, O with mio-1-1 basis).
+
+A new set of **dense-matrix kernels** has been implemented to support arbitrary angular momentum including d-orbitals (l=2). The dense kernels:
+
+- Accept the full dense density matrix or MO coefficient vector directly
+- Support arbitrary orbital counts per atom (s=1, p=3, d=5, etc.)
+- Use shell-based angular function evaluation to minimize branching
+- Maintain the existing sparse kernel code path unchanged
+
+#### 13.2 New OpenCL Kernels (Grid.cl)
+
+**Added prefactors for d-orbitals:**
+```c
+#define PREF_D 1.09254843f   // sqrt(15/(4*pi))
+#define PREF_D_Z2 0.31539157f // for 3z^2-r^2
+#define PREF_D_X2Y2 0.54627422f // for x^2-y^2
+```
+
+**New helper functions:**
+- `eval_angular_dense(int l, int mm, float3 rhat)` - Real spherical harmonics for s, p, d orbitals
+  - Follows Fortran `realTessY` ordering: mm = -l to +l
+  - d-orbital ordering: -2(xy), -1(yz), 0(z²), 1(xz), 2(x²-y²)
+- `eval_atom_orbitals()` - Evaluates all orbitals for one atom at a point into a private array
+
+**New kernels:**
+1. `project_orbital_dense_points` - MO evaluation at arbitrary points using dense coefficient vector
+2. `project_density_dense_points` - Density evaluation at arbitrary points using dense density matrix
+3. `project_orbital_dense` - MO projection onto 3D grid
+4. `project_density_dense` - Density matrix projection onto 3D grid
+
+**Key design decisions:**
+- **Shell-based indexing**: Loop `ish=0..max_shells`, compute `l=ish`, then `mm=-l..+l`
+- **No `orb_types` array**: Angular functions computed on-the-fly from shell index
+- **Dense matrix indexing**: `dm[(i0_i + mu) * norb_total + (i0_j + nu)]`
+- **GPU execution model**: One workgroup per 8×8×8 voxel block, all threads process same atom pairs (no divergence)
+
+#### 13.3 Python Host Methods (Grid.py)
+
+**Modified functions:**
+- `load_basis_sto()` - Added `max_shells` parameter (default 2 for sp, use 3 for spd)
+- `setup_gridprojector_from_dftb()` - Added `max_shells` parameter
+
+**New helper:**
+- `_build_atom_data_dense()` - Builds `AtomData` with correct `i0orb` and `norb` for dense kernels
+
+**New projection methods:**
+1. `project_orbital_dense_points(points, coeffs_dense, norb_per_atom, orb_offsets, atoms_dict)`
+2. `project_density_dense_points(points, dm_dense, norb_per_atom, orb_offsets, atoms_dict)`
+3. `project_orbital_dense(coeffs_dense, norb_per_atom, orb_offsets, atoms_dict, grid_spec)`
+4. `project_density_dense(dm_dense, norb_per_atom, orb_offsets, atoms_dict, grid_spec)`
+
+**Orbital indexing:**
+- `norb_per_atom[ia]` - Number of orbitals for atom `ia` (sum of 2l+1 for each shell)
+- `orb_offsets[ia]` - Cumulative orbital offset, `orb_offsets[0]=0`, `orb_offsets[natoms]=norb_total`
+- `i0orb` in `AtomData` - Starting orbital index for this atom in the dense array
+
+#### 13.4 Test Results
+
+**Test script:** `tests/grid/compare_density_multizeta.py`
+
+**Modified to:**
+- Compute `max_shells` from basis (max l across all species)
+- Compute `orb_offsets` from `norb_per_atom`
+- Run both OLD (sparse) and NEW (dense) code paths
+- Generate separate comparison file: `dense_kernel_comparison_{system}_z{z_offset}.txt`
+- Updated Figure 2 to show 4 columns: libwaveplot, OLD (sparse), NEW (dense sum), NEW (dense DM)
+
+**Validation results:**
+
+| System | max_shells | norb_total | OLD vs NEW (orbital) | Dense-sum vs Dense-DM | Status |
+|--------|------------|------------|----------------------|-----------------------|--------|
+| H2O mio-1-1 | 2 | 6 | ~3e-08 | ~1.2e-07 | ✓ |
+| H2O 3ob-3-1 | 2 | 6 | ~3e-08 | ~1.8e-07 | ✓ |
+| PTCDA mio-1-1 | 2 | 128 | ~3e-08 | ~3.7e-07 | ✓ |
+
+**Interpretation:**
+- OLD vs NEW orbital maxdiff ~3e-08: Dense kernel produces identical results to sparse kernel for sp systems
+- Dense-sum vs Dense-DM maxdiff ~1e-07: Density matrix projection matches sum of squared orbitals
+- 3D grid tests: Both orbital and density projections completed successfully
+
+#### 13.5 Usage Example
+
+```python
+from pyBall.OCL.Grid import setup_gridprojector_from_dftb
+
+# Setup projector with d-orbital support
+max_shells = 3  # s, p, d
+projector, atoms_dict = setup_gridprojector_from_dftb(dftb_data, basis, max_shells=max_shells)
+
+# Compute orbital offsets
+orb_offsets = np.zeros(natoms + 1, dtype=np.int32)
+orb_offsets[1:] = np.cumsum(norb_per_atom)
+
+# Project MO using dense kernel
+coeffs_dense = evecs[imo].astype(np.float32)  # (norb_total,)
+psi_grid = projector.project_orbital_dense(
+    coeffs_dense, norb_per_atom, orb_offsets, atoms_dict, grid_spec
+)
+
+# Project density using dense kernel
+dm_dense = dftb.get_dm_dense().astype(np.float32)  # (norb_total, norb_total)
+rho_grid = projector.project_density_dense(
+    dm_dense, norb_per_atom, orb_offsets, atoms_dict, grid_spec
+)
+```
+
+#### 13.6 Comparison: OLD vs NEW
+
+**OLD (sparse) kernels:**
+- Input: Sparse density matrix blocks for atom-neighbor pairs
+- Orbital limit: 4 per atom (s + p)
+- Matrix operations: 4×4 `float4` block operations
+- Use: `project_orbital_points`, `project_density_sparse`
+
+**NEW (dense) kernels:**
+- Input: Full dense density matrix or MO coefficient vector
+- Orbital limit: Arbitrary (1, 4, 9, 16, ... for s, sp, spd, spdf, ...)
+- Matrix operations: General dense matrix multiplication
+- Use: `project_orbital_dense_points`, `project_density_dense_points`
+
+**Why both?**
+- OLD kernels remain for backward compatibility and sp-only systems
+- NEW kernels enable d-orbital support and are more general
+- Both produce identical results for sp systems (validated to ~3e-08)
+
+### 14. Reference: Input File Formats
 
 #### `geom.xyz` (for DFTB+ input)
 ```
@@ -2823,3 +2952,218 @@ When testing on the laptop (prokophapala), we observed that the overlap matrix S
 - Default coefficient if not specified: +1.0 (set in `DFTBplusParser.py` line 406: `coef_b = np.ones((1, len(exps_b)))`)
 - The negative S-matrix elements come from the SK files themselves, not from these coefficients
 - Example from dftb_h2o/waveplot_in.hsd: `Coefficients = { 1.0 }` for both H and O orbitals
+
+### 14. Simplified Density and Orbital Plotting Script
+
+#### 14.1 Overview
+
+A new simplified script `tests/grid/plot_density_simple.py` has been created for plotting molecular orbitals and total electron density using the DFTBcore library and OpenCL projector. This script:
+
+- **Does NOT use libwaveplot** (pyBall.WavePlot.WavePlot)
+- **Does NOT use dftb_utils module** (pyBall.dftb_utils)
+- **Only uses**: pyBall.DFTBcore and pyBall.OCL.Grid
+- Supports both orbital and density plotting
+- Supports dense projection method with d-orbital support
+- Provides flexible CLI with absolute or HOMO-relative MO indexing
+
+#### 14.2 Key Features
+
+**Projection methods:**
+- **Dense method** (default): Uses dense density matrix and MO coefficient vectors, supports d-orbitals (l=2)
+- **Sparse method**: Uses sparse kernel optimized for s and p orbitals only
+
+**Orbital indexing:**
+- Absolute indexing: `--mo 1 2 3` (1-based MO indices)
+- HOMO-relative: `--mo HOMO HOMO-1 LUMO LUMO+1`
+- Default: HOMO-4 to LUMO+4 (9 orbitals around HOMO/LUMO)
+
+**Grid specification:**
+- Grid step size: `--step 0.1` (default 0.1 Å)
+- Bounding box margin: `--margin 4.0` (default 4.0 Å)
+- Grid points auto-calculated from molecular extent
+
+**Visualization:**
+- Orbitals: Symmetric colormap (vmin=-vmax) with RdBu_r (zero-centered)
+- Density: Magma colormap (gnuplot-like)
+- Both with atom overlay
+
+#### 14.3 CLI Interface
+
+```bash
+python plot_density_simple.py \
+    --xyz <path to .xyz file> \
+    --basis {mio-1-1, 3ob-3-1} \
+    --work-dir <working directory> \
+    --mode {orbitals, density, both} \
+    --method {dense, sparse} \
+    --mo <MO indices> \
+    --z-offsets <z offsets in Å> \
+    --step <grid step in Å> \
+    --margin <margin in Å> \
+    --output-prefix <prefix> \
+    --dpi <resolution>
+```
+
+**Examples:**
+
+```bash
+# Plot HOMO-4 to LUMO+4 at z=1.5 Å (default behavior)
+python plot_density_simple.py \
+    --xyz /path/to/molecule.xyz \
+    --basis 3ob-3-1 \
+    --work-dir dftb_calc \
+    --mode orbitals \
+    --z-offsets 1.5
+
+# Plot density using dense method at multiple z-planes
+python plot_density_simple.py \
+    --xyz /path/to/molecule.xyz \
+    --basis 3ob-3-1 \
+    --work-dir dftb_calc \
+    --mode density \
+    --method dense \
+    --z-offsets 0.0 1.5 2.0
+
+# Plot specific orbitals (HOMO, LUMO)
+python plot_density_simple.py \
+    --xyz /path/to/molecule.xyz \
+    --basis mio-1-1 \
+    --work-dir dftb_calc \
+    --mode orbitals \
+    --mo HOMO LUMO
+
+# Plot both orbitals and density
+python plot_density_simple.py \
+    --xyz /path/to/molecule.xyz \
+    --basis 3ob-3-1 \
+    --work-dir dftb_calc \
+    --mode both \
+    --z-offsets 1.5
+```
+
+#### 14.4 How It Works
+
+**Step 1: DFTB+ Calculation (via DFTBcore library)**
+```python
+dftb = DFTBcore(libpath=str(lib_path))
+dftb.init(str(input_file))
+dftb.enable_matrix_collection(dm=True, h=False, s=True)
+energy = dftb.run_scf()
+evecs = dftb.get_eigvecs_dense()
+dm_dense = dftb.get_dm_dense()
+```
+
+**Step 2: Parse Output Files**
+- `detailed.xml`: geometry, occupations
+- `eigenvec.bin`: eigenvectors (binary)
+- `waveplot_in.hsd`: basis set parameters for projector
+
+**Step 3: Setup OpenCL Projector**
+```python
+projector, atoms_dict = setup_gridprojector_from_dftb(
+    dftb_data, 
+    basis, 
+    max_shells=3  # supports s, p, d orbitals
+)
+```
+
+**Step 4: Project Orbitals (dense method)**
+```python
+for imo in mo_indices:
+    coeffs = evecs[imo].astype(np.float32)
+    psi = projector.project_orbital_dense_points(
+        points_ang.astype(np.float32), 
+        coeffs,
+        norb_per_atom, 
+        orb_offsets, 
+        atoms_dict
+    )
+```
+
+**Step 5: Project Density (dense method)**
+```python
+# Method 1: From density matrix
+density_dm = projector.project_density_dense_points(
+    points_ang.astype(np.float32), 
+    dm_dense.astype(np.float32),
+    norb_per_atom, 
+    orb_offsets, 
+    atoms_dict
+)
+
+# Method 2: Sum of occupied orbitals (for validation)
+density_sum = sum(occ * |psi|^2 for occupied orbitals)
+```
+
+**Step 6: Plot with plotUtils**
+```python
+plotUtils.plot_2d_array(
+    values, 
+    extent, 
+    atom_coords, 
+    title, 
+    output_path, 
+    cmap='RdBu_r'  # orbitals
+    symmetric=True  # zero-centered
+)
+```
+
+#### 14.5 Dense vs Sparse Projection
+
+**Dense projection (supports d-orbitals):**
+- Accepts full dense MO coefficient vector (norb_total elements)
+- Accepts full dense density matrix (norb_total × norb_total)
+- Supports arbitrary orbital counts per atom (s=1, p=3, d=5, etc.)
+- Uses shell-based angular function evaluation
+- Required for basis sets with d-orbitals (e.g., 3ob-3-1 for Br)
+
+**Sparse projection (s/p only):**
+- Uses float4 blocks for 4x4 matrix operations
+- Optimized for s and p shells only
+- Limited to systems with max 4 orbitals per atom
+- Faster but less general
+
+**Key difference:** Dense method is required for d-orbital support in multi-zeta basis sets like 3ob-3-1.
+
+#### 14.6 Test Results
+
+**Tested with TBTAP molecule (3ob-3-1 basis):**
+- 306 basis functions (includes d-orbitals for Br)
+- 9 orbitals plotted (HOMO-4 to LUMO+3)
+- Grid: 262×262 at step=0.1 Å
+- Density projection: Sum vs DM maxdiff = 1.3e-8 (excellent agreement)
+- Both methods produce identical results within numerical precision
+
+**Orbital labels:**
+- Show both absolute index and HOMO-relative
+- Example: "MO147 (HOMO)", "MO146 (HOMO-1)", "MO148 (LUMO)"
+
+#### 14.7 Dependencies
+
+**Required modules:**
+- `pyBall.DFTBcore` - DFTB+ SCF calculation via library interface
+- `pyBall.OCL.Grid` - OpenCL projector for orbital/density projection
+- `pyBall.OCL.DFTBplusParser` - Parse detailed.xml, eigenvec.bin, waveplot_in.hsd
+- `pyBall.WavePlot.TestUtils.generate_2d_point_grid` - Generate 2D point grid
+- `pyBall.plotUtils.plot_2d_array` - Simple 2D array plotting
+
+**NOT required:**
+- libwaveplot (pyBall.WavePlot.WavePlot)
+- dftb_utils module (pyBall.dftb_utils)
+
+#### 14.8 Comparison with compare_density_multizeta.py
+
+**compare_density_multizeta.py:**
+- Purpose: Parity check between libwaveplot and OpenCL
+- Uses libwaveplot for reference results
+- Tests both sparse and dense methods
+- Complex comparison figures with difference plots
+
+**plot_density_simple.py:**
+- Purpose: Production plotting script for orbitals and density
+- No libwaveplot dependency
+- Uses dense method by default (supports d-orbitals)
+- Simple, clean output with proper colormaps
+- Flexible CLI with HOMO-relative indexing
+
+Both scripts use the same underlying OpenCL projector and dense projection method, but plot_density_simple.py is designed for everyday use with a simpler interface.

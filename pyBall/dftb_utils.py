@@ -768,6 +768,72 @@ def hessian_to_frequencies(hessian, masses):
     return frequencies, modes
 
 
+def run_dftb_scf(work_dir, lib_path=None, dm=True, h=False, s=True):
+    """Run DFTB+ SCF calculation and return eigenvectors, DM, occupations, detailed.
+    
+    Args:
+        work_dir: Path to directory with dftb_in.hsd
+        lib_path: Optional path to libdftbcore.so
+        dm: Collect density matrix
+        h: Collect Hamiltonian
+        s: Collect overlap matrix
+        
+    Returns:
+        dict with keys: evecs, dm_dense, s_dense, occupations, detailed, energy, basis_size
+    """
+    from .DFTBcore import DFTBcore
+    from pathlib import Path
+    import os
+    
+    work_dir = Path(work_dir)
+    
+    # Find libdftbcore.so if not provided
+    if lib_path is None:
+        lib_paths = [
+            Path(__file__).parent.parent / '_build' / 'app' / 'dftbcore' / 'libdftbcore.so',
+            Path(__file__).parent.parent / 'build' / 'libdftbcore.so',
+            Path(__file__).parent.parent / 'build' / 'lib' / 'libdftbcore.so',
+        ]
+        for p in lib_paths:
+            if p.exists():
+                lib_path = str(p)
+                break
+        if lib_path is None:
+            raise FileNotFoundError(f"libdftbcore.so not found in {lib_paths}")
+    
+    orig_dir = os.getcwd()
+    os.chdir(work_dir)
+    
+    try:
+        dftb = DFTBcore(libpath=str(lib_path))
+        input_file = work_dir / 'dftb_in.hsd'
+        dftb.init(str(input_file))
+        dftb.enable_matrix_collection(dm=dm, h=h, s=s)
+        energy = dftb.run_scf()
+        
+        evecs, eigenvals = dftb.get_eigvecs_dense()
+        dm_dense = dftb.get_dm_dense() if dm else None
+        s_dense = dftb.get_s_dense() if s else None
+        basis_size = dftb.get_basis_size()
+        
+        dftb.finalize()
+    finally:
+        os.chdir(orig_dir)
+    
+    from .OCL.DFTBplusParser import parse_detailed_xml_custom
+    detailed = parse_detailed_xml_custom(str(work_dir / 'detailed.xml'))
+    occupations = np.array(detailed['occupations']).flatten()
+    
+    return {
+        'evecs': evecs,
+        'dm_dense': dm_dense,
+        's_dense': s_dense,
+        'occupations': occupations,
+        'detailed': detailed,
+        'energy': energy,
+        'basis_size': basis_size,
+    }
+
 # ============ Molecular Orbitals (Waveplot) ============
 
 def run_waveplot(workdir='.', waveplot_exe='waveplot', 
