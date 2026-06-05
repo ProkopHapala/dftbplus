@@ -793,6 +793,40 @@ f"""
 #   Orbital comparison plotting   #
 #############################
 
+def plot_2d_array(values, extent, atom_coords, title, output_path, dpi=150, cmap='viridis', symmetric=False):
+    """
+    Plot a single 2D array (density or orbital) with atoms overlay.
+    
+    Args:
+        values: (nx, ny) array of values
+        extent: [xmin, xmax, ymin, ymax] for imshow
+        atom_coords: (natoms, 3) array in Angstrom
+        title: plot title
+        output_path: path to save PNG
+        dpi: resolution
+        cmap: colormap name (use 'gnuplot' for gnuplot colorscale)
+        symmetric: if True, set vmin=-vmax to center zero
+    """
+    import matplotlib.pyplot as plt
+    fig, ax = plt.subplots(figsize=(8, 8))
+    
+    if symmetric:
+        vmax = np.max(np.abs(values))
+        vmin = -vmax
+    else:
+        vmin, vmax = None, None
+    
+    im = ax.imshow(values, origin='lower', cmap=cmap, extent=extent, vmin=vmin, vmax=vmax)
+    ax.set_title(title)
+    plt.colorbar(im, ax=ax)
+    
+    # Add atoms
+    ax.scatter(atom_coords[:, 0], atom_coords[:, 1], c='black', marker='.', s=10, alpha=0.5, zorder=10)
+    
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=dpi)
+    plt.close()
+
 def plot_comparison_2d(wp_vals, ocl_vals, diff_vals, extent, title_prefix, plane_desc, 
                       method_tag, mo_indices, energies, homo, output_path, dpi=150, 
                       atom_coords=None):
