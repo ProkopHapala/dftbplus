@@ -904,6 +904,31 @@ Same fix applied to `parse_numbers_strict` and grid-line tokenization.
 
 ---
 
+### Bug 5: Hardcoded 4-Orbitals-Per-Atom Assumption (LIMITATION)
+
+**Symptom:** Polyatomic molecules with mixed basis (e.g., HCOOH with s-only H and sp C/O) fail with matrix dimension mismatch. Rust produces 20×20 (5 atoms × 4 orbitals) while DFTB+ produces 14×14 (C:4 + O:4 + O:4 + H:1 + H:1).
+
+**Root cause:** `HamiltonianBuilder::build_non_scc` hardcodes `n_orb = 4 * n_atom` (line 43 in `hamiltonian.rs`). This assumes all atoms have sp basis (s, py, pz, px = 4 orbitals). In DFTB+ mio-1-1, H is s-only (1 orbital) while C, O, N are sp (4 orbitals).
+
+**Current status:** H2 and N2 parity tests pass because all atoms have the same basis (H2: both H with 1 orbital, N2: both N with 4 orbitals). Polyatomic tests fail due to this limitation.
+
+**Required fix:** Implement per-species orbital counting:
+1. Parse orbital count from SK file header or MaxAngularMomentum specification
+2. Create an orbital index map: `iAtomStart[iAtom] = cumulative orbital count`
+3. Use `iAtomStart` for matrix indexing instead of `4 * iAtom`
+4. Update rotation and assembly to handle variable block sizes
+
+**Files to modify:**
+- `src/sk_data.rs` — Add orbital count per species (parse from SK or user-specified)
+- `src/hamiltonian.rs` — Replace `4 * n_atom` with per-species orbital counting
+- `src/rotation.rs` — Generalize `rotate_sp_block` to handle variable orbital counts (s-only, sp-only, sd, etc.)
+
+**Test molecules affected:**
+- HCOOH (formic acid): 5 atoms, expected 14 orbitals (C:4, O:4, O:4, H:1, H:1)
+- HCONH2 (formamide): 6 atoms, expected 18 orbitals (C:4, O:4, N:4, H:1, H:1, H:1)
+
+---
+
 ### Reference: Fortran skMap Decoded Table
 
 From `src/dftbp/dftbplus/parser.F90` lines 3984–3990:

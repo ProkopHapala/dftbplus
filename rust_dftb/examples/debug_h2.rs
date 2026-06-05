@@ -7,11 +7,36 @@ fn main() {
     let ref_s = env::var("RUST_DFTB_REF_S").unwrap();
 
     let mol = env::var("RUST_DFTB_MOL").unwrap_or("H2".to_string());
-    let (species, coords): (Vec<String>, Vec<[f64; 3]>) = if mol == "N2" {
-        (vec!["N".to_string(), "N".to_string()], vec![[-1.05, 0.0, 0.0], [1.05, 0.0, 0.0]])
-    } else {
-        (vec!["H".to_string(), "H".to_string()], vec![[-0.75, 0.0, 0.0], [0.75, 0.0, 0.0]])
+    let (species, coords): (Vec<String>, Vec<[f64; 3]>) = match mol.as_str() {
+        "N2" => (vec!["N".to_string(), "N".to_string()], vec![[-1.05, 0.0, 0.0], [1.05, 0.0, 0.0]]),
+        "HCOOH" => (
+            vec!["C".to_string(), "O".to_string(), "O".to_string(), "H".to_string(), "H".to_string()],
+            vec![
+                [ 0.000,  0.000,  0.000],   // C
+                [ 2.300,  0.000,  0.000],   // O (carbonyl)
+                [-1.120,  2.250,  0.000],   // O (hydroxyl)
+                [-2.100,  0.000,  0.000],   // H (formyl)
+                [-2.500,  2.200,  0.000],   // H (hydroxyl)
+            ]
+        ),
+        "HCONH2" => (
+            vec!["C".to_string(), "O".to_string(), "N".to_string(), "H".to_string(), "H".to_string(), "H".to_string()],
+            vec![
+                [ 0.000,  0.000,  0.000],   // C
+                [ 2.300,  0.000,  0.000],   // O
+                [-1.300,  2.300,  0.000],   // N
+                [-2.100,  0.000,  0.000],   // H (formyl)
+                [-2.200,  2.300,  1.800],   // H (amine 1)
+                [-0.800,  3.200,  0.000],   // H (amine 2)
+            ]
+        ),
+        _ => (vec!["H".to_string(), "H".to_string()], vec![[-0.75, 0.0, 0.0], [0.75, 0.0, 0.0]]),
     };
+
+    println!("species.len() = {}", species.len());
+    for (i, s) in species.iter().enumerate() {
+        println!("  {}: {}", i, s);
+    }
 
     let sk = SkData::load_sk_folder(&sk_dir, ".skf", "-").unwrap();
 

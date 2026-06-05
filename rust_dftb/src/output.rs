@@ -12,43 +12,61 @@ pub struct DftbOutput;
 
 impl DftbOutput {
     /// Read DFTB+ `hamsqr*.dat` / `oversqr.dat` format.
+    /// Format: header comments, then "T  nOrb  nKpoint", then kpoint index, then "# MATRIX", then data.
     pub fn read_square(path: &str) -> Result<DMatrix<f64>> {
-        let f = File::open(path)?;
-        let mut it = BufReader::new(f).lines();
-        let header = it
-            .next()
-            .ok_or_else(|| DftbError::Parse("empty matrix file".into()))??;
-        let mut h = header.split_whitespace();
-        let n: usize = h
-            .next()
-            .ok_or_else(|| DftbError::Parse("missing n".into()))?
-            .parse()
-            .map_err(|e: std::num::ParseIntError| DftbError::Parse(e.to_string()))?;
-        let m: usize = h
-            .next()
-            .ok_or_else(|| DftbError::Parse("missing m".into()))?
-            .parse()
-            .map_err(|e: std::num::ParseIntError| DftbError::Parse(e.to_string()))?;
-        if n != m {
-            return Err(DftbError::Parse("expected square matrix".into()));
-        }
-
-        let mut data = Vec::with_capacity(n * n);
-        for _ in 0..n {
-            let line = it
-                .next()
-                .ok_or_else(|| DftbError::Parse("unexpected EOF".into()))??;
-            let row: Vec<f64> = line
-                .split_whitespace()
-                .map(|x| x.parse::<f64>().map_err(|e: std::num::ParseFloatError| DftbError::Parse(e.to_string())))
-                .collect::<Result<Vec<f64>>>()?;
-            if row.len() != n {
-                return Err(DftbError::Parse("row length mismatch".into()));
+        let content = std::fs::read_to_string(path)?;
+        
+        // Extract all numeric values, plus detect the dimension line
+        let mut values = Vec::new();
+        let mut dim_line_found = false;
+        let mut n_orb = 0;
+        
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
             }
-            data.extend_from_slice(&row);
+            
+            let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+            
+            // Check if this is the dimension line: "T  14  1" or similar
+            // It has 3 tokens: logical (T/F), nOrb, nKpoint
+            if tokens.len() == 3 && !dim_line_found {
+                if let (Ok(n), Ok(_k)) = (tokens[1].parse::<usize>(), tokens[2].parse::<usize>()) {
+                    n_orb = n;
+                    dim_line_found = true;
+                    continue; // Don't add dimension values to data
+                }
+            }
+            
+            // Skip single-number lines (kpoint index)
+            if tokens.len() == 1 && tokens[0].parse::<usize>().is_ok() {
+                continue;
+            }
+            
+            // Parse all numeric tokens as data
+            for token in tokens {
+                if let Ok(val) = token.parse::<f64>() {
+                    values.push(val);
+                }
+            }
         }
-
-        Ok(DMatrix::from_row_slice(n, n, &data))
+        
+        if !dim_line_found {
+            return Err(DftbError::Parse("could not find matrix dimension line".into()));
+        }
+        
+        let expected = n_orb * n_orb;
+        if values.len() < expected {
+            return Err(DftbError::Parse(format!(
+                "not enough data: got {} values, expected {} for {}x{} matrix",
+                values.len(), expected, n_orb, n_orb
+            )));
+        }
+        
+        // Take only the expected number of values (ignore any trailing)
+        let data: Vec<f64> = values[..expected].to_vec();
+        Ok(DMatrix::from_row_slice(n_orb, n_orb, &data))
     }
 
     pub fn write_square(path: &str, mat: &DMatrix<f64>) -> Result<()> {
