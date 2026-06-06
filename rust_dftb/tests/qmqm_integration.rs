@@ -27,7 +27,13 @@ fn fragment_h2_matches_full_system_non_scc() {
         [0.74, 0.0, 0.0], // H-H bond length in Å
     ];
 
-    let sk = SkData::load_sk_folder(sk_dir, ".skf", "-").unwrap();
+    let mut sk = SkData::load_sk_folder(sk_dir, ".skf", "-").unwrap();
+    let mut ang_map = std::collections::HashMap::new();
+    ang_map.insert("H".to_string(), vec![0]);
+    ang_map.insert("C".to_string(), vec![0, 1]);
+    ang_map.insert("N".to_string(), vec![0, 1]);
+    ang_map.insert("O".to_string(), vec![0, 1]);
+    sk.set_species_angular_momenta(ang_map);
 
     // Full-system Hamiltonian
     let builder = HamiltonianBuilder::new(sk.clone());
@@ -62,7 +68,13 @@ fn fragment_h2_diagonalization() {
         [0.74, 0.0, 0.0],
     ];
 
-    let sk = SkData::load_sk_folder(sk_dir, ".skf", "-").unwrap();
+    let mut sk = SkData::load_sk_folder(sk_dir, ".skf", "-").unwrap();
+    let mut ang_map = std::collections::HashMap::new();
+    ang_map.insert("H".to_string(), vec![0]);
+    ang_map.insert("C".to_string(), vec![0, 1]);
+    ang_map.insert("N".to_string(), vec![0, 1]);
+    ang_map.insert("O".to_string(), vec![0, 1]);
+    sk.set_species_angular_momenta(ang_map);
     let template = FragmentTemplate::new(&sk, species, coords.clone()).unwrap();
     let mut frag = Fragment::from_template(template, coords);
 
@@ -96,7 +108,13 @@ fn fragment_h2_fixed_neutral_charges() {
         [0.74, 0.0, 0.0],
     ];
 
-    let sk = SkData::load_sk_folder(sk_dir, ".skf", "-").unwrap();
+    let mut sk = SkData::load_sk_folder(sk_dir, ".skf", "-").unwrap();
+    let mut ang_map = std::collections::HashMap::new();
+    ang_map.insert("H".to_string(), vec![0]);
+    ang_map.insert("C".to_string(), vec![0, 1]);
+    ang_map.insert("N".to_string(), vec![0, 1]);
+    ang_map.insert("O".to_string(), vec![0, 1]);
+    sk.set_species_angular_momenta(ang_map);
     let template = FragmentTemplate::new(&sk, species, coords.clone()).unwrap();
     let mut frag = Fragment::from_template(template, coords);
 
@@ -121,6 +139,88 @@ fn fragment_h2_fixed_neutral_charges() {
         &nalgebra::DMatrix::from_row_slice(frag_ref.template.n_orbs, 1, &frag_ref.eigenvalues.as_slice()),
     );
     assert!(de < 1e-12, "Eigenvalues should match for neutral charges, diff = {de:e}");
+}
+
+/// Test N2 fragment: same parity check with more orbitals (sp basis).
+#[test]
+fn fragment_n2_matches_full_system_non_scc() {
+    let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else { return; };
+
+    let species = vec!["N".to_string(), "N".to_string()];
+    let coords = vec![
+        [0.0, 0.0, 0.0],
+        [1.10, 0.0, 0.0], // N≡N triple bond in Å
+    ];
+
+    let mut sk = SkData::load_sk_folder(sk_dir, ".skf", "-").unwrap();
+    let mut ang_map = std::collections::HashMap::new();
+    ang_map.insert("H".to_string(), vec![0]);
+    ang_map.insert("C".to_string(), vec![0, 1]);
+    ang_map.insert("N".to_string(), vec![0, 1]);
+    ang_map.insert("O".to_string(), vec![0, 1]);
+    sk.set_species_angular_momenta(ang_map);
+
+    let builder = HamiltonianBuilder::new(sk.clone());
+    let ham_full = builder.build_non_scc(&species, &coords).unwrap();
+
+    let template = FragmentTemplate::new(&sk, species.clone(), coords.clone()).unwrap();
+    let frag = Fragment::from_template(template, coords);
+
+    let dh = max_abs_diff(&ham_full.h0, &frag.template.h0);
+    let ds = max_abs_diff(&ham_full.s, &frag.template.s);
+
+    assert!(
+        dh < 1e-12,
+        "Fragment H0 should match full-system H0 for N2, diff = {dh:e}"
+    );
+    assert!(
+        ds < 1e-12,
+        "Fragment S should match full-system S for N2, diff = {ds:e}"
+    );
+}
+
+/// Test HCOOH (formic acid) fragment: multi-atom, multi-species parity.
+#[test]
+fn fragment_hcooh_matches_full_system_non_scc() {
+    let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else { return; };
+
+    let species = vec![
+        "H".to_string(), "C".to_string(), "O".to_string(), "O".to_string(), "H".to_string(),
+    ];
+    // Approximate formic acid geometry (Å)
+    let coords = vec![
+        [0.00, 0.00, 0.00], // H (hydroxyl)
+        [1.00, 0.00, 0.00], // C
+        [2.20, 0.00, 0.00], // O (carbonyl)
+        [1.50, 1.00, 0.00], // O (hydroxyl)
+        [2.20, 1.00, 0.00], // H (hydroxyl)
+    ];
+
+    let mut sk = SkData::load_sk_folder(sk_dir, ".skf", "-").unwrap();
+    let mut ang_map = std::collections::HashMap::new();
+    ang_map.insert("H".to_string(), vec![0]);
+    ang_map.insert("C".to_string(), vec![0, 1]);
+    ang_map.insert("N".to_string(), vec![0, 1]);
+    ang_map.insert("O".to_string(), vec![0, 1]);
+    sk.set_species_angular_momenta(ang_map);
+
+    let builder = HamiltonianBuilder::new(sk.clone());
+    let ham_full = builder.build_non_scc(&species, &coords).unwrap();
+
+    let template = FragmentTemplate::new(&sk, species.clone(), coords.clone()).unwrap();
+    let frag = Fragment::from_template(template, coords);
+
+    let dh = max_abs_diff(&ham_full.h0, &frag.template.h0);
+    let ds = max_abs_diff(&ham_full.s, &frag.template.s);
+
+    assert!(
+        dh < 1e-12,
+        "Fragment H0 should match full-system H0 for HCOOH, diff = {dh:e}"
+    );
+    assert!(
+        ds < 1e-12,
+        "Fragment S should match full-system S for HCOOH, diff = {ds:e}"
+    );
 }
 
 /// Test gamma function self-consistency: for a single atom,

@@ -227,12 +227,19 @@ impl Fragment {
         let eigenvalues = se.eigenvalues;
         let c_prime = se.eigenvectors;
 
+        // nalgebra does not guarantee sorted eigenvalues — sort ascending.
+        let n = eigenvalues.len();
+        let mut idx: Vec<usize> = (0..n).collect();
+        idx.sort_by(|&a, &b| eigenvalues[a].partial_cmp(&eigenvalues[b]).unwrap());
+
+        let sorted_eigenvalues: Vec<f64> = idx.iter().map(|&i| eigenvalues[i]).collect();
+        let sorted_c_prime = c_prime.select_columns(&idx);
+
         // 4. Back-transform: c = L⁻ᵀ·c'
-        let c = l.tr_solve_lower_triangular(&c_prime)
+        let c = l.tr_solve_lower_triangular(&sorted_c_prime)
             .ok_or_else(|| DftbError::InvalidInput("Failed to solve Lᵀ·c = c'".into()))?;
 
-        // Store results (eigenvalues sorted ascending by nalgebra)
-        self.eigenvalues = eigenvalues;
+        self.eigenvalues = DVector::from(sorted_eigenvalues);
         self.eigenvectors = c;
 
         Ok(())
