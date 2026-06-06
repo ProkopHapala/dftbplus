@@ -51,11 +51,6 @@ impl SpeciesOrbitals {
 //
 // Extended-format files store 20 columns directly (0-based indices 0..19),
 // so the new column maps directly: new_col=N → array index N-1.
-const OLD_SS_SIGMA: usize = 9; // old col 10 (0-based)
-const OLD_SP_SIGMA: usize = 8; // old col 9
-const OLD_PP_SIGMA: usize = 5; // old col 6
-const OLD_PP_PI:    usize = 6; // old col 7
-
 fn parse_f64(tok: &str) -> Result<f64> {
     let t = tok.replace('D', "E").replace('d', "e");
     t.parse::<f64>()
@@ -134,22 +129,15 @@ impl SkTableSp {
     }
 
     /// Evaluate SK integrals for a shell pair (ang1, ang2) at distance r.
+    /// Convenience wrapper around `eval_shell_integrals_into`.
     pub fn eval_shell_integrals(&self, ang1: i32, ang2: i32, r: f64)
         -> Result<(Vec<f64>, Vec<f64>)> {
-        let h_all = self.h.eval(r)?;
-        let s_all = self.s.eval(r)?;
-        if h_all.len() != s_all.len() {
-            return Err(DftbError::Parse("H and S integral count mismatch".into()));
-        }
-        let h_shell = match self.format {
-            SkFormat::Extended => extract_shell_integrals_new(&h_all, ang1, ang2),
-            SkFormat::Old => extract_shell_integrals_old(&h_all, ang1, ang2),
-        };
-        let s_shell = match self.format {
-            SkFormat::Extended => extract_shell_integrals_new(&s_all, ang1, ang2),
-            SkFormat::Old => extract_shell_integrals_old(&s_all, ang1, ang2),
-        };
-        Ok((h_shell, s_shell))
+        let (l_min, _) = if ang1 <= ang2 { (ang1, ang2) } else { (ang2, ang1) };
+        let n_mm = (l_min + 1) as usize;
+        let mut out_h = vec![0.0; n_mm];
+        let mut out_s = vec![0.0; n_mm];
+        self.eval_shell_integrals_into(ang1, ang2, r, &mut out_h, &mut out_s)?;
+        Ok((out_h, out_s))
     }
 
     /// Evaluate SK integrals into caller-provided buffers (no Vec allocation).
@@ -418,31 +406,6 @@ fn read_skf_all(path: &Path, sp1: &str, sp2: &str) -> Result<SkTableSp> {
     })
 }
 
-/// Extract SK integrals for a shell pair (ang1, ang2) from the raw old-format 10-integral array.
-/// The returned Vec has length = min(ang1, ang2) + 1, ordered by mm=0,1,...,min(ang1,ang2).
-///
-/// DFTB+ skMap(mm, lMax, lMin) → new column → old column via iSKInterOld.
-fn extract_shell_integrals_old(arr10: &[f64], ang1: i32, ang2: i32) -> Vec<f64> {
-    // iSKInterOld maps old col → new col: [8,9,10,13,14,15,16,18,19,20]
-    let iSKInterOld: [usize; 10] = [8, 9, 10, 13, 14, 15, 16, 18, 19, 20];
-    // Inverse: new col → old index (0-based)
-    let mut new_to_old = [0usize; 21];
-    for (old_idx, &new_col) in iSKInterOld.iter().enumerate() {
-        new_to_old[new_col] = old_idx;
-    }
-
-    let (l_min, l_max) = if ang1 <= ang2 { (ang1, ang2) } else { (ang2, ang1) };
-    let n_mm = (l_min + 1) as usize;
-    let mut out = Vec::with_capacity(n_mm);
-
-    for mm in 0..=l_min {
-        let new_col = sk_map(mm, l_max, l_min);
-        let old_idx = new_to_old[new_col as usize];
-        out.push(arr10[old_idx]);
-    }
-    out
-}
-
 /// DFTB+ skMap(mm, lMax, lMin) decoded from parser.F90.
 fn sk_map(mm: i32, l_max: i32, l_min: i32) -> i32 {
     // From Fortran reshape((/.../), (/4,4,4/)) in column-major order
@@ -453,16 +416,4 @@ fn sk_map(mm: i32, l_max: i32, l_min: i32) -> i32 {
         (1, 1, 1) => 16, // ppπ
         _ => panic!("sk_map: unsupported ({}, {}, {})", mm, l_max, l_min),
     }
-}
-
-/// Extract SK integrals for a shell pair (ang1, ang2) from raw extended-format 20-integral array.
-fn extract_shell_integrals_new(arr20: &[f64], ang1: i32, ang2: i32) -> Vec<f64> {
-    let (l_min, l_max) = if ang1 <= ang2 { (ang1, ang2) } else { (ang2, ang1) };
-    let n_mm = (l_min + 1) as usize;
-    let mut out = Vec::with_capacity(n_mm);
-    for mm in 0..=l_min {
-        let new_col = sk_map(mm, l_max, l_min) as usize;
-        out.push(arr20[new_col - 1]); // 0-based
-    }
-    out
 }
