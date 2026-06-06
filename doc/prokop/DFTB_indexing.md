@@ -1,3 +1,8 @@
+@CODEMAP: DFTB+ Sparse Hamiltonian Indexing (Fortran) vs Dense Hamiltonian Construction (Rust)
+https://windsurf.com/codemaps/127cdb9c-d166-4f9c-acad-2a4f3f547404-fe86ab10a43f3d18
+
+
+
 # Fortran Sparse Indexing vs. Rust Reimplementation
 
 ## 1. The Sparse Data Structure (`iPair` / `iSparseStart`)
