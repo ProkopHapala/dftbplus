@@ -140,6 +140,46 @@ pub const cov_rad: &[f64] = &[
     (4.0/3.0) * 0.63 * 1.889726133, // O
 ];
 
+/// Hubbard parameters (atomic hardnesses) for second-order electrostatics [element]
+pub const hubbard_parameter: &[f64] = &[
+    0.470099, // H
+    1.441379, // He
+    0.205342, // Li
+    0.274022, // Be
+    0.340530, // B
+    0.479988, // C
+    0.476106, // N
+    0.583349, // O
+];
+
+/// Shell Hubbard scaling factors (1.0 + delta) [element][l=0,1,2]
+/// From tblite gfn1.f90 shell_hubbard(0:2, max_elem), elements 1-8
+pub const shell_hubbard: &[[f64; 3]] = &[
+    [1.0, 1.0,       1.0],   // H  (1): s=+0.0, p=+0.0
+    [1.0, 1.0,       1.0],   // He (2): s=+0.0, p=+0.0
+    [1.0, 0.9227988, 1.0],   // Li (3): s=+0.0, p=-0.0772012
+    [1.0, 1.1113005, 1.0],   // Be (4): s=+0.0, p=+0.1113005
+    [1.0, 1.0165643, 1.0],   // B  (5): s=+0.0, p=+0.0165643
+    [1.0, 0.9528819, 1.0],   // C  (6): s=+0.0, p=-0.0471181
+    [1.0, 1.0315090, 1.0],   // N  (7): s=+0.0, p=+0.0315090
+    [1.0, 1.0374608, 1.0],   // O  (8): s=+0.0, p=+0.0374608
+];
+
+/// Third-order Hubbard derivatives [element]
+pub const hubbard_derivs: &[f64] = &[
+    0.000000, // H
+    0.1500000, // He  (1.500000 * 0.1)
+    0.1027370, // Li  (1.027370 * 0.1)
+    0.0900554, // Be  (0.900554 * 0.1)
+    0.1300000, // B   (1.300000 * 0.1)
+    0.1053856, // C   (1.053856 * 0.1)
+    0.0042507, // N   (0.042507 * 0.1)
+    -0.0005102, // O  (-0.005102 * 0.1)
+];
+
+/// Coulomb kernel exponent for GFN1 (Klopman-Ohno)
+pub const GEXP: f64 = 2.0;
+
 /// evtoau for GFN1
 pub fn ev_to_au(ev: f64) -> f64 {
     ev * EVTOAU

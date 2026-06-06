@@ -91,6 +91,14 @@ int main(int argc, char **argv) {
     double *smat = calloc(nao * nao, sizeof(double));
     tblite_get_result_overlap_matrix(err, res, smat);
 
+    /* Density matrix (dense nao×nao) */
+    double *pmat = calloc(nao * nao, sizeof(double));
+    tblite_get_result_density_matrix(err, res, pmat);
+
+    /* Orbital coefficients (dense nao×nao) */
+    double *cmat = calloc(nao * nao, sizeof(double));
+    tblite_get_result_orbital_coefficients(err, res, cmat);
+
     /* Output JSON */
     printf("{\n");
     printf("  \"nat\": %d,\n", nat);
@@ -115,10 +123,20 @@ int main(int argc, char **argv) {
     for (int i = 0; i < nao * nao; ++i) {
         printf("%.16e%s", smat[i], (i + 1 < nao * nao) ? ", " : "");
     }
+    printf("],\n");
+    printf("  \"density\": [");
+    for (int i = 0; i < nao * nao; ++i) {
+        printf("%.16e%s", pmat[i], (i + 1 < nao * nao) ? ", " : "");
+    }
+    printf("],\n");
+    printf("  \"coefficients\": [");
+    for (int i = 0; i < nao * nao; ++i) {
+        printf("%.16e%s", cmat[i], (i + 1 < nao * nao) ? ", " : "");
+    }
     printf("]\n");
     printf("}\n");
 
-    free(xyz); free(num); free(qat); free(emo); free(hmat); free(smat);
+    free(xyz); free(num); free(qat); free(emo); free(hmat); free(smat); free(pmat); free(cmat);
     tblite_delete_result(&res);
     tblite_delete_calculator(&calc);
     tblite_delete_structure(&mol);
