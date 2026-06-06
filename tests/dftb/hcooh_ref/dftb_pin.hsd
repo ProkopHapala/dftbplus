@@ -1,6 +1,6 @@
 Geometry = GenFormat {
 5  C
-H C O
+H  C  O
 1  1  0.0000000000E+00  0.0000000000E+00  0.0000000000E+00
 2  2  1.0000000000E+00  0.0000000000E+00  0.0000000000E+00
 3  3  2.2000000000E+00  0.0000000000E+00  0.0000000000E+00
@@ -8,7 +8,36 @@ H C O
 5  1  2.2000000000E+00  1.0000000000E+00  0.0000000000E+00
 }
 Hamiltonian = DFTB {
-  SCC = No
+  SCC = Yes
+  SCCTolerance = 1.0E-010
+  MaxSCCIterations = 1
+  Charge = 0.0
+  InitialCharges = {
+    AtomCharge = {
+      Atoms = {
+1
+      }
+      ChargePerAtom = 0.1
+    }
+    AtomCharge = {
+      Atoms = {
+2
+      }
+      ChargePerAtom = -0.1
+    }
+    AtomCharge = {
+      Atoms = {
+3
+      }
+      ChargePerAtom = 0.1
+    }
+    AtomCharge = {
+      Atoms = {
+4
+      }
+      ChargePerAtom = -0.1
+    }
+  }
   MaxAngularMomentum = {
     H = "s"
     C = "p"
@@ -25,16 +54,33 @@ Hamiltonian = DFTB {
   }
   PolynomialRepulsive = {}
   Hybrid = None {}
+  ShellResolvedSCC = No
   OldSKInterpolation = No
+  ReadInitialCharges = No
+  ConvergentSCCOnly = Yes
+  RecomputeAfterDensity = Yes
+  HCorrection = None {}
   SpinPolarisation = {}
   ElectricField = {}
   Solver = RelativelyRobust {}
-  Charge = 0.0000000000000000
+  OnSiteCorrection = {}
   Dispersion = {}
   Solvation = {}
   ElectronicConstraints = {}
+  Electrostatics = GammaFunctional {}
+  Mdftb = None {}
+  ThirdOrder = No
+  ThirdOrderFull = No
   Differentiation = FiniteDiff {
     Delta = 1.2207031250000000E-004
+  }
+  ForceEvaluation = "Traditional"
+  Mixer = Broyden {
+    MixingParameter = 0.20000000000000001
+    InverseJacobiWeight = 1.0000000000000000E-002
+    MinimalWeight = 1.0000000000000000
+    MaximalWeight = 100000.00000000000
+    WeightFactor = 1.0000000000000000E-002
   }
 }
 Options = {
@@ -43,6 +89,7 @@ Options = {
   WriteAutotestTag = No
   WriteDetailedXML = No
   WriteResultsTag = No
+  RestartFrequency = 20
   RandomSeed = 0
   WriteRealHS = No
   MinimiseMemoryUsage = No

@@ -16,6 +16,8 @@ use crate::qmqm::neighbor::FragmentNeighborList;
 use crate::qmqm::fragment::Fragment;
 use crate::qmqm::shifts::compute_intra_shifts;
 
+const ANG2BOHR: f64 = 1.889_726_133;
+
 /// QM/QM multi-system solver.
 #[derive(Debug)]
 pub struct MultiSystemSolver<M: Mixer> {
@@ -148,7 +150,7 @@ impl<M: Mixer> MultiSystemSolver<M> {
                         let dx = coord_i[0] - frag_j.coords[aj][0];
                         let dy = coord_i[1] - frag_j.coords[aj][1];
                         let dz = coord_i[2] - frag_j.coords[aj][2];
-                        let r = (dx * dx + dy * dy + dz * dz).sqrt();
+                        let r = (dx * dx + dy * dy + dz * dz).sqrt() * ANG2BOHR;
                         let sp_j = frag_j.template.atom_species[aj];
                         let g = self.gamma.gamma(r, sp_i, sp_j);
                         *vi += g * dq;

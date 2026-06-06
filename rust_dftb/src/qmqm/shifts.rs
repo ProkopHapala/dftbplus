@@ -12,6 +12,8 @@
 
 use crate::qmqm::gamma::GammaTable;
 
+const ANG2BOHR: f64 = 1.889_726_133;
+
 /// Compute intra-fragment shifts for all atoms in a fragment.
 ///
 /// `coords`  – atom coordinates, length `n_atoms`.
@@ -42,7 +44,7 @@ pub fn compute_intra_shifts(
             let dx = coords[i][0] - coords[j][0];
             let dy = coords[i][1] - coords[j][1];
             let dz = coords[i][2] - coords[j][2];
-            let r = (dx * dx + dy * dy + dz * dz).sqrt();
+            let r = (dx * dx + dy * dy + dz * dz).sqrt() * ANG2BOHR;
             let g = gamma_tbl.gamma(r, species[i], species[j]);
 
             out[i] += g * delta_q[j];
@@ -73,7 +75,7 @@ pub fn compute_intra_shift_atom(
         let dx = coords[iat][0] - coords[j][0];
         let dy = coords[iat][1] - coords[j][1];
         let dz = coords[iat][2] - coords[j][2];
-        let r = (dx * dx + dy * dy + dz * dz).sqrt();
+        let r = (dx * dx + dy * dy + dz * dz).sqrt() * ANG2BOHR;
         let g = gamma_tbl.gamma(r, species[iat], species[j]);
         shift += g * delta_q[j];
     }
@@ -99,7 +101,8 @@ mod tests {
 
     #[test]
     fn intra_shift_two_atoms() {
-        let coords = vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]];
+        // 1.0 Bohr in Ångström so that after ANG2BOHR conversion gamma sees r=1.0
+        let coords = vec![[0.0, 0.0, 0.0], [1.0 / ANG2BOHR, 0.0, 0.0]];
         let species = vec![0u8, 0u8];
         let delta_q = vec![0.2, -0.1];
         let gamma = GammaTable::from_hubbard_u(vec![0.5]);
