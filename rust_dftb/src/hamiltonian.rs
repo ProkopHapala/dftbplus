@@ -22,8 +22,17 @@ impl HamiltonianBuilder {
 
     /// Build non-SCC H0 and overlap S for arbitrary basis per species.
     ///
-    /// Orbital ordering matches DFTB+: per atom, shells in order (s, p, d, ...),
-    /// within each shell: tesseral ordering (py, pz, px for p; etc.).
+    /// This builds dense matrices directly (not sparse). For small molecules this
+    /// is fine and avoids the sparse indexing machinery (iPair in Fortran).
+    ///
+    /// ORBITAL LAYOUT CONVENTION:
+    ///   i_orb_atom[i] = cumulative orbital count before atom i
+    ///   Atom i occupies orbitals i_orb_atom[i] .. i_orb_atom[i+1]-1
+    ///
+    /// Per-atom orbital ordering matches DFTB+:
+    ///   shells in increasing l (s, then p, then d, ...)
+    ///   within each shell: tesseral ordering by m = -l, ..., +l
+    ///   Example sp: [s, py(m=-1), pz(m=0), px(m=+1)]
     pub fn build_non_scc(&self, species: &[String], coords: &[[f64; 3]]) -> Result<Hamiltonian> {
         if species.len() != coords.len() {
             return Err(DftbError::InvalidInput(
@@ -40,7 +49,9 @@ impl HamiltonianBuilder {
 
         let neigh = NeighborBuilder { cutoff }.build(coords)?;
 
-        // Compute per-atom orbital offsets (cumulative)
+        // i_orb_atom[i] = first orbital index of atom i in the dense matrix.
+        // This is the Rust equivalent of Fortran's orbital offset bookkeeping.
+        // Example: 5 atoms [C(4), O(4), O(4), H(1), H(1)] → i_orb_atom = [0,4,8,12,13,14]
         let n_atom = coords.len();
         let mut i_orb_atom = vec![0usize; n_atom + 1];
         for i in 0..n_atom {
@@ -90,23 +101,28 @@ impl HamiltonianBuilder {
         s: &mut DMatrix<f64>,
     ) -> Result<()> {
         for p in &neigh.pairs {
-            let sp1 = &species[p.i];
-            let sp2 = &species[p.j];
+            let sp1 = &species[p.i];  // atom i (defines matrix COLUMNS)
+            let sp2 = &species[p.j];  // atom j (defines matrix ROWS)
 
             let dc = DirectionCosines::from_vec(p.vec_ij)?;
+            // rotate_diatomic_block returns a block where:
+            //   rows = orbitals of atom j, cols = orbitals of atom i
+            // This is the lower-left submatrix of the dense Hamiltonian.
             let (h_blk, s_blk) = Rotation::rotate_diatomic_block(&self.sk, sp1, sp2, p.r, dc)?;
 
-            let bi = i_orb_atom[p.i]; // atom i start
-            let bj = i_orb_atom[p.j]; // atom j start
-            let ni = self.sk.n_orb_species(sp1)?;
-            let nj = self.sk.n_orb_species(sp2)?;
+            let bi = i_orb_atom[p.i]; // first orbital of atom i
+            let bj = i_orb_atom[p.j]; // first orbital of atom j
+            let ni = self.sk.n_orb_species(sp1)?; // n_orb atom i
+            let nj = self.sk.n_orb_species(sp2)?; // n_orb atom j
 
+            // Place the lower-left block and its hermitian transpose.
+            // Fortran stores only the lower triangle in sparse format;
+            // we build dense directly so we write both triangles explicitly.
             for a in 0..nj {
                 for b in 0..ni {
-                    // h_blk rows = atom j orbitals, cols = atom i orbitals
-                    // lower-left block: h0[atomJ_row, atomI_col]
+                    // lower-left: h0[atomJ_row, atomI_col]
                     h0[(bj + a, bi + b)] = h_blk[(a, b)];
-                    // upper-right: hermitian transpose
+                    // upper-right: hermitian partner (same value for real matrices)
                     h0[(bi + b, bj + a)] = h_blk[(a, b)];
 
                     s[(bj + a, bi + b)] = s_blk[(a, b)];

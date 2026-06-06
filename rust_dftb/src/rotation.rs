@@ -25,7 +25,24 @@ impl DirectionCosines {
 }
 
 /// Rotation routines matching DFTB+ `src/dftbp/dftb/sk.F90`.
-/// p orbitals are ordered (py, pz, px).
+///
+/// ORBITAL ORDERING (NON-OBVIOUS):
+/// DFTB+ uses tesseral/real spherical harmonics ordered by magnetic quantum number m:
+///   l=0 (s):  [s]
+///   l=1 (p):  [py (m=-1), pz (m=0), px (m=+1)]   ← NOT px,py,pz!
+///   l=2 (d):  [xy, yz, z2, xz, x2-y2]
+///
+/// SHELL ITERATION CONVENTION (from Fortran rotateH0):
+///   Outer loop: shells of atom i (species sp1) → matrix COLUMNS
+///   Inner loop: shells of atom j (species sp2) → matrix ROWS
+///   i_col increments by n_orb(sp1_shell), i_row increments by n_orb(sp2_shell)
+///
+/// TRANSPOSE/SIGN RULE (from Fortran rotateH0):
+///   If ang1 <= ang2: direct placement (tmpH rows=atomJ, cols=atomI)
+///   If ang1 >  ang2: transpose(tmpH) * (-1)^(ang1+ang2)
+///   Example: sp block (ang1=0, ang2=1) → direct
+///            ps block (ang1=1, ang2=0) → transpose * (-1)^1 = -transpose
+///   This is needed because old-format SK files assume lMax >= lMin.
 pub struct Rotation;
 
 impl Rotation {
@@ -93,17 +110,21 @@ impl Rotation {
     /// Returns (h_blk, s_blk) with dimensions:
     ///   rows = n_orb(sp2), cols = n_orb(sp1)
     ///
-    /// This iterates over shells like Fortran rotateH0.
+    /// This iterates over shells like Fortran rotateH0. The resulting block is
+    /// placed into the global dense matrix as the lower-left submatrix:
+    ///   h0[atom_j_row_start .. atom_j_row_start+n_orb2, atom_i_col_start .. atom_i_col_start+n_orb1]
     pub fn rotate_diatomic_block(sk: &SkData, sp1: &str, sp2: &str, r: f64, dc: DirectionCosines)
         -> Result<(DMatrix<f64>, DMatrix<f64>)> {
-        let ang1_list = sk.ang_shells(sp1)?;
-        let ang2_list = sk.ang_shells(sp2)?;
+        let ang1_list = sk.ang_shells(sp1)?;  // shells of atom i → matrix COLUMNS
+        let ang2_list = sk.ang_shells(sp2)?;  // shells of atom j → matrix ROWS
         let n_orb1: usize = ang1_list.iter().map(|&l| (2 * l + 1) as usize).sum();
         let n_orb2: usize = ang2_list.iter().map(|&l| (2 * l + 1) as usize).sum();
 
         let mut h_blk = DMatrix::<f64>::zeros(n_orb2, n_orb1);
         let mut s_blk = DMatrix::<f64>::zeros(n_orb2, n_orb1);
 
+        // Shell iteration: outer loop over atom-i shells, inner loop over atom-j shells.
+        // This matches Fortran rotateH0 exactly.
         let mut i_col = 0;
         for &ang1 in ang1_list {
             let n_orb1_sh = (2 * ang1 + 1) as usize;
@@ -113,9 +134,10 @@ impl Rotation {
                 let (h_sk, s_sk) = sk.eval_shell_integrals(sp1, sp2, ang1, ang2, r)?;
                 let (h_sub, s_sub) = Self::rotate_shell_pair(ang1, ang2, &h_sk, &s_sk, dc)?;
 
-                // Fortran placement rule:
-                // ang1 <= ang2: direct (tmpH rows=atom2, cols=atom1)
-                // ang1 > ang2: transpose with (-1)^(ang1+ang2) sign
+                // Fortran rotateH0 placement rule:
+                //   ang1 <= ang2: direct (tmpH rows=atomJ orbitals, cols=atomI orbitals)
+                //   ang1 > ang2: transpose(tmpH) * (-1)^(ang1+ang2)
+                // The sign factor ensures hermitian symmetry after the transpose.
                 if ang1 <= ang2 {
                     for a in 0..n_orb2_sh {
                         for b in 0..n_orb1_sh {

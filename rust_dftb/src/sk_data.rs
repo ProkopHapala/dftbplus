@@ -34,13 +34,23 @@ impl SpeciesOrbitals {
     }
 }
 
-// Indices into the OLD 10-column SK table (0-based) for sp interactions.
-// skMap(mm, lMax, lMin) in parser.F90 is Fortran column-major (mm varies fastest):
-//   ss-σ: skMap(0, lMax=0, lMin=0)=20 → iSKInterOld pos 10 → old index 9
-//   sp-σ: skMap(0, lMax=1, lMin=0)=19 → iSKInterOld pos  9 → old index 8
-//   pp-σ: skMap(0, lMax=1, lMin=1)=15 → iSKInterOld pos  6 → old index 5
-//   pp-π: skMap(1, lMax=1, lMin=1)=16 → iSKInterOld pos  7 → old index 6
-// iSKInterOld = [8,9,10,13,14,15,16,18,19,20] (1-based new indices)
+// --- SK FILE COLUMN CONVENTIONS (NON-OBVIOUS) ---
+//
+// Old-format .skf files store 10 integral columns per grid point (0-based):
+//   [ham10[0..10] | over10[0..10]]
+//
+// These 10 columns map to the 20 "new" columns via iSKInterOld:
+//   iSKInterOld = [8,9,10,13,14,15,16,18,19,20]  (1-based new column indices)
+//
+// The skMap(mm, lMax, lMin) array (Fortran column-major, mm fastest) gives the
+// new column for each (mm, lMax, lMin) combination:
+//   ss-σ: skMap(0,0,0)=20 → iSKInterOld[9]=20 → old index 9
+//   sp-σ: skMap(0,1,0)=19 → iSKInterOld[8]=19 → old index 8
+//   pp-σ: skMap(0,1,1)=15 → iSKInterOld[5]=15 → old index 5
+//   pp-π: skMap(1,1,1)=16 → iSKInterOld[6]=16 → old index 6
+//
+// Extended-format files store 20 columns directly (0-based indices 0..19),
+// so the new column maps directly: new_col=N → array index N-1.
 const OLD_SS_SIGMA: usize = 9; // old col 10 (0-based)
 const OLD_SP_SIGMA: usize = 8; // old col 9
 const OLD_PP_SIGMA: usize = 5; // old col 6
@@ -165,12 +175,15 @@ impl SkData {
     /// Evaluate SK integrals at distance `r` for a specific shell pair (ang1, ang2)
     /// between species sp1 and sp2. Returns (h_integrals, s_integrals), each of length min(ang1,ang2)+1.
     ///
-    /// When ang1 > ang2, DFTB+ swaps to the reversed species pair SK data
-    /// (skData21 in Fortran), because the old-format SK files store integrals
-    /// with the convention that the "first" species has the lower angular momentum.
+    /// CRITICAL: When ang1 > ang2, we must use the REVERSED species pair SK data.
+    /// Old-format .skf files are NOT symmetric: C-O.skf and O-C.skf contain different
+    /// data because the radial wavefunctions differ per species. Fortran getFullTable
+    /// uses skData21 (the reversed file) when l1 > l2.
     pub fn eval_shell_integrals(&self, sp1: &str, sp2: &str, ang1: i32, ang2: i32, r: f64)
         -> Result<(Vec<f64>, Vec<f64>)> {
-        // Fortran getFullTable: if l1 > l2, use skData21(iSK1,iSK2) = reversed pair data
+        // Fortran getFullTable logic:
+        //   if l1 <= l2: use skData12 (sp1-sp2 file)
+        //   if l1 >  l2: use skData21 (sp2-sp1 file = reversed pair)
         let (lookup_sp1, lookup_sp2) = if ang1 <= ang2 {
             (sp1, sp2)
         } else {
