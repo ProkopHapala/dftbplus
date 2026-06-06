@@ -15,7 +15,7 @@ pub mod output;
 pub mod qmqm;
 
 pub use error::{DftbError, Result};
-pub use sk_data::{SkData, SkFormat, SkTableSp, SpeciesOrbitals};
+pub use sk_data::{SkData, SkTableSp, SpeciesOrbitals};
 pub use interpolation::{InterpolationMethod, EqGridTable};
 pub use rotation::{Rotation, DirectionCosines};
 pub use neighbor::{NeighborList, NeighborBuilder};

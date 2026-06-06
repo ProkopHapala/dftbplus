@@ -5,6 +5,10 @@ use crate::sk_data::{AtomicParamsSp, SkData, SkTableSp};
 use nalgebra::DMatrix;
 use std::collections::HashMap;
 
+/// DFTB+ internal units: Bohr. Input coordinates are in Ångström.
+const ANG2BOHR: f64 = 1.889726133;
+
+
 #[derive(Debug, Clone)]
 pub struct Hamiltonian {
     pub h0: DMatrix<f64>,
@@ -156,12 +160,19 @@ impl HamiltonianBuilder {
     }
 
     /// Build non-SCC H0 and overlap S for arbitrary basis per species.
+    /// Input coords are in Ångström; converted to Bohr internally to match DFTB+.
     pub fn build_non_scc(&self, species: &[String], coords: &[[f64; 3]]) -> Result<Hamiltonian> {
         if species.len() != coords.len() {
             return Err(DftbError::InvalidInput(
                 "species and coords length mismatch".into(),
             ));
         }
+
+        // Convert coordinates from Ångström to Bohr (DFTB+ internal units)
+        let coords_bohr: Vec<[f64; 3]> = coords
+            .iter()
+            .map(|c| [c[0] * ANG2BOHR, c[1] * ANG2BOHR, c[2] * ANG2BOHR])
+            .collect();
 
         let cutoff = self
             .sk
@@ -170,7 +181,7 @@ impl HamiltonianBuilder {
             .map(|t| t.cutoff())
             .fold(0.0_f64, f64::max);
 
-        let neigh = NeighborBuilder { cutoff }.build(coords)?;
+        let neigh = NeighborBuilder { cutoff }.build(&coords_bohr)?;
 
         // Precompute all numerical-indexed lookups. After this, the hot loop
         // uses only Vec<u8>/Vec<u16> indexing — no HashMap, no String, no hashing.
@@ -194,6 +205,12 @@ impl HamiltonianBuilder {
             ));
         }
 
+        // Convert coordinates from Ångström to Bohr (DFTB+ internal units)
+        let coords_bohr: Vec<[f64; 3]> = coords
+            .iter()
+            .map(|c| [c[0] * ANG2BOHR, c[1] * ANG2BOHR, c[2] * ANG2BOHR])
+            .collect();
+
         let cutoff = self
             .sk
             .pairs
@@ -201,7 +218,7 @@ impl HamiltonianBuilder {
             .map(|t| t.cutoff())
             .fold(0.0_f64, f64::max);
 
-        let neigh = NeighborBuilder { cutoff }.build(coords)?;
+        let neigh = NeighborBuilder { cutoff }.build(&coords_bohr)?;
         let ctx = SystemContext::from_sk_data(&self.sk, species)?;
 
         // Verify sp-only

@@ -108,36 +108,17 @@ pub struct AtomicParamsSp {
     pub e_p: f64,
 }
 
-#[derive(Debug, Clone, Copy)]
-pub enum SkFormat {
-    Old,
-    Extended,
-}
-
 #[derive(Debug, Clone)]
 pub struct SkTableSp {
     pub sp1: String,
     pub sp2: String,
     pub h: EqGridTable, // [n_grid][4]
     pub s: EqGridTable, // [n_grid][4]
-    pub format: SkFormat,
 }
 
 impl SkTableSp {
     pub fn cutoff(&self) -> f64 {
         self.h.r_max()
-    }
-
-    /// Evaluate SK integrals for a shell pair (ang1, ang2) at distance r.
-    /// Convenience wrapper around `eval_shell_integrals_into`.
-    pub fn eval_shell_integrals(&self, ang1: i32, ang2: i32, r: f64)
-        -> Result<(Vec<f64>, Vec<f64>)> {
-        let (l_min, _) = if ang1 <= ang2 { (ang1, ang2) } else { (ang2, ang1) };
-        let n_mm = (l_min + 1) as usize;
-        let mut out_h = vec![0.0; n_mm];
-        let mut out_s = vec![0.0; n_mm];
-        self.eval_shell_integrals_into(ang1, ang2, r, &mut out_h, &mut out_s)?;
-        Ok((out_h, out_s))
     }
 
     /// Evaluate SK integrals into caller-provided buffers (no Vec allocation).
@@ -160,32 +141,32 @@ impl SkTableSp {
         let (l_min, l_max) = if ang1 <= ang2 { (ang1, ang2) } else { (ang2, ang1) };
         let n_mm = (l_min + 1) as usize;
 
-        match self.format {
-            SkFormat::Extended => {
-                for mm in 0..=l_min {
-                    let new_col = sk_map(mm, l_max, l_min) as usize;
-                    out_h[mm as usize] = h_all[new_col - 1];
-                    out_s[mm as usize] = s_all[new_col - 1];
-                }
+        // Determine format from length of interpolated array
+        let is_extended = h_all.iter().skip(10).any(|&x| x != 0.0);
+        if is_extended {
+            for mm in 0..=l_min {
+                let new_col = sk_map(mm, l_max, l_min) as usize;
+                out_h[mm as usize] = h_all[new_col - 1];
+                out_s[mm as usize] = s_all[new_col - 1];
             }
-            SkFormat::Old => {
-                // iSKInterOld maps old col → new col: [8,9,10,13,14,15,16,18,19,20]
-                const NEW_TO_OLD: [usize; 21] = {
-                    let mut arr = [0usize; 21];
-                    let old = [8usize, 9, 10, 13, 14, 15, 16, 18, 19, 20];
-                    let mut i = 0;
-                    while i < 10 {
-                        arr[old[i]] = i;
-                        i += 1;
-                    }
-                    arr
-                };
-                for mm in 0..=l_min {
-                    let new_col = sk_map(mm, l_max, l_min) as usize;
-                    let old_idx = NEW_TO_OLD[new_col];
-                    out_h[mm as usize] = h_all[old_idx];
-                    out_s[mm as usize] = s_all[old_idx];
+        } else {
+            // iSKInterOld maps old col → new col: [8,9,10,13,14,15,16,18,19,20]
+            // Inverse: new col → old index (0-based)
+            const NEW_TO_OLD: [usize; 21] = {
+                let mut arr = [0usize; 21];
+                let iSKInterOld: [usize; 10] = [8, 9, 10, 13, 14, 15, 16, 18, 19, 20];
+                let mut i = 0;
+                while i < 10 {
+                    arr[iSKInterOld[i]] = i;
+                    i += 1;
                 }
+                arr
+            };
+            for mm in 0..=l_min {
+                let new_col = sk_map(mm, l_max, l_min) as usize;
+                let old_idx = NEW_TO_OLD[new_col];
+                out_h[mm as usize] = h_all[old_idx];
+                out_s[mm as usize] = s_all[old_idx];
             }
         }
         Ok(n_mm)
@@ -240,15 +221,12 @@ impl SkData {
     /// Evaluate SK integrals at distance `r` for a specific shell pair (ang1, ang2)
     /// between species sp1 and sp2. Returns (h_integrals, s_integrals), each of length min(ang1,ang2)+1.
     ///
-    /// CRITICAL: When ang1 > ang2, we must use the REVERSED species pair SK data.
-    /// Old-format .skf files are NOT symmetric: C-O.skf and O-C.skf contain different
-    /// data because the radial wavefunctions differ per species. Fortran getFullTable
-    /// uses skData21 (the reversed file) when l1 > l2.
+    /// When ang1 > ang2, DFTB+ swaps to the reversed species pair SK data
+    /// (skData21 in Fortran), because the old-format SK files store integrals
+    /// with the convention that the "first" species has the lower angular momentum.
     pub fn eval_shell_integrals(&self, sp1: &str, sp2: &str, ang1: i32, ang2: i32, r: f64)
         -> Result<(Vec<f64>, Vec<f64>)> {
-        // Fortran getFullTable logic:
-        //   if l1 <= l2: use skData12 (sp1-sp2 file)
-        //   if l1 >  l2: use skData21 (sp2-sp1 file = reversed pair)
+        // Fortran getFullTable: if l1 > l2, use skData21(iSK1,iSK2) = reversed pair data
         let (lookup_sp1, lookup_sp2) = if ang1 <= ang2 {
             (sp1, sp2)
         } else {
@@ -257,7 +235,23 @@ impl SkData {
         let tab = self.get_pair(lookup_sp1, lookup_sp2).ok_or_else(|| {
             DftbError::InvalidInput(format!("missing SK table for {lookup_sp1}-{lookup_sp2}"))
         })?;
-        tab.eval_shell_integrals(ang1, ang2, r)
+        let h_all = tab.h.eval(r)?;
+        let s_all = tab.s.eval(r)?;
+        if h_all.len() != s_all.len() {
+            return Err(DftbError::Parse("H and S integral count mismatch".into()));
+        }
+        let is_extended = h_all.len() == 20;
+        let h_shell = if is_extended {
+            extract_shell_integrals_new(&h_all, ang1, ang2)
+        } else {
+            extract_shell_integrals_old(&h_all, ang1, ang2)
+        };
+        let s_shell = if is_extended {
+            extract_shell_integrals_new(&s_all, ang1, ang2)
+        } else {
+            extract_shell_integrals_old(&s_all, ang1, ang2)
+        };
+        Ok((h_shell, s_shell))
     }
 
     /// Load all `.skf` files from a folder with DFTB+ Type2FileNames naming convention.
@@ -378,7 +372,7 @@ fn read_skf_all(path: &Path, sp1: &str, sp2: &str) -> Result<SkTableSp> {
 
     for _ in 0..n_grid {
         let line = it.next().ok_or_else(|| DftbError::Parse("unexpected EOF in integrals".into()))?;
-        let nums: Vec<f64> = parse_numbers_strict(line)?;
+        let nums = parse_numbers_loose(line);
 
         if extended {
             if nums.len() < 40 {
@@ -395,14 +389,49 @@ fn read_skf_all(path: &Path, sp1: &str, sp2: &str) -> Result<SkTableSp> {
         }
     }
 
-    let format = if extended { SkFormat::Extended } else { SkFormat::Old };
     Ok(SkTableSp {
         sp1: sp1.to_string(),
         sp2: sp2.to_string(),
         h: EqGridTable { dr: dist, values: h_vals },
         s: EqGridTable { dr: dist, values: s_vals },
-        format,
     })
+}
+
+/// Extract SK integrals for a shell pair (ang1, ang2) from the raw old-format 10-integral array.
+/// The returned Vec has length = min(ang1, ang2) + 1, ordered by mm=0,1,...,min(ang1,ang2).
+///
+/// DFTB+ skMap(mm, lMax, lMin) → new column → old column via iSKInterOld.
+fn extract_shell_integrals_old(arr10: &[f64], ang1: i32, ang2: i32) -> Vec<f64> {
+    // iSKInterOld maps old col → new col: [8,9,10,13,14,15,16,18,19,20]
+    let iSKInterOld: [usize; 10] = [8, 9, 10, 13, 14, 15, 16, 18, 19, 20];
+    // Inverse: new col → old index (0-based)
+    let mut new_to_old = [0usize; 21];
+    for (old_idx, &new_col) in iSKInterOld.iter().enumerate() {
+        new_to_old[new_col] = old_idx;
+    }
+
+    let (l_min, l_max) = if ang1 <= ang2 { (ang1, ang2) } else { (ang2, ang1) };
+    let n_mm = (l_min + 1) as usize;
+    let mut out = Vec::with_capacity(n_mm);
+
+    for mm in 0..=l_min {
+        let new_col = sk_map(mm, l_max, l_min);
+        let old_idx = new_to_old[new_col as usize];
+        out.push(arr10[old_idx]);
+    }
+    out
+}
+
+/// Extract SK integrals for a shell pair (ang1, ang2) from raw extended-format 20-integral array.
+fn extract_shell_integrals_new(arr20: &[f64], ang1: i32, ang2: i32) -> Vec<f64> {
+    let (l_min, l_max) = if ang1 <= ang2 { (ang1, ang2) } else { (ang2, ang1) };
+    let n_mm = (l_min + 1) as usize;
+    let mut out = Vec::with_capacity(n_mm);
+    for mm in 0..=l_min {
+        let new_col = sk_map(mm, l_max, l_min) as usize;
+        out.push(arr20[new_col - 1]); // 0-based
+    }
+    out
 }
 
 /// DFTB+ skMap(mm, lMax, lMin) decoded from parser.F90.

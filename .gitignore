@@ -15,3 +15,28 @@ __pycache__
 tools/dptools/build
 .nfs*
 _build*
+
+# Large binary/output files
+*.cub
+*.cube
+*.xsf
+*.log
+*.png
+*.jpg
+*.jpeg
+*.svg
+*.bin
+*.xml
+*.dat
+!tests/dftb/*/hamsqr1.dat
+!tests/dftb/*/oversqr.dat
+*.out
+
+# Rust compilation artifacts
+target/
+*.so
+*.o
+*.a
+*.dll
+*.dylib
+Cargo.lock

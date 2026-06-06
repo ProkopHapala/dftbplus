@@ -1,0 +1,34 @@
+Geometry = GenFormat {
+  5  C
+  H C O
+  1  1  0.0000000000E+00  0.0000000000E+00  0.0000000000E+00
+  2  2  1.0000000000E+00  0.0000000000E+00  0.0000000000E+00
+  3  3  2.2000000000E+00  0.0000000000E+00  0.0000000000E+00
+  4  3  1.5000000000E+00  1.0000000000E+00  0.0000000000E+00
+  5  1  2.2000000000E+00  1.0000000000E+00  0.0000000000E+00
+}
+
+Hamiltonian = DFTB {
+  SCC = No
+  MaxAngularMomentum = {
+    H = "s"
+    C = "p"
+    O = "p"
+  }
+  SlaterKosterFiles = Type2Filenames {
+    Prefix = "/home/prokophapala/git_SW/dftbplus/external/slakos/origin/mio-1-1/"
+    Separator = "-"
+    Suffix = ".skf"
+  }
+  Filling = Fermi {
+    Temperature [Kelvin] = 0.0
+  }
+}
+
+Options {
+  WriteHS = Yes
+}
+
+ParserOptions {
+  ParserVersion = 13
+}
