@@ -28,8 +28,7 @@ _build*
 *.bin
 *.xml
 *.dat
-!tests/dftb/*/hamsqr1.dat
-!tests/dftb/*/oversqr.dat
+*.skf
 *.out
 
 # Rust compilation artifacts
