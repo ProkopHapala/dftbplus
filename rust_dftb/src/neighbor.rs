@@ -21,8 +21,9 @@ pub struct NeighborBuilder {
 
 impl NeighborBuilder {
     pub fn build(&self, coords: &[[f64; 3]]) -> Result<NeighborList> {
-        let mut pairs = Vec::new();
         let n = coords.len();
+        // Upper-bound estimate: n*(n-1)/2 pairs within cutoff
+        let mut pairs = Vec::with_capacity(n * (n.saturating_sub(1)) / 2);
         for i in 0..n {
             for j in (i + 1)..n {
                 let v = [

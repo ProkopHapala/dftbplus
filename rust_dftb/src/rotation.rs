@@ -59,6 +59,22 @@ impl Rotation {
         Ok((h, s))
     }
 
+    /// In-place shell rotation for both H and S.
+    /// `out_h` / `out_s` must each be at least `(2*ang2+1)*(2*ang1+1)` elements.
+    pub fn rotate_shell_pair_into(
+        ang1: i32,
+        ang2: i32,
+        h_sk: &[f64],
+        s_sk: &[f64],
+        dc: DirectionCosines,
+        out_h: &mut [f64],
+        out_s: &mut [f64],
+    ) -> Result<()> {
+        Self::rotate_shell_pair_single_into(ang1, ang2, h_sk, dc, out_h)?;
+        Self::rotate_shell_pair_single_into(ang1, ang2, s_sk, dc, out_s)?;
+        Ok(())
+    }
+
     fn rotate_shell_pair_single(ang1: i32, ang2: i32, sk: &[f64], dc: DirectionCosines)
         -> Result<DMatrix<f64>> {
         match (ang1, ang2) {
@@ -66,6 +82,23 @@ impl Rotation {
             (0, 1) => Ok(Self::rotate_sp(dc, sk[0])),
             (1, 0) => Ok(Self::rotate_sp(dc, sk[0])),
             (1, 1) => Ok(Self::rotate_pp(dc, sk[0], sk[1])),
+            _ => Err(DftbError::Rotation(format!(
+                "unsupported shell pair ({}, {})", ang1, ang2))),
+        }
+    }
+
+    fn rotate_shell_pair_single_into(
+        ang1: i32,
+        ang2: i32,
+        sk: &[f64],
+        dc: DirectionCosines,
+        out: &mut [f64],
+    ) -> Result<()> {
+        match (ang1, ang2) {
+            (0, 0) => { out[0] = sk[0]; Ok(()) }
+            (0, 1) => { Self::rotate_sp_into(dc, sk[0], out); Ok(()) }
+            (1, 0) => { Self::rotate_sp_into(dc, sk[0], out); Ok(()) }
+            (1, 1) => { Self::rotate_pp_into(dc, sk[0], sk[1], out); Ok(()) }
             _ => Err(DftbError::Rotation(format!(
                 "unsupported shell pair ({}, {})", ang1, ang2))),
         }
@@ -81,6 +114,13 @@ impl Rotation {
     fn rotate_sp(dc: DirectionCosines, sp: f64) -> DMatrix<f64> {
         let (l, m, n) = (dc.l, dc.m, dc.n);
         DMatrix::from_row_slice(3, 1, &[m * sp, n * sp, l * sp])
+    }
+
+    fn rotate_sp_into(dc: DirectionCosines, sp: f64, out: &mut [f64]) {
+        let (l, m, n) = (dc.l, dc.m, dc.n);
+        out[0] = m * sp;
+        out[1] = n * sp;
+        out[2] = l * sp;
     }
 
     /// p-p rotation: Fortran pp() with sk(1)=sigma, sk(2)=pi.
@@ -104,6 +144,22 @@ impl Rotation {
             n * l * sk1 - n * l * sk2,
             l * l * sk1 + (1.0 - l * l) * sk2,
         ])
+    }
+
+    fn rotate_pp_into(dc: DirectionCosines, pp_sigma: f64, pp_pi: f64, out: &mut [f64]) {
+        let (l, m, n) = (dc.l, dc.m, dc.n);
+        let sk1 = pp_sigma;
+        let sk2 = pp_pi;
+        // Row-major 3x3, (py,pz,px) ordering
+        out[0] = (1.0 - n * n - l * l) * sk1 + (n * n + l * l) * sk2; // py,py
+        out[1] = n * m * sk1 - n * m * sk2;                           // py,pz
+        out[2] = l * m * sk1 - l * m * sk2;                           // py,px
+        out[3] = n * m * sk1 - n * m * sk2;                           // pz,py
+        out[4] = n * n * sk1 + (1.0 - n * n) * sk2;                   // pz,pz
+        out[5] = n * l * sk1 - n * l * sk2;                           // pz,px
+        out[6] = l * m * sk1 - l * m * sk2;                           // px,py
+        out[7] = n * l * sk1 - n * l * sk2;                           // px,pz
+        out[8] = l * l * sk1 + (1.0 - l * l) * sk2;                   // px,px
     }
 
     /// Assemble the full diatomic block for a species pair at distance r.
@@ -151,6 +207,9 @@ impl Rotation {
         // Reusable stack buffers for shell integrals (max 4 for spd)
         let mut sk_h = [0.0f64; 4];
         let mut sk_s = [0.0f64; 4];
+        // Max shell-pair matrix = 3x3 = 9 elements
+        let mut sub_h = [0.0f64; 9];
+        let mut sub_s = [0.0f64; 9];
 
         let mut i_col = 0;
         for &ang1 in ang1_list {
@@ -162,15 +221,18 @@ impl Rotation {
 
                 // Zero-allocation SK evaluation (writes into stack buffers)
                 let n_mm = tab.eval_shell_integrals_into(ang1, ang2, r, &mut sk_h, &mut sk_s)?;
-                let (h_sub, s_sub) =
-                    Self::rotate_shell_pair(ang1, ang2, &sk_h[..n_mm], &sk_s[..n_mm], dc)?;
+                let sub_size = n_orb2_sh * n_orb1_sh;
+                Self::rotate_shell_pair_into(
+                    ang1, ang2, &sk_h[..n_mm], &sk_s[..n_mm], dc,
+                    &mut sub_h[..sub_size], &mut sub_s[..sub_size],
+                )?;
 
                 if ang1 <= ang2 {
                     for a in 0..n_orb2_sh {
                         for b in 0..n_orb1_sh {
                             let idx = (i_row + a) * n_orb1 + (i_col + b);
-                            out_h[idx] = h_sub[(a, b)];
-                            out_s[idx] = s_sub[(a, b)];
+                            out_h[idx] = sub_h[a * n_orb1_sh + b];
+                            out_s[idx] = sub_s[a * n_orb1_sh + b];
                         }
                     }
                 } else {
@@ -178,8 +240,8 @@ impl Rotation {
                     for a in 0..n_orb2_sh {
                         for b in 0..n_orb1_sh {
                             let idx = (i_row + a) * n_orb1 + (i_col + b);
-                            out_h[idx] = sign * h_sub[(b, a)];
-                            out_s[idx] = sign * s_sub[(b, a)];
+                            out_h[idx] = sign * sub_h[b * n_orb2_sh + a];
+                            out_s[idx] = sign * sub_s[b * n_orb2_sh + a];
                         }
                     }
                 }
