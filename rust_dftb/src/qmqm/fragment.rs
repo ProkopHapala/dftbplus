@@ -9,9 +9,10 @@
 //! 2. Diagonalizing the generalized eigenvalue problem `H·c = E·S·c`.
 //! 3. Returning updated atom-resolved Mulliken charges.
 
-use nalgebra::{DMatrix, DVector};
+use nalgebra::{DMatrix, DVector, SymmetricEigen};
+use nalgebra::linalg::Cholesky;
 
-use crate::error::Result;
+use crate::error::{DftbError, Result};
 use crate::hamiltonian::{HamiltonianBuilder, SystemContext};
 use crate::sk_data::SkData;
 
@@ -201,24 +202,88 @@ impl Fragment {
     /// Diagonalize the generalized eigenvalue problem `H·c = E·S·c`.
     ///
     /// Stores eigenvalues and eigenvectors in place.
-    /// TODO: replace with LAPACK `dsygv` or Cholesky+symmetric reduction.
+    /// Uses Cholesky reduction to a standard symmetric eigenproblem:
+    ///   1. S = L·Lᵀ  (Cholesky)
+    ///   2. H' = L⁻¹·H·L⁻ᵀ
+    ///   3. diagonalize H' → eigenvalues E, eigenvectors c'
+    ///   4. c = L⁻ᵀ·c'
     pub fn diagonalize(&mut self) -> Result<()> {
-        // Placeholder: nalgebra does not expose generalized symmetric eigensolvers.
-        // For production, transform via Cholesky of S:
-        //   1. S = L·Lᵀ  (Cholesky)
-        //   2. H' = L⁻¹·H·L⁻ᵀ
-        //   3. diagonalize H' → eigenvalues E, eigenvectors c'
-        //   4. c = L⁻ᵀ·c'
-        todo!("generalized eigenvalue solver not yet implemented; use LAPACK dsygv");
+        // 1. Cholesky of S
+        let cholesky = Cholesky::new(self.template.s.clone())
+            .ok_or_else(|| DftbError::InvalidInput("Overlap matrix is not positive definite".into()))?;
+        let l = cholesky.l();
+
+        // 2. H' = L⁻¹·H·L⁻ᵀ
+        //   a) M = L⁻¹·H  → solve L·M = H
+        let m = l.solve_lower_triangular(&self.h_scc)
+            .ok_or_else(|| DftbError::InvalidInput("Failed to solve L·M = H".into()))?;
+        //   b) N = L⁻¹·Mᵀ → solve L·N = Mᵀ
+        let n_mat = l.solve_lower_triangular(&m.transpose())
+            .ok_or_else(|| DftbError::InvalidInput("Failed to solve L·N = Mᵀ".into()))?;
+        let h_prime = n_mat.transpose();
+
+        // 3. Standard symmetric eigenproblem on H'
+        let se = SymmetricEigen::new(h_prime);
+        let eigenvalues = se.eigenvalues;
+        let c_prime = se.eigenvectors;
+
+        // 4. Back-transform: c = L⁻ᵀ·c'
+        let c = l.tr_solve_lower_triangular(&c_prime)
+            .ok_or_else(|| DftbError::InvalidInput("Failed to solve Lᵀ·c = c'".into()))?;
+
+        // Store results (eigenvalues sorted ascending by nalgebra)
+        self.eigenvalues = eigenvalues;
+        self.eigenvectors = c;
+
+        Ok(())
     }
 
     /// Compute Mulliken charges from the occupied eigenvectors.
     ///
-    /// `q_A = Σ_{μ∈A} (D·S)_{μμ}` where `D = Σ_occ c_i·c_iᵀ`.
+    /// `q_A = q0_A - Σ_{μ∈A} (D·S)_{μμ}` where `D = Σ_occ c_i·c_iᵀ`.
     /// For closed-shell: each occupied MO holds 2 electrons.
     pub fn compute_charges(&mut self) {
-        // TODO: implement after diagonalization is wired in.
-        // For now, leave charges untouched (neutral).
+        let n_orbs = self.template.n_orbs;
+        let n_occ = (self.n_electrons / 2.0).round() as usize;
+
+        // Extract occupied eigenvectors (eigenvalues are sorted ascending)
+        let c_occ = self.eigenvectors.columns(n_orbs - n_occ, n_occ);
+
+        // Build D·S = 2·C_occ·C_occᵀ·S (closed-shell)
+        let mut work = DMatrix::zeros(n_orbs, n_orbs);
+        for k in 0..n_occ {
+            for i in 0..n_orbs {
+                let c_ik = c_occ[(i, k)];
+                for j in 0..n_orbs {
+                    work[(i, j)] += c_ik * c_occ[(j, k)];
+                }
+            }
+        }
+        // Multiply by S on right: work = work · S
+        let mut tmp = DMatrix::zeros(n_orbs, n_orbs);
+        for i in 0..n_orbs {
+            for j in 0..n_orbs {
+                let mut sum = 0.0;
+                for k in 0..n_orbs {
+                    sum += work[(i, k)] * self.template.s[(k, j)];
+                }
+                tmp[(i, j)] = sum;
+            }
+        }
+        work.copy_from(&tmp);
+        work.scale_mut(2.0);
+
+        // Trace per atom: q_A = q0_A - Σ_{μ∈A} (D·S)_{μμ}
+        let orb_off = &self.template.atom_orb_off;
+        for i_at in 0..self.template.n_atoms {
+            let i0 = orb_off[i_at] as usize;
+            let i1 = orb_off[i_at + 1] as usize;
+            let mut pop = 0.0;
+            for mu in i0..i1 {
+                pop += work[(mu, mu)];
+            }
+            self.charges[i_at] = self.template.q0[i_at] - pop;
+        }
     }
 
     /// Update the total shift vector from intra- and external potentials.

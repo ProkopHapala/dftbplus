@@ -222,6 +222,28 @@ impl<M: Mixer> MultiSystemSolver<M> {
         (s / arr.len() as f64).sqrt()
     }
 
+    /// Build H_scc for all fragments using externally-provided fixed charges.
+    ///
+    /// No SCC loop, no mixing — just one-shot Hamiltonian construction.
+    /// Useful for testing: inject arbitrary charges → get H_scc → diagonalize.
+    pub fn build_h_scc_with_fixed_charges(&mut self, fixed_charges: &[f64]) {
+        assert_eq!(fixed_charges.len(), self.n_atoms_total());
+        self.charges.copy_from_slice(fixed_charges);
+        self.scatter_charges();
+        self.compute_v_ext();
+        self.build_all_h_scc();
+    }
+
+    /// Diagonalize all fragments with current H_scc and compute charges.
+    pub fn diagonalize_all(&mut self) -> Result<()> {
+        for frag in &mut self.fragments {
+            frag.diagonalize()?;
+            frag.compute_charges();
+        }
+        self.gather_charges();
+        Ok(())
+    }
+
     /// Run the global SCC fixed-point iteration.
     ///
     /// # Algorithm
@@ -232,10 +254,6 @@ impl<M: Mixer> MultiSystemSolver<M> {
     /// 5. Compute residual = `q_out - charges`.
     /// 6. If RMS residual < `tol`, converged.
     /// 7. Mix to produce next `charges`.
-    ///
-    /// # TODO
-    /// - Parallelize fragment loops with `rayon`.
-    /// - Replace `diagonalize()` placeholder with actual `dsygv` or Cholesky reduction.
     pub fn solve_scc(&mut self, max_iter: usize, tol: f64) -> Result<()> {
         for iter in 0..max_iter {
             // 1. External potential from other fragments.
@@ -244,11 +262,10 @@ impl<M: Mixer> MultiSystemSolver<M> {
             // 2. Intra shifts + build H_scc for each fragment.
             self.build_all_h_scc();
 
-            // 3. Diagonalize and compute charges (placeholder until solver wired).
-            for _frag in &mut self.fragments {
-                // TODO: uncomment once diagonalization is implemented.
-                // frag.diagonalize()?;
-                // frag.compute_charges();
+            // 3. Diagonalize and compute charges.
+            for frag in &mut self.fragments {
+                frag.diagonalize()?;
+                frag.compute_charges();
             }
 
             // 4. Gather global output charges.

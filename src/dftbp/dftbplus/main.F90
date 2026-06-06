@@ -1459,6 +1459,14 @@ contains
               & this%qiBlockIn, errStatus)
           @:PROPAGATE_ERROR(errStatus)
 
+          if (allocated(this%scc)) then
+            block
+              character(len=64) :: fname
+              write(fname, '(A,I0,A)') 'scc_debug_', iSccIter, '.txt'
+              call this%scc%exportSccDebug(trim(fname))
+            end block
+          end if
+
           if (this%electronicSolver%iSolver == electronicSolverTypes%pexsi .and. this%tSccCalc) then
             call this%electronicSolver%elsi%updatePexsiDeltaVRanges(this%potential)
           end if

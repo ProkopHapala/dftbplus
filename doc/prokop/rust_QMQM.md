@@ -657,26 +657,27 @@ Unit tests pass (10/10):
 
 ### Known Limitations / TODOs
 
-1. **Generalized eigensolver**: `Fragment::diagonalize()` has a `todo!()` placeholder. The Cholesky-transform approach is documented but not yet implemented. This is required for SCC testing.
+1. **No integration tests**: The module has unit tests for individual components but no end-to-end test comparing full-system vs fragment results.
 
-2. **Charge computation**: `Fragment::compute_charges()` is a stub. Needs integration with the eigensolver output.
+2. **Fortran debug export**: Added `exportSccDebug` subroutine to scc.F90 and call in main.F90, but needs testing with actual DFTB+ runs.
 
-3. **SCC loop**: `MultiSystemSolver::solve_scc()` has the diagonalization calls commented out until the eigensolver is wired.
+3. **Charge initialization**: q0 extraction from SK data is approximate (uses full shell occupations). Should read exact neutral charges from onsite parameters.
 
-4. **No integration tests**: The module has unit tests for individual components but no end-to-end test comparing full-system vs fragment results.
+### Completed Since Last Update
+
+- **Generalized eigensolver**: Implemented Cholesky-based solver in `Fragment::diagonalize()`. Uses `nalgebra::linalg::Cholesky` and `SymmetricEigen`.
+- **Charge computation**: `Fragment::compute_charges()` now performs full Mulliken population analysis with closed-shell density matrix.
+- **SCC loop**: `MultiSystemSolver::solve_scc()` is fully wired with diagonalization and charge computation.
+- **Fixed-charge testing**: Added `build_h_scc_with_fixed_charges()` and `diagonalize_all()` for one-shot testing without SCC iteration.
 
 ### Next Steps for Testing
 
-To perform meaningful testing (e.g., HF...HF dimer scan), we need:
-
-1. Implement the Cholesky-based generalized eigensolver in `Fragment::diagonalize()`
-2. Wire up `Fragment::compute_charges()` to use the occupied eigenvectors
-3. Uncomment the diagonalization calls in `MultiSystemSolver::solve_scc()`
-4. Create an integration test that:
-   - Builds a full-system Hamiltonian (existing code)
-   - Builds fragment-based solver with the same geometry
-   - Compares non-SCC H0/S elements (should match exactly for non-overlapping fragments)
-   - Compares SCC energies and charges (should match within tolerance)
+Create integration tests that:
+1. Build full-system Hamiltonian with existing code
+2. Build fragment-based solver with same geometry
+3. Compare non-SCC H0/S (should match exactly)
+4. Compare SCC with fixed charges (inject same charges into both, compare shifts and H_scc)
+5. Compare full SCC convergence (should match within tolerance)
 
 ### Design Notes from Implementation
 

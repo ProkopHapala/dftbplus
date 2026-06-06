@@ -33,7 +33,7 @@ module dftbp_dftb_scc
   implicit none
 
   private
-  public :: TSccInput, TScc, TScc_init
+  public :: TSccInput, TScc, TScc_init, exportSccDebug
 
 
   !> Data necessary to initialize the SCC module
@@ -898,6 +898,41 @@ contains
     end if
 
   end subroutine getShiftPerL
+
+
+  !> Debug export: write SCC quantities to a file for external comparison.
+  !> Format is simple text, one array per section, for easy parsing by test code.
+  subroutine exportSccDebug(this, filename)
+    class(TScc), intent(in) :: this
+    character(len=*), intent(in) :: filename
+    integer :: fd, iAt, iSh
+
+    open(newunit=fd, file=filename, action='write', status='replace')
+
+    write(fd, '(A)') '# SCC Debug Export'
+    write(fd, '(A,I0)') '# nAtom=', this%nAtom
+    write(fd, '(A,I0)') '# nSpecies=', this%nSpecies
+
+    write(fd, '(A)') '## deltaQAtom'
+    do iAt = 1, this%nAtom
+      write(fd, '(ES25.16)') this%deltaQAtom(iAt)
+    end do
+
+    write(fd, '(A)') '## shiftPerAtom'
+    do iAt = 1, this%nAtom
+      write(fd, '(ES25.16)') this%shiftPerAtom(iAt)
+    end do
+
+    write(fd, '(A)') '## shiftPerL'
+    do iAt = 1, this%nAtom
+      do iSh = 1, size(this%shiftPerL, dim=1)
+        write(fd, '(ES25.16)', advance='no') this%shiftPerL(iSh, iAt)
+      end do
+      write(fd, *)
+    end do
+
+    close(fd)
+  end subroutine exportSccDebug
 
 
   !> Derivative of the shift potentials with respect to atom positions
