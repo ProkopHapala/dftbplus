@@ -29,4 +29,7 @@ pub enum DftbError {
 
     #[error("Invalid input: {0}")]
     InvalidInput(String),
+
+    #[error("SCC not converged: {0}")]
+    SccNotConverged(String),
 }

@@ -12,6 +12,7 @@ pub mod neighbor;
 pub mod hamiltonian;
 pub mod scc;
 pub mod output;
+pub mod qmqm;
 
 pub use error::{DftbError, Result};
 pub use sk_data::{SkData, SkFormat, SkTableSp, SpeciesOrbitals};
