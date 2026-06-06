@@ -988,18 +988,37 @@ Decoded (column-major, mm fastest):
 
 ---
 
-## 11. Summary Checklist
+## 11. Summary of Bugs Found and Fixed
+
+| Bug | File | Root Cause | Fix |
+|-----|------|-----------|-----|
+| 1 | `sk_data.rs` | Old-format column indices misread | Corrected `OLD_SS_SIGMA=9, OLD_SP_SIGMA=8, OLD_PP_SIGMA=5, OLD_PP_PI=6` |
+| 2 | `sk_data.rs` | Extended-format column indices misread | Corrected `pick_sp` to `arr20[19], arr20[18], arr20[14], arr20[15]` |
+| 3 | `rotation.rs` | s-p block sign wrong | Applied `(-1)^(ang1+ang2)` factor = `-1` for p-s case |
+| 4 | `hamiltonian.rs` | Block transpose convention wrong | Direct placement: `h0[bj+a, bi+b] = h_blk[a,b]` and symmetric partner |
+| 5 | `hamiltonian.rs`, `rotation.rs`, `sk_data.rs` | Hardcoded `n_orb = 4 * n_atom` | Added `SpeciesOrbitals`, per-atom offsets, shell iteration |
+| 6 | `sk_data.rs` | Reversed SK file not used when `ang1 > ang2` | Swap `(sp1, sp2) → (sp2, sp1)` when `ang1 > ang2` |
+
+---
+
+## 12. Summary Checklist
 
 ### For Non-SCC Testing
 
-- [ ] Set `SCC = No` in `dftb_in.hsd`
-- [ ] Set `WriteHS = Yes` in `dftb_in.hsd`
-- [ ] Run DFTB+ to get `hamsqr1.dat` (H0)
-- [ ] Implement Rust SK parser
-- [ ] Implement Rust interpolation
-- [ ] Implement Rust rotation
-- [ ] Implement Rust H0 builder
-- [ ] Compare matrices element-by-element
+- [x] Set `SCC = No` in `dftb_in.hsd`
+- [x] Set `WriteHS = Yes` in `dftb_in.hsd`
+- [x] Run DFTB+ to get `hamsqr1.dat` (H0)
+- [x] Implement Rust SK parser
+- [x] Implement Rust interpolation
+- [x] Implement Rust rotation
+- [x] Implement Rust H0 builder
+- [x] Compare matrices element-by-element
+
+**Verified molecules:**
+- [x] H2 (mio-1-1, s-only) — exact match
+- [x] N2 (mio-1-1, sp) — exact match
+- [x] HCOOH (mio-1-1, mixed basis) — H0 diff 4.9e-7, S diff 5.6e-13
+- [x] HCONH2 (mio-1-1, mixed basis) — H0 diff 4.6e-8, S diff 1.6e-12
 
 ### For SCC Testing
 
@@ -1013,10 +1032,10 @@ Decoded (column-major, mm fastest):
 
 ### For Debug Output
 
-- [ ] Add debug prints in `nonscc.F90:417` (SK integrals)
-- [ ] Add debug prints in `nonscc.F90:418` (rotation)
-- [ ] Add H0 output in `main.F90:1468`
-- [ ] Recompile DFTB+ in debug mode
-- [ ] Run test molecule
-- [ ] Capture debug output
-- [ ] Compare with Rust debug output
+- [x] Add debug prints in `nonscc.F90:417` (SK integrals)
+- [x] Add debug prints in `nonscc.F90:418` (rotation)
+- [x] Add H0 output in `main.F90:1468`
+- [x] Recompile DFTB+ in debug mode
+- [x] Run test molecule
+- [x] Capture debug output
+- [x] Compare with Rust debug output
