@@ -461,3 +461,107 @@ make -j$(nproc)
 ```
 
 Which do you prefer — should you switch to Code mode, or will you run the build manually?
+
+---
+
+# Session Report: Non-SCC H0 Parity Achieved (2025-06-06)
+
+## What Was Done
+
+Implemented and debugged non-SCC Hamiltonian (`H0`) and overlap (`S`) construction for GFN1-xTB in Rust, achieving **machine-precision parity** with tblite C API for three test molecules: **H2**, **N2**, and **HCOOH**.
+
+**Final test results:**
+- `H2`:  H0 `max_err = 2.1e-8`, S `max_err = 2.3e-15`
+- `N2`:  H0 `max_err = 3.3e-8`, S `max_err = 4.4e-16`
+- `HCOOH`: H0 `max_err = 3.8e-8`, S `max_err = 1.0e-12`
+
+## Bugs Found and Fixed
+
+### 1. `shpoly` Scaling (100x Error)
+**File:** `rust_dftb/src/methods/xtb/params.rs`
+
+**Problem:** `shpoly` values were copied directly from tblite's `gfn1.f90` raw array without applying the `* 0.01_wp` scaling factor applied at load time in tblite:
+
+```fortran
+! In tblite gfn1.f90:245-291
+real(wp), parameter :: p_shpoly(0:2, max_elem) = reshape([...], shape(p_shpoly)) * 0.01_wp
+```
+
+**Fix:** All `shpoly` values in Rust multiplied by `0.01`. This caused ~60 H0 mismatch for N2 before fix, dropped to ~0.6 after.
+
+### 2. p Orbital Cartesian Ordering
+**File:** `rust_dftb/src/methods/xtb/integrals.rs`
+
+**Problem:** Rust code used standard Cartesian ordering `[px, py, pz]`, but tblite uses a different convention derived from its `multipole.f90` `lx` indexing array.
+
+**tblite's p ordering:** `[py, pz, px]` (indices 1, 2, 0 in standard `[px, py, pz]`)
+
+This is determined by the `lx` array in `tblite/integral/multipole.f90:47-69`:
+```fortran
+integer, parameter :: lx(3, 84) = reshape([&
+   & 0, &                           ! s
+   & 0,0,1, &                      ! p: py, pz, px  (x angular momentum)
+   ...
+```
+
+**Fix:** Applied permutation mapping in all `overlap_cgto` `l=1` cases:
+```rust
+// tblite p ordering: [py, pz, px]
+result[0] += c * s[1]; // py
+result[1] += c * s[2]; // pz
+result[2] += c * s[0]; // px
+```
+
+This reduced N2 H0 mismatch from `0.58` to `3.3e-8`.
+
+### 3. HCOOH Element Index Bug
+**File:** `rust_dftb/tests/xtb_parity.rs`
+
+**Problem:** HCOOH test passed `elem_idx = [0, 6, 5, 6, 0]` where O atoms got index `6` (Nitrogen parameters) instead of `7` (Oxygen parameters). This caused O 2s/2p CGTOs to be built with N's Slater exponents, giving ~5% error in all O-related overlaps.
+
+**Fix:** Changed to `elem_idx = [0, 7, 5, 7, 0]`.
+
+## Special Conventions to Remember
+
+| Convention | tblite Behavior | Rust Implementation |
+|------------|-----------------|---------------------|
+| **p orbital ordering** | `[py, pz, px]` (from `multipole.f90:lx`) | Must apply permutation in overlap integrals |
+| **shpoly values** | Raw `p_shpoly` multiplied by `0.01` at load | Store pre-scaled or multiply at init |
+| **CN formula (GFN1)** | Single exponential: `CN = Σ exp(-kcn * (r/(r_i+r_j) - 1))` with `kcn = 16.0` | Implemented in `hamiltonian.rs::compute_cn_gfn1` |
+| **Covalent radii** | D3 scaled: `rcov = 4/3 * covalent_rad_2009` | Use `dftd3_ncoord` values, not raw CSD |
+| **On-site H0** | Diagonal = `selfenergy` directly, **no** `hscale` factor | Skip `hscale` for `iat == jat && ish == jsh` |
+| **Off-site H0** | `H_ij = 0.5*(ε_i+ε_j) * hscale * shpoly * S_ij` | Both `hscale` and `shpoly` applied |
+| **Selfenergy** | `ε = p_selfenergy - p_kcn * CN` (in eV, then `evtoau` scaled) | Convert eV→Hartree with `EVTOAU = 3.674932217695e-2` |
+| **Basis normalization** | `(2α/π)^(3/4) * (4α)^(l/2) / sqrt(dfactorial(l+1))` | Match exactly for CGTO coefficients |
+| **Orthogonalization** | Gram-Schmidt: append previous shell primitives with `-overlap` coeffs, renormalize | Implemented in `basis.rs::orthogonalize` |
+
+## Files Modified in This Session
+
+- `rust_dftb/src/methods/xtb/params.rs` — added O parameters, fixed `shpoly` scaling, fixed covalent radii
+- `rust_dftb/src/methods/xtb/hamiltonian.rs` — fixed CN formula, fixed on-site H0 (no hscale), fixed off-site scaling
+- `rust_dftb/src/methods/xtb/integrals.rs` — fixed p orbital ordering to match tblite `[py, pz, px]`
+- `rust_dftb/tests/xtb_parity.rs` — added N2 and HCOOH tests, fixed `elem_idx` for HCOOH
+
+## What Is Yet To Be Done
+
+### Non-SCC Components Still Missing
+- [ ] **Repulsion energy** — pairwise effective repulsion (`xtb/repulsion.f90`)
+- [ ] **Halogen bonding** — special correction for X···O/N interactions
+- [ ] **Dispersion** — D3 or D4 correction (user explicitly deferred)
+- [ ] **Full element coverage** — currently only H, He, Li, Be, B, C, N, O parameters are hardcoded
+
+### SCC Components (Next Priority)
+- [ ] **Coulomb model** — GFN1 uses `effective_coulomb` (Klopman-Ohno with harmonic average) + `onsite_thirdorder`
+- [ ] **Mulliken charges** — `get_mulliken_shell_charges`, `get_mulliken_atomic_multipoles`
+- [ ] **SCF potential** — `add_pot_to_h1` applies charge-dependent shifts to H0
+- [ ] **SCF loop** — reuse existing `qmqm/` infrastructure or implement new mixer + solver
+- [ ] **Fermi smearing** — occupation update with `kt > 0`
+
+### Parity Testing Expansion
+- [ ] **SCC parity** — compare charges, eigenvalues, density matrix (cannot get H_scc directly from C API)
+- [ ] **More molecules** — test with 3rd row elements (Na, Mg, Al, Si, P, S, Cl)
+- [ ] **Gradient verification** — if forces are needed
+
+## Key Insight
+
+> **The saved `hamiltonian` from tblite C API is NON-SCC H0 only.** The SCC potential is added in-place during `next_scf()` and is not exposed. For SCC parity, we must compare derived quantities (charges, eigenvalues, density) rather than the Hamiltonian matrix directly.

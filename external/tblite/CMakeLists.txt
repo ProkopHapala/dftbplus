@@ -7,7 +7,7 @@ set(WITH_OpenMP ${WITH_OMP})
 set(WITH_TESTS FALSE)
 
 # Do not compile with C-API support as we do not want to vendor the subproject C-API
-set(WITH_API FALSE)
+set(WITH_API TRUE)
 
 add_subdirectory(${TBLITE_SOURCE_DIR} ${TBLITE_BINARY_DIR})
 
