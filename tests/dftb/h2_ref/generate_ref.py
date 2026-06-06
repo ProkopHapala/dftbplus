@@ -5,7 +5,7 @@ import os
 import subprocess
 import numpy as np
 
-ANG2BOHR = 1.0 / 0.52917720859
+ANG2BOHR = 1.0  # GenFormat uses Angstrom, NOT Bohr
 sk_dir = '/home/prokophapala/git_SW/dftbplus/external/slakos/origin/mio-1-1'
 dftb_bin = '/home/prokophapala/git/dftbplus/_build/app/dftb+/dftb+'
 

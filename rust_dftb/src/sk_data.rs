@@ -106,6 +106,8 @@ fn parse_numbers_strict(line: &str) -> Result<Vec<f64>> {
 pub struct AtomicParamsSp {
     pub e_s: f64,
     pub e_p: f64,
+    /// Valence electron count (sum of shell occupations from SK file).
+    pub q0: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -306,11 +308,16 @@ fn sk_read_onsite_sp(path: &Path) -> Result<AtomicParamsSp> {
         lines = text.lines();
     }
 
-    // read grid line
+    // read grid line: dist, nGrid, nShell
     let grid_line = lines
         .next()
         .ok_or_else(|| DftbError::Parse("missing grid line".into()))?;
-    let _grid: Vec<f64> = parse_numbers_strict(grid_line)?;
+    let grid_nums: Vec<f64> = parse_numbers_strict(grid_line)?;
+    let n_shell = if grid_nums.len() >= 3 {
+        grid_nums[2] as usize
+    } else {
+        1
+    };
 
     let line2 = lines
         .next()
@@ -330,7 +337,14 @@ fn sk_read_onsite_sp(path: &Path) -> Result<AtomicParamsSp> {
     let e_s = nums[2];
     let _ = e_d;
 
-    Ok(AtomicParamsSp { e_s, e_p })
+    // Occupations are the last n_shell numbers on this line.
+    let q0 = if nums.len() >= n_shell {
+        nums[nums.len() - n_shell..].iter().sum()
+    } else {
+        0.0
+    };
+
+    Ok(AtomicParamsSp { e_s, e_p, q0 })
 }
 
 /// Read all SK integrals (10 for old format, 20 for extended) per grid point.

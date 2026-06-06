@@ -1026,13 +1026,34 @@ Decoded (column-major, mm fastest):
 
 ### For SCC Testing
 
-- [ ] Set `SCC = Yes` in `dftb_in.hsd`
-- [ ] Set `MaxSccIterations = 1` (for initial shifts)
-- [ ] Run DFTB+ to get `hamsqr1.dat` (H with SCC)
-- [ ] Run DFTB+ with `SCC = No` to get H0
-- [ ] Compute SCC_shifts = H_SCC - H0
-- [ ] Implement Rust SCC calculator
-- [ ] Compare shifts
+- [x] Set `SCC = Yes` in `dftb_in.hsd`
+- [x] Set `MaxSccIterations = 1` (for initial shifts)
+- [x] Run DFTB+ to get `hamsqr1.dat` (H with SCC)
+- [x] Run DFTB+ with `SCC = No` to get H0
+- [x] Compute SCC_shifts = H_SCC - H0
+- [x] Implement Rust SCC calculator (`qmqm/solver.rs`, `qmqm/shifts.rs`, `qmqm/gamma.rs`)
+- [x] Compare shifts
+
+**Verified:**
+- [x] H2 fixed-charge SCC parity (deltaQ = [0.1, -0.1]) at 0.74 Å — **PASS** (diff = 2.0e-8)
+  - Reference: `tests/dftb/h2_ref/hamsqr1.dat`
+- [x] N2 fixed-charge SCC parity (deltaQ = [0.2, -0.2]) at 1.10 Å — **PASS** (diff ≈ 1e-8)
+  - Reference: `tests/dftb/n2_ref/hamsqr1.dat`
+- [x] HCOOH fixed-charge SCC parity (deltaQ = [-0.1, +0.1, -0.1, +0.1, 0.0]) — **PASS** (diff = 8.6e-8)
+  - Reference: `tests/dftb/hcooh_ref/hamsqr1.dat`
+  - Note: DFTB+ `InitialCharges` sign convention is opposite to intuitive expectation
+
+**Bugs fixed during SCC parity:**
+- `generate_ref.py` used `ANG2BOHR` conversion for GenFormat (which expects Å, not Bohr)
+  → Removed conversion, regenerated reference data
+- `qmqm/shifts.rs` and `qmqm/solver.rs` computed distances in Å for `gamma_full`
+  → Added `ANG2BOHR` conversion before gamma evaluation
+- `fragment.rs` computed `q0` as full shell capacity (H=2 instead of 1)
+  → Now reads `q0` from SK file occupation data (`sk_data.rs:sk_read_onsite_sp`)
+
+**Still missing:**
+- [ ] Full SCC convergence parity (self-consistent charges + total energy)
+- [ ] `shiftPerL` (shell-resolved SCC) for systems with `ShellResolvedScc = Yes`
 
 ### For Debug Output
 
@@ -1043,3 +1064,46 @@ Decoded (column-major, mm fastest):
 - [x] Run test molecule
 - [x] Capture debug output
 - [x] Compare with Rust debug output
+
+## 13. Universal Parity Test
+
+A single script `tests/run_parity.py` generates Fortran reference data and invokes a generic Rust test (`tests/parity_universal.rs`) for **any XYZ molecule**.
+
+### Usage
+
+```bash
+cd rust_dftb/tests
+
+# Non-SCC only
+python3 run_parity.py /path/to/molecule.xyz
+
+# Non-SCC + SCC with fixed charges
+python3 run_parity.py /path/to/molecule.xyz --scc --delta-q 0.1,-0.1,...
+```
+
+### What it does
+
+1. Parses XYZ file (handles standard 4-column and 5-column formats)
+2. Writes GenFormat geometry + DFTB+ input
+3. Runs Fortran DFTB+ (non-SCC) → `ref_h0.dat`, `ref_s.dat`
+4. Runs Fortran DFTB+ (SCC, MaxSccIterations=1) → `ref_h_scc.dat`
+5. **Reads actual `deltaQAtom` from Fortran `scc_debug_1.txt`** (critical: `InitialCharges` ≠ actual deltaQ)
+6. Invokes `cargo test --test parity_universal` with env vars
+
+### Verified molecules (all PASS)
+
+| Molecule | Atoms | Non-SCC | SCC |
+|----------|-------|---------|-----|
+| H2O      | 3     | ✓       | ✓   |
+| HF       | 2     | ✓       | ✓   |
+| CO       | 2     | ✓       | ✓   |
+| CH2O     | 4     | ✓       | ✓   |
+| HCN      | 3     | ✓       | ✓   |
+| C2H4     | 6     | ✓       | ✓   |
+| HCOOH    | 5     | ✓       | ✓   |
+
+### Key implementation files
+
+- `rust_dftb/tests/run_parity.py` — Python orchestrator
+- `rust_dftb/tests/parity_universal.rs` — Generic Rust parity test
+- `rust_dftb/src/output.rs` — DFTB+ square matrix reader

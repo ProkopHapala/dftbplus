@@ -68,15 +68,17 @@ impl FragmentTemplate {
         let species_n_orb = ctx.species_n_orb.clone();
         let species_ang: Vec<Vec<i32>> = ctx.species_ang.iter().map(|&v| v.to_vec()).collect();
 
-        // Extract q0 from onsite params: valence electron count per atom.
-        // For mio/3ob this is the number of s+p electrons for H/C/N/O.
-        // TODO: read exact q0 from SK data once available.
+        // Extract q0 from SK file onsite params (valence electron count).
         let q0: Vec<f64> = (0..n_atoms)
             .map(|i| {
-                let si = atom_species[i] as usize;
-                let ang = &species_ang[si];
-                // Sum of shell occupations: 2 for s, 6 for p (full shells)
-                ang.iter().map(|&l| 2.0 * (2.0 * l as f64 + 1.0)).sum()
+                sk.onsite(&species[i])
+                    .map(|p| p.q0)
+                    .unwrap_or_else(|_| {
+                        // Fallback for species without homonuclear SK file
+                        let si = atom_species[i] as usize;
+                        let ang = &species_ang[si];
+                        ang.iter().map(|&l| 2.0 * (2.0 * l as f64 + 1.0)).sum()
+                    })
             })
             .collect();
 

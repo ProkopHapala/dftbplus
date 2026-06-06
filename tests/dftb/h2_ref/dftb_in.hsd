@@ -6,7 +6,20 @@ Geometry = GenFormat {
 }
 
 Hamiltonian = DFTB {
-  SCC = No
+  SCC = Yes
+  SCCTolerance = 1.0E-010
+  MaxSCCIterations = 1
+  Charge = 0.0
+  InitialCharges = {
+    AtomCharge = {
+      Atoms = { 1 }
+      ChargePerAtom = -0.1
+    }
+    AtomCharge = {
+      Atoms = { 2 }
+      ChargePerAtom = 0.1
+    }
+  }
   MaxAngularMomentum = {
     H = "s"
   }
@@ -22,6 +35,7 @@ Hamiltonian = DFTB {
 
 Options {
   WriteHS = Yes
+  WriteDetailedOut = Yes
 }
 
 ParserOptions {
