@@ -185,6 +185,44 @@ impl HamiltonianBuilder {
         Ok(Hamiltonian { h0, s })
     }
 
+    /// Build non-SCC H0 and S specialized for sp-only systems.
+    /// Every species must have exactly shells [s, p]; otherwise returns an error.
+    pub fn build_non_scc_sp_only(&self, species: &[String], coords: &[[f64; 3]]) -> Result<Hamiltonian> {
+        if species.len() != coords.len() {
+            return Err(DftbError::InvalidInput(
+                "species and coords length mismatch".into(),
+            ));
+        }
+
+        let cutoff = self
+            .sk
+            .pairs
+            .values()
+            .map(|t| t.cutoff())
+            .fold(0.0_f64, f64::max);
+
+        let neigh = NeighborBuilder { cutoff }.build(coords)?;
+        let ctx = SystemContext::from_sk_data(&self.sk, species)?;
+
+        // Verify sp-only
+        for i in 0..ctx.n_atoms {
+            let ang = ctx.species_ang[ctx.atom_species[i] as usize];
+            if ang != &[0, 1] {
+                return Err(DftbError::InvalidInput(
+                    format!("sp_only: atom {i} has shells {:?}, expected [0, 1]", ang)
+                ));
+            }
+        }
+
+        let mut h0 = DMatrix::<f64>::zeros(ctx.n_orbs, ctx.n_orbs);
+        let mut s = DMatrix::<f64>::identity(ctx.n_orbs, ctx.n_orbs);
+
+        self.fill_onsite_sp_only(&ctx, &mut h0)?;
+        self.fill_pairs_sp_only(&ctx, &neigh, &mut h0, &mut s)?;
+
+        Ok(Hamiltonian { h0, s })
+    }
+
     fn fill_onsite(&self, ctx: &SystemContext<'_>, h0: &mut DMatrix<f64>) -> Result<()> {
         for i_at in 0..ctx.n_atoms {
             let si = ctx.atom_species[i_at] as usize;
@@ -260,6 +298,112 @@ impl HamiltonianBuilder {
                 for b in 0..ni {
                     let val_h = out_h[a * ni + b];
                     let val_s = out_s[a * ni + b];
+                    h0[(bj + a, bi + b)] = val_h;
+                    h0[(bi + b, bj + a)] = val_h;
+                    s[(bj + a, bi + b)] = val_s;
+                    s[(bi + b, bj + a)] = val_s;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Onsite fill for sp-only: no shell loop, no match on angular momentum.
+    fn fill_onsite_sp_only(&self, ctx: &SystemContext<'_>, h0: &mut DMatrix<f64>) -> Result<()> {
+        for i_at in 0..ctx.n_atoms {
+            let si = ctx.atom_species[i_at] as usize;
+            let p = ctx.species_onsite[si];
+            let base = ctx.atom_orb_off[i_at] as usize;
+            h0[(base, base)] = p.e_s;
+            h0[(base + 1, base + 1)] = p.e_p;
+            h0[(base + 2, base + 2)] = p.e_p;
+            h0[(base + 3, base + 3)] = p.e_p;
+        }
+        Ok(())
+    }
+
+    /// Pair fill for sp-only: unrolled shell-pair evaluation and rotation.
+    /// Eliminates the generic nested-shell loops and the (ang1,ang2) match dispatch.
+    fn fill_pairs_sp_only(
+        &self,
+        ctx: &SystemContext<'_>,
+        neigh: &NeighborList,
+        h0: &mut DMatrix<f64>,
+        s: &mut DMatrix<f64>,
+    ) -> Result<()> {
+        let mut sk_h = [0.0f64; 4];
+        let mut sk_s = [0.0f64; 4];
+        let mut sub_h = [0.0f64; 9];
+        let mut sub_s = [0.0f64; 9];
+        let mut block_h = [0.0f64; 16];
+        let mut block_s = [0.0f64; 16];
+
+        for p in &neigh.pairs {
+            let si = ctx.atom_species[p.i];
+            let sj = ctx.atom_species[p.j];
+
+            let tab_fwd = ctx.pair_table(si, sj).ok_or_else(|| {
+                DftbError::InvalidInput(format!("missing SK table fwd ({si},{sj})"))
+            })?;
+            let tab_rev = ctx.pair_table(sj, si).ok_or_else(|| {
+                DftbError::InvalidInput(format!("missing SK table rev ({sj},{si})"))
+            })?;
+
+            let dc = DirectionCosines::from_vec(p.vec_ij)?;
+
+            // --- Shell (0,0): ss ---
+            tab_fwd.eval_shell_integrals_into(0, 0, p.r, &mut sk_h[..1], &mut sk_s[..1])?;
+            sub_h[0] = sk_h[0];
+            sub_s[0] = sk_s[0];
+            block_h[0] = sub_h[0];
+            block_s[0] = sub_s[0];
+
+            // --- Shell (0,1): sp (direct) ---
+            tab_fwd.eval_shell_integrals_into(0, 1, p.r, &mut sk_h[..1], &mut sk_s[..1])?;
+            Rotation::rotate_shell_pair_into(
+                0, 1, &sk_h[..1], &sk_s[..1], dc,
+                &mut sub_h[..3], &mut sub_s[..3],
+            )?;
+            block_h[4] = sub_h[0];
+            block_h[8] = sub_h[1];
+            block_h[12] = sub_h[2];
+            block_s[4] = sub_s[0];
+            block_s[8] = sub_s[1];
+            block_s[12] = sub_s[2];
+
+            // --- Shell (1,0): ps (transpose, sign = -1) ---
+            tab_rev.eval_shell_integrals_into(1, 0, p.r, &mut sk_h[..1], &mut sk_s[..1])?;
+            Rotation::rotate_shell_pair_into(
+                1, 0, &sk_h[..1], &sk_s[..1], dc,
+                &mut sub_h[..3], &mut sub_s[..3],
+            )?;
+            block_h[1] = -sub_h[0];
+            block_h[2] = -sub_h[1];
+            block_h[3] = -sub_h[2];
+            block_s[1] = -sub_s[0];
+            block_s[2] = -sub_s[1];
+            block_s[3] = -sub_s[2];
+
+            // --- Shell (1,1): pp (direct) ---
+            tab_fwd.eval_shell_integrals_into(1, 1, p.r, &mut sk_h[..2], &mut sk_s[..2])?;
+            Rotation::rotate_shell_pair_into(
+                1, 1, &sk_h[..2], &sk_s[..2], dc,
+                &mut sub_h[..9], &mut sub_s[..9],
+            )?;
+            for a in 0..3 {
+                for b in 0..3 {
+                    block_h[5 + a * 4 + b] = sub_h[a * 3 + b];
+                    block_s[5 + a * 4 + b] = sub_s[a * 3 + b];
+                }
+            }
+
+            // Write to global matrices
+            let bi = ctx.atom_orb_off[p.i] as usize;
+            let bj = ctx.atom_orb_off[p.j] as usize;
+            for a in 0..4 {
+                for b in 0..4 {
+                    let val_h = block_h[a * 4 + b];
+                    let val_s = block_s[a * 4 + b];
                     h0[(bj + a, bi + b)] = val_h;
                     h0[(bi + b, bj + a)] = val_h;
                     s[(bj + a, bi + b)] = val_s;

@@ -51,3 +51,37 @@ fn parity_h0_methane_example() {
     assert!(dh < 1e-8, "H0 mismatch max diff = {dh:e}");
     assert!(ds < 1e-8, "S mismatch max diff = {ds:e}");
 }
+
+/// Verify that build_non_scc_sp_only produces identical results to the generic
+/// build_non_scc for an sp-only system (methane with mio-1-1 SK set).
+#[test]
+fn parity_sp_only_vs_generic() {
+    let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else { return; };
+
+    let species = vec![
+        "C".to_string(),
+        "H".to_string(),
+        "H".to_string(),
+        "H".to_string(),
+        "H".to_string(),
+    ];
+    let coords = vec![
+        [0.0, 0.0, 0.0],
+        [0.629118, 0.629118, 0.629118],
+        [-0.629118, -0.629118, 0.629118],
+        [-0.629118, 0.629118, -0.629118],
+        [0.629118, -0.629118, -0.629118],
+    ];
+
+    let sk = SkData::load_sk_folder(sk_dir, ".skf", "-").unwrap();
+    let builder = HamiltonianBuilder::new(sk);
+
+    let ham_generic = builder.build_non_scc(&species, &coords).unwrap();
+    let ham_sp_only = builder.build_non_scc_sp_only(&species, &coords).unwrap();
+
+    let dh = max_abs_diff(&ham_generic.h0, &ham_sp_only.h0);
+    let ds = max_abs_diff(&ham_generic.s, &ham_sp_only.s);
+
+    assert!(dh < 1e-14, "sp-only H0 diverges from generic: max diff = {dh:e}");
+    assert!(ds < 1e-14, "sp-only S diverges from generic: max diff = {ds:e}");
+}
