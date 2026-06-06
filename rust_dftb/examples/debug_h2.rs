@@ -38,7 +38,15 @@ fn main() {
         println!("  {}: {}", i, s);
     }
 
-    let sk = SkData::load_sk_folder(&sk_dir, ".skf", "-").unwrap();
+    let mut sk = SkData::load_sk_folder(&sk_dir, ".skf", "-").unwrap();
+
+    // Set angular momenta per species for mio-1-1: H=s-only, C/O/N=sp
+    let mut ang_map = std::collections::HashMap::new();
+    for sp in ["H", "C", "O", "N"] {
+        let shells = if sp == "H" { vec![0] } else { vec![0, 1] };
+        ang_map.insert(sp.to_string(), shells);
+    }
+    sk.set_species_angular_momenta(ang_map);
 
     // Debug: print the H-H table header and a few grid points
     if let Some(table) = sk.pairs.get(&("H".to_string(), "H".to_string())) {

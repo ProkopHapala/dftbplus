@@ -904,28 +904,60 @@ Same fix applied to `parse_numbers_strict` and grid-line tokenization.
 
 ---
 
-### Bug 5: Hardcoded 4-Orbitals-Per-Atom Assumption (LIMITATION)
+### Bug 5: Hardcoded 4-Orbitals-Per-Atom Assumption (FIXED)
 
 **Symptom:** Polyatomic molecules with mixed basis (e.g., HCOOH with s-only H and sp C/O) fail with matrix dimension mismatch. Rust produces 20×20 (5 atoms × 4 orbitals) while DFTB+ produces 14×14 (C:4 + O:4 + O:4 + H:1 + H:1).
 
-**Root cause:** `HamiltonianBuilder::build_non_scc` hardcodes `n_orb = 4 * n_atom` (line 43 in `hamiltonian.rs`). This assumes all atoms have sp basis (s, py, pz, px = 4 orbitals). In DFTB+ mio-1-1, H is s-only (1 orbital) while C, O, N are sp (4 orbitals).
+**Root cause:** `HamiltonianBuilder::build_non_scc` hardcoded `n_orb = 4 * n_atom`.
 
-**Current status:** H2 and N2 parity tests pass because all atoms have the same basis (H2: both H with 1 orbital, N2: both N with 4 orbitals). Polyatomic tests fail due to this limitation.
+**Fix implemented:**
+1. Added `SpeciesOrbitals` struct with `ang_shells`, `n_orb`, `n_shell`
+2. Added `SkData::set_species_angular_momenta()` to define per-species orbital info
+3. Replaced `4 * n_atom` with cumulative orbital offsets `i_orb_atom[i]`
+4. Updated `fill_onsite` and `fill_pairs` to use per-atom orbital starts
+5. Generalized `rotation.rs` to iterate over shells like Fortran `rotateH0`
 
-**Required fix:** Implement per-species orbital counting:
-1. Parse orbital count from SK file header or MaxAngularMomentum specification
-2. Create an orbital index map: `iAtomStart[iAtom] = cumulative orbital count`
-3. Use `iAtomStart` for matrix indexing instead of `4 * iAtom`
-4. Update rotation and assembly to handle variable block sizes
+**Verification:**
+- H2: exact match (0e0)
+- N2: exact match (0e0)
+- HCOOH: H0 diff = 4.87e-7, S diff = 5.56e-13
+- HCONH2: H0 diff = 4.64e-8, S diff = 1.62e-12
 
-**Files to modify:**
-- `src/sk_data.rs` — Add orbital count per species (parse from SK or user-specified)
-- `src/hamiltonian.rs` — Replace `4 * n_atom` with per-species orbital counting
-- `src/rotation.rs` — Generalize `rotate_sp_block` to handle variable orbital counts (s-only, sp-only, sd, etc.)
+---
 
-**Test molecules affected:**
-- HCOOH (formic acid): 5 atoms, expected 14 orbitals (C:4, O:4, O:4, H:1, H:1)
-- HCONH2 (formamide): 6 atoms, expected 18 orbitals (C:4, O:4, N:4, H:1, H:1, H:1)
+### Bug 6: Reversed SK File Lookup When ang1 > ang2 (FIXED)
+
+**Symptom:** After fixing Bug 5, HCOOH/HCONH2 showed large mismatches (~0.15 for H0, ~0.07 for S) in off-diagonal sp blocks.
+
+**Root cause:** DFTB+ old-format SK files are **not symmetric**. `C-O.skf` and `O-C.skf` contain different data. When `l1 > l2` in `getFullTable`, Fortran uses `skData21(iSK1,iSK2)` — the data from the **reversed** file (e.g., `O-C.skf` instead of `C-O.skf`).
+
+**Why this matters:** The sp integral value depends on which species has the s orbital and which has the p orbital, because the radial wavefunctions differ. `sp(C_s, O_p)` ≠ `sp(O_s, C_p)`.
+
+**Fix in `rust_dftb/src/sk_data.rs`:**
+```rust
+// Fortran getFullTable: if l1 > l2, use skData21(iSK1,iSK2) = reversed pair data
+let (lookup_sp1, lookup_sp2) = if ang1 <= ang2 {
+    (sp1, sp2)
+} else {
+    (sp2, sp1)
+};
+let tab = self.get_pair(lookup_sp1, lookup_sp2)?;
+```
+
+**Key insight from Fortran `parser.F90` `getFullTable`:**
+```fortran
+if (l1 <= l2) then
+  pHam => skData12(iSK2,iSK1)%skHam
+  lMin = l1
+  lMax = l2
+else
+  pHam => skData21(iSK1,iSK2)%skHam
+  lMin = l2
+  lMax = l1
+end if
+```
+
+When `l1 > l2`, DFTB+ switches to `skData21` which contains the SK data for the reversed species pair (from the reversed `.skf` file). The `skMap(mm, lMax, lMin)` extraction then uses the same `lMax >= lMin` ordering, but the **raw data comes from a different file**.
 
 ---
 

@@ -4,6 +4,36 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
+/// Orbital info for a species, matching Fortran TOrbitals per-species fields.
+#[derive(Debug, Clone)]
+pub struct SpeciesOrbitals {
+    /// Angular momenta of each shell (e.g., [0] for s-only, [0, 1] for sp)
+    pub ang_shells: Vec<i32>,
+    /// Number of orbitals = sum(2*l + 1) for each shell
+    pub n_orb: usize,
+    /// Number of shells
+    pub n_shell: usize,
+}
+
+impl SpeciesOrbitals {
+    pub fn from_ang_momenta(ang: &[i32]) -> Self {
+        let n_orb = ang.iter().map(|&l| (2 * l + 1) as usize).sum();
+        Self {
+            ang_shells: ang.to_vec(),
+            n_orb,
+            n_shell: ang.len(),
+        }
+    }
+    /// Offset of each shell within the species orbital block
+    pub fn shell_offsets(&self) -> Vec<usize> {
+        let mut off = vec![0usize; self.n_shell];
+        for i in 1..self.n_shell {
+            off[i] = off[i - 1] + (2 * self.ang_shells[i - 1] + 1) as usize;
+        }
+        off
+    }
+}
+
 // Indices into the OLD 10-column SK table (0-based) for sp interactions.
 // skMap(mm, lMax, lMin) in parser.F90 is Fortran column-major (mm varies fastest):
 //   ss-σ: skMap(0, lMax=0, lMin=0)=20 → iSKInterOld pos 10 → old index 9
@@ -91,6 +121,8 @@ impl SkTableSp {
 pub struct SkData {
     pub onsite: HashMap<String, AtomicParamsSp>,
     pub pairs: HashMap<(String, String), SkTableSp>,
+    /// Orbital info per species (must be set after loading SK files)
+    pub orbital_info: HashMap<String, SpeciesOrbitals>,
 }
 
 impl SkData {
@@ -107,8 +139,67 @@ impl SkData {
             .ok_or_else(|| DftbError::InvalidInput(format!("missing onsite params for {a}")))
     }
 
-    /// Load all `.skf` files from a folder with DFTB+ Type2FileNames naming convention:
-    /// `Prefix/El1-El2.suffix`. You must have homonuclear files to get onsite energies.
+    /// Set angular momenta for each species. Call after load_sk_folder.
+    /// e.g., {"H" => vec![0], "C" => vec![0, 1], "O" => vec![0, 1]}
+    pub fn set_species_angular_momenta(&mut self, ang: HashMap<String, Vec<i32>>) {
+        self.orbital_info.clear();
+        for (sp, shells) in ang {
+            self.orbital_info.insert(sp, SpeciesOrbitals::from_ang_momenta(&shells));
+        }
+    }
+
+    pub fn n_orb_species(&self, sp: &str) -> Result<usize> {
+        self.orbital_info
+            .get(sp)
+            .map(|o| o.n_orb)
+            .ok_or_else(|| DftbError::InvalidInput(format!("missing orbital info for {sp}")))
+    }
+
+    pub fn ang_shells(&self, sp: &str) -> Result<&[i32]> {
+        self.orbital_info
+            .get(sp)
+            .map(|o| o.ang_shells.as_slice())
+            .ok_or_else(|| DftbError::InvalidInput(format!("missing orbital info for {sp}")))
+    }
+
+    /// Evaluate SK integrals at distance `r` for a specific shell pair (ang1, ang2)
+    /// between species sp1 and sp2. Returns (h_integrals, s_integrals), each of length min(ang1,ang2)+1.
+    ///
+    /// When ang1 > ang2, DFTB+ swaps to the reversed species pair SK data
+    /// (skData21 in Fortran), because the old-format SK files store integrals
+    /// with the convention that the "first" species has the lower angular momentum.
+    pub fn eval_shell_integrals(&self, sp1: &str, sp2: &str, ang1: i32, ang2: i32, r: f64)
+        -> Result<(Vec<f64>, Vec<f64>)> {
+        // Fortran getFullTable: if l1 > l2, use skData21(iSK1,iSK2) = reversed pair data
+        let (lookup_sp1, lookup_sp2) = if ang1 <= ang2 {
+            (sp1, sp2)
+        } else {
+            (sp2, sp1)
+        };
+        let tab = self.get_pair(lookup_sp1, lookup_sp2).ok_or_else(|| {
+            DftbError::InvalidInput(format!("missing SK table for {lookup_sp1}-{lookup_sp2}"))
+        })?;
+        let h_all = tab.h.eval(r)?;
+        let s_all = tab.s.eval(r)?;
+        if h_all.len() != s_all.len() {
+            return Err(DftbError::Parse("H and S integral count mismatch".into()));
+        }
+        let is_extended = h_all.len() == 20;
+        let h_shell = if is_extended {
+            extract_shell_integrals_new(&h_all, ang1, ang2)
+        } else {
+            extract_shell_integrals_old(&h_all, ang1, ang2)
+        };
+        let s_shell = if is_extended {
+            extract_shell_integrals_new(&s_all, ang1, ang2)
+        } else {
+            extract_shell_integrals_old(&s_all, ang1, ang2)
+        };
+        Ok((h_shell, s_shell))
+    }
+
+    /// Load all `.skf` files from a folder with DFTB+ Type2FileNames naming convention.
+    /// After loading, call set_species_angular_momenta to define orbital info.
     pub fn load_sk_folder(prefix: impl AsRef<Path>, suffix: &str, sep: &str) -> Result<Self> {
         let prefix = prefix.as_ref();
         let mut out = SkData::default();
@@ -120,7 +211,7 @@ impl SkData {
                 continue;
             }
             if let Some((a, b)) = parse_pair_from_filename(&path, sep, suffix) {
-                let sk = read_skf_sp(&path, &a, &b)?;
+                let sk = read_skf_all(&path, &a, &b)?;
                 if a == b {
                     out.onsite.insert(a.clone(), sk_read_onsite_sp(&path)?);
                 }
@@ -186,13 +277,11 @@ fn sk_read_onsite_sp(path: &Path) -> Result<AtomicParamsSp> {
     Ok(AtomicParamsSp { e_s, e_p })
 }
 
-fn read_skf_sp(path: &Path, sp1: &str, sp2: &str) -> Result<SkTableSp> {
-    // Minimal parser for the integrals part of old-format .skf.
-    // We ignore spline repulsive etc.
+/// Read all SK integrals (10 for old format, 20 for extended) per grid point.
+fn read_skf_all(path: &Path, sp1: &str, sp2: &str) -> Result<SkTableSp> {
     let text = fs::read_to_string(path)?;
     let mut it = text.lines();
 
-    // detect optional '@'
     let first = it.next().ok_or_else(|| DftbError::Parse("empty skf".into()))?;
     let extended = first.trim_start().starts_with('@');
     let grid_line = if extended {
@@ -212,11 +301,9 @@ fn read_skf_sp(path: &Path, sp1: &str, sp2: &str) -> Result<SkTableSp> {
         .ok_or_else(|| DftbError::Parse("missing ngrid".into()))?
         .parse()
         .map_err(|e: std::num::ParseIntError| DftbError::Parse(e.to_string()))?;
-
-    // oldskdata: skData%nGrid = nGrid - 1
     let n_grid = n_grid_raw.saturating_sub(1);
 
-    // skip 2nd/3rd lines (atomic params / poly repulsive) if homonuclear
+    // skip atomic params / repulsive lines
     if sp1 == sp2 {
         it.next();
         it.next();
@@ -232,26 +319,17 @@ fn read_skf_sp(path: &Path, sp1: &str, sp2: &str) -> Result<SkTableSp> {
         let nums: Vec<f64> = parse_numbers_strict(line)?;
 
         if extended {
-            // extended has 20 ham + 20 over
             if nums.len() < 40 {
                 return Err(DftbError::InvalidSkFormat("extended line needs 40 numbers".into()));
             }
-            let ham = &nums[0..20];
-            let ovl = &nums[20..40];
-            h_vals.push(pick_sp(ham));
-            s_vals.push(pick_sp(ovl));
+            h_vals.push(nums[0..20].to_vec());
+            s_vals.push(nums[20..40].to_vec());
         } else {
-            // old has 10 ham + 10 over, corresponding to indices iSKInterOld.
             if nums.len() < 20 {
                 return Err(DftbError::InvalidSkFormat("old line needs 20 numbers".into()));
             }
-            let ham10 = &nums[0..10];
-            let ovl10 = &nums[10..20];
-            // Pick sp integrals using correct old-format column positions
-            let h_sp = vec![ham10[OLD_SS_SIGMA], ham10[OLD_SP_SIGMA], ham10[OLD_PP_SIGMA], ham10[OLD_PP_PI]];
-            let s_sp = vec![ovl10[OLD_SS_SIGMA], ovl10[OLD_SP_SIGMA], ovl10[OLD_PP_SIGMA], ovl10[OLD_PP_PI]];
-            h_vals.push(h_sp);
-            s_vals.push(s_sp);
+            h_vals.push(nums[0..10].to_vec());
+            s_vals.push(nums[10..20].to_vec());
         }
     }
 
@@ -263,16 +341,51 @@ fn read_skf_sp(path: &Path, sp1: &str, sp2: &str) -> Result<SkTableSp> {
     })
 }
 
-fn pick_sp(arr20: &[f64]) -> Vec<f64> {
-    // arr20 is 20 long (0-based), using skMap(mm,lMax,lMin) column-major:
-    // ss-σ: new col 20 → idx 19
-    // sp-σ: new col 19 → idx 18
-    // pp-σ: new col 15 → idx 14
-    // pp-π: new col 16 → idx 15
-    vec![
-        arr20[19], // ss-σ
-        arr20[18], // sp-σ
-        arr20[14], // pp-σ
-        arr20[15], // pp-π
-    ]
+/// Extract SK integrals for a shell pair (ang1, ang2) from the raw old-format 10-integral array.
+/// The returned Vec has length = min(ang1, ang2) + 1, ordered by mm=0,1,...,min(ang1,ang2).
+///
+/// DFTB+ skMap(mm, lMax, lMin) → new column → old column via iSKInterOld.
+fn extract_shell_integrals_old(arr10: &[f64], ang1: i32, ang2: i32) -> Vec<f64> {
+    // iSKInterOld maps old col → new col: [8,9,10,13,14,15,16,18,19,20]
+    let iSKInterOld: [usize; 10] = [8, 9, 10, 13, 14, 15, 16, 18, 19, 20];
+    // Inverse: new col → old index (0-based)
+    let mut new_to_old = [0usize; 21];
+    for (old_idx, &new_col) in iSKInterOld.iter().enumerate() {
+        new_to_old[new_col] = old_idx;
+    }
+
+    let (l_min, l_max) = if ang1 <= ang2 { (ang1, ang2) } else { (ang2, ang1) };
+    let n_mm = (l_min + 1) as usize;
+    let mut out = Vec::with_capacity(n_mm);
+
+    for mm in 0..=l_min {
+        let new_col = sk_map(mm, l_max, l_min);
+        let old_idx = new_to_old[new_col as usize];
+        out.push(arr10[old_idx]);
+    }
+    out
+}
+
+/// DFTB+ skMap(mm, lMax, lMin) decoded from parser.F90.
+fn sk_map(mm: i32, l_max: i32, l_min: i32) -> i32 {
+    // From Fortran reshape((/.../), (/4,4,4/)) in column-major order
+    match (mm, l_max, l_min) {
+        (0, 0, 0) => 20, // ssσ
+        (0, 1, 0) => 19, // spσ
+        (0, 1, 1) => 15, // ppσ
+        (1, 1, 1) => 16, // ppπ
+        _ => panic!("sk_map: unsupported ({}, {}, {})", mm, l_max, l_min),
+    }
+}
+
+/// Extract SK integrals for a shell pair (ang1, ang2) from raw extended-format 20-integral array.
+fn extract_shell_integrals_new(arr20: &[f64], ang1: i32, ang2: i32) -> Vec<f64> {
+    let (l_min, l_max) = if ang1 <= ang2 { (ang1, ang2) } else { (ang2, ang1) };
+    let n_mm = (l_min + 1) as usize;
+    let mut out = Vec::with_capacity(n_mm);
+    for mm in 0..=l_min {
+        let new_col = sk_map(mm, l_max, l_min) as usize;
+        out.push(arr20[new_col - 1]); // 0-based
+    }
+    out
 }
