@@ -16,3 +16,4 @@ Thumbs.db
 # Test outputs
 *.dat
 /tmp/
+*_bak_*
