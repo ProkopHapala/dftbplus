@@ -156,7 +156,6 @@ impl SkTableSp {
         let mut s_all = [0.0f64; 20];
         self.h.eval_into(r, &mut h_all)?;
         self.s.eval_into(r, &mut s_all)?;
-        let n_integ = self.h.n_integ();
 
         let (l_min, l_max) = if ang1 <= ang2 { (ang1, ang2) } else { (ang2, ang1) };
         let n_mm = (l_min + 1) as usize;
