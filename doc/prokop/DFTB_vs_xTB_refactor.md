@@ -287,3 +287,47 @@ With generics, Rust monomorphizes at compile time. The hot [fill_pairs](cci:1://
 - **`sk_data`:** DFTB-only. Move to `methods/dftb/`.
 - **xTB params:** No "reader" needed — static arrays in `methods/xtb/params.rs`, selected by enum (`GFN1` / `GFN2`).
 - **Refactor order:** (1) Extract `core/` and `methods::traits`, (2) Move DFTB-specific files into `methods/dftb/`, (3) Make [FragmentTemplate](cci:2://file:///home/prokophapala/git/dftbplus/rust_dftb/src/qmqm/fragment.rs:27:0-52:1) and [MultiSystemSolver](cci:2://file:///home/prokophapala/git/dftbplus/rust_dftb/src/qmqm/solver.rs:20:0-51:1) generic, (4) Implement `methods/xtb/` without touching anything in `methods/dftb/` or [qmqm/](cci:9://file:///home/prokophapala/git/dftbplus/rust_dftb/src/qmqm:0:0-0:0) beyond the trait.
+
+---
+
+## What was done (2025-06-06)
+
+### Phase 1: `core/` extraction
+
+- `src/core/error.rs` — moved `DftbError`, `Result`
+- `src/core/neighbor.rs` — moved `NeighborList`, `NeighborBuilder`
+- `src/core/charges.rs` — moved Mulliken charge analysis from `qmqm/charges.rs`
+- `src/core/mod.rs` — declares the three submodules
+
+### Phase 2: `methods/` extraction
+
+- `src/methods/traits.rs` — created `H0Builder` and `CoulombModel` trait stubs
+- `src/methods/dftb/` — moved all DFTB-specific code:
+  - `sk_data.rs` — SK file parsing, `SkData`, `SkTableSp`
+  - `interpolation.rs` — `EqGridTable`, Neville interpolation
+  - `rotation.rs` — `DirectionCosines`, `Rotation`
+  - `hamiltonian.rs` — `HamiltonianBuilder`, `SystemContext`, `HWorkspace`
+  - `gamma.rs` — `gamma_full`, `GammaTable`
+- `src/methods/dftb/mod.rs` — declares DFTB submodules
+- `src/methods/xtb/mod.rs` — placeholder for future xTB implementation
+- `src/methods/mod.rs` — declares `traits`, `dftb`, `xtb`
+
+### Phase 3: `lib.rs` update and cleanup
+
+- `lib.rs` now declares `pub mod core; pub mod methods; pub mod qmqm;`
+- Re-exports public API directly from new locations for backward compatibility
+- Removed 6 old root-level stub files (`error.rs`, `neighbor.rs`, `sk_data.rs`, `interpolation.rs`, `rotation.rs`, `hamiltonian.rs`)
+- Fixed all internal imports in `qmqm/fragment.rs`, `qmqm/solver.rs`, `scc.rs`, `output.rs`
+
+### Verification
+
+- `cargo check` — clean
+- `cargo test --test parity_universal` — passes
+- All 6 molecules (H2O, CO, CH2O, HCN, C2H4, HCOOH) pass both non-SCC and SCC parity
+- HF excluded due to missing Fluorine parameters in `mio-1-1`
+
+### Still pending
+
+- Phase 3 proper: make `FragmentTemplate` and `MultiSystemSolver` generic over `H0Builder` and `CoulombModel`
+- Implement `H0Builder` for `HamiltonianBuilder` and `CoulombModel` for `GammaTable`
+- `methods/xtb/` actual implementation (params, basis, integrals, Hamiltonian, coulomb)

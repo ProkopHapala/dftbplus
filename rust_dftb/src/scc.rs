@@ -1,4 +1,4 @@
-use crate::error::Result;
+use crate::core::error::Result;
 use nalgebra::DMatrix;
 
 /// SCC module placeholder.

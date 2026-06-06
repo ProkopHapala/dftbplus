@@ -1,4 +1,4 @@
-use crate::error::{DftbError, Result};
+use crate::core::error::{DftbError, Result};
 use nalgebra::DMatrix;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};

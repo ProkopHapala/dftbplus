@@ -12,9 +12,9 @@
 use nalgebra::{DMatrix, DVector, SymmetricEigen};
 use nalgebra::linalg::Cholesky;
 
-use crate::error::{DftbError, Result};
-use crate::hamiltonian::{HamiltonianBuilder, SystemContext};
-use crate::sk_data::SkData;
+use crate::core::error::{DftbError, Result};
+use crate::methods::dftb::hamiltonian::{HamiltonianBuilder, SystemContext};
+use crate::methods::dftb::sk_data::SkData;
 
 /// Pre-computed template for a fragment type (e.g. one water molecule).
 ///

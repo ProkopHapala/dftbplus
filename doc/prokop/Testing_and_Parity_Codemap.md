@@ -1095,15 +1095,46 @@ python3 run_parity.py /path/to/molecule.xyz --scc --delta-q 0.1,-0.1,...
 | Molecule | Atoms | Non-SCC | SCC |
 |----------|-------|---------|-----|
 | H2O      | 3     | ✓       | ✓   |
-| HF       | 2     | ✓       | ✓   |
 | CO       | 2     | ✓       | ✓   |
 | CH2O     | 4     | ✓       | ✓   |
 | HCN      | 3     | ✓       | ✓   |
 | C2H4     | 6     | ✓       | ✓   |
 | HCOOH    | 5     | ✓       | ✓   |
 
+**Note:** HF is excluded because the `mio-1-1` parameter set does not contain Fluorine (`F`) SK files. DFTB+ segfaults during reference generation when F is requested with this parameter set. Switching to a parameter set that includes F (e.g. `ob2-1-1`) would allow HF testing.
+
 ### Key implementation files
 
 - `rust_dftb/tests/run_parity.py` — Python orchestrator
 - `rust_dftb/tests/parity_universal.rs` — Generic Rust parity test
 - `rust_dftb/src/output.rs` — DFTB+ square matrix reader
+
+---
+
+## 14. Post-Refactor Verification (2025-06-06)
+
+After reorganizing the Rust codebase into `core/`, `methods/`, and `qmqm/` modules:
+
+### What changed
+
+- `core/` — method-agnostic: `error.rs`, `neighbor.rs`, `charges.rs`
+- `methods/dftb/` — DFTB-specific: `sk_data.rs`, `interpolation.rs`, `rotation.rs`, `hamiltonian.rs`, `gamma.rs`
+- `methods/xtb/` — placeholder for future xTB implementation
+- `methods/traits.rs` — `H0Builder` and `CoulombModel` trait boundaries
+- `lib.rs` — updated to declare new hierarchy with backward-compatible re-exports
+- Old root-level stubs (`error.rs`, `neighbor.rs`, `sk_data.rs`, `interpolation.rs`, `rotation.rs`, `hamiltonian.rs`) removed
+
+### Parity status after refactor
+
+All 6 verified molecules pass both non-SCC and SCC parity:
+
+| Molecule | Non-SCC | SCC |
+|----------|---------|-----|
+| H2O      | ✓       | ✓   |
+| CO       | ✓       | ✓   |
+| CH2O     | ✓       | ✓   |
+| HCN      | ✓       | ✓   |
+| C2H4     | ✓       | ✓   |
+| HCOOH    | ✓       | ✓   |
+
+**HF excluded:** `mio-1-1` SK set lacks Fluorine parameters.

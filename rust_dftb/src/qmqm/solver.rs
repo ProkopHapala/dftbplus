@@ -9,7 +9,7 @@
 //! - `self.q_out` is pre-allocated to `n_atoms_total`.
 //! - Mixer history buffers are pre-allocated.
 
-use crate::error::{DftbError, Result};
+use crate::core::error::{DftbError, Result};
 use crate::qmqm::gamma::GammaTable;
 use crate::qmqm::mixer::Mixer;
 use crate::qmqm::neighbor::FragmentNeighborList;

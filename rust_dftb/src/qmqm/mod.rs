@@ -9,12 +9,12 @@
 //! - Embarrassingly parallel fragment diagonalization.
 //! - O(N) inter-fragment neighbor finding via cell lists.
 
-pub mod gamma;
+pub use crate::methods::dftb::gamma;
 pub mod mixer;
 pub mod neighbor;
 pub mod fragment;
 pub mod shifts;
-pub mod charges;
+pub use crate::core::charges;
 pub mod solver;
 
 pub use gamma::{GammaTable, gamma_full};

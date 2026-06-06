@@ -1,24 +1,31 @@
-//! Rust implementation of DFTB non-SCC Hamiltonian assembly
+//! Rust implementation of semi-empirical LCAO solvers (DFTB, xTB) and
+//! multi-system QM/QM fragment solver.
 //!
-//! This library implements the core DFTB+ Hamiltonian assembly workflow
-//! for arbitrary basis sets per species, focusing on non-SCC components
-//! with parity checking against the original DFTB+ implementation.
+//! Module layout:
+//! - `core/`    – method-agnostic primitives (errors, neighbor finding, charges)
+//! - `methods/` – specific Hamiltonian methods (DFTB SK-tables, xTB analytical)
+//! - `qmqm/`    – multi-fragment QM/QM solver (generic over Hamiltonian / Coulomb model)
 
-pub mod error;
-pub mod sk_data;
-pub mod interpolation;
-pub mod rotation;
-pub mod neighbor;
-pub mod hamiltonian;
-pub mod scc;
-pub mod output;
+pub mod core;
+pub mod methods;
 pub mod qmqm;
 
-pub use error::{DftbError, Result};
-pub use sk_data::{SkData, SkTableSp, SpeciesOrbitals};
-pub use interpolation::{InterpolationMethod, EqGridTable};
-pub use rotation::{Rotation, DirectionCosines};
-pub use neighbor::{NeighborList, NeighborBuilder};
-pub use hamiltonian::{HamiltonianBuilder, Hamiltonian};
-pub use scc::Scc;
+// --- Re-exports for backward compatibility ---
+// These keep existing tests and callers working without changing their imports.
+
+pub use core::error::{DftbError, Result};
+pub use core::neighbor::{NeighborList, NeighborBuilder};
+pub use core::charges;
+
+pub use methods::dftb::sk_data::{SkData, SkTableSp, SpeciesOrbitals, AtomicParamsSp};
+pub use methods::dftb::interpolation::{InterpolationMethod, EqGridTable};
+pub use methods::dftb::rotation::{Rotation, DirectionCosines};
+pub use methods::dftb::hamiltonian::{HamiltonianBuilder, Hamiltonian};
+pub use methods::dftb::gamma::{GammaTable, gamma_full};
+
+pub use methods::traits::{H0Builder, CoulombModel};
+
+pub mod scc;
+pub mod output;
+
 pub use output::{DftbOutput, OutputFormat};
