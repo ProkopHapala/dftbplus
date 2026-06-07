@@ -379,7 +379,7 @@ fn extract_shell_integrals_new(arr20: &[f64], ang1: i32, ang2: i32) -> Vec<f64> 
     out
 }
 
-fn sk_map(mm: i32, l_max: i32, l_min: i32) -> i32 {
+pub fn sk_map(mm: i32, l_max: i32, l_min: i32) -> i32 {
     match (mm, l_max, l_min) {
         (0, 0, 0) => 20,
         (0, 1, 0) => 19,

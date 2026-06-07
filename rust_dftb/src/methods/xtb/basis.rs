@@ -1,6 +1,7 @@
 //! CGTO basis construction from Slater exponents using Stewart coefficients.
 
 use crate::methods::xtb::params;
+use crate::methods::xtb::params_gfn2;
 
 /// Contracted Gaussian-type orbital
 #[derive(Debug, Clone)]
@@ -24,23 +25,57 @@ impl Cgto {
 
 /// Build CGTOs for a single element from GFN1 parameters
 pub fn build_element_cgtos(elem_idx: usize) -> Vec<Cgto> {
-    let nsh = params::nshell[elem_idx];
+    build_element_cgtos_generic(
+        elem_idx,
+        &params::nshell,
+        &params::ang_shell,
+        &params::principal_qn,
+        &params::nprim,
+        &params::slater_zeta,
+        true,
+    )
+}
+
+/// Build CGTOs for a single element from GFN2 parameters (no orthogonalization)
+pub fn build_element_cgtos_gfn2(elem_idx: usize) -> Vec<Cgto> {
+    build_element_cgtos_generic(
+        elem_idx,
+        &params_gfn2::nshell,
+        &params_gfn2::ang_shell,
+        &params_gfn2::principal_qn,
+        &params_gfn2::nprim,
+        &params_gfn2::slater_zeta,
+        false,
+    )
+}
+
+/// Generic CGTO builder
+pub fn build_element_cgtos_generic(
+    elem_idx: usize,
+    nshell_arr: &[usize],
+    ang_shell_arr: &[[usize; 3]],
+    principal_qn_arr: &[[usize; 3]],
+    nprim_arr: &[[usize; 3]],
+    slater_zeta_arr: &[[f64; 3]],
+    orthogonalize: bool,
+) -> Vec<Cgto> {
+    let nsh = nshell_arr[elem_idx];
     let mut cgtos = Vec::with_capacity(nsh);
     let mut ang_idx = [0usize; 3]; // track first shell of each angular momentum
 
     // First pass: build raw CGTOs from Slater exponents
     for ish in 0..nsh {
-        let l = params::ang_shell[elem_idx][ish];
-        let ng = params::nprim[elem_idx][ish];
-        let n = params::principal_qn[elem_idx][ish];
-        let zeta = params::slater_zeta[elem_idx][ish];
+        let l = ang_shell_arr[elem_idx][ish];
+        let ng = nprim_arr[elem_idx][ish];
+        let n = principal_qn_arr[elem_idx][ish];
+        let zeta = slater_zeta_arr[elem_idx][ish];
 
         let mut cgto = slater_to_gauss(ng, n, l, zeta, true);
 
-        if ang_idx[l] > 0 {
+        if orthogonalize && ang_idx[l] > 0 {
             // Orthogonalize against previous shell with same angular momentum
             let prev = ang_idx[l] - 1;
-            orthogonalize(&cgtos[prev], &mut cgto);
+            orthogonalize_cgto(&cgtos[prev], &mut cgto);
         } else {
             ang_idx[l] = ish + 1;
         }
@@ -114,7 +149,7 @@ fn slater_to_gauss(ng: usize, n: usize, l: usize, zeta: f64, norm: bool) -> Cgto
 
 /// Gram-Schmidt orthogonalization of cgto_b against cgto_a (same angular momentum)
 /// Follows tblite's approach: append primitives from a to b with scaled coefficients
-fn orthogonalize(cgto_a: &Cgto, cgto_b: &mut Cgto) {
+fn orthogonalize_cgto(cgto_a: &Cgto, cgto_b: &mut Cgto) {
     if cgto_a.ang != cgto_b.ang { return; }
 
     // Compute overlap S_ab = <a|b>

@@ -39,3 +39,8 @@ target/
 *.dll
 *.dylib
 Cargo.lock
+*.helper
+tests/dftb/*_debug*.txt
+tests/dftb/*.hsd
+tests/dftb/*.xyz
+tests/grid/*.hsd

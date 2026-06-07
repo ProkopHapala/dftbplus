@@ -44,6 +44,18 @@ pub const nprim: &[[usize; 3]] = &[
     [6, 6, 0], // O
 ];
 
+/// Reference occupation numbers by angular momentum [element][l]
+pub const reference_occ: &[[f64; 3]] = &[
+    [1.0, 0.0, 0.0], // H
+    [2.0, 0.0, 0.0], // He
+    [1.0, 0.0, 0.0], // Li
+    [2.0, 0.0, 0.0], // Be
+    [2.0, 1.0, 0.0], // B
+    [2.0, 2.0, 0.0], // C
+    [2.0, 3.0, 0.0], // N
+    [2.0, 4.0, 0.0], // O
+];
+
 /// Slater exponents zeta [element][shell]
 pub const slater_zeta: &[[f64; 3]] = &[
     [1.207940, 1.993207, 0.0], // H

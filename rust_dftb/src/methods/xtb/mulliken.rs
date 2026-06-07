@@ -1,5 +1,7 @@
 //! Mulliken population analysis for xTB
 
+use crate::methods::xtb::params;
+use crate::methods::xtb::params_gfn2;
 use nalgebra::{DMatrix, DVector};
 
 /// Compute shell-resolved Mulliken charges
@@ -47,12 +49,51 @@ pub fn atomic_charges(
     qat
 }
 
-/// Compute reference shell occupations (n0sh) from element data
-/// For GFN1, this is the number of electrons in each shell for neutral atom
-pub fn reference_shell_occupations(
+/// Compute atomic multipole moments from density matrix and multipole integrals.
+/// Reproduces tblite wavefunction/mulliken.f90 get_mulliken_atomic_multipoles.
+///
+/// mpat(cmp, iat) = -sum_{iao on iat} sum_{jao} P(jao, iao) * mpint(cmp, jao, iao)
+///
+/// Inputs:
+///   - density: nao × nao density matrix
+///   - mp_ints: flattened [nmp][nao][nao] multipole integrals in Fortran column-major order
+///   - ao2at: mapping from AO index to atom index
+///   - nmp: number of multipole components (3 for dipole, 6 for quadrupole)
+pub fn atomic_multipoles(
+    density: &DMatrix<f64>,
+    mp_ints: &[f64],
+    ao2at: &[usize],
+    nmp: usize,
+) -> DMatrix<f64> {
+    let nao = density.nrows();
+    let nat = *ao2at.iter().max().unwrap() + 1;
+    let mut mpat = DMatrix::zeros(nmp, nat);
+
+    for iao in 0..nao {
+        let iat = ao2at[iao];
+        let mut pao = vec![0.0f64; nmp];
+        for jao in 0..nao {
+            let p_ji = density[(jao, iao)];
+            for cmp in 0..nmp {
+                let mp_ji = mp_ints[cmp + nmp * jao + nmp * nao * iao];
+                pao[cmp] += p_ji * mp_ji;
+            }
+        }
+        for cmp in 0..nmp {
+            mpat[(cmp, iat)] -= pao[cmp];
+        }
+    }
+
+    mpat
+}
+
+/// Generic reference shell occupations builder
+fn reference_shell_occupations_generic(
     nshell_per_atom: &[usize],
     elem_idx: &[usize],
     ang_per_shell: &[usize],
+    reference_occ: &[[f64; 3]],
+    valence_filter: bool,
 ) -> DVector<f64> {
     let nat = nshell_per_atom.len();
     let nshell_total: usize = nshell_per_atom.iter().sum();
@@ -62,60 +103,40 @@ pub fn reference_shell_occupations(
     for iat in 0..nat {
         let izp = elem_idx[iat];
         let nsh = nshell_per_atom[iat];
-
-        // Simple electron counting for H, C, N, O
-        // H: 1s(1), 2s(0)
-        // C: 2s(2), 2p(2)
-        // N: 2s(2), 2p(3)
-        // O: 2s(2), 2p(4)
-        match izp {
-            0 => { // H
-                n0sh[offset] = 1.0; // 1s
-                if nsh > 1 { n0sh[offset + 1] = 0.0; } // 2s
-            }
-            1 => { // He
-                n0sh[offset] = 2.0; // 1s
-            }
-            2 => { // Li
-                n0sh[offset] = 2.0; // 2s
-                n0sh[offset + 1] = 1.0; // 2p
-            }
-            3 => { // Be
-                n0sh[offset] = 2.0; // 2s
-                n0sh[offset + 1] = 2.0; // 2p
-            }
-            4 => { // B
-                n0sh[offset] = 2.0; // 2s
-                n0sh[offset + 1] = 3.0; // 2p
-            }
-            5 => { // C
-                n0sh[offset] = 2.0; // 2s
-                n0sh[offset + 1] = 2.0; // 2p
-            }
-            6 => { // N
-                n0sh[offset] = 2.0; // 2s
-                n0sh[offset + 1] = 3.0; // 2p
-            }
-            7 => { // O
-                n0sh[offset] = 2.0; // 2s
-                n0sh[offset + 1] = 4.0; // 2p
-            }
-            _ => {
-                // Default: fill shells based on angular momentum
-                for ish in 0..nsh {
-                    let l = ang_per_shell[offset + ish];
-                    // s: 2, p: 6, d: 10 (but this is approximate)
-                    n0sh[offset + ish] = match l {
-                        0 => 2.0,
-                        1 => 6.0,
-                        2 => 10.0,
-                        _ => 0.0,
-                    };
-                }
+        let mut seen_ang = [false; 3];
+        for ish in 0..nsh {
+            let l = ang_per_shell[offset + ish];
+            let is_valence = if valence_filter {
+                let first = !seen_ang[l];
+                seen_ang[l] = true;
+                first
+            } else {
+                true
+            };
+            if is_valence {
+                n0sh[offset + ish] = reference_occ[izp][l];
             }
         }
         offset += nsh;
     }
 
     n0sh
+}
+
+/// Compute reference shell occupations for GFN1 (with valence filter)
+pub fn reference_shell_occupations(
+    nshell_per_atom: &[usize],
+    elem_idx: &[usize],
+    ang_per_shell: &[usize],
+) -> DVector<f64> {
+    reference_shell_occupations_generic(nshell_per_atom, elem_idx, ang_per_shell, &params::reference_occ, true)
+}
+
+/// Compute reference shell occupations for GFN2 (no valence filter)
+pub fn reference_shell_occupations_gfn2(
+    nshell_per_atom: &[usize],
+    elem_idx: &[usize],
+    ang_per_shell: &[usize],
+) -> DVector<f64> {
+    reference_shell_occupations_generic(nshell_per_atom, elem_idx, ang_per_shell, &params_gfn2::reference_occ, false)
 }

@@ -76,7 +76,7 @@ fn main() {
     // inspect neighbor list manually
     let cutoff = builder.sk.pairs.values().map(|t| t.cutoff()).fold(0.0_f64, f64::max);
     println!("cutoff = {}", cutoff);
-    let neigh = rust_dftb::neighbor::NeighborBuilder { cutoff }.build(&coords).unwrap();
+    let neigh = rust_dftb::core::neighbor::NeighborBuilder { cutoff }.build(&coords).unwrap();
     println!("neigh pairs = {:?}", neigh.pairs);
 
     // direct eval of H-H at 1.5
