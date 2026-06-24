@@ -2,7 +2,12 @@ use crate::core::error::{DftbError, Result};
 use crate::core::neighbor::{NeighborBuilder, NeighborList};
 use crate::methods::dftb::rotation::{DirectionCosines, Rotation};
 use crate::methods::dftb::sk_data::{AtomicParamsSp, SkData, SkTableSp};
-use nalgebra::DMatrix;
+use crate::methods::dftb::gamma::GammaTable;
+use crate::qmqm::fragment::{Fragment, FragmentTemplate};
+use crate::qmqm::neighbor::FragmentNeighborList;
+use crate::qmqm::mixer::DiisMixer;
+use crate::qmqm::solver::MultiSystemSolver;
+use nalgebra::{DMatrix, DVector};
 use std::collections::HashMap;
 
 const ANG2BOHR: f64 = 1.889726133;
@@ -11,6 +16,29 @@ const ANG2BOHR: f64 = 1.889726133;
 pub struct Hamiltonian {
     pub h0: DMatrix<f64>,
     pub s: DMatrix<f64>,
+}
+
+/// Result of a self-consistent charge (SCC) calculation.
+#[derive(Debug, Clone)]
+pub struct SccResult {
+    /// Non-SCC Hamiltonian H0
+    pub h0: DMatrix<f64>,
+    /// Converged SCC Hamiltonian H_scc = H0 + S·shift
+    pub h_scc: DMatrix<f64>,
+    /// Overlap matrix S
+    pub s: DMatrix<f64>,
+    /// Density matrix D = 2 * C_occ * C_occ^T (closed-shell)
+    pub density: DMatrix<f64>,
+    /// Eigenvalues from the converged generalized eigenvalue problem
+    pub eigenvalues: DVector<f64>,
+    /// Converged atom-resolved Mulliken charges
+    pub charges: Vec<f64>,
+    /// Reference neutral charges q0
+    pub q0: Vec<f64>,
+    /// Total SCC energy (band structure + charge repulsion correction)
+    pub energy: f64,
+    /// Number of SCC iterations to convergence
+    pub n_iter: usize,
 }
 
 pub struct SystemContext<'a> {
@@ -389,5 +417,93 @@ impl HamiltonianBuilder {
             }
         }
         Ok(())
+    }
+}
+
+impl HamiltonianBuilder {
+    /// Run a full self-consistent charge (SCC) calculation for a single molecule.
+    ///
+    /// This wraps the qmqm multi-system solver with a single fragment.
+    /// The SCC loop iterates until the RMS charge residual drops below `tol`
+    /// or `max_iter` is reached.
+    pub fn build_scc(
+        &self,
+        species: &[String],
+        coords: &[[f64; 3]],
+        max_iter: usize,
+        tol: f64,
+    ) -> Result<SccResult> {
+        if species.len() != coords.len() {
+            return Err(DftbError::InvalidInput(
+                "species and coords length mismatch".into(),
+            ));
+        }
+
+        // 1. Build fragment template (constructs H0, S, q0, orbital mapping)
+        let template = FragmentTemplate::new(&self.sk, species.to_vec(), coords.to_vec())?;
+
+        // 2. Create fragment from template
+        let frag = Fragment::from_template(template, coords.to_vec());
+
+        // 3. Build gamma table from SK data (auto-extract Hubbard U)
+        let gamma = GammaTable::from_sk_data(&self.sk, species)?;
+
+        // 4. For a single fragment, neighbor list is just self
+        let centroid = coords
+            .iter()
+            .fold([0.0, 0.0, 0.0], |acc, c| [acc[0] + c[0], acc[1] + c[1], acc[2] + c[2]]);
+        let n = coords.len() as f64;
+        let centroids = vec![[centroid[0] / n, centroid[1] / n, centroid[2] / n]];
+        let frag_neighbors = FragmentNeighborList::build(&centroids, 10.0);
+
+        // 5. Create solver with DIIS mixing (warmup + Anderson acceleration)
+        let mixer = DiisMixer::new(10, coords.len());
+        let mut solver = MultiSystemSolver::new(vec![frag], frag_neighbors, gamma, mixer);
+
+        // 6. Run SCC to convergence
+        solver.solve_scc(max_iter, tol)?;
+
+        // 7. Extract results
+        let frag = &solver.fragments[0];
+        let n_electrons = frag.n_electrons;
+        let n_occ = (n_electrons / 2.0).round() as usize;
+        let n_orbs = frag.template.n_orbs;
+
+        // Density matrix: D = 2 * C_occ * C_occ^T (closed-shell)
+        let c_occ = frag.eigenvectors.columns(0, n_occ);
+        let density = &c_occ * c_occ.transpose() * 2.0;
+
+        // H0 energy: Tr(D · H0) — the non-SCC part of the electronic energy
+        let e_h0 = (&density * &frag.template.h0).trace();
+
+        // SCC double-counting correction: 0.5 * sum(deltaQ_A * shift_A)
+        // (our deltaQ = q_elec - q0, our shift = +gamma * deltaQ, so this matches
+        //  DFTB+'s 0.5 * sum(shift_DFTB+ * deltaQ_DFTB+) since both are negated)
+        let delta_q: Vec<f64> = frag
+            .charges
+            .iter()
+            .zip(frag.template.q0.iter())
+            .map(|(q, q0)| q - q0)
+            .collect();
+        let e_scc: f64 = 0.5
+            * delta_q
+                .iter()
+                .zip(frag.shift.iter())
+                .map(|(dq, s)| dq * s)
+                .sum::<f64>();
+
+        let energy = e_h0 + e_scc;
+
+        Ok(SccResult {
+            h0: frag.template.h0.clone(),
+            h_scc: frag.h_scc.clone(),
+            s: frag.template.s.clone(),
+            density,
+            eigenvalues: frag.eigenvalues.clone(),
+            charges: frag.charges.clone(),
+            q0: frag.template.q0.clone(),
+            energy,
+            n_iter: solver.n_scc_iter,
+        })
     }
 }

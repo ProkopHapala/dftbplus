@@ -2,6 +2,8 @@
 
 use std::process::{Command, Stdio};
 use std::io::Write;
+use rust_dftb::compare_matrices;
+use rust_dftb::compare_vecs;
 
 const TBLITE_HELPER: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/tblite_helper");
 
@@ -59,46 +61,6 @@ fn json_to_dmatrix(json: &serde_json::Value, key: &str, n: usize) -> nalgebra::D
 
 fn json_to_vec(json: &serde_json::Value, key: &str) -> Vec<f64> {
     json[key].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect()
-}
-
-/// Compare two matrices element-wise and report max error.
-fn compare_matrices(a: &nalgebra::DMatrix<f64>, b: &nalgebra::DMatrix<f64>, name: &str) {
-    assert_eq!(a.nrows(), b.nrows());
-    assert_eq!(a.ncols(), b.ncols());
-    let mut max_err = 0.0_f64;
-    let mut max_rel = 0.0_f64;
-    let mut max_idx = (0, 0);
-    for i in 0..a.nrows() {
-        for j in 0..a.ncols() {
-            let diff = (a[(i, j)] - b[(i, j)]).abs();
-            let ref_val = b[(i, j)].abs().max(1e-10);
-            let rel = diff / ref_val;
-            if diff > max_err {
-                max_err = diff;
-                max_rel = rel;
-                max_idx = (i, j);
-            }
-        }
-    }
-    println!("{name}: max_abs_err = {max_err:.6e}, max_rel_err = {max_rel:.6e} at {:?}", max_idx);
-    assert!(max_err < 1e-4, "{name} mismatch too large: max_err={max_err:.6e}");
-}
-
-fn compare_vecs(a: &[f64], b: &[f64], name: &str) {
-    assert_eq!(a.len(), b.len());
-    let mut max_err = 0.0_f64;
-    let mut max_rel = 0.0_f64;
-    for i in 0..a.len() {
-        let diff = (a[i] - b[i]).abs();
-        let ref_val = b[i].abs().max(1e-10);
-        let rel = diff / ref_val;
-        if diff > max_err {
-            max_err = diff;
-            max_rel = rel;
-        }
-    }
-    println!("{name}: max_abs_err = {max_err:.6e}, max_rel_err = {max_rel:.6e}");
-    assert!(max_err < 1e-3, "{name} mismatch too large: max_err={max_err:.6e}");
 }
 
 #[test]
@@ -161,8 +123,8 @@ fn test_h2_gfn1_parity() {
         println!();
     }
 
-    compare_matrices(&h_rust, &h_ref, "H2 H0");
-    compare_matrices(&s_rust, &s_ref, "H2 S");
+    compare_matrices(&h_rust, &h_ref, "H2 H0", 1e-4);
+    compare_matrices(&s_rust, &s_ref, "H2 S", 1e-4);
 }
 
 #[test]
@@ -194,8 +156,8 @@ fn test_n2_gfn1_parity() {
     let (h_rust, s_rust, _shell_elem, _shell_idx) =
         rust_dftb::methods::xtb::hamiltonian::build_h0_s(&coords, &elem_idx);
 
-    compare_matrices(&h_rust, &h_ref, "N2 H0");
-    compare_matrices(&s_rust, &s_ref, "N2 S");
+    compare_matrices(&h_rust, &h_ref, "N2 H0", 1e-4);
+    compare_matrices(&s_rust, &s_ref, "N2 S", 1e-4);
 }
 
 #[test]
@@ -229,8 +191,8 @@ fn test_hcooh_gfn1_parity() {
     let (h_rust, s_rust, _shell_elem, _shell_idx) =
         rust_dftb::methods::xtb::hamiltonian::build_h0_s(&coords, &elem_idx);
 
-    compare_matrices(&h_rust, &h_ref, "HCOOH H0");
-    compare_matrices(&s_rust, &s_ref, "HCOOH S");
+    compare_matrices(&h_rust, &h_ref, "HCOOH H0", 1e-4);
+    compare_matrices(&s_rust, &s_ref, "HCOOH S", 1e-4);
 }
 
 #[test]
@@ -275,8 +237,8 @@ fn test_h2_scc_parity() {
     println!("Reference eigenvalues: {:?}", emo_ref);
     println!("Rust eigenvalues: {:?}", emo.data.as_vec());
 
-    compare_vecs(q_rust.data.as_vec(), &q_ref, "H2 charges");
-    compare_vecs(emo.data.as_vec(), &emo_ref, "H2 eigenvalues");
+    compare_vecs(q_rust.data.as_vec(), &q_ref, "H2 charges", 1e-3);
+    compare_vecs(emo.data.as_vec(), &emo_ref, "H2 eigenvalues", 1e-3);
 }
 
 #[test]
@@ -356,8 +318,8 @@ fn test_n2_scc_parity() {
     println!("N2 eigenvalues ref (SCC tblite): {:?}", emo_ref);
     println!("N2 eigenvalues rust (SCC): {:?}", emo.data.as_vec());
 
-    compare_vecs(q_rust.data.as_vec(), &q_ref, "N2 charges");
-    compare_vecs(emo.data.as_vec(), &emo_ref, "N2 eigenvalues");
+    compare_vecs(q_rust.data.as_vec(), &q_ref, "N2 charges", 1e-3);
+    compare_vecs(emo.data.as_vec(), &emo_ref, "N2 eigenvalues", 1e-3);
 }
 
 #[test]
@@ -487,12 +449,12 @@ fn test_hcooh_scc_parity() {
     }
 
     // Compare H1 matrices directly
-    compare_matrices(&h1_rust, &h1_tblite, "HCOOH H1");
-    compare_matrices(&h0_rust, &h0_tblite, "HCOOH H0");
-    compare_matrices(&s_rust, &s_tblite, "HCOOH S");
+    compare_matrices(&h1_rust, &h1_tblite, "HCOOH H1", 1e-4);
+    compare_matrices(&h0_rust, &h0_tblite, "HCOOH H0", 1e-4);
+    compare_matrices(&s_rust, &s_tblite, "HCOOH S", 1e-4);
 
-    compare_vecs(q_rust.data.as_vec(), &q_ref, "HCOOH charges");
-    compare_vecs(emo.data.as_vec(), &emo_ref, "HCOOH eigenvalues");
+    compare_vecs(q_rust.data.as_vec(), &q_ref, "HCOOH charges", 1e-3);
+    compare_vecs(emo.data.as_vec(), &emo_ref, "HCOOH eigenvalues", 1e-3);
 }
 
 // ---------------------------------------------------------------------------
@@ -526,8 +488,8 @@ fn test_h2_gfn2_parity() {
     let (h_rust, s_rust, _, _) =
         rust_dftb::methods::xtb::hamiltonian::build_h0_s_gfn2(&coords, &elem_idx);
 
-    compare_matrices(&h_rust, &h_ref, "H2 GFN2 H0");
-    compare_matrices(&s_rust, &s_ref, "H2 GFN2 S");
+    compare_matrices(&h_rust, &h_ref, "H2 GFN2 H0", 1e-4);
+    compare_matrices(&s_rust, &s_ref, "H2 GFN2 S", 1e-4);
 }
 
 #[test]
@@ -557,8 +519,8 @@ fn test_n2_gfn2_parity() {
     let (h_rust, s_rust, _, _) =
         rust_dftb::methods::xtb::hamiltonian::build_h0_s_gfn2(&coords, &elem_idx);
 
-    compare_matrices(&h_rust, &h_ref, "N2 GFN2 H0");
-    compare_matrices(&s_rust, &s_ref, "N2 GFN2 S");
+    compare_matrices(&h_rust, &h_ref, "N2 GFN2 H0", 1e-4);
+    compare_matrices(&s_rust, &s_ref, "N2 GFN2 S", 1e-4);
 }
 
 #[test]
@@ -590,8 +552,8 @@ fn test_hcooh_gfn2_parity() {
     let (h_rust, s_rust, _, _) =
         rust_dftb::methods::xtb::hamiltonian::build_h0_s_gfn2(&coords, &elem_idx);
 
-    compare_matrices(&h_rust, &h_ref, "HCOOH GFN2 H0");
-    compare_matrices(&s_rust, &s_ref, "HCOOH GFN2 S");
+    compare_matrices(&h_rust, &h_ref, "HCOOH GFN2 H0", 1e-4);
+    compare_matrices(&s_rust, &s_ref, "HCOOH GFN2 S", 1e-4);
 }
 
 #[test]
@@ -640,9 +602,9 @@ fn test_h2_gfn2_scc_hamiltonian_parity() {
 
     // Verify H0 and S match first
     println!("H2 GFN2 H0 comparison:");
-    compare_matrices(&h0_rust, &h0_ref, "H2 GFN2 H0");
+    compare_matrices(&h0_rust, &h0_ref, "H2 GFN2 H0", 1e-4);
     println!("H2 GFN2 S comparison:");
-    compare_matrices(&s_rust, &s_ref, "H2 GFN2 S");
+    compare_matrices(&s_rust, &s_ref, "H2 GFN2 S", 1e-4);
 
     // Build nshell_per_atom and ang_per_shell from params_gfn2 (like SCF code does)
     let nshell_per_atom: Vec<usize> = elem_idx.iter().map(|&z| {
@@ -749,7 +711,7 @@ fn test_h2_gfn2_scc_hamiltonian_parity() {
 
     // Direct comparison of effective Hamiltonian matrices
     println!("H2 GFN2 effective Hamiltonian comparison (with multipole):");
-    compare_matrices(&h_scc_with_mp, &h_scc_ref, "H2 GFN2 SCC Hamiltonian with multipole");
+    compare_matrices(&h_scc_with_mp, &h_scc_ref, "H2 GFN2 SCC Hamiltonian with multipole", 1e-4);
 
     // First, check what H0 eigenvalues should be (standard eigenvalue problem)
     let h0_eigen = h0_rust.clone().symmetric_eigen();
@@ -788,7 +750,7 @@ fn test_h2_gfn2_scc_hamiltonian_parity() {
     println!("Difference from H0 (rust): [{}, {}]",
              emo_rust[0] - emo_h0_gen[0], emo_rust[1] - emo_h0_gen[1]);
 
-    compare_vecs(&emo_rust, &emo_ref, "H2 GFN2 SCC eigenvalues");
+    compare_vecs(&emo_rust, &emo_ref, "H2 GFN2 SCC eigenvalues", 1e-3);
 }
 
 #[test]
@@ -835,9 +797,9 @@ fn test_n2_gfn2_scc_parity() {
     let (h0_rust, s_rust, _, _) =
         rust_dftb::methods::xtb::hamiltonian::build_h0_s_gfn2(&coords, &elem_idx);
     println!("N2 GFN2 H0 comparison:");
-    compare_matrices(&h0_rust, &h0_ref, "N2 GFN2 H0");
+    compare_matrices(&h0_rust, &h0_ref, "N2 GFN2 H0", 1e-4);
     println!("N2 GFN2 S comparison:");
-    compare_matrices(&s_rust, &s_ref, "N2 GFN2 S");
+    compare_matrices(&s_rust, &s_ref, "N2 GFN2 S", 1e-4);
 
     // Build effective Hamiltonian with reference charges for direct comparison
     let nshell_per_atom = vec![2, 2];
@@ -1037,10 +999,10 @@ fn test_n2_gfn2_scc_parity() {
     println!("N2 GFN2 quadrupole potential rust: {:?}", vqp_rust);
 
     println!("N2 GFN2 effective Hamiltonian comparison:");
-    compare_matrices(&h_scc_rust, &h_scc_ref, "N2 GFN2 effective Hamiltonian");
+    compare_matrices(&h_scc_rust, &h_scc_ref, "N2 GFN2 effective Hamiltonian", 1e-4);
 
-    compare_vecs(q_rust.data.as_vec(), &q_ref, "N2 GFN2 charges");
-    compare_vecs(emo.data.as_vec(), &emo_ref, "N2 GFN2 eigenvalues");
+    compare_vecs(q_rust.data.as_vec(), &q_ref, "N2 GFN2 charges", 1e-3);
+    compare_vecs(emo.data.as_vec(), &emo_ref, "N2 GFN2 eigenvalues", 1e-3);
 }
 
 #[test]
@@ -1219,9 +1181,9 @@ fn test_hcooh_gfn2_scc_parity() {
     let (h0_rust, s_rust, _, _) =
         rust_dftb::methods::xtb::hamiltonian::build_h0_s_gfn2(&coords, &elem_idx);
     println!("HCOOH GFN2 H0 comparison:");
-    compare_matrices(&h0_rust, &h0_ref, "HCOOH GFN2 H0");
+    compare_matrices(&h0_rust, &h0_ref, "HCOOH GFN2 H0", 1e-4);
     println!("HCOOH GFN2 S comparison:");
-    compare_matrices(&s_rust, &s_ref, "HCOOH GFN2 S");
+    compare_matrices(&s_rust, &s_ref, "HCOOH GFN2 S", 1e-4);
 
     // Build Rust effective Hamiltonian with REFERENCE shell charges
     let mut ang_per_shell = Vec::new();
@@ -1273,7 +1235,7 @@ fn test_hcooh_gfn2_scc_parity() {
         let vsh_ref_vec = vsh_ref_val.as_array().unwrap();
         let vsh_ref = nalgebra::DVector::from_vec(vsh_ref_vec.iter().map(|x| x.as_f64().unwrap()).collect());
         println!("HCOOH vsh comparison:");
-        compare_vecs(vsh_rust.data.as_vec(), vsh_ref.data.as_vec(), "HCOOH vsh");
+        compare_vecs(vsh_rust.data.as_vec(), vsh_ref.data.as_vec(), "HCOOH vsh", 1e-3);
     }
 
     let h_charge_rust = rust_dftb::methods::xtb::scf::build_scc_hamiltonian_with_thirdorder_gfn2(
@@ -1334,11 +1296,11 @@ fn test_hcooh_gfn2_scc_parity() {
     println!("HCOOH GFN2 effective Hamiltonian comparison (fixed charges+density):");
     // Print specific element (9, 12) before compare_matrices panics
     println!("HCOOH H_scc ref[9,12] = {:.16e}, rust[9,12] = {:.16e}", h_scc_ref[(9, 12)], h_scc_rust[(9, 12)]);
-    compare_matrices(&h_scc_rust, &h_scc_ref, "HCOOH GFN2 effective Hamiltonian");
+    compare_matrices(&h_scc_rust, &h_scc_ref, "HCOOH GFN2 effective Hamiltonian", 1e-4);
 
     println!("HCOOH shell charges ref: {:?}", qsh_ref_vec);
-    compare_vecs(q_rust.data.as_vec(), &q_ref, "HCOOH GFN2 charges");
-    compare_vecs(emo.data.as_vec(), &emo_ref, "HCOOH GFN2 eigenvalues");
+    compare_vecs(q_rust.data.as_vec(), &q_ref, "HCOOH GFN2 charges", 1e-3);
+    compare_vecs(emo.data.as_vec(), &emo_ref, "HCOOH GFN2 eigenvalues", 1e-3);
 }
 
 #[test]

@@ -4,16 +4,8 @@
 //! to verify that the qmqm module produces correct Hamiltonians,
 //! shifts, and charges.
 
-use rust_dftb::{DftbOutput, HamiltonianBuilder, SkData};
+use rust_dftb::{load_sk_for_species, max_abs_diff, parse_xyz, DftbOutput, HamiltonianBuilder};
 use rust_dftb::qmqm::{Fragment, FragmentTemplate};
-
-fn max_abs_diff(a: &nalgebra::DMatrix<f64>, b: &nalgebra::DMatrix<f64>) -> f64 {
-    assert_eq!(a.shape(), b.shape());
-    a.iter()
-        .zip(b.iter())
-        .map(|(x, y)| (x - y).abs())
-        .fold(0.0_f64, f64::max)
-}
 
 /// Test that a single fragment (H2) produces identical H0 and S
 /// to the full-system Hamiltonian builder.
@@ -27,13 +19,7 @@ fn fragment_h2_matches_full_system_non_scc() {
         [0.74, 0.0, 0.0], // H-H bond length in Å
     ];
 
-    let mut sk = SkData::load_sk_folder(sk_dir, ".skf", "-").unwrap();
-    let mut ang_map = std::collections::HashMap::new();
-    ang_map.insert("H".to_string(), vec![0]);
-    ang_map.insert("C".to_string(), vec![0, 1]);
-    ang_map.insert("N".to_string(), vec![0, 1]);
-    ang_map.insert("O".to_string(), vec![0, 1]);
-    sk.set_species_angular_momenta(ang_map);
+    let sk = load_sk_for_species(&sk_dir, &species).unwrap();
 
     // Full-system Hamiltonian
     let builder = HamiltonianBuilder::new(sk.clone());
@@ -68,13 +54,7 @@ fn fragment_h2_diagonalization() {
         [0.74, 0.0, 0.0],
     ];
 
-    let mut sk = SkData::load_sk_folder(sk_dir, ".skf", "-").unwrap();
-    let mut ang_map = std::collections::HashMap::new();
-    ang_map.insert("H".to_string(), vec![0]);
-    ang_map.insert("C".to_string(), vec![0, 1]);
-    ang_map.insert("N".to_string(), vec![0, 1]);
-    ang_map.insert("O".to_string(), vec![0, 1]);
-    sk.set_species_angular_momenta(ang_map);
+    let sk = load_sk_for_species(&sk_dir, &species).unwrap();
     let template = FragmentTemplate::new(&sk, species, coords.clone()).unwrap();
     let mut frag = Fragment::from_template(template, coords);
 
@@ -108,13 +88,7 @@ fn fragment_h2_fixed_neutral_charges() {
         [0.74, 0.0, 0.0],
     ];
 
-    let mut sk = SkData::load_sk_folder(sk_dir, ".skf", "-").unwrap();
-    let mut ang_map = std::collections::HashMap::new();
-    ang_map.insert("H".to_string(), vec![0]);
-    ang_map.insert("C".to_string(), vec![0, 1]);
-    ang_map.insert("N".to_string(), vec![0, 1]);
-    ang_map.insert("O".to_string(), vec![0, 1]);
-    sk.set_species_angular_momenta(ang_map);
+    let sk = load_sk_for_species(&sk_dir, &species).unwrap();
     let template = FragmentTemplate::new(&sk, species, coords.clone()).unwrap();
     let mut frag = Fragment::from_template(template, coords);
 
@@ -152,13 +126,7 @@ fn fragment_n2_matches_full_system_non_scc() {
         [1.10, 0.0, 0.0], // N≡N triple bond in Å
     ];
 
-    let mut sk = SkData::load_sk_folder(sk_dir, ".skf", "-").unwrap();
-    let mut ang_map = std::collections::HashMap::new();
-    ang_map.insert("H".to_string(), vec![0]);
-    ang_map.insert("C".to_string(), vec![0, 1]);
-    ang_map.insert("N".to_string(), vec![0, 1]);
-    ang_map.insert("O".to_string(), vec![0, 1]);
-    sk.set_species_angular_momenta(ang_map);
+    let sk = load_sk_for_species(&sk_dir, &species).unwrap();
 
     let builder = HamiltonianBuilder::new(sk.clone());
     let ham_full = builder.build_non_scc(&species, &coords).unwrap();
@@ -184,25 +152,13 @@ fn fragment_n2_matches_full_system_non_scc() {
 fn fragment_hcooh_matches_full_system_non_scc() {
     let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else { return; };
 
-    let species = vec![
-        "H".to_string(), "C".to_string(), "O".to_string(), "O".to_string(), "H".to_string(),
-    ];
-    // Approximate formic acid geometry (Å)
-    let coords = vec![
-        [0.00, 0.00, 0.00], // H (hydroxyl)
-        [1.00, 0.00, 0.00], // C
-        [2.20, 0.00, 0.00], // O (carbonyl)
-        [1.50, 1.00, 0.00], // O (hydroxyl)
-        [2.20, 1.00, 0.00], // H (hydroxyl)
-    ];
+    // Load HCOOH geometry from data/xyz/HCOOH.xyz
+    let xyz_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../data/xyz/HCOOH.xyz");
+    let mol = parse_xyz(xyz_path).unwrap();
+    let species = mol.species;
+    let coords = mol.coords;
 
-    let mut sk = SkData::load_sk_folder(sk_dir, ".skf", "-").unwrap();
-    let mut ang_map = std::collections::HashMap::new();
-    ang_map.insert("H".to_string(), vec![0]);
-    ang_map.insert("C".to_string(), vec![0, 1]);
-    ang_map.insert("N".to_string(), vec![0, 1]);
-    ang_map.insert("O".to_string(), vec![0, 1]);
-    sk.set_species_angular_momenta(ang_map);
+    let sk = load_sk_for_species(&sk_dir, &species).unwrap();
 
     let builder = HamiltonianBuilder::new(sk.clone());
     let ham_full = builder.build_non_scc(&species, &coords).unwrap();
@@ -252,10 +208,7 @@ fn h2_fixed_charge_scc_parity() {
         [0.74, 0.0, 0.0], // H-H bond length in Å
     ];
 
-    let mut sk = SkData::load_sk_folder(sk_dir, ".skf", "-").unwrap();
-    let mut ang_map = std::collections::HashMap::new();
-    ang_map.insert("H".to_string(), vec![0]);
-    sk.set_species_angular_momenta(ang_map);
+    let sk = load_sk_for_species(&sk_dir, &species).unwrap();
 
     // Build fragment template and solver
     let template = FragmentTemplate::new(&sk, species, coords.clone()).unwrap();
@@ -354,11 +307,7 @@ fn n2_fixed_charge_scc_parity() {
         [1.10, 0.0, 0.0], // N≡N triple bond in Å
     ];
 
-    let mut sk = SkData::load_sk_folder(sk_dir, ".skf", "-").unwrap();
-    let mut ang_map = std::collections::HashMap::new();
-    ang_map.insert("N".to_string(), vec![0, 1]);
-    sk.set_species_angular_momenta(ang_map);
-
+    let sk = load_sk_for_species(&sk_dir, &species).unwrap();
     let template = FragmentTemplate::new(&sk, species, coords.clone()).unwrap();
     let frag = Fragment::from_template(template.clone(), coords.clone());
 
@@ -403,24 +352,13 @@ fn hcooh_fixed_charge_scc_parity() {
     let Ok(ref_h) = std::env::var("RUST_DFTB_REF_H") else { return; };
     let Ok(ref_s) = std::env::var("RUST_DFTB_REF_S") else { return; };
 
-    let species = vec![
-        "H".to_string(), "C".to_string(), "O".to_string(), "O".to_string(), "H".to_string(),
-    ];
-    let coords = vec![
-        [0.00, 0.00, 0.00], // H (hydroxyl)
-        [1.00, 0.00, 0.00], // C
-        [2.20, 0.00, 0.00], // O (carbonyl)
-        [1.50, 1.00, 0.00], // O (hydroxyl)
-        [2.20, 1.00, 0.00], // H (hydroxyl)
-    ];
+    // Load HCOOH geometry from data/xyz/HCOOH.xyz
+    let xyz_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../data/xyz/HCOOH.xyz");
+    let mol = parse_xyz(xyz_path).unwrap();
+    let species = mol.species;
+    let coords = mol.coords;
 
-    let mut sk = SkData::load_sk_folder(sk_dir, ".skf", "-").unwrap();
-    let mut ang_map = std::collections::HashMap::new();
-    ang_map.insert("H".to_string(), vec![0]);
-    ang_map.insert("C".to_string(), vec![0, 1]);
-    ang_map.insert("O".to_string(), vec![0, 1]);
-    sk.set_species_angular_momenta(ang_map);
-
+    let sk = load_sk_for_species(&sk_dir, &species).unwrap();
     let template = FragmentTemplate::new(&sk, species, coords.clone()).unwrap();
     let frag = Fragment::from_template(template.clone(), coords.clone());
 

@@ -17,7 +17,11 @@
 // Constants
 // ------------------------------------------------------------------
 #ifndef SK_GRID_MAX
-#define SK_GRID_MAX 1024
+#define SK_GRID_MAX 256
+#endif
+
+#ifndef N_SK_COLS
+#define N_SK_COLS 4
 #endif
 
 #define TAU_FACTOR 3.2f
@@ -72,18 +76,14 @@ inline float gamma_sub_exprn(float r, float tau1, float tau2) {
     return exp(-tau1 * r) * (term_a - term_b);
 }
 
-// CONSIDER: branch divergence in gamma_full (r<1e-10, du<1e-4).
-//           Could pre-sort pairs by u-similarity or use select() if target device supports fast predication.
+// Branch-minimized gamma: fabs() instead of branch, r<1e-10 handled by host.
+// The same_u vs different_u branch remains but is unavoidable without pre-sorting.
 inline float gamma_full(float r, float u1, float u2) {
-    if (r < 1.0e-10f) {
-        return 0.5f * (u1 + u2);
-    }
     float tau1 = TAU_FACTOR * u1;
     float tau2 = TAU_FACTOR * u2;
 
+    float du = fabs(u1 - u2);
     float short_range;
-    float du = u1 - u2;
-    if (du < 0.0f) du = -du;
     if (du < 1.0e-4f) {
         short_range = exp_gamma_same_u(r, 0.5f * (tau1 + tau2));
     } else {
@@ -94,8 +94,17 @@ inline float gamma_full(float r, float u1, float u2) {
 }
 
 // ------------------------------------------------------------------
-// Cubic B-spline basis weights (shared)
+// Cubic B-spline interpolation (4-point stencil, 1 float per node)
+//
+// SK tables are resampled to 32-64 points on the host using natural cubic
+// spline fitting, then stored as plain float values. The GPU interpolates
+// using the cubic B-spline 4-point stencil:
+//   val = w0*f[i-1] + w1*f[i] + w2*f[i+1] + w3*f[i+2]
+//
+// This requires only 1 float per node (vs 2 for Hermite), and the 4-point
+// stencil shares data between neighbors, minimizing local memory usage.
 // ------------------------------------------------------------------
+
 inline float4 cubic_weights(float t) {
     float omt = 1.0f - t;
     return (float4)(
@@ -106,35 +115,24 @@ inline float4 cubic_weights(float t) {
     );
 }
 
-// Combined: compute base index and weights in one call (avoids redundant r/dr and floor)
+// Compute base index and weights. Returns base = i-1 for 4-point stencil.
 inline int cubic_interp_params(float r, float dr, int n_grid, float4* out_w) {
-    if (r < 0.0f || r >= (n_grid - 1) * dr) {
-        *out_w = (float4)(0.0f);
-        return -1;
-    }
     float u = r / dr;
     int i = (int)u;
-    if (i < 1) i = 1;
-    if (i > n_grid - 3) i = n_grid - 3;
-    float t = u - i;
+    i = clamp(i, 1, n_grid - 3);
+    float t = u - (float)i;
     *out_w = cubic_weights(t);
     return i - 1;
 }
 
-// ------------------------------------------------------------------
 // 1-channel: scalar with dot()
-// ------------------------------------------------------------------
-inline float interp_sk_1_indexed(__local const float* tab, int base, float4 w) {
-    if (base < 0) return 0.0f;
+inline float interp_sk_1(__local const float* tab, int base, float4 w) {
     __local float4* tab4 = (__local float4*)tab;
     return dot(tab4[base], w);
 }
 
-// ------------------------------------------------------------------
 // 2-channel: float2 cast (1x4: ss, sp)
-// ------------------------------------------------------------------
-inline float2 interp_sk_2_indexed(__local const float* tab, int base, float4 w) {
-    if (base < 0) return (float2)(0.0f);
+inline float2 interp_sk_2(__local const float* tab, int base, float4 w) {
     __local float2* tab2 = (__local float2*)tab;
     float2 v0 = tab2[base    ];
     float2 v1 = tab2[base + 1];
@@ -143,13 +141,8 @@ inline float2 interp_sk_2_indexed(__local const float* tab, int base, float4 w) 
     return v0 * w.x + v1 * w.y + v2 * w.z + v3 * w.w;
 }
 
-// ------------------------------------------------------------------
 // 4-channel: float4 cast (4x4: ss, sp, pp_sig, pp_pi)
-// ------------------------------------------------------------------
-
-// Indexed version: base and weights pre-computed (avoid re-evaluating index)
-inline float4 interp_sk_4_indexed(__local const float* tab, int base, float4 w) {
-    if (base < 0) return (float4)(0.0f);
+inline float4 interp_sk_4(__local const float* tab, int base, float4 w) {
     __local float4* tab4 = (__local float4*)tab;
     float4 v0 = tab4[base    ];
     float4 v1 = tab4[base + 1];
@@ -177,28 +170,16 @@ inline void rotate_1x4(float l, float m, float n, float2 sk, float4* blk) {
 inline void rotate_4x4(float l, float m, float n, float4 sk, float4* blk) {
     float4 v = (float4)(m, n, l, 0.0f);  // (py, pz, px, pad)
     float diff = sk.z - sk.w;
-    float4 diff4 = (float4)(diff, diff, diff, diff);
 
     // Row 0: (ss, -sp_py, -sp_pz, -sp_px)
     blk[0] = (float4)(sk.x, -sk.y * m, -sk.y * n, -sk.y * l);
 
-    // TODO: deduplicate pp outer product v.yzw * v.yzw * diff4.yzw + sk.w * v.yzw
-    //       (currently computed 3x identically for rows 1..3).  
-    //       Saves 6 mul + 3 add per rotation.
-    float4 row1 = v * sk.y;
-    row1.x = sk.y * m;
-    row1.yzw = v.yzw * v.yzw * diff4.yzw + sk.w * v.yzw;
-    blk[1] = row1;
+    // pp outer product: v.yzw * v.yzw * diff + sk.w * v.yzw — computed once, reused for rows 1..3
+    float3 pp = v.yzw * v.yzw * diff + sk.w * v.yzw;
 
-    float4 row2 = v * sk.y;
-    row2.x = sk.y * n;
-    row2.yzw = v.yzw * v.yzw * diff4.yzw + sk.w * v.yzw;
-    blk[2] = row2;
-
-    float4 row3 = v * sk.y;
-    row3.x = sk.y * l;
-    row3.yzw = v.yzw * v.yzw * diff4.yzw + sk.w * v.yzw;
-    blk[3] = row3;
+    blk[1] = (float4)(sk.y * m, pp.x, pp.y, pp.z);
+    blk[2] = (float4)(sk.y * n, pp.x, pp.y, pp.z);
+    blk[3] = (float4)(sk.y * l, pp.x, pp.y, pp.z);
 }
 
 // ------------------------------------------------------------------
@@ -260,28 +241,72 @@ inline void write_symmetric_4x4(
 }
 
 // ------------------------------------------------------------------
-// Kernel 1: onsite H0 + V_A computation
+// Kernel 0: onsite H0 diagonal (separate, coalesced)
+// ------------------------------------------------------------------
+// Writes only the diagonal elements of H0 for all fragments in a single launch.
+// Each thread writes one atom's diagonal (up to 4 values).
+// This is coalesced because consecutive threads write to consecutive atoms.
+//
+// Onsite diagonal is just onsite_es_ep[species] placed at known positions —
+// no interpolation, no rotation, no distance dependence. Separating this from
+// the V_A kernel avoids the uncoalesced strided writes that dominated before.
+__kernel void onsite_diagonal(
+    __global const Fragment* fragments,      // [n_frags]
+    __global const int*    atom_species,   // [total_atoms]
+    __global const int*    orb_offsets,    // [total_atoms]
+    __global const float2* onsite_es_ep,   // [n_global_species]  (e_s, e_p)
+    __global float*        H_out,          // flat [total_H_elements]
+    const int n_frags,
+    const int total_atoms
+)
+{
+    const int gid = get_global_id(0);
+    if (gid >= total_atoms) return;
+
+    // Find which fragment this atom belongs to.
+    // For simplicity, we pass a pre-computed frag_id per atom from host.
+    // But since fragments are contiguous, we can binary search or use a map.
+    // Simpler: host passes frag_id_per_atom[] array.
+    // To avoid extra buffer, we iterate fragments (n_frags is small).
+    int frag_id = 0;
+    for (int f = 0; f < n_frags; f++) {
+        int next_off = fragments[f].atom_off + fragments[f].n_atoms;
+        if (gid < next_off) { frag_id = f; break; }
+        frag_id = f;
+    }
+
+    Fragment frag = fragments[frag_id];
+    int n_orbs  = frag.n_orbs;
+    int base_H  = frag.H_base;
+    int off     = orb_offsets[gid];
+    int sp      = atom_species[gid];
+    float2 e    = onsite_es_ep[sp];
+
+    H_out[base_H + off * n_orbs + off] = e.x;
+    H_out[base_H + (off + 1) * n_orbs + (off + 1)] = e.y;
+    H_out[base_H + (off + 2) * n_orbs + (off + 2)] = e.y;
+    H_out[base_H + (off + 3) * n_orbs + (off + 3)] = e.y;
+}
+
+// ------------------------------------------------------------------
+// Kernel 1: V_A computation (gamma electrostatics)
 // ------------------------------------------------------------------
 // One workgroup per fragment.
-// Writes onsite diagonal elements of H and computes V_A = sum_C q_C * gamma_AC.
-// V_A is a pure gather: each thread handles one atom, loops over its
-// CSR neighbor list, accumulates q_j * gamma(r_ij). No atomics.
+// Computes V_A = sum_C q_C * gamma_AC. Pure gather, no atomics.
+// Per-fragment data (charges, species) cached in __local for the inner loop.
 //
-// All per-atom arrays are flat (concatenated across fragments).
-// Fragment metadata provides local-to-global mapping.
+// Onsite H0 diagonal is handled by the separate onsite_diagonal kernel.
 __kernel void onsite_and_va(
     __global const Fragment* fragments,      // [n_frags]
     __global const int*    atom_species,   // [total_atoms]  global species index
-    __global const int*    orb_offsets,    // [total_atoms]  local offset within fragment
-    __global const float2* onsite_es_ep,   // [n_global_species]  (e_s, e_p)
     __global const float*  charges,        // [total_atoms]
     __global const float*  hubbard_u,      // [n_global_species]
     __global const int*    neigh_offsets,  // [total_atoms+1]  CSR row pointer (flat)
     __global const int*    neigh_j,        // [total_neigh]    local neighbor atom index
     __global const float*  neigh_r,        // [total_neigh]    distance
-    __global float*        H_out,          // flat [total_H_elements]
     __global float*        V_out,          // flat [total_atoms]
-    const int n_frags
+    const int n_frags,
+    const int n_global_species
 )
 {
     const int tid     = get_local_id(0);
@@ -291,40 +316,39 @@ __kernel void onsite_and_va(
     if (frag_id >= n_frags) return;
 
     Fragment frag = fragments[frag_id];
-    int n_atoms = frag.n_atoms;
-    int n_orbs  = frag.n_orbs;
+    int n_atoms  = frag.n_atoms;
     int atom_off = frag.atom_off;
-    int base_H = frag.H_base;
 
-    // 1. Write onsite H0 diagonal
-    for (int a = tid; a < n_atoms; a += wg) {
-        int ga  = atom_off + a;                // global atom index
-        int sp  = atom_species[ga];
-        int off = orb_offsets[ga];
-        float2 e = onsite_es_ep[sp];
-        H_out[base_H + off * n_orbs + off] = e.x;
-        H_out[base_H + (off + 1) * n_orbs + (off + 1)] = e.y;
-        H_out[base_H + (off + 2) * n_orbs + (off + 2)] = e.y;
-        H_out[base_H + (off + 3) * n_orbs + (off + 3)] = e.y;
+    // --- Cache per-fragment data into __local ---
+    // Charges and species for this fragment's atoms (accessed in inner loop)
+    __local float l_charges[256];
+    __local int   l_species[256];
+    // Hubbard U for all species (small, accessed per-neighbor)
+    __local float l_u[64];
+
+    for (int i = tid; i < n_atoms && i < 256; i += wg) {
+        l_charges[i] = charges[atom_off + i];
+        l_species[i] = atom_species[atom_off + i];
     }
+    for (int i = tid; i < n_global_species && i < 64; i += wg) {
+        l_u[i] = hubbard_u[i];
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
 
-    // 2. Compute V_A per atom (gather, no atomics)
-    // CONSIDER: neighbor list order affects cache locality.
-    //           Could sort neighbors by atom index or by spatial bins.
+    // Compute V_A per atom (gather, no atomics)
     for (int a = tid; a < n_atoms; a += wg) {
-        int ga = atom_off + a;
-        int sp = atom_species[ga];
-        float q = charges[ga];
-        float v = q * hubbard_u[sp];
+        int sp = l_species[a];
+        float q = l_charges[a];
+        float v = q * l_u[sp];
 
+        int ga = atom_off + a;
         int start = neigh_offsets[ga];
         int end   = neigh_offsets[ga + 1];
         for (int n = start; n < end; n++) {
             int b_local = neigh_j[n];         // 0..n_atoms-1 within this fragment
-            int gb = atom_off + b_local;      // global atom index
-            int sb = atom_species[gb];
-            float qb = charges[gb];
-            float g  = gamma_full(neigh_r[n], hubbard_u[sp], hubbard_u[sb]);
+            int sb = l_species[b_local];
+            float qb = l_charges[b_local];
+            float g  = gamma_full(neigh_r[n], l_u[sp], l_u[sb]);
             v += qb * g;
         }
         V_out[ga] = v;
@@ -347,6 +371,7 @@ __kernel void assemble_pairs(
     const float dr,
     const int n_grid,
     const int n_pairs,
+    const int n_frags,
     const int block_type       // 0=1x1, 1=1x4, 2=4x4  (uniform for whole launch)
 )
 {
@@ -354,14 +379,20 @@ __kernel void assemble_pairs(
     const int wg  = get_local_size(0);
     const int gid = get_global_id(0);
 
-    // --- CACHE SK TABLE INTO __LOCAL ---
-    int n_sk_cols = (block_type == 0) ? 1 : (block_type == 1) ? 2 : 4;
-    __local float l_sk_h[SK_GRID_MAX * 4];
-    __local float l_sk_s[SK_GRID_MAX * 4];
+    // --- CACHE SK TABLE INTO __local (1 float per node, B-spline stencil) ---
+    __local float l_sk_h[SK_GRID_MAX * N_SK_COLS];
+    __local float l_sk_s[SK_GRID_MAX * N_SK_COLS];
 
-    for (int i = tid; i < n_grid * n_sk_cols; i += wg) {
+    int n_sk_elements = n_grid * N_SK_COLS;
+    for (int i = tid; i < n_sk_elements; i += wg) {
         l_sk_h[i] = sk_h[i];
         l_sk_s[i] = sk_s[i];
+    }
+
+    // --- CACHE FRAGMENT METADATA INTO __local ---
+    __local Fragment l_frags[128];
+    for (int i = tid; i < n_frags && i < 128; i += wg) {
+        l_frags[i] = fragments[i];
     }
     barrier(CLK_LOCAL_MEM_FENCE);
 
@@ -369,8 +400,8 @@ __kernel void assemble_pairs(
 
     PairEntry p = pairs[gid];
 
-    // --- PER-FRAGMENT LOOKUP ---
-    Fragment frag = fragments[p.replica];
+    // --- PER-FRAGMENT LOOKUP (from __local) ---
+    Fragment frag = l_frags[p.replica];
     int n_orbs  = frag.n_orbs;
     int atom_off = frag.atom_off;
     int base = frag.H_base;
@@ -379,37 +410,29 @@ __kernel void assemble_pairs(
     float vb = V_a[atom_off + p.atom_j];
     float h1_factor = 0.5f * (va + vb);
 
-    // Compute index and weights once (same for all block types)
-    // TODO: size l_sk_h/l_sk_s dynamically to n_sk_cols (avoids 2-8x local memory waste)
+    // Compute B-spline index and weights once (same for all block types)
     float4 w;
     int    base_idx = cubic_interp_params(p.r, dr, n_grid, &w);
 
     if (block_type == 0) {
-        // Interpolate with pre-computed index
-        float sk_h = interp_sk_1_indexed(l_sk_h, base_idx, w);
-        float sk_s = interp_sk_1_indexed(l_sk_s, base_idx, w);
+        float sk_h = interp_sk_1(l_sk_h, base_idx, w);
+        float sk_s = interp_sk_1(l_sk_s, base_idx, w);
         write_symmetric_1x1(H_out, n_orbs, base, p.orb_i, p.orb_j, sk_h + h1_factor * sk_s);
         write_symmetric_1x1(S_out, n_orbs, base, p.orb_i, p.orb_j, sk_s);
     } else if (block_type == 1) {
-        // Interpolate with pre-computed index
-        float2 sk_h = interp_sk_2_indexed(l_sk_h, base_idx, w);
-        float2 sk_s = interp_sk_2_indexed(l_sk_s, base_idx, w);
-        // Use single blk: compute S first, then H = H0 + h1_factor * S
+        float2 sk_h = interp_sk_2(l_sk_h, base_idx, w);
+        float2 sk_s = interp_sk_2(l_sk_s, base_idx, w);
         float4 blk;
         rotate_1x4(p.l, p.m, p.n, sk_s, &blk);
         write_symmetric_1x4(S_out, n_orbs, base, p.orb_i, p.orb_j, &blk);
         rotate_1x4(p.l, p.m, p.n, sk_h + h1_factor * sk_s, &blk);
         write_symmetric_1x4(H_out, n_orbs, base, p.orb_i, p.orb_j, &blk);
     } else {
-        // Interpolate with pre-computed index
-        // Use single blk array: compute S first, then H = H0 + h1_factor * S
         float4 blk[4];
-        float4 sk_s = interp_sk_4_indexed(l_sk_s, base_idx, w);
+        float4 sk_s = interp_sk_4(l_sk_s, base_idx, w);
         rotate_4x4(p.l, p.m, p.n, sk_s, blk);
         write_symmetric_4x4(S_out, n_orbs, base, p.orb_i, p.orb_j, blk);
-        // Compute H in-place: blk = rotate(sk_h) + h1_factor * rotate(sk_s)
-        // Since rotate is linear: rotate(sk_h + h1_factor * sk_s) = rotate(sk_h) + h1_factor * rotate(sk_s)
-        float4 sk_h = interp_sk_4_indexed(l_sk_h, base_idx, w);
+        float4 sk_h = interp_sk_4(l_sk_h, base_idx, w);
         rotate_4x4(p.l, p.m, p.n, sk_h + h1_factor * sk_s, blk);
         write_symmetric_4x4(H_out, n_orbs, base, p.orb_i, p.orb_j, blk);
     }

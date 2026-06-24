@@ -62,6 +62,9 @@ fn gamma_sub_exprn(r: f64, tau1: f64, tau2: f64) -> f64 {
     (-tau1 * r).exp() * (term_a - term_b)
 }
 
+use crate::core::error::Result;
+use crate::methods::dftb::sk_data::SkData;
+
 #[derive(Debug, Clone)]
 pub struct GammaTable {
     pub hubbard_u: Vec<f64>,
@@ -70,6 +73,22 @@ pub struct GammaTable {
 }
 
 impl GammaTable {
+    /// Build a GammaTable from SkData, extracting Hubbard U for each unique species
+    /// in the order they appear in `species`.
+    pub fn from_sk_data(sk: &SkData, species: &[String]) -> Result<Self> {
+        let mut unique: Vec<String> = Vec::new();
+        for sp in species {
+            if !unique.contains(sp) {
+                unique.push(sp.clone());
+            }
+        }
+        let hubbard_u: Vec<f64> = unique
+            .iter()
+            .map(|sp| sk.onsite(sp).map(|p| p.u_hubbard).unwrap_or(0.4))
+            .collect();
+        Ok(Self::from_hubbard_u(hubbard_u))
+    }
+
     pub fn from_hubbard_u(hubbard_u: Vec<f64>) -> Self {
         let n = hubbard_u.len();
         let mut cutoffs = vec![0.0; n * n];

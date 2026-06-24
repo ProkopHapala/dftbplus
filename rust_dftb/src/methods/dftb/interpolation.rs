@@ -6,7 +6,7 @@ const MAX_N_INTER: usize = 8;  // max interpolation stencil
 const MAX_N_INTEG: usize = 20; // max columns in extended-format SK tables
 const N_INTER: usize = 8;
 const N_RIGHT: usize = 4;
-const DELTA_R: f64 = 1.0e-2;
+const DELTA_R: f64 = 1.0e-4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InterpolationMethod {
@@ -29,7 +29,7 @@ impl EqGridTable {
     }
 
     pub fn r_max(&self) -> f64 {
-        (self.n_grid().saturating_sub(1) as f64) * self.dr + DIST_FUDGE
+        self.n_grid() as f64 * self.dr + DIST_FUDGE
     }
 
     /// Convenience wrapper that allocates a Vec. For hot paths use `eval_into`.
@@ -147,11 +147,13 @@ fn eval_eqgrid_new_into(tab: &EqGridTable, r: f64, out: &mut [f64]) -> Result<()
         ));
     }
 
-    let r_max = (leng as f64 - 1.0) * tab.dr;
+    // DFTB+ uses rMax = nGrid * dr + distFudge (not (nGrid-1)*dr)
+    let r_max = leng as f64 * tab.dr + DIST_FUDGE;
     let n_integ = tab.n_integ();
     assert!(out.len() >= n_integ, "eval_eqgrid_new_into: output buffer too small");
 
-    if r < 0.0 {
+    // Hard cutoff: beyond rMax, no interaction (matches DFTB+)
+    if r < 0.0 || r >= r_max {
         out[..n_integ].fill(0.0);
         return Ok(());
     }

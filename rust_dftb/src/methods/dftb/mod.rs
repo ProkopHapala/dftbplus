@@ -3,3 +3,4 @@ pub mod interpolation;
 pub mod rotation;
 pub mod hamiltonian;
 pub mod gamma;
+pub mod spline_resample;

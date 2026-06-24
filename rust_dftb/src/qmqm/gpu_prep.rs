@@ -5,11 +5,17 @@
 
 use crate::core::error::{DftbError, Result};
 use crate::methods::dftb::sk_data::SkData;
+use crate::methods::dftb::spline_resample;
 use crate::qmqm::fragment::Fragment;
 use crate::qmqm::gamma::GammaTable;
 use std::collections::HashMap;
 
 const ANG2BOHR: f64 = 1.889726133;
+
+/// Maximum SK grid size that can be loaded into GPU __local memory.
+/// Must match SK_GRID_MAX in dftb_hamiltonian.cl.
+/// With resampling to 64 points, actual usage is 64*4*8B = 2KB per table.
+pub const SK_GRID_MAX: usize = 256;
 
 // ------------------------------------------------------------------
 // GPU-compatible structs (match OpenCL layout)
@@ -216,6 +222,10 @@ fn build_global_species(
     Ok((names, map))
 }
 
+/// Target number of grid points after resampling SK tables.
+/// 32-64 is sufficient for cubic spline representation of typical SK tables.
+const SK_RESAMPLE_N: usize = 64;
+
 fn pack_sk_tables(
     sk_data: &SkData,
     global_species: &[String],
@@ -243,52 +253,67 @@ fn pack_sk_tables(
                 _ => unreachable!(),
             };
 
-            let n_grid = tab.h.n_grid();
-            let mut sk_h = vec![0.0f32; n_grid * n_sk_cols];
-            let mut sk_s = vec![0.0f32; n_grid * n_sk_cols];
+            let n_grid_orig = tab.h.n_grid();
+            let dr_orig = tab.h.dr;
 
-            // Read raw grid values directly (no interpolation)
-            for k in 0..n_grid {
+            // Extract columns from original grid into per-channel arrays
+            let mut h_cols: Vec<Vec<f64>> = vec![vec![0.0; n_grid_orig]; n_sk_cols];
+            let mut s_cols: Vec<Vec<f64>> = vec![vec![0.0; n_grid_orig]; n_sk_cols];
+
+            for k in 0..n_grid_orig {
                 let h_all = &tab.h.values[k];
                 let s_all = &tab.s.values[k];
 
                 match block_type {
                     0 => {
-                        // s-s: column 20 (new) → index 19
-                        let (h, s, _n) = extract_shell_old_or_new(h_all, s_all, 0, 0);
-                        sk_h[k] = h[0] as f32;
-                        sk_s[k] = s[0] as f32;
+                        let (h, s, _) = extract_shell_old_or_new(h_all, s_all, 0, 0);
+                        h_cols[0][k] = h[0];
+                        s_cols[0][k] = s[0];
                     }
                     1 => {
-                        // ss (column 20)
-                        let (h_ss, s_ss, _n) = extract_shell_old_or_new(h_all, s_all, 0, 0);
-                        sk_h[2 * k] = h_ss[0] as f32;
-                        sk_s[2 * k] = s_ss[0] as f32;
+                        let (h_ss, s_ss, _) = extract_shell_old_or_new(h_all, s_all, 0, 0);
+                        h_cols[0][k] = h_ss[0];
+                        s_cols[0][k] = s_ss[0];
 
-                        // sp (column 19)
-                        let (h_sp, s_sp, _n) = extract_shell_old_or_new(h_all, s_all, 0, 1);
-                        sk_h[2 * k + 1] = h_sp[0] as f32;
-                        sk_s[2 * k + 1] = s_sp[0] as f32;
+                        let (h_sp, s_sp, _) = extract_shell_old_or_new(h_all, s_all, 0, 1);
+                        h_cols[1][k] = h_sp[0];
+                        s_cols[1][k] = s_sp[0];
                     }
                     2 => {
-                        // ss
-                        let (h_ss, s_ss, _n) = extract_shell_old_or_new(h_all, s_all, 0, 0);
-                        sk_h[4 * k] = h_ss[0] as f32;
-                        sk_s[4 * k] = s_ss[0] as f32;
+                        let (h_ss, s_ss, _) = extract_shell_old_or_new(h_all, s_all, 0, 0);
+                        h_cols[0][k] = h_ss[0];
+                        s_cols[0][k] = s_ss[0];
 
-                        // sp
-                        let (h_sp, s_sp, _n) = extract_shell_old_or_new(h_all, s_all, 0, 1);
-                        sk_h[4 * k + 1] = h_sp[0] as f32;
-                        sk_s[4 * k + 1] = s_sp[0] as f32;
+                        let (h_sp, s_sp, _) = extract_shell_old_or_new(h_all, s_all, 0, 1);
+                        h_cols[1][k] = h_sp[0];
+                        s_cols[1][k] = s_sp[0];
 
-                        // pp: sigma + pi
-                        let (h_pp, s_pp, _n) = extract_shell_old_or_new(h_all, s_all, 1, 1);
-                        sk_h[4 * k + 2] = h_pp[0] as f32; // sigma
-                        sk_s[4 * k + 2] = s_pp[0] as f32;
-                        sk_h[4 * k + 3] = h_pp[1] as f32; // pi
-                        sk_s[4 * k + 3] = s_pp[1] as f32;
+                        let (h_pp, s_pp, _) = extract_shell_old_or_new(h_all, s_all, 1, 1);
+                        h_cols[2][k] = h_pp[0]; // sigma
+                        s_cols[2][k] = s_pp[0];
+                        h_cols[3][k] = h_pp[1]; // pi
+                        s_cols[3][k] = s_pp[1];
                     }
                     _ => unreachable!(),
+                }
+            }
+
+            // Resample each channel to SK_RESAMPLE_N points using cubic B-spline
+            let n_grid = SK_RESAMPLE_N;
+            let mut sk_h = vec![0.0f32; n_grid * n_sk_cols];
+            let mut sk_s = vec![0.0f32; n_grid * n_sk_cols];
+            let mut dr_new = 0.0f32;
+
+            for col in 0..n_sk_cols {
+                let (h_vals, dr) =
+                    spline_resample::resample_sk_column(&h_cols[col], dr_orig, n_grid);
+                let (s_vals, _) =
+                    spline_resample::resample_sk_column(&s_cols[col], dr_orig, n_grid);
+                dr_new = dr;
+
+                for k in 0..n_grid {
+                    sk_h[k * n_sk_cols + col] = h_vals[k];
+                    sk_s[k * n_sk_cols + col] = s_vals[k];
                 }
             }
 
@@ -296,7 +321,7 @@ fn pack_sk_tables(
                 sk_h,
                 sk_s,
                 n_grid,
-                dr: tab.h.dr as f32,
+                dr: dr_new,
                 n_sk_cols,
                 block_type,
                 species_i: si as u8,
@@ -448,7 +473,7 @@ fn build_pair_buckets(
     species_to_global: &HashMap<String, u8>,
 ) -> Result<Vec<GpuPairBucket>> {
     // Build flat SK lookup table: sk_lookup[sp_i * n_species + sp_j] = table index
-    let n_species = global_species.len();
+    let n_species = species_to_global.len();
     let mut sk_lookup = vec![usize::MAX; n_species * n_species];
     for (idx, tab) in sk_tables.iter().enumerate() {
         let key = tab.species_i as usize * n_species + tab.species_j as usize;

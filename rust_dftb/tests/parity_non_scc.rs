@@ -1,12 +1,4 @@
-use rust_dftb::{DftbOutput, HamiltonianBuilder, SkData};
-
-fn max_abs_diff(a: &nalgebra::DMatrix<f64>, b: &nalgebra::DMatrix<f64>) -> f64 {
-    assert_eq!(a.shape(), b.shape());
-    a.iter()
-        .zip(b.iter())
-        .map(|(x, y)| (x - y).abs())
-        .fold(0.0_f64, f64::max)
-}
+use rust_dftb::{load_sk_for_species, max_abs_diff, parse_xyz, DftbOutput, HamiltonianBuilder};
 
 #[test]
 fn parity_h0_methane_example() {
@@ -20,24 +12,13 @@ fn parity_h0_methane_example() {
     let Ok(ref_h) = std::env::var("RUST_DFTB_REF_H") else { return; };
     let Ok(ref_s) = std::env::var("RUST_DFTB_REF_S") else { return; };
 
-    // Methane geometry in Angstrom (match your DFTB+ input!).
-    // Note: DFTB+ uses atomic units internally but input/output here is Hartree.
-    let species = vec![
-        "C".to_string(),
-        "H".to_string(),
-        "H".to_string(),
-        "H".to_string(),
-        "H".to_string(),
-    ];
-    let coords = vec![
-        [0.0, 0.0, 0.0],
-        [0.629118, 0.629118, 0.629118],
-        [-0.629118, -0.629118, 0.629118],
-        [-0.629118, 0.629118, -0.629118],
-        [0.629118, -0.629118, -0.629118],
-    ];
+    // Load methane geometry from data/xyz/CH4.xyz
+    let xyz_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../data/xyz/CH4.xyz");
+    let mol = parse_xyz(xyz_path).unwrap();
+    let species = mol.species;
+    let coords = mol.coords;
 
-    let sk = SkData::load_sk_folder(sk_dir, ".skf", "-").unwrap();
+    let sk = load_sk_for_species(&sk_dir, &species).unwrap();
     let builder = HamiltonianBuilder::new(sk);
     let ham = builder.build_non_scc(&species, &coords).unwrap();
 
@@ -71,10 +52,7 @@ fn parity_sp_only_vs_generic() {
         [0.0, 0.0, 1.0],
     ];
 
-    let mut sk = SkData::load_sk_folder(sk_dir, ".skf", "-").unwrap();
-    let mut ang_map = std::collections::HashMap::new();
-    ang_map.insert("C".to_string(), vec![0, 1]);
-    sk.set_species_angular_momenta(ang_map);
+    let sk = load_sk_for_species(&sk_dir, &species).unwrap();
     let builder = HamiltonianBuilder::new(sk);
 
     let ham_generic = builder.build_non_scc(&species, &coords).unwrap();
@@ -106,11 +84,7 @@ fn benchmark_parity_sp_only() {
         [0.0, 0.0, 1.0],
     ];
 
-    let mut sk = SkData::load_sk_folder(sk_dir, ".skf", "-").unwrap();
-    let mut ang_map = std::collections::HashMap::new();
-    ang_map.insert("C".to_string(), vec![0, 1]);
-    sk.set_species_angular_momenta(ang_map);
-
+    let sk = load_sk_for_species(&sk_dir, &species).unwrap();
     let builder = HamiltonianBuilder::new(sk);
 
     const N_STEPS: usize = 1000;

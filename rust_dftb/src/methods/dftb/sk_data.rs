@@ -80,6 +80,7 @@ pub struct AtomicParamsSp {
     pub e_s: f64,
     pub e_p: f64,
     pub q0: f64,
+    pub u_hubbard: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -278,13 +279,17 @@ fn sk_read_onsite_sp(path: &Path) -> Result<AtomicParamsSp> {
     let e_s = nums[2];
     let _ = e_d;
 
+    // Hubbard U is at index 6 in the standard mio SK format onsite line.
+    // Format: Ed Ep Es <params> U_hub ... q0 values
+    let u_hubbard = if nums.len() > 6 { nums[6] } else { 0.0 };
+
     let q0 = if nums.len() >= n_shell {
         nums[nums.len() - n_shell..].iter().sum()
     } else {
         0.0
     };
 
-    Ok(AtomicParamsSp { e_s, e_p, q0 })
+    Ok(AtomicParamsSp { e_s, e_p, q0, u_hubbard })
 }
 
 fn read_skf_all(path: &Path, sp1: &str, sp2: &str) -> Result<SkTableSp> {

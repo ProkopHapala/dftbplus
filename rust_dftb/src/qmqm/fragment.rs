@@ -129,6 +129,8 @@ pub struct Fragment {
     pub fermi_level: f64,
     /// Total number of electrons in the fragment.
     pub n_electrons: f64,
+    /// Cached Cholesky factor L of S (S = L·Lᵀ), computed once and reused across SCC iterations.
+    pub cholesky_l: Option<DMatrix<f64>>,
 }
 
 impl Fragment {
@@ -153,6 +155,7 @@ impl Fragment {
             energy: 0.0,
             fermi_level: 0.0,
             n_electrons,
+            cholesky_l: None,
         }
     }
 
@@ -210,10 +213,13 @@ impl Fragment {
     ///   3. diagonalize H' → eigenvalues E, eigenvectors c'
     ///   4. c = L⁻ᵀ·c'
     pub fn diagonalize(&mut self) -> Result<()> {
-        // 1. Cholesky of S
-        let cholesky = Cholesky::new(self.template.s.clone())
-            .ok_or_else(|| DftbError::InvalidInput("Overlap matrix is not positive definite".into()))?;
-        let l = cholesky.l();
+        // 1. Cholesky of S (cached — S never changes across SCC iterations)
+        if self.cholesky_l.is_none() {
+            let cholesky = Cholesky::new(self.template.s.clone())
+                .ok_or_else(|| DftbError::InvalidInput("Overlap matrix is not positive definite".into()))?;
+            self.cholesky_l = Some(cholesky.l());
+        }
+        let l = self.cholesky_l.as_ref().unwrap();
 
         // 2. H' = L⁻¹·H·L⁻ᵀ
         //   a) M = L⁻¹·H  → solve L·M = H
@@ -249,49 +255,37 @@ impl Fragment {
 
     /// Compute Mulliken charges from the occupied eigenvectors.
     ///
-    /// `q_A = q0_A - Σ_{μ∈A} (D·S)_{μμ}` where `D = Σ_occ c_i·c_iᵀ`.
+    /// `pop_A = Σ_{μ∈A} (D·S)_{μμ}` where `D = 2·Σ_occ c_i·c_iᵀ`.
     /// For closed-shell: each occupied MO holds 2 electrons.
+    ///
+    /// Only the diagonal of D·S is needed, so we compute:
+    /// `(D·S)_{μμ} = 2·Σ_{k∈occ} c_{μk} · (Σ_ν c_{νk} · S_{μν})`
+    /// This is O(N²·n_occ) instead of O(N³) for the full matrix.
     pub fn compute_charges(&mut self) {
         let n_orbs = self.template.n_orbs;
         let n_occ = (self.n_electrons / 2.0).round() as usize;
 
-        // Extract occupied eigenvectors (eigenvalues are sorted ascending)
-        let c_occ = self.eigenvectors.columns(n_orbs - n_occ, n_occ);
+        let c_occ = self.eigenvectors.columns(0, n_occ);
+        let s = &self.template.s;
 
-        // Build D·S = 2·C_occ·C_occᵀ·S (closed-shell)
-        let mut work = DMatrix::zeros(n_orbs, n_orbs);
+        // Compute diagonal of D·S per orbital
+        let mut diag_ds = vec![0.0_f64; n_orbs];
         for k in 0..n_occ {
-            for i in 0..n_orbs {
-                let c_ik = c_occ[(i, k)];
-                for j in 0..n_orbs {
-                    work[(i, j)] += c_ik * c_occ[(j, k)];
+            for mu in 0..n_orbs {
+                let mut sc = 0.0;
+                for nu in 0..n_orbs {
+                    sc += c_occ[(nu, k)] * s[(mu, nu)];
                 }
+                diag_ds[mu] += 2.0 * c_occ[(mu, k)] * sc;
             }
         }
-        // Multiply by S on right: work = work · S
-        let mut tmp = DMatrix::zeros(n_orbs, n_orbs);
-        for i in 0..n_orbs {
-            for j in 0..n_orbs {
-                let mut sum = 0.0;
-                for k in 0..n_orbs {
-                    sum += work[(i, k)] * self.template.s[(k, j)];
-                }
-                tmp[(i, j)] = sum;
-            }
-        }
-        work.copy_from(&tmp);
-        work.scale_mut(2.0);
 
-        // Trace per atom: q_A = q0_A - Σ_{μ∈A} (D·S)_{μμ}
+        // Sum diagonal per atom
         let orb_off = &self.template.atom_orb_off;
         for i_at in 0..self.template.n_atoms {
             let i0 = orb_off[i_at] as usize;
             let i1 = orb_off[i_at + 1] as usize;
-            let mut pop = 0.0;
-            for mu in i0..i1 {
-                pop += work[(mu, mu)];
-            }
-            self.charges[i_at] = self.template.q0[i_at] - pop;
+            self.charges[i_at] = diag_ds[i0..i1].iter().sum();
         }
     }
 

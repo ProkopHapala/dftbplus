@@ -38,6 +38,8 @@ pub fn compute_intra_shifts(
     for i in 0..n {
         let ui = gamma_tbl.u(species[i]);
         // Self term: U_i * delta_q_i
+        // (our deltaQ = q_elec - q0, opposite to DFTB+'s deltaQ = q0 - q_elec,
+        //  so the -gamma*deltaQ_DFTB+ becomes +gamma*deltaQ_ours)
         out[i] += ui * delta_q[i];
 
         for j in (i + 1)..n {

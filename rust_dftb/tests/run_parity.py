@@ -14,106 +14,10 @@ import subprocess
 import sys
 import tempfile
 
-DFTB_BIN = "/home/prokophapala/git/dftbplus/_build/app/dftb+/dftb+"
-SK_DIR = "/home/prokophapala/git_SW/dftbplus/external/slakos/origin/mio-1-1"
-RUST_DIR = os.path.dirname(os.path.abspath(__file__))
-
-HUBBARD_U = {"H": 0.4195, "C": 0.3647, "N": 0.4309, "O": 0.4954, "F": 0.4500, "S": 0.3200, "P": 0.3500}
-
-
-def parse_xyz(path):
-    """Parse standard XYZ; optional 5th column is charge (ignored for geometry)."""
-    with open(path) as f:
-        lines = f.readlines()
-    n = int(lines[0].strip())
-    species, coords = [], []
-    for line in lines[2:2 + n]:
-        parts = line.split()
-        species.append(parts[0].capitalize())
-        coords.append([float(parts[1]), float(parts[2]), float(parts[3])])
-    return species, coords
-
-
-def write_gen(path, species, coords):
-    """Write DFTB+ GenFormat file."""
-    uq = []
-    for s in species:
-        if s not in uq:
-            uq.append(s)
-    with open(path, "w") as f:
-        f.write(f"{len(species)}  C\n")
-        f.write(" ".join(uq) + "\n")
-        for i, (s, c) in enumerate(zip(species, coords)):
-            sp_idx = uq.index(s) + 1
-            f.write(f"{i + 1}  {sp_idx}  {c[0]:.10E}  {c[1]:.10E}  {c[2]:.10E}\n")
-
-
-def write_hsd(path, gen_file, species, scc=False, initial_charges=None):
-    """Write DFTB+ input HSD."""
-    max_ang = []
-    uq = []
-    for s in species:
-        if s not in uq:
-            uq.append(s)
-    for s in uq:
-        max_ang.append(f'    {s} = "{"p" if s in ("C","N","O","F","S","P") else "s"}"')
-    ang_block = "\n".join(max_ang)
-
-    ic_block = ""
-    if initial_charges:
-        ic_block = "  InitialCharges = {\n"
-        for i, dq in enumerate(initial_charges, 1):
-            ic_block += f"    AtomCharge {{\n      Atoms = {{ {i} }}\n      ChargePerAtom = {dq}\n    }}\n"
-        ic_block += "  }\n"
-
-    scc_block = "  SCCTolerance = 1.0E-010\n  MaxSCCIterations = 1\n" if scc else ""
-    hsd = f"""Geometry = GenFormat {{
-  <<< "{gen_file}"
-}}
-
-Hamiltonian = DFTB {{
-  SCC = {"Yes" if scc else "No"}
-  {scc_block}{ic_block}  MaxAngularMomentum = {{
-{ang_block}
-  }}
-  SlaterKosterFiles = Type2Filenames {{
-    Prefix = "{SK_DIR}/"
-    Separator = "-"
-    Suffix = ".skf"
-  }}
-  Filling = Fermi {{
-    Temperature [Kelvin] = 0.0
-  }}
-}}
-
-Options {{
-  WriteHS = Yes
-  WriteDetailedOut = Yes
-}}
-
-ParserOptions {{
-  ParserVersion = 13
-}}
-"""
-    with open(path, "w") as f:
-        f.write(hsd)
-
-
-def parse_square_matrix(path):
-    """Parse DFTB+ hamsqr/oversqr file."""
-    with open(path) as f:
-        lines = f.readlines()
-    data = []
-    found = False
-    for line in lines:
-        if line.strip().startswith("# MATRIX"):
-            found = True
-            continue
-        if found:
-            for tok in line.split():
-                data.append(float(tok))
-    n = int(len(data) ** 0.5)
-    return n, data
+from test_utils import (
+    parse_xyz, write_gen, write_hsd, run_dftb, parse_square_matrix,
+    unique_species, SK_DIR, RUST_DIR, HUBBARD_U,
+)
 
 
 def parse_delta_q_from_debug(work_dir):
@@ -137,39 +41,29 @@ def parse_delta_q_from_debug(work_dir):
     return delta_q
 
 
-def run_dftb(work_dir):
-    """Run DFTB+ in work_dir; hamsqr1.dat and oversqr.dat must be produced."""
-    subprocess.run([DFTB_BIN, os.path.join(work_dir, "dftb_in.hsd")],
-                   cwd=work_dir, capture_output=True, text=True)
-
-
 def run_non_scc(work_dir, species, coords):
     """Generate and run non-SCC reference."""
     gen = os.path.join(work_dir, "geometry.gen")
     write_gen(gen, species, coords)
-    write_hsd(os.path.join(work_dir, "dftb_in.hsd"), gen, species, scc=False)
+    write_hsd(os.path.join(work_dir, "dftb_in.hsd"), gen, species, scc=False, write_hs=True)
     run_dftb(work_dir)
-    # Rename outputs so SCC run does not overwrite them
-    h0 = os.path.join(work_dir, "hamsqr1.dat")
-    s0 = os.path.join(work_dir, "oversqr.dat")
     h_ref = os.path.join(work_dir, "ref_h0.dat")
     s_ref = os.path.join(work_dir, "ref_s.dat")
-    os.rename(h0, h_ref)
-    os.rename(s0, s_ref)
+    os.rename(os.path.join(work_dir, "hamsqr1.dat"), h_ref)
+    os.rename(os.path.join(work_dir, "oversqr.dat"), s_ref)
     return h_ref, s_ref
 
 
-def run_scc(work_dir, species, coords, initial_charges):
+def run_scc_fixed(work_dir, species, coords, initial_charges):
     """Generate and run SCC (MaxSccIterations=1) reference.
     Returns path to H_scc ref and the ACTUAL deltaQ from Fortran debug output."""
     gen = os.path.join(work_dir, "geometry.gen")
     write_gen(gen, species, coords)
-    write_hsd(os.path.join(work_dir, "dftb_in.hsd"), gen, species, scc=True, initial_charges=initial_charges)
+    write_hsd(os.path.join(work_dir, "dftb_in.hsd"), gen, species,
+              scc=True, initial_charges=initial_charges, max_scc_iterations=1, write_hs=True)
     run_dftb(work_dir)
-    h_scc = os.path.join(work_dir, "hamsqr1.dat")
     h_ref = os.path.join(work_dir, "ref_h_scc.dat")
-    os.rename(h_scc, h_ref)
-    # Read actual deltaQ from Fortran debug output
+    os.rename(os.path.join(work_dir, "hamsqr1.dat"), h_ref)
     delta_q = parse_delta_q_from_debug(work_dir)
     return h_ref, delta_q
 
@@ -209,7 +103,7 @@ def main():
             # Fortran InitialCharges sign convention is complex;
             # we pass user values as initial guess and read ACTUAL deltaQ from debug.
             print(f"[{name}] Running SCC reference (requested deltaQ={user_delta_q})...")
-            ref_h_scc, actual_delta_q = run_scc(work, species, coords, user_delta_q)
+            ref_h_scc, actual_delta_q = run_scc_fixed(work, species, coords, user_delta_q)
             n_scc, _ = parse_square_matrix(ref_h_scc)
             print(f"  H_scc: {n_scc}x{n_scc}")
             print(f"  Actual Fortran deltaQ: {actual_delta_q}")
@@ -217,11 +111,7 @@ def main():
             env["RUST_DFTB_DELTA_Q"] = ",".join(str(x) for x in actual_delta_q)
             env["RUST_DFTB_TOLERANCE_SCC"] = str(args.tol_scc)
 
-        # Collect unique species and their Hubbard U values
-        uq = []
-        for s in species:
-            if s not in uq:
-                uq.append(s)
+        uq = unique_species(species)
         hubbard = [str(HUBBARD_U.get(s, 0.4)) for s in uq]
         env["RUST_DFTB_HUBBARD_U"] = ",".join(hubbard)
         env["RUST_DFTB_SPECIES_U"] = ",".join(uq)

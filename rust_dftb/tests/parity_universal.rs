@@ -10,37 +10,11 @@
 //! - RUST_DFTB_DELTA_Q        – optional: comma-separated deltaQ values for SCC
 //! - RUST_DFTB_TOLERANCE      – optional: tolerance (default 1e-7 for H0, 1e-6 for SCC)
 
-use rust_dftb::{DftbOutput, HamiltonianBuilder, SkData};
+use rust_dftb::{load_sk_for_species, max_abs_diff, parse_coords, parse_f64_list, parse_species, DftbOutput, HamiltonianBuilder};
 use rust_dftb::qmqm::{
     Fragment, FragmentNeighborList, FragmentTemplate, GammaTable, SimpleMixer,
     solver::MultiSystemSolver,
 };
-
-fn max_abs_diff(a: &nalgebra::DMatrix<f64>, b: &nalgebra::DMatrix<f64>) -> f64 {
-    assert_eq!(a.shape(), b.shape());
-    a.iter()
-        .zip(b.iter())
-        .map(|(x, y)| (x - y).abs())
-        .fold(0.0_f64, f64::max)
-}
-
-fn parse_species(s: &str) -> Vec<String> {
-    s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect()
-}
-
-fn parse_coords(s: &str) -> Vec<[f64; 3]> {
-    let vals: Vec<f64> = s
-        .split(|c| c == ',' || c == ' ' || c == ';' || c == '\n' || c == '\t' || c == '[' || c == ']' || c == '(' || c == ')')
-        .filter(|x| !x.is_empty())
-        .filter_map(|x| x.parse::<f64>().ok())
-        .collect();
-    assert!(vals.len() % 3 == 0);
-    vals.chunks_exact(3).map(|c| [c[0], c[1], c[2]]).collect()
-}
-
-fn parse_delta_q(s: &str) -> Vec<f64> {
-    s.split(',').filter_map(|x| x.trim().parse::<f64>().ok()).collect()
-}
 
 #[test]
 fn parity_universal_from_env() {
@@ -59,16 +33,7 @@ fn parity_universal_from_env() {
     let coords = parse_coords(&coords_s);
     assert_eq!(species.len(), coords.len(), "species/coords length mismatch");
 
-    let mut sk = SkData::load_sk_folder(&sk_dir, ".skf", "-").unwrap();
-    let mut ang_map = std::collections::HashMap::new();
-    for sp in &species {
-        match sp.as_str() {
-            "H" => { ang_map.insert(sp.clone(), vec![0]); }
-            "C" | "N" | "O" | "F" | "S" | "P" => { ang_map.insert(sp.clone(), vec![0, 1]); }
-            _ => panic!("Unknown species: {}", sp),
-        }
-    }
-    sk.set_species_angular_momenta(ang_map);
+    let sk = load_sk_for_species(&sk_dir, &species).unwrap();
 
     // ---- Non-SCC H0 parity ----
     let builder = HamiltonianBuilder::new(sk.clone());
@@ -88,7 +53,7 @@ fn parity_universal_from_env() {
         std::env::var("RUST_DFTB_REF_H_SCC"),
         std::env::var("RUST_DFTB_DELTA_Q"),
     ) {
-        let delta_q = parse_delta_q(&delta_q_s);
+        let delta_q = parse_f64_list(&delta_q_s);
         assert_eq!(
             delta_q.len(),
             species.len(),

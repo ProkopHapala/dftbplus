@@ -64,12 +64,18 @@ impl Mixer for SimpleMixer {
 pub struct DiisMixer {
     /// Max number of history vectors to retain.
     pub max_history: usize,
+    /// Number of simple-mixing warmup iterations before DIIS kicks in.
+    pub warmup: usize,
+    /// Simple mixing parameter for warmup and fallback.
+    pub alpha: f64,
+    /// Iteration counter.
+    iter: usize,
     /// History of input vectors `q_in`.
     q_in_history: VecDeque<Vec<f64>>,
     /// History of residual vectors `F(q)`.
     residual_history: VecDeque<Vec<f64>>,
     /// Pre-allocated matrix for the DIIS linear system `B·c = rhs`.
-    /// Shape `[max_history × max_history]`, stored row-major.
+    /// Shape `[(max_history+1) × (max_history+1)]`, stored row-major.
     b_mat: Vec<f64>,
     /// Pre-allocated RHS vector.
     rhs: Vec<f64>,
@@ -81,12 +87,15 @@ pub struct DiisMixer {
 
 impl DiisMixer {
     pub fn new(max_history: usize, _vector_len: usize) -> Self {
-        let b_mat = vec![0.0; max_history * max_history];
+        let b_mat = vec![0.0; (max_history + 1) * (max_history + 1)];
         let rhs = vec![0.0; max_history + 1];
         let work = vec![0.0; max_history];
         let ipiv = vec![0; max_history + 1];
         Self {
             max_history,
+            warmup: 5,
+            alpha: 0.2,
+            iter: 0,
             q_in_history: VecDeque::with_capacity(max_history),
             residual_history: VecDeque::with_capacity(max_history),
             b_mat,
@@ -142,6 +151,16 @@ impl DiisMixer {
 
 impl Mixer for DiisMixer {
     fn mix(&mut self, q_inout: &mut [f64], _q_out: &[f64], residual: &[f64]) {
+        self.iter += 1;
+
+        // Warmup phase: simple mixing for first `warmup` iterations.
+        if self.iter <= self.warmup {
+            for (q, &r) in q_inout.iter_mut().zip(residual.iter()) {
+                *q += self.alpha * r;
+            }
+            return;
+        }
+
         // Store current state in history.
         let q_in_copy: Vec<f64> = q_inout.to_vec();
         let res_copy: Vec<f64> = residual.to_vec();
@@ -155,21 +174,20 @@ impl Mixer for DiisMixer {
 
         let n_hist = self.solve_diis();
         if n_hist == 0 {
-            // Fall back to simple mixing on first iteration.
+            // Fall back to simple mixing.
             for (q, &r) in q_inout.iter_mut().zip(residual.iter()) {
-                *q += 0.3 * r;
+                *q += self.alpha * r;
             }
             return;
         }
 
-        // q_new = Σ_i c_i · q_out_i   (using the stored q_in + residual = q_out)
+        // q_new = Σ_i c_i · q_out_i  where q_out_i = q_in_i + residual_i
         q_inout.fill(0.0);
         for (i, q_in_i) in self.q_in_history.iter().enumerate() {
             let c = self.work[i];
-            for (q, &q_in_val) in q_inout.iter_mut().zip(q_in_i.iter()) {
-                // q_out_i = q_in_i + residual_i, but for DIIS we extrapolate q_in directly
-                // Standard DIIS: q_new = Σ c_i · q_in_i
-                *q += c * q_in_val;
+            let res_i = &self.residual_history[i];
+            for (q, (&q_in_val, &res_val)) in q_inout.iter_mut().zip(q_in_i.iter().zip(res_i.iter())) {
+                *q += c * (q_in_val + res_val);
             }
         }
     }
@@ -177,6 +195,7 @@ impl Mixer for DiisMixer {
     fn reset(&mut self) {
         self.q_in_history.clear();
         self.residual_history.clear();
+        self.iter = 0;
     }
 }
 
