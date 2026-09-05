@@ -9,8 +9,9 @@
 //! 2. Diagonalizing the generalized eigenvalue problem `H·c = E·S·c`.
 //! 3. Returning updated atom-resolved Mulliken charges.
 
-use nalgebra::{DMatrix, DVector, SymmetricEigen};
+use nalgebra::{DMatrix, DVector};
 use nalgebra::linalg::Cholesky;
+use lapack::dsyevd;
 
 use crate::core::error::{DftbError, Result};
 use crate::methods::dftb::hamiltonian::{HamiltonianBuilder, SystemContext};
@@ -213,6 +214,9 @@ impl Fragment {
     ///   3. diagonalize H' → eigenvalues E, eigenvectors c'
     ///   4. c = L⁻ᵀ·c'
     pub fn diagonalize(&mut self) -> Result<()> {
+        let verbose = std::env::var("RUST_DFTB_TIMING").is_ok();
+        let t0 = std::time::Instant::now();
+
         // 1. Cholesky of S (cached — S never changes across SCC iterations)
         if self.cholesky_l.is_none() {
             let cholesky = Cholesky::new(self.template.s.clone())
@@ -220,35 +224,70 @@ impl Fragment {
             self.cholesky_l = Some(cholesky.l());
         }
         let l = self.cholesky_l.as_ref().unwrap();
+        let t_chol = t0.elapsed();
 
-        // 2. H' = L⁻¹·H·L⁻ᵀ
-        //   a) M = L⁻¹·H  → solve L·M = H
+        let n = self.h_scc.nrows();
+        assert_eq!(self.h_scc.ncols(), n, "H_scc must be square");
+
+        // 2. H' = L⁻¹·H·L⁻ᵀ  (transform generalized → standard eigenproblem)
+        let t0 = std::time::Instant::now();
         let m = l.solve_lower_triangular(&self.h_scc)
             .ok_or_else(|| DftbError::InvalidInput("Failed to solve L·M = H".into()))?;
-        //   b) N = L⁻¹·Mᵀ → solve L·N = Mᵀ
         let n_mat = l.solve_lower_triangular(&m.transpose())
             .ok_or_else(|| DftbError::InvalidInput("Failed to solve L·N = Mᵀ".into()))?;
-        let h_prime = n_mat.transpose();
+        // h_prime is symmetric: (L⁻¹·H·L⁻ᵀ)ᵀ = L⁻¹·Hᵀ·L⁻ᵀ = L⁻¹·H·L⁻ᵀ
+        let mut h_prime = n_mat.transpose();
+        let t_transform = t0.elapsed();
 
-        // 3. Standard symmetric eigenproblem on H'
-        let se = SymmetricEigen::new(h_prime);
-        let eigenvalues = se.eigenvalues;
-        let c_prime = se.eigenvectors;
+        // 3. LAPACK dsyevd: eigenvalues + eigenvectors of symmetric H'
+        //    nalgebra DMatrix is column-major (Fortran order), so we can pass
+        //    the raw data directly to LAPACK.
+        let t0 = std::time::Instant::now();
+        let mut eigenvalues = vec![0.0f64; n];
+        // Workspace query: lwork = -1, liwork = -1
+        let mut work = vec![0.0f64; 1];
+        let mut iwork = vec![0i32; 1];
+        let mut info: i32 = 0;
+        unsafe {
+            dsyevd(b'V', b'L', n as i32, h_prime.as_mut_slice(), n as i32,
+                   &mut eigenvalues, &mut work, -1, &mut iwork, -1, &mut info);
+        }
+        if info != 0 {
+            return Err(DftbError::InvalidInput(format!("dsyevd workspace query failed: info={info}")));
+        }
+        let lwork = work[0] as i32;
+        let liwork = iwork[0];
+        let mut work = vec![0.0f64; lwork as usize];
+        let mut iwork = vec![0i32; liwork as usize];
+        // Actual eigensolve
+        unsafe {
+            dsyevd(b'V', b'L', n as i32, h_prime.as_mut_slice(), n as i32,
+                   &mut eigenvalues, &mut work, lwork, &mut iwork, liwork, &mut info);
+        }
+        if info != 0 {
+            return Err(DftbError::InvalidInput(format!("dsyevd failed: info={info}")));
+        }
+        let t_eigen = t0.elapsed();
 
-        // nalgebra does not guarantee sorted eigenvalues — sort ascending.
-        let n = eigenvalues.len();
-        let mut idx: Vec<usize> = (0..n).collect();
-        idx.sort_by(|&a, &b| eigenvalues[a].partial_cmp(&eigenvalues[b]).unwrap());
-
-        let sorted_eigenvalues: Vec<f64> = idx.iter().map(|&i| eigenvalues[i]).collect();
-        let sorted_c_prime = c_prime.select_columns(&idx);
+        // h_prime now contains eigenvectors in column-major order (same as nalgebra)
+        let c_prime = h_prime; // DMatrix still owns the modified data
 
         // 4. Back-transform: c = L⁻ᵀ·c'
-        let c = l.tr_solve_lower_triangular(&sorted_c_prime)
+        let t0 = std::time::Instant::now();
+        let c = l.tr_solve_lower_triangular(&c_prime)
             .ok_or_else(|| DftbError::InvalidInput("Failed to solve Lᵀ·c = c'".into()))?;
+        let t_back = t0.elapsed();
 
-        self.eigenvalues = DVector::from(sorted_eigenvalues);
+        // LAPACK dsyevd returns eigenvalues in ascending order (no sort needed)
+        self.eigenvalues = DVector::from(eigenvalues);
         self.eigenvectors = c;
+
+        if verbose {
+            eprintln!("      [diag] chol={:.3}ms transform={:.3}ms eigen={:.3}ms back={:.3}ms total={:.3}ms (N={})",
+                t_chol.as_secs_f64()*1e3, t_transform.as_secs_f64()*1e3,
+                t_eigen.as_secs_f64()*1e3, t_back.as_secs_f64()*1e3,
+                (t_chol+t_transform+t_eigen+t_back).as_secs_f64()*1e3, n);
+        }
 
         Ok(())
     }

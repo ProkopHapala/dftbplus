@@ -584,3 +584,260 @@ __kernel void local_jacobi_blocks_parallel(
     for (int i = lid; i < m; i += lsz) eigvals[gid * m + i] = A[i * m + i];
     for (int i = lid; i < n2; i += lsz) gV[i] = V[i];
 }
+
+// ==================================================================
+// Agent_6 (Wave 2): Full-local batched GEMM + SCC component kernels.
+//
+// All kernels below operate on batched row-major data, one workgroup
+// per system (batch element). They use the shared GpuRuntime context
+// and are independent of the Jacobi eigensolver (Agent_4).
+//
+// New kernel inventory:
+//   matmul_full_local_batched   — C = A·B, both matrices in __local
+//   gamma_matvec_batched        — V = G · Δq (atom-resolved electrostatics)
+//   h_scc_update_batched        — H = H0 + 0.5·S·(V_i + V_j)
+//   mulliken_charges_batched    — q_A = Σ_{μ∈A} (D·S)_μμ
+//   residual_and_mix_batched    — rms = ||q_new-q_old||, q_mixed = α·q_new+(1-α)·q_old
+// ==================================================================
+
+#ifndef FL_NORB
+#define FL_NORB 64
+#endif
+
+#ifndef FL_WG
+#define FL_WG 256
+#endif
+
+// ------------------------------------------------------------------
+// matmul_full_local_batched
+//
+// Full-local batched matrix multiply: C_b = A_b · B_b for each batch
+// element b. One workgroup per system; both A and B are loaded once
+// into __local memory with a padded leading dimension (N+1) to avoid
+// bank conflicts, then each thread computes N²/WG output elements in
+// a strided loop.
+//
+// Specialized at compile time via FL_NORB (max N, sizes the static
+// __local arrays) and FL_WG (workgroup size). The runtime `n` arg
+// may be ≤ FL_NORB. The host renders a distinct program per (N, WG)
+// pair; GpuRuntime's program cache avoids recompilation for repeats.
+//
+// Local memory: 2 · FL_NORB · (FL_NORB+1) · 4 B. For FL_NORB=64 that
+// is 33 KB, within the 48 KB typical local-memory limit.
+// ------------------------------------------------------------------
+__kernel void matmul_full_local_batched(
+    const int n,
+    const int batch,
+    __global const float* A,
+    __global const float* B,
+    __global float* C
+) {
+    const int sid = get_group_id(0);
+    const int lid = get_local_id(0);
+    const int lsz = get_local_size(0);
+    if (sid >= batch) return;
+
+    const int stride = n * n;
+    __global const float* Ab = A + (size_t)sid * stride;
+    __global const float* Bb = B + (size_t)sid * stride;
+    __global float* Cb       = C + (size_t)sid * stride;
+
+    __local float LA[FL_NORB * (FL_NORB + 1)];
+    __local float LB[FL_NORB * (FL_NORB + 1)];
+    const int ld = n + 1;  // padded leading dimension
+
+    // Cooperative load of A and B into local memory (padded ld).
+    for (int i = lid; i < n * n; i += lsz) {
+        int r = i / n;
+        int c = i - r * n;
+        LA[r * ld + c] = Ab[r * n + c];
+        LB[r * ld + c] = Bb[r * n + c];
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    // Strided output: each thread computes N²/WG elements.
+    for (int idx = lid; idx < n * n; idx += lsz) {
+        int r = idx / n;
+        int c = idx - r * n;
+        float sum = 0.0f;
+        for (int k = 0; k < n; ++k) {
+            sum += LA[r * ld + k] * LB[k * ld + c];
+        }
+        Cb[r * n + c] = sum;
+    }
+}
+
+// ------------------------------------------------------------------
+// gamma_matvec_batched
+//
+// Atom-resolved electrostatic potential: V_A = Σ_B G_AB · Δq_B.
+// G is a dense [n_atoms × n_atoms] gamma matrix per system, Δq and V
+// are per-atom vectors. One workgroup per system; each thread computes
+// one V_A (threads with lid >= n_atoms are idle). Naive reduction over
+// B — fine since n_atoms ≤ ~100.
+//
+// Layout: G[b][Na*Na] row-major, dq[b][Na], V[b][Na].
+// ------------------------------------------------------------------
+__kernel void gamma_matvec_batched(
+    const int n_atoms,
+    const int batch,
+    __global const float* G,
+    __global const float* dq,
+    __global float* V
+) {
+    const int sid = get_group_id(0);
+    const int lid = get_local_id(0);
+    if (sid >= batch) return;
+    __global const float* Gb  = G  + (size_t)sid * n_atoms * n_atoms;
+    __global const float* dqb = dq + (size_t)sid * n_atoms;
+    __global float* Vb        = V  + (size_t)sid * n_atoms;
+
+    if (lid < n_atoms) {
+        float sum = 0.0f;
+        for (int b = 0; b < n_atoms; ++b) {
+            sum += Gb[lid * n_atoms + b] * dqb[b];
+        }
+        Vb[lid] = sum;
+    }
+}
+
+// ------------------------------------------------------------------
+// h_scc_update_batched
+//
+// SCC Hamiltonian update: H[μ,ν] = H0[μ,ν] + 0.5·S[μ,ν]·(V[A_μ] + V[A_ν])
+// where A_μ is the atom owning orbital μ (from orb_atom[μ]). V is the
+// per-atom potential vector. Elementwise over N² orbitals.
+//
+// V_atom is cached in __local once (cooperative load), then each thread
+// updates strided (μ,ν) elements. One workgroup per system.
+//
+// Layout: H0,S,H [b][N*N] row-major; V [b][Na]; orb_atom [b][N] (int32).
+// ------------------------------------------------------------------
+__kernel void h_scc_update_batched(
+    const int n,
+    const int n_atoms,
+    const int batch,
+    __global const float* H0,
+    __global const float* S,
+    __global const float* V,
+    __global const int* orb_atom,
+    __global float* H,
+    __local float* Vloc
+) {
+    const int sid = get_group_id(0);
+    const int lid = get_local_id(0);
+    const int lsz = get_local_size(0);
+    if (sid >= batch) return;
+    __global const float* H0b = H0 + (size_t)sid * n * n;
+    __global const float* Sb  = S  + (size_t)sid * n * n;
+    __global const float* Vb  = V  + (size_t)sid * n_atoms;
+    __global const int* oa    = orb_atom + (size_t)sid * n;
+    __global float* Hb        = H  + (size_t)sid * n * n;
+
+    // Cache per-atom potential in local memory.
+    for (int a = lid; a < n_atoms; a += lsz) Vloc[a] = Vb[a];
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    // Elementwise SCC update over N².
+    for (int idx = lid; idx < n * n; idx += lsz) {
+        int i = idx / n;
+        int j = idx - i * n;
+        float vi = Vloc[oa[i]];
+        float vj = Vloc[oa[j]];
+        Hb[idx] = H0b[idx] + 0.5f * Sb[idx] * (vi + vj);
+    }
+}
+
+// ------------------------------------------------------------------
+// mulliken_charges_batched
+//
+// Per-atom Mulliken population: q_A = Σ_{μ∈A} (D·S)_μμ, where
+// (D·S)_μμ = Σ_ν D[μ,ν]·S[ν,μ] = Σ_ν D[μ,ν]·S[μ,ν] (S symmetric).
+//
+// Two phases, one workgroup per system:
+//   1. Each thread computes strided diag_ds[μ] into __local `diag`.
+//   2. Each thread (one per atom) sums diag[μ] for μ belonging to its
+//      atom (via orb_atom[μ]).
+//
+// Layout: D,S [b][N*N] row-major; orb_atom [b][N] (int32); q [b][Na].
+// ------------------------------------------------------------------
+__kernel void mulliken_charges_batched(
+    const int n,
+    const int n_atoms,
+    const int batch,
+    __global const float* D,
+    __global const float* S,
+    __global const int* orb_atom,
+    __global float* q,
+    __local float* diag
+) {
+    const int sid = get_group_id(0);
+    const int lid = get_local_id(0);
+    const int lsz = get_local_size(0);
+    if (sid >= batch) return;
+    __global const float* Db = D + (size_t)sid * n * n;
+    __global const float* Sb = S + (size_t)sid * n * n;
+    __global const int* oa   = orb_atom + (size_t)sid * n;
+    __global float* qb       = q + (size_t)sid * n_atoms;
+
+    // Phase 1: diagonal of D·S per orbital.
+    for (int mu = lid; mu < n; mu += lsz) {
+        float s = 0.0f;
+        for (int nu = 0; nu < n; ++nu) {
+            s += Db[mu * n + nu] * Sb[mu * n + nu];
+        }
+        diag[mu] = s;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    // Phase 2: per-atom reduction.
+    if (lid < n_atoms) {
+        float sum = 0.0f;
+        for (int mu = 0; mu < n; ++mu) {
+            if (oa[mu] == lid) sum += diag[mu];
+        }
+        qb[lid] = sum;
+    }
+}
+
+// ------------------------------------------------------------------
+// residual_and_mix_batched
+//
+// Simple mixing step + residual norm:
+//   q_mixed = α·q_new + (1-α)·q_old
+//   rms     = ||q_new - q_old||_2  (L2 norm, sqrt of sum of squares)
+//
+// One workgroup per system; tree reduction in __local for the rms.
+// ------------------------------------------------------------------
+__kernel void residual_and_mix_batched(
+    const int n_atoms,
+    const int batch,
+    const float alpha,
+    __global const float* q_new,
+    __global const float* q_old,
+    __global float* q_mixed,
+    __global float* rms,
+    __local float* scratch
+) {
+    const int sid = get_group_id(0);
+    const int lid = get_local_id(0);
+    const int lsz = get_local_size(0);
+    if (sid >= batch) return;
+    __global const float* qn = q_new + (size_t)sid * n_atoms;
+    __global const float* qo = q_old + (size_t)sid * n_atoms;
+    __global float* qm       = q_mixed + (size_t)sid * n_atoms;
+
+    float partial = 0.0f;
+    for (int a = lid; a < n_atoms; a += lsz) {
+        float d = qn[a] - qo[a];
+        qm[a] = alpha * qn[a] + (1.0f - alpha) * qo[a];
+        partial += d * d;
+    }
+    scratch[lid] = partial;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int off = lsz >> 1; off > 0; off >>= 1) {
+        if (lid < off) scratch[lid] += scratch[lid + off];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (lid == 0) rms[sid] = sqrt(scratch[0]);
+}

@@ -1,6 +1,6 @@
 # rust_dftb — Master Roadmap & Status Checklist
 
-**Last updated:** 2026-09-06
+**Last updated:** 2025-09-05
 **Maintained by:** prokop / Devin
 **Purpose:** Single source of truth for what is done (`[*]`) and what is not (`[ ]`)
 across the whole `rust_dftb` reimplementation (DFTB, xTB, QM/QM multi-system, OpenCL GPU).
@@ -43,6 +43,9 @@ file/function where the work should land.
 - [*] Diagonal-only Mulliken charges (O(N²·n_occ)) — `qmqm/fragment.rs::Fragment::compute_charges`
 - [*] SCC total energy matching DFTB+ "Total Electronic energy" — `methods/dftb/hamiltonian.rs::SccResult` (energy field), computed in `build_scc`
 - [*] Parity on 13 molecules (H2O … PTCDA, 3–38 atoms) to `<1e-6` — `tests/parity_scc.rs::scc_convergence_from_xyz` (driven by `tests/run_scc_full.py`)
+- [*] LAPACK `dsyevd` eigensolver (replaces nalgebra Jacobi, 29× faster) — `qmqm/fragment.rs::Fragment::diagonalize`; see `doc/prokop/topical_audit/eigensolver_performance.md`
+- [ ] **SCC warm start** (reuse previous charges → 4× fewer iterations) — target: `methods/dftb/hamiltonian.rs::build_scc_warm`; see `eigensolver_performance.md` §Optimization plan
+- [ ] **LAPACK triangular solves** (replace nalgebra `solve_lower_triangular` with `dtrtrs`) — target: `qmqm/fragment.rs::diagonalize`; see `eigensolver_performance.md`
 
 ### 1.3 Forces  ← `Forces_Implementation_Notes.md`
 - [ ] Density matrix DM exposed in `SccResult` — target: `methods/dftb/hamiltonian.rs::SccResult` (add `density` field)
@@ -280,6 +283,44 @@ file/function where the work should land.
 
 ---
 
+## 7.5 Sparse BSR4 Purification + Frontier Orbitals  ← `topical_audit/sparse_tc2_purification.md`, `topical_audit/davidson_eigensolver.md`
+
+### 7.5.1 BSR4 sparse matrices
+- [*] BSR4 layout (4×4 atom blocks, CSR, symmetric storage) — `methods/sparse/bsr4.rs::Bsr4Matrix`
+- [*] Geometric + full masks for sparsity — `methods/sparse/bsr4.rs::build_geometric_mask`, `build_full_mask`
+- [*] Dense ↔ BSR4 conversion — `methods/sparse/bsr4.rs::from_dense`
+
+### 7.5.2 GPU TC2 purification
+- [*] Newton-Schulz `Z ≈ S⁻¹` — `methods/sparse/gpu_sparse.rs` (OpenCL)
+- [*] Spectral bound estimation — `methods/sparse/gpu_sparse.rs`
+- [*] TC2 purification loop with idempotency residual `R_I` — `methods/sparse/gpu_sparse.rs`, `sparse_bsr4_purification.cl`
+- [*] Sparse Mulliken charges from `KS` diagonal blocks — `methods/sparse/gpu_sparse.rs::mulliken`
+- [*] Convergence history export — `SparseResult.history`, Rhai `save_convergence`
+- [*] Parity vs dense + DFTB+ on benzene/coronene/circumcoronene (max\|Δq\| < 6.5e-5 e) — `scripts/compare_rust_vs_dftbplus.py`
+
+### 7.5.3 Davidson partial eigensolver
+- [*] Generalized Davidson `H C = S C ε` with S-orthonormalization — `methods/sparse/davidson.rs::davidson_generalized`
+- [*] Diagonal preconditioner with regularization for near-degenerate states — `methods/sparse/davidson.rs`
+- [*] Subspace restart when `m > max_subspace` — `methods/sparse/davidson.rs`
+- [*] Unit test vs dense `SymmetricEigen` — `methods/sparse/davidson.rs::tests::test_davidson_vs_dense_small`
+- [*] Rhai exposure `davidson_homo_lumo(name, n_target)` — `bin/dftb_engine.rs`
+- [*] Validated on benzene (3 iters, match to 1e-10 Ha)
+- [~] **Coronene/circumcoronene: does not converge** — diagonal preconditioner insufficient for dense near-degenerate frontier manifolds. Needs SSOR/ILU or shift-invert. See `topical_audit/davidson_eigensolver.md`
+
+### 7.5.4 DFTB+ Fortran parity harness
+- [*] `scripts/run_dftbplus_ref.py` — generates HSD, runs DFTB+, parses `detailed.out` + `band.out` (eV→Ha)
+- [*] `scripts/plot_charges_homo_lumo.py` — spatial charge map + HOMO-LUMO levels
+- [*] `scripts/compare_rust_vs_dftbplus.py` — numerical parity report
+- [*] End-to-end on benzene/coronene/circumcoronene: dense charges match to machine precision, eigenvalues to ~2e-6 Ha
+
+### 7.5.5 Open issues
+- [ ] Davidson: stronger preconditioner for degenerate systems (SSOR/ILU or CheFSI)
+- [ ] Davidson: wire to sparse BSR4 matvec operator (avoid densification)
+- [ ] BSR4: variable block size or dense fallback for H atoms
+- [ ] Fermi temperature alignment between Rust and DFTB+ (currently ~2e-6 Ha eigenvalue diff)
+
+---
+
 ## 8. I/O, Tooling & Test Infrastructure
 
 ### 8.1 I/O
@@ -325,6 +366,9 @@ file/function where the work should land.
 | GPU multi-system (independent) | ❌ | Not started — Stage 2–3 of revised plan |
 | GPU multi-system (QM/QM coupling) | ❌ | Not started — Stage 8 of revised plan |
 | Scan / NEB driver | ❌ | Not started (Agent_5 ready to dispatch, CPU backend) |
+| Sparse TC2 purification | ✅ | Benzene/coronene/circumcoronene parity < 6.5e-5 e — `methods/sparse/gpu_sparse.rs` |
+| Davidson partial eigensolver | ⚠️ | Benzene OK; coronene/circumcoronene do not converge (diagonal preconditioner) — `methods/sparse/davidson.rs` |
+| DFTB+ parity harness | ✅ | `scripts/run_dftbplus_ref.py` + `compare_rust_vs_dftbplus.py` |
 | Test infra / CI | ⚠️ | Drivers exist, no CI |
 
 **Overall "multi-system DFTB in OpenCL": ~45% complete.**

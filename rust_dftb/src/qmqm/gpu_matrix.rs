@@ -579,6 +579,250 @@ fn map_ocl_err(err: ocl::Error) -> DftbError {
     DftbError::InvalidInput(format!("OpenCL error: {err}"))
 }
 
+// ==================================================================
+// Agent_6 (Wave 2): Full-local batched GEMM + SCC component kernels.
+//
+// The functions below use the shared `GpuRuntime` (coordinator pre-work,
+// D14) instead of `GpuMatrixContext`. They append to the same OpenCL
+// template `gpu_matrix_ops.cl` and render a per-(N, WG) specialized
+// program via text substitution of FL_NORB / FL_WG. GpuRuntime's
+// program cache avoids recompiling identical source.
+// ==================================================================
+
+use crate::qmqm::gpu_runtime::GpuRuntime;
+
+/// Render the matrix-ops template with `FL_NORB` and `FL_WG` substituted
+/// for the full-local GEMM kernel. Existing `#define TILE_*` defaults are
+/// left in place so the legacy kernels still compile in the same program.
+fn render_source_full_local(n: usize, wg: usize) -> String {
+    MATRIX_KERNEL_TEMPLATE
+        .replace("#define FL_NORB 64", &format!("#define FL_NORB {}", n))
+        .replace("#define FL_WG 256", &format!("#define FL_WG {}", wg))
+}
+
+/// Choose a workgroup size for the full-local GEMM. For small matrices
+/// one thread per output element is best; for larger ones cap at 256.
+fn full_local_wg(n: usize) -> usize {
+    let n2 = n * n;
+    if n2 <= 256 {
+        n2.max(1)
+    } else {
+        256
+    }
+}
+
+/// Full-local batched matrix multiply: C_b = A_b · B_b.
+///
+/// One workgroup per system; both A and B are loaded into `__local`
+/// memory once (padded leading dimension N+1) and reused across the
+/// full N² output. Specialized at compile time for the given `n` via
+/// text substitution of `FL_NORB`/`FL_WG`; the compiled program is
+/// cached by `GpuRuntime`.
+///
+/// All buffers are `[batch][N*N]` row-major `Buffer<f32>`.
+pub fn matmul_full_local_batched(
+    rt: &mut GpuRuntime,
+    a_buf: &Buffer<f32>,
+    b_buf: &Buffer<f32>,
+    c_buf: &Buffer<f32>,
+    n: usize,
+    batch: usize,
+) -> Result<()> {
+    if n == 0 || batch == 0 {
+        return Ok(());
+    }
+    if n > 64 {
+        return Err(DftbError::InvalidInput(format!(
+            "matmul_full_local_batched: n={n} exceeds max supported 64 (local memory limit)"
+        )));
+    }
+    let wg = full_local_wg(n);
+    let source = render_source_full_local(n, wg);
+    let program = rt.build_program(&source)?;
+    let kernel = Kernel::builder()
+        .program(&program)
+        .name("matmul_full_local_batched")
+        .queue(rt.queue().clone())
+        .global_work_size(batch * wg)
+        .local_work_size(wg)
+        .arg(n as i32)
+        .arg(batch as i32)
+        .arg(a_buf)
+        .arg(b_buf)
+        .arg(c_buf)
+        .build()
+        .map_err(map_ocl_err)?;
+    unsafe { kernel.enq().map_err(map_ocl_err)?; }
+    Ok(())
+}
+
+/// Atom-resolved gamma matvec: V_b = G_b · Δq_b for each batch element.
+///
+/// One workgroup per system, one thread per atom. `g_buf` is
+/// `[batch][Na*Na]`, `dq_buf`/`v_buf` are `[batch][Na]`.
+pub fn gamma_matvec_batched(
+    rt: &mut GpuRuntime,
+    g_buf: &Buffer<f32>,
+    dq_buf: &Buffer<f32>,
+    v_buf: &Buffer<f32>,
+    n_atoms: usize,
+    batch: usize,
+) -> Result<()> {
+    if n_atoms == 0 || batch == 0 {
+        return Ok(());
+    }
+    // WG must cover n_atoms (one thread per atom). Round up to a multiple
+    // of the preferred WG multiple for occupancy; cap at max workgroup size.
+    let caps = rt.caps();
+    let wg = n_atoms
+        .min(caps.max_work_group_size)
+        .max(1);
+    // Use the default template (FL_* defaults are irrelevant for this kernel).
+    let source = MATRIX_KERNEL_TEMPLATE;
+    let program = rt.build_program(source)?;
+    let kernel = Kernel::builder()
+        .program(&program)
+        .name("gamma_matvec_batched")
+        .queue(rt.queue().clone())
+        .global_work_size(batch * wg)
+        .local_work_size(wg)
+        .arg(n_atoms as i32)
+        .arg(batch as i32)
+        .arg(g_buf)
+        .arg(dq_buf)
+        .arg(v_buf)
+        .build()
+        .map_err(map_ocl_err)?;
+    unsafe { kernel.enq().map_err(map_ocl_err)?; }
+    Ok(())
+}
+
+/// SCC Hamiltonian update: H = H0 + 0.5·S·(V[A_i] + V[A_j]).
+///
+/// `orb_atom_buf` is `[batch][N]` int32 mapping each orbital to its
+/// owning atom. `v_buf` is `[batch][Na]`. H0/S/H are `[batch][N*N]`.
+pub fn h_scc_update_batched(
+    rt: &mut GpuRuntime,
+    h0_buf: &Buffer<f32>,
+    s_buf: &Buffer<f32>,
+    v_buf: &Buffer<f32>,
+    h_buf: &Buffer<f32>,
+    orb_atom_buf: &Buffer<i32>,
+    n: usize,
+    n_atoms: usize,
+    batch: usize,
+) -> Result<()> {
+    if n == 0 || batch == 0 {
+        return Ok(());
+    }
+    let wg = 256usize;
+    let source = MATRIX_KERNEL_TEMPLATE;
+    let program = rt.build_program(source)?;
+    let kernel = Kernel::builder()
+        .program(&program)
+        .name("h_scc_update_batched")
+        .queue(rt.queue().clone())
+        .global_work_size(batch * wg)
+        .local_work_size(wg)
+        .arg(n as i32)
+        .arg(n_atoms as i32)
+        .arg(batch as i32)
+        .arg(h0_buf)
+        .arg(s_buf)
+        .arg(v_buf)
+        .arg(orb_atom_buf)
+        .arg(h_buf)
+        .arg_local::<f32>(n_atoms)
+        .build()
+        .map_err(map_ocl_err)?;
+    unsafe { kernel.enq().map_err(map_ocl_err)?; }
+    Ok(())
+}
+
+/// Per-atom Mulliken population: q_A = Σ_{μ∈A} (D·S)_μμ.
+///
+/// `d_buf`/`s_buf` are `[batch][N*N]`, `orb_atom_buf` is `[batch][N]`
+/// int32, `q_buf` is `[batch][Na]` output.
+pub fn mulliken_charges_batched(
+    rt: &mut GpuRuntime,
+    d_buf: &Buffer<f32>,
+    s_buf: &Buffer<f32>,
+    q_buf: &Buffer<f32>,
+    orb_atom_buf: &Buffer<i32>,
+    n: usize,
+    n_atoms: usize,
+    batch: usize,
+) -> Result<()> {
+    if n == 0 || batch == 0 {
+        return Ok(());
+    }
+    // WG must accommodate both phases: phase 1 over n orbitals, phase 2
+    // over n_atoms atoms. Use max(n, n_atoms) capped at 256.
+    let wg = n.max(n_atoms).min(256).max(1);
+    let source = MATRIX_KERNEL_TEMPLATE;
+    let program = rt.build_program(source)?;
+    let kernel = Kernel::builder()
+        .program(&program)
+        .name("mulliken_charges_batched")
+        .queue(rt.queue().clone())
+        .global_work_size(batch * wg)
+        .local_work_size(wg)
+        .arg(n as i32)
+        .arg(n_atoms as i32)
+        .arg(batch as i32)
+        .arg(d_buf)
+        .arg(s_buf)
+        .arg(orb_atom_buf)
+        .arg(q_buf)
+        .arg_local::<f32>(n)
+        .build()
+        .map_err(map_ocl_err)?;
+    unsafe { kernel.enq().map_err(map_ocl_err)?; }
+    Ok(())
+}
+
+/// Residual norm + simple mixer:
+///   q_mixed = α·q_new + (1-α)·q_old
+///   rms     = ||q_new - q_old||_2
+///
+/// `q_new_buf`/`q_old_buf`/`q_mixed_buf` are `[batch][Na]`; `rms_buf`
+/// is `[batch]`. One workgroup per system with tree reduction.
+pub fn residual_and_mix_batched(
+    rt: &mut GpuRuntime,
+    q_new_buf: &Buffer<f32>,
+    q_old_buf: &Buffer<f32>,
+    q_mixed_buf: &Buffer<f32>,
+    rms_buf: &Buffer<f32>,
+    alpha: f32,
+    n_atoms: usize,
+    batch: usize,
+) -> Result<()> {
+    if n_atoms == 0 || batch == 0 {
+        return Ok(());
+    }
+    let wg = 256usize;
+    let source = MATRIX_KERNEL_TEMPLATE;
+    let program = rt.build_program(source)?;
+    let kernel = Kernel::builder()
+        .program(&program)
+        .name("residual_and_mix_batched")
+        .queue(rt.queue().clone())
+        .global_work_size(batch * wg)
+        .local_work_size(wg)
+        .arg(n_atoms as i32)
+        .arg(batch as i32)
+        .arg(alpha)
+        .arg(q_new_buf)
+        .arg(q_old_buf)
+        .arg(q_mixed_buf)
+        .arg(rms_buf)
+        .arg_local::<f32>(wg)
+        .build()
+        .map_err(map_ocl_err)?;
+    unsafe { kernel.enq().map_err(map_ocl_err)?; }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

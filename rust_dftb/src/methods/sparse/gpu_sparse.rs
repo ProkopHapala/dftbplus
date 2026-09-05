@@ -1,0 +1,942 @@
+//! GPU wrapper for the BSR4 sparse purification kernels
+//! (`sparse_bsr4_purification.cl`).
+//!
+//! This module is self-contained: it owns its compiled `Program` (built from
+//! the shared `GpuRuntime`'s context/device so no second OpenCL context is
+//! created) and exposes both low-level buffer-level kernel launches and
+//! high-level `Bsr4Matrix`-in / `Bsr4Matrix`-out convenience methods.
+//!
+//! It does **not** depend on any `qmqm` solver logic — only on the shared
+//! `GpuRuntime` OpenCL runtime.
+
+use crate::core::error::{DftbError, Result};
+use crate::methods::sparse::bsr4::{
+    dense_max_abs_diff, Bsr4Matrix, BS, BS2,
+};
+use crate::qmqm::gpu_runtime::{map_ocl_err, GpuRuntime};
+use ocl::{builders::ProgramBuilder, flags, Buffer, Kernel, Program};
+
+const BSR4_KERNEL_SOURCE: &str = include_str!("sparse_bsr4_purification.cl");
+
+/// Tunable build-time parameters for the BSR4 kernels. These are passed to
+/// the OpenCL compiler as `-D` defines; the `.cl` file guards each with
+/// `#ifndef` so unspecified values keep their defaults.
+#[derive(Debug, Clone)]
+pub struct SparseBsr4Config {
+    /// Workgroup size for the SpGEMM kernels. Must be a multiple of 16
+    /// (one 16-thread team per output 4×4 block). Default 128.
+    pub wg: i32,
+    /// Max blocks in a left row that fits in the local-memory cache.
+    /// Local mem ≈ `MAX_LEFT_BLOCKS * (16*4 + 4)` bytes. Default 256 (~17 KiB).
+    pub max_left_blocks: i32,
+    /// Workgroup size for reduction kernels. Default 256.
+    pub reduce_wg: i32,
+}
+
+impl Default for SparseBsr4Config {
+    fn default() -> Self {
+        Self {
+            wg: 128,
+            max_left_blocks: 256,
+            reduce_wg: 256,
+        }
+    }
+}
+
+/// Compiled BSR4 sparse kernel set bound to an OpenCL device.
+pub struct SparseBsr4Gpu {
+    rt: GpuRuntime,
+    program: Program,
+    config: SparseBsr4Config,
+}
+
+impl SparseBsr4Gpu {
+    /// Initialize OpenCL and compile the BSR4 kernels with the given config.
+    pub fn new(config: SparseBsr4Config) -> Result<Self> {
+        if config.wg % 16 != 0 || config.wg <= 0 {
+            return Err(DftbError::InvalidInput(format!(
+                "wg must be a positive multiple of 16, got {}",
+                config.wg
+            )));
+        }
+        let mut rt = GpuRuntime::new()?;
+        let device = rt.device().clone();
+        let context = rt.context().clone();
+
+        let mut builder = ProgramBuilder::new();
+        builder.devices(device);
+        builder.src(BSR4_KERNEL_SOURCE);
+        builder.cmplr_def("WG", config.wg);
+        builder.cmplr_def("MAX_LEFT_BLOCKS", config.max_left_blocks);
+        builder.cmplr_def("REDUCE_WG", config.reduce_wg);
+        let program = builder.build(&context).map_err(map_ocl_err)?;
+
+        // Touch the program cache so the runtime is aware (no-op effectively,
+        // but keeps the runtime's cache consistent if later reused).
+        let _ = rt.build_program(BSR4_KERNEL_SOURCE);
+        let _ = &mut rt; // silence unused_mut if any
+        Ok(Self {
+            rt,
+            program,
+            config,
+        })
+    }
+
+    /// Borrow the underlying runtime (for buffer allocation helpers).
+    pub fn runtime(&self) -> &GpuRuntime {
+        &self.rt
+    }
+
+    pub fn config(&self) -> &SparseBsr4Config {
+        &self.config
+    }
+
+    // ------------------------------------------------------------------
+    // Buffer helpers
+    // ------------------------------------------------------------------
+
+    /// Allocate a `u32` GPU buffer from a host slice.
+    pub fn buf_u32(&self, data: &[u32]) -> Result<Buffer<u32>> {
+        Buffer::<u32>::builder()
+            .queue(self.rt.queue().clone())
+            .flags(flags::MEM_READ_WRITE | flags::MEM_COPY_HOST_PTR)
+            .len(data.len())
+            .copy_host_slice(data)
+            .build()
+            .map_err(map_ocl_err)
+    }
+
+    /// Allocate an `f32` GPU buffer from a host slice.
+    pub fn buf_f32(&self, data: &[f32]) -> Result<Buffer<f32>> {
+        Buffer::<f32>::builder()
+            .queue(self.rt.queue().clone())
+            .flags(flags::MEM_READ_WRITE | flags::MEM_COPY_HOST_PTR)
+            .len(data.len())
+            .copy_host_slice(data)
+            .build()
+            .map_err(map_ocl_err)
+    }
+
+    /// Allocate a zero-filled `f32` buffer.
+    pub fn zero_f32(&self, len: usize) -> Result<Buffer<f32>> {
+        Buffer::<f32>::builder()
+            .queue(self.rt.queue().clone())
+            .flags(flags::MEM_READ_WRITE)
+            .len(len)
+            .fill_val(0.0f32)
+            .build()
+            .map_err(map_ocl_err)
+    }
+
+    /// Read an `f32` buffer back to host (blocking).
+    pub fn read_f32(&self, buf: &Buffer<f32>, out: &mut [f32]) -> Result<()> {
+        self.rt.read_buffer(buf, out)
+    }
+
+    /// Read a `u32` buffer back to host (blocking).
+    pub fn read_u32(&self, buf: &Buffer<u32>, out: &mut [u32]) -> Result<()> {
+        self.rt.read_buffer(buf, out)
+    }
+
+    fn queue(&self) -> &ocl::Queue {
+        self.rt.queue()
+    }
+
+    // ------------------------------------------------------------------
+    // Low-level kernel launches
+    // ------------------------------------------------------------------
+
+    /// Generic masked block-sparse product `C = P_M(A·B)`.
+    /// `C` must already be allocated with the right size; it is overwritten.
+    pub fn spgemm_masked(
+        &self,
+        nrow: usize,
+        a: &Bsr4Matrix,
+        b: &Bsr4Matrix,
+        c_row: &Buffer<u32>,
+        c_col: &Buffer<u32>,
+        c: &Buffer<f32>,
+    ) -> Result<()> {
+        let a_row = self.buf_u32(&a.row_ptr)?;
+        let a_col = self.buf_u32(&a.col_idx)?;
+        let a_val = self.buf_f32(&a.values)?;
+        let b_row = self.buf_u32(&b.row_ptr)?;
+        let b_col = self.buf_u32(&b.col_idx)?;
+        let b_val = self.buf_f32(&b.values)?;
+        let kernel = Kernel::builder()
+            .program(&self.program)
+            .name("bsr4_spgemm_masked")
+            .queue(self.queue().clone())
+            .global_work_size(nrow * self.config.wg as usize)
+            .local_work_size(self.config.wg as usize)
+            .arg(nrow as u32)
+            .arg(&a_row)
+            .arg(&a_col)
+            .arg(&a_val)
+            .arg(&b_row)
+            .arg(&b_col)
+            .arg(&b_val)
+            .arg(c_row)
+            .arg(c_col)
+            .arg(c)
+            .build()
+            .map_err(map_ocl_err)?;
+        unsafe {
+            kernel.enq().map_err(map_ocl_err)?;
+        }
+        self.rt.finish()
+    }
+
+    /// Masked product with symmetric right operand `B` (two-pointer
+    /// intersection, no binary search). `C = P_M(A·B)` with `B = B^T`.
+    pub fn spgemm_masked_bsym(
+        &self,
+        nrow: usize,
+        a: &Bsr4Matrix,
+        b: &Bsr4Matrix,
+        c_row: &Buffer<u32>,
+        c_col: &Buffer<u32>,
+        c: &Buffer<f32>,
+    ) -> Result<()> {
+        let a_row = self.buf_u32(&a.row_ptr)?;
+        let a_col = self.buf_u32(&a.col_idx)?;
+        let a_val = self.buf_f32(&a.values)?;
+        let b_row = self.buf_u32(&b.row_ptr)?;
+        let b_col = self.buf_u32(&b.col_idx)?;
+        let b_val = self.buf_f32(&b.values)?;
+        let kernel = Kernel::builder()
+            .program(&self.program)
+            .name("bsr4_spgemm_masked_Bsym")
+            .queue(self.queue().clone())
+            .global_work_size(nrow * self.config.wg as usize)
+            .local_work_size(self.config.wg as usize)
+            .arg(nrow as u32)
+            .arg(&a_row)
+            .arg(&a_col)
+            .arg(&a_val)
+            .arg(&b_row)
+            .arg(&b_col)
+            .arg(&b_val)
+            .arg(c_row)
+            .arg(c_col)
+            .arg(c)
+            .build()
+            .map_err(map_ocl_err)?;
+        unsafe {
+            kernel.enq().map_err(map_ocl_err)?;
+        }
+        self.rt.finish()
+    }
+
+    /// `C = alpha*A + beta*B` (identical CSR structure for A, B, C).
+    pub fn axpby(
+        &self,
+        nblock: usize,
+        alpha: f32,
+        a: &Buffer<f32>,
+        beta: f32,
+        b: &Buffer<f32>,
+        c: &Buffer<f32>,
+    ) -> Result<()> {
+        let total = nblock * BS2;
+        let kernel = Kernel::builder()
+            .program(&self.program)
+            .name("bsr4_axpby")
+            .queue(self.queue().clone())
+            .global_work_size(total)
+            .arg(nblock as u32)
+            .arg(alpha)
+            .arg(a)
+            .arg(beta)
+            .arg(b)
+            .arg(c)
+            .build()
+            .map_err(map_ocl_err)?;
+        unsafe {
+            kernel.enq().map_err(map_ocl_err)?;
+        }
+        self.rt.finish()
+    }
+
+    /// Zero a value buffer.
+    pub fn zero(&self, nblock: usize, a: &Buffer<f32>) -> Result<()> {
+        let total = nblock * BS2;
+        let kernel = Kernel::builder()
+            .program(&self.program)
+            .name("bsr4_zero")
+            .queue(self.queue().clone())
+            .global_work_size(total)
+            .arg(nblock as u32)
+            .arg(a)
+            .build()
+            .map_err(map_ocl_err)?;
+        unsafe {
+            kernel.enq().map_err(map_ocl_err)?;
+        }
+        self.rt.finish()
+    }
+
+    /// Generalized McWeeny combination: `Knew = 3*Q - 2*V`.
+    pub fn mcweeny(
+        &self,
+        nblock: usize,
+        q: &Buffer<f32>,
+        v: &Buffer<f32>,
+        knew: &Buffer<f32>,
+    ) -> Result<()> {
+        let total = nblock * BS2;
+        let kernel = Kernel::builder()
+            .program(&self.program)
+            .name("bsr4_mcweeny")
+            .queue(self.queue().clone())
+            .global_work_size(total)
+            .arg(nblock as u32)
+            .arg(q)
+            .arg(v)
+            .arg(knew)
+            .build()
+            .map_err(map_ocl_err)?;
+        unsafe {
+            kernel.enq().map_err(map_ocl_err)?;
+        }
+        self.rt.finish()
+    }
+
+    /// Metric TC2 update. `trace_ks` is a single-float device buffer holding
+    /// `Tr(KS)`; the kernel reads it uniformly.
+    pub fn tc2(
+        &self,
+        nblock: usize,
+        k: &Buffer<f32>,
+        q: &Buffer<f32>,
+        trace_ks: &Buffer<f32>,
+        nocc: f32,
+        knew: &Buffer<f32>,
+    ) -> Result<()> {
+        let total = nblock * BS2;
+        let kernel = Kernel::builder()
+            .program(&self.program)
+            .name("bsr4_tc2")
+            .queue(self.queue().clone())
+            .global_work_size(total)
+            .arg(nblock as u32)
+            .arg(k)
+            .arg(q)
+            .arg(trace_ks)
+            .arg(nocc)
+            .arg(knew)
+            .build()
+            .map_err(map_ocl_err)?;
+        unsafe {
+            kernel.enq().map_err(map_ocl_err)?;
+        }
+        self.rt.finish()
+    }
+
+    /// Symmetrize a BSR4 matrix in place using a precomputed transpose map.
+    pub fn symmetrize(
+        &self,
+        nblock: usize,
+        transpose_block: &Buffer<u32>,
+        a: &Buffer<f32>,
+    ) -> Result<()> {
+        let kernel = Kernel::builder()
+            .program(&self.program)
+            .name("bsr4_symmetrize")
+            .queue(self.queue().clone())
+            .global_work_size(nblock)
+            .arg(nblock as u32)
+            .arg(transpose_block)
+            .arg(a)
+            .build()
+            .map_err(map_ocl_err)?;
+        unsafe {
+            kernel.enq().map_err(map_ocl_err)?;
+        }
+        self.rt.finish()
+    }
+
+    /// Mulliken charges from `KS`: `q_A = 2 * Tr((KS)_AA)`.
+    pub fn mulliken_ks(
+        &self,
+        nrow: usize,
+        diag_block: &Buffer<u32>,
+        ks: &Buffer<f32>,
+        q: &Buffer<f32>,
+    ) -> Result<()> {
+        let kernel = Kernel::builder()
+            .program(&self.program)
+            .name("bsr4_mulliken_KS")
+            .queue(self.queue().clone())
+            .global_work_size(nrow)
+            .arg(nrow as u32)
+            .arg(diag_block)
+            .arg(ks)
+            .arg(q)
+            .build()
+            .map_err(map_ocl_err)?;
+        unsafe {
+            kernel.enq().map_err(map_ocl_err)?;
+        }
+        self.rt.finish()
+    }
+
+    /// `Tr(KS) = sum_A Tr((KS)_AA)` — partial reduction. Recursively reduce
+    /// `partial` until a single float remains; returns that float on host.
+    pub fn trace_ks(
+        &self,
+        nrow: usize,
+        diag_block: &Buffer<u32>,
+        ks: &Buffer<f32>,
+    ) -> Result<f32> {
+        let reduce_wg = self.config.reduce_wg as usize;
+        // Stage 1: per-atom diagonal trace + first reduction.
+        let n_groups = div_ceil(nrow, reduce_wg);
+        let partial = self.zero_f32(n_groups)?;
+        let kernel = Kernel::builder()
+            .program(&self.program)
+            .name("bsr4_trace_KS_partial")
+            .queue(self.queue().clone())
+            .global_work_size(n_groups * reduce_wg)
+            .local_work_size(reduce_wg)
+            .arg(nrow as u32)
+            .arg(diag_block)
+            .arg(ks)
+            .arg(&partial)
+            .build()
+            .map_err(map_ocl_err)?;
+        unsafe {
+            kernel.enq().map_err(map_ocl_err)?;
+        }
+        self.rt.finish()?;
+        self.reduce_to_one(n_groups, &partial)
+    }
+
+    /// `||KSK - K||_F^2` — partial reduction over all block scalars.
+    pub fn idempotency_err(
+        &self,
+        nblock: usize,
+        q_ksk: &Buffer<f32>,
+        k: &Buffer<f32>,
+    ) -> Result<f32> {
+        let reduce_wg = self.config.reduce_wg as usize;
+        let n = nblock * BS2;
+        let n_groups = div_ceil(n, reduce_wg);
+        let partial = self.zero_f32(n_groups)?;
+        let kernel = Kernel::builder()
+            .program(&self.program)
+            .name("bsr4_idempotency_partial")
+            .queue(self.queue().clone())
+            .global_work_size(n_groups * reduce_wg)
+            .local_work_size(reduce_wg)
+            .arg(nblock as u32)
+            .arg(q_ksk)
+            .arg(k)
+            .arg(&partial)
+            .build()
+            .map_err(map_ocl_err)?;
+        unsafe {
+            kernel.enq().map_err(map_ocl_err)?;
+        }
+        self.rt.finish()?;
+        let s2 = self.reduce_to_one(n_groups, &partial)?;
+        Ok(s2.sqrt())
+    }
+
+    /// Recursive `reduce_sum_f32` until one float remains.
+    fn reduce_to_one(&self, mut n: usize, input: &Buffer<f32>) -> Result<f32> {
+        let reduce_wg = self.config.reduce_wg as usize;
+        let mut current = input.clone();
+        while n > 1 {
+            let n_groups = div_ceil(n, reduce_wg);
+            let out = self.zero_f32(n_groups)?;
+            let kernel = Kernel::builder()
+                .program(&self.program)
+                .name("reduce_sum_f32")
+                .queue(self.queue().clone())
+                .global_work_size(n_groups * reduce_wg)
+                .local_work_size(reduce_wg)
+                .arg(n as u32)
+                .arg(&current)
+                .arg(&out)
+                .build()
+                .map_err(map_ocl_err)?;
+            unsafe {
+                kernel.enq().map_err(map_ocl_err)?;
+            }
+            self.rt.finish()?;
+            current = out;
+            n = n_groups;
+        }
+        let mut host = [0.0f32; 1];
+        self.read_f32(&current, &mut host)?;
+        Ok(host[0])
+    }
+
+    // ------------------------------------------------------------------
+    // High-level Bsr4Matrix convenience methods
+    // ------------------------------------------------------------------
+
+    /// Run generic masked SpGEMM and return the result as a `Bsr4Matrix`
+    /// with the given output mask `(c_row, c_col)`.
+    pub fn matmul_masked(
+        &self,
+        a: &Bsr4Matrix,
+        b: &Bsr4Matrix,
+        c_mask: &(Vec<u32>, Vec<u32>),
+    ) -> Result<Bsr4Matrix> {
+        let nrow = a.n_atom;
+        let nblock = c_mask.1.len();
+        let c_row = self.buf_u32(&c_mask.0)?;
+        let c_col = self.buf_u32(&c_mask.1)?;
+        let c = self.zero_f32(nblock * BS2)?;
+        self.spgemm_masked(nrow, a, b, &c_row, &c_col, &c)?;
+        let mut values = vec![0.0f32; nblock * BS2];
+        self.read_f32(&c, &mut values)?;
+        Bsr4Matrix::from_parts(nrow, c_mask.0.clone(), c_mask.1.clone(), values)
+    }
+
+    /// Run symmetric-right masked SpGEMM and return the result as a
+    /// `Bsr4Matrix`. `b` must be symmetric.
+    pub fn matmul_masked_bsym(
+        &self,
+        a: &Bsr4Matrix,
+        b: &Bsr4Matrix,
+        c_mask: &(Vec<u32>, Vec<u32>),
+    ) -> Result<Bsr4Matrix> {
+        let nrow = a.n_atom;
+        let nblock = c_mask.1.len();
+        let c_row = self.buf_u32(&c_mask.0)?;
+        let c_col = self.buf_u32(&c_mask.1)?;
+        let c = self.zero_f32(nblock * BS2)?;
+        self.spgemm_masked_bsym(nrow, a, b, &c_row, &c_col, &c)?;
+        let mut values = vec![0.0f32; nblock * BS2];
+        self.read_f32(&c, &mut values)?;
+        Bsr4Matrix::from_parts(nrow, c_mask.0.clone(), c_mask.1.clone(), values)
+    }
+
+    /// Compute `Q = K·S·K` via two masked products:
+    ///   `T = P_MT(K·S)`  (on the T mask)
+    ///   `Q = P_MK(T·K)`  (on the K mask)
+    /// Returns `(T, Q)`. Both `S` and `K` are symmetric, so both products use
+    /// the symmetric-right kernel.
+    pub fn ksk(
+        &self,
+        k: &Bsr4Matrix,
+        s: &Bsr4Matrix,
+        k_mask: &(Vec<u32>, Vec<u32>),
+        t_mask: &(Vec<u32>, Vec<u32>),
+    ) -> Result<(Bsr4Matrix, Bsr4Matrix)> {
+        let t = self.matmul_masked_bsym(k, s, t_mask)?;
+        let q = self.matmul_masked_bsym(&t, k, k_mask)?;
+        Ok((t, q))
+    }
+
+    /// One generalized McWeeny purification step:
+    ///   `Q = K·S·K`, `V = Q·S·K`, `K' = 3Q − 2V`.
+    /// `V = K·S·K·S·K` is computed as `(Q·S)·K` using the T mask for the
+    /// intermediate `Q·S` and the K mask for the final product.
+    pub fn mcweeny_step(
+        &self,
+        k: &Bsr4Matrix,
+        s: &Bsr4Matrix,
+        k_mask: &(Vec<u32>, Vec<u32>),
+        t_mask: &(Vec<u32>, Vec<u32>),
+    ) -> Result<Bsr4Matrix> {
+        let (_t_ks, q) = self.ksk(k, s, k_mask, t_mask)?;
+        let us = self.matmul_masked_bsym(&q, s, t_mask)?; // U = Q·S
+        let v = self.matmul_masked_bsym(&us, k, k_mask)?; // V = U·K = KSKSK
+        let nblock = k.nblock();
+        let q_buf = self.buf_f32(&q.values)?;
+        let v_buf = self.buf_f32(&v.values)?;
+        let knew_buf = self.zero_f32(nblock * BS2)?;
+        self.mcweeny(nblock, &q_buf, &v_buf, &knew_buf)?;
+        let mut values = vec![0.0f32; nblock * BS2];
+        self.read_f32(&knew_buf, &mut values)?;
+        Bsr4Matrix::from_parts(k.n_atom, k.row_ptr.clone(), k.col_idx.clone(), values)
+    }
+
+    /// One metric TC2 purification step:
+    ///   `Q = K·S·K`, `n = Tr(KS)`, then `K' = Q` if `n > Nocc` else `2K − Q`.
+    /// Returns `(K', n)` where `n` is the current `Tr(KS)`.
+    pub fn tc2_step(
+        &self,
+        k: &Bsr4Matrix,
+        s: &Bsr4Matrix,
+        nocc: f32,
+        k_mask: &(Vec<u32>, Vec<u32>),
+        t_mask: &(Vec<u32>, Vec<u32>),
+        diag_block: &Buffer<u32>,
+    ) -> Result<(Bsr4Matrix, f32)> {
+        // T = K·S (on T mask); trace uses T's diagonal blocks.
+        let t = self.matmul_masked_bsym(k, s, t_mask)?;
+        // Tr(KS) = sum_A Tr(T_AA). diag_block indexes into T's structure.
+        let n = self.trace_ks(k.n_atom, diag_block, &self.buf_f32(&t.values)?)?;
+        // Q = T·K (on K mask).
+        let q = self.matmul_masked_bsym(&t, k, k_mask)?;
+        let nblock = k.nblock();
+        let k_buf = self.buf_f32(&k.values)?;
+        let q_buf = self.buf_f32(&q.values)?;
+        // trace_ks for the TC2 decision: store n in a 1-float device buffer.
+        let trace_buf = self.buf_f32(&[n])?;
+        let knew_buf = self.zero_f32(nblock * BS2)?;
+        self.tc2(nblock, &k_buf, &q_buf, &trace_buf, nocc, &knew_buf)?;
+        let mut values = vec![0.0f32; nblock * BS2];
+        self.read_f32(&knew_buf, &mut values)?;
+        Bsr4Matrix::from_parts(k.n_atom, k.row_ptr.clone(), k.col_idx.clone(), values).map(|m| (m, n))
+    }
+
+    /// Symmetrize a `Bsr4Matrix` on the GPU and return the result.
+    pub fn symmetrize_mat(&self, m: &Bsr4Matrix) -> Result<Bsr4Matrix> {
+        let transpose = crate::methods::sparse::bsr4::transpose_block_map(m);
+        let tbuf = self.buf_u32(&transpose)?;
+        let vals = self.buf_f32(&m.values)?;
+        self.symmetrize(m.nblock(), &tbuf, &vals)?;
+        let mut out = vec![0.0f32; m.values.len()];
+        self.read_f32(&vals, &mut out)?;
+        Bsr4Matrix::from_parts(m.n_atom, m.row_ptr.clone(), m.col_idx.clone(), out)
+    }
+
+    /// Mulliken charges `q_A = 2·Tr((KS)_AA)` from a `KS` matrix.
+    pub fn mulliken(&self, ks: &Bsr4Matrix) -> Result<Vec<f32>> {
+        let diag = crate::methods::sparse::bsr4::diag_block_map(ks)?;
+        let diag_buf = self.buf_u32(&diag)?;
+        let ks_buf = self.buf_f32(&ks.values)?;
+        let qbuf = self.zero_f32(ks.n_atom)?;
+        self.mulliken_ks(ks.n_atom, &diag_buf, &ks_buf, &qbuf)?;
+        let mut q = vec![0.0f32; ks.n_atom];
+        self.read_f32(&qbuf, &mut q)?;
+        Ok(q)
+    }
+
+    // ==================================================================
+    // P0 high-level solver pieces (per SparseLargeSystemOpenCL.chat.md)
+    // ==================================================================
+
+    /// Frobenius norm of a Bsr4Matrix via GPU reduction.
+    /// Uses `bsr4_idempotency_partial` with a zero K buffer (so it computes
+    /// sum Q[i]^2 = ||Q||_F^2), then takes sqrt on host.
+    pub fn frobenius_norm(&self, m: &Bsr4Matrix) -> Result<f32> {
+        let nblock = m.nblock();
+        let q_buf = self.buf_f32(&m.values)?;
+        let zero = self.zero_f32(m.values.len())?;
+        let norm_sq = self.idempotency_err(nblock, &q_buf, &zero)?;
+        Ok(norm_sq)
+    }
+
+    /// Newton-Schulz / Hotelling iteration for sparse approximate inverse:
+    ///
+    ///   Z_{n+1} = 2 Z_n - Z_n S Z_n
+    ///
+    /// with Z₀ = α·I, α = 1/||S||_∞.
+    ///
+    /// Uses M_K for Z storage and M_T = M_K ∘ M_HS for the intermediate
+    /// T = Z·S.  Monitors R_Z = ||I - ZS||_F / sqrt(N_orb).
+    ///
+    /// Stops when R_Z < tol or when improvement stalls (R_Z^{n+1} > 0.9 R_Z^n
+    /// for `stall` consecutive iterations).
+    ///
+    /// Returns (Z, final_R_Z, iterations).
+    pub fn newton_schulz_inverse(
+        &self,
+        s: &Bsr4Matrix,
+        k_mask: &(Vec<u32>, Vec<u32>),
+        t_mask: &(Vec<u32>, Vec<u32>),
+        max_iter: usize,
+        tol: f32,
+        stall: usize,
+    ) -> Result<(Bsr4Matrix, f32, usize)> {
+        let n_atom = s.n_atom;
+        let n_orb = (n_atom * BS) as f32;
+
+        // Z₀ = α·I on M_K, α = 1/||S||_∞.
+        let s_inf = crate::methods::sparse::bsr4::inf_norm(s);
+        let alpha = 1.0 / s_inf.max(1e-30);
+        let mut z = crate::methods::sparse::bsr4::build_identity(n_atom, k_mask)?;
+        for v in z.values.iter_mut() {
+            *v *= alpha;
+        }
+
+        let mut prev_rz = f32::INFINITY;
+        let mut stall_count = 0;
+        let mut iter_done = 0;
+
+        for iter in 0..max_iter {
+            iter_done = iter + 1;
+            // T = Z·S  (on M_T, S symmetric → Bsym)
+            let t = self.matmul_masked_bsym(&z, s, t_mask)?;
+
+            // R_Z = ||I - T||_F / sqrt(N_orb)
+            //    = sqrt( ||T||_F^2 - 2*Tr(T) + N_orb ) / sqrt(N_orb)
+            let t_norm = self.frobenius_norm(&t)?;
+            let diag_t = crate::methods::sparse::bsr4::diag_block_map(&t)?;
+            let diag_buf = self.buf_u32(&diag_t)?;
+            let t_buf = self.buf_f32(&t.values)?;
+            let tr_t = self.trace_ks(n_atom, &diag_buf, &t_buf)?;
+            let rz_sq = t_norm * t_norm - 2.0 * tr_t + n_orb;
+            let rz = (rz_sq.max(0.0)).sqrt() / n_orb.sqrt();
+
+            println!(
+                "  Newton-Schulz iter {iter}: R_Z = {rz:e}  (||T||_F={t_norm:.4}, Tr={tr_t:.4})"
+            );
+
+            if rz < tol {
+                return Ok((z, rz, iter_done));
+            }
+            if iter > 0 && rz > 0.9 * prev_rz {
+                stall_count += 1;
+                if stall_count >= stall {
+                    println!("  Newton-Schulz stalled after {iter_done} iters, R_Z = {rz:e}");
+                    return Ok((z, rz, iter_done));
+                }
+            } else {
+                stall_count = 0;
+            }
+            prev_rz = rz;
+
+            // Q = T·Z  (on M_K, Z symmetric → Bsym)
+            let q = self.matmul_masked_bsym(&t, &z, k_mask)?;
+
+            // Z_new = 2*Z - Q  (axpby: alpha=2, beta=-1)
+            let nblock = z.nblock();
+            let z_buf = self.buf_f32(&z.values)?;
+            let q_buf = self.buf_f32(&q.values)?;
+            let znew_buf = self.zero_f32(nblock * BS2)?;
+            self.axpby(nblock, 2.0, &z_buf, -1.0, &q_buf, &znew_buf)?;
+            let mut znew_vals = vec![0.0f32; nblock * BS2];
+            self.read_f32(&znew_buf, &mut znew_vals)?;
+            z = Bsr4Matrix::from_parts(n_atom, k_mask.0.clone(), k_mask.1.clone(), znew_vals)?;
+            z = self.symmetrize_mat(&z)?;
+        }
+
+        // Final residual.
+        let t = self.matmul_masked_bsym(&z, s, t_mask)?;
+        let t_norm = self.frobenius_norm(&t)?;
+        let diag_t = crate::methods::sparse::bsr4::diag_block_map(&t)?;
+        let diag_buf = self.buf_u32(&diag_t)?;
+        let t_buf = self.buf_f32(&t.values)?;
+        let tr_t = self.trace_ks(n_atom, &diag_buf, &t_buf)?;
+        let rz = ((t_norm * t_norm - 2.0 * tr_t + n_orb).max(0.0)).sqrt() / n_orb.sqrt();
+        Ok((z, rz, iter_done))
+    }
+
+    /// Build the Hamiltonian-derived initial density kernel:
+    ///
+    ///   K₀ = (εmax·Z - Z·H·Z) / (εmax - εmin)
+    ///
+    /// where Z ≈ S⁻¹.  Uses:
+    ///   B = Z·H   (on M_T, generic SpGEMM — Z symmetric, H symmetric, but
+    ///              Z·H is NOT symmetric)
+    ///   A = B·Z   (on M_K, Bsym — Z is symmetric right operand)
+    ///   K₀ = (emax·Z - A) / Δε   (elementwise axpby)
+    ///
+    /// Returns K₀ on M_K.
+    pub fn build_k0(
+        &self,
+        h: &Bsr4Matrix,
+        s: &Bsr4Matrix,
+        z: &Bsr4Matrix,
+        k_mask: &(Vec<u32>, Vec<u32>),
+        t_mask: &(Vec<u32>, Vec<u32>),
+        emin: f32,
+        emax: f32,
+    ) -> Result<Bsr4Matrix> {
+        let delta = (emax - emin).max(1e-12);
+        let alpha_k = emax / delta;
+        let beta_k = -1.0 / delta;
+
+        // B = Z·H  (on M_T, generic — Z·H not symmetric)
+        let b = self.matmul_masked(z, h, t_mask)?;
+
+        // A = B·Z  (on M_K, Bsym — Z symmetric)
+        let a = self.matmul_masked_bsym(&b, z, k_mask)?;
+
+        // K₀ = alpha_k * Z - beta_k_abs * A  (axpby with beta = beta_k)
+        let nblock = z.nblock();
+        let z_buf = self.buf_f32(&z.values)?;
+        let a_buf = self.buf_f32(&a.values)?;
+        let k0_buf = self.zero_f32(nblock * BS2)?;
+        self.axpby(nblock, alpha_k, &z_buf, beta_k, &a_buf, &k0_buf)?;
+        let mut k0_vals = vec![0.0f32; nblock * BS2];
+        self.read_f32(&k0_buf, &mut k0_vals)?;
+        let mut k0 =
+            Bsr4Matrix::from_parts(z.n_atom, k_mask.0.clone(), k_mask.1.clone(), k0_vals)?;
+        k0 = self.symmetrize_mat(&k0)?;
+        Ok(k0)
+    }
+
+    /// Compute spectral bounds (emin, emax) of B = Z·H via Gershgorin at the
+    /// orbital level, with `padding` fractional widening.
+    ///
+    /// Returns bounds suitable for K₀ construction. Conservative is safe;
+    /// too-tight bounds can push K₀S eigenvalues outside [0,1].
+    pub fn spectral_bounds(
+        &self,
+        h: &Bsr4Matrix,
+        z: &Bsr4Matrix,
+        t_mask: &(Vec<u32>, Vec<u32>),
+        padding: f32,
+    ) -> Result<(f32, f32)> {
+        let b = self.matmul_masked(z, h, t_mask)?;
+        let (mut emin, mut emax) = crate::methods::sparse::bsr4::gershgorin_bounds(&b)?;
+        let span = (emax - emin).abs() * padding;
+        emin -= span;
+        emax += span;
+        Ok((emin, emax))
+    }
+
+    /// Hamiltonian commutator residual:
+    ///
+    ///   R_H = ||H·K·S - S·K·H||_F
+    ///
+    /// For the exact ground-state projector, HKS = SKH, so R_H → 0.
+    /// This catches the case where K is idempotent but projects onto the
+    /// wrong subspace.
+    ///
+    /// Uses full-mask-compatible logic: all products on the same mask.
+    /// For multi-mask, all products use `mask` (which must be large enough
+    /// to contain the support of all intermediates — use full mask for now).
+    pub fn hamiltonian_residual(
+        &self,
+        h: &Bsr4Matrix,
+        k: &Bsr4Matrix,
+        s: &Bsr4Matrix,
+        mask: &(Vec<u32>, Vec<u32>),
+    ) -> Result<f32> {
+        // KS = K·S  (Bsym, S symmetric)
+        let ks = self.matmul_masked_bsym(k, s, mask)?;
+        // HKS = H·KS  (generic — KS not symmetric)
+        let hks = self.matmul_masked(h, &ks, mask)?;
+
+        // SK = S·K  (Bsym, K symmetric)
+        let sk = self.matmul_masked_bsym(s, k, mask)?;
+        // SKH = SK·H  (Bsym, H symmetric)
+        let skh = self.matmul_masked_bsym(&sk, h, mask)?;
+
+        // R_H = ||HKS - SKH||_F
+        // Use axpby to compute diff = HKS - SKH, then frobenius_norm.
+        let nblock = hks.nblock();
+        let hks_buf = self.buf_f32(&hks.values)?;
+        let skh_buf = self.buf_f32(&skh.values)?;
+        let diff_buf = self.zero_f32(nblock * BS2)?;
+        self.axpby(nblock, 1.0, &hks_buf, -1.0, &skh_buf, &diff_buf)?;
+        let mut diff_vals = vec![0.0f32; nblock * BS2];
+        self.read_f32(&diff_buf, &mut diff_vals)?;
+        let diff = Bsr4Matrix::from_parts(
+            hks.n_atom,
+            hks.row_ptr.clone(),
+            hks.col_idx.clone(),
+            diff_vals,
+        )?;
+        self.frobenius_norm(&diff)
+    }
+
+    /// Full TC2 purification loop from a starting K₀:
+    ///
+    ///   repeat:
+    ///     KS = K·S, Q = KS·K, n = Tr(KS)
+    ///     K = Q if n > Nocc else 2K-Q
+    ///     symmetrize, monitor
+    ///
+    /// Stops when ||KSK-K||_F < tol or max_iter reached.
+    /// Returns (K_final, final_R_I, final_Tr, iterations).
+    pub fn tc2_purify(
+        &self,
+        k0: &Bsr4Matrix,
+        s: &Bsr4Matrix,
+        nocc: f32,
+        k_mask: &(Vec<u32>, Vec<u32>),
+        t_mask: &(Vec<u32>, Vec<u32>),
+        max_iter: usize,
+        tol: f32,
+    ) -> Result<(Bsr4Matrix, f32, f32, usize, Vec<(usize, f32, f32)>)> {
+        let diag_dummy =
+            crate::methods::sparse::bsr4::Bsr4Matrix::from_structure(
+                k0.n_atom,
+                t_mask.0.clone(),
+                t_mask.1.clone(),
+            )?;
+        let diag = crate::methods::sparse::bsr4::diag_block_map(&diag_dummy)?;
+        let diag_buf = self.buf_u32(&diag)?;
+
+        let mut k = k0.clone();
+        let mut r_i = f32::INFINITY;
+        let mut tr = 0.0f32;
+        let mut history: Vec<(usize, f32, f32)> = Vec::new();
+
+        // Track best iteration to guard against TC2 divergence.
+        // TC2 can converge to a minimum R_I then diverge (especially in f32
+        // when the tolerance is below the achievable precision).
+        let mut best_k = k.clone();
+        let mut best_r_i = f32::INFINITY;
+        let mut best_tr = 0.0f32;
+        let mut best_iter = 0usize;
+
+        for iter in 0..max_iter {
+            // Q = K·S·K  (on K mask)
+            let (_t, q) = self.ksk(&k, s, k_mask, t_mask)?;
+            // R_I = ||KSK - K||_F
+            let q_buf = self.buf_f32(&q.values)?;
+            let k_buf = self.buf_f32(&k.values)?;
+            r_i = self.idempotency_err(k.nblock(), &q_buf, &k_buf)?;
+
+            // Tr(KS) via T = K·S
+            let t = self.matmul_masked_bsym(&k, s, t_mask)?;
+            let t_buf = self.buf_f32(&t.values)?;
+            tr = self.trace_ks(k.n_atom, &diag_buf, &t_buf)?;
+
+            println!(
+                "  TC2 iter {iter}: R_I={r_i:e}  Tr(KS)={tr:.6}  (Nocc={nocc})"
+            );
+            history.push((iter, r_i, tr));
+
+            // Track best (minimum R_I) iteration
+            if r_i < best_r_i {
+                best_r_i = r_i;
+                best_k = k.clone();
+                best_tr = tr;
+                best_iter = iter;
+            }
+
+            if r_i < tol {
+                return Ok((k, r_i, tr, iter + 1, history));
+            }
+
+            // Divergence detection: if R_I has grown by >10x from the best,
+            // TC2 is diverging. Return the best K found.
+            if r_i > best_r_i * 10.0 && best_r_i < f32::INFINITY {
+                println!(
+                    "  TC2 diverging at iter {iter}: R_I={r_i:e} > 10×best={best_r_i:e}, returning best (iter {best_iter})"
+                );
+                return Ok((best_k, best_r_i, best_tr, best_iter + 1, history));
+            }
+
+            let (knew, _) = self.tc2_step(&k, s, nocc, k_mask, t_mask, &diag_buf)?;
+            k = self.symmetrize_mat(&knew)?;
+        }
+
+        // If we exhausted iterations, return the best K found
+        if best_r_i < r_i {
+            println!(
+                "  TC2 exhausted {max_iter} iters, returning best (iter {best_iter}, R_I={best_r_i:e})"
+            );
+            Ok((best_k, best_r_i, best_tr, best_iter + 1, history))
+        } else {
+            Ok((k, r_i, tr, max_iter, history))
+        }
+    }
+}
+
+/// Compare a GPU-produced `Bsr4Matrix` against a dense reference (already
+/// expanded) and return the max absolute elementwise difference.
+pub fn compare_to_dense(gpu: &Bsr4Matrix, dense_ref: &[f32]) -> f32 {
+    let dense_gpu = gpu.to_dense();
+    dense_max_abs_diff(&dense_gpu, dense_ref)
+}
+
+fn div_ceil(a: usize, b: usize) -> usize {
+    (a + b - 1) / b
+}
+
+// Re-export BS/BS2 for convenience.
+pub use crate::methods::sparse::bsr4::{BS as PUB_BS, BS2 as PUB_BS2};

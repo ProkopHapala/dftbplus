@@ -73,13 +73,64 @@ fn cubic_spline_eval(y: &[f64], d2: &[f64], h: f64, r: f64) -> f64 {
 
 // --- B-spline resampling ---
 
+/// Solve the tridiagonal system that converts function values to cubic B-spline
+/// control points. For uniform cubic B-splines:
+///   f_i = (c_{i-1} + 4*c_i + c_{i+1}) / 6
+/// with boundary conditions c_0 = f_0, c_{n-1} = f_{n-1} (endpoint interpolation).
+///
+/// This is essential because the GPU's 4-point B-spline stencil treats stored
+/// values as control points, not function values. Without this conversion, the
+/// GPU produces a smoothed (approximate) version of the data, causing ~1e-3
+/// parity error even with dense grids.
+fn function_to_bspline_control_points(f: &[f64]) -> Vec<f64> {
+    let n = f.len();
+    if n <= 2 {
+        return f.to_vec();
+    }
+
+    // Interior system: c_{i-1} + 4*c_i + c_{i+1} = 6*f_i, for i=1..n-2
+    // Boundary: c_0 = f_0, c_{n-1} = f_{n-1}
+    let m = n - 2;
+    let mut diag = vec![4.0f64; m];
+    let mut upper = vec![1.0f64; m.saturating_sub(1)];
+    let mut lower = vec![1.0f64; m.saturating_sub(1)];
+    let mut rhs = vec![0.0f64; m];
+
+    for i in 0..m {
+        rhs[i] = 6.0 * f[i + 1];
+    }
+    // Adjust for known boundary values
+    rhs[0] -= f[0];
+    rhs[m - 1] -= f[n - 1];
+
+    // Thomas algorithm
+    for i in 1..m {
+        let w = lower[i - 1] / diag[i - 1];
+        diag[i] -= w * upper[i - 1];
+        rhs[i] -= w * rhs[i - 1];
+    }
+
+    let mut c_inner = vec![0.0f64; m];
+    c_inner[m - 1] = rhs[m - 1] / diag[m - 1];
+    for i in (0..m - 1).rev() {
+        c_inner[i] = (rhs[i] - upper[i] * c_inner[i + 1]) / diag[i];
+    }
+
+    let mut c = vec![0.0f64; n];
+    c[0] = f[0];
+    c[n - 1] = f[n - 1];
+    c[1..n - 1].copy_from_slice(&c_inner);
+    c
+}
+
 /// Resample a function from a uniform grid to a target number of points.
 ///
 /// Uses natural cubic spline for accurate interpolation of the original data,
-/// then evaluates at N_target equally-spaced points. The resulting values
-/// are used directly as B-spline control points on the GPU (4-point stencil).
+/// evaluates at N_target equally-spaced points, then converts the function
+/// values to B-spline control points so the GPU 4-point stencil reproduces
+/// the original function exactly (to f32 precision).
 ///
-/// Returns (resampled_values, new_dr).
+/// Returns (bspline_control_points, new_dr).
 pub fn resample_bspline(
     y_orig: &[f64],
     dr_orig: f64,
@@ -105,7 +156,11 @@ pub fn resample_bspline(
         y_new[i] = cubic_spline_eval(y_orig, &d2_orig, dr_orig, r);
     }
 
-    let y_f32: Vec<f32> = y_new.iter().map(|&v| v as f32).collect();
+    // Convert function values to B-spline control points so the GPU 4-point
+    // stencil reproduces the original function exactly (to f32 precision).
+    let ctrl = function_to_bspline_control_points(&y_new);
+
+    let y_f32: Vec<f32> = ctrl.iter().map(|&v| v as f32).collect();
     (y_f32, dr_new as f32)
 }
 

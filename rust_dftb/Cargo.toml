@@ -12,6 +12,9 @@ thiserror = "1.0"
 log = "0.4"
 env_logger = "0.11"
 ocl = "0.19"
+rhai = { version = "1.26", features = ["sync"] }
+lapack = "0.20"
+openblas-src = { version = "0.10", features = ["system"] }
 
 # --- Build profiles: shrink disk footprint without losing backtrace quality ---
 # See: blood_of_civilization/doc/AGENTS/notes/Memory_Issues/reduce_target_footprint_plan.md

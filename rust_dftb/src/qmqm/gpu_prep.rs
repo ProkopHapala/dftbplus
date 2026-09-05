@@ -14,8 +14,9 @@ const ANG2BOHR: f64 = 1.889726133;
 
 /// Maximum SK grid size that can be loaded into GPU __local memory.
 /// Must match SK_GRID_MAX in dftb_hamiltonian.cl.
-/// With resampling to 64 points, actual usage is 64*4*8B = 2KB per table.
-pub const SK_GRID_MAX: usize = 256;
+/// 512 accommodates original mio-1-1 grids (499 points) without resampling.
+/// With 499 points * 4 cols * 4B = ~8KB per table (H or S), ~16KB total.
+pub const SK_GRID_MAX: usize = 512;
 
 // ------------------------------------------------------------------
 // GPU-compatible structs (match OpenCL layout)
@@ -223,8 +224,9 @@ fn build_global_species(
 }
 
 /// Target number of grid points after resampling SK tables.
-/// 32-64 is sufficient for cubic spline representation of typical SK tables.
-const SK_RESAMPLE_N: usize = 64;
+/// 256 gives H/S parity ~1e-4 in f32 (64 gave ~1e-2, insufficient for SCC).
+/// Must be ≤ SK_GRID_MAX (256).
+const SK_RESAMPLE_N: usize = 256;
 
 fn pack_sk_tables(
     sk_data: &SkData,
@@ -298,24 +300,53 @@ fn pack_sk_tables(
                 }
             }
 
-            // Resample each channel to SK_RESAMPLE_N points using cubic B-spline
-            let n_grid = SK_RESAMPLE_N;
-            let mut sk_h = vec![0.0f32; n_grid * n_sk_cols];
-            let mut sk_s = vec![0.0f32; n_grid * n_sk_cols];
-            let mut dr_new = 0.0f32;
-
-            for col in 0..n_sk_cols {
-                let (h_vals, dr) =
-                    spline_resample::resample_sk_column(&h_cols[col], dr_orig, n_grid);
-                let (s_vals, _) =
-                    spline_resample::resample_sk_column(&s_cols[col], dr_orig, n_grid);
-                dr_new = dr;
-
-                for k in 0..n_grid {
-                    sk_h[k * n_sk_cols + col] = h_vals[k];
-                    sk_s[k * n_sk_cols + col] = s_vals[k];
+            // Use original grid directly if it fits in SK_GRID_MAX, with B-spline
+            // control point conversion. Otherwise resample to SK_RESAMPLE_N points.
+            //
+            // IMPORTANT: CPU SK tables use 1-based grid (tab.values[k] is at r=(k+1)*dr).
+            // The GPU interpolation assumes 0-based (tab[k] at r=k*dr). To fix this
+            // off-by-one, we prepend a dummy zero at r=0, so GPU tab[k] = CPU tab.values[k-1].
+            // This requires n_grid_orig+1 points (500 for mio-1-1, within SK_GRID_MAX=512).
+            let (n_grid, dr_new, sk_h, sk_s) = if n_grid_orig + 1 <= SK_GRID_MAX {
+                // Use original grid directly with prepended zero at r=0
+                let n_gpu = n_grid_orig + 1;
+                let dr = dr_orig as f32;
+                let mut sk_h = vec![0.0f32; n_gpu * n_sk_cols];
+                let mut sk_s = vec![0.0f32; n_gpu * n_sk_cols];
+                for col in 0..n_sk_cols {
+                    let (h_ctrl, _) = spline_resample::resample_bspline(&h_cols[col], dr_orig, n_grid_orig);
+                    let (s_ctrl, _) = spline_resample::resample_bspline(&s_cols[col], dr_orig, n_grid_orig);
+                    // sk_h[0] = 0.0 (dummy at r=0), sk_h[k] = control_point[k-1] for k>=1
+                    sk_h[col] = 0.0; // r=0 dummy
+                    sk_s[col] = 0.0;
+                    for k in 0..n_grid_orig {
+                        sk_h[(k + 1) * n_sk_cols + col] = h_ctrl[k];
+                        sk_s[(k + 1) * n_sk_cols + col] = s_ctrl[k];
+                    }
                 }
-            }
+                (n_gpu, dr, sk_h, sk_s)
+            } else {
+                // Resample to SK_RESAMPLE_N points (with prepended zero)
+                let n_resampled = SK_RESAMPLE_N - 1; // -1 to leave room for prepended zero
+                let n_gpu = n_resampled + 1;
+                let mut sk_h = vec![0.0f32; n_gpu * n_sk_cols];
+                let mut sk_s = vec![0.0f32; n_gpu * n_sk_cols];
+                let mut dr_new = 0.0f32;
+                for col in 0..n_sk_cols {
+                    let (h_vals, dr) =
+                        spline_resample::resample_sk_column(&h_cols[col], dr_orig, n_resampled);
+                    let (s_vals, _) =
+                        spline_resample::resample_sk_column(&s_cols[col], dr_orig, n_resampled);
+                    dr_new = dr;
+                    sk_h[col] = 0.0; // r=0 dummy
+                    sk_s[col] = 0.0;
+                    for k in 0..n_resampled {
+                        sk_h[(k + 1) * n_sk_cols + col] = h_vals[k];
+                        sk_s[(k + 1) * n_sk_cols + col] = s_vals[k];
+                    }
+                }
+                (n_gpu, dr_new, sk_h, sk_s)
+            };
 
             tables.push(GpuSkTable {
                 sk_h,

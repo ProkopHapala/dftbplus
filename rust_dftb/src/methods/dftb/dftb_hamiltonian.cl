@@ -17,7 +17,7 @@
 // Constants
 // ------------------------------------------------------------------
 #ifndef SK_GRID_MAX
-#define SK_GRID_MAX 256
+#define SK_GRID_MAX 512
 #endif
 
 #ifndef N_SK_COLS

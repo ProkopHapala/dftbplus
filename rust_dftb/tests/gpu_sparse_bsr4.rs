@@ -1,0 +1,840 @@
+//! GPU tests for the BSR4 sparse purification kernels
+//! (`methods::sparse`), independent of the `qmqm` dense/fragment solver.
+//!
+//! These tests validate the OpenCL kernels in `sparse_bsr4_purification.cl`
+//! against dense CPU references (nalgebra):
+//!
+//!   1. `bsr4_spgemm_masked`        — generic masked SpGEMM vs dense matmul
+//!   2. `bsr4_spgemm_masked_Bsym`   — symmetric-right SpGEMM vs dense matmul
+//!   3. masked truncation           — only masked blocks are computed
+//!   4. `bsr4_trace_KS_partial`     — Tr(KS) vs CPU
+//!   5. `bsr4_symmetrize`           — vs host symmetrize reference
+//!   6. `bsr4_mulliken_KS`          — Mulliken charges vs CPU
+//!   7. `bsr4_idempotency_partial`  — ||KSK-K||_F for an exact idempotent K
+//!   8. TC2 / McWeeny purification  — convergence from a perturbed K0
+//!
+//! Tests skip gracefully if no OpenCL device is available.
+
+use nalgebra::{DMatrix, SymmetricEigen};
+use rust_dftb::methods::sparse::bsr4::{
+    build_full_mask, build_geometric_mask, build_identity, build_product_mask,
+    dense_matmul, dense_max_abs_diff, dense_frobenius, diag_block_map,
+    gershgorin_bounds, inf_norm, symmetrize_host, Bsr4Matrix, BS, BS2,
+};
+use rust_dftb::methods::sparse::gpu_sparse::{SparseBsr4Config, SparseBsr4Gpu};
+use rust_dftb::methods::sparse::gpu_sparse;
+
+/// Deterministic LCG for reproducible random-ish data.
+struct Rng(u64);
+impl Rng {
+    fn next(&mut self) -> f32 {
+        // xorshift64
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        // map to [-1, 1]
+        ((x as i64 as f64) / (i64::MAX as f64)) as f32
+    }
+}
+
+/// Try to create a SparseBsr4Gpu; return None if no OpenCL device.
+fn try_gpu() -> Option<SparseBsr4Gpu> {
+    match SparseBsr4Gpu::new(SparseBsr4Config::default()) {
+        Ok(g) => Some(g),
+        Err(e) => {
+            eprintln!("Skipping GPU sparse test: no OpenCL device ({e})");
+            None
+        }
+    }
+}
+
+/// Build a Bsr4Matrix from a dense (4N)x(4N) row-major f32 matrix using the
+/// given mask. Blocks outside the mask are dropped.
+fn bsr4_from_dense(n_atom: usize, dense: &[f32], mask: &(Vec<u32>, Vec<u32>)) -> Bsr4Matrix {
+    let n = n_atom * BS;
+    let mut m = Bsr4Matrix::from_structure(n_atom, mask.0.clone(), mask.1.clone()).unwrap();
+    for i in 0..n_atom {
+        let (a, b) = (mask.0[i] as usize, mask.0[i + 1] as usize);
+        for blk in a..b {
+            let j = mask.1[blk] as usize;
+            let mut v = [0.0f32; BS2];
+            for r in 0..BS {
+                for c in 0..BS {
+                    v[r * BS + c] = dense[(i * BS + r) * n + (j * BS + c)];
+                }
+            }
+            m.set_block(i, j, &v).unwrap();
+        }
+    }
+    m
+}
+
+/// Make a dense symmetric matrix from a full BSR4 mask + random blocks.
+fn random_symmetric_dense(n_atom: usize, rng: &mut Rng, scale: f32) -> Vec<f32> {
+    let n = n_atom * BS;
+    let mut d = vec![0.0f32; n * n];
+    for i in 0..n {
+        for j in i..n {
+            let v = scale * rng.next();
+            d[i * n + j] = v;
+            d[j * n + i] = v;
+        }
+    }
+    d
+}
+
+/// Build a symmetric positive-definite S: S = I + small symmetric offdiag.
+fn make_overlap_dense(n_atom: usize, rng: &mut Rng, offdiag: f32) -> Vec<f32> {
+    let n = n_atom * BS;
+    let mut d = vec![0.0f32; n * n];
+    for i in 0..n {
+        d[i * n + i] = 1.0;
+    }
+    for i in 0..n {
+        for j in i + 1..n {
+            let v = offdiag * rng.next() * 0.5;
+            d[i * n + j] = v;
+            d[j * n + i] = v;
+        }
+    }
+    d
+}
+
+/// CPU generalized eigensolve H c = S c eps. Returns spinless density kernel
+/// K = sum_{occ} c_i c_i^T (row-major f32) and the occupied count.
+fn cpu_density_kernel(h: &[f32], s: &[f32], n: usize, nocc: usize) -> Vec<f32> {
+    let hf = row_major_to_dmatrix_f64(h, n);
+    let sf = row_major_to_dmatrix_f64(s, n);
+    // S^{-1/2} via eigendecomposition.
+    let se = SymmetricEigen::new(sf.clone());
+    let mut d = DMatrix::<f64>::zeros(n, n);
+    for i in 0..n {
+        d[(i, i)] = 1.0 / se.eigenvalues[i].max(1e-12).sqrt();
+    }
+    let s_inv_sqrt = &se.eigenvectors * &d * se.eigenvectors.transpose();
+    // H_orth = S^{-1/2} H S^{-1/2}
+    let h_orth = &s_inv_sqrt * &hf * &s_inv_sqrt;
+    let he = SymmetricEigen::new(h_orth);
+    // Sort ascending.
+    let mut idx: Vec<usize> = (0..n).collect();
+    idx.sort_by(|&i, &j| he.eigenvalues[i].partial_cmp(&he.eigenvalues[j]).unwrap());
+    // C = S^{-1/2} * V_orth (columns reordered).
+    let v_sorted = he.eigenvectors.select_columns(&idx);
+    let c = &s_inv_sqrt * &v_sorted;
+    // K = sum_{i in occ} c[:,i] c[:,i]^T  (spinless)
+    let mut k = DMatrix::<f64>::zeros(n, n);
+    for i in 0..nocc {
+        let col = c.column(i);
+        k += &col * col.transpose();
+    }
+    dmatrix_to_row_major_f32(&k)
+}
+
+fn row_major_to_dmatrix_f64(data: &[f32], n: usize) -> DMatrix<f64> {
+    let mut m = DMatrix::<f64>::zeros(n, n);
+    for i in 0..n {
+        for j in 0..n {
+            m[(i, j)] = data[i * n + j] as f64;
+        }
+    }
+    m
+}
+
+fn dmatrix_to_row_major_f32(m: &DMatrix<f64>) -> Vec<f32> {
+    let n = m.nrows();
+    let mut out = vec![0.0f32; n * n];
+    for i in 0..n {
+        for j in 0..n {
+            out[i * n + j] = m[(i, j)] as f32;
+        }
+    }
+    out
+}
+
+fn dense_trace(a: &[f32], n: usize) -> f32 {
+    (0..n).map(|i| a[i * n + i]).sum()
+}
+
+// (dense_frobenius is now imported from bsr4.rs)
+
+// =====================================================================
+// 1. Generic masked SpGEMM vs dense
+// =====================================================================
+
+#[test]
+fn test_spgemm_masked_vs_dense() {
+    let Some(gpu) = try_gpu() else { return };
+    let n_atom = 4;
+    let n = n_atom * BS;
+    let mut rng = Rng(0x1234_5678_9abc_def0);
+    let a_dense = random_symmetric_dense(n_atom, &mut rng, 1.0);
+    // B not necessarily symmetric for the generic kernel.
+    let mut b_dense = vec![0.0f32; n * n];
+    for i in 0..n {
+        for j in 0..n {
+            b_dense[i * n + j] = 0.5 * rng.next();
+        }
+    }
+    let mask = build_full_mask(n_atom);
+    let a = bsr4_from_dense(n_atom, &a_dense, &mask);
+    let b = bsr4_from_dense(n_atom, &b_dense, &mask);
+
+    let c = gpu.matmul_masked(&a, &b, &mask).unwrap();
+    let c_ref = dense_matmul(n, &a_dense, &b_dense);
+    let err = gpu_sparse::compare_to_dense(&c, &c_ref);
+    println!("spgemm_masked (n_atom={n_atom}): max|dC| = {err:e}");
+    assert!(err < 1e-4, "generic SpGEMM parity failed: {err:e}");
+}
+
+// =====================================================================
+// 2. Symmetric-right SpGEMM vs dense
+// =====================================================================
+
+#[test]
+fn test_spgemm_masked_bsym_vs_dense() {
+    let Some(gpu) = try_gpu() else { return };
+    let n_atom = 4;
+    let n = n_atom * BS;
+    let mut rng = Rng(0xa1b2_c3d4_e5f6_0718);
+    let a_dense = random_symmetric_dense(n_atom, &mut rng, 1.0);
+    let b_dense = random_symmetric_dense(n_atom, &mut rng, 0.7); // symmetric B
+    let mask = build_full_mask(n_atom);
+    let a = bsr4_from_dense(n_atom, &a_dense, &mask);
+    let b = bsr4_from_dense(n_atom, &b_dense, &mask);
+
+    let c = gpu.matmul_masked_bsym(&a, &b, &mask).unwrap();
+    let c_ref = dense_matmul(n, &a_dense, &b_dense);
+    let err = gpu_sparse::compare_to_dense(&c, &c_ref);
+    println!("spgemm_masked_Bsym (n_atom={n_atom}): max|dC| = {err:e}");
+    assert!(err < 1e-4, "symmetric-right SpGEMM parity failed: {err:e}");
+}
+
+// =====================================================================
+// 3. Masked truncation: only masked blocks computed
+// =====================================================================
+
+#[test]
+fn test_spgemm_mask_truncation() {
+    let Some(gpu) = try_gpu() else { return };
+    let n_atom = 4;
+    let n = n_atom * BS;
+    // Place atoms on a line with spacing 1.5; cutoff 2.0 -> only nearest
+    // neighbors + self are in the mask.
+    let pos: Vec<[f64; 3]> = (0..n_atom)
+        .map(|i| [1.5 * i as f64, 0.0, 0.0])
+        .collect();
+    let mask = build_geometric_mask(&pos, 2.0);
+    let mut rng = Rng(0x55aa_55aa_55aa_55aa);
+    let a_dense = random_symmetric_dense(n_atom, &mut rng, 1.0);
+    let b_dense = random_symmetric_dense(n_atom, &mut rng, 0.8);
+    let a = bsr4_from_dense(n_atom, &a_dense, &mask);
+    let b = bsr4_from_dense(n_atom, &b_dense, &mask);
+
+    let c = gpu.matmul_masked_bsym(&a, &b, &mask).unwrap();
+    // Reference: dense product of the MASK-PROJECTED A and B (blocks outside
+    // the mask are zero in the BSR4 representation), then projected onto the
+    // output mask. Using the raw full dense matrices would include k that the
+    // GPU kernel never sees.
+    let a_proj = a.to_dense();
+    let b_proj = b.to_dense();
+    let c_full = dense_matmul(n, &a_proj, &b_proj);
+    let c_ref = bsr4_from_dense(n_atom, &c_full, &mask);
+    let err = gpu_sparse::compare_to_dense(&c, &c_ref.to_dense());
+    // Count blocks in mask.
+    let nblock = mask.1.len();
+    println!(
+        "spgemm truncation (n_atom={n_atom}, nblock={nblock}/{}): max|dC| = {err:e}",
+        n_atom * n_atom
+    );
+    assert!(nblock < n_atom * n_atom, "mask should be sparse");
+    assert!(err < 1e-4, "masked truncation parity failed: {err:e}");
+}
+
+// =====================================================================
+// 4. Tr(KS) vs CPU
+// =====================================================================
+
+#[test]
+fn test_trace_ks_vs_cpu() {
+    let Some(gpu) = try_gpu() else { return };
+    let n_atom = 4;
+    let n = n_atom * BS;
+    let mut rng = Rng(0x0123_4567_89ab_cdef);
+    let k_dense = random_symmetric_dense(n_atom, &mut rng, 1.0);
+    let s_dense = make_overlap_dense(n_atom, &mut rng, 0.3);
+    let mask = build_full_mask(n_atom);
+    let k = bsr4_from_dense(n_atom, &k_dense, &mask);
+    let s = bsr4_from_dense(n_atom, &s_dense, &mask);
+
+    // T = K·S (symmetric right).
+    let t = gpu.matmul_masked_bsym(&k, &s, &mask).unwrap();
+    let diag = diag_block_map(&t).unwrap();
+    let diag_buf = gpu.buf_u32(&diag).unwrap();
+    let t_buf = gpu.buf_f32(&t.values).unwrap();
+    let tr_gpu = gpu.trace_ks(n_atom, &diag_buf, &t_buf).unwrap();
+
+    let t_ref = dense_matmul(n, &k_dense, &s_dense);
+    let tr_cpu = dense_trace(&t_ref, n);
+    let err = (tr_gpu - tr_cpu).abs();
+    println!("trace_KS: GPU={tr_gpu:.6} CPU={tr_cpu:.6} |d|={err:e}");
+    assert!(err < 1e-3, "Tr(KS) parity failed: {err:e}");
+}
+
+// =====================================================================
+// 5. Symmetrize vs host reference
+// =====================================================================
+
+#[test]
+fn test_symmetrize_vs_host() {
+    let Some(gpu) = try_gpu() else { return };
+    let n_atom = 3;
+    let mut rng = Rng(0xfeed_face_dead_beef);
+    let mask = build_full_mask(n_atom);
+    // Asymmetric dense matrix.
+    let n = n_atom * BS;
+    let mut a_dense = vec![0.0f32; n * n];
+    for i in 0..n {
+        for j in 0..n {
+            a_dense[i * n + j] = 0.3 * rng.next();
+        }
+    }
+    let a = bsr4_from_dense(n_atom, &a_dense, &mask);
+
+    // GPU symmetrize.
+    let a_gpu_sym = gpu.symmetrize_mat(&a).unwrap();
+    // Host symmetrize on a copy.
+    let mut a_host = a.clone();
+    symmetrize_host(&mut a_host).unwrap();
+    let err = dense_max_abs_diff(&a_gpu_sym.to_dense(), &a_host.to_dense());
+    println!("symmetrize: max|dA| = {err:e}");
+    assert!(err < 1e-5, "symmetrize parity failed: {err:e}");
+
+    // Verify symmetry of the result: A == A^T.
+    let d = a_gpu_sym.to_dense();
+    let mut sym_err = 0.0f32;
+    for i in 0..n {
+        for j in 0..n {
+            sym_err = sym_err.max((d[i * n + j] - d[j * n + i]).abs());
+        }
+    }
+    assert!(sym_err < 1e-5, "result not symmetric: {sym_err:e}");
+}
+
+// =====================================================================
+// 6. Mulliken charges vs CPU
+// =====================================================================
+
+#[test]
+fn test_mulliken_vs_cpu() {
+    let Some(gpu) = try_gpu() else { return };
+    let n_atom = 4;
+    let n = n_atom * BS;
+    let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+    let k_dense = random_symmetric_dense(n_atom, &mut rng, 1.0);
+    let s_dense = make_overlap_dense(n_atom, &mut rng, 0.3);
+    let mask = build_full_mask(n_atom);
+    let k = bsr4_from_dense(n_atom, &k_dense, &mask);
+    let s = bsr4_from_dense(n_atom, &s_dense, &mask);
+
+    let ks = gpu.matmul_masked_bsym(&k, &s, &mask).unwrap();
+    let q_gpu = gpu.mulliken(&ks).unwrap();
+
+    // CPU: q_A = 2 * sum_{mu in A} (KS)[mu,mu]
+    let ks_ref = dense_matmul(n, &k_dense, &s_dense);
+    let mut q_cpu = vec![0.0f32; n_atom];
+    for a in 0..n_atom {
+        let mut tr = 0.0f32;
+        for r in 0..BS {
+            let mu = a * BS + r;
+            tr += ks_ref[mu * n + mu];
+        }
+        q_cpu[a] = 2.0 * tr;
+    }
+    let err = q_gpu
+        .iter()
+        .zip(q_cpu.iter())
+        .map(|(g, c)| (*g - *c).abs())
+        .fold(0.0f32, f32::max);
+    println!("mulliken: q_gpu={q_gpu:?} q_cpu={q_cpu:?} max|dq|={err:e}");
+    assert!(err < 1e-4, "Mulliken parity failed: {err:e}");
+}
+
+// =====================================================================
+// 7. Idempotency of an exact density kernel
+//    K from CPU generalized eigensolve -> KSK should equal K (full mask,
+//    no truncation error). Validates ksk + idempotency kernels.
+// =====================================================================
+
+#[test]
+fn test_idempotency_exact_kernel() {
+    let Some(gpu) = try_gpu() else { return };
+    let n_atom = 3;
+    let n = n_atom * BS;
+    let nocc = 3; // spinless occupied orbitals
+    let mut rng = Rng(0xc0de_1234_5678_abcd);
+    // H with a clear gap: diagonal dominant.
+    let mut h_dense = random_symmetric_dense(n_atom, &mut rng, 0.4);
+    for i in 0..n {
+        h_dense[i * n + i] += 2.0;
+    }
+    let s_dense = make_overlap_dense(n_atom, &mut rng, 0.25);
+    let k_dense = cpu_density_kernel(&h_dense, &s_dense, n, nocc);
+
+    let mask = build_full_mask(n_atom);
+    let k = bsr4_from_dense(n_atom, &k_dense, &mask);
+    let s = bsr4_from_dense(n_atom, &s_dense, &mask);
+
+    let (_t, q) = gpu.ksk(&k, &s, &mask, &mask).unwrap();
+    // ||KSK - K||_F
+    let q_buf = gpu.buf_f32(&q.values).unwrap();
+    let k_buf = gpu.buf_f32(&k.values).unwrap();
+    let idem_gpu = gpu.idempotency_err(k.nblock(), &q_buf, &k_buf).unwrap();
+
+    // CPU reference.
+    let ks = dense_matmul(n, &k_dense, &s_dense);
+    let ksk = dense_matmul(n, &ks, &k_dense);
+    let mut diff = vec![0.0f32; n * n];
+    for i in 0..n * n {
+        diff[i] = ksk[i] - k_dense[i];
+    }
+    let idem_cpu = dense_frobenius(&diff);
+    println!("idempotency exact K: ||KSK-K||_F GPU={idem_gpu:e} CPU={idem_cpu:e}");
+    assert!(idem_gpu < 5e-4, "exact K not idempotent on GPU: {idem_gpu:e}");
+    assert!((idem_gpu - idem_cpu).abs() < 5e-4, "idempotency mismatch GPU vs CPU");
+
+    // Also check Tr(KS) == Nocc.
+    let t = gpu.matmul_masked_bsym(&k, &s, &mask).unwrap();
+    let diag = diag_block_map(&t).unwrap();
+    let diag_buf = gpu.buf_u32(&diag).unwrap();
+    let t_buf = gpu.buf_f32(&t.values).unwrap();
+    let tr = gpu.trace_ks(n_atom, &diag_buf, &t_buf).unwrap();
+    println!("Tr(KS) = {tr:.6} (expected Nocc = {nocc})");
+    assert!((tr - nocc as f32).abs() < 1e-3, "Tr(KS) != Nocc: {tr} vs {nocc}");
+}
+
+// =====================================================================
+// 8. McWeeny purification convergence from a perturbed K0
+//    Start from K0 = exact K + noise (non-idempotent), run McWeeny steps,
+//    verify ||KSK-K||_F decreases monotonically.
+// =====================================================================
+
+#[test]
+fn test_mcweeny_convergence() {
+    let Some(gpu) = try_gpu() else { return };
+    let n_atom = 3;
+    let n = n_atom * BS;
+    let nocc = 3;
+    let mut rng = Rng(0x51de_0bad_f00d_1234);
+    let mut h_dense = random_symmetric_dense(n_atom, &mut rng, 0.4);
+    for i in 0..n {
+        h_dense[i * n + i] += 2.0;
+    }
+    let s_dense = make_overlap_dense(n_atom, &mut rng, 0.25);
+    let k_exact_dense = cpu_density_kernel(&h_dense, &s_dense, n, nocc);
+    let mask = build_full_mask(n_atom);
+    let s = bsr4_from_dense(n_atom, &s_dense, &mask);
+
+    // Perturb: K0 = K_exact + 0.05 * symmetric noise, then re-symmetrize.
+    // McWeeny is quadratically convergent once inside the basin; a small
+    // perturbation keeps K0 safely in the basin.
+    let noise = random_symmetric_dense(n_atom, &mut rng, 0.05);
+    let mut k0_dense = vec![0.0f32; n * n];
+    for i in 0..n * n {
+        k0_dense[i] = k_exact_dense[i] + noise[i];
+    }
+    let mut k = bsr4_from_dense(n_atom, &k0_dense, &mask);
+    k = gpu.symmetrize_mat(&k).unwrap();
+
+    let mut prev_idem = f32::INFINITY;
+    for step in 0..20 {
+        let (_t, q) = gpu.ksk(&k, &s, &mask, &mask).unwrap();
+        let q_buf = gpu.buf_f32(&q.values).unwrap();
+        let k_buf = gpu.buf_f32(&k.values).unwrap();
+        let idem = gpu.idempotency_err(k.nblock(), &q_buf, &k_buf).unwrap();
+        println!("McWeeny step {step}: ||KSK-K||_F = {idem:e}");
+        if step > 0 {
+            assert!(
+                idem <= prev_idem * 1.02 + 1e-7,
+                "McWeeny not decreasing at step {step}: {idem:e} vs {prev_idem:e}"
+            );
+        }
+        prev_idem = idem;
+        if idem < 1e-6 {
+            break;
+        }
+        k = gpu.mcweeny_step(&k, &s, &mask, &mask).unwrap();
+        k = gpu.symmetrize_mat(&k).unwrap();
+    }
+    println!("McWeeny final ||KSK-K||_F = {prev_idem:e}");
+    assert!(prev_idem < 1e-4, "McWeeny did not converge: {prev_idem:e}");
+}
+
+// =====================================================================
+// 9. TC2 purification keeps trace at Nocc and converges
+// =====================================================================
+
+#[test]
+fn test_tc2_convergence() {
+    let Some(gpu) = try_gpu() else { return };
+    let n_atom = 3;
+    let n = n_atom * BS;
+    let nocc: f32 = 3.0;
+    let mut rng = Rng(0x7e57_c0de_face_cafe);
+    let mut h_dense = random_symmetric_dense(n_atom, &mut rng, 0.4);
+    for i in 0..n {
+        h_dense[i * n + i] += 2.0;
+    }
+    let s_dense = make_overlap_dense(n_atom, &mut rng, 0.25);
+    let k_exact_dense = cpu_density_kernel(&h_dense, &s_dense, n, nocc as usize);
+    let mask = build_full_mask(n_atom);
+    let s = bsr4_from_dense(n_atom, &s_dense, &mask);
+
+    // diag_block for the T mask (same as K mask here, full).
+    let t_dummy = Bsr4Matrix::from_structure(n_atom, mask.0.clone(), mask.1.clone()).unwrap();
+    let diag = diag_block_map(&t_dummy).unwrap();
+    let diag_buf = gpu.buf_u32(&diag).unwrap();
+
+    // TC2 requires K0 to already be a spectral function of the generalized
+    // eigenproblem (the chat doc warns: "TC2 does not magically discover the
+    // Hamiltonian eigenvectors"). A spectrally valid perturbation is to scale
+    // the exact projector: K0 = alpha * K_exact, whose KS-eigenvalues are
+    // {alpha, 0} subset [0,1]. TC2 should push alpha -> 1.
+    let alpha = 0.8f32;
+    let mut k0_dense = vec![0.0f32; n * n];
+    for i in 0..n * n {
+        k0_dense[i] = alpha * k_exact_dense[i];
+    }
+    let mut k = bsr4_from_dense(n_atom, &k0_dense, &mask);
+    k = gpu.symmetrize_mat(&k).unwrap();
+
+    let mut prev_idem = f32::INFINITY;
+    let mut last_tr = f32::NAN;
+    for step in 0..30 {
+        let (_t, q) = gpu.ksk(&k, &s, &mask, &mask).unwrap();
+        let q_buf = gpu.buf_f32(&q.values).unwrap();
+        let k_buf = gpu.buf_f32(&k.values).unwrap();
+        let idem = gpu.idempotency_err(k.nblock(), &q_buf, &k_buf).unwrap();
+        // trace of KS via T = K·S
+        let t = gpu.matmul_masked_bsym(&k, &s, &mask).unwrap();
+        let t_buf = gpu.buf_f32(&t.values).unwrap();
+        let tr = gpu.trace_ks(n_atom, &diag_buf, &t_buf).unwrap();
+        println!("TC2 step {step}: ||KSK-K||_F={idem:e}  Tr(KS)={tr:.5} (Nocc={nocc})");
+        // Trace must stay bounded and in [0, 2*Nocc].
+        assert!(tr >= -1.0 && tr <= 2.0 * nocc, "TC2 trace out of bounds at step {step}: {tr}");
+        prev_idem = idem;
+        last_tr = tr;
+        if idem < 1e-5 {
+            break;
+        }
+        let (knew, _n) = gpu.tc2_step(&k, &s, nocc, &mask, &mask, &diag_buf).unwrap();
+        k = gpu.symmetrize_mat(&knew).unwrap();
+    }
+    println!("TC2 final ||KSK-K||_F = {prev_idem:e}  Tr(KS)={last_tr:.5}");
+    assert!(prev_idem < 1e-3, "TC2 did not converge: {prev_idem:e}");
+    assert!((last_tr - nocc).abs() < 1e-2, "TC2 trace != Nocc: {last_tr} vs {nocc}");
+}
+
+// =====================================================================
+// 10. Boolean product mask M_T = M_K ∘ M_HS
+//     Verify it contains exactly the structurally possible support of K·S,
+//     and that omitting a required block is detectable.
+// =====================================================================
+
+#[test]
+fn test_boolean_product_mask() {
+    let n_atom = 5;
+    // Place atoms on a line, spacing 1.5.
+    let pos: Vec<[f64; 3]> = (0..n_atom)
+        .map(|i| [1.5 * i as f64, 0.0, 0.0])
+        .collect();
+    // M_HS: cutoff 2.0 -> self + nearest neighbors.
+    let s_mask = build_geometric_mask(&pos, 2.0);
+    // M_K: cutoff 3.5 -> self + 2 nearest neighbors.
+    let k_mask = build_geometric_mask(&pos, 3.5);
+    let t_mask = build_product_mask(n_atom, &k_mask, &s_mask);
+
+    // Reference: dense boolean product computed on host from the dense
+    // adjacency of K and S.
+    let k_adj = adjacency_dense(n_atom, &k_mask);
+    let s_adj = adjacency_dense(n_atom, &s_mask);
+    let mut t_ref = vec![false; n_atom * n_atom];
+    for i in 0..n_atom {
+        for k in 0..n_atom {
+            if !k_adj[i * n_atom + k] {
+                continue;
+            }
+            for j in 0..n_atom {
+                if s_adj[k * n_atom + j] {
+                    t_ref[i * n_atom + j] = true;
+                }
+            }
+        }
+    }
+    // Compare t_mask against t_ref.
+    let t_adj = adjacency_dense(n_atom, &t_mask);
+    let mut mismatches = 0;
+    for i in 0..n_atom {
+        for j in 0..n_atom {
+            if t_adj[i * n_atom + j] != t_ref[i * n_atom + j] {
+                mismatches += 1;
+                println!("  mismatch ({i},{j}): mask={} ref={}", t_adj[i * n_atom + j], t_ref[i * n_atom + j]);
+            }
+        }
+    }
+    println!(
+        "boolean product mask: |M_K|={} |M_HS|={} |M_T|={} mismatches={mismatches}",
+        k_mask.1.len(),
+        s_mask.1.len(),
+        t_mask.1.len()
+    );
+    assert_eq!(mismatches, 0, "boolean product mask incorrect");
+
+    // Omission detection: drop one structurally-required block from a copy
+    // of t_mask and verify the SpGEMM result differs from the full-mask
+    // reference.
+    let Some(gpu) = try_gpu() else { return };
+    let n = n_atom * BS;
+    let mut rng = Rng(0xbad_cafe_dead_beef);
+    let k_dense = random_symmetric_dense(n_atom, &mut rng, 1.0);
+    let s_dense = make_overlap_dense(n_atom, &mut rng, 0.3);
+    let k = bsr4_from_dense(n_atom, &k_dense, &k_mask);
+    let s = bsr4_from_dense(n_atom, &s_dense, &s_mask);
+
+    // Full T mask result.
+    let t_full = gpu.matmul_masked_bsym(&k, &s, &t_mask).unwrap();
+    // Truncated T mask: remove the last block of row 0 (if it's not the only
+    // block). This drops a structurally possible (0, j) contribution.
+    let mut t_trunc_row = t_mask.0.clone();
+    let mut t_trunc_col = t_mask.1.clone();
+    let b0 = t_mask.0[0] as usize;
+    let b1 = t_mask.0[1] as usize;
+    if b1 - b0 > 1 {
+        // Remove the last block of row 0 by shifting col_idx and row_ptr.
+        let removed = t_trunc_col.remove(b1 - 1);
+        for r in 1..=n_atom {
+            t_trunc_row[r] -= 1;
+        }
+        println!("  omitted block (0,{removed}) from M_T");
+        let t_trunc = (t_trunc_row, t_trunc_col);
+        let t_trunc_res = gpu.matmul_masked_bsym(&k, &s, &t_trunc).unwrap();
+        // Each output block is computed independently, so blocks present in
+        // both masks are identical. The omission is detectable only in the
+        // MISSING block: the full result has a nonzero block at (0, removed)
+        // that the truncated result lacks entirely.
+        let full_block = t_full.block(0, removed as usize).unwrap_or([0.0; BS2]);
+        let full_norm = dense_frobenius(&full_block);
+        println!("  omitted block (0,{removed}) full norm = {full_norm:e}");
+        // The truncated result should NOT have this block.
+        assert!(t_trunc_res.find(0, removed as usize).is_none(),
+            "truncated mask still contains omitted block");
+        // And the full result should have a nonzero block there (otherwise
+        // the omission is physically irrelevant for this data).
+        assert!(full_norm > 1e-6,
+            "omitted block is zero in full result — test data doesn't exercise the omission (full_norm={full_norm:e})");
+        let max_diff = full_norm; // the "diff" is the entire missing block
+        println!("  omission detected: missing block norm = {max_diff:e}");
+        assert!(max_diff > 1e-6, "omission not detected (max_diff={max_diff:e})");
+    }
+}
+
+fn adjacency_dense(n_atom: usize, mask: &(Vec<u32>, Vec<u32>)) -> Vec<bool> {
+    let mut adj = vec![false; n_atom * n_atom];
+    for i in 0..n_atom {
+        let (a, b) = (mask.0[i] as usize, mask.0[i + 1] as usize);
+        for blk in a..b {
+            adj[i * n_atom + mask.1[blk] as usize] = true;
+        }
+    }
+    adj
+}
+
+// =====================================================================
+// 11. Newton-Schulz sparse inverse Z ≈ S⁻¹
+//     Verify ||I - ZS||_F / sqrt(N) decreases and Z matches dense S⁻¹.
+// =====================================================================
+
+#[test]
+fn test_newton_schulz_inverse() {
+    let Some(gpu) = try_gpu() else { return };
+    let n_atom = 3;
+    let n = n_atom * BS;
+    let mut rng = Rng(0x5a5a_5a5a_5a5a_5a5a);
+    // Well-conditioned S: I + small offdiag.
+    let s_dense = make_overlap_dense(n_atom, &mut rng, 0.15);
+    let mask = build_full_mask(n_atom);
+    let s = bsr4_from_dense(n_atom, &s_dense, &mask);
+
+    let (z, rz, iters) = gpu
+        .newton_schulz_inverse(&s, &mask, &mask, 30, 1e-4, 3)
+        .unwrap();
+    println!("Newton-Schulz: {iters} iters, R_Z = {rz:e}");
+
+    // CPU reference: dense S⁻¹ via eigendecomposition.
+    let s_f64 = row_major_to_dmatrix_f64(&s_dense, n);
+    let se = SymmetricEigen::new(s_f64.clone());
+    let mut d = DMatrix::<f64>::zeros(n, n);
+    for i in 0..n {
+        d[(i, i)] = 1.0 / se.eigenvalues[i].max(1e-12);
+    }
+    let s_inv = &se.eigenvectors * &d * se.eigenvectors.transpose();
+    let s_inv_dense = dmatrix_to_row_major_f32(&s_inv);
+
+    let z_dense = z.to_dense();
+    let err = dense_max_abs_diff(&z_dense, &s_inv_dense);
+    println!("  ||Z - S⁻¹||_max = {err:e}");
+    assert!(rz < 1e-3, "Newton-Schulz did not converge: R_Z = {rz:e}");
+    assert!(err < 1e-2, "Z != S⁻¹: max|dZ| = {err:e}");
+}
+
+// =====================================================================
+// 12. Hamiltonian-derived K₀ and real parity test
+//     H,S -> Z -> K₀ -> TC2 -> K, compare against dense projector K_ref.
+//     Also check R_H = ||HKS - SKH||_F -> 0.
+// =====================================================================
+
+#[test]
+fn test_k0_and_tc2_vs_dense_projector() {
+    let Some(gpu) = try_gpu() else { return };
+    let n_atom = 3;
+    let n = n_atom * BS;
+    let nocc = 3;
+    let mut rng = Rng(0x1234_abcd_5678_ef90);
+    // H with a clear gap.
+    let mut h_dense = random_symmetric_dense(n_atom, &mut rng, 0.4);
+    for i in 0..n {
+        h_dense[i * n + i] += 2.0;
+    }
+    let s_dense = make_overlap_dense(n_atom, &mut rng, 0.2);
+
+    // Dense reference projector.
+    let k_ref_dense = cpu_density_kernel(&h_dense, &s_dense, n, nocc);
+
+    let mask = build_full_mask(n_atom);
+    let h = bsr4_from_dense(n_atom, &h_dense, &mask);
+    let s = bsr4_from_dense(n_atom, &s_dense, &mask);
+
+    // 1. Z ≈ S⁻¹
+    println!("Computing Z ≈ S⁻¹ ...");
+    let (z, rz, z_iters) = gpu
+        .newton_schulz_inverse(&s, &mask, &mask, 30, 1e-4, 3)
+        .unwrap();
+    println!("  Z: {z_iters} iters, R_Z = {rz:e}");
+    assert!(rz < 1e-3, "Z did not converge for K₀ test");
+
+    // 2. Spectral bounds of B = Z·H (Gershgorin + 10% padding).
+    let (emin, emax) = gpu.spectral_bounds(&h, &z, &mask, 0.1).unwrap();
+    println!("  spectral bounds: emin={emin:.4} emax={emax:.4}");
+    assert!(emax > emin, "degenerate spectral bounds");
+
+    // 3. K₀ = (emax·Z - ZHZ) / Δε
+    let k0 = gpu.build_k0(&h, &s, &z, &mask, &mask, emin, emax).unwrap();
+    let k0_dense = k0.to_dense();
+    let k0_err = dense_max_abs_diff(&k0_dense, &k_ref_dense);
+    println!("  ||K₀ - K_ref||_max = {k0_err:e} (before purification)");
+    // K₀ should be in the right ballpark but not exact.
+    assert!(k0_err < 1.0, "K₀ wildly off from K_ref: {k0_err:e}");
+
+    // 4. TC2 purification from K₀.
+    let nocc_f = nocc as f32;
+    println!("TC2 purification from K₀ ...");
+    let (k_final, r_i, tr, iters, _history) = gpu
+        .tc2_purify(&k0, &s, nocc_f, &mask, &mask, 40, 1e-5)
+        .unwrap();
+    println!("  TC2: {iters} iters, R_I={r_i:e}, Tr(KS)={tr:.6}");
+
+    // 5. Compare final K against dense reference projector.
+    let k_final_dense = k_final.to_dense();
+    let k_err = dense_max_abs_diff(&k_final_dense, &k_ref_dense);
+    println!("  ||K_final - K_ref||_max = {k_err:e}");
+    assert!(r_i < 1e-3, "TC2 did not converge: R_I = {r_i:e}");
+    assert!((tr - nocc_f).abs() < 1e-2, "Tr(KS) != Nocc: {tr} vs {nocc_f}");
+    // The final K should match the dense projector much better than K₀.
+    assert!(k_err < k0_err, "TC2 did not improve over K₀: {k_err:e} vs {k0_err:e}");
+    // With full mask + well-conditioned S, expect good agreement.
+    assert!(k_err < 5e-2, "K_final != K_ref: {k_err:e}");
+
+    // 6. Hamiltonian commutator R_H = ||HKS - SKH||_F.
+    let r_h = gpu.hamiltonian_residual(&h, &k_final, &s, &mask).unwrap();
+    // Normalize by sqrt(N_orb) for scale.
+    let r_h_norm = r_h / (n as f32).sqrt();
+    println!("  R_H = ||HKS-SKH||_F = {r_h:e}  (normalized {r_h_norm:e})");
+    // For the exact projector R_H = 0. With f32 + Newton-Schulz truncation,
+    // expect small but nonzero. It should be much smaller than the raw K
+    // magnitude.
+    assert!(r_h_norm < 1e-2, "R_H too large: {r_h_norm:e}");
+
+    // 7. Sanity: R_H for the dense reference projector should also be ~0
+    //    (validates the diagnostic itself).
+    let k_ref_mat = bsr4_from_dense(n_atom, &k_ref_dense, &mask);
+    let r_h_ref = gpu.hamiltonian_residual(&h, &k_ref_mat, &s, &mask).unwrap();
+    let r_h_ref_norm = r_h_ref / (n as f32).sqrt();
+    println!("  R_H(K_ref) = {r_h_ref:e}  (normalized {r_h_ref_norm:e})");
+    assert!(r_h_ref_norm < 1e-4, "R_H of exact projector too large: {r_h_ref_norm:e}");
+}
+
+// =====================================================================
+// 13. R_H distinguishes eigenvector-aligned from non-aligned projectors
+//     R_H = ||HKS-SKH||_F = 0 for ANY projector onto eigenvectors of the
+//     generalized problem (occupied or not), because Hc_i = Sc_i ε_i for
+//     every eigenvector. R_H is large only for K NOT aligned with the
+//     eigenvector basis. This validates R_H as a "is K in the eigenspace?"
+//     diagnostic, which together with Tr(KS)=Nocc ensures correctness.
+// =====================================================================
+
+#[test]
+fn test_rh_distinguishes_projectors() {
+    let Some(gpu) = try_gpu() else { return };
+    let n_atom = 3;
+    let n = n_atom * BS;
+    let nocc = 3;
+    let mut rng = Rng(0xc0de_face_1234_5678);
+    let mut h_dense = random_symmetric_dense(n_atom, &mut rng, 0.4);
+    for i in 0..n {
+        h_dense[i * n + i] += 2.0;
+    }
+    let s_dense = make_overlap_dense(n_atom, &mut rng, 0.2);
+    let mask = build_full_mask(n_atom);
+    let h = bsr4_from_dense(n_atom, &h_dense, &mask);
+    let s = bsr4_from_dense(n_atom, &s_dense, &mask);
+
+    // Correct projector: lowest nocc eigenvectors.
+    let k_correct_dense = cpu_density_kernel(&h_dense, &s_dense, n, nocc);
+    let k_correct = bsr4_from_dense(n_atom, &k_correct_dense, &mask);
+
+    // Non-eigenvector-aligned "projector": a random symmetric matrix with
+    // trace(KS) ≈ Nocc. This is NOT idempotent and NOT eigenvector-aligned,
+    // so R_H should be large.
+    let k_random_dense = random_symmetric_dense(n_atom, &mut rng, 0.5);
+    // Scale to roughly match trace. (Not critical — R_H is about alignment,
+    // not trace.)
+    let k_random = bsr4_from_dense(n_atom, &k_random_dense, &mask);
+
+    // R_I and R_H for the correct projector.
+    let (_, q_c) = gpu.ksk(&k_correct, &s, &mask, &mask).unwrap();
+    let q_c_buf = gpu.buf_f32(&q_c.values).unwrap();
+    let k_c_buf = gpu.buf_f32(&k_correct.values).unwrap();
+    let r_i_c = gpu.idempotency_err(k_correct.nblock(), &q_c_buf, &k_c_buf).unwrap();
+    let r_h_c = gpu.hamiltonian_residual(&h, &k_correct, &s, &mask).unwrap();
+
+    // R_H for the random (non-aligned) matrix.
+    let r_h_r = gpu.hamiltonian_residual(&h, &k_random, &s, &mask).unwrap();
+
+    let sqrt_n = (n as f32).sqrt();
+    println!(
+        "correct: R_I={r_i_c:e} R_H={:.4e}  random: R_H={:.4e}",
+        r_h_c / sqrt_n,
+        r_h_r / sqrt_n
+    );
+    // Correct projector: R_H ≈ 0 (eigenvector-aligned).
+    assert!(r_h_c / sqrt_n < 1e-3, "R_H of correct projector too large: {:.4e}", r_h_c / sqrt_n);
+    // Random matrix: R_H should be much larger (not eigenvector-aligned).
+    assert!(r_h_r / sqrt_n > 1e-2,
+        "R_H of random matrix too small (does not distinguish!): {:.4e}",
+        r_h_r / sqrt_n);
+    // And the ratio should be large.
+    let ratio = r_h_r / r_h_c.max(1e-30);
+    println!("  R_H ratio (random/correct) = {ratio:.1e}");
+    assert!(ratio > 100.0, "R_H does not distinguish: ratio={ratio:.1e}");
+}

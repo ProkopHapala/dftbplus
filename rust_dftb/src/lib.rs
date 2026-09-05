@@ -9,6 +9,7 @@
 pub mod core;
 pub mod methods;
 pub mod qmqm;
+pub mod geometry;
 
 // --- Re-exports for backward compatibility ---
 // These keep existing tests and callers working without changing their imports.

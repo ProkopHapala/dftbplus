@@ -439,29 +439,49 @@ impl HamiltonianBuilder {
             ));
         }
 
+        let verbose = std::env::var("RUST_DFTB_TIMING").is_ok();
+        let t0 = std::time::Instant::now();
+
         // 1. Build fragment template (constructs H0, S, q0, orbital mapping)
         let template = FragmentTemplate::new(&self.sk, species.to_vec(), coords.to_vec())?;
+        let t_template = t0.elapsed();
 
         // 2. Create fragment from template
+        let t0 = std::time::Instant::now();
         let frag = Fragment::from_template(template, coords.to_vec());
+        let t_frag = t0.elapsed();
 
         // 3. Build gamma table from SK data (auto-extract Hubbard U)
+        let t0 = std::time::Instant::now();
         let gamma = GammaTable::from_sk_data(&self.sk, species)?;
+        let t_gamma = t0.elapsed();
 
         // 4. For a single fragment, neighbor list is just self
+        let t0 = std::time::Instant::now();
         let centroid = coords
             .iter()
             .fold([0.0, 0.0, 0.0], |acc, c| [acc[0] + c[0], acc[1] + c[1], acc[2] + c[2]]);
         let n = coords.len() as f64;
         let centroids = vec![[centroid[0] / n, centroid[1] / n, centroid[2] / n]];
         let frag_neighbors = FragmentNeighborList::build(&centroids, 10.0);
+        let t_neigh = t0.elapsed();
 
         // 5. Create solver with DIIS mixing (warmup + Anderson acceleration)
+        let t0 = std::time::Instant::now();
         let mixer = DiisMixer::new(10, coords.len());
         let mut solver = MultiSystemSolver::new(vec![frag], frag_neighbors, gamma, mixer);
+        let t_solver_init = t0.elapsed();
 
         // 6. Run SCC to convergence
+        let t0 = std::time::Instant::now();
         solver.solve_scc(max_iter, tol)?;
+        let t_scc = t0.elapsed();
+
+        if verbose {
+            eprintln!("    [timing] template={:.2}ms frag={:.3}ms gamma={:.3}ms neigh={:.3}ms solver_init={:.3}ms scc={:.2}ms ({} iter)",
+                t_template.as_secs_f64()*1e3, t_frag.as_secs_f64()*1e3, t_gamma.as_secs_f64()*1e3,
+                t_neigh.as_secs_f64()*1e3, t_solver_init.as_secs_f64()*1e3, t_scc.as_secs_f64()*1e3, solver.n_scc_iter);
+        }
 
         // 7. Extract results
         let frag = &solver.fragments[0];

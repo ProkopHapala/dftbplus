@@ -1,14 +1,14 @@
 ---
 type: Task
-title: GPU Multi-System DFTB — Agent_04 GPU batched SCC (independent replicas)
-tags: [parallel-agents, worker-task, gpu, scc]
+title: GPU Multi-System DFTB — Agent_04 Brent-Luk Jacobi + S^{-1/2}
+tags: [parallel-agents, worker-task, jacobi, eigensolver, opencl]
 ---
 
-# Agent_04: GPU batched SCC (independent replicas)
+# Agent_04: Brent-Luk parallel cyclic Jacobi + S^{-1/2} on GPU
 
 - **Master:** [`task_master.md`](task_master.md)
 - **Agent ID:** `Agent_4`
-- **Required contract version:** 1
+- **Required contract version:** 2
 - **Status authority:** coordinator only
 
 Read the master completely before working. The master overrides this file. Execute
@@ -16,115 +16,164 @@ only this packet; other worker scopes are context, not optional work.
 
 ## Goal and boundary
 
-- **Goal:** Extend `GpuDriver` (from Agent_1) with a host-driven SCC loop that runs all replicas in parallel on GPU: assemble H → diagonalize → compute charges → mix → converge. Save per-replica data (H0, S, H_scc, C, ε, D, q, E) to disk.
-- **In scope:** `qmqm/gpu_driver.rs` (extend with SCC methods), `tests/gpu_scc.rs` (new). Mulliken charge computation on GPU or host; mixer on host; convergence check on host.
-- **Out of scope:** Modifying OpenCL kernels (`dftb_hamiltonian.cl`, `gpu_matrix_ops.cl`). GPU-internal mega-kernel (D2b — future). QM/QM inter-fragment coupling on GPU (future). Scan/NEB driver (Agent_5).
+- **Goal:** Implement a Brent-Luk parallel cyclic Jacobi eigensolver for batched
+  symmetric matrices (N≤64, full-local in `__local` memory), and an S^{-1/2} kernel
+  that reuses the Jacobi eigensolver. This is the central technical challenge of the
+  revised architecture — it replaces the sequential-rotation `local_jacobi_blocks_parallel`
+  with N/2 independent rotations per round and one barrier per round.
+- **In scope:** `qmqm/gpu_eigen.cl` (new OpenCL kernel file), `qmqm/gpu_eigen.rs`
+  (new Rust host module), `tests/gpu_eigenproblem.rs` (new tests + benchmarks).
+- **Out of scope:** Modifying `gpu_matrix_ops.cl`, `gpu_matrix.rs`, `gpu_driver.rs`,
+  `dftb_hamiltonian.cl`, or any existing kernel. SCC loop integration (coordinator).
+  GEMM (Agent_6). Scan/NEB (Agent_5).
+
+## Design reference
+
+See `GPU_MultiSystem_Design.md` §4.1 (Brent-Luk Jacobi), §4.2 (S^{-1/2}), §3.1
+(local memory budget), D8, D9, D10 (f32 precision).
+
+Key design points:
+- **N≤64:** A and V (eigenvectors) fully in `__local` memory. ~35 KiB/workgroup for N=64.
+- **N+1 leading dimension** (`JLD = N+1`) to avoid power-of-two bank conflicts.
+- **N+1 padding for odd N:** pad with dummy state (huge diagonal, zero off-diagonal).
+  One kernel works for N=63 and N=64.
+- **Round-robin schedule** computed in-kernel (no upload needed):
+  ```c
+  inline ushort2 jacobi_pair(int round, int ipair) {
+      if (ipair == 0) return (ushort2)(JN-1, round);
+      int m = JN-1;
+      return (ushort2)((round+ipair)%m, (round+m-ipair)%m);
+  }
+  ```
+- **N/2 independent rotations per round.** Each work-item owns one 2×2 block update.
+  No atomics, no races. One barrier per round. N-1 rounds per sweep.
+- **f32 only.** Monitor λ_min(S) for precision.
+- **Workgroup sizes:** N≤32 → WG=128, N~32-64 → WG=256. Query
+  `CL_KERNEL_PREFERRED_WORK_GROUP_SIZE_MULTIPLE` if possible.
+- **Compile-time specialization:** Use text substitution for `JN` (N+1 padded),
+  `JLD` (N+1), `JPAIR` (N/2), `JROUND` (N-1), `WG`. The existing Rust matrix
+  infrastructure already specializes kernels by text substitution.
 
 ## Inputs and preconditions
 
+- **Coordinator pre-work DONE:** `GpuRuntime` exists in `qmqm/gpu_runtime.rs`.
+  `pub mod gpu_eigen;` wired into `qmqm/mod.rs`. `gpu_eigen.rs` is a stub with
+  `unimplemented!()` — replace the stub with your implementation.
 - Frozen inputs/fixtures:
   - `RUST_DFTB_SK_DIR` env var pointing to mio-1-1 SK files
-  - Test molecules: 10× H2O at different geometries
-  - CPU reference: `HamiltonianBuilder::build_scc()` (already parity-verified on 13 molecules)
-- Upstream gate: **Agent_1 must be accepted** — `GpuDriver::new()` and `gpu_assemble_batched()` must work and pass `tests/gpu_hamiltonian.rs`.
+  - Test molecules: H2 (N=2), N2 (N=8), H2O (N=6), CH4 (N=8)
+  - CPU reference: `HamiltonianBuilder::build_non_scc()` + `build_scc()` for eigenvalues
 - Interfaces consumed:
-  - `qmqm/gpu_driver.rs::GpuDriver` (from Agent_1) — device, buffer management, H-assembly
-  - `qmqm/gpu_matrix.rs::GpuMatrixContext::lowdin_transform()`, `local_jacobi_blocks()` — batched diagonalization
-  - `qmqm/mixer.rs::SimpleMixer`, `DiisMixer` — host-side mixing
-  - `qmqm/gamma.rs::GammaTable::from_sk_data()` — gamma for intra-fragment shifts
-  - `qmqm/shifts.rs::compute_intra_shifts()` — intra-fragment SCC shifts (host-side)
-  - `methods/dftb/hamiltonian.rs::HamiltonianBuilder::build_scc()` — CPU reference
+  - `qmqm/gpu_runtime.rs::GpuRuntime` (from coordinator) — shared OpenCL context/queue/program.
+    Key API: `GpuRuntime::new() -> Result<Self>`, `rt.build_program(&mut self, source) -> Result<Program>`
+    (note: `&mut self` because of program cache), `rt.buffer_from_slice(&self, &[T]) -> Result<Buffer<T>>`,
+    `rt.zero_buffer<T: Default>(&self, len) -> Result<Buffer<T>>`, `rt.read_buffer(&self, &Buffer<T>, &mut [T])`,
+    `rt.queue() -> &Queue`, `rt.context() -> &Context`, `rt.caps() -> &GpuCapabilities`.
+  - `qmqm/gpu_driver.rs::GpuDriver::gpu_assemble_batched()` (from Agent_1, read-only) —
+    to get H0/S on GPU for testing. Note: `GpuDriver` has its own separate context/queue;
+    for your tests you can either use `GpuDriver` to produce H/S and then copy to host and
+    re-upload to `GpuRuntime` buffers, or just build H/S on CPU and upload via `GpuRuntime`.
+  - CPU `nalgebra` symmetric eigendecomposition for reference comparison
+- **Important:** The `cargo test` wrapper crashes with LLVM/clang. Use
+  `cargo test --test gpu_eigenproblem --no-run` then run the binary directly
+  from `~/.cargo-target-shared/debug/deps/`.
 
 ## Exclusive ownership
 
-- **May write:** `qmqm/gpu_driver.rs` (extend — Agent_1's code is the base), `tests/gpu_scc.rs` (new)
-- **Read-only:** `methods/dftb/dftb_hamiltonian.cl`, `qmqm/gpu_matrix.rs`, `qmqm/gpu_matrix_ops.cl`, `qmqm/gpu_prep.rs`, `qmqm/mixer.rs`, `qmqm/shifts.rs`, `qmqm/gamma.rs`, `methods/dftb/hamiltonian.rs`
-- **Must not:** edit kernel files, edit `gpu_matrix.rs` or `gpu_prep.rs` or `mixer.rs` or `shifts.rs`. If a change is needed, stop and report.
-
-If any required edit falls outside ownership, stop and propose it to the coordinator.
+- **May write:** `qmqm/gpu_eigen.cl` (new), `qmqm/gpu_eigen.rs` (new), `tests/gpu_eigenproblem.rs` (new)
+- **Read-only:** all other `src/` files
+- **Must not:** edit any file outside your ownership. If `GpuRuntime` API is insufficient, stop and report.
 
 ## Work and verification
 
-1. **Study Agent_1's handoff:** Read `GpuDriver` API from Agent_1's code. Understand `gpu_assemble_batched()` return type and buffer management. Read `gpu_matrix.rs` batched diagonalization API (`lowdin_transform`, `local_jacobi_blocks`).
+### 1. Write `qmqm/gpu_eigen.cl` — Brent-Luk Jacobi kernel
 
-2. **Implement `gpu_diagonalize_batched`:**
-   - Input: H_buf, S_buf (GPU buffers from `gpu_assemble_batched`), n (matrix size), batch (n_replicas)
-   - Compute S^{-1/2} on host (read S back, eigendecompose, reconstruct) — or on GPU if Agent_1 already does this
-   - Löwdin transform: H' = X^T·H·X via `lowdin_transform` (two batched GEMMs)
-   - Diagonalize H' via `local_jacobi_blocks` (batched, one workgroup per replica)
-   - Back-transform: C = X·C' (one batched GEMM)
-   - Read back eigenvalues (sorted ascending) and MO coefficients
-   - Return: eps_buf, C_buf (GPU buffers or host Vec)
+Implement `jacobi_cyclic_local_batched`:
+- Input: `__global const float* A` (batched symmetric matrices), `__global float* V`
+  (eigenvectors, initialized to identity), `int n`, `int batch`
+- Output: A overwritten with eigenvalues on diagonal, V holds eigenvectors
+- Layout: `A[batch][i][j]` at `batch*N*N + i*N + j`, same for V
+- One workgroup per system (`get_group_id(0) = system_index`)
+- Load A and V into `__local` with leading dimension `JLD = N+1`
+- For each round (0..N-2):
+  - N/2 work-items compute rotation parameters for their (p,q) pair
+  - `barrier(CLK_LOCAL_MEM_FENCE)`
+  - All work-items update 2×2 blocks of A: `B_ab = G_a^T · A_ab · G_b`
+  - All work-items update V: `V <- V · G`
+  - `barrier(CLK_LOCAL_MEM_FENCE)`
+- Store A (diagonal = eigenvalues) and V back to global
+- Multiple sweeps until off-diagonal norm < tolerance (or fixed 5-10 sweeps)
 
-3. **Implement Mulliken charges (host-side, per replica):**
-   - For each replica: D = 2·C_occ·C_occ^T (occupied = first n_electrons/2 columns)
-   - q_atom[i] = sum_j D[i,j]·S[i,j] (diagonal of D·S)
-   - delta_q[i] = q_atom[i] - q0[i]
-   - This can be done on host after reading back C and S — simpler than a GPU kernel
+Also implement `build_inv_sqrt_from_eig`:
+- Input: eigenvectors U, eigenvalues λ
+- Output: X = U · diag(rsqrt(λ)) · U^T
+- Load U into `__local`, compute `X_ij = sum_k U_ik * rsqrt(lambda_k) * U_jk`
+- Return λ_min per system for precision monitoring
 
-4. **Implement `gpu_solve_scc_batched`:**
-   ```rust
-   pub fn gpu_solve_scc_batched(
-       &self,
-       geometries: &[(Vec<String>, Vec<[f64;3]>)],  // N replicas
-       max_iter: usize,
-       tol: f64,
-   ) -> Result<SccBatchResult>
-   ```
-   - For each SCC iteration:
-     a. Build `GpuBatch` from all replicas' current charges (host-side `gpu_prep`)
-     b. `gpu_assemble_batched` → H, S on GPU
-     c. `gpu_diagonalize_batched` → eps, C on GPU
-     d. Read back C, eps to host
-     e. Compute Mulliken charges on host (per replica)
-     f. Compute residual = q_out - q_in
-     g. Mix: `SimpleMixer::mix` or `DiisMixer::mix` (host-side, per replica or global)
-     h. Check convergence: RMS residual < tol for all replicas
-     i. If not converged, update charges and repeat
-   - Return: `SccBatchResult { energies, charges, eigenvalues, n_iters, ... }`
+### 2. Write `qmqm/gpu_eigen.rs` — Rust host module
 
-5. **Implement `save_replica_data`:**
-   - For each replica, write binary file: `{dir}/replica_{i}.bin`
-   - Contents: H0 (f64, N²), S (f64, N²), H_scc (f64, N²), C (f64, N²), eps (f64, N), D (f64, N²), q (f64, N_atoms), E (f64, 1)
-   - Simple format: magic number + N + N_atoms + data arrays (no external dependency)
+- `pub fn jacobi_cyclic_local_batched(rt: &GpuRuntime, a_buf: &Buffer<f32>, v_buf: &Buffer<f32>, n: usize, batch: usize) -> Result<()>`
+  - Specializes kernel source by text substitution for given N
+  - Compiles program via `rt.build_program()`
+  - Launches with `global_size = batch * wg`, `local_size = wg`
+- `pub fn build_inv_sqrt(rt: &GpuRuntime, s_buf: &Buffer<f32>, n: usize, batch: usize) -> Result<(Buffer<f32>, Buffer<f32>)>`
+  - First calls `jacobi_cyclic_local_batched` on S
+  - Then launches `build_inv_sqrt_from_eig` kernel
+  - Returns (X_buf, lambda_min_buf)
+- Handle N padding: if N is odd, pad to N+1 with dummy state
 
-6. **Write `tests/gpu_scc.rs`:**
-   - `test_gpu_scc_parity_h2` — 1× H2, compare converged charges + energy vs CPU `build_scc`, tol 1e-5
-   - `test_gpu_scc_independent_h2o` — 10× H2O at different geometries, all in one batch, each matches CPU `build_scc` within 1e-5 energy, 1e-5 charges
-   - `test_gpu_save_replica_data` — run SCC, save data, read back, verify shapes and values
-   - Skip gracefully if no OpenCL device
+### 3. Write `tests/gpu_eigenproblem.rs` — tests + benchmarks
 
-7. **Run tests:**
-   ```bash
-   export RUST_DFTB_SK_DIR=/path/to/mio-1-1
-   cargo test --test gpu_scc -- --nocapture
-   ```
+Tests:
+- `test_jacobi_parity_h2` — H2 Hamiltonian (2×2), compare eigenvalues + eigenvectors vs CPU
+- `test_jacobi_parity_n2` — N2 Hamiltonian (8×8), compare vs CPU
+- `test_jacobi_parity_h2o` — H2O Hamiltonian (6×6), compare vs CPU
+- `test_jacobi_parity_ch4` — CH4 Hamiltonian (8×8), compare vs CPU
+- `test_inv_sqrt_h2` — S^{-1/2} for H2, compare vs CPU
+- `test_inv_sqrt_n2` — S^{-1/2} for N2, compare vs CPU
+- `test_inv_sqrt_h2o` — S^{-1/2} for H2O, compare vs CPU
+- `test_lambda_min_reporting` — verify λ_min is returned and reasonable
+- `test_batched_jacobi` — 10× H2O at different geometries, all in one launch
+- Skip gracefully if no OpenCL device or no SK dir
 
-**Commands:**
+Benchmarks:
+- `bench_jacobi_vs_old` — compare `jacobi_cyclic_local_batched` vs existing
+  `local_jacobi_blocks_parallel` at N=8,16,32,48,64 and batch=1,10,100,1000
+- Print timing per system for each configuration
+
+Tolerances:
+- Eigenvalues: < 1e-4 vs CPU (f32)
+- Eigenvectors: < 1e-3 vs CPU (f32, sign-insensitive)
+- S^{-1/2}: < 1e-3 vs CPU (f32)
+
+### 4. Run tests
 
 ```bash
-export RUST_DFTB_SK_DIR=/path/to/mio-1-1
-cargo test --test gpu_scc -- --nocapture
+export RUST_DFTB_SK_DIR=/home/prokophapala/SIMULATIONS/dftbplus/slakos/mio/mio-1-1
+cargo build
+# Run binary directly (cargo test wrapper has LLVM crash issue):
+/home/prokophapala/.cargo-target-shared/debug/deps/gpu_eigenproblem-<hash> --nocapture
+# Or: cargo test --test gpu_eigenproblem -- --nocapture
 ```
 
 **Expected deliverables:**
-- `qmqm/gpu_driver.rs` extended with `gpu_diagonalize_batched`, `gpu_solve_scc_batched`, `save_replica_data`
-- `tests/gpu_scc.rs` — 3 tests passing
-- SCC parity < 1e-5 energy, < 1e-5 charges (f32 GPU vs f64 CPU)
-- Binary data files saved correctly
+- `qmqm/gpu_eigen.cl` — Brent-Luk Jacobi + S^{-1/2} kernels
+- `qmqm/gpu_eigen.rs` — Rust host module with public API
+- `tests/gpu_eigenproblem.rs` — all tests pass, benchmark results recorded
+- Evidence: eigenvalue/eigenvector parity vs CPU for H2, N2, H2O, CH4
 
-## Handoff to coordinator/consumer
+## Handoff to coordinator
 
-When finished, write your handoff report directly into the `## Agent reports` section at
-the bottom of the **master** file (not this worker file). Check your checkbox `[ ]` → `[x]`
-in the master's dispatch checklist. Your report must include:
+When finished, write your handoff report into `## Agent reports` at the bottom of
+the **master** file. Check your checkbox `[ ]` → `[x]` in the dispatch checklist.
+Your report must include:
 
 1. Contract version and baseline used.
 2. Changed files and concise rationale.
 3. Exact commands plus full pass/fail results.
-4. Artifact and `REVIEW:` paths.
-5. Produced interface: `SccBatchResult` struct, `gpu_solve_scc_batched` signature, `save_replica_data` format (for Agent_5).
-6. Worst discrepancy, assumptions, unresolved risks, and requested coordinator edits.
+4. Benchmark results (Jacobi vs old, timing per system).
+5. Produced API: function signatures, kernel names, specialization parameters.
+6. Worst discrepancy (eigenvalues, eigenvectors, S^{-1/2}), λ_min values observed.
+7. Assumptions, unresolved risks, requested coordinator edits.
 
-You MAY edit only your own checkbox and your own report in the master file. Do not edit
-anything else in the master. Do not mark the aggregate task fixed/resolved/done.
+You MAY edit only your own checkbox and your own report in the master file.

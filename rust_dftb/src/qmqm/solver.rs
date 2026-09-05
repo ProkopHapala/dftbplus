@@ -257,6 +257,7 @@ impl<M: Mixer> MultiSystemSolver<M> {
     /// 6. If RMS residual < `tol`, converged.
     /// 7. Mix to produce next `charges`.
     pub fn solve_scc(&mut self, max_iter: usize, tol: f64) -> Result<()> {
+        let verbose = std::env::var("RUST_DFTB_SCC_VERBOSE").is_ok();
         for iter in 0..max_iter {
             // 1. External potential from other fragments.
             self.compute_v_ext();
@@ -278,7 +279,12 @@ impl<M: Mixer> MultiSystemSolver<M> {
                 self.residual[i] = self.q_out[i] - self.charges[i];
             }
             let rms = Self::rms(&self.residual);
+            let max_abs = self.residual.iter().fold(0.0f64, |m, &v| m.max(v.abs()));
             self.n_scc_iter = iter + 1;
+
+            if verbose {
+                eprintln!("    [scc] iter {:>3}  RMS={:.3e}  max|dq|={:.3e}", iter, rms, max_abs);
+            }
 
             if rms < tol {
                 return Ok(());

@@ -133,12 +133,11 @@ fn test_gpu_hs_parity_h2() {
     let ds = max_abs_diff(&ham_cpu.s, &s_gpu);
 
     eprintln!("H2 parity: max|dH| = {dh:e}, max|dS| = {ds:e}");
-    // Tolerance 1e-2: the GPU uses f32 + 64-point B-spline resampling of SK
-    // tables (in gpu_prep.rs, SK_RESAMPLE_N=64). The resampling/interpolation
-    // error dominates at ~3e-3..8e-3. The frozen contract tolerance of 1e-5 is
-    // not achievable with this approach — see handoff report for details.
-    assert!(dh < 1e-2, "H2 H parity failed: max|dH| = {dh:e}\nCPU:\n{}\nGPU:\n{}", ham_cpu.h0, h_gpu);
-    assert!(ds < 1e-2, "H2 S parity failed: max|dS| = {ds:e}\nCPU:\n{}\nGPU:\n{}", ham_cpu.s, s_gpu);
+    // Tolerance 1e-5: GPU f32 + original grid (499 pts) with B-spline control
+    // point conversion. Off-by-one grid convention fixed 2026-09-06.
+    // Achieved: ~1e-8 for H2 (s-only).
+    assert!(dh < 1e-5, "H2 H parity failed: max|dH| = {dh:e}\nCPU:\n{}\nGPU:\n{}", ham_cpu.h0, h_gpu);
+    assert!(ds < 1e-5, "H2 S parity failed: max|dS| = {ds:e}\nCPU:\n{}\nGPU:\n{}", ham_cpu.s, s_gpu);
 }
 
 // ==================================================================
@@ -177,9 +176,10 @@ fn test_gpu_hs_parity_n2() {
     let ds = max_abs_diff(&ham_cpu.s, &s_gpu);
 
     eprintln!("N2 parity: max|dH| = {dh:e}, max|dS| = {ds:e}");
-    // Tolerance 1e-2: f32 + 64-point B-spline resampling (see H2 test note).
-    assert!(dh < 1e-2, "N2 H parity failed: max|dH| = {dh:e}\nCPU:\n{}\nGPU:\n{}", ham_cpu.h0, h_gpu);
-    assert!(ds < 1e-2, "N2 S parity failed: max|dS| = {ds:e}\nCPU:\n{}\nGPU:\n{}", ham_cpu.s, s_gpu);
+    // Tolerance 1e-5: GPU f32 + original grid with B-spline control points.
+    // Achieved: ~1e-7 for N2 (sp-sp, 4-channel).
+    assert!(dh < 1e-5, "N2 H parity failed: max|dH| = {dh:e}\nCPU:\n{}\nGPU:\n{}", ham_cpu.h0, h_gpu);
+    assert!(ds < 1e-5, "N2 S parity failed: max|dS| = {ds:e}\nCPU:\n{}\nGPU:\n{}", ham_cpu.s, s_gpu);
 }
 
 // ==================================================================
@@ -236,7 +236,7 @@ fn test_gpu_multi_replica() {
     }
 
     eprintln!("multi-replica worst: replica {worst_idx}, max|dH|={worst_dh:e}, max|dS|={worst_ds:e}");
-    // Tolerance 1e-2: f32 + 64-point B-spline resampling (see H2 test note).
-    assert!(worst_dh < 1e-2, "multi-replica H parity failed: max|dH| = {worst_dh:e}");
-    assert!(worst_ds < 1e-2, "multi-replica S parity failed: max|dS| = {worst_ds:e}");
+    // Tolerance 1e-5: GPU f32 + original grid with B-spline control points.
+    assert!(worst_dh < 1e-5, "multi-replica H parity failed: max|dH| = {worst_dh:e}");
+    assert!(worst_ds < 1e-5, "multi-replica S parity failed: max|dS| = {worst_ds:e}");
 }

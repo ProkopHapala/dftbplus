@@ -17,6 +17,8 @@ pub mod shifts;
 pub mod gpu_prep;
 pub mod gpu_matrix;
 pub mod gpu_driver;
+pub mod gpu_runtime;
+pub mod gpu_eigen;
 pub use crate::core::charges;
 pub mod solver;
 
