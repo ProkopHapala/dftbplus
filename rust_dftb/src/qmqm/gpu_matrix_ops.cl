@@ -841,3 +841,130 @@ __kernel void residual_and_mix_batched(
     }
     if (lid == 0) rms[sid] = sqrt(scratch[0]);
 }
+
+// ------------------------------------------------------------------
+// delta_q_batched
+//
+// dq[a] = q[a] - q0[a]  per atom, per system.
+// One workgroup per system, threads stride over atoms.
+// ------------------------------------------------------------------
+__kernel void delta_q_batched(
+    const int n_atoms,
+    const int batch,
+    __global const float* q,
+    __global const float* q0,
+    __global float* dq
+) {
+    const int sid = get_group_id(0);
+    const int lid = get_local_id(0);
+    const int lsz = get_local_size(0);
+    if (sid >= batch) return;
+    __global const float* qb  = q  + (size_t)sid * n_atoms;
+    __global const float* q0b = q0 + (size_t)sid * n_atoms;
+    __global float* dqb       = dq + (size_t)sid * n_atoms;
+    for (int a = lid; a < n_atoms; a += lsz) {
+        dqb[a] = qb[a] - q0b[a];
+    }
+}
+
+// ------------------------------------------------------------------
+// build_density_masked_batched
+//
+// D = 2 * sum_{k: occ[k]!=0} C[:,k] * C[:,k]^T  (closed-shell density).
+// C is [batch][N*N] row-major: C[i*N + k] = coefficient of orbital i
+// in MO k.  occ_mask is [batch][N] int (1=occupied, 0=virtual).
+// One workgroup per system, threads stride over N*N elements.
+// ------------------------------------------------------------------
+__kernel void build_density_masked_batched(
+    const int n,
+    const int batch,
+    __global const float* C,
+    __global const int* occ_mask,
+    __global float* D
+) {
+    const int sid = get_group_id(0);
+    const int lid = get_local_id(0);
+    const int lsz = get_local_size(0);
+    if (sid >= batch) return;
+    __global const float* Cb = C + (size_t)sid * n * n;
+    __global const int* mb   = occ_mask + (size_t)sid * n;
+    __global float* Db       = D + (size_t)sid * n * n;
+    const int nn = n * n;
+    for (int idx = lid; idx < nn; idx += lsz) {
+        const int i = idx / n;
+        const int j = idx - i * n;
+        float s = 0.0f;
+        for (int k = 0; k < n; ++k) {
+            s += (float)mb[k] * Cb[i * n + k] * Cb[j * n + k];
+        }
+        Db[idx] = 2.0f * s;
+    }
+}
+
+// ------------------------------------------------------------------
+// frobenius_trace_batched
+//
+// tr[sid] = sum_{i,j} A[i,j] * B[i,j]  (Frobenius inner product).
+// For symmetric matrices this equals Tr(A·B).
+// One workgroup per system, tree reduction in __local.
+// ------------------------------------------------------------------
+__kernel void frobenius_trace_batched(
+    const int n,
+    const int batch,
+    __global const float* A,
+    __global const float* B,
+    __global float* tr,
+    __local float* scratch
+) {
+    const int sid = get_group_id(0);
+    const int lid = get_local_id(0);
+    const int lsz = get_local_size(0);
+    if (sid >= batch) return;
+    __global const float* Ab = A + (size_t)sid * n * n;
+    __global const float* Bb = B + (size_t)sid * n * n;
+    const int nn = n * n;
+    float partial = 0.0f;
+    for (int idx = lid; idx < nn; idx += lsz) {
+        partial += Ab[idx] * Bb[idx];
+    }
+    scratch[lid] = partial;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int off = lsz >> 1; off > 0; off >>= 1) {
+        if (lid < off) scratch[lid] += scratch[lid + off];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (lid == 0) tr[sid] = scratch[0];
+}
+
+// ------------------------------------------------------------------
+// dot_batched
+//
+// dot[sid] = sum_a x[a] * y[a]  per system.
+// One workgroup per system, tree reduction.
+// ------------------------------------------------------------------
+__kernel void dot_batched(
+    const int n,
+    const int batch,
+    __global const float* x,
+    __global const float* y,
+    __global float* dot,
+    __local float* scratch
+) {
+    const int sid = get_group_id(0);
+    const int lid = get_local_id(0);
+    const int lsz = get_local_size(0);
+    if (sid >= batch) return;
+    __global const float* xb = x + (size_t)sid * n;
+    __global const float* yb = y + (size_t)sid * n;
+    float partial = 0.0f;
+    for (int a = lid; a < n; a += lsz) {
+        partial += xb[a] * yb[a];
+    }
+    scratch[lid] = partial;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int off = lsz >> 1; off > 0; off >>= 1) {
+        if (lid < off) scratch[lid] += scratch[lid + off];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (lid == 0) dot[sid] = scratch[0];
+}

@@ -22,7 +22,7 @@ use rust_dftb::methods::sparse::{
     build_full_mask, build_geometric_mask,
 };
 use rust_dftb::{
-    HamiltonianBuilder, SccResult, load_sk_for_species,
+    HamiltonianBuilder, SccResult, SystemContext, load_sk_for_species,
 };
 use nalgebra::{DMatrix, DVector, SymmetricEigen};
 use rhai::{Array, Dynamic, Engine, Scope, INT};
@@ -116,14 +116,8 @@ fn rhai_run_dftb_scc(name: &str, sk_dir: &str, max_iter: INT, tol: f64) -> Dynam
         return Dynamic::from_float(f64::NAN);
     };
 
-    // Check all atoms have 4 orbitals (BSR4 requirement)
-    for sp in &species {
-        if sp == "H" {
-            eprintln!("ERROR: geometry contains H — BSR4 requires all atoms to have 4 orbitals (s,p). Use pure-carbon systems (no passivation) for sparse tests.");
-            return Dynamic::from_float(f64::NAN);
-        }
-    }
-
+    // Dense SCC supports arbitrary species (H, C, N, O, ...).
+    // The BSR4 4-orbital restriction only applies to the sparse TC2 path.
     eprintln!("Loading SK tables from {sk_dir} ...");
     let sk = match load_sk_for_species(sk_dir, &species) {
         Ok(sk) => sk,
@@ -131,6 +125,7 @@ fn rhai_run_dftb_scc(name: &str, sk_dir: &str, max_iter: INT, tol: f64) -> Dynam
     };
 
     let builder = HamiltonianBuilder::new(sk);
+    eprintln!("[SCC] Starting '{name}': {} atoms, {} orbitals, max_iter={max_iter}, tol={tol}", species.len(), species.len() * 4);
     eprintln!("Running dense DFTB SCC (max_iter={max_iter}, tol={tol}) ...");
     match builder.build_scc(&species, &coords, max_iter as usize, tol) {
         Ok(scc) => {
@@ -169,13 +164,23 @@ fn rhai_run_dftb_nonscc(name: &str, sk_dir: &str) -> Dynamic {
     };
 
     let builder = HamiltonianBuilder::new(sk);
-    eprintln!("Building non-SCC Hamiltonian ...");
-    match builder.build_non_scc_sp_only(&species, &coords) {
+    eprintln!("[non-SCC] '{name}': {} atoms, building H0/S ...", species.len());
+    match builder.build_non_scc(&species, &coords) {
         Ok(ham) => {
             let n_orbs = ham.h0.nrows();
             eprintln!("  H0: {n_orbs}×{n_orbs}");
 
-            // Solve generalized eigenproblem H0 c = S c ε
+            // Build SystemContext for per-atom orbital counts (handles H with 1 orb, C with 4)
+            let ctx = match SystemContext::from_sk_data(&builder.sk, &species) {
+                Ok(c) => c,
+                Err(e) => { eprintln!("ERROR SystemContext: {e}"); return Dynamic::from_float(f64::NAN); }
+            };
+            let atom_n_orb = ctx.atom_n_orb.clone();
+            let atom_orb_off = ctx.atom_orb_off.clone();
+
+            // Solve generalized eigenproblem H0 c = S c ε (dense reference)
+            let t0 = std::time::Instant::now();
+            eprintln!("  [dense] S eigendecomp ...");
             let s_inv_sqrt = {
                 let se = SymmetricEigen::new(ham.s.clone());
                 let mut d = DMatrix::<f64>::zeros(n_orbs, n_orbs);
@@ -184,8 +189,10 @@ fn rhai_run_dftb_nonscc(name: &str, sk_dir: &str) -> Dynamic {
                 }
                 &se.eigenvectors * &d * se.eigenvectors.transpose()
             };
+            eprintln!("  [dense] H' = S^(-1/2) H S^(-1/2) eigendecomp ...");
             let h_orth = &s_inv_sqrt * &ham.h0 * &s_inv_sqrt;
             let he = SymmetricEigen::new(h_orth);
+            eprintln!("  [dense] done in {:.2}s", t0.elapsed().as_secs_f64());
             // Sort ascending
             let mut idx: Vec<usize> = (0..n_orbs).collect();
             idx.sort_by(|&i, &j| he.eigenvalues[i].partial_cmp(&he.eigenvalues[j]).unwrap());
@@ -205,15 +212,14 @@ fn rhai_run_dftb_nonscc(name: &str, sk_dir: &str) -> Dynamic {
             let e_band = (&density * &ham.h0).trace();
             eprintln!("  band energy = {e_band:.10} Ha");
 
-            // Mulliken charges
+            // Mulliken charges — per-atom orbital count (H=1, C=4)
             let ds = &density * &ham.s;
             let mut charges = Vec::with_capacity(species.len());
-            let mut off = 0;
             for i in 0..species.len() {
-                let n_orb_i = 4; // sp basis
+                let n_orb_i = atom_n_orb[i] as usize;
+                let off = atom_orb_off[i] as usize;
                 let q = (0..n_orb_i).map(|k| ds[(off + k, off + k)]).sum::<f64>();
                 charges.push(q);
-                off += n_orb_i;
             }
             eprintln!("  Mulliken charges: {:?}", charges.iter()
                 .map(|q| format!("{q:.4}")).collect::<Vec<_>>());

@@ -253,4 +253,189 @@ impl Rotation {
 
         Ok(())
     }
+
+    /// Assemble the full diatomic block AND its Cartesian derivatives for a species pair.
+    /// P8: analytic derivatives — replaces 6 finite-difference block evaluations.
+    ///
+    /// Outputs (all row-major, size n_orb2*n_orb1):
+    ///   out_h, out_s: H and S blocks
+    ///   dh_dx, dh_dy, dh_z: dH/dR_a for a=x,y,z (derivative w.r.t. atom j position)
+    ///   ds_dx, ds_dy, ds_z: dS/dR_a for a=x,y,z
+    ///
+    /// Derivative formulas (GPT 5.6 §10):
+    ///   u = R_vec/R, u_a = R_a/R
+    ///   dR/dR_a = u_a
+    ///   du_i/dR_a = (δ_ia - u_i*u_a) / R
+    ///
+    ///   ss: H = V(r), dH/dR_a = V'(r) * u_a
+    ///   sp: H_i = u_i * V(r), dH_i/dR_a = (δ_ia - u_i*u_a)/R * V + u_i * V' * u_a
+    ///   pp: H_ij = V_π*δ_ij + (V_σ-V_π)*u_i*u_j
+    ///       dH_ij/dR_a = V'_π*u_a*δ_ij + ΔV'*u_a*u_i*u_j
+    ///                  + ΔV/R * [(δ_ia-u_i*u_a)*u_j + u_i*(δ_ja-u_j*u_a)]
+    pub fn rotate_block_with_derivs_into(
+        tab_fwd: &SkTableSp,
+        tab_rev: &SkTableSp,
+        ang1_list: &[i32],
+        ang2_list: &[i32],
+        r: f64,
+        dc: DirectionCosines,
+        out_h: &mut [f64], out_s: &mut [f64],
+        dh_dx: &mut [f64], dh_dy: &mut [f64], dh_dz: &mut [f64],
+        ds_dx: &mut [f64], ds_dy: &mut [f64], ds_dz: &mut [f64],
+    ) -> Result<()> {
+        let n_orb1: usize = ang1_list.iter().map(|&l| (2 * l + 1) as usize).sum();
+        let n_orb2: usize = ang2_list.iter().map(|&l| (2 * l + 1) as usize).sum();
+        let block_size = n_orb2 * n_orb1;
+        assert!(out_h.len() >= block_size);
+        for buf in [&mut *dh_dx, &mut *dh_dy, &mut *dh_dz, &mut *ds_dx, &mut *ds_dy, &mut *ds_dz] {
+            assert!(buf.len() >= block_size);
+            buf[..block_size].fill(0.0);
+        }
+        out_h[..block_size].fill(0.0);
+        out_s[..block_size].fill(0.0);
+
+        let (l, m, n) = (dc.l, dc.m, dc.n);
+        let inv_r = if r > 1e-12 { 1.0 / r } else { 0.0 };
+        // Direction cosines u = (l, m, n) = R_vec/R
+        // u_x = l, u_y = m, u_z = n
+        // du_i/dR_a = (δ_ia - u_i*u_a) / R
+
+        let mut sk_h = [0.0f64; 4]; let mut sk_s = [0.0f64; 4];
+        let mut dh_dr = [0.0f64; 4]; let mut ds_dr = [0.0f64; 4];
+
+        let mut i_col = 0;
+        for &ang1 in ang1_list {
+            let n1 = (2 * ang1 + 1) as usize;
+            let mut i_row = 0;
+            for &ang2 in ang2_list {
+                let n2 = (2 * ang2 + 1) as usize;
+                let tab = if ang1 <= ang2 { tab_fwd } else { tab_rev };
+                let n_mm = tab.eval_shell_integrals_and_derivs_into(
+                    ang1, ang2, r, &mut sk_h, &mut sk_s, &mut dh_dr, &mut ds_dr,
+                )?;
+                let sub = n2 * n1;
+
+                // Compute sub-block values and derivatives
+                let (sh, sdh_x, sdh_y, sdh_z) = Self::shell_pair_with_derivs(
+                    ang1, ang2, &sk_h[..n_mm], &dh_dr[..n_mm], dc, r,
+                );
+                let (ss_, sds_x, sds_y, sds_z) = Self::shell_pair_with_derivs(
+                    ang1, ang2, &sk_s[..n_mm], &ds_dr[..n_mm], dc, r,
+                );
+
+                if ang1 <= ang2 {
+                    for a in 0..n2 {
+                        for b in 0..n1 {
+                            let idx = (i_row + a) * n_orb1 + (i_col + b);
+                            let sidx = a * n1 + b;
+                            out_h[idx] = sh[sidx];
+                            out_s[idx] = ss_[sidx];
+                            dh_dx[idx] = sdh_x[sidx]; dh_dy[idx] = sdh_y[sidx]; dh_dz[idx] = sdh_z[sidx];
+                            ds_dx[idx] = sds_x[sidx]; ds_dy[idx] = sds_y[sidx]; ds_dz[idx] = sds_z[sidx];
+                        }
+                    }
+                } else {
+                    let sign = if (ang1 + ang2) % 2 == 0 { 1.0 } else { -1.0 };
+                    for a in 0..n2 {
+                        for b in 0..n1 {
+                            let idx = (i_row + a) * n_orb1 + (i_col + b);
+                            let sidx = b * n2 + a; // transpose
+                            out_h[idx] = sign * sh[sidx];
+                            out_s[idx] = sign * ss_[sidx];
+                            dh_dx[idx] = sign * sdh_x[sidx]; dh_dy[idx] = sign * sdh_y[sidx]; dh_dz[idx] = sign * sdh_z[sidx];
+                            ds_dx[idx] = sign * sds_x[sidx]; ds_dy[idx] = sign * sds_y[sidx]; ds_dz[idx] = sign * sds_z[sidx];
+                        }
+                    }
+                }
+                i_row += n2;
+            }
+            i_col += n1;
+        }
+        Ok(())
+    }
+
+    /// Compute shell-pair block and Cartesian derivatives.
+    /// Returns (values[9], dh_dx[9], dh_dy[9], dh_dz[9]) — only first sub elements are valid.
+    /// Derivative is w.r.t. atom j position (R_vec = r_j - r_i).
+    fn shell_pair_with_derivs(
+        ang1: i32, ang2: i32,
+        sk: &[f64], dsk_dr: &[f64],
+        dc: DirectionCosines, r: f64,
+    ) -> ([f64; 9], [f64; 9], [f64; 9], [f64; 9]) {
+        let (l, m, nn) = (dc.l, dc.m, dc.n);
+        let inv_r = if r > 1e-12 { 1.0 / r } else { 0.0 };
+        let mut val = [0.0f64; 9];
+        let mut dx = [0.0f64; 9];
+        let mut dy = [0.0f64; 9];
+        let mut dz = [0.0f64; 9];
+
+        // u = (l, m, n) = R_vec/R. Component mapping: u_x=l, u_y=m, u_z=n
+        // du_i/dR_a = (δ_ia - u_i*u_a) / R
+        // For a=x: du_x/dR_x = (1-l²)/R, du_y/dR_x = -m*l/R, du_z/dR_x = -n*l/R
+        // For a=y: du_x/dR_y = -l*m/R, du_y/dR_y = (1-m²)/R, du_z/dR_y = -n*m/R
+        // For a=z: du_x/dR_z = -l*n/R, du_y/dR_z = -m*n/R, du_z/dR_z = (1-n²)/R
+
+        match (ang1, ang2) {
+            (0, 0) => {
+                // H = V(r), dH/dR_a = V'(r) * u_a
+                val[0] = sk[0];
+                dx[0] = dsk_dr[0] * l;
+                dy[0] = dsk_dr[0] * m;
+                dz[0] = dsk_dr[0] * nn;
+            }
+            (0, 1) | (1, 0) => {
+                // H_i = u_i * V(r)  (i = y,z,x → indices 0,1,2)
+                // dH_i/dR_a = du_i/dR_a * V + u_i * V' * u_a
+                let v = sk[0]; let vp = dsk_dr[0];
+                // i=y (idx 0): u_y = m
+                val[0] = m * v;
+                dx[0] = (-m*l*inv_r) * v + m * vp * l;
+                dy[0] = ((1.0-m*m)*inv_r) * v + m * vp * m;
+                dz[0] = (-m*nn*inv_r) * v + m * vp * nn;
+                // i=z (idx 1): u_z = n
+                val[1] = nn * v;
+                dx[1] = (-nn*l*inv_r) * v + nn * vp * l;
+                dy[1] = (-nn*m*inv_r) * v + nn * vp * m;
+                dz[1] = ((1.0-nn*nn)*inv_r) * v + nn * vp * nn;
+                // i=x (idx 2): u_x = l
+                val[2] = l * v;
+                dx[2] = ((1.0-l*l)*inv_r) * v + l * vp * l;
+                dy[2] = (-l*m*inv_r) * v + l * vp * m;
+                dz[2] = (-l*nn*inv_r) * v + l * vp * nn;
+            }
+            (1, 1) => {
+                // H_ij = V_π*δ_ij + (V_σ-V_π)*u_i*u_j
+                // sk[0] = V_σ, sk[1] = V_π
+                let vs = sk[0]; let vp = sk[1];
+                let dvs = dsk_dr[0]; let dvp = dsk_dr[1];
+                let dv = vs - vp; let dvp_total = dvs - dvp;
+                let ui = [m, nn, l]; // i=y,z,x (indices 0,1,2)
+                let ua = [l, m, nn]; // a=x,y,z
+                // Orbital i maps to direction a via: i=0(y)→a=1(y), i=1(z)→a=2(z), i=2(x)→a=0(x)
+                // So delta_ia = 1 when a == (i+1)%3
+                for i in 0..3 {
+                    for j in 0..3 {
+                        let idx = i * 3 + j;
+                        let delta_ij = if i == j { 1.0 } else { 0.0 };
+                        val[idx] = vp * delta_ij + dv * ui[i] * ui[j];
+                        for a in 0..3 {
+                            let ua_a = ua[a];
+                            let delta_ia = if a == (i + 1) % 3 { 1.0 } else { 0.0 };
+                            let delta_ja = if a == (j + 1) % 3 { 1.0 } else { 0.0 };
+                            let dval = dvp * ua_a * delta_ij
+                                + dvp_total * ua_a * ui[i] * ui[j]
+                                + dv * inv_r * ((delta_ia - ui[i]*ua_a) * ui[j] + ui[i] * (delta_ja - ui[j]*ua_a));
+                            match a {
+                                0 => dx[idx] = dval,
+                                1 => dy[idx] = dval,
+                                _ => dz[idx] = dval,
+                            }
+                        }
+                    }
+                }
+            }
+            _ => panic!("unsupported shell pair ({},{})", ang1, ang2),
+        }
+        (val, dx, dy, dz)
+    }
 }

@@ -282,7 +282,7 @@ impl<M: Mixer> MultiSystemSolver<M> {
             let max_abs = self.residual.iter().fold(0.0f64, |m, &v| m.max(v.abs()));
             self.n_scc_iter = iter + 1;
 
-            if verbose {
+            if verbose || iter % 10 == 0 || iter < 3 {
                 eprintln!("    [scc] iter {:>3}  RMS={:.3e}  max|dq|={:.3e}", iter, rms, max_abs);
             }
 

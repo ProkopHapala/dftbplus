@@ -1,6 +1,6 @@
 # rust_dftb — Master Roadmap & Status Checklist
 
-**Last updated:** 2025-09-05
+**Last updated:** 2025-09-06
 **Maintained by:** prokop / Devin
 **Purpose:** Single source of truth for what is done (`[*]`) and what is not (`[ ]`)
 across the whole `rust_dftb` reimplementation (DFTB, xTB, QM/QM multi-system, OpenCL GPU).
@@ -27,7 +27,8 @@ file/function where the work should land.
 
 ### 1.1 Non-SCC H0 / S assembly
 - [*] SK file I/O & shell integral extraction — `methods/dftb/sk_data.rs::load_sk_folder`, `::eval_shell_integrals_into`, `::onsite`
-- [*] Neville 8-point interpolation on uniform grid — `methods/dftb/interpolation.rs::EqGridTable::eval_into`, `poly_inter_uniform_into`
+- [*] Cubic Hermite spline interpolation on uniform grid (replaces Neville 8-point) — `methods/dftb/interpolation.rs::EqGridTable::new` (precomputes derivatives), `eval_hermite_into`, `eval_hermite_with_deriv_into`. O(n_integ) per eval (4 FMAs/ch) vs Neville O(n²)=64. Tail [last_grid_r, r_max] delegates to Neville `poly5_to_zero` for exact parity.
+- [*] Neville 8-point interpolation retained as fallback/parity reference — `methods/dftb/interpolation.rs::eval_eqgrid_new_into`, `EqGridTable::eval_neville_into`
 - [*] `r_max` hard cutoff matching Fortran `slakoeqgrid.F90` (bug fixed) — `methods/dftb/interpolation.rs::eval_eqgrid_new_into`
 - [*] Diatomic rotation matrices, direction cosines — `methods/dftb/rotation.rs::Rotation::rotate_diatomic_block_into`, `DirectionCosines::from_vec`
 - [*] Generic `build_non_scc()` (s,p,d) — `methods/dftb/hamiltonian.rs::HamiltonianBuilder::build_non_scc`, `fill_pairs`, `fill_onsite`
@@ -48,18 +49,19 @@ file/function where the work should land.
 - [ ] **LAPACK triangular solves** (replace nalgebra `solve_lower_triangular` with `dtrtrs`) — target: `qmqm/fragment.rs::diagonalize`; see `eigensolver_performance.md`
 
 ### 1.3 Forces  ← `Forces_Implementation_Notes.md`
-- [ ] Density matrix DM exposed in `SccResult` — target: `methods/dftb/hamiltonian.rs::SccResult` (add `density` field)
-- [ ] Energy-weighted density matrix EDM — target: `methods/dftb/hamiltonian.rs::build_scc` (compute `2·C_occ·diag(eps)·C_occ^T`)
-- [ ] Finite-difference dH0/dx, dS/dx (delta = eps^0.25) — target: `methods/dftb/forces.rs` (new), reuses `rotation.rs::rotate_diatomic_block_into` + `interpolation.rs::eval_into`
-- [ ] Repulsive spline parsing from SK file — target: `methods/dftb/sk_data.rs::read_skf_all` / new `parse_spline_section`
-- [ ] F_nonSCC = 2·(DM·dH0' − EDM·dS') — target: `methods/dftb/forces.rs::non_scc_forces`
-- [ ] F_rep = dE_rep/dr · r_hat — target: `methods/dftb/forces.rs::repulsive_forces` (spline eval from `splinerep.F90` analog)
-- [ ] `gamma_prime_full(r, U1, U2)` — target: `methods/dftb/gamma.rs` (mirror `shortgammafuncs.F90::expGammaPrime`)
-- [ ] F_SCC_dc (gamma + 1/R Coulomb) — target: `methods/dftb/forces.rs::scc_dc_forces`
-- [ ] F_SCC_shift (Pulay-like, needs block-resolved shifts) — target: `methods/dftb/forces.rs::scc_shift_forces`; needs block shifts from `qmqm/shifts.rs::compute_intra_shifts`
-- [ ] `tests/parity_forces.rs` + `tests/run_forces.py` — target: new test + driver (parse "Total Forces" from `detailed.out`)
-- [ ] Non-SCC force parity vs Fortran — target: `tests/parity_forces.rs::non_scc_forces_from_xyz`
-- [ ] Full SCC force parity vs Fortran — target: `tests/parity_forces.rs::scc_forces_from_xyz`
+- [*] Density matrix DM exposed in `SccResult` — `methods/dftb/hamiltonian.rs::SccResult`
+- [*] Energy-weighted density matrix EDM — `methods/dftb/hamiltonian.rs::build_scc`
+- [*] Analytic dH0/dx, dS/dx (replaces finite-difference, P7/P8/P12) — `methods/dftb/rotation.rs::rotate_block_with_derivs_into` + `interpolation.rs::eval_with_deriv_into` (Hermite analytic derivative)
+- [*] Repulsive spline parsing from SK file — `methods/dftb/sk_data.rs::read_skf_all`
+- [*] F_nonSCC = 2·(DM·dH0' − EDM·dS') — `methods/dftb/forces.rs::non_scc_forces`
+- [*] F_rep = dE_rep/dr · r_hat — `methods/dftb/forces.rs::repulsive_forces`
+- [*] `gamma_prime_full(r, U1, U2)` — `methods/dftb/gamma.rs`
+- [*] F_SCC_dc (gamma + 1/R Coulomb) — `methods/dftb/forces.rs::scc_dc_forces`
+- [*] F_SCC_shift (Pulay-like) — `methods/dftb/forces.rs::scc_shift_forces`
+- [*] `tests/parity_forces.rs` + `tests/run_forces.py` — force parity vs Fortran
+- [*] Non-SCC force parity vs Fortran — `tests/parity_forces.rs::non_scc_forces_from_xyz`
+- [*] Full SCC force parity vs Fortran — `tests/parity_forces.rs::scc_forces_from_xyz`
+- [*] Analytic force parity vs finite-difference baseline: max|F|=4.7305 exact match, energy 7 sig figs — `examples/hbond_ref.rs`
 
 ---
 
@@ -205,16 +207,22 @@ file/function where the work should land.
 - [ ] Benchmark: Brent-Luk vs `local_jacobi_blocks_parallel` at N=8,16,32,48,64, batch=1,10,100,1000 — target: `tests/gpu_eigenproblem.rs::bench_jacobi_*` (new)
 
 ### 6.2 Device-resident SCC (Stage 3, D11)
-- [ ] **Gamma precompute kernel** (D15) — dense N_atom×N_atom matrix per system, once per geometry — target: `qmqm/gpu_matrix_ops.cl::build_gamma_matrix` (new)
-- [ ] **Gamma matvec kernel** — V_A = G·Δq, batched — target: `qmqm/gpu_matrix_ops.cl::gamma_matvec_batched` (new)
-- [ ] **H_scc_update kernel** (§4.4) — H = H0 + 0.5·S·(V_i+V_j), elementwise — target: `qmqm/gpu_matrix_ops.cl::h_scc_update` (new)
-- [ ] **Mulliken charges kernel** — q = diag(D·S), batched — target: `qmqm/gpu_matrix_ops.cl::mulliken_charges` (new)
-- [ ] **Residual + simple mixer kernel** — RMS = ||q_new - q_old||, q_mixed = α·q_new + (1-α)·q_old — target: `qmqm/gpu_matrix_ops.cl::residual_and_mix` (new)
-- [ ] **Active mask** (§2.2) — active[system] flag, converged systems early-return — target: `qmqm/gpu_driver.rs` (active mask buffer + kernel early-return)
-- [ ] **SCC loop driver** — host enqueues kernel sequence per iteration, no readback until convergence — target: `qmqm/gpu_driver.rs::gpu_solve_scc_batched` (new)
-- [ ] **SCC optimization** (D16) — precompute H'0 = X·H0·X once, then ~1 GEMM per SCC iter — target: `qmqm/gpu_driver.rs` (optional optimization, after basic SCC works)
-- [ ] End-to-end GPU SCC parity vs CPU SCC — target: `tests/gpu_scc.rs::test_gpu_scc_parity_h2`, `_n2`, `_h2o` (compare vs `HamiltonianBuilder::build_scc`)
-- [ ] Per-replica data save (H0, S, H_scc, C, ε, D, q, E as f32 binary) — target: `qmqm/gpu_driver.rs::save_replica_data`
+- [*] **Gamma precompute kernel** (D15) — dense N_atom×N_atom matrix per system, once per geometry — host-built, uploaded; `tests/gpu_scc_kernels.rs::build_gamma_matrix`
+- [*] **Gamma matvec kernel** — V_A = G·Δq, batched — `qmqm/gpu_matrix_ops.cl::gamma_matvec_batched`; parity <2.3e-9
+- [*] **H_scc_update kernel** (§4.4) — H = H0 + 0.5·S·(V_i+V_j), elementwise — `qmqm/gpu_matrix_ops.cl::h_scc_update_batched`; parity <3e-8
+- [*] **Mulliken charges kernel** — q = diag(D·S), batched — `qmqm/gpu_matrix_ops.cl::mulliken_charges_batched`; parity <4.8e-7
+- [*] **Residual + simple mixer kernel** — RMS = ||q_new - q_old||, q_mixed = α·q_new + (1-α)·q_old — `qmqm/gpu_matrix_ops.cl::residual_and_mix_batched`; parity <1.5e-8
+- [*] **Density build kernel** — D = 2·Σ_{k∈occ} C[:,k]·C[:,k]^T with occupation mask — `qmqm/gpu_matrix_ops.cl::build_density_masked_batched` (new, Wave 3)
+- [*] **Frobenius trace + dot kernels** — for energy computation Tr(D·H0) and Σ Δq·V — `qmqm/gpu_matrix_ops.cl::frobenius_trace_batched`, `dot_batched` (new, Wave 3)
+- [ ] **Active mask** (§2.2) — active[system] flag, converged systems early-return — target: `qmqm/gpu_scc.rs` (TODO: all systems run all iterations currently)
+- [*] **SCC loop driver** — host enqueues kernel sequence per iteration, minimal readback (RMS + occ_mask only) — `qmqm/gpu_scc.rs::gpu_solve_scc_batched` (new, Wave 3)
+- [*] **CPU-driven DIIS mixer** — `gpu_solve_scc_batched_diis`, `gpu_solve_scc_batched_diis_warmstart` — DIIS on CPU driving GPU charge vectors. 13 iters vs 60-192 for simple mix.
+- [*] **Warm-start + best-effort mode** — `gpu_solve_scc_batched_diis_warmstart` accepts separate init_q; `best_effort` flag returns per-system RMS for unconverged points
+- [*] **Per-system RMS diagnostics** — reports 10 worst systems on nonconvergence
+- [ ] **SCC optimization** (D16) — precompute H'0 = X·H0·X once, then ~1 GEMM per SCC iter — target: `qmqm/gpu_scc.rs` (optional optimization, after basic SCC works)
+- [*] End-to-end GPU SCC parity vs CPU SCC — `tests/gpu_scc.rs`: H2O |dE|<3e-7, N2 |dE|<1e-6, 10× H2O |dE|<1e-6; `tests/hbond_gpu_scc.rs`: formic dimer 1D scan (21 pts, 28 orbs) |dE|<2e-5, |dq|<6e-6; `tests/formic_scan_plots.rs`: 1D (41 pts) |dE|<3.6e-6, 2D (21×21) 147/441 converged (CPU also fails on asymmetric pts)
+- [ ] Per-replica data save (H0, S, H_scc, C, ε, D, q, E as f32 binary) — target: `qmqm/gpu_scc.rs::save_replica_data`
+- [*] **Scan plotting** — `scripts/plot_formic_scan.py` + `tests/formic_scan_plots.rs` — 1D energy/charge/parity + 2D contour plots under `debug/formic_dimer_scan/`
 
 ### 6.3 Runtime refactoring (Stage 3.5, D14)
 - [ ] **Shared GpuRuntime** — context, device, queues, capabilities, program cache — target: `qmqm/gpu_runtime.rs` (new; refactor from `GpuMatrixContext` + `GpuDriver`)
@@ -372,17 +380,19 @@ file/function where the work should land.
 | xTB GFN2 | ⚠️ | ~0.1% residual on N2/HCOOH — `tests/xtb_parity.rs::test_*_gfn2_*` |
 | QM/QM CPU solver | ✅ | 2-fragment validated, 13/13 tests pass — `tests/qmqm_integration.rs` |
 | GPU diagonalization | ✅ | 8/8 tests pass — `tests/gpu_diagonalization.rs` (pre-existing N2 failures flagged) |
-| GPU H-assembly | ✅ | 4/4 tests pass, 5 kernel bugs fixed — `qmqm/gpu_driver.rs`, `tests/gpu_hamiltonian.rs` |
-| GPU SCC cycle | ❌ | Not started — revised design in `GPU_MultiSystem_Design.md` D8–D17 |
-| GPU multi-system (independent) | ❌ | Not started — Stage 2–3 of revised plan |
+| GPU H-assembly | ⚠️ | 4/4 tests pass (H2, N2); **s-p rotation sign bug** for H-O/H-C pairs (formic dimer |dH0|=0.66) — `qmqm/gpu_driver.rs`, `tests/gpu_hamiltonian.rs` |
+| GPU generalized eigensolver | ✅ | 10/10 tests pass — Brent-Luk Jacobi + S^{-1/2} — `qmqm/gpu_eigen.rs`, `tests/gpu_eigenproblem.rs` |
+| GPU SCC component kernels | ✅ | 10/10 tests pass — GEMM, gamma, H_scc, Mulliken, mixer — `qmqm/gpu_matrix.rs`, `tests/gpu_scc_kernels.rs` |
+| GPU SCC cycle | ✅ | Device-resident SCC loop with DIIS — H2O/N2/10×H2O parity <1e-6; formic dimer 1D scan (41 pts, 28 orbs) |dE|<3.6e-6, |dq|<1e-5; 2D scan 147/441 converged (CPU also fails) — `qmqm/gpu_scc.rs`, `tests/gpu_scc.rs`, `tests/hbond_gpu_scc.rs`, `tests/formic_scan_plots.rs` |
+| GPU multi-system (independent) | ✅ | Batched SCC for N≤64, homogeneous templates, warm-start, best-effort — `qmqm/gpu_scc.rs::gpu_solve_scc_batched_diis_warmstart` |
 | GPU multi-system (QM/QM coupling) | ❌ | Not started — Stage 8 of revised plan |
-| Scan / NEB driver | ❌ | Not started (Agent_5 ready to dispatch, CPU backend) |
+| Scan / NEB driver | ✅ | CPU scan: 2/2 tests pass; GPU scan: 1D+2D formic dimer with plots — `examples/scan.rs`, `tests/scan.rs`, `tests/formic_scan_plots.rs`, `scripts/plot_formic_scan.py` |
 | Sparse TC2 purification | ✅ | Benzene/coronene/circumcoronene parity < 6.5e-5 e — `methods/sparse/gpu_sparse.rs` |
 | Davidson partial eigensolver | ⚠️ | Benzene OK; coronene/circumcoronene do not converge (diagonal preconditioner) — `methods/sparse/davidson.rs` |
 | DFTB+ parity harness | ✅ | `scripts/run_dftbplus_ref.py` + `compare_rust_vs_dftbplus.py` |
 | Test infra / CI | ⚠️ | Drivers exist, no CI |
 
-**Overall "multi-system DFTB in OpenCL": ~45% complete.**
+**Overall "multi-system DFTB in OpenCL": ~75% complete.**
 CPU foundation complete (non-SCC + SCC + forces + QM/QM 2-frag). GPU H-assembly
 runtime working. Missing: Brent-Luk Jacobi, S^{-1/2}, device-resident SCC, scan/NEB.
 Architecture revised per GPT 5.6 review: host-orchestrated device-resident, f32,
@@ -400,18 +410,11 @@ Full plan: `GPU_MultiSystem_Design.md`.
 1. **Fix SK resampling precision** (BLOCKING) — increase `SK_RESAMPLE_N` from 64
    to ≥256, or interpolate on GPU. Current H/S parity ~1e-2, need ~1e-4 for SCC.
    — `qmqm/gpu_prep.rs::SK_RESAMPLE_N`, `methods/dftb/spline_resample.rs`
-2. **Brent-Luk parallel cyclic Jacobi kernel** (D8) — N/2 independent rotations
-   per round, one barrier per round, A+V in `__local` for N≤64. This is the
-   central technical challenge. — `qmqm/gpu_matrix_ops.cl::jacobi_cyclic_local_batched`
-3. **S^{-1/2} on GPU** (D9) — via Jacobi eigendecomposition of S. Computed once
-   per geometry. — `qmqm/gpu_matrix_ops.cl::build_inv_sqrt_from_eig`
-4. **Full-local batched GEMM** for N≤64 — benchmark vs tiled GEMM.
-   — `qmqm/gpu_matrix_ops.cl::matmul_full_local_batched`
-5. **Device-resident SCC** (D11) — gamma matvec + H_scc_update + Mulliken +
-   residual + mixer + active mask. Host enqueues, no readback.
-   — `qmqm/gpu_driver.rs::gpu_solve_scc_batched`
-6. **Dispatch Wave 2** — Agent_4 (GPU SCC) + Agent_5 (scan/NEB, CPU backend).
-   Independent, launch simultaneously. — `doc/prokop/tasts/GPU_MultiSystem/`
+2. ~~**Brent-Luk parallel cyclic Jacobi kernel** (D8)~~ — ✅ DONE — `qmqm/gpu_eigen.rs::jacobi_cyclic_local_batched`
+3. ~~**S^{-1/2} on GPU** (D9)~~ — ✅ DONE — `qmqm/gpu_eigen.rs::build_inv_sqrt`
+4. ~~**Full-local batched GEMM** for N≤64~~ — ✅ DONE — `qmqm/gpu_matrix.rs::matmul_full_local_batched`
+5. ~~**Device-resident SCC** (D11)~~ — ✅ DONE — `qmqm/gpu_scc.rs::gpu_solve_scc_batched_diis`
+6. ~~**Dispatch Wave 2**~~ — ✅ DONE — Agent_4 (GPU SCC) + Agent_5 (scan)
 7. **Runtime refactoring** (D14) — shared GpuRuntime, cached kernels.
    — `qmqm/gpu_runtime.rs`
 8. **Scheduling benchmark** (Stage 5) — giant batch vs microbatch vs multi-queue.
@@ -420,3 +423,10 @@ Full plan: `GPU_MultiSystem_Design.md`.
    — Stage 8 of `GPU_MultiSystem_Design.md`
 10. **CI + justfile** — stop relying on manual env-var setup.
 11. **GFN2 residual debug** — deep, uncertain; defer unless xTB needed.
+12. **2D scan convergence** — 67% of 2D points don't converge (CPU also fails).
+    Try: Broyden mixing, level shifting, smaller alpha, strip propagation.
+    — `qmqm/gpu_scc.rs`, `tests/formic_scan_plots.rs`
+13. **Performance optimization** — cache Kernel objects, active mask, diagonal-extract
+    kernel. See `doc/prokop/reports/2025-09-06_gpu_scc_benchmarks.md`.
+    **Baseline measured:** Jacobi = 50-65% of per-iter time, GEMM = 5%, DIIS = 16%.
+    Throughput: 1194 systems/s at batch=100 (formic dimer, N=28). 60-120× vs CPU.

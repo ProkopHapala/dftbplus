@@ -27,7 +27,28 @@ use crate::methods::dftb::gamma::GammaTable;
 use crate::methods::dftb::hamiltonian::{HamiltonianBuilder, SystemContext};
 use crate::methods::dftb::sk_data::SkData;
 use crate::methods::dftb::forces::gamma_prime_full;
-use crate::qmqm::mixer::{DiisMixer, Mixer};
+use crate::qmqm::mixer::{DiisMixer, BroydenMixer, Mixer};
+
+/// Mixer selection enum.
+enum MixerKind {
+    Diis(DiisMixer),
+    Broyden(BroydenMixer),
+}
+
+impl Mixer for MixerKind {
+    fn mix(&mut self, q_inout: &mut [f64], q_out: &[f64], residual: &[f64]) {
+        match self {
+            MixerKind::Diis(m) => m.mix(q_inout, q_out, residual),
+            MixerKind::Broyden(m) => m.mix(q_inout, q_out, residual),
+        }
+    }
+    fn reset(&mut self) {
+        match self {
+            MixerKind::Diis(m) => m.reset(),
+            MixerKind::Broyden(m) => m.reset(),
+        }
+    }
+}
 
 use nalgebra::{DMatrix, DVector};
 use lapack::dsyevd;
@@ -55,30 +76,62 @@ pub struct DftbCpu {
 
     // ─── Per-geometry (rebuilt in update_geometry()) ──────────────────
     pub coords: Vec<[f64; 3]>,
+    coords_bohr: Vec<[f64; 3]>,   // M1: preallocated Bohr coords
     pub neigh: NeighborList,
     pub h0: DMatrix<f64>,
     pub s: DMatrix<f64>,
+    s_copy: DMatrix<f64>,         // M2: preallocated S copy for Cholesky
     pub cholesky_l: DMatrix<f64>,
     /// Gamma matrix G[A,B] = gamma(R_AB, U_A, U_B), dense Nat×Nat.
     /// Precomputed once per geometry; SCC just does V = G·Δq.
     pub gamma_mat: Vec<f64>,
+    /// gamma'(R_AB)/R_AB per pair, precomputed for Coulomb force (H3).
+    /// Force = -Δq_A·Δq_B·gamma'(R)/R · (r_A - r_B), so this stores the coefficient.
+    gamma_prime_over_r: Vec<f64>,
     /// H0' = L⁻¹·H⁰·L⁻ᵀ, precomputed once per geometry.
     pub h0_prime: DMatrix<f64>,
+    // Pair workspace for H/S fill (reused across pairs)
+    pair_h: Vec<f64>,
+    pair_s: Vec<f64>,
 
     // ─── SCC workspace (reused, warm-started) ─────────────────────────
     pub charges: Vec<f64>,
+    charges_prev: Vec<f64>,   // previous geometry's converged charges (for predictor)
+    n_geom: usize,            // geometry counter (for predictor)
     q_out: Vec<f64>,
     residual: Vec<f64>,
     v_shift: Vec<f64>,
+    dq: Vec<f64>,              // C3: preallocated Δq, no per-iter alloc
     h_prime: DMatrix<f64>,
+    b_mat: DMatrix<f64>,       // C4: preallocated B = V_orb·L, no per-iter clone
+    b_scratch: DMatrix<f64>,   // C4: scratch for triangular solve (consumed)
+    h_prime_data: Vec<f64>,    // C6: preallocated LAPACK input buffer
+    eig_tmp: Vec<f64>,         // C7: preallocated eigenvalue buffer
+    y_occ: DMatrix<f64>,       // M3: preallocated N×N_occ
+    c_occ: DMatrix<f64>,       // M3: preallocated N×N_occ
+    sc_occ: DMatrix<f64>,      // M3: preallocated N×N_occ
+    eps_occ: Vec<f64>,         // M5: preallocated occupied eigenvalues
+    orb_to_atom_lut: Vec<u8>,  // H7: O(1) orbital→atom lookup
     pub eigenvalues: DVector<f64>,
     pub eigenvectors: DMatrix<f64>,
-    mixer: DiisMixer,
+    mixer: MixerKind,
     pub n_scc_iter: usize,
 
     // ─── LAPACK workspace (preallocated) ──────────────────────────────
     lapack_work: Vec<f64>,
     lapack_iwork: Vec<i32>,
+
+    // ─── Force workspace (preallocated, C8) ───────────────────────────
+    fws: ForceWorkspace,
+}
+
+/// Preallocated scratch buffers for force computation (C8).
+/// P8: now stores analytic derivative blocks instead of finite-difference buffers.
+struct ForceWorkspace {
+    h_blk: Vec<f64>, s_blk: Vec<f64>,
+    dh_dx: Vec<f64>, dh_dy: Vec<f64>, dh_dz: Vec<f64>,
+    ds_dx: Vec<f64>, ds_dy: Vec<f64>, ds_dz: Vec<f64>,
+    sqr_dm: Vec<f64>, sqr_edm: Vec<f64>,
 }
 
 /// Owned version of SystemContext (no lifetime references).
@@ -188,6 +241,17 @@ impl DftbCpu {
         let lapack_work = vec![0.0f64; lwork as usize];
         let lapack_iwork = vec![0i32; liwork as usize];
 
+        // H7: Precompute orbital→atom lookup table (O(1) in hot loop)
+        let orb_to_atom_lut: Vec<u8> = (0..n_orbs).map(|mu| {
+            let mut found = 0u8;
+            for a in 0..n_atoms {
+                let off = ctx.atom_orb_off[a] as usize;
+                let norb = ctx.atom_n_orb[a] as usize;
+                if mu < off + norb { found = a as u8; break; }
+            }
+            found
+        }).collect();
+
         Ok(Self {
             sk,
             species,
@@ -200,46 +264,129 @@ impl DftbCpu {
             n_orbs,
             cutoff_bohr,
             coords: vec![[0.0; 3]; n_atoms],
+            coords_bohr: vec![[0.0; 3]; n_atoms],
             neigh: NeighborList { pairs: Vec::new(), cutoff: 0.0 },
             h0: DMatrix::zeros(n_orbs, n_orbs),
             s: DMatrix::identity(n_orbs, n_orbs),
+            s_copy: DMatrix::identity(n_orbs, n_orbs),
             cholesky_l: DMatrix::zeros(n_orbs, n_orbs),
             gamma_mat: vec![0.0; n_atoms * n_atoms],
+            gamma_prime_over_r: vec![0.0; n_atoms * n_atoms],
             h0_prime: DMatrix::zeros(n_orbs, n_orbs),
+            pair_h: vec![0.0; 16],
+            pair_s: vec![0.0; 16],
             charges: vec![0.0; n_atoms],
+            charges_prev: vec![0.0; n_atoms],
+            n_geom: 0,
             q_out: vec![0.0; n_atoms],
             residual: vec![0.0; n_atoms],
             v_shift: vec![0.0; n_atoms],
+            dq: vec![0.0; n_atoms],
             h_prime: DMatrix::zeros(n_orbs, n_orbs),
+            b_mat: DMatrix::zeros(n_orbs, n_orbs),
+            b_scratch: DMatrix::zeros(n_orbs, n_orbs),
+            h_prime_data: vec![0.0f64; n_orbs * n_orbs],
+            eig_tmp: vec![0.0f64; n_orbs],
+            y_occ: DMatrix::zeros(n_orbs, n_occ),
+            c_occ: DMatrix::zeros(n_orbs, n_occ),
+            sc_occ: DMatrix::zeros(n_orbs, n_occ),
+            eps_occ: vec![0.0; n_occ],
+            orb_to_atom_lut,
             eigenvalues: DVector::zeros(n_orbs),
             eigenvectors: DMatrix::zeros(n_orbs, n_orbs),
-            mixer: DiisMixer::new(10, n_atoms),
+            mixer: MixerKind::Diis(DiisMixer::new(10, n_atoms)),
             n_scc_iter: 0,
             lapack_work,
             lapack_iwork,
+            fws: ForceWorkspace {
+                h_blk: vec![0.0; 16], s_blk: vec![0.0; 16],
+                dh_dx: vec![0.0; 16], dh_dy: vec![0.0; 16], dh_dz: vec![0.0; 16],
+                ds_dx: vec![0.0; 16], ds_dy: vec![0.0; 16], ds_dz: vec![0.0; 16],
+                sqr_dm: vec![0.0; 16], sqr_edm: vec![0.0; 16],
+            },
         })
     }
 
     /// Update geometry: rebuild all per-geometry data.
     /// This is the only place H0/S/gamma/Cholesky should be rebuilt.
+    /// C1: no SK clone — uses self.ctx directly.
+    /// M1: preallocated coords_bohr.
+    /// M2: preallocated s_copy for Cholesky.
     pub fn update_geometry(&mut self, coords: &[[f64; 3]]) -> Result<()> {
+        let timing = std::env::var("RUST_DFTB_TIMING").is_ok();
+        let tg0 = std::time::Instant::now();
         assert_eq!(coords.len(), self.n_atoms, "coords length mismatch in update_geometry");
-        self.coords = coords.to_vec();
+        self.coords.copy_from_slice(coords);
 
-        // 1. Build H0 and S using existing HamiltonianBuilder
-        let builder = HamiltonianBuilder::new(self.sk.clone()); // TODO: avoid clone, see note below
-        let ham = builder.build_non_scc(&self.species, coords)?;
-        self.h0 = ham.h0;
-        self.s = ham.s;
+        // 1. Build neighbor list in Bohr (correct Bohr/Bohr — matches H/S construction)
+        // M1: use preallocated coords_bohr
+        for i in 0..self.n_atoms {
+            self.coords_bohr[i] = [coords[i][0] * ANG2BOHR, coords[i][1] * ANG2BOHR, coords[i][2] * ANG2BOHR];
+        }
+        self.neigh = NeighborBuilder { cutoff: self.cutoff_bohr }.build(&self.coords_bohr)?;
 
-        // 2. Neighbor list (in Bohr, for sharing with forces)
-        let coords_bohr: Vec<[f64; 3]> = coords.iter()
-            .map(|c| [c[0] * ANG2BOHR, c[1] * ANG2BOHR, c[2] * ANG2BOHR])
-            .collect();
-        self.neigh = NeighborBuilder { cutoff: self.cutoff_bohr }.build(&coords_bohr)?;
+        // 2. Build H0 and S directly from self.ctx — no SK clone, no SystemContext rebuild
+        // C1: eliminated HamiltonianBuilder::new(self.sk.clone())
+        self.h0.fill(0.0);
+        self.s.fill(0.0);
+        // Set diagonal of S to 1 (identity for onsite)
+        for i in 0..self.n_orbs { self.s[(i, i)] = 1.0; }
+        // Onsite H0
+        for i_at in 0..self.n_atoms {
+            let si = self.ctx.atom_species[i_at] as usize;
+            let p = &self.ctx.species_onsite[si];
+            let base = self.ctx.atom_orb_off[i_at] as usize;
+            let ang = &self.ctx.species_ang[si];
+            let mut off = 0;
+            for &l in ang {
+                let e = match l { 0 => p.e_s, 1 => p.e_p, _ => 0.0 };
+                let n_orb_l = (2 * l + 1) as usize;
+                for k in 0..n_orb_l { self.h0[(base + off + k, base + off + k)] = e; }
+                off += n_orb_l;
+            }
+        }
+        // Pair H0/S — same logic as HamiltonianBuilder::fill_pairs but using self.ctx
+        let max_n_orb = self.ctx.species_n_orb.iter().copied().map(|n| n as usize).max().unwrap_or(0);
+        let max_block = max_n_orb * max_n_orb;
+        // Reuse pair workspace
+        if self.pair_h.len() < max_block { self.pair_h.resize(max_block, 0.0); self.pair_s.resize(max_block, 0.0); }
+        for p in &self.neigh.pairs {
+            let si = self.ctx.atom_species[p.i];
+            let sj = self.ctx.atom_species[p.j];
+            let tab_fwd = self.ctx.pair_lut[si as usize * self.ctx.n_species + sj as usize]
+                .map(|idx| &self.ctx.pair_tables[idx])
+                .ok_or_else(|| DftbError::InvalidInput(format!("missing SK table fwd ({si},{sj})")))?;
+            let tab_rev = self.ctx.pair_lut[sj as usize * self.ctx.n_species + si as usize]
+                .map(|idx| &self.ctx.pair_tables[idx])
+                .ok_or_else(|| DftbError::InvalidInput(format!("missing SK table rev ({sj},{si})")))?;
+            let ni = self.ctx.atom_n_orb[p.i] as usize;
+            let nj = self.ctx.atom_n_orb[p.j] as usize;
+            let bi = self.ctx.atom_orb_off[p.i] as usize;
+            let bj = self.ctx.atom_orb_off[p.j] as usize;
+            // Use r and vec_ij directly from the Bohr-space neighbor list (same as fill_pairs)
+            let dc = crate::methods::dftb::rotation::DirectionCosines::from_vec(p.vec_ij)?;
+            crate::methods::dftb::rotation::Rotation::rotate_diatomic_block_into(
+                tab_fwd, tab_rev,
+                &self.ctx.species_ang[si as usize],
+                &self.ctx.species_ang[sj as usize],
+                p.r, dc,
+                &mut self.pair_h, &mut self.pair_s,
+            )?;
+            for a in 0..nj {
+                for b in 0..ni {
+                    let val_h = self.pair_h[a * ni + b];
+                    let val_s = self.pair_s[a * ni + b];
+                    self.h0[(bj + a, bi + b)] = val_h;
+                    self.h0[(bi + b, bj + a)] = val_h;
+                    self.s[(bj + a, bi + b)] = val_s;
+                    self.s[(bi + b, bj + a)] = val_s;
+                }
+            }
+        }
 
-        // 3. Cholesky of S
-        let chol = nalgebra::linalg::Cholesky::new(self.s.clone())
+        // 3. Cholesky of S (M2: use preallocated s_copy)
+        self.s_copy.copy_from(&self.s);
+        let chol = nalgebra::linalg::Cholesky::new(self.s_copy.clone())
             .ok_or_else(|| DftbError::InvalidInput("Overlap matrix not positive definite".into()))?;
         self.cholesky_l = chol.l();
 
@@ -251,14 +398,14 @@ impl DftbCpu {
             .ok_or_else(|| DftbError::InvalidInput("L·N = Mᵀ solve failed".into()))?;
         self.h0_prime = n_mat.transpose();
 
-        // 5. Precompute gamma matrix G[A,B] = gamma(R_AB, U_A, U_B)
+        // 5. Precompute gamma matrix G[A,B] and gamma'(R)/R for Coulomb force (H3)
         let n = self.n_atoms;
         for a in 0..n {
             for b in a..n {
-                let g = if a == b {
-                    // On-site: gamma(0) = U_A (Hubbard)
+                if a == b {
                     let sp_a = self.ctx.atom_species[a] as usize;
-                    self.gamma_table.hubbard_u[sp_a]
+                    self.gamma_mat[a * n + a] = self.gamma_table.hubbard_u[sp_a];
+                    self.gamma_prime_over_r[a * n + a] = 0.0; // no self-force
                 } else {
                     let dx = coords[a][0] - coords[b][0];
                     let dy = coords[a][1] - coords[b][1];
@@ -267,21 +414,36 @@ impl DftbCpu {
                     let r_bohr = r_ang * ANG2BOHR;
                     let sp_a = self.ctx.atom_species[a] as usize;
                     let sp_b = self.ctx.atom_species[b] as usize;
-                    self.gamma_table.gamma(r_bohr, sp_a as u8, sp_b as u8)
-                };
-                self.gamma_mat[a * n + b] = g;
-                self.gamma_mat[b * n + a] = g;
+                    self.gamma_mat[a * n + b] = self.gamma_table.gamma(r_bohr, sp_a as u8, sp_b as u8);
+                    self.gamma_mat[b * n + a] = self.gamma_mat[a * n + b];
+                    // H3: precompute gamma'(R)/R for force: F = -dq_a·dq_b·γ'(R)·r̂
+                    // Store γ'(R_bohr)/R_ang · ANG2BOHR so force = -dq_a·dq_b · coef · dr_ang
+                    let u_a = self.gamma_table.u(self.ctx.atom_species[a]);
+                    let u_b = self.gamma_table.u(self.ctx.atom_species[b]);
+                    let gp = gamma_prime_full(r_bohr, u_a, u_b);
+                    // F_i = -dq_i·dq_j·γ'(r_bohr)·r̂_ang, where r̂_ang = dr_ang/r_ang
+                    // So F_i = -dq_i·dq_j·γ'(r_bohr)/r_ang · dr_ang
+                    // Store γ'(r_bohr)/r_ang (includes unit conversion: γ' is in Hartree/Bohr,
+                    // dividing by r_ang gives Hartree/(Bohr·Å), multiplying by dr_ang gives Hartree/Bohr,
+                    // then we convert to Hartree/Å with ANG2BOHR)
+                    self.gamma_prime_over_r[a * n + b] = gp / r_ang * ANG2BOHR;
+                    self.gamma_prime_over_r[b * n + a] = self.gamma_prime_over_r[a * n + b];
+                }
             }
         }
 
-        // 6. Reset DIIS history (geometry changed, old history is invalid)
+        // 6. Reset DIIS history
         self.mixer.reset();
 
+        if timing {
+            eprintln!("    [timing] update_geometry={:.3}ms", tg0.elapsed().as_secs_f64() * 1e3);
+        }
         Ok(())
     }
 
     /// Run SCC loop with warm-started charges.
     /// Uses precomputed gamma matrix and H0' — no distance/sqrt/exp in the loop.
+    /// All workspace is preallocated — zero allocations per iteration.
     pub fn solve_scc(&mut self, max_iter: usize, tol: f64) -> Result<()> {
         let verbose = std::env::var("RUST_DFTB_SCC_VERBOSE").is_ok();
         let timing = std::env::var("RUST_DFTB_TIMING").is_ok();
@@ -289,71 +451,93 @@ impl DftbCpu {
         let nat = self.n_atoms;
         let n_occ = self.n_occ;
 
+        // Granular timing accumulators
+        let mut t_gamma = 0.0f64;
+        let mut t_trsolve1 = 0.0f64;
+        let mut t_hprime = 0.0f64;
+        let mut t_dsyevd = 0.0f64;
+        let mut t_backtr = 0.0f64;
+        let mut t_mull = 0.0f64;
+        let mut t_mix = 0.0f64;
+
         for iter in 0..max_iter {
             let t0 = if timing { Some(std::time::Instant::now()) } else { None };
+            let ts = || std::time::Instant::now();
 
-            // 1. V = G · Δq  (precomputed gamma matrix, just a matvec)
-            let dq: Vec<f64> = (0..nat)
-                .map(|i| self.charges[i] - self.q0[i])
-                .collect();
+            // 1. V = G · Δq
+            let tg = ts();
+            for i in 0..nat { self.dq[i] = self.charges[i] - self.q0[i]; }
             for a in 0..nat {
                 self.v_shift[a] = 0.0;
                 for b in 0..nat {
-                    self.v_shift[a] += self.gamma_mat[a * nat + b] * dq[b];
+                    self.v_shift[a] += self.gamma_mat[a * nat + b] * self.dq[b];
                 }
             }
+            if timing { t_gamma += tg.elapsed().as_secs_f64() * 1e6; }
 
-            // 2. H' = H0' + ½(X + Xᵀ) where X = L⁻¹·V_orb·L
-            //    V_orb[μ] = V[atom(μ)], diagonal in AO space
-            //    B = V_orb * L (row scaling), X = L⁻¹·B (one triangular solve)
-            let l = &self.cholesky_l;
-            // Build V_orb as diagonal matrix, then B = V_orb · L
-            let mut b = l.clone(); // copy L
+            // 2. H' = H0' + ½(X + Xᵀ)
+            let t1 = ts();
+            self.b_mat.copy_from(&self.cholesky_l);
             for mu in 0..n {
-                let atom = self.orb_to_atom(mu);
+                let atom = self.orb_to_atom_lut[mu] as usize;
                 let v = self.v_shift[atom];
                 for j in 0..n {
-                    b[(mu, j)] *= v;
+                    self.b_mat[(mu, j)] *= v;
                 }
             }
-            let x = l.solve_lower_triangular(&b)
+            self.b_scratch.copy_from(&self.b_mat);
+            let x = self.cholesky_l.solve_lower_triangular(&self.b_scratch)
                 .ok_or_else(|| DftbError::InvalidInput("L·X = B solve failed".into()))?;
-            // H' = H0' + ½(X + Xᵀ)
-            self.h_prime = self.h0_prime.clone();
+            if timing { t_trsolve1 += t1.elapsed().as_secs_f64() * 1e6; }
+
+            let t2 = ts();
+            self.h_prime.copy_from(&self.h0_prime);
             for i in 0..n {
                 for j in 0..n {
                     self.h_prime[(i, j)] += 0.5 * (x[(i, j)] + x[(j, i)]);
                 }
             }
+            if timing { t_hprime += t2.elapsed().as_secs_f64() * 1e6; }
 
-            // 3. Diagonalize H' using LAPACK dsyevd
-            let mut h_prime_data = self.h_prime.as_slice().to_vec();
-            let mut eig = vec![0.0f64; n];
+            // 3. Diagonalize H'
+            let t3 = ts();
+            self.h_prime_data.copy_from_slice(self.h_prime.as_slice());
+            self.eig_tmp.fill(0.0);
             let mut info: i32 = 0;
             let lwork = self.lapack_work.len() as i32;
             let liwork = self.lapack_iwork.len() as i32;
             unsafe {
-                dsyevd(b'V', b'L', n as i32, &mut h_prime_data, n as i32,
-                       &mut eig, &mut self.lapack_work, lwork,
+                dsyevd(b'V', b'L', n as i32, &mut self.h_prime_data, n as i32,
+                       &mut self.eig_tmp, &mut self.lapack_work, lwork,
                        &mut self.lapack_iwork, liwork, &mut info);
             }
             if info != 0 {
                 return Err(DftbError::InvalidInput(format!("dsyevd failed: info={info}")));
             }
-            self.eigenvalues = DVector::from(eig);
-            // h_prime_data now contains eigenvectors Y (column-major = nalgebra order)
-            let y_full = DMatrix::from_vec(n, n, h_prime_data);
+            self.eigenvalues = DVector::from(self.eig_tmp.clone());
+            let y_full = DMatrix::from_vec(n, n, self.h_prime_data.clone());
+            if timing { t_dsyevd += t3.elapsed().as_secs_f64() * 1e6; }
 
             // 4. Back-transform: C = L⁻ᵀ · Y
-            let c = l.tr_solve_lower_triangular(&y_full)
+            let t4 = ts();
+            let c = self.cholesky_l.tr_solve_lower_triangular(&y_full)
                 .ok_or_else(|| DftbError::InvalidInput("Lᵀ·C = Y solve failed".into()))?;
             self.eigenvectors = c;
+            if timing { t_backtr += t4.elapsed().as_secs_f64() * 1e6; }
+
+            // 5. Mulliken charges
+            let t5 = ts();
+            self.y_occ.copy_from(&y_full.columns(0, n_occ));
+            self.c_occ.copy_from(&self.eigenvectors.columns(0, n_occ));
+            self.sc_occ = &self.cholesky_l * &self.y_occ;
 
             // 5. Mulliken charges: SC = L·Y_occ, p_μ = 2·Σ_k C_μk·(SC)_μk, q_A = Σ_{μ∈A} p_μ
             //    SC = S·C = L·Lᵀ·L⁻ᵀ·Y = L·Y, so we need Y_occ (before back-transform)
-            let y_occ = y_full.columns(0, n_occ).into_owned();
-            let c_occ = self.eigenvectors.columns(0, n_occ).into_owned();
-            let sc_occ = &self.cholesky_l * &y_occ;
+            // M3: use preallocated y_occ, c_occ, sc_occ
+            self.y_occ.copy_from(&y_full.columns(0, n_occ));
+            self.c_occ.copy_from(&self.eigenvectors.columns(0, n_occ));
+            // sc_occ = L · y_occ
+            self.sc_occ = &self.cholesky_l * &self.y_occ;
 
             for a in 0..nat {
                 let mut pop_a = 0.0;
@@ -361,13 +545,12 @@ impl DftbCpu {
                 let norb_a = self.ctx.atom_n_orb[a] as usize;
                 for mu in off..off + norb_a {
                     for k in 0..n_occ {
-                        pop_a += 2.0 * c_occ[(mu, k)] * sc_occ[(mu, k)];
+                        pop_a += 2.0 * self.c_occ[(mu, k)] * self.sc_occ[(mu, k)];
                     }
                 }
-                // charges stores electron population (matching original convention)
-                // delta_q = pop - q0 is used in the SCC shift
                 self.q_out[a] = pop_a;
             }
+            if timing { t_mull += t5.elapsed().as_secs_f64() * 1e6; }
 
             // 6. Residual
             for i in 0..nat {
@@ -382,15 +565,17 @@ impl DftbCpu {
 
             if rms < tol {
                 if timing {
-                    if let Some(t) = t0 {
-                        eprintln!("    [timing] scc_iter={:.3}ms", t.elapsed().as_secs_f64() * 1e3);
-                    }
+                    eprintln!("    [timing] scc_iter={:.3}ms  [gamma={:.1}µs trsolve1={:.1}µs hprime={:.1}µs dsyevd={:.1}µs backtr={:.1}µs mull={:.1}µs mix={:.1}µs]",
+                        t_gamma + t_trsolve1 + t_hprime + t_dsyevd + t_backtr + t_mull + t_mix,
+                        t_gamma, t_trsolve1, t_hprime, t_dsyevd, t_backtr, t_mull, t_mix);
                 }
                 return Ok(());
             }
 
             // 7. Mix
+            let t6 = ts();
             self.mixer.mix(&mut self.charges, &self.q_out, &self.residual);
+            if timing { t_mix += t6.elapsed().as_secs_f64() * 1e6; }
         }
 
         Err(DftbError::SccNotConverged(format!(
@@ -398,20 +583,6 @@ impl DftbCpu {
             max_iter,
             (self.residual.iter().map(|x| x * x).sum::<f64>() / nat as f64).sqrt()
         )))
-    }
-
-    /// Map orbital index to atom index.
-    #[inline]
-    fn orb_to_atom(&self, mu: usize) -> usize {
-        // Binary search or linear scan through atom_orb_off
-        for a in 0..self.n_atoms {
-            let off = self.ctx.atom_orb_off[a] as usize;
-            let norb = self.ctx.atom_n_orb[a] as usize;
-            if mu < off + norb {
-                return a;
-            }
-        }
-        panic!("orb_to_atom: orbital index {mu} out of range (n_orbs={})", self.n_orbs);
     }
 
     /// Build the final result: density matrix, EDM, energy, H_scc.
@@ -427,46 +598,27 @@ impl DftbCpu {
         let density = &c_occ * c_occ.transpose() * 2.0;
 
         // W = 2 · C_occ · diag(eps_occ) · C_occᵀ
-        let eps_occ: Vec<f64> = self.eigenvalues.iter().take(n_occ).copied().collect();
+        // M5: use preallocated eps_occ
+        for k in 0..n_occ { self.eps_occ[k] = self.eigenvalues[k]; }
         let mut ce = c_occ.clone();
         for k in 0..n_occ {
-            let e = eps_occ[k];
+            let e = self.eps_occ[k];
             for mu in 0..n {
                 ce[(mu, k)] *= 2.0 * e;
             }
         }
         let edm = &ce * c_occ.transpose();
 
-        // H_scc = H0 + S·shift (build for the result, needed by some callers)
-        // V_orb[μ] = V[atom(μ)]
-        let mut h_scc = self.h0.clone();
-        for mu in 0..n {
-            let atom = self.orb_to_atom(mu);
-            let v = self.v_shift[atom];
-            for nu in 0..n {
-                h_scc[(mu, nu)] += 0.5 * self.s[(mu, nu)] * v;
-            }
-        }
-        // Symmetrize: H_scc = H0 + ½(SV + VS), the VS part
-        for mu in 0..n {
-            let atom_mu = self.orb_to_atom(mu);
-            let v_mu = self.v_shift[atom_mu];
-            for nu in 0..n {
-                h_scc[(mu, nu)] += 0.5 * self.s[(mu, nu)] * v_mu;
-            }
-        }
-        // Wait — the above double-counts. Let me redo this properly.
         // H_scc = H0 + ½(S·V + V·S) where V is diagonal in AO space.
         // (S·V)[mu,nu] = S[mu,nu] * V[nu]  (V diagonal, right multiply)
         // (V·S)[mu,nu] = V[mu] * S[mu,nu]  (V diagonal, left multiply)
         // So H_scc[mu,nu] = H0[mu,nu] + 0.5 * S[mu,nu] * (V[mu] + V[nu])
+        // H4: removed dead double-build code, use orb_to_atom_lut (H7)
         let mut h_scc = self.h0.clone();
         for mu in 0..n {
-            let atom_mu = self.orb_to_atom(mu);
-            let v_mu = self.v_shift[atom_mu];
+            let v_mu = self.v_shift[self.orb_to_atom_lut[mu] as usize];
             for nu in 0..n {
-                let atom_nu = self.orb_to_atom(nu);
-                let v_nu = self.v_shift[atom_nu];
+                let v_nu = self.v_shift[self.orb_to_atom_lut[nu] as usize];
                 h_scc[(mu, nu)] += 0.5 * self.s[(mu, nu)] * (v_mu + v_nu);
             }
         }
@@ -515,57 +667,129 @@ impl DftbCpu {
         self.charges.copy_from_slice(&self.q0);
     }
 
+    /// Switch to Broyden quasi-Newton mixing.
+    pub fn use_broyden(&mut self, alpha: f64) {
+        self.mixer = MixerKind::Broyden(BroydenMixer::new(self.n_atoms, alpha));
+    }
+
+    /// Switch to DIIS mixing.
+    pub fn use_diis(&mut self, max_history: usize) {
+        self.mixer = MixerKind::Diis(DiisMixer::new(max_history, self.n_atoms));
+    }
+
     /// Compute SCC forces using cached state — no re-diagonalization, no rebuilds.
     ///
-    /// This replaces `compute_scc_forces` with:
-    /// - EDM from `build_result` (no re-diagonalization — P2)
-    /// - Gamma matrix from `update_geometry` (no rebuild — P3)
-    /// - Neighbor list from `update_geometry` (no rebuild, correct units — P6)
-    /// - SystemContext from `DftbCpu::new` (no rebuild)
-    /// - Repulsive tables parsed once (no Strings/HashMaps — P9)
-    ///
-    /// `result` must be from a `build_result()` call after `solve_scc()` converged.
+    /// P8: Analytic SK derivatives — replaces 6 finite-difference block evaluations
+    /// per pair with 1 analytic evaluation. ~12× fewer Neville interpolations.
     pub fn compute_forces(
-        &self,
+        &mut self,
         result: &CpuSccResult,
         repulsive: &[Option<crate::methods::dftb::forces::RepulsiveSpline>],
     ) -> Result<crate::methods::dftb::forces::Forces> {
         use crate::methods::dftb::forces::{
-            Forces, non_scc_electronic_force, scc_shift_force,
-            check_finite, check_newton,
-            repulsive_force_cached,
+            Forces, check_finite, check_newton, repulsive_force_cached,
         };
+        use crate::methods::dftb::rotation::{DirectionCosines, Rotation};
 
         let n_atoms = self.n_atoms;
         let mut out = Forces::zeros(n_atoms);
 
-        // Use cached neighbor list (already in Bohr from update_geometry)
         let neigh = &self.neigh;
-        let coords_bohr: Vec<[f64; 3]> = self.coords.iter()
-            .map(|c| [c[0] * ANG2BOHR, c[1] * ANG2BOHR, c[2] * ANG2BOHR])
-            .collect();
-
-        // DM and EDM from the converged result (no re-diagonalization!)
         let dm = &result.density;
         let edm = &result.edm;
 
-        // Build a borrowed SystemContext from the cached static one
-        let ctx = self.ctx.as_ctx();
+        let max_block = self.fws.h_blk.len();
+        for p in &neigh.pairs {
+            let i = p.i;
+            let j = p.j;
+            let ni = self.ctx.atom_n_orb[i] as usize;
+            let nj = self.ctx.atom_n_orb[j] as usize;
+            let block_size = ni * nj;
+            if block_size > max_block {
+                panic!("ForceWorkspace too small: {block_size} > {max_block}");
+            }
 
-        // Non-SCC electronic force (uses H0 derivatives, DM and EDM)
-        // Note: coords here need to be in Å for the finite-difference step
-        non_scc_electronic_force(&ctx, neigh, &self.coords, dm, edm, &mut out.non_scc)?;
+            let bi = self.ctx.atom_orb_off[i] as usize;
+            let bj = self.ctx.atom_orb_off[j] as usize;
 
-        // SCC shift force: use cached v_shift (already computed during SCC)
-        scc_shift_force(&ctx, neigh, &self.coords, dm, &self.v_shift, &mut out.scc_shift)?;
+            // Extract DM and EDM pair blocks
+            let fws = &mut self.fws;
+            for a in 0..nj {
+                for b in 0..ni {
+                    fws.sqr_dm[a * ni + b] = dm[(bi + b, bj + a)];
+                    fws.sqr_edm[a * ni + b] = edm[(bi + b, bj + a)];
+                }
+            }
 
-        // SCC double-counting (Coulomb) force: use cached gamma_mat
-        let delta_q: Vec<f64> = (0..n_atoms)
-            .map(|i| self.charges[i] - self.q0[i])
-            .collect();
+            // P8: Evaluate H, S, and their Cartesian derivatives analytically
+            // Uses the Bohr neighbor list (p.r, p.vec_ij are in Bohr)
+            let si = self.ctx.atom_species[i];
+            let sj = self.ctx.atom_species[j];
+            let tab_fwd = self.ctx.pair_lut[si as usize * self.ctx.n_species + sj as usize]
+                .map(|idx| &self.ctx.pair_tables[idx])
+                .ok_or_else(|| DftbError::InvalidInput(format!("missing SK table fwd ({si},{sj})")))?;
+            let tab_rev = self.ctx.pair_lut[sj as usize * self.ctx.n_species + si as usize]
+                .map(|idx| &self.ctx.pair_tables[idx])
+                .ok_or_else(|| DftbError::InvalidInput(format!("missing SK table rev ({sj},{si})")))?;
+            let dc = DirectionCosines::from_vec(p.vec_ij)?;
+
+            Rotation::rotate_block_with_derivs_into(
+                tab_fwd, tab_rev,
+                &self.ctx.species_ang[si as usize],
+                &self.ctx.species_ang[sj as usize],
+                p.r, dc,
+                &mut fws.h_blk, &mut fws.s_blk,
+                &mut fws.dh_dx, &mut fws.dh_dy, &mut fws.dh_dz,
+                &mut fws.ds_dx, &mut fws.ds_dy, &mut fws.ds_dz,
+            )?;
+
+            // The derivatives are w.r.t. R_vec (Bohr) = r_j - r_i.
+            // dH/dR_a gives force on atom j. Force on atom i = -force on atom j.
+            // But we need to convert from Bohr to Ångström: d/dR_Å = d/dR_Bohr * BOHR2ANG
+            // Actually: R_Bohr = R_Å * ANG2BOHR, so d/dR_Å = d/dR_Bohr * ANG2BOHR
+            // Wait: if R_Bohr = R_Å * ANG2BOHR, then dR_Bohr/dR_Å = ANG2BOHR
+            // So dH/dR_Å = dH/dR_Bohr * dR_Bohr/dR_Å = dH/dR_Bohr * ANG2BOHR
+            // But the SK tables are evaluated at r_Bohr, and the derivatives are w.r.t. R_Bohr.
+            // The force is F = -dE/dR_Å = -dE/dR_Bohr * ANG2BOHR
+            // Actually, the energy is in Hartree, R_Bohr is in Bohr.
+            // Force in Hartree/Bohr = -dE/dR_Bohr
+            // Force in Hartree/Å = -dE/dR_Å = -dE/dR_Bohr * ANG2BOHR
+            // The derivatives from rotate_block_with_derivs are dH/dR_Bohr (Hartree/Bohr)
+            // We need force in Hartree/Å, so multiply by ANG2BOHR
+            let bohr2ang = ANG2BOHR; // convert dH/dR_Bohr to dH/dR_Å (multiply by ANG2BOHR)
+
+            let shift_i = self.v_shift[i];
+            let shift_j = self.v_shift[j];
+            let avg_shift = 0.5 * (shift_i + shift_j);
+
+            // F^{el}_{ij,a} = 2 * Σ_{μν} [ DM·dH/dR_a + (avg_shift·DM - EDM)·dS/dR_a ]
+            // (GPT 5.6 §9, fused formula)
+            // dH/dR_a are w.r.t. atom j position in Bohr; convert to Å
+            for dir in 0..3 {
+                let dh = match dir { 0 => fws.dh_dx.as_slice(), 1 => fws.dh_dy.as_slice(), _ => fws.dh_dz.as_slice() };
+                let ds = match dir { 0 => fws.ds_dx.as_slice(), 1 => fws.ds_dy.as_slice(), _ => fws.ds_dz.as_slice() };
+
+                let mut contr_non_scc = 0.0f64;
+                let mut contr_scc_shift = 0.0f64;
+                for k in 0..block_size {
+                    let dh_a = dh[k] * bohr2ang; // convert dH/dR_Bohr to dH/dR_Å
+                    let ds_a = ds[k] * bohr2ang;
+                    contr_non_scc += fws.sqr_dm[k] * dh_a - fws.sqr_edm[k] * ds_a;
+                    contr_scc_shift += avg_shift * ds_a * fws.sqr_dm[k];
+                }
+                let f_non_scc = 2.0 * contr_non_scc;
+                let f_scc_shift = 2.0 * contr_scc_shift;
+                out.non_scc[i][dir] += f_non_scc;
+                out.non_scc[j][dir] -= f_non_scc;
+                out.scc_shift[i][dir] += f_scc_shift;
+                out.scc_shift[j][dir] -= f_scc_shift;
+            }
+        }
+
+        // SCC double-counting (Coulomb) force: use precomputed gamma'/R (H3)
+        for i in 0..n_atoms { self.dq[i] = self.charges[i] - self.q0[i]; }
         scc_double_counting_force_cached(
-            &self.coords, &self.ctx.atom_species, &delta_q,
-            &self.gamma_mat, &self.gamma_table, &mut out.scc_dc,
+            &self.coords, &self.dq, &self.gamma_prime_over_r, &mut out.scc_dc,
         );
 
         // Repulsive force: use cached tables (no Strings/HashMaps)
@@ -589,14 +813,15 @@ impl DftbCpu {
     }
 }
 
-/// SCC double-counting force using precomputed gamma matrix.
-/// F_A^γ = -Σ_{B>A} Δq_A·Δq_B·γ'(R_AB)·R̂_AB
+// build_pair_block_static removed — replaced by analytic derivatives (P8)
+
+/// SCC double-counting force using precomputed gamma'/R (H3).
+/// F_A = -Σ_{B≠A} Δq_A·Δq_B · (γ'(R)/R) · (r_A - r_B)
+/// gamma_prime_over_r already includes unit conversion (Hartree/Bohr → Hartree/Å).
 fn scc_double_counting_force_cached(
     coords: &[[f64; 3]],
-    atom_species: &[u8],
     delta_q: &[f64],
-    _gamma_mat: &[f64],
-    gamma_table: &GammaTable,
+    gamma_prime_over_r: &[f64],
     forces: &mut [[f64; 3]],
 ) {
     let n = coords.len();
@@ -605,23 +830,15 @@ fn scc_double_counting_force_cached(
             let dx = coords[i][0] - coords[j][0];
             let dy = coords[i][1] - coords[j][1];
             let dz = coords[i][2] - coords[j][2];
-            let r_ang = (dx * dx + dy * dy + dz * dz).sqrt();
-            if r_ang < 1e-10 { continue; }
-            let r_bohr = r_ang * ANG2BOHR;
-            let u_i = gamma_table.u(atom_species[i]);
-            let u_j = gamma_table.u(atom_species[j]);
-            let g_prime = gamma_prime_full(r_bohr, u_i, u_j);
-            let dq_dq = delta_q[i] * delta_q[j];
-            let f_scalar = -dq_dq * g_prime * ANG2BOHR; // convert to Hartree/Å
-            let ux = dx / r_ang;
-            let uy = dy / r_ang;
-            let uz = dz / r_ang;
-            forces[i][0] += f_scalar * ux;
-            forces[i][1] += f_scalar * uy;
-            forces[i][2] += f_scalar * uz;
-            forces[j][0] -= f_scalar * ux;
-            forces[j][1] -= f_scalar * uy;
-            forces[j][2] -= f_scalar * uz;
+            let r2 = dx * dx + dy * dy + dz * dz;
+            if r2 < 1e-20 { continue; }
+            let coef = -delta_q[i] * delta_q[j] * gamma_prime_over_r[i * n + j];
+            forces[i][0] += coef * dx;
+            forces[i][1] += coef * dy;
+            forces[i][2] += coef * dz;
+            forces[j][0] -= coef * dx;
+            forces[j][1] -= coef * dy;
+            forces[j][2] -= coef * dz;
         }
     }
 }

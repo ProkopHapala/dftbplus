@@ -222,7 +222,8 @@ and the lack of a proper LBFGS optimizer (FIRE is inefficient near the minimum).
 | Jacobi eigensolve | Rust | `nalgebra::SymmetricEigen` | deprecated | 20ms for N=56, do not use for N>20 |
 | LAPACK dsyevd | Rust+FFI | `rust_dftb/src/qmqm/fragment.rs` | active | 0.7ms for N=56, via `lapack` crate + system OpenBLAS |
 | GPU Jacobi eigensolve | OpenCL | `rust_dftb/src/qmqm/gpu_eigen.cl` | experimental | for GPU-resident batched solve, separate path |
-| Davidson partial eigensolve | Rust | `rust_dftb/src/methods/sparse/davidson.rs` | experimental | for sparse/large systems, frontier orbitals only |
+| Davidson partial eigensolve | Rust | `rust_dftb/src/methods/sparse/davidson.rs` | experimental | for sparse/large systems, frontier orbitals only. Fails on coronene (diagonal preconditioner). See `davidson_eigensolver.md`. |
+| Chebyshev+Ritz sparse eigensolve | Python | `scripts/sparse_homo_lumo.py` | active | Cholesky-transformed implicit operator + polynomial filter. Converges on coronene, circumcoronene, ribbons to N=1156. 7.5× faster than dense at N=1156. See `chebyshev_ritz_eigensolver.md`. |
 
 ## Parity status
 

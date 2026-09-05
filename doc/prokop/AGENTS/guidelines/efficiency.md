@@ -249,20 +249,18 @@ lto = false
 coefficients at load time. Runtime becomes Horner's method (~7 FMAs), not
 Neville recursion (nested loops + stack matrices).**
 
-**Violation**: `eval_eqgrid_new_into()` does 8-point Neville interpolation at
-runtime, with `xa[8]` and `yb[20][8]` stack arrays and nested loops. This is
-called for every shell pair (ss, sp, ps, pp) of every atom pair — ~4× repeated
-interpolation per pair.
+**Status: ADDRESSED** — Replaced 8-point Neville with cubic Hermite spline.
+`EqGridTable::new` precomputes per-grid-point derivatives (4th-order central
+differences) at load time. `eval_hermite_into` is O(n_integ) — 4 FMAs per
+channel vs Neville's O(n²)=64. `eval_hermite_with_deriv_into` returns value +
+analytic derivative in one call (no 3× finite-difference evals).
+Tail region delegates to Neville `poly5_to_zero` for exact DFTB+ parity.
+Neville code retained as `eval_neville_into` for parity verification.
+See `methods/dftb/interpolation.rs`.
 
-**Fix**: At SK-loading time, for each interval `[i, i+1)` and each channel,
-compute degree-7 polynomial coefficients `a_0..a_7` in the local variable
-`t = (R - R_i) / ΔR`. Runtime:
-```rust
-let t = (r - r_start) / dr;
-let v  = horner(coeffs, t);       // 7 FMAs
-let dv = horner_deriv(coeffs, t); // 7 FMAs, derivative for forces
-```
-No Neville recursion. No stack matrices. Derivative comes for free.
+**Original violation (for reference)**: `eval_eqgrid_new_into()` did 8-point
+Neville interpolation at runtime, with `xa[8]` and `yb[20][8]` stack arrays and
+nested loops. Called for every shell pair (ss, sp, ps, pp) of every atom pair.
 
 ---
 
@@ -287,10 +285,17 @@ rotate all shell pairs from the cached results.
 **When analytic derivatives are available and simple (e.g., sp basis sets),
 use them. Reserve finite differences for parity testing only.**
 
-**Violation**: Force calculation does 6 complete SK block evaluations per pair
-(x±, y±, z±) via finite differences. For an sp basis, analytic derivatives are
-closed-form:
+**Status: ADDRESSED** — `rotate_block_with_derivs_into` computes H, S, and
+dH/dR_a, dS/dR_a for all 3 Cartesian directions using closed-form analytic
+formulas (ss, sp, ps, pp). Radial derivative comes from `eval_with_deriv_into`
+(Hermite analytic, no finite difference). Force parity verified: max|F|=4.7305
+exact match vs finite-difference baseline, energy 7 sig figs.
+See `methods/dftb/rotation.rs::shell_pair_with_derivs`,
+`methods/dftb/sk_data.rs::eval_shell_integrals_and_derivs_into`.
 
+**Original violation (for reference)**: Force calculation did 6 complete SK
+block evaluations per pair (x±, y±, z±) via finite differences. The analytic
+formulas are:
 ```
 ∂R/∂R_a = u_a
 ∂u_i/∂R_a = (δ_ia - u_i·u_a) / R
@@ -299,10 +304,6 @@ H_ss = V_ssσ(R)     →  ∂_a H_ss = V'_ssσ · u_a
 H_sp_i = u_i·V_spσ  →  ∂_a H_sp_i = [(δ_ia - u_i·u_a)/R]·V_spσ + u_i·V'_spσ·u_a
 H_p_ip_j = V_π·δ_ij + (V_σ-V_π)·u_i·u_j  →  (closed form, see chat)
 ```
-
-**Fix**: One pair evaluation returns `H[16], S[16], dHdx[16], dHdy[16],
-dHdz[16], dSdx[16], dSdy[16], dSdz[16]` with **one radial interpolation**.
-Keep finite difference only as a parity test.
 
 ---
 

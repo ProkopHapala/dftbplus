@@ -55,5 +55,8 @@ RUST_DFTB_SCC_VERBOSE=1 cargo run --example hbond_ref -- ...
 - `src/qmqm/` — multi-fragment QM/QM solver + GPU runtime
 - `src/bin/` — executables (`dftb_engine`, `graphene_build`)
 - `examples/` — `hbond_ref`, `scan`, `neb`, `test_h2`, `debug_sk`
-- `tests/` — parity tests vs Fortran DFTB+, GPU tests, integration tests
+- `tests/` — parity tests vs Fortran DFTB+, GPU tests, integration tests.
+  Key GPU tests: `gpu_scc.rs` (H2O/N2 parity), `hbond_gpu_scc.rs` (formic dimer
+  1D scan), `formic_scan_plots.rs` (1D+2D scan with plots, `--ignored`),
+  `gpu_scc_bench.rs` (timing benchmarks, `--ignored`).
 - `build.rs` — links system OpenBLAS for LAPACK

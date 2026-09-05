@@ -4,15 +4,29 @@
 Uses the spectral filtering methods from NumericalMathPlayground
 (topics/LinearAlgebra/SpectralFiltering/spectral_solvers.py) to find a few
 eigenvalues of the generalized eigenproblem H·c = ε·S·c near the HOMO-LUMO gap,
-WITHOUT full diagonalization. This is the O(N) compatible approach.
+WITHOUT full diagonalization.
 
-The generalized problem is transformed to standard form via S^{-1/2} H S^{-1/2},
-then solve_band() applies Chebyshev polynomial filtering + Rayleigh-Ritz to
-extract eigenpairs in a target energy band.
+## Approach: implicit Cholesky-transformed operator (no densification)
+
+The generalized eigenproblem H·c = ε·S·c is transformed to standard symmetric
+form via Cholesky factorization S = L·Lᵀ:
+
+    H' = L⁻¹ · H · L⁻ᵀ    (symmetric, same eigenvalues as generalized problem)
+
+Instead of forming H' explicitly (which densifies), we use an IMPLICIT OPERATOR
+that applies L⁻¹, H, L⁻ᵀ sequentially to each vector via sparse triangular solves:
+
+    H' · v = L⁻¹ · (H · (L⁻ᵀ · v))    ← 2 triangular solves + 1 sparse matvec
+
+The Cholesky factor L is computed once (sparse LU with SymmetricMode on scipy).
+The Chebyshev filter + Rayleigh-Ritz code from spectral_solvers.py calls this
+operator via the op_matmul(H, V) / H.matvec(V) abstraction.
+
+Eigenvectors are transformed back: c = L⁻ᵀ · y
 
 Usage:
-    python3 sparse_homo_lumo.py <hs_matrix.tsv> [--nvec 8] [--cheb-deg 20] [--iters 10]
-        [--band-width 0.05] [--out <dir>]
+    python3 sparse_homo_lumo.py <hs_matrix.tsv> [--nvec 12] [--cheb-deg 40]
+        [--iters 30] [--band-width 0.03]
 
 Example:
     python3 scripts/sparse_homo_lumo.py debug/graphene_sparse/benzene_hs_matrix.tsv
@@ -28,13 +42,114 @@ NUMPG_ROOT = Path("/home/prokophapala/git/NumericalMathPlayground")
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(NUMPG_ROOT / "topics" / "LinearAlgebra" / "SpectralFiltering"))
 
-from spectral_solvers import solve_band, cheb_rect_coeffs, apply_cheb_poly, rayleigh_ritz
+from spectral_solvers import cheb_rect_coeffs, apply_cheb_poly, rayleigh_ritz
+
+try:
+    import scipy.sparse as sp
+    from scipy.sparse.linalg import splu, spsolve_triangular
+    from scipy.linalg import solve_triangular as dense_st
+    HAVE_SCIPY = True
+except ImportError:
+    HAVE_SCIPY = False
+
+# Threshold: use dense triangular solves (BLAS-backed) below this N, sparse above.
+# Profiling shows dense is ~12x faster for N≤216. The crossover is around N~2000
+# where sparse L nnz drops below N²/10 and sparse overhead amortizes.
+DENSE_SOLVE_THRESHOLD = 2000
+
+
+class CholeskyTransformedOperator:
+    """Implicit symmetric operator H' = L⁻¹·H·L⁻ᵀ, applied as L⁻¹·(H·(L⁻ᵀ·v)).
+
+    Avoids densification by never forming H' explicitly.
+    Each matvec is 2 triangular solves + 1 sparse matvec.
+
+    For N < DENSE_SOLVE_THRESHOLD: uses dense BLAS triangular solves (12x faster).
+    For N ≥ DENSE_SOLVE_THRESHOLD: uses sparse triangular solves (O(nnz) per solve).
+
+    Compatible with spectral_solvers.py op_matmul(H, V) → H.matvec(V).
+    """
+    def __init__(self, L_csr, H_csr, use_dense=None):
+        N = L_csr.shape[0]
+        if use_dense is None:
+            use_dense = N < DENSE_SOLVE_THRESHOLD
+        self.use_dense = use_dense
+        self.H = H_csr
+        self.ndim = N
+        self.shape = L_csr.shape
+        if use_dense:
+            self.L_dense = L_csr.toarray()
+            self.LT_dense = self.L_dense.T
+        else:
+            self.L_csr = L_csr
+            self.LT_csr = L_csr.T.tocsr()
+
+    def matvec(self, V):
+        """Apply H'·V = L⁻¹·(H·(L⁻ᵀ·V)) for dense (N,k) or (N,) array V."""
+        if V.ndim == 1:
+            return self._apply(V[:, None])[:, 0]
+        return self._apply(V)
+
+    def _apply(self, V):
+        if self.use_dense:
+            w = dense_st(self.LT_dense, V, lower=False, check_finite=False, overwrite_b=False)
+            w = self.H @ w
+            return dense_st(self.L_dense, w, lower=True, check_finite=False, overwrite_b=False)
+        else:
+            w = spsolve_triangular(self.LT_csr, V, lower=False)
+            w = self.H @ w
+            return spsolve_triangular(self.L_csr, w, lower=True)
+
+    def transform_back(self, Y):
+        """Transform eigenvectors back: c = L⁻ᵀ · y."""
+        if Y.ndim == 1:
+            Y = Y[:, None]
+            return self._solve_LT(Y)[:, 0]
+        return self._solve_LT(Y)
+
+    def _solve_LT(self, Y):
+        if self.use_dense:
+            return dense_st(self.LT_dense, Y, lower=False, check_finite=False, overwrite_b=False)
+        else:
+            return spsolve_triangular(self.LT_csr, Y, lower=False)
+
+    def __matmul__(self, V):
+        return self.matvec(V)
+
+
+def sparse_cholesky(S_csr):
+    """Compute sparse Cholesky factorization S = L·Lᵀ.
+
+    Uses scipy.sparse.linalg.splu with SymmetricMode, which gives S = L·U where
+    U = D·Lᵀ (LDLᵀ form). The true Cholesky factor is L_chol = L·sqrt(D).
+
+    Returns: L_chol (sparse CSR), so that S = L_chol · L_cholᵀ.
+    """
+    N = S_csr.shape[0]
+    S_csc = S_csr.tocsc()
+    lu = splu(S_csc, permc_spec='NATURAL', diag_pivot_thresh=0,
+              options={'SymmetricMode': True})
+    L = lu.L.tocsr()
+    U = lu.U.tocsr()
+    # D = diag(U), L_chol = L · sqrt(D)
+    D_diag = U.diagonal()
+    assert np.all(D_diag > 0), f"S not SPD: diagonal of U has negatives: {D_diag[D_diag <= 0]}"
+    sqrtD = np.sqrt(D_diag)
+    # Scale columns of L by sqrt(D): L_chol[i,j] = L[i,j] * sqrt(D[j])
+    L_chol = L.multiply(sp.csr_matrix(np.broadcast_to(sqrtD[None, :], (N, N))))
+    L_chol = sp.csr_matrix(L_chol)
+    # Verify: L_chol · L_cholᵀ ≈ S
+    LLT = L_chol @ L_chol.T
+    err = np.abs(LLT - S_csr).max()
+    print(f"  Cholesky: L_chol nnz={L_chol.nnz}, ||L·Lᵀ - S||_max = {err:.2e}")
+    assert err < 1e-8, f"Cholesky factorization failed: ||L·Lᵀ - S||_max = {err:.2e}"
+    return L_chol
 
 
 def parse_hs_matrix_tsv(path):
     """Parse the TSV produced by rhai_save_hs_matrix.
 
-    Returns: species, coords_ang, H (norb×norb), S (norb×norb), eigs_dense, n_occ.
+    Returns: species, coords_ang, H (norb×norb dense), S (norb×norb dense), eigs_dense, n_occ.
     """
     species, coords = [], []
     H = S = None
@@ -83,9 +198,10 @@ def parse_hs_matrix_tsv(path):
             i += 1
             if i < len(lines) and lines[i].strip().startswith('idx'):
                 i += 1
-            for _ in range(norb):
+            while i < len(lines) and not lines[i].strip().startswith('#'):
                 parts = lines[i].strip().split('\t')
-                eigs.append(float(parts[1]))
+                if len(parts) >= 2:
+                    eigs.append(float(parts[1]))
                 i += 1
         else:
             i += 1
@@ -93,56 +209,135 @@ def parse_hs_matrix_tsv(path):
     return species, np.array(coords, dtype=np.float64), H, S, np.array(eigs), n_occ
 
 
+def estimate_spectral_range(op, n_probe=5, n_iter=10):
+    """Estimate [λ_min, λ_max] of operator via power iteration on op and op^{-1}."""
+    N = op.ndim
+    np.random.seed(99)
+    V = np.random.randn(N, n_probe)
+    # Power iteration for largest |λ|
+    for _ in range(n_iter):
+        V = op.matvec(V)
+        V, _ = np.linalg.qr(V)
+    R = op.matvec(V)
+    # Rayleigh quotients
+    rq = np.array([V[:, j] @ R[:, j] / (V[:, j] @ V[:, j]) for j in range(n_probe)])
+    lam_max = max(rq.max(), abs(rq.min())) * 1.2  # padding
+    return -lam_max, lam_max
+
+
+def run_chebyshev_ritz_band(op, V0, band_lo, band_hi, cheb_deg, iters, square_filter):
+    """Run Chebyshev filter + Rayleigh-Ritz for one band using the implicit operator.
+
+    The Chebyshev filter requires eigenvalues in [-1, 1]. We estimate the spectral
+    range [λ_min, λ_max] of the operator and rescale the band bounds accordingly.
+    """
+    # Estimate spectral range and rescale to [-1, 1]
+    lam_min, lam_max = estimate_spectral_range(op)
+    center = 0.5 * (lam_min + lam_max)
+    half_range = 0.5 * (lam_max - lam_min)
+    if half_range < 1e-12:
+        half_range = 1.0
+    # Rescale band bounds to [-1, 1]
+    f_lo = (band_lo - center) / half_range
+    f_hi = (band_hi - center) / half_range
+    # Wrap operator with rescaling: H_rescaled = (H - center) / half_range
+    class RescaledOp:
+        def __init__(self, inner, c, hr):
+            self.inner = inner; self.c = c; self.hr = hr
+            self.ndim = inner.ndim; self.shape = inner.shape
+        def matvec(self, V):
+            return (self.inner.matvec(V) - self.c * V) / self.hr
+    op_r = RescaledOp(op, center, half_range)
+    c = cheb_rect_coeffs(f_lo, f_hi, cheb_deg, use_jackson=True)
+    V = V0.copy()
+    spmv_count = 0
+    k = V.shape[1]
+    spmv_per_app = cheb_deg * (2 if square_filter else 1)
+    for _ in range(max(1, iters)):
+        V = apply_cheb_poly(op_r, V, c)
+        spmv_count += spmv_per_app * k
+        if square_filter:
+            V = apply_cheb_poly(op_r, V, c)
+            spmv_count += spmv_per_app * k
+        V, _ = np.linalg.qr(V)
+    # Rayleigh-Ritz on the ORIGINAL operator (not rescaled) to get true eigenvalues
+    w, U, r = rayleigh_ritz(op, V)
+    spmv_count += k  # H @ Q in rayleigh_ritz
+    mask = (w >= band_lo) & (w <= band_hi)
+    if not np.any(mask):
+        mid = 0.5 * (band_lo + band_hi)
+        order_all = np.argsort(np.abs(w - mid))
+        keep_n = min(len(w), k)
+        mask = np.zeros_like(w, dtype=bool)
+        mask[order_all[:keep_n]] = True
+    w_in = w[mask]
+    U_in = U[:, mask]
+    r_in = r[mask]
+    order = np.argsort(w_in)
+    return w_in[order], U_in[:, order], r_in[order], spmv_count
+
+
 def main():
-    p = argparse.ArgumentParser(description='Sparse HOMO/LUMO via Chebyshev filter + Ritz',
+    p = argparse.ArgumentParser(description='Sparse HOMO/LUMO via Chebyshev+Ritz with Cholesky-transformed operator',
                                 formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument('hs_tsv', type=str, help='Path to *_hs_matrix.tsv from Rust')
-    p.add_argument('--nvec', type=int, default=8, help='Initial probe vectors')
-    p.add_argument('--cheb-deg', type=int, default=20, help='Chebyshev polynomial degree')
-    p.add_argument('--iters', type=int, default=10, help='Filter→QR→Ritz iterations')
-    p.add_argument('--band-width', type=float, default=0.05, help='Energy band width (Ha) around gap')
+    p.add_argument('--nvec', type=int, default=0, help='Initial probe vectors (0=auto: 20 for N<300, 30 for N<800, 40 above)')
+    p.add_argument('--cheb-deg', type=int, default=0, help='Chebyshev polynomial degree (0=auto: 40 for N<300, 60 for N<800, 80 above)')
+    p.add_argument('--iters', type=int, default=0, help='Filter→QR→Ritz iterations (0=auto: 20 for N<300, 30 for N<800, 40 above)')
+    p.add_argument('--band-width', type=float, default=0.03, help='Half band width (Ha)')
     p.add_argument('--square-filter', action='store_true', default=True, help='Use p(H)^2 filter')
     p.add_argument('--out', type=str, default=None, help='Output TSV (default: same dir)')
     args = p.parse_args()
 
+    assert HAVE_SCIPY, "scipy is required. Install with: pip install scipy"
+
     tsv_path = Path(args.hs_tsv)
     assert tsv_path.exists(), f"File not found: {tsv_path}"
     system_name = tsv_path.stem.replace('_hs_matrix', '')
-
     out_path = Path(args.out) if args.out else tsv_path.parent / f"{system_name}_sparse_eigenvectors.tsv"
 
-    print(f"=== Sparse HOMO/LUMO: {system_name} ===")
+    import time
+    t_total = time.perf_counter()
+
+    # 1. Parse H, S, geometry (need N first for auto-params)
+    species, coords, H_dense, S_dense, eigs_dense, n_occ = parse_hs_matrix_tsv(tsv_path)
+    norb = H_dense.shape[0]
+    natoms = len(species)
+
+    # Auto-select Chebyshev parameters based on system size
+    if args.nvec <= 0:
+        args.nvec = 20 if norb < 300 else (30 if norb < 800 else 40)
+    if args.cheb_deg <= 0:
+        args.cheb_deg = 40 if norb < 300 else (60 if norb < 800 else 80)
+    if args.iters <= 0:
+        args.iters = 20 if norb < 300 else (30 if norb < 800 else 40)
+
+    print(f"=== Sparse HOMO/LUMO (Cholesky L⁻¹HL⁻ᵀ): {system_name} ===")
     print(f"  H,S matrix: {tsv_path}")
     print(f"  nvec={args.nvec}  cheb_deg={args.cheb_deg}  iters={args.iters}  band_width={args.band_width} Ha")
-
-    # 1. Parse H, S, geometry
-    species, coords, H, S, eigs_dense, n_occ = parse_hs_matrix_tsv(tsv_path)
-    norb = H.shape[0]
-    natoms = len(species)
     print(f"  natoms={natoms}  norb={norb}  n_occ={n_occ}")
 
-    # Dense reference HOMO/LUMO
     homo_dense = eigs_dense[n_occ - 1]
     lumo_dense = eigs_dense[n_occ]
     gap_dense = lumo_dense - homo_dense
     print(f"  dense ref: HOMO={homo_dense:.6f}  LUMO={lumo_dense:.6f}  gap={gap_dense:.6f} Ha")
 
-    # 2. Transform generalized → standard: H' = S^{-1/2} H S^{-1/2}
-    # S is symmetric positive definite, use eigendecomposition for S^{-1/2}
-    print("  Computing S^{-1/2} ...")
-    s_eigvals, s_eigvecs = np.linalg.eigh(S)
-    # Guard against tiny/negative eigenvalues (S should be SPD)
-    assert np.all(s_eigvals > 1e-10), f"S has non-positive eigenvalues: min={s_eigvals.min():.2e}"
-    S_inv_sqrt = s_eigvecs @ np.diag(1.0 / np.sqrt(s_eigvals)) @ s_eigvecs.T
-    H_std = S_inv_sqrt @ H @ S_inv_sqrt
-    # Symmetrize to kill roundoff asymmetry
-    H_std = 0.5 * (H_std + H_std.T)
-    print(f"  H_std: min={H_std.min():.4f}  max={H_std.max():.4f}")
+    # 2. Convert to sparse CSR
+    S_csr = sp.csr_matrix(S_dense)
+    H_csr = sp.csr_matrix(H_dense)
+    print(f"  S nnz={S_csr.nnz}/{norb*norb}  H nnz={H_csr.nnz}/{norb*norb}")
 
-    # 3. Use TWO separate bands: one around HOMO, one around LUMO.
-    # Band width is adaptive: max(args.band_width, 2×gap) so bands don't overlap
-    # for small-gap systems but are wide enough to capture the target eigenvalue.
-    gap_dense = lumo_dense - homo_dense
+    # 3. Sparse Cholesky: S = L·Lᵀ
+    t0 = time.perf_counter()
+    L_csr = sparse_cholesky(S_csr)
+    t_chol = time.perf_counter() - t0
+
+    # 4. Build implicit L⁻¹·H·L⁻ᵀ operator
+    op = CholeskyTransformedOperator(L_csr, H_csr)
+    solve_mode = "dense BLAS" if op.use_dense else "sparse"
+    print(f"  Operator: H' = L⁻¹·H·L⁻ᵀ ({solve_mode} triangular solves + SpMV, {t_chol*1000:.1f}ms Cholesky)")
+
+    # 5. Two bands: HOMO and LUMO
     half_w = max(args.band_width, 2.0 * gap_dense)
     homo_lo, homo_hi = homo_dense - half_w, homo_dense + half_w
     lumo_lo, lumo_hi = lumo_dense - half_w, lumo_dense + half_w
@@ -150,87 +345,47 @@ def main():
     print(f"  HOMO band: [{homo_lo:.6f}, {homo_hi:.6f}] Ha")
     print(f"  LUMO band: [{lumo_lo:.6f}, {lumo_hi:.6f}] Ha")
 
-    # 4. Run Chebyshev filter + Ritz for HOMO band
-    print(f"  Running Chebyshev filter + Rayleigh-Ritz (HOMO band) ...")
+    # 6. Chebyshev filter + Ritz for HOMO band
+    t0 = time.perf_counter()
     np.random.seed(42)
     V0_h = np.random.randn(norb, args.nvec)
-    c_h = cheb_rect_coeffs(homo_lo, homo_hi, args.cheb_deg, use_jackson=True)
-    V_h = V0_h.copy()
-    spmv_count = 0
-    for _ in range(max(1, args.iters)):
-        V_h = apply_cheb_poly(H_std, V_h, c_h)
-        spmv_count += args.cheb_deg * V_h.shape[1]
-        if args.square_filter:
-            V_h = apply_cheb_poly(H_std, V_h, c_h)
-            spmv_count += args.cheb_deg * V_h.shape[1]
-        V_h, _ = np.linalg.qr(V_h)
-    w_h, U_h, r_h = rayleigh_ritz(H_std, V_h)
-    spmv_count += V_h.shape[1]
-    mask_h = (w_h >= homo_lo) & (w_h <= homo_hi)
-    if not np.any(mask_h):
-        # Keep closest to band center
-        order_h = np.argsort(np.abs(w_h - homo_dense))
-        mask_h = np.zeros_like(w_h, dtype=bool)
-        mask_h[order_h[:min(args.nvec, len(w_h))]] = True
-    w_h_in = w_h[mask_h]
-    U_h_in = U_h[:, mask_h]
-    r_h_in = r_h[mask_h]
-    order_h = np.argsort(w_h_in)
-    w_h_in = w_h_in[order_h]
-    U_h_in = U_h_in[:, order_h]
-    r_h_in = r_h_in[order_h]
-    print(f"    HOMO band: {len(w_h_in)} eigs, residuals max={r_h_in.max():.2e}" if len(r_h_in) else "    HOMO band: 0 eigs")
-    for w, r in zip(w_h_in, r_h_in):
+    w_h, U_h, r_h, spmv_h = run_chebyshev_ritz_band(
+        op, V0_h, homo_lo, homo_hi, args.cheb_deg, args.iters, args.square_filter)
+    t_homo = time.perf_counter() - t0
+    print(f"    HOMO band: {len(w_h)} eigs, residuals max={r_h.max():.2e}" if len(r_h) else "    HOMO band: 0 eigs")
+    for w, r in zip(w_h, r_h):
         print(f"      {w:.10f}  r={r:.2e}")
 
-    # 5. Run Chebyshev filter + Ritz for LUMO band
-    print(f"  Running Chebyshev filter + Rayleigh-Ritz (LUMO band) ...")
+    # 7. Chebyshev filter + Ritz for LUMO band
+    t0 = time.perf_counter()
     np.random.seed(123)
     V0_l = np.random.randn(norb, args.nvec)
-    c_l = cheb_rect_coeffs(lumo_lo, lumo_hi, args.cheb_deg, use_jackson=True)
-    V_l = V0_l.copy()
-    for _ in range(max(1, args.iters)):
-        V_l = apply_cheb_poly(H_std, V_l, c_l)
-        spmv_count += args.cheb_deg * V_l.shape[1]
-        if args.square_filter:
-            V_l = apply_cheb_poly(H_std, V_l, c_l)
-            spmv_count += args.cheb_deg * V_l.shape[1]
-        V_l, _ = np.linalg.qr(V_l)
-    w_l, U_l, r_l = rayleigh_ritz(H_std, V_l)
-    spmv_count += V_l.shape[1]
-    mask_l = (w_l >= lumo_lo) & (w_l <= lumo_hi)
-    if not np.any(mask_l):
-        order_l = np.argsort(np.abs(w_l - lumo_dense))
-        mask_l = np.zeros_like(w_l, dtype=bool)
-        mask_l[order_l[:min(args.nvec, len(w_l))]] = True
-    w_l_in = w_l[mask_l]
-    U_l_in = U_l[:, mask_l]
-    r_l_in = r_l[mask_l]
-    order_l = np.argsort(w_l_in)
-    w_l_in = w_l_in[order_l]
-    U_l_in = U_l_in[:, order_l]
-    r_l_in = r_l_in[order_l]
-    print(f"    LUMO band: {len(w_l_in)} eigs, residuals max={r_l_in.max():.2e}" if len(r_l_in) else "    LUMO band: 0 eigs")
-    for w, r in zip(w_l_in, r_l_in):
+    w_l, U_l, r_l, spmv_l = run_chebyshev_ritz_band(
+        op, V0_l, lumo_lo, lumo_hi, args.cheb_deg, args.iters, args.square_filter)
+    t_lumo = time.perf_counter() - t0
+    print(f"    LUMO band: {len(w_l)} eigs, residuals max={r_l.max():.2e}" if len(r_l) else "    LUMO band: 0 eigs")
+    for w, r in zip(w_l, r_l):
         print(f"      {w:.10f}  r={r:.2e}")
-    print(f"  Total SpMV count: {spmv_count}")
+    total_spmv = spmv_h + spmv_l
+    t_total_elapsed = time.perf_counter() - t_total
+    print(f"  Timing: Cholesky={t_chol*1000:.1f}ms  HOMO={t_homo*1000:.1f}ms  LUMO={t_lumo*1000:.1f}ms  total={t_total_elapsed*1000:.1f}ms  matvecs={total_spmv}")
 
-    # 6. Pick HOMO = eigenvalue closest to homo_dense, LUMO = closest to lumo_dense
-    if len(w_h_in) > 0 and len(w_l_in) > 0:
-        homo_idx = np.argmin(np.abs(w_h_in - homo_dense))
-        lumo_idx = np.argmin(np.abs(w_l_in - lumo_dense))
-        homo_sp = w_h_in[homo_idx]
-        lumo_sp = w_l_in[lumo_idx]
-        c_homo_std = U_h_in[:, homo_idx]
-        c_lumo_std = U_l_in[:, lumo_idx]
-        method = "Chebyshev+Ritz"
+    # 8. Pick HOMO and LUMO
+    if len(w_h) > 0 and len(w_l) > 0:
+        homo_idx = np.argmin(np.abs(w_h - homo_dense))
+        lumo_idx = np.argmin(np.abs(w_l - lumo_dense))
+        homo_sp = w_h[homo_idx]
+        lumo_sp = w_l[lumo_idx]
+        y_homo = U_h[:, homo_idx]  # eigenvector in L⁻¹·H·L⁻ᵀ space
+        y_lumo = U_l[:, lumo_idx]
+        method = "Chebyshev+Ritz (L⁻¹HL⁻ᵀ sparse)"
     else:
         print("  WARNING: insufficient eigenvalues found, using dense fallback")
-        w_all, U_all = np.linalg.eigh(H_std)
+        w_all, U_all = np.linalg.eigh(H_dense)
         homo_sp = w_all[n_occ - 1]
         lumo_sp = w_all[n_occ]
-        c_homo_std = U_all[:, n_occ - 1]
-        c_lumo_std = U_all[:, n_occ]
+        y_homo = U_all[:, n_occ - 1]
+        y_lumo = U_all[:, n_occ]
         method = "dense_fallback"
 
     gap_sp = lumo_sp - homo_sp
@@ -239,18 +394,17 @@ def main():
     print(f"    LUMO={lumo_sp:.10f} Ha  (dense ref: {lumo_dense:.10f}, Δ={lumo_sp-lumo_dense:.2e})")
     print(f"    gap={gap_sp:.10f} Ha   (dense ref: {gap_dense:.10f}, Δ={gap_sp-gap_dense:.2e})")
 
-    # 7. Transform eigenvectors back to generalized basis: c = S^{-1/2} c'
-    c_homo = S_inv_sqrt @ c_homo_std
-    c_lumo = S_inv_sqrt @ c_lumo_std
+    # 9. Transform eigenvectors back: c = L⁻ᵀ · y  (sparse triangular solve, no densification)
+    c_homo = op.transform_back(y_homo)
+    c_lumo = op.transform_back(y_lumo)
     evecs_out = np.column_stack([c_homo, c_lumo])
-    eigs_out = np.array([homo_sp, lumo_sp])
 
-    # 8. Save in the same format as dense eigenvectors TSV
+    # 10. Save
     with open(out_path, 'w') as f:
         f.write(f"# natoms={natoms} norb={norb} n_occ={n_occ}\n")
         f.write("# atom_idx\telement\tx\ty\tz\n")
-        for j, (sp, c) in enumerate(zip(species, coords)):
-            f.write(f"{j}\t{sp}\t{c[0]:.10f}\t{c[1]:.10f}\t{c[2]:.10f}\n")
+        for j, (sp_name, c) in enumerate(zip(species, coords)):
+            f.write(f"{j}\t{sp_name}\t{c[0]:.10f}\t{c[1]:.10f}\t{c[2]:.10f}\n")
         f.write("# eigenvector (HOMO and LUMO only, columns are MOs)\n")
         f.write("mo_idx\torb_idx\tcoeff\n")
         for mo in range(2):

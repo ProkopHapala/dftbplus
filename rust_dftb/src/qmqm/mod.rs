@@ -19,6 +19,7 @@ pub mod gpu_matrix;
 pub mod gpu_driver;
 pub mod gpu_runtime;
 pub mod gpu_eigen;
+pub mod gpu_scc;
 pub use crate::core::charges;
 pub mod solver;
 

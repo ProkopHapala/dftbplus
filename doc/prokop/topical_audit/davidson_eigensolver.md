@@ -44,6 +44,12 @@ densification on large sparse systems.
   - Chebyshev-filtered subspace iteration (CheFSI) — see
     `NumericalMathPlayground/topics/LinearAlgebra/LinearScalingQM/CheFSI/`.
   - Lanczos with spectral transformation.
+- **Working alternative exists**: the **Chebyshev+Ritz sparse eigensolver**
+  (`chebyshev_ritz_eigensolver.md`) converges on coronene, circumcoronene, and
+  H-passivated ribbons up to N=1156 with machine precision (1e-11 to 1e-12).
+  It uses a Cholesky-transformed implicit operator + polynomial band-pass
+  filter instead of a diagonal preconditioner. This is the recommended path
+  for frontier-orbital extraction on sparse systems.
 - **Not wired to sparse BSR4 operator.** Currently uses dense `H_scc` and `S`
   from `SccResult`. For large systems, a sparse matvec operator is needed to
   avoid densification.
@@ -53,5 +59,6 @@ densification on large sparse systems.
 ## Related
 
 - `/doc/prokop/reports/2025-09-05_scc_charges_davidson_parity.md` — session report.
+- `/doc/prokop/topical_audit/chebyshev_ritz_eigensolver.md` — working alternative for coronene+.
 - `/rust_dftb/src/methods/sparse/davidson.rs` — implementation.
 - `dftb_engine.rs` Rhai function `davidson_homo_lumo(name, n_target)`.

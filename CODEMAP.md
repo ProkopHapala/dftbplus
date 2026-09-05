@@ -43,10 +43,18 @@ QM/QM fragment solver with OpenCL GPU offload. Python utilities (`pyBall/`,
     contour plots side-by-side).
   - `sparse_homo_lumo.py` — finds HOMO/LUMO via Chebyshev filter + Rayleigh-Ritz
     iterative eigensolver (from NumericalMathPlayground). Reads H,S matrices
-    exported by Rust, transforms to standard form, finds few eigenvalues near
-    the gap without full diagonalization.
+    exported by Rust, transforms to standard form via sparse Cholesky L⁻¹HL⁻ᵀ,
+    finds few eigenvalues near the gap without full diagonalization. Uses dense
+    BLAS triangular solves for N<2000, spectral range rescaling for large N,
+    adaptive Chebyshev parameters (nvec/deg/iters scale with system size).
+  - `ribbon_scaling_test.py` — systematic scaling benchmark on H-passivated
+    zigzag carbon ribbons (L=4..64, N=76..1156). Produces timing table, nnz
+    counts, parity, and 4-panel scaling plot.
   - `compare_rust_vs_dftbplus.py` — numerical parity report (charges, eigenvalues,
     gaps).
+  - `plot_formic_scan.py` — plots 1D/2D proton-transfer scan data from
+    `rust_dftb/debug/formic_dimer_scan/*.tsv`. Produces energy PES, Mulliken
+    charge, parity, and 2D contour plots (handles NaN for unconverged points).
   - `geometry_engine.py`, `plot_hbond.py`, `run_formic_dimer_*.sh`.
 - `debug/` — **all debug artifacts** (PNGs, scratch CSVs, SCC dumps, one-off
   plots). Organized as `debug/<topic>/`. **Never commit anything here.**
@@ -75,13 +83,17 @@ QM/QM fragment solver with OpenCL GPU offload. Python utilities (`pyBall/`,
 - `src/qmqm/` — multi-fragment QM/QM solver + GPU runtime: `fragment.rs`,
   `solver.rs`, `mixer.rs`, `shifts.rs`, `gamma.rs`, `charges.rs`,
   `gpu_driver.rs`, `gpu_runtime.rs`, `gpu_matrix.rs`, `gpu_prep.rs`,
-  `gpu_eigen.rs`/`.cl`, `gpu_matrix_ops.cl`.
+  `gpu_eigen.rs`/`.cl`, `gpu_matrix_ops.cl`, `gpu_scc.rs` (device-resident
+  SCC loop driver with DIIS, warm-start, best-effort mode, per-system RMS
+  diagnostics).
 - `src/bin/` — executables: `dftb_engine.rs`, `graphene_build.rs`.
 - `examples/` — runnable demos: `hbond_ref.rs`, `scan.rs`, `neb.rs`, `test_h2.rs`,
   `debug_h2.rs`, `debug_sk.rs`.
 - `tests/` — Rust integration tests: `parity_*.rs` (vs Fortran), `gpu_*.rs`,
-  `qmqm_integration.rs`, `xtb_parity.rs`, `scan.rs` + Python runners
-  (`run_parity.py`, `run_scc_full.py`, `run_forces.py`).
+  `qmqm_integration.rs`, `xtb_parity.rs`, `scan.rs`, `formic_scan_plots.rs`
+  (1D/2D proton-transfer scan with plotting, `--ignored`), `hbond_gpu_scc.rs`
+  (H-bond GPU SCC parity) + Python runners (`run_parity.py`, `run_scc_full.py`,
+  `run_forces.py`).
 - `tools/` — crate-local Python tools: `sk_compress/` (SK table compression),
   `make_diatomic_hsd.py`, `run_dftbcore_dump.py`.
 - `scripts/` — Rhai test scripts (e.g. `test_graphene_sparse.rhai`).
@@ -105,7 +117,10 @@ QM/QM fragment solver with OpenCL GPU offload. Python utilities (`pyBall/`,
   - `chats/` — design chat logs (`MultiSystemOpenCL.chat.md`, …).
   - `reports/` — written session reports (e.g.
     `2025-09-05_scc_charges_davidson_parity.md`,
-    `2025-09-05_hbond_optimization_lapack.md`).
+    `2025-09-05_hbond_optimization_lapack.md`,
+    `2025-09-06_gpu_hs_assembly_bugfix.md`,
+    `2025-09-06_scan_plots_and_gamma_fix.md`,
+    `2025-09-06_gpu_scc_benchmarks.md`).
   - `topical_audit/` — cross-implementation topic maps (one `.md` per topic:
     `davidson_eigensolver.md`, `eigensolver_performance.md`,
     `sparse_tc2_purification.md`, `dftbplus_parity_harness.md`,

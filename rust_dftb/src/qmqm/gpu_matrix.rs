@@ -823,6 +823,102 @@ pub fn residual_and_mix_batched(
     Ok(())
 }
 
+/// Δq = q − q0 per atom, per system. `q`/`q0`/`dq` are `[batch][Na]`.
+pub fn delta_q_batched(
+    rt: &mut GpuRuntime,
+    q_buf: &Buffer<f32>,
+    q0_buf: &Buffer<f32>,
+    dq_buf: &Buffer<f32>,
+    n_atoms: usize,
+    batch: usize,
+) -> Result<()> {
+    if n_atoms == 0 || batch == 0 { return Ok(()); }
+    let wg = n_atoms.min(256).max(1);
+    let source = MATRIX_KERNEL_TEMPLATE;
+    let program = rt.build_program(source)?;
+    let kernel = Kernel::builder()
+        .program(&program).name("delta_q_batched").queue(rt.queue().clone())
+        .global_work_size(batch * wg).local_work_size(wg)
+        .arg(n_atoms as i32).arg(batch as i32)
+        .arg(q_buf).arg(q0_buf).arg(dq_buf)
+        .build().map_err(map_ocl_err)?;
+    unsafe { kernel.enq().map_err(map_ocl_err)?; }
+    Ok(())
+}
+
+/// D = 2·Σ_{k: occ[k]≠0} C[:,k]·C[:,k]^T (closed-shell density with occupation mask).
+/// `C`/`D` are `[batch][N*N]`, `occ_mask` is `[batch][N]` int32 (1=occ, 0=virt).
+pub fn build_density_masked_batched(
+    rt: &mut GpuRuntime,
+    c_buf: &Buffer<f32>,
+    occ_mask_buf: &Buffer<i32>,
+    d_buf: &Buffer<f32>,
+    n: usize,
+    batch: usize,
+) -> Result<()> {
+    if n == 0 || batch == 0 { return Ok(()); }
+    let wg = (n * n).min(256).max(1);
+    let source = MATRIX_KERNEL_TEMPLATE;
+    let program = rt.build_program(source)?;
+    let kernel = Kernel::builder()
+        .program(&program).name("build_density_masked_batched").queue(rt.queue().clone())
+        .global_work_size(batch * wg).local_work_size(wg)
+        .arg(n as i32).arg(batch as i32)
+        .arg(c_buf).arg(occ_mask_buf).arg(d_buf)
+        .build().map_err(map_ocl_err)?;
+    unsafe { kernel.enq().map_err(map_ocl_err)?; }
+    Ok(())
+}
+
+/// tr[sid] = Σ_{i,j} A[i,j]·B[i,j] (Frobenius inner product = Tr(A·B) for symmetric).
+/// `A`/`B` are `[batch][N*N]`, `tr` is `[batch]`.
+pub fn frobenius_trace_batched(
+    rt: &mut GpuRuntime,
+    a_buf: &Buffer<f32>,
+    b_buf: &Buffer<f32>,
+    tr_buf: &Buffer<f32>,
+    n: usize,
+    batch: usize,
+) -> Result<()> {
+    if n == 0 || batch == 0 { return Ok(()); }
+    let wg = 256usize;
+    let source = MATRIX_KERNEL_TEMPLATE;
+    let program = rt.build_program(source)?;
+    let kernel = Kernel::builder()
+        .program(&program).name("frobenius_trace_batched").queue(rt.queue().clone())
+        .global_work_size(batch * wg).local_work_size(wg)
+        .arg(n as i32).arg(batch as i32)
+        .arg(a_buf).arg(b_buf).arg(tr_buf)
+        .arg_local::<f32>(wg)
+        .build().map_err(map_ocl_err)?;
+    unsafe { kernel.enq().map_err(map_ocl_err)?; }
+    Ok(())
+}
+
+/// dot[sid] = Σ_a x[a]·y[a]. `x`/`y` are `[batch][n]`, `dot` is `[batch]`.
+pub fn dot_batched(
+    rt: &mut GpuRuntime,
+    x_buf: &Buffer<f32>,
+    y_buf: &Buffer<f32>,
+    dot_buf: &Buffer<f32>,
+    n: usize,
+    batch: usize,
+) -> Result<()> {
+    if n == 0 || batch == 0 { return Ok(()); }
+    let wg = 256usize;
+    let source = MATRIX_KERNEL_TEMPLATE;
+    let program = rt.build_program(source)?;
+    let kernel = Kernel::builder()
+        .program(&program).name("dot_batched").queue(rt.queue().clone())
+        .global_work_size(batch * wg).local_work_size(wg)
+        .arg(n as i32).arg(batch as i32)
+        .arg(x_buf).arg(y_buf).arg(dot_buf)
+        .arg_local::<f32>(wg)
+        .build().map_err(map_ocl_err)?;
+    unsafe { kernel.enq().map_err(map_ocl_err)?; }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

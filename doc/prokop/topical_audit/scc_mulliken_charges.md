@@ -21,6 +21,7 @@ DFTB+.
 | Rust (sparse) | `rust_dftb/src/methods/sparse/gpu_sparse.rs` | active | Mulliken from diagonal blocks of `K·S` (BSR4). `SparseResult.mulliken`. |
 | Rust (xtb) | `rust_dftb/src/methods/xtb/mulliken.rs` | active | xTB Mulliken/CM5 charges. |
 | Rust (engine) | `rust_dftb/src/bin/dftb_engine.rs` | active | Rhai: `get_charges`, `save_charges`, `get_sparse_charges`, `save_sparse_charges`. |
+| Rust (GPU) | `rust_dftb/src/qmqm/gpu_scc.rs` | active | `GpuSccResult.charges` — Mulliken from device-resident D·S diagonal, batched. Parity <6e-6 vs CPU on formic dimer. |
 | Python | `scripts/compare_rust_vs_dftbplus.py` | active | Parity report: converts Rust populations → charges for comparison. |
 | Python | `scripts/plot_charges_homo_lumo.py` | active | Spatial charge map (Rust dense vs sparse vs DFTB+). |
 | Fortran (ref) | `src/dftbp/scc/` | reference | Upstream SCC + Mulliken analysis. `detailed.out` reports `deltaQ = q0 - q_elec`. |
@@ -57,5 +58,6 @@ Dense charges match DFTB+ to machine precision. Sparse TC2 charges match to
 ## Related
 
 - `/doc/prokop/topical_audit/sparse_tc2_purification.md` — sparse charge route.
+- `/doc/prokop/topical_audit/gpu_scc_pipeline.md` — GPU device-resident SCC.
 - `/doc/prokop/topical_audit/dftbplus_parity_harness.md` — parity validation.
 - `/doc/prokop/reports/2025-09-05_scc_charges_davidson_parity.md` — session report.

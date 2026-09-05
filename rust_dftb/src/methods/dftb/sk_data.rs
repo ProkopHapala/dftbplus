@@ -139,6 +139,57 @@ impl SkTableSp {
         }
         Ok(n_mm)
     }
+
+    /// Evaluate shell integrals AND their radial derivatives dV/dr at distance r.
+    /// Uses analytic Hermite spline derivatives — no finite differences.
+    /// Returns n_mm (number of magnetic quantum numbers = l_min+1).
+    /// out_h, out_s: values [n_mm]
+    /// dh_dr, ds_dr: radial derivatives [n_mm]
+    pub fn eval_shell_integrals_and_derivs_into(
+        &self,
+        ang1: i32,
+        ang2: i32,
+        r: f64,
+        out_h: &mut [f64],
+        out_s: &mut [f64],
+        dh_dr: &mut [f64],
+        ds_dr: &mut [f64],
+    ) -> Result<usize> {
+        // Single Hermite evaluation with analytic derivative — O(n_integ), no finite diff
+        let mut h_all = [0.0f64; 20]; let mut s_all = [0.0f64; 20];
+        let mut dh_all = [0.0f64; 20]; let mut ds_all = [0.0f64; 20];
+        self.h.eval_with_deriv_into(r, &mut h_all, &mut dh_all)?;
+        self.s.eval_with_deriv_into(r, &mut s_all, &mut ds_all)?;
+
+        let (l_min, l_max) = if ang1 <= ang2 { (ang1, ang2) } else { (ang2, ang1) };
+        let n_mm = (l_min + 1) as usize;
+
+        let is_extended = h_all.iter().skip(10).any(|&x| x != 0.0);
+        let extract = |all: &[f64; 20], mm: usize| -> f64 {
+            if is_extended {
+                let new_col = sk_map(mm as i32, l_max, l_min) as usize;
+                all[new_col - 1]
+            } else {
+                const NEW_TO_OLD: [usize; 21] = {
+                    let mut arr = [0usize; 21];
+                    let iSKInterOld: [usize; 10] = [8, 9, 10, 13, 14, 15, 16, 18, 19, 20];
+                    let mut i = 0;
+                    while i < 10 { arr[iSKInterOld[i]] = i; i += 1; }
+                    arr
+                };
+                let new_col = sk_map(mm as i32, l_max, l_min) as usize;
+                all[NEW_TO_OLD[new_col]]
+            }
+        };
+
+        for mm in 0..=l_min {
+            out_h[mm as usize] = extract(&h_all, mm as usize);
+            out_s[mm as usize] = extract(&s_all, mm as usize);
+            dh_dr[mm as usize] = extract(&dh_all, mm as usize);
+            ds_dr[mm as usize] = extract(&ds_all, mm as usize);
+        }
+        Ok(n_mm)
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -349,8 +400,8 @@ fn read_skf_all(path: &Path, sp1: &str, sp2: &str) -> Result<SkTableSp> {
     Ok(SkTableSp {
         sp1: sp1.to_string(),
         sp2: sp2.to_string(),
-        h: EqGridTable { dr: dist, values: h_vals },
-        s: EqGridTable { dr: dist, values: s_vals },
+        h: EqGridTable::new(dist, h_vals),
+        s: EqGridTable::new(dist, s_vals),
     })
 }
 

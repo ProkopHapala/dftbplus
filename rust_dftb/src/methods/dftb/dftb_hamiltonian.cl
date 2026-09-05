@@ -21,7 +21,7 @@
 #endif
 
 #ifndef N_SK_COLS
-#define N_SK_COLS 4
+#define N_SK_COLS 5  // max: (ss, sp, pp_sig, pp_pi, ps) for 4x4 blocks
 #endif
 
 #define TAU_FACTOR 3.2f
@@ -140,14 +140,30 @@ inline float2 interp_sk_2(__local const float* tab, int base, float4 w) {
     return v0 * w.x + v1 * w.y + v2 * w.z + v3 * w.w;
 }
 
-// 4-channel: float4 cast (4x4: ss, sp, pp_sig, pp_pi)
-inline float4 interp_sk_4(__local const float* tab, int base, float4 w) {
-    __local float4* tab4 = (__local float4*)tab;
-    float4 v0 = tab4[base    ];
-    float4 v1 = tab4[base + 1];
-    float4 v2 = tab4[base + 2];
-    float4 v3 = tab4[base + 3];
-    return v0 * w.x + v1 * w.y + v2 * w.z + v3 * w.w;
+// 5-channel: (ss, sp, pp_sig, pp_pi, ps) — 5 floats per node for 4x4 blocks.
+// ps is the s-p integral from the REVERSE SK table, needed for heteronuclear
+// pairs where sp(fwd) ≠ ps(rev). For homonuclear pairs, ps == sp.
+// Returns float4 (ss, sp, pp_sig, pp_pi) via return + ps via *ps_out.
+// tab is interleaved [ss, sp, pp_sig, pp_pi, ps, ...] with stride 5.
+// base is the starting node index (in nodes, not floats).
+inline float4 interp_sk_5(__local const float* tab, int base, float4 w, float* ps_out) {
+    float4 r = (float4)(0.0f, 0.0f, 0.0f, 0.0f);
+    float ps = 0.0f;
+    for (int j = 0; j < 4; j++) {
+        int off = (base + j) * 5;
+        float wt;
+        if (j == 0) wt = w.x;
+        else if (j == 1) wt = w.y;
+        else if (j == 2) wt = w.z;
+        else wt = w.w;
+        r.s0 += tab[off    ] * wt;  // ss
+        r.s1 += tab[off + 1] * wt;  // sp
+        r.s2 += tab[off + 2] * wt;  // pp_sig
+        r.s3 += tab[off + 3] * wt;  // pp_pi
+        ps   += tab[off + 4] * wt;  // ps
+    }
+    *ps_out = ps;
+    return r;
 }
 
 // ------------------------------------------------------------------
@@ -159,29 +175,31 @@ inline float4 interp_sk_4(__local const float* tab, int base, float4 w) {
 // sk = (ss, sp)
 // blk as float4: (ss, sp_py, sp_pz, sp_px)
 inline void rotate_1x4(float l, float m, float n, float2 sk, float4* blk) {
-    float4 sp = (float4)(sk.x, m, n, l) * sk.y;
-    *blk = sp;
+    // blk = (ss, sp*m, sp*n, sp*l) — ss is NOT multiplied by sp
+    *blk = (float4)(sk.x, sk.y * m, sk.y * n, sk.y * l);
 }
 
 // 4x4: sp-sp block (4x4)
-// sk = (ss, sp, pp_sig, pp_pi)
+// sk = (ss, sp, pp_sig, pp_pi), ps = separate s-p integral from reverse SK table
 // blk as float4[4]: row-major 4x4, rows = atom j (s,py,pz,px), cols = atom i (s,py,pz,px)
 // Orbital ordering: s, py, pz, px  (DFTB+ convention)
 // v = (py, pz, px) = (m, n, l)
 // pp block: diff * v ⊗ v + sk.w * I  (3x3 outer product + diagonal)
-inline void rotate_4x4(float l, float m, float n, float4 sk, float4* blk) {
+// Row 0 (s_j, p_i): -ps from rev table (sign from (-1)^(ang1+ang2) = -1 for ps)
+// Rows 1-3 col 0 (p_j, s_i): sp from fwd table
+inline void rotate_4x4(float l, float m, float n, float4 sk, float ps, float4* blk) {
     float diff = sk.z - sk.w;  // pp_sigma - pp_pi
 
-    // Row 0 (s_j): (ss, ps_py, ps_pz, ps_px) = (ss, -sp*m, -sp*n, -sp*l)
-    blk[0] = (float4)(sk.x, -sk.y * m, -sk.y * n, -sk.y * l);
+    // Row 0 (s_j): (ss, -ps*m, -ps*n, -ps*l) — ps from rev table, negated
+    blk[0] = (float4)(sk.x, -ps * m, -ps * n, -ps * l);
 
-    // Row 1 (py_j): (sp_py, pp[py,py], pp[py,pz], pp[py,px])
+    // Row 1 (py_j): (sp*m, pp[py,py], pp[py,pz], pp[py,px]) — sp from fwd table
     blk[1] = (float4)(sk.y * m,  m * m * diff + sk.w,  m * n * diff,      m * l * diff);
 
-    // Row 2 (pz_j): (sp_pz, pp[pz,py], pp[pz,pz], pp[pz,px])
+    // Row 2 (pz_j): (sp*n, pp[pz,py], pp[pz,pz], pp[pz,px])
     blk[2] = (float4)(sk.y * n,  n * m * diff,        n * n * diff + sk.w, n * l * diff);
 
-    // Row 3 (px_j): (sp_px, pp[px,py], pp[px,pz], pp[px,px])
+    // Row 3 (px_j): (sp*l, pp[px,py], pp[px,pz], pp[px,px])
     blk[3] = (float4)(sk.y * l,  l * m * diff,        l * n * diff,        l * l * diff + sk.w);
 }
 
@@ -211,11 +229,14 @@ inline void write_symmetric_1x4(
     M[base + (orb_j + 1) * n_orbs + orb_i] =  v.y;
     M[base + (orb_j + 2) * n_orbs + orb_i] =  v.z;
     M[base + (orb_j + 3) * n_orbs + orb_i] =  v.w;
-    // Transpose: row orb_i, cols orb_j..orb_j+3  (ss symmetric, sp→-ps)
-    M[base + orb_i * n_orbs +  orb_j    ] =   v.x;
-    M[base + orb_i * n_orbs + (orb_j + 1)] =  -v.y;
-    M[base + orb_i * n_orbs + (orb_j + 2)] =  -v.z;
-    M[base + orb_i * n_orbs + (orb_j + 3)] =  -v.w;
+    // Transpose: H is symmetric, so (s_i, p_j) = (p_j, s_i) — same value.
+    // The sp/ps sign asymmetry is already handled inside rotate_4x4 for
+    // sp-sp blocks; for s-sp blocks, rotate_1x4 gives (p_j, s_i) directly,
+    // and the symmetric copy must use the SAME sign (no negation).
+    M[base + orb_i * n_orbs +  orb_j    ] =  v.x;
+    M[base + orb_i * n_orbs + (orb_j + 1)] =  v.y;
+    M[base + orb_i * n_orbs + (orb_j + 2)] =  v.z;
+    M[base + orb_i * n_orbs + (orb_j + 3)] =  v.w;
 }
 
 inline void write_symmetric_4x4(
@@ -383,7 +404,7 @@ __kernel void assemble_pairs(
     const int gid = get_global_id(0);
 
     // --- CACHE SK TABLE INTO __local (1 float per node, B-spline stencil) ---
-    // Local memory is sized for the worst case (N_SK_COLS=4); actual copy uses
+    // Local memory is sized for the worst case (N_SK_COLS=5); actual copy uses
     // n_sk_cols which may be 1, 2, or 4 depending on block_type.
     __local float l_sk_h[SK_GRID_MAX * N_SK_COLS];
     __local float l_sk_s[SK_GRID_MAX * N_SK_COLS];
@@ -434,11 +455,12 @@ __kernel void assemble_pairs(
         write_symmetric_1x4(H_out, n_orbs, base, p.orb_i, p.orb_j, &blk);
     } else {
         float4 blk[4];
-        float4 sk_s = interp_sk_4(l_sk_s, base_idx, w);
-        rotate_4x4(p.l, p.m, p.n, sk_s, blk);
+        float ps_s, ps_h;
+        float4 sk_s = interp_sk_5(l_sk_s, base_idx, w, &ps_s);
+        rotate_4x4(p.l, p.m, p.n, sk_s, ps_s, blk);
         write_symmetric_4x4(S_out, n_orbs, base, p.orb_i, p.orb_j, blk);
-        float4 sk_h = interp_sk_4(l_sk_h, base_idx, w);
-        rotate_4x4(p.l, p.m, p.n, sk_h + h1_factor * sk_s, blk);
+        float4 sk_h = interp_sk_5(l_sk_h, base_idx, w, &ps_h);
+        rotate_4x4(p.l, p.m, p.n, sk_h + h1_factor * sk_s, ps_h + h1_factor * ps_s, blk);
         write_symmetric_4x4(H_out, n_orbs, base, p.orb_i, p.orb_j, blk);
     }
 }

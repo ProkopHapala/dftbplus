@@ -19,11 +19,20 @@ never into this folder.
 - **sparse_homo_lumo.py** — finds HOMO/LUMO via Chebyshev filter + Rayleigh-Ritz
   iterative eigensolver (from `NumericalMathPlayground/topics/LinearAlgebra/
   SpectralFiltering/spectral_solvers.py`). Reads H,S matrices from Rust
-  (`*_hs_matrix.tsv`), transforms the generalized problem to standard form via
-  S^{-1/2}, then applies Chebyshev polynomial filtering + Rayleigh-Ritz to
-  extract eigenpairs in two bands (around HOMO and LUMO) without full
-  diagonalization. Usage:
-  `python3 sparse_homo_lumo.py <hs_matrix.tsv> --nvec 12 --cheb-deg 40 --iters 30`.
+  (`*_hs_matrix.tsv`), transforms the generalized problem `H·c = ε·S·c` to
+  standard symmetric form via **sparse Cholesky** `S = L·Lᵀ`, then uses an
+  **implicit operator** `H'·v = L⁻¹·(H·(L⁻ᵀ·v))` (2 triangular solves +
+  1 SpMV per matvec, no densification). Optimizations: dense BLAS triangular
+  solves for N<2000 (12x faster), spectral range rescaling for large N,
+  adaptive Chebyshev parameters (nvec/deg/iters auto-scale with system size).
+  Chebyshev polynomial filtering + Rayleigh-Ritz extracts eigenpairs in two
+  bands (around HOMO and LUMO) without full diagonalization. Usage:
+  `python3 sparse_homo_lumo.py <hs_matrix.tsv>` (params auto-selected).
+- **ribbon_scaling_test.py** — systematic scaling benchmark on H-passivated
+  zigzag carbon ribbons (L=4..64, N=76..1156 orbitals). Runs the sparse solver
+  on all ribbon TSV files, produces timing/nnz/parity CSV+JSON, and a 4-panel
+  scaling plot (runtime vs N, nnz vs N, parity vs N, fill ratio vs N).
+  Usage: `python3 ribbon_scaling_test.py`.
 - **compare_homo_lumo_3way.py** — 3-way HOMO/LUMO comparison: Rust dense vs
   Rust sparse (Chebyshev+Ritz) vs DFTB+ Fortran. Prints eigenvalue table
   (HOMO, LUMO, gap differences) and generates side-by-side wavefunction contour

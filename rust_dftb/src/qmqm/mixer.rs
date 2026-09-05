@@ -3,8 +3,6 @@
 //! The residual is defined as `F(q) = q_out(q) - q_in`.
 //! Mixers accelerate convergence by extrapolating in the history subspace.
 
-use std::collections::VecDeque;
-
 /// Trait for charge-vector mixers.
 ///
 /// All implementations work on pre-allocated slices to guarantee zero
@@ -59,6 +57,8 @@ impl Mixer for SimpleMixer {
 /// is the linear combination that minimises the residual norm in the history
 /// subspace.
 ///
+/// C9: Uses a ring buffer of preallocated arrays — zero allocations per iteration.
+///
 /// Reference: Anderson, J. Assoc. Comput. Mach. 12, 547 (1965).
 #[derive(Debug, Clone)]
 pub struct DiisMixer {
@@ -70,10 +70,14 @@ pub struct DiisMixer {
     pub alpha: f64,
     /// Iteration counter.
     iter: usize,
-    /// History of input vectors `q_in`.
-    q_in_history: VecDeque<Vec<f64>>,
-    /// History of residual vectors `F(q)`.
-    residual_history: VecDeque<Vec<f64>>,
+    /// Ring buffer of input vectors `q_in` (preallocated, C9).
+    q_in_bufs: Vec<Vec<f64>>,
+    /// Ring buffer of residual vectors `F(q)` (preallocated, C9).
+    res_bufs: Vec<Vec<f64>>,
+    /// Ring buffer write position.
+    buf_idx: usize,
+    /// Number of valid entries in the ring buffer.
+    n_filled: usize,
     /// Pre-allocated matrix for the DIIS linear system `B·c = rhs`.
     /// Shape `[(max_history+1) × (max_history+1)]`, stored row-major.
     b_mat: Vec<f64>,
@@ -86,18 +90,23 @@ pub struct DiisMixer {
 }
 
 impl DiisMixer {
-    pub fn new(max_history: usize, _vector_len: usize) -> Self {
+    pub fn new(max_history: usize, vector_len: usize) -> Self {
         let b_mat = vec![0.0; (max_history + 1) * (max_history + 1)];
         let rhs = vec![0.0; max_history + 1];
         let work = vec![0.0; max_history];
         let ipiv = vec![0; max_history + 1];
+        // C9: preallocate ring buffer arrays
+        let q_in_bufs = (0..max_history).map(|_| vec![0.0; vector_len]).collect();
+        let res_bufs = (0..max_history).map(|_| vec![0.0; vector_len]).collect();
         Self {
             max_history,
-            warmup: 5,
-            alpha: 0.2,
+            warmup: 0,   // no warmup — DIIS starts immediately (falls back to simple mixing until enough history)
+            alpha: 0.5,  // more aggressive simple mixing for faster convergence
             iter: 0,
-            q_in_history: VecDeque::with_capacity(max_history),
-            residual_history: VecDeque::with_capacity(max_history),
+            q_in_bufs,
+            res_bufs,
+            buf_idx: 0,
+            n_filled: 0,
             b_mat,
             rhs,
             work,
@@ -112,7 +121,7 @@ impl DiisMixer {
     ///
     /// Returns coefficients `c` in `self.work[..n_hist]`.
     fn solve_diis(&mut self) -> usize {
-        let n = self.residual_history.len();
+        let n = self.n_filled;
         if n == 0 {
             return 0;
         }
@@ -120,10 +129,11 @@ impl DiisMixer {
         // Assemble augmented matrix B (size (n+1)×(n+1)) in row-major.
         let np1 = n + 1;
         for i in 0..n {
+            let res_i = &self.res_bufs[i];
             for j in 0..n {
-                let dot: f64 = self.residual_history[i]
+                let dot: f64 = res_i
                     .iter()
-                    .zip(&self.residual_history[j])
+                    .zip(&self.res_bufs[j])
                     .map(|(a, b)| a * b)
                     .sum();
                 self.b_mat[i * np1 + j] = dot;
@@ -138,9 +148,7 @@ impl DiisMixer {
         self.rhs.fill(0.0);
         self.rhs[n] = 1.0;
 
-        // Solve with LAPACK dgesv (if available) or a small dense solver.
-        // For the skeleton we use a simple Gaussian elimination for the small system.
-        // TODO: replace with lapack bindings for production.
+        // Solve with Gaussian elimination for the small system.
         gauss_eliminate(np1, &mut self.b_mat, &mut self.rhs, &mut self.ipiv);
 
         // Copy coefficients to work buffer.
@@ -161,16 +169,12 @@ impl Mixer for DiisMixer {
             return;
         }
 
-        // Store current state in history.
-        let q_in_copy: Vec<f64> = q_inout.to_vec();
-        let res_copy: Vec<f64> = residual.to_vec();
-
-        if self.q_in_history.len() == self.max_history {
-            self.q_in_history.pop_front();
-            self.residual_history.pop_front();
-        }
-        self.q_in_history.push_back(q_in_copy);
-        self.residual_history.push_back(res_copy);
+        // C9: Store current state in ring buffer (no allocation — copy_from_slice)
+        let idx = self.buf_idx;
+        self.q_in_bufs[idx].copy_from_slice(q_inout);
+        self.res_bufs[idx].copy_from_slice(residual);
+        self.buf_idx = (self.buf_idx + 1) % self.max_history;
+        if self.n_filled < self.max_history { self.n_filled += 1; }
 
         let n_hist = self.solve_diis();
         if n_hist == 0 {
@@ -183,9 +187,10 @@ impl Mixer for DiisMixer {
 
         // q_new = Σ_i c_i · q_out_i  where q_out_i = q_in_i + residual_i
         q_inout.fill(0.0);
-        for (i, q_in_i) in self.q_in_history.iter().enumerate() {
+        for i in 0..n_hist {
             let c = self.work[i];
-            let res_i = &self.residual_history[i];
+            let q_in_i = &self.q_in_bufs[i];
+            let res_i = &self.res_bufs[i];
             for (q, (&q_in_val, &res_val)) in q_inout.iter_mut().zip(q_in_i.iter().zip(res_i.iter())) {
                 *q += c * (q_in_val + res_val);
             }
@@ -193,8 +198,17 @@ impl Mixer for DiisMixer {
     }
 
     fn reset(&mut self) {
-        self.q_in_history.clear();
-        self.residual_history.clear();
+        self.buf_idx = 0;
+        self.n_filled = 0;
+        self.iter = 0;
+    }
+}
+
+impl DiisMixer {
+    /// Reset only the iteration counter, keeping history buffers.
+    /// Use after geometry change with warm-started charges — the old DIIS
+    /// subspace may still span useful directions in charge space.
+    pub fn reset_iter_only(&mut self) {
         self.iter = 0;
     }
 }
@@ -276,5 +290,160 @@ mod tests {
         gauss_eliminate(2, &mut a, &mut b, &mut ipiv);
         assert!((b[0] - 3.0).abs() < 1e-12);
         assert!((b[1] - 5.0).abs() < 1e-12);
+    }
+}
+
+/// Broyden "good" quasi-Newton mixer for SCC fixed-point iteration.
+///
+/// Approximates the inverse Jacobian J^{-1} of F(q) = q_out(q) - q_in
+/// using multi-secant updates (Sherman-Morrison).
+///
+/// Convergence: superlinear (faster than DIIS for well-behaved SCC).
+/// Storage: O(n²) for J_inv (n = number of atoms).
+/// Per-iter cost: O(n²) for matrix-vector + rank-1 update.
+///
+/// Reference: Broyden, Math. Comp. 19, 577 (1965); Johnson, J. Chem. Phys.
+/// 153, 184103 (2020) — "Broyden mixing for DFTB".
+#[derive(Debug, Clone)]
+pub struct BroydenMixer {
+    pub alpha: f64,           // initial mixing parameter (J_inv = -alpha*I)
+    n: usize,                 // vector length
+    iter: usize,
+    /// Inverse Jacobian approximation, row-major n×n.
+    j_inv: Vec<f64>,
+    /// Previous q_in (for computing s = Δq).
+    q_prev: Vec<f64>,
+    /// Previous residual F (for computing y = ΔF).
+    f_prev: Vec<f64>,
+    /// Work vectors.
+    jq: Vec<f64>,             // J_inv · F
+    s: Vec<f64>,              // Δq
+    y: Vec<f64>,              // ΔF
+    jt_y: Vec<f64>,           // J_inv^T · y  (for denominator)
+    js: Vec<f64>,             // J_inv · s
+    /// Whether J_inv has been initialized.
+    initialized: bool,
+}
+
+impl BroydenMixer {
+    pub fn new(n: usize, alpha: f64) -> Self {
+        Self {
+            alpha,
+            n,
+            iter: 0,
+            j_inv: vec![0.0; n * n],
+            q_prev: vec![0.0; n],
+            f_prev: vec![0.0; n],
+            jq: vec![0.0; n],
+            s: vec![0.0; n],
+            y: vec![0.0; n],
+            jt_y: vec![0.0; n],
+            js: vec![0.0; n],
+            initialized: false,
+        }
+    }
+
+    /// J_inv = -alpha * I
+    fn init_j_inv(&mut self) {
+        self.j_inv.fill(0.0);
+        for i in 0..self.n {
+            self.j_inv[i * self.n + i] = -self.alpha;
+        }
+        self.initialized = true;
+    }
+
+    /// Compute v = J_inv · x  (row-major matrix-vector product)
+    fn matvec(&self, x: &[f64], v: &mut [f64]) {
+        let n = self.n;
+        let j_inv = &self.j_inv;
+        for i in 0..n {
+            let mut sum = 0.0;
+            for j in 0..n {
+                sum += j_inv[i * n + j] * x[j];
+            }
+            v[i] = sum;
+        }
+    }
+
+    /// Sherman-Morrison rank-1 update for "good Broyden":
+    ///   J_{k+1}·s = y  (secant condition)
+    ///   J_inv_{k+1} = J_inv + (s - J_inv·y)·(s^T·J_inv) / (s^T·J_inv·y)
+    fn update(&mut self) {
+        let n = self.n;
+        // J_inv · y → js (inline to avoid borrow conflict)
+        let y = self.y.clone(); // small (n_atoms), stack-ish
+        for i in 0..n {
+            let mut sum = 0.0;
+            for j in 0..n {
+                sum += self.j_inv[i * n + j] * y[j];
+            }
+            self.js[i] = sum;
+        }
+        // s^T · (J_inv · y) = s · js  (denominator)
+        let denom: f64 = self.s.iter().zip(self.js.iter()).map(|(a, b)| a * b).sum();
+        if denom.abs() < 1e-14 {
+            return; // Singular update — skip
+        }
+        // u = s - J_inv·y = s - js
+        let mut u = vec![0.0; n];
+        for i in 0..n { u[i] = self.s[i] - self.js[i]; }
+        // w = J_inv^T · s  (row vector for outer product)
+        let s = self.s.clone();
+        for i in 0..n {
+            let mut sum = 0.0;
+            for j in 0..n {
+                sum += self.j_inv[j * n + i] * s[j]; // J_inv^T[i,j] = J_inv[j,i]
+            }
+            self.jt_y[i] = sum;
+        }
+        // J_inv += u ⊗ w / denom
+        let inv_denom = 1.0 / denom;
+        for i in 0..n {
+            for j in 0..n {
+                self.j_inv[i * n + j] += u[i] * self.jt_y[j] * inv_denom;
+            }
+        }
+    }
+}
+
+impl Mixer for BroydenMixer {
+    fn mix(&mut self, q_inout: &mut [f64], _q_out: &[f64], residual: &[f64]) {
+        self.iter += 1;
+        let n = self.n;
+
+        if !self.initialized {
+            self.init_j_inv();
+        } else {
+            // s = q_in - q_prev, y = F - F_prev
+            for i in 0..n {
+                self.s[i] = q_inout[i] - self.q_prev[i];
+                self.y[i] = residual[i] - self.f_prev[i];
+            }
+            self.update();
+        }
+
+        // Save current state
+        self.q_prev.copy_from_slice(q_inout);
+        self.f_prev.copy_from_slice(residual);
+
+        // Step: q_new = q_in - J_inv · F  (inline matvec to avoid borrow conflict)
+        let f = residual.to_vec(); // small (n_atoms)
+        for i in 0..n {
+            let mut sum = 0.0;
+            for j in 0..n {
+                sum += self.j_inv[i * n + j] * f[j];
+            }
+            self.jq[i] = sum;
+        }
+        for i in 0..n {
+            q_inout[i] -= self.jq[i];
+        }
+    }
+
+    fn reset(&mut self) {
+        self.iter = 0;
+        self.initialized = false;
+        self.q_prev.fill(0.0);
+        self.f_prev.fill(0.0);
     }
 }

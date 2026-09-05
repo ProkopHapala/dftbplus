@@ -45,7 +45,7 @@ const BOHR2ANG: f64 = 1.0 / ANG2BOHR;
 /// `epsilon(1.0_dp)` in double precision is 2.220446049250313e-16, so
 /// `epsilon**0.25 ≈ 1.1920928955078125e-4`.
 const DELTA_X_DIFF_BOHR: f64 = 1.1920928955078125e-4;
-const DELTA_X_DIFF_ANG: f64 = DELTA_X_DIFF_BOHR * BOHR2ANG;
+pub const DELTA_X_DIFF_ANG: f64 = DELTA_X_DIFF_BOHR * BOHR2ANG;
 
 /// Minimum neighbour distance (matches Fortran `minNeighDist = 1.0e-2`).
 const MIN_NEIGH_DIST: f64 = 1.0e-2;

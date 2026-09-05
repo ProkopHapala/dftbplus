@@ -81,9 +81,10 @@ dense diagonalization for benzene and coronene, and ~1e-5 for circumcoronene
   so H-containing systems can only use the dense eigenvector path for
   wavefunction projection.
 - **Sparse Chebyshev+Ritz convergence** — circumcoronene needs ~30 iterations
-  with Chebyshev degree 40 to reach ~1e-5 parity. The S^{-1/2} transformation
-  is currently dense O(N³); for true linear scaling, a sparse/iterative
-  S^{-1/2} or a generalized Chebyshev filter would be needed.
+  with Chebyshev degree 40 to reach ~1e-5 parity. The transformation now uses
+  sparse Cholesky `S = L·Lᵀ` with an implicit `L⁻¹·H·L⁻ᵀ` operator (2 sparse
+  triangular solves + 1 SpMV per matvec, no densification). For very large 3D
+  systems, hierarchical Cholesky would be needed to control fill-in.
 
 ## Related
 

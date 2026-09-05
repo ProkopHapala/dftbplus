@@ -316,6 +316,7 @@ fn optimize_geometry_persistent(
     scc_tol: f64,
     traj_path: Option<&Path>,
     hist_path: Option<&Path>,
+    mixer: &str,
 ) -> Result<(Vec<[f64; 3]>, f64, usize), String> {
     use rust_dftb::methods::dftb::dftb_cpu::{DftbCpu, CpuSccResult};
     use rust_dftb::methods::dftb::forces::parse_all_repulsive;
@@ -342,6 +343,13 @@ fn optimize_geometry_persistent(
 
     let mut solver = DftbCpu::new(sk, species.to_vec())
         .map_err(|e| format!("DftbCpu::new failed: {e}"))?;
+
+    if mixer == "broyden" {
+        solver.use_broyden(0.5);
+        eprintln!("  [opt] Mixer: Broyden (alpha=0.5)");
+    } else {
+        eprintln!("  [opt] Mixer: DIIS (history=10, alpha=0.5)");
+    }
 
     eprintln!("  [opt] FIRE: dt0={}, dt_max={}, vmax={}, max_disp=0.1Å, max_iter={}, f_tol={:.2e}", 1.0, 5.0, 2.0, max_opt_iter, f_tol);
     eprintln!("  [opt] SCC: max_iter={}, tol={:.2e} (warm-started, persistent state)", scc_max_iter, scc_tol);
@@ -401,9 +409,10 @@ fn optimize_geometry_persistent(
         current = new_coords;
         max_f = mf;
 
-        eprintln!("  [opt] iter {:>3}  E={:.8e}  max|F|={:.4e}  rms|F|={:.4e}  scc={}  dt={:.3}  t={:.2}s",
+        eprintln!("  [opt] iter {:>3}  E={:.8e}  max|F|={:.4e}  rms|F|={:.4e}  scc={}  dt={:.3}  t={:.2}s  [scc={:.1}ms f={:.1}ms]",
             iter, last_energy, max_f, rms_f, scc.n_iter, opt.dt,
-            t_scc.as_secs_f64() + t_force.as_secs_f64());
+            t_scc.as_secs_f64() + t_force.as_secs_f64(),
+            t_scc.as_secs_f64() * 1e3, t_force.as_secs_f64() * 1e3);
 
         if let Some(tf) = &mut traj_file {
             writeln!(tf, "{}", n).unwrap();
@@ -582,6 +591,7 @@ struct Args {
     // Switch args
     switch_from: String,    // optimized reactant XYZ to read for switch mode
     restrain_k: f64,        // harmonic restraint spring constant for h1 (0=none)
+    mixer: String,          // "diis" or "broyden"
 }
 
 fn parse_args() -> Args {
@@ -616,6 +626,7 @@ fn parse_args() -> Args {
         opt_frozen: get_opt("--opt-frozen").unwrap_or_default(),
         switch_from: get_opt("--switch-from").unwrap_or_default(),
         restrain_k: get_opt("--restrain-k").map(|v| v.parse().unwrap()).unwrap_or(0.0),
+        mixer: get_opt("--mixer").unwrap_or_else(|| "diis".to_string()),
     }
 }
 
@@ -657,6 +668,7 @@ fn main() {
             args.opt_max_iter, args.opt_f_tol, args.max_iter, args.tol,
             Some(&PathBuf::from("../debug/hbond_switching/reactant_traj.xyz")),
             Some(&PathBuf::from("../debug/hbond_switching/reactant_hist.csv")),
+            &args.mixer,
         ).unwrap_or_else(|e| panic!("Optimization failed: {e}"));
 
         let out_xyz = PathBuf::from(&args.out);

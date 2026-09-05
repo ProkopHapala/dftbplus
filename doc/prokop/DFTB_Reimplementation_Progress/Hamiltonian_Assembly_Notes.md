@@ -99,6 +99,18 @@ end type
 - Uses derivatives at grid boundary for smooth extrapolation
 - Extrapolation formula: `poly5ToZero(y1, y1p, y1pp, dr, -distFudge, invDistFudge)`
 
+**Rust reimplementation — cubic Hermite spline (replaces Neville):**
+- `EqGridTable::new` precomputes per-grid-point derivatives (4th-order central
+  differences) at load time — O(n_grid·n_integ) once
+- `eval_hermite_into` — cubic Hermite, O(n_integ) per eval (4 FMAs/channel vs
+  Neville's ~64), no stack matrices
+- `eval_hermite_with_deriv_into` — value + analytic dV/dr in one call (no 3×
+  finite-difference evals for force paths)
+- Tail [last_grid_r, r_max] delegates to Neville `poly5_to_zero` for exact
+  DFTB+ parity (tail derivative sensitive to finite-difference order)
+- Neville code retained as `eval_neville_into` for parity verification
+- Parity: max diff <1.2e-7 in tail, <1e-10 in interior; energy 7 sig figs
+
 **Old method interpolation (SlakoEqGrid_interOld_):**
 - For distances within grid: 3-point polynomial fit
 - Between penultimate and last point: Free cubic spline

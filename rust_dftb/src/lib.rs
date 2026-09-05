@@ -21,7 +21,7 @@ pub use core::charges;
 pub use methods::dftb::sk_data::{SkData, SkTableSp, SpeciesOrbitals, AtomicParamsSp};
 pub use methods::dftb::interpolation::{InterpolationMethod, EqGridTable};
 pub use methods::dftb::rotation::{Rotation, DirectionCosines};
-pub use methods::dftb::hamiltonian::{HamiltonianBuilder, Hamiltonian, SccResult};
+pub use methods::dftb::hamiltonian::{HamiltonianBuilder, Hamiltonian, SccResult, SystemContext};
 pub use methods::dftb::gamma::{GammaTable, gamma_full};
 
 pub use methods::traits::{H0Builder, CoulombModel};

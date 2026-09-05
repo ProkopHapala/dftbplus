@@ -251,7 +251,7 @@ fn pack_sk_tables(
             let n_sk_cols = match block_type {
                 0 => 1,
                 1 => 2,
-                2 => 4,
+                2 => 5,  // (ss, sp, pp_sig, pp_pi, ps) — ps from reverse table
                 _ => unreachable!(),
             };
 
@@ -287,7 +287,7 @@ fn pack_sk_tables(
                         s_cols[0][k] = s_ss[0];
 
                         let (h_sp, s_sp, _) = extract_shell_old_or_new(h_all, s_all, 0, 1);
-                        h_cols[1][k] = h_sp[0];
+                        h_cols[1][k] = h_sp[0]; // sp from fwd table (s_i, p_j)
                         s_cols[1][k] = s_sp[0];
 
                         let (h_pp, s_pp, _) = extract_shell_old_or_new(h_all, s_all, 1, 1);
@@ -295,6 +295,25 @@ fn pack_sk_tables(
                         s_cols[2][k] = s_pp[0];
                         h_cols[3][k] = h_pp[1]; // pi
                         s_cols[3][k] = s_pp[1];
+
+                        // ps from reverse table (p_i, s_j) — needed for heteronuclear pairs
+                        // where sp(fwd) ≠ ps(rev). For homonuclear pairs, fwd == rev.
+                        let (h_ps, s_ps) = if sp_i == sp_j {
+                            // Same species: ps == sp
+                            (h_sp, s_sp)
+                        } else {
+                            let tab_rev = sk_data.get_pair(sp_j, sp_i).ok_or_else(|| {
+                                DftbError::InvalidInput(format!(
+                                    "missing reverse SK table ({sp_j}, {sp_i}) for ps channel"
+                                ))
+                            })?;
+                            let h_rev = &tab_rev.h.values[k];
+                            let s_rev = &tab_rev.s.values[k];
+                            let (h_ps_v, s_ps_v, _) = extract_shell_old_or_new(h_rev, s_rev, 0, 1);
+                            (h_ps_v, s_ps_v)
+                        };
+                        h_cols[4][k] = h_ps[0]; // ps from rev table
+                        s_cols[4][k] = s_ps[0];
                     }
                     _ => unreachable!(),
                 }
@@ -511,7 +530,26 @@ fn build_pair_buckets(
         sk_lookup[key] = idx;
     }
 
-    // Precompute global SK cutoff once (same for all fragments)
+    // Precompute per-species-pair cutoff lookup.
+    // CPU uses per-pair r_max = n_grid*dr + DIST_FUDGE; GPU must match to avoid
+    // including pairs that the CPU excludes (e.g. H-H at 11.98 Bohr vs H-H cutoff 10.98).
+    let n_sp = species_to_global.len();
+    let mut global_species = vec![String::new(); n_sp];
+    for (sp, &idx) in species_to_global.iter() {
+        global_species[idx as usize] = sp.clone();
+    }
+    let mut pair_cutoff_sq = vec![0.0f64; n_sp * n_sp];
+    for si in 0..n_sp {
+        for sj in 0..n_sp {
+            let sp_i = &global_species[si];
+            let sp_j = &global_species[sj];
+            if let Some(tab) = sk_data.get_pair(sp_i, sp_j) {
+                let c = tab.cutoff();
+                pair_cutoff_sq[si * n_sp + sj] = c * c;
+            }
+        }
+    }
+    // Global cutoff for upper-bound check (avoids per-pair lookup in inner loop)
     let mut sk_cutoff = 0.0f64;
     for (_, tab) in &sk_data.pairs {
         let c = tab.cutoff();
@@ -551,6 +589,14 @@ fn build_pair_buckets(
 
                 let r = r2.sqrt();
                 let inv_r = 1.0 / r;
+
+                // Per-pair cutoff check: CPU uses per-pair r_max, not global max.
+                let sp_i_idx = global_atom_species[atom_off + i] as usize;
+                let sp_j_idx = global_atom_species[atom_off + j] as usize;
+                let pair_cut_sq = pair_cutoff_sq[sp_i_idx * n_sp + sp_j_idx];
+                if pair_cut_sq == 0.0 || r2 > pair_cut_sq {
+                    continue;
+                }
 
                 let n_orb_j = tmpl.atom_n_orb[j] as usize;
                 let orb_off_j = tmpl.atom_orb_off[j];

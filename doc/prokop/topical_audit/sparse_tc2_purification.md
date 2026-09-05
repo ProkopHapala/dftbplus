@@ -52,14 +52,22 @@ match to ~1e-5–1e-4 e, consistent with the TC2 tolerance.
 
 - **BSR4 requires 4 orbitals/atom** — rejects H (1s only). Pure-C systems only.
   Variable block size or dense fallback for H needed for realistic systems.
+  **Note**: the Chebyshev+Ritz sparse eigensolver (`chebyshev_ritz_eigensolver.md`)
+  handles mixed C/H systems via the general `build_non_scc` path with
+  per-atom orbital counts from `SystemContext::atom_n_orb`. H-passivated
+  ribbons up to N=1156 (388 atoms, 132 H) are validated. The BSR4 TC2 path
+  remains pure-C only.
 - **TC2 convergence depends on spectral bounds** — the Newton-Schulz `Z≈S⁻¹`
   step must converge first; if it fails, TC2 diverges. Fail-loud checks present.
 - **No sparse matvec operator for Davidson** — the partial eigensolver currently
   densifies `H` and `S`. A sparse matvec would enable Davidson on large systems
-  without densification.
+  without densification. **Note**: the Chebyshev+Ritz solver already uses a
+  sparse implicit operator (`CholeskyTransformedOperator`) with sparse SpMV
+  and triangular solves — see `chebyshev_ritz_eigensolver.md`.
 
 ## Related
 
 - `/doc/prokop/reports/2025-09-05_scc_charges_davidson_parity.md` — session report.
+- `/doc/prokop/topical_audit/chebyshev_ritz_eigensolver.md` — sparse Chebyshev+Ritz eigensolver (handles mixed C/H, alternative to TC2 for frontier orbitals).
 - `/rust_dftb/scripts/test_charges_homo_lumo.rhai` — end-to-end test.
 - `/debug/graphene_sparse/` — plots, TSVs, convergence history.

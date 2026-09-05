@@ -316,11 +316,30 @@ Shape is `(3, nAtom)`, values are `-derivs` (actual forces).
 
 **Test:** Run DFTB+ with SCC=Yes, PrintForces=Yes, compare forces.
 
-### Phase 3: Analytic Derivatives (optional optimization)
+### Phase 3: Analytic Derivatives (IMPLEMENTED)
 
-DFTB+ uses finite differences for dH0/dR and dS/dR. For the Rust implementation,
-we could eventually implement analytic derivatives of the SK interpolation + rotation,
-which would be faster and more accurate. But for parity, finite differences are sufficient.
+DFTB+ uses finite differences for dH0/dR and dS/dR. The Rust implementation now
+uses analytic derivatives of the SK interpolation + rotation, which are faster
+and more accurate.
+
+**Implementation:**
+- `interpolation.rs::eval_hermite_with_deriv_into` — cubic Hermite spline with
+  analytic dV/dr (precomputed derivatives at load time, O(1) per eval)
+- `rotation.rs::shell_pair_with_derivs` — closed-form analytic derivatives of
+  the direction-cosine rotation for ss, sp, ps, pp shell pairs
+- `rotation.rs::rotate_block_with_derivs_into` — returns H, S, dH/dR_a, dS/dR_a
+  for all 3 Cartesian directions in one call
+- `sk_data.rs::eval_shell_integrals_and_derivs_into` — one Hermite eval returns
+  V(r) and dV/dr (no 3× finite-difference evals)
+
+**Parity verified:**
+- Initial max|F| = 4.7305 (exact match vs finite-difference baseline)
+- Energy after 100 opt iters: -3.2112994345e1 (7 sig figs match)
+- Force cost dropped from ~1.5ms to ~0.8ms per geometry
+
+**Note on p-orbital ordering:** The p orbital order is [py, pz, px] (indices
+0,1,2), mapping to Cartesian directions (y, z, x) = (1, 2, 0). The Kronecker
+delta in the pp derivative must use this mapping: `delta_ia = 1 when a == (i+1)%3`.
 
 ---
 
