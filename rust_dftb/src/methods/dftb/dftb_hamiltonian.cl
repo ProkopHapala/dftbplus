@@ -125,10 +125,9 @@ inline int cubic_interp_params(float r, float dr, int n_grid, float4* out_w) {
     return i - 1;
 }
 
-// 1-channel: scalar with dot()
+// 1-channel: scalar 4-point B-spline stencil (1 float per node)
 inline float interp_sk_1(__local const float* tab, int base, float4 w) {
-    __local float4* tab4 = (__local float4*)tab;
-    return dot(tab4[base], w);
+    return tab[base] * w.x + tab[base + 1] * w.y + tab[base + 2] * w.z + tab[base + 3] * w.w;
 }
 
 // 2-channel: float2 cast (1x4: ss, sp)
@@ -166,20 +165,24 @@ inline void rotate_1x4(float l, float m, float n, float2 sk, float4* blk) {
 
 // 4x4: sp-sp block (4x4)
 // sk = (ss, sp, pp_sig, pp_pi)
-// blk as float4[4]: row-major 4x4
+// blk as float4[4]: row-major 4x4, rows = atom j (s,py,pz,px), cols = atom i (s,py,pz,px)
+// Orbital ordering: s, py, pz, px  (DFTB+ convention)
+// v = (py, pz, px) = (m, n, l)
+// pp block: diff * v ⊗ v + sk.w * I  (3x3 outer product + diagonal)
 inline void rotate_4x4(float l, float m, float n, float4 sk, float4* blk) {
-    float4 v = (float4)(m, n, l, 0.0f);  // (py, pz, px, pad)
-    float diff = sk.z - sk.w;
+    float diff = sk.z - sk.w;  // pp_sigma - pp_pi
 
-    // Row 0: (ss, -sp_py, -sp_pz, -sp_px)
+    // Row 0 (s_j): (ss, ps_py, ps_pz, ps_px) = (ss, -sp*m, -sp*n, -sp*l)
     blk[0] = (float4)(sk.x, -sk.y * m, -sk.y * n, -sk.y * l);
 
-    // pp outer product: v.yzw * v.yzw * diff + sk.w * v.yzw — computed once, reused for rows 1..3
-    float3 pp = v.yzw * v.yzw * diff + sk.w * v.yzw;
+    // Row 1 (py_j): (sp_py, pp[py,py], pp[py,pz], pp[py,px])
+    blk[1] = (float4)(sk.y * m,  m * m * diff + sk.w,  m * n * diff,      m * l * diff);
 
-    blk[1] = (float4)(sk.y * m, pp.x, pp.y, pp.z);
-    blk[2] = (float4)(sk.y * n, pp.x, pp.y, pp.z);
-    blk[3] = (float4)(sk.y * l, pp.x, pp.y, pp.z);
+    // Row 2 (pz_j): (sp_pz, pp[pz,py], pp[pz,pz], pp[pz,px])
+    blk[2] = (float4)(sk.y * n,  n * m * diff,        n * n * diff + sk.w, n * l * diff);
+
+    // Row 3 (px_j): (sp_px, pp[px,py], pp[px,pz], pp[px,px])
+    blk[3] = (float4)(sk.y * l,  l * m * diff,        l * n * diff,        l * l * diff + sk.w);
 }
 
 // ------------------------------------------------------------------
@@ -221,23 +224,18 @@ inline void write_symmetric_4x4(
     ushort orb_i, ushort orb_j,
     const float4* blk
 ) {
-    // Write 4x4 block at (orb_j, orb_i) and its transpose at (orb_i, orb_j)
-    // blk is float4[4] row-major
-    __global float4* M4 = (__global float4*)M;
-    int row_j_base = base + orb_j * n_orbs;
-    int row_i_base = base + orb_i * n_orbs;
-
-    // Direct block: rows orb_j..orb_j+3, cols orb_i..orb_i+3
-    M4[row_j_base + orb_i] = blk[0];
-    M4[row_j_base + orb_i + 1] = blk[1];
-    M4[row_j_base + orb_i + 2] = blk[2];
-    M4[row_j_base + orb_i + 3] = blk[3];
-
-    // Transpose block: rows orb_i..orb_i+3, cols orb_j..orb_j+3
-    M4[row_i_base + orb_j    ] = (float4)(blk[0].x, blk[1].x, blk[2].x, blk[3].x);
-    M4[row_i_base + orb_j + 1] = (float4)(blk[0].y, blk[1].y, blk[2].y, blk[3].y);
-    M4[row_i_base + orb_j + 2] = (float4)(blk[0].z, blk[1].z, blk[2].z, blk[3].z);
-    M4[row_i_base + orb_j + 3] = (float4)(blk[0].w, blk[1].w, blk[2].w, blk[3].w);
+    // Write 4x4 block at (orb_j, orb_i) and its transpose at (orb_i, orb_j).
+    // blk is float4[4] row-major: blk[a] = row a.
+    // Use individual float writes to avoid float4 alignment/indexing issues.
+    for (int a = 0; a < 4; a++) {
+        float4 row = blk[a];
+        float vals[4] = { row.x, row.y, row.z, row.w };
+        for (int b = 0; b < 4; b++) {
+            float val = vals[b];
+            M[base + (orb_j + a) * n_orbs + (orb_i + b)] = val;
+            M[base + (orb_i + b) * n_orbs + (orb_j + a)] = val;
+        }
+    }
 }
 
 // ------------------------------------------------------------------
@@ -254,6 +252,7 @@ __kernel void onsite_diagonal(
     __global const Fragment* fragments,      // [n_frags]
     __global const int*    atom_species,   // [total_atoms]
     __global const int*    orb_offsets,    // [total_atoms]
+    __global const int*    n_orb_per_atom, // [total_atoms]  number of orbitals on this atom
     __global const float2* onsite_es_ep,   // [n_global_species]  (e_s, e_p)
     __global float*        H_out,          // flat [total_H_elements]
     const int n_frags,
@@ -282,10 +281,13 @@ __kernel void onsite_diagonal(
     int sp      = atom_species[gid];
     float2 e    = onsite_es_ep[sp];
 
-    H_out[base_H + off * n_orbs + off] = e.x;
-    H_out[base_H + (off + 1) * n_orbs + (off + 1)] = e.y;
-    H_out[base_H + (off + 2) * n_orbs + (off + 2)] = e.y;
-    H_out[base_H + (off + 3) * n_orbs + (off + 3)] = e.y;
+    // Only write diagonal entries for orbitals this atom actually has.
+    // (s-only atoms have n_orb=1; sp atoms have n_orb=4.)
+    int na = n_orb_per_atom[gid];
+    if (na >= 1) H_out[base_H + off * n_orbs + off] = e.x;
+    if (na >= 2) H_out[base_H + (off + 1) * n_orbs + (off + 1)] = e.y;
+    if (na >= 3) H_out[base_H + (off + 2) * n_orbs + (off + 2)] = e.y;
+    if (na >= 4) H_out[base_H + (off + 3) * n_orbs + (off + 3)] = e.y;
 }
 
 // ------------------------------------------------------------------
@@ -372,7 +374,8 @@ __kernel void assemble_pairs(
     const int n_grid,
     const int n_pairs,
     const int n_frags,
-    const int block_type       // 0=1x1, 1=1x4, 2=4x4  (uniform for whole launch)
+    const int block_type,      // 0=1x1, 1=1x4, 2=4x4  (uniform for whole launch)
+    const int n_sk_cols        // actual columns in this SK table (1, 2, or 4)
 )
 {
     const int tid = get_local_id(0);
@@ -380,10 +383,12 @@ __kernel void assemble_pairs(
     const int gid = get_global_id(0);
 
     // --- CACHE SK TABLE INTO __local (1 float per node, B-spline stencil) ---
+    // Local memory is sized for the worst case (N_SK_COLS=4); actual copy uses
+    // n_sk_cols which may be 1, 2, or 4 depending on block_type.
     __local float l_sk_h[SK_GRID_MAX * N_SK_COLS];
     __local float l_sk_s[SK_GRID_MAX * N_SK_COLS];
 
-    int n_sk_elements = n_grid * N_SK_COLS;
+    int n_sk_elements = n_grid * n_sk_cols;
     for (int i = tid; i < n_sk_elements; i += wg) {
         l_sk_h[i] = sk_h[i];
         l_sk_s[i] = sk_s[i];

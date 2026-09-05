@@ -12,3 +12,26 @@ thiserror = "1.0"
 log = "0.4"
 env_logger = "0.11"
 ocl = "0.19"
+
+# --- Build profiles: shrink disk footprint without losing backtrace quality ---
+# See: blood_of_civilization/doc/AGENTS/notes/Memory_Issues/reduce_target_footprint_plan.md
+#
+# debug = 1            : line tables only (keeps panic file:line + function names
+#                       in backtraces), drops variable/type debug info. Cuts
+#                       debug info ~4x vs default debug=2.
+# strip = "debuginfo"  : removes .debug_line/.debug_str/.debug_info from the
+#                       final binary. .eh_frame (unwind tables) survives, so
+#                       function-name backtraces still work without gdb.
+#                       Measured: 935 MB -> 343 MB debug binary on boc project.
+[profile.dev]
+debug = 1
+strip = "debuginfo"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+debug = 1
+incremental = true
+debug-assertions = true
+overflow-checks = true
+strip = "debuginfo"

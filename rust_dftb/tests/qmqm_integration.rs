@@ -393,3 +393,396 @@ fn hcooh_fixed_charge_scc_parity() {
         "HCOOH S mismatch (diff = {diff_s:e})"
     );
 }
+
+// ─── Agent_2: Multi-fragment validation tests ──────────────────────
+//
+// These tests exercise the `MultiSystemSolver` with 2+ fragments to validate
+// inter-fragment electrostatic coupling (`compute_v_ext`), charge conservation,
+// and polarization convergence. They serve as the correctness oracle for the
+// GPU QM/QM path.
+//
+// All tests use H2O from `data/xyz/H2O.xyz` as the fragment geometry.
+
+/// Load the H2O geometry from `data/xyz/H2O.xyz`.
+fn agent02_load_h2o() -> (Vec<String>, Vec<[f64; 3]>) {
+    let xyz_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../data/xyz/H2O.xyz");
+    let mol = parse_xyz(xyz_path).unwrap();
+    (mol.species, mol.coords)
+}
+
+/// Compute the total SCC energy of a multi-fragment solver.
+///
+/// Energy per fragment = Tr(D · H0) + 0.5 · Σ_A Δq_A · shift_A
+/// where shift = v_intra + v_ext. Summing over all fragments gives the
+/// total QM/QM energy including inter-fragment electrostatic interaction.
+fn agent02_total_energy<M: rust_dftb::qmqm::Mixer>(
+    solver: &rust_dftb::qmqm::MultiSystemSolver<M>,
+) -> f64 {
+    let mut total = 0.0;
+    for frag in &solver.fragments {
+        let n_occ = (frag.n_electrons / 2.0).round() as usize;
+        let c_occ = frag.eigenvectors.columns(0, n_occ);
+        let density = &c_occ * c_occ.transpose() * 2.0;
+        let e_h0 = (&density * &frag.template.h0).trace();
+        let delta_q: Vec<f64> = frag
+            .charges
+            .iter()
+            .zip(frag.template.q0.iter())
+            .map(|(q, q0)| q - q0)
+            .collect();
+        let e_scc: f64 = 0.5
+            * delta_q
+                .iter()
+                .zip(frag.shift.iter())
+                .map(|(dq, s)| dq * s)
+                .sum::<f64>();
+        total += e_h0 + e_scc;
+    }
+    total
+}
+
+/// Build a `MultiSystemSolver` with N H2O fragments at the given translations.
+///
+/// `neighbor_cutoff` controls the fragment neighbor list — use a small value
+/// for independent (uncoupled) fragments and a large value for coupled ones.
+fn agent02_build_h2o_solver(
+    sk_dir: &str,
+    translations: &[[f64; 3]],
+    neighbor_cutoff: f64,
+) -> rust_dftb::qmqm::MultiSystemSolver<rust_dftb::qmqm::DiisMixer> {
+    use rust_dftb::qmqm::{
+        DiisMixer, Fragment, FragmentNeighborList, FragmentTemplate, GammaTable, MultiSystemSolver,
+    };
+
+    let (species, base_coords) = agent02_load_h2o();
+    let sk = load_sk_for_species(sk_dir, &species).unwrap();
+
+    let mut fragments = Vec::new();
+    let mut centroids = Vec::new();
+    for &trans in translations {
+        let coords: Vec<[f64; 3]> = base_coords
+            .iter()
+            .map(|c| [c[0] + trans[0], c[1] + trans[1], c[2] + trans[2]])
+            .collect();
+        let template = FragmentTemplate::new(&sk, species.clone(), coords.clone()).unwrap();
+        let n = coords.len() as f64;
+        centroids.push([
+            coords.iter().map(|c| c[0]).sum::<f64>() / n,
+            coords.iter().map(|c| c[1]).sum::<f64>() / n,
+            coords.iter().map(|c| c[2]).sum::<f64>() / n,
+        ]);
+        let frag = Fragment::from_template(template, coords);
+        fragments.push(frag);
+    }
+
+    let frag_neighbors = FragmentNeighborList::build(&centroids, neighbor_cutoff);
+    let gamma = GammaTable::from_sk_data(&sk, &species).unwrap();
+    let total_atoms = fragments.iter().map(|f| f.template.n_atoms).sum();
+    let mixer = DiisMixer::new(10, total_atoms);
+
+    MultiSystemSolver::new(fragments, frag_neighbors, gamma, mixer)
+}
+
+/// Test: Two H2O molecules far apart (20 Å) converge to standalone charges.
+///
+/// At large separation with a neighbor cutoff that excludes the other fragment,
+/// inter-fragment coupling is zero. Each fragment should converge to the same
+/// charges as a standalone H2O SCC calculation.
+#[test]
+fn two_fragment_independent_scc() {
+    let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else { return; };
+
+    let (species, base_coords) = agent02_load_h2o();
+    let sk = load_sk_for_species(&sk_dir, &species).unwrap();
+
+    // Standalone H2O SCC reference
+    let builder = HamiltonianBuilder::new(sk.clone());
+    let standalone = builder.build_scc(&species, &base_coords, 200, 1e-9).unwrap();
+    eprintln!("Standalone H2O charges: {:?}", standalone.charges);
+    eprintln!("Standalone H2O energy: {:.10e}", standalone.energy);
+
+    // Two H2O 20 Å apart, neighbor cutoff 10 Å → not neighbors → v_ext = 0
+    let mut solver =
+        agent02_build_h2o_solver(&sk_dir, &[[0.0, 0.0, 0.0], [20.0, 0.0, 0.0]], 10.0);
+    solver.solve_scc(200, 1e-9).unwrap();
+
+    let q0 = &solver.fragments[0].charges;
+    let q1 = &solver.fragments[1].charges;
+    eprintln!("Multi-frag H2O[0] charges: {:?}", q0);
+    eprintln!("Multi-frag H2O[1] charges: {:?}", q1);
+
+    // Both fragments should match standalone within 1e-6
+    for i in 0..3 {
+        assert!(
+            (q0[i] - standalone.charges[i]).abs() < 1e-6,
+            "Fragment 0 charge {} mismatch: multi={}, standalone={}, diff={}",
+            i,
+            q0[i],
+            standalone.charges[i],
+            (q0[i] - standalone.charges[i]).abs()
+        );
+        assert!(
+            (q1[i] - standalone.charges[i]).abs() < 1e-6,
+            "Fragment 1 charge {} mismatch: multi={}, standalone={}, diff={}",
+            i,
+            q1[i],
+            standalone.charges[i],
+            (q1[i] - standalone.charges[i]).abs()
+        );
+    }
+
+    // Verify v_ext is zero (no inter-fragment coupling)
+    for (fi, frag) in solver.fragments.iter().enumerate() {
+        for (ai, &v) in frag.v_ext.iter().enumerate() {
+            assert!(
+                v.abs() < 1e-15,
+                "v_ext should be zero for independent fragments (frag {} atom {}), got {}",
+                fi,
+                ai,
+                v
+            );
+        }
+    }
+
+    eprintln!("two_fragment_independent_scc: PASS (both fragments match standalone)");
+}
+
+/// Test: Two H2O molecules close together (3 Å) — polarization occurs.
+///
+/// At close range, inter-fragment coupling is active. Verify:
+/// - Both fragments converge
+/// - Total charge is conserved (sum of all Δq = 0 within 1e-10)
+/// - Charges differ from standalone (polarization occurred)
+/// - Total energy differs from 2× standalone (interaction energy)
+#[test]
+fn two_fragment_polarization() {
+    let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else { return; };
+
+    let (species, base_coords) = agent02_load_h2o();
+    let sk = load_sk_for_species(&sk_dir, &species).unwrap();
+
+    // Standalone reference
+    let builder = HamiltonianBuilder::new(sk.clone());
+    let standalone = builder.build_scc(&species, &base_coords, 200, 1e-9).unwrap();
+    let standalone_energy = standalone.energy;
+
+    // Two H2O 3 Å apart (centroid separation), neighbor cutoff 30 Å → coupled
+    let mut solver =
+        agent02_build_h2o_solver(&sk_dir, &[[0.0, 0.0, 0.0], [3.0, 0.0, 0.0]], 30.0);
+    solver.solve_scc(200, 1e-9).unwrap();
+
+    let q0 = &solver.fragments[0].charges;
+    let q1 = &solver.fragments[1].charges;
+    eprintln!("Polarized H2O[0] charges: {:?}", q0);
+    eprintln!("Polarized H2O[1] charges: {:?}", q1);
+
+    // Charge conservation: sum of all charges = sum of q0
+    let total_q: f64 = solver.fragments.iter().flat_map(|f| f.charges.iter()).sum();
+    let total_q0: f64 = solver.q0.iter().sum();
+    assert!(
+        (total_q - total_q0).abs() < 1e-10,
+        "Total charge not conserved: sum(q) = {}, sum(q0) = {}, diff = {}",
+        total_q,
+        total_q0,
+        (total_q - total_q0).abs()
+    );
+
+    // Polarization: charges should differ from standalone
+    let max_diff_0 = q0
+        .iter()
+        .zip(standalone.charges.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0_f64, f64::max);
+    let max_diff_1 = q1
+        .iter()
+        .zip(standalone.charges.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0_f64, f64::max);
+    eprintln!(
+        "Max charge diff from standalone: frag0={:.3e}, frag1={:.3e}",
+        max_diff_0, max_diff_1
+    );
+    assert!(
+        max_diff_0 > 1e-4 || max_diff_1 > 1e-4,
+        "Polarization should cause charge differences > 1e-4, got max_diff_0={}, max_diff_1={}",
+        max_diff_0,
+        max_diff_1
+    );
+
+    // v_ext should be non-zero (inter-fragment coupling active)
+    let max_v_ext: f64 = solver
+        .fragments
+        .iter()
+        .flat_map(|f| f.v_ext.iter())
+        .map(|v| v.abs())
+        .fold(0.0_f64, f64::max);
+    eprintln!("Max |v_ext| = {:.3e}", max_v_ext);
+    assert!(
+        max_v_ext > 1e-6,
+        "v_ext should be non-zero for polarized fragments, got max = {}",
+        max_v_ext
+    );
+
+    // Total energy vs 2× standalone
+    let multi_energy = agent02_total_energy(&solver);
+    let interaction_energy = multi_energy - 2.0 * standalone_energy;
+    eprintln!("Multi-frag total energy = {:.10e}", multi_energy);
+    eprintln!("2× standalone energy    = {:.10e}", 2.0 * standalone_energy);
+    eprintln!("Interaction energy      = {:.3e} Hartree", interaction_energy);
+    assert!(
+        interaction_energy.abs() > 1e-6,
+        "Interaction energy should be non-zero, got {}",
+        interaction_energy
+    );
+
+    eprintln!("two_fragment_polarization: PASS (polarization + charge conservation verified)");
+}
+
+/// Test: 3× H2O — charge conservation at every SCC iteration.
+///
+/// Verify that sum of all atomic charges = sum of q0 (neutral) within 1e-10
+/// at every SCC iteration, both after diagonalization (Mulliken sum) and
+/// after mixing. This is a critical invariant — if it fails, there's a bug
+/// in `compute_v_ext` or `gather/scatter_charges`.
+#[test]
+fn charge_conservation_multi_frag() {
+    use rust_dftb::qmqm::Mixer;
+
+    let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else { return; };
+
+    // 3 H2O at various separations: 0, 3, 7 Å
+    let mut solver =
+        agent02_build_h2o_solver(&sk_dir, &[[0.0, 0.0, 0.0], [3.0, 0.0, 0.0], [7.0, 0.0, 0.0]], 30.0);
+    let total_q0: f64 = solver.q0.iter().sum();
+    eprintln!("Total q0 = {:.10}", total_q0);
+
+    let max_iter = 100;
+    let tol = 1e-8;
+
+    for iter in 0..max_iter {
+        solver.compute_v_ext();
+        solver.build_all_h_scc();
+        solver.diagonalize_all().unwrap();
+
+        // Check charge conservation after diagonalization (Mulliken sum = n_electrons)
+        let total_q: f64 = solver.fragments.iter().flat_map(|f| f.charges.iter()).sum();
+        assert!(
+            (total_q - total_q0).abs() < 1e-10,
+            "Charge conservation violated at iter {} (after diag): sum(q) = {}, sum(q0) = {}, diff = {}",
+            iter,
+            total_q,
+            total_q0,
+            (total_q - total_q0).abs()
+        );
+
+        // Compute residual from fragment charges
+        let q_out: Vec<f64> = solver
+            .fragments
+            .iter()
+            .flat_map(|f| f.charges.iter().copied())
+            .collect();
+        let residual: Vec<f64> = q_out
+            .iter()
+            .zip(solver.charges.iter())
+            .map(|(qo, qi)| qo - qi)
+            .collect();
+        let rms = (residual.iter().map(|x| x * x).sum::<f64>() / residual.len() as f64).sqrt();
+
+        eprintln!(
+            "Iter {}: RMS = {:.3e}, sum(q) = {:.10}",
+            iter + 1,
+            rms,
+            total_q
+        );
+
+        if rms < tol {
+            eprintln!("Converged at iter {} with RMS = {:.3e}", iter + 1, rms);
+            break;
+        }
+
+        // Mix (disjoint borrows of solver fields)
+        let charges_ref = &mut solver.charges;
+        let mixer_ref = &mut solver.mixer;
+        mixer_ref.mix(charges_ref, &q_out, &residual);
+
+        // Check charge conservation after mixing
+        let total_q_mixed: f64 = solver.charges.iter().sum();
+        assert!(
+            (total_q_mixed - total_q0).abs() < 1e-10,
+            "Charge conservation violated at iter {} (after mix): sum(q) = {}, diff = {}",
+            iter,
+            total_q_mixed,
+            (total_q_mixed - total_q0).abs()
+        );
+
+        // Scatter mixed charges back to fragments
+        solver.scatter_charges();
+    }
+
+    eprintln!("charge_conservation_multi_frag: PASS (charge conserved at every iteration)");
+}
+
+/// Test: Two H2O as 2 fragments vs 1 combined fragment (QM/QM approximation error).
+///
+/// The 2-fragment QM/QM approach treats each H2O as an independent subsystem
+/// with inter-fragment electrostatic coupling only (no orbital overlap between
+/// fragments). The 1-fragment approach treats all 6 atoms as one system with
+/// full H0/S including inter-fragment orbital overlap.
+///
+/// The QM/QM approximation should give similar but not identical results.
+/// This test documents the approximation error.
+#[test]
+fn two_fragment_vs_single_combined() {
+    let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else { return; };
+
+    let (species, base_coords) = agent02_load_h2o();
+    let sk = load_sk_for_species(&sk_dir, &species).unwrap();
+
+    // 2-fragment: two H2O 3 Å apart
+    let mut solver =
+        agent02_build_h2o_solver(&sk_dir, &[[0.0, 0.0, 0.0], [3.0, 0.0, 0.0]], 30.0);
+    solver.solve_scc(200, 1e-9).unwrap();
+    let multi_energy = agent02_total_energy(&solver);
+    let multi_charges: Vec<f64> = solver
+        .fragments
+        .iter()
+        .flat_map(|f| f.charges.iter().copied())
+        .collect();
+
+    // 1-fragment: all 6 atoms as one system
+    let combined_species: Vec<String> = species.iter().chain(species.iter()).cloned().collect();
+    let combined_coords: Vec<[f64; 3]> = base_coords
+        .iter()
+        .cloned()
+        .chain(base_coords.iter().map(|c| [c[0] + 3.0, c[1], c[2]]))
+        .collect();
+    let builder = HamiltonianBuilder::new(sk);
+    let combined = builder
+        .build_scc(&combined_species, &combined_coords, 200, 1e-9)
+        .unwrap();
+
+    let energy_diff = (multi_energy - combined.energy).abs();
+    eprintln!("2-fragment energy  = {:.10e}", multi_energy);
+    eprintln!("1-fragment energy  = {:.10e}", combined.energy);
+    eprintln!(
+        "QM/QM approx error = {:.3e} Hartree = {:.3} kcal/mol",
+        energy_diff,
+        energy_diff * 627.509
+    );
+    eprintln!("2-frag charges: {:?}", multi_charges);
+    eprintln!("1-frag charges: {:?}", combined.charges);
+
+    // Energies should be similar but not identical (QM/QM approximation)
+    assert!(
+        energy_diff < 0.1,
+        "QM/QM approximation error should be < 0.1 Hartree, got {}",
+        energy_diff
+    );
+    assert!(
+        energy_diff > 1e-6,
+        "QM/QM approximation should give different energy from full system, got diff = {}",
+        energy_diff
+    );
+
+    eprintln!("two_fragment_vs_single_combined: PASS (QM/QM approximation error documented)");
+}
