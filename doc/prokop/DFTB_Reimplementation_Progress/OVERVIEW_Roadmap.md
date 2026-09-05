@@ -313,6 +313,17 @@ file/function where the work should land.
 - [*] `scripts/compare_rust_vs_dftbplus.py` — numerical parity report
 - [*] End-to-end on benzene/coronene/circumcoronene: dense charges match to machine precision, eigenvalues to ~2e-6 Ha
 
+### 7.5.6 Wavefunction projection (real-space grid)
+- [*] `SccResult.eigenvectors` field added (norb × norb MO coefficient matrix)
+- [*] Rhai `save_eigenvectors(name, path)` — exports geometry + eigenvectors + eigenvalues to TSV
+- [*] Rhai `save_hs_matrix(name, path)` — exports H_scc + S matrices for sparse iterative eigensolving
+- [*] `scripts/plot_wavefunctions.py` — projects MOs onto 2D grid via pyBall OpenCL `GridProjector` + STO basis
+- [*] `scripts/sparse_homo_lumo.py` — Chebyshev filter + Rayleigh-Ritz iterative eigensolver (from NumericalMathPlayground) for sparse HOMO/LUMO
+- [*] `scripts/compare_homo_lumo_3way.py` — 3-way comparison: dense vs sparse(Cheb+Ritz) vs Fortran
+- [*] Validated on benzene/coronene/circumcoronene (eigenvalues + wavefunction contour plots)
+- [ ] Numerical parity vs DFTB+ waveplot cube files (visual only so far)
+- See `topical_audit/wavefunction_projection.md`
+
 ### 7.5.5 Open issues
 - [ ] Davidson: stronger preconditioner for degenerate systems (SSOR/ILU or CheFSI)
 - [ ] Davidson: wire to sparse BSR4 matvec operator (avoid densification)

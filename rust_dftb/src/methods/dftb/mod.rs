@@ -5,3 +5,4 @@ pub mod hamiltonian;
 pub mod gamma;
 pub mod spline_resample;
 pub mod forces;
+pub mod dftb_cpu;

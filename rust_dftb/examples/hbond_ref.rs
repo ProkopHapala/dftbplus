@@ -301,6 +301,139 @@ impl FireOptimizer {
     }
 }
 
+/// Optimize geometry using the persistent DftbCpu solver with warm-started charges.
+/// This is the new architecture: static state built once, per-geometry state rebuilt
+/// only on geometry change, charges carried forward between steps.
+fn optimize_geometry_persistent(
+    sk_dir: &str,
+    species: &[String],
+    coords: &[[f64; 3]],
+    frozen: &std::collections::HashSet<usize>,
+    restraints: &[(usize, [f64; 3], f64)],
+    max_opt_iter: usize,
+    f_tol: f64,
+    scc_max_iter: usize,
+    scc_tol: f64,
+    traj_path: Option<&Path>,
+    hist_path: Option<&Path>,
+) -> Result<(Vec<[f64; 3]>, f64, usize), String> {
+    use rust_dftb::methods::dftb::dftb_cpu::{DftbCpu, CpuSccResult};
+    use rust_dftb::methods::dftb::forces::parse_all_repulsive;
+
+    let n = coords.len();
+    let mut opt = FireOptimizer::new(n, 1.0);
+    let mut current = coords.to_vec();
+
+    // Load SK and build persistent solver state ONCE
+    let sk = load_sk_for_species(sk_dir, species)
+        .map_err(|e| format!("Failed to load SK: {e}"))?;
+
+    // Parse repulsive splines ONCE (no Strings/HashMaps in hot path)
+    let unique_species: Vec<String> = {
+        let mut seen = std::collections::HashSet::new();
+        let mut uniq = Vec::new();
+        for s in species {
+            if seen.insert(s.clone()) { uniq.push(s.clone()); }
+        }
+        uniq
+    };
+    let repulsive = parse_all_repulsive(sk_dir, &unique_species, unique_species.len())
+        .map_err(|e| format!("parse_all_repulsive failed: {e}"))?;
+
+    let mut solver = DftbCpu::new(sk, species.to_vec())
+        .map_err(|e| format!("DftbCpu::new failed: {e}"))?;
+
+    eprintln!("  [opt] FIRE: dt0={}, dt_max={}, vmax={}, max_disp=0.1Å, max_iter={}, f_tol={:.2e}", 1.0, 5.0, 2.0, max_opt_iter, f_tol);
+    eprintln!("  [opt] SCC: max_iter={}, tol={:.2e} (warm-started, persistent state)", scc_max_iter, scc_tol);
+    eprintln!("  [opt] frozen atoms: {:?}", frozen.iter().collect::<Vec<_>>());
+
+    // First geometry: start from neutral charges
+    solver.update_geometry(&current).map_err(|e| format!("update_geometry failed: {e}"))?;
+    solver.reset_charges();
+
+    let mut traj_file = if let Some(p) = traj_path {
+        if let Some(parent) = p.parent() { std::fs::create_dir_all(parent).unwrap(); }
+        Some(File::create(p).unwrap_or_else(|e| panic!("Cannot create trajectory {}: {e}", p.display())))
+    } else { None };
+    let mut hist_file = if let Some(p) = hist_path {
+        if let Some(parent) = p.parent() { std::fs::create_dir_all(parent).unwrap(); }
+        let mut f = File::create(p).unwrap_or_else(|e| panic!("Cannot create history {}: {e}", p.display()));
+        writeln!(f, "iter,E_elec,max_F,rms_F,scc_iter,dt").unwrap();
+        Some(f)
+    } else { None };
+
+    let mut iter = 0;
+    let mut max_f = f64::INFINITY;
+    let mut last_energy = 0.0f64;
+    let t0_total = std::time::Instant::now();
+
+    while iter < max_opt_iter && max_f > f_tol {
+        let t0 = std::time::Instant::now();
+
+        // SCC with warm-started charges (charges from previous geometry)
+        solver.solve_scc(scc_max_iter, scc_tol)
+            .map_err(|e| format!("SCC failed at opt iter {iter}: {e}"))?;
+        let scc = solver.build_result();
+        let t_scc = t0.elapsed();
+        last_energy = scc.energy;
+
+        // Forces — use cached state from DftbCpu (no re-diagonalization, no rebuilds)
+        let t0 = std::time::Instant::now();
+        let forces = solver.compute_forces(&scc, &repulsive)
+            .map_err(|e| format!("forces failed at opt iter {iter}: {e}"))?;
+        let t_force = t0.elapsed();
+
+        // Zero forces on frozen atoms
+        let mut f = forces.forces.clone();
+        for &i in frozen { f[i] = [0.0; 3]; }
+
+        // Add harmonic restraint forces
+        for (i, target, k) in restraints {
+            for c in 0..3 { f[*i][c] -= k * (current[*i][c] - target[c]); }
+        }
+
+        // RMS force
+        let mut rms_f = 0.0f64;
+        for fi in &f { for c in 0..3 { rms_f += fi[c]*fi[c]; } }
+        rms_f = (rms_f / (n as f64 * 3.0)).sqrt();
+
+        let (new_coords, mf) = opt.step(&current, &f);
+        current = new_coords;
+        max_f = mf;
+
+        eprintln!("  [opt] iter {:>3}  E={:.8e}  max|F|={:.4e}  rms|F|={:.4e}  scc={}  dt={:.3}  t={:.2}s",
+            iter, last_energy, max_f, rms_f, scc.n_iter, opt.dt,
+            t_scc.as_secs_f64() + t_force.as_secs_f64());
+
+        if let Some(tf) = &mut traj_file {
+            writeln!(tf, "{}", n).unwrap();
+            writeln!(tf, "iter={} E={:.10e} max_F={:.6e} rms_F={:.6e}", iter, last_energy, max_f, rms_f).unwrap();
+            for (sp, c) in species.iter().zip(current.iter()) {
+                writeln!(tf, "{sp} {:.10} {:.10} {:.10}", c[0], c[1], c[2]).unwrap();
+            }
+        }
+        if let Some(hf) = &mut hist_file {
+            writeln!(hf, "{},{:.16e},{:.10e},{:.10e},{},{:.6e}", iter, last_energy, max_f, rms_f, scc.n_iter, opt.dt).unwrap();
+        }
+
+        // Update geometry for next step (charges are kept = warm start)
+        solver.update_geometry(&current).map_err(|e| format!("update_geometry failed at iter {iter}: {e}"))?;
+
+        iter += 1;
+    }
+
+    // Final energy with converged charges
+    solver.solve_scc(scc_max_iter, scc_tol)
+        .map_err(|e| format!("final SCC failed: {e}"))?;
+    let scc = solver.build_result();
+    last_energy = scc.energy;
+
+    let elapsed = t0_total.elapsed();
+    eprintln!("  [opt] DONE: {} iters, {:.2}s, final E={:.10e}", iter, elapsed.as_secs_f64(), last_energy);
+
+    Ok((current, last_energy, iter))
+}
+
 /// Optimize geometry with DFTB SCC forces using FIRE.
 /// `frozen` = set of atom indices to keep fixed (not moved).
 /// `restraints` = harmonic restraints pulling atoms toward target positions.
@@ -518,9 +651,9 @@ fn main() {
             args.opt_frozen.split(',').map(|s| s.trim().parse::<usize>().unwrap()).collect()
         };
 
-        println!("\n=== Geometry optimization (FIRE) ===");
-        let (opt_coords, opt_energy, n_iter) = optimize_geometry(
-            &builder, &species, &base_coords, &frozen, &[],
+        println!("\n=== Geometry optimization (FIRE, persistent DftbCpu) ===");
+        let (opt_coords, opt_energy, n_iter) = optimize_geometry_persistent(
+            &sk_dir, &species, &base_coords, &frozen, &[],
             args.opt_max_iter, args.opt_f_tol, args.max_iter, args.tol,
             Some(&PathBuf::from("../debug/hbond_switching/reactant_traj.xyz")),
             Some(&PathBuf::from("../debug/hbond_switching/reactant_hist.csv")),

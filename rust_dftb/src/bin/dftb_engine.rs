@@ -7,7 +7,7 @@
 //!   - Sparse BSR4 purification (GPU, Z→K₀→TC2→K)
 //!   - Result comparison and diagnostics
 //!   - Charge/eigenvalue access: `get_charges`, `get_eigenvalues`, `save_charges`,
-//!     `save_eigenvalues`, `get_sparse_charges`, `save_sparse_charges`
+//!     `save_eigenvalues`, `save_eigenvectors`, `get_sparse_charges`, `save_sparse_charges`
 //!   - Frontier orbitals: `davidson_homo_lumo(name, n_target)` — partial
 //!     generalized eigensolver (see `sparse::davidson`)
 //!   - Convergence history: `save_convergence(name, path)`
@@ -24,7 +24,7 @@ use rust_dftb::methods::sparse::{
 use rust_dftb::{
     HamiltonianBuilder, SccResult, load_sk_for_species,
 };
-use nalgebra::{DMatrix, SymmetricEigen};
+use nalgebra::{DMatrix, DVector, SymmetricEigen};
 use rhai::{Array, Dynamic, Engine, Scope, INT};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -218,12 +218,14 @@ fn rhai_run_dftb_nonscc(name: &str, sk_dir: &str) -> Dynamic {
             eprintln!("  Mulliken charges: {:?}", charges.iter()
                 .map(|q| format!("{q:.4}")).collect::<Vec<_>>());
 
+            let eigs_sorted: DVector<f64> = DVector::from_iterator(n_orbs, idx.iter().map(|&i| he.eigenvalues[i]));
             let scc = SccResult {
                 h0: ham.h0.clone(),
                 h_scc: ham.h0.clone(), // non-SCC: H_scc = H0
                 s: ham.s.clone(),
                 density,
-                eigenvalues: DMatrix::<f64>::zeros(0, 0).diagonal().clone(),
+                eigenvalues: eigs_sorted,
+                eigenvectors: c.clone(),
                 charges: charges.clone(),
                 q0: charges, // placeholder
                 energy: e_band,
@@ -598,6 +600,123 @@ fn rhai_save_eigenvalues(name: &str, path: &str) -> bool {
     true
 }
 
+/// Save eigenvectors + geometry + eigenvalues to a TSV for wavefunction plotting.
+/// Format:
+///   # natoms norb n_occ
+///   # atom_idx element x y z
+///   ... (natoms lines)
+///   # eigenvector matrix (norb × norb), columns are MOs
+///   mo_idx  orb_idx  coeff
+///   ... (norb*norb lines)
+///   # eigenvalues
+///   idx  eigenvalue  occupied
+fn rhai_save_eigenvectors(name: &str, path: &str) -> bool {
+    let payload = with_state(|s| {
+        let scc = s.scc_results.get(name)?;
+        let st = s.geometries.get(name)?;
+        let species: Vec<String> = st.elements.iter().map(|e| e.symbol().to_string()).collect();
+        let coords: Vec<[f64; 3]> = st.positions.clone();
+        let n_electrons: f64 = scc.q0.iter().sum();
+        let n_occ = (n_electrons / 2.0).round() as usize;
+        Some((scc.eigenvectors.clone(), scc.eigenvalues.clone(), species, coords, n_occ))
+    });
+    let Some((evecs, eigs, species, coords, n_occ)) = payload else {
+        eprintln!("ERROR: no SCC result for '{name}'");
+        return false;
+    };
+    let natoms = species.len();
+    let norb = evecs.nrows();
+    let mut txt = String::new();
+    txt.push_str(&format!("# natoms={natoms} norb={norb} n_occ={n_occ}\n"));
+    txt.push_str("# atom_idx\telement\tx\ty\tz\n");
+    for (i, (sp, c)) in species.iter().zip(coords.iter()).enumerate() {
+        txt.push_str(&format!("{i}\t{sp}\t{:.10}\t{:.10}\t{:.10}\n", c[0], c[1], c[2]));
+    }
+    txt.push_str("# eigenvector matrix (norb x norb), columns are MOs\n");
+    txt.push_str("mo_idx\torb_idx\tcoeff\n");
+    for mo in 0..evecs.ncols() {
+        for orb in 0..evecs.nrows() {
+            txt.push_str(&format!("{mo}\t{orb}\t{:.12e}\n", evecs[(orb, mo)]));
+        }
+    }
+    txt.push_str("# eigenvalues\n");
+    txt.push_str("idx\teigenvalue\toccupied\n");
+    for (i, e) in eigs.iter().enumerate() {
+        let occ = if i < n_occ { 1 } else { 0 };
+        txt.push_str(&format!("{i}\t{e:.10}\t{occ}\n"));
+    }
+    if let Err(e) = std::fs::write(path, txt) {
+        eprintln!("ERROR writing {path}: {e}");
+        return false;
+    }
+    eprintln!("  saved eigenvectors: {path} ({natoms} atoms, {norb} orbitals, n_occ={n_occ})");
+    true
+}
+
+/// Save H_scc and S matrices + geometry to a TSV for sparse iterative eigensolving
+/// (Chebyshev filter + Ritz from NumericalMathPlayground).
+/// Format:
+///   # natoms norb n_occ
+///   # atom_idx element x y z
+///   ... (natoms lines)
+///   # H_scc matrix (norb × norb), row-major
+///   i j H_ij
+///   ... (norb*norb lines)
+///   # S matrix (norb × norb), row-major
+///   i j S_ij
+///   ... (norb*norb lines)
+///   # eigenvalues (from dense diagonalization, for reference)
+///   idx eigenvalue occupied
+fn rhai_save_hs_matrix(name: &str, path: &str) -> bool {
+    let payload = with_state(|s| {
+        let scc = s.scc_results.get(name)?;
+        let st = s.geometries.get(name)?;
+        let species: Vec<String> = st.elements.iter().map(|e| e.symbol().to_string()).collect();
+        let coords: Vec<[f64; 3]> = st.positions.clone();
+        let n_electrons: f64 = scc.q0.iter().sum();
+        let n_occ = (n_electrons / 2.0).round() as usize;
+        Some((scc.h_scc.clone(), scc.s.clone(), scc.eigenvalues.clone(), species, coords, n_occ))
+    });
+    let Some((h, s_mat, eigs, species, coords, n_occ)) = payload else {
+        eprintln!("ERROR: no SCC result for '{name}'");
+        return false;
+    };
+    let natoms = species.len();
+    let norb = h.nrows();
+    let mut txt = String::new();
+    txt.push_str(&format!("# natoms={natoms} norb={norb} n_occ={n_occ}\n"));
+    txt.push_str("# atom_idx\telement\tx\ty\tz\n");
+    for (i, (sp, c)) in species.iter().zip(coords.iter()).enumerate() {
+        txt.push_str(&format!("{i}\t{sp}\t{:.10}\t{:.10}\t{:.10}\n", c[0], c[1], c[2]));
+    }
+    txt.push_str("# H_scc matrix (norb x norb), row-major\n");
+    txt.push_str("i\tj\tH_ij\n");
+    for i in 0..h.nrows() {
+        for j in 0..h.ncols() {
+            txt.push_str(&format!("{i}\t{j}\t{:.12e}\n", h[(i, j)]));
+        }
+    }
+    txt.push_str("# S matrix (norb x norb), row-major\n");
+    txt.push_str("i\tj\tS_ij\n");
+    for i in 0..s_mat.nrows() {
+        for j in 0..s_mat.ncols() {
+            txt.push_str(&format!("{i}\t{j}\t{:.12e}\n", s_mat[(i, j)]));
+        }
+    }
+    txt.push_str("# eigenvalues (dense reference)\n");
+    txt.push_str("idx\teigenvalue\toccupied\n");
+    for (i, e) in eigs.iter().enumerate() {
+        let occ = if i < n_occ { 1 } else { 0 };
+        txt.push_str(&format!("{i}\t{e:.10}\t{occ}\n"));
+    }
+    if let Err(e) = std::fs::write(path, txt) {
+        eprintln!("ERROR writing {path}: {e}");
+        return false;
+    }
+    eprintln!("  saved H,S matrices: {path} ({natoms} atoms, {norb} orbitals, n_occ={n_occ})");
+    true
+}
+
 /// Run Davidson partial eigensolver on the stored SCC Hamiltonian to find
 /// a few eigenvalues around the HOMO-LUMO gap. Returns "homo,lumo,gap".
 /// n_target = number of eigenvalues to compute on each side of the gap.
@@ -695,6 +814,8 @@ fn main() {
                 eprintln!("  save_charges(name, path) -> bool");
                 eprintln!("  save_sparse_charges(name, path) -> bool");
                 eprintln!("  save_eigenvalues(name, path) -> bool");
+                eprintln!("  save_eigenvectors(name, path) -> bool");
+                eprintln!("  save_hs_matrix(name, path) -> bool");
                 eprintln!("  davidson_homo_lumo(name, n_target) -> 'homo,lumo,gap'");
                 eprintln!("  save_convergence(name, path) -> bool");
                 eprintln!("  ftos(x) / itos(x) -> string");
@@ -743,6 +864,8 @@ fn main() {
     engine.register_fn("save_charges", rhai_save_charges);
     engine.register_fn("save_sparse_charges", rhai_save_sparse_charges);
     engine.register_fn("save_eigenvalues", rhai_save_eigenvalues);
+    engine.register_fn("save_eigenvectors", rhai_save_eigenvectors);
+    engine.register_fn("save_hs_matrix", rhai_save_hs_matrix);
     engine.register_fn("davidson_homo_lumo", rhai_davidson_homo_lumo);
 
     // Register constants

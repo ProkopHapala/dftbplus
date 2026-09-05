@@ -35,6 +35,16 @@ QM/QM fragment solver with OpenCL GPU offload. Python utilities (`pyBall/`,
     `detailed.out` + `band.out` → TSV charges/eigenvalues.
   - `plot_charges_homo_lumo.py` — spatial charge map + HOMO-LUMO energy levels
     (Rust dense vs sparse vs DFTB+ ref).
+  - `plot_wavefunctions.py` — projects Rust DFTB MOs onto a 2D grid using the
+    pyBall OpenCL `GridProjector` (STO basis from `wfc.mio-1-1.hsd`). Produces
+    contour plots of HOMO, LUMO, and nearby orbitals.
+  - `compare_homo_lumo_3way.py` — 3-way HOMO/LUMO comparison: Rust dense vs
+    Rust sparse (Chebyshev+Ritz) vs DFTB+ Fortran (eigenvalues + wavefunction
+    contour plots side-by-side).
+  - `sparse_homo_lumo.py` — finds HOMO/LUMO via Chebyshev filter + Rayleigh-Ritz
+    iterative eigensolver (from NumericalMathPlayground). Reads H,S matrices
+    exported by Rust, transforms to standard form, finds few eigenvalues near
+    the gap without full diagonalization.
   - `compare_rust_vs_dftbplus.py` — numerical parity report (charges, eigenvalues,
     gaps).
   - `geometry_engine.py`, `plot_hbond.py`, `run_formic_dimer_*.sh`.
@@ -83,6 +93,12 @@ QM/QM fragment solver with OpenCL GPU offload. Python utilities (`pyBall/`,
   - `DFTB_Reimplementation_Progress/` — design notes & status: `OVERVIEW_Roadmap.md`
     (master status checklist), `GPU_MultiSystem_Design.md`, `DFTB_Hassembly_OpenCL.md`,
     `Forces_Implementation_Notes.md`, `xTB_reimplementation.md`, …
+  - `AGENTS/guidelines/` — repo-specific efficiency and coding guidelines,
+    derived from code reviews. `efficiency.md` has 12 rules + 6 general
+    principles (three-tier data lifetime, no allocation in hot loops, no
+    strings/HashMaps in hot paths, verify before claiming, benchmark in
+    release mode, exploit math structure, precompute polynomials, analytic
+    derivatives, check units, warm starts). Referenced from `AGENTS.md`.
   - `tasts/<task>/` — **task specs only** (Markdown). e.g.
     `tasts/GPU_MultiSystem/` → `task_master.md` + `agent*.md`. No scripts/artifacts
     here; specs may *reference* `debug/...` paths.

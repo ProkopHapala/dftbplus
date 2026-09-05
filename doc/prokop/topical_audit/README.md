@@ -13,3 +13,5 @@ implementations of the same concept across Rust, Fortran, Python, and OpenCL.
   binary for parity validation of Rust results.
 - **scc_mulliken_charges.md** — atomic Mulliken charges after SCC: dense, sparse,
   and DFTB+ reference. Sign convention documentation.
+- **wavefunction_projection.md** — projecting MOs onto a real-space grid using
+  pyBall OpenCL GridProjector + STO basis. Rust eigenvectors → 2D contour plots.

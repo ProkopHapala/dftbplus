@@ -31,6 +31,9 @@ pub struct SccResult {
     pub density: DMatrix<f64>,
     /// Eigenvalues from the converged generalized eigenvalue problem
     pub eigenvalues: DVector<f64>,
+    /// Eigenvectors (MO coefficients), shape `[n_orbs × n_orbs]`, columns are MOs.
+    /// From the generalized eigenproblem `H·C = S·C·ε`.
+    pub eigenvectors: DMatrix<f64>,
     /// Converged atom-resolved Mulliken charges
     pub charges: Vec<f64>,
     /// Reference neutral charges q0
@@ -520,6 +523,7 @@ impl HamiltonianBuilder {
             s: frag.template.s.clone(),
             density,
             eigenvalues: frag.eigenvalues.clone(),
+            eigenvectors: frag.eigenvectors.clone(),
             charges: frag.charges.clone(),
             q0: frag.template.q0.clone(),
             energy,

@@ -91,6 +91,10 @@ Hamiltonian = DFTB {{
 Options {{
   WriteDetailedOut = Yes
 }}
+
+Analysis {{
+  WriteEigenvectors = Yes
+}}
 """
 
 
@@ -159,6 +163,23 @@ def parse_band_out(path):
                 except ValueError:
                     continue
     return eigs
+
+
+def parse_eigenvec_bin(path, nstates, norb):
+    """Parse DFTB+ eigenvec.bin → (nstates, norb) float64 array.
+
+    Format: [4-byte identity int] [nstates * norb * 8-byte float64]
+    Fortran stores eigvecsReal(nOrb, nStates) column-major; the .bin file is
+    a raw Fortran memory dump. We reshape with order='F' and transpose to get
+    (nStates, nOrb) in C order — same as DFTBcore.get_eigvecs_dense().
+    """
+    import struct
+    import numpy as np
+    with open(path, 'rb') as f:
+        raw = f.read()
+    identity = struct.unpack_from('i', raw, 0)[0]
+    evecs = np.frombuffer(raw[4:], dtype=np.float64).reshape(norb, nstates, order='F').T.copy()
+    return evecs
 
 
 def main():
@@ -230,6 +251,7 @@ def main():
     print(f"  saved: {charges_tsv}")
 
     # Parse and write eigenvalues
+    eigs = []
     if os.path.exists(band_path):
         eigs = parse_band_out(band_path)
         eigs_tsv = os.path.join(args.output_dir, "ref_eigenvalues.tsv")
@@ -248,6 +270,34 @@ def main():
             print(f"  HOMO={homo:.10f}, LUMO={lumo:.10f}, gap={lumo-homo:.10f} Ha")
     else:
         print("  WARNING: band.out not found")
+
+    # Parse and write eigenvectors (eigenvec.bin)
+    eigvec_path = os.path.join(work, "eigenvec.bin")
+    if os.path.exists(eigvec_path) and eigs:
+        import numpy as np
+        nstates = len(eigs)
+        norb = nstates  # square matrix
+        evecs = parse_eigenvec_bin(eigvec_path, nstates, norb)
+        n_occ = sum(1 for _, _, o in eigs if o > 0.5)
+        eigvec_tsv = os.path.join(args.output_dir, "ref_eigenvectors.tsv")
+        with open(eigvec_tsv, "w") as f:
+            f.write(f"# natoms={len(elements)} norb={norb} n_occ={n_occ}\n")
+            f.write("# atom_idx\telement\tx\ty\tz\n")
+            for i, (el, pos) in enumerate(zip(elements, coords)):
+                f.write(f"{i}\t{el}\t{pos[0]:.10f}\t{pos[1]:.10f}\t{pos[2]:.10f}\n")
+            f.write("# eigenvector matrix (norb x norb), columns are MOs\n")
+            f.write("mo_idx\torb_idx\tcoeff\n")
+            for mo in range(nstates):
+                for orb in range(norb):
+                    f.write(f"{mo}\t{orb}\t{evecs[mo, orb]:.12e}\n")
+            f.write("# eigenvalues\n")
+            f.write("idx\teigenvalue\toccupied\n")
+            for idx, eig, occ in eigs:
+                occ_flag = 1 if occ > 0.5 else 0
+                f.write(f"{idx}\t{eig:.10f}\t{occ_flag}\n")
+        print(f"  saved: {eigvec_tsv} ({len(elements)} atoms, {norb} orbitals, n_occ={n_occ})")
+    else:
+        print("  WARNING: eigenvec.bin not found (eigenvectors not saved)")
 
     print(f"  log: {log_path}")
     print(f"=== DFTB+ reference done ===")

@@ -56,6 +56,8 @@ save_convergence("benzene", debug_dir + "/benzene_conv.tsv");
 
 save_charges("benzene", debug_dir + "/benzene_charges.tsv");
 save_eigenvalues("benzene", debug_dir + "/benzene_eigenvalues.tsv");
+save_eigenvectors("benzene", debug_dir + "/benzene_eigenvectors.tsv");
+save_hs_matrix("benzene", debug_dir + "/benzene_hs_matrix.tsv");
 print("");
 
 // ─── Test 2: Coronene (n=1, 24 C atoms) ──────────────────────────
@@ -90,6 +92,8 @@ save_convergence("coronene", debug_dir + "/coronene_conv.tsv");
 
 save_charges("coronene", debug_dir + "/coronene_charges.tsv");
 save_eigenvalues("coronene", debug_dir + "/coronene_eigenvalues.tsv");
+save_eigenvectors("coronene", debug_dir + "/coronene_eigenvectors.tsv");
+save_hs_matrix("coronene", debug_dir + "/coronene_hs_matrix.tsv");
 print("");
 
 // ─── Test 3: Circumcoronene (n=2, 54 C atoms) ────────────────────
@@ -124,6 +128,8 @@ save_convergence("circumcoronene", debug_dir + "/circumcoronene_conv.tsv");
 
 save_charges("circumcoronene", debug_dir + "/circumcoronene_charges.tsv");
 save_eigenvalues("circumcoronene", debug_dir + "/circumcoronene_eigenvalues.tsv");
+save_eigenvectors("circumcoronene", debug_dir + "/circumcoronene_eigenvectors.tsv");
+save_hs_matrix("circumcoronene", debug_dir + "/circumcoronene_hs_matrix.tsv");
 print("");
 
 // ─── Summary ──────────────────────────────────────────────────────

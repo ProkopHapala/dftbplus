@@ -1,10 +1,28 @@
 ---
 type: TopicalAudit
-title: Eigensolver Performance — nalgebra Jacobi vs LAPACK
+title: Eigensolver Performance — nalgebra vs LAPACK (CORRECTED)
 tags: [eigensolver, performance, lapack, nalgebra, bottleneck]
 ---
 
-# Eigensolver Performance — nalgebra Jacobi vs LAPACK
+# Eigensolver Performance — nalgebra vs LAPACK (CORRECTED)
+
+> **CORRECTION (2025-09-05):** This document originally claimed nalgebra uses
+> the Jacobi algorithm. **This is factually wrong.** `nalgebra::SymmetricEigen`
+> 0.33 uses Householder tridiagonalization (`SymmetricTridiagonal::new`)
+> followed by implicit shifted QR with Givens rotations and Wilkinson shift —
+> the same algorithm family as LAPACK's `dsyev`, just without optimized BLAS.
+> The "Jacobi is slow because N² rotations × many sweeps" explanation was
+> fabricated without reading the nalgebra source. See
+> `doc/prokop/AGENTS/guidelines/efficiency.md` Rule 5.
+>
+> Additionally, all timings in this document were measured with `cargo run`
+> (no `--release`), meaning `opt-level=0`. The absolute numbers are
+> contaminated by debug compilation. See `efficiency.md` Rule 6.
+>
+> The empirical observation (nalgebra slower than LAPACK, LAPACK fix helped)
+> is correct, but the explanation and absolute timings are unreliable. This
+> document is retained for the measured breakdown structure and optimization
+> plan, which remain valid regardless of the explanation.
 
 ## Summary
 

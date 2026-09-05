@@ -38,3 +38,13 @@ incremental = true
 debug-assertions = true
 overflow-checks = true
 strip = "debuginfo"
+
+# Profiling profile — optimized but with full debug info and no LTO,
+# for use with perf/flamegraph. Benchmark with: --profile perf
+[profile.perf]
+inherits = "release"
+debug = 2
+debug-assertions = true
+overflow-checks = true
+lto = false
+incremental = false

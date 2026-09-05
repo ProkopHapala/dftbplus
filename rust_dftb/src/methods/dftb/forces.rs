@@ -345,7 +345,7 @@ pub struct Forces {
 }
 
 impl Forces {
-    fn zeros(n: usize) -> Self {
+    pub fn zeros(n: usize) -> Self {
         Forces {
             forces: vec![[0.0; 3]; n],
             non_scc: vec![[0.0; 3]; n],
@@ -541,7 +541,7 @@ fn extract_pair_dm_edm(
 ///
 /// The factor of 2 accounts for the implicit lower-triangle summation,
 /// matching `derivativeNonSccEuclidian` in `forces.F90`.
-fn non_scc_electronic_force(
+pub fn non_scc_electronic_force(
     ctx: &SystemContext<'_>,
     neigh: &NeighborList,
     coords: &[[f64; 3]],
@@ -595,7 +595,7 @@ fn non_scc_electronic_force(
 /// when the SCC potential is purely atom-resolved (which is the case for
 /// the standard DFTB SCC model used here — there are no orbital-resolved
 /// contributions in mio-1-1).
-fn scc_shift_force(
+pub fn scc_shift_force(
     ctx: &SystemContext<'_>,
     neigh: &NeighborList,
     coords: &[[f64; 3]],
@@ -662,7 +662,7 @@ fn scc_shift_force(
 /// for the Coulomb part. Combined with the short-range derivative, the
 /// net force on atom i is:
 ///   F_i = -deltaQ_i * deltaQ_j * gamma_full'(r_bohr) * r_hat_ang
-fn scc_double_counting_force(
+pub fn scc_double_counting_force(
     coords: &[[f64; 3]],
     species: &[u8],
     delta_q: &[f64],
@@ -808,8 +808,79 @@ fn repulsive_force(
     Ok(())
 }
 
+/// Repulsive force using pre-parsed spline tables indexed by pair type.
+/// No Strings, HashMaps, file I/O, or clones in the hot path.
+/// `repulsive[pair_type]` where `pair_type = species_i * n_species + species_j`.
+pub fn repulsive_force_cached(
+    coords: &[[f64; 3]],
+    ctx: &super::hamiltonian::SystemContext<'_>,
+    repulsive: &[Option<RepulsiveSpline>],
+    forces: &mut [[f64; 3]],
+) -> Result<()> {
+    let n = coords.len();
+    let n_species = ctx.n_species;
+    for i in 0..n {
+        let si = ctx.atom_species[i] as usize;
+        for j in (i + 1)..n {
+            let sj = ctx.atom_species[j] as usize;
+            let pair_type = si * n_species + sj;
+            let pair_type_rev = sj * n_species + si;
+            let spline = if let Some(s) = &repulsive[pair_type] {
+                s
+            } else if let Some(s) = &repulsive[pair_type_rev] {
+                s
+            } else {
+                continue; // no repulsive for this pair
+            };
+
+            let dx = coords[j][0] - coords[i][0];
+            let dy = coords[j][1] - coords[i][1];
+            let dz = coords[j][2] - coords[i][2];
+            let r2 = dx * dx + dy * dy + dz * dz;
+            if r2 < MIN_NEIGH_DIST * MIN_NEIGH_DIST { continue; }
+            let r_ang = r2.sqrt();
+            let r_bohr = r_ang * ANG2BOHR;
+            let (_e, de_bohr) = spline.eval(r_bohr);
+            if de_bohr == 0.0 { continue; }
+            let de_ang = de_bohr * ANG2BOHR;
+            let inv_r = 1.0 / r_ang;
+            let fx = de_ang * dx * inv_r;
+            let fy = de_ang * dy * inv_r;
+            let fz = de_ang * dz * inv_r;
+            forces[i][0] += fx; forces[i][1] += fy; forces[i][2] += fz;
+            forces[j][0] -= fx; forces[j][1] -= fy; forces[j][2] -= fz;
+        }
+    }
+    Ok(())
+}
+
+/// Parse all repulsive splines from SK files into a flat array indexed by pair type.
+/// Call once at initialization, not in the hot path.
+pub fn parse_all_repulsive(
+    sk_dir: &str,
+    species_names: &[String],
+    n_species: usize,
+) -> Result<Vec<Option<RepulsiveSpline>>> {
+    let mut out = vec![None; n_species * n_species];
+    for i in 0..n_species {
+        for j in 0..n_species {
+            let p1 = format!("{}/{}-{}.skf", sk_dir, species_names[i], species_names[j]);
+            let p2 = format!("{}/{}-{}.skf", sk_dir, species_names[j], species_names[i]);
+            let s = if std::path::Path::new(&p1).exists() {
+                parse_repulsive_spline(&p1)?
+            } else if std::path::Path::new(&p2).exists() {
+                parse_repulsive_spline(&p2)?
+            } else {
+                None
+            };
+            out[i * n_species + j] = s;
+        }
+    }
+    Ok(out)
+}
+
 /// Sanity check: assert no NaN/Inf in the force array (fail-loud).
-fn check_finite(forces: &[[f64; 3]], label: &str) {
+pub fn check_finite(forces: &[[f64; 3]], label: &str) {
     for (i, f) in forces.iter().enumerate() {
         for c in 0..3 {
             if !f[c].is_finite() {
@@ -820,7 +891,7 @@ fn check_finite(forces: &[[f64; 3]], label: &str) {
 }
 
 /// Sanity check: Newton's third law (total force ≈ 0).
-fn check_newton(forces: &[[f64; 3]], label: &str, tol: f64) {
+pub fn check_newton(forces: &[[f64; 3]], label: &str, tol: f64) {
     let mut sum = [0.0f64; 3];
     for f in forces {
         sum[0] += f[0];
