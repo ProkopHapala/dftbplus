@@ -1,8 +1,27 @@
-# GPU SCC Performance Benchmarks
+# GPU Dense Multi-System SCC Performance Benchmarks
 
 **Date:** 2025-09-06
+**Code path:** GPU dense multi-system solver (batched Jacobi eigensolver + DIIS SCC)
 **System:** Formic acid dimer (10 atoms, 28 orbitals, 18 occupied)
 **GPU:** OpenCL device (NVIDIA)
+
+## Scope — what this report covers
+
+This report benchmarks the **GPU dense multi-system SCC solver** — the code
+path for small systems (N < ~100 orbitals) where many replicas are solved
+in parallel on GPU via direct Jacobi diagonalization. This is the path used
+for H-bond exchange scans, formic dimer dynamics, and other small-system
+multi-replica workflows.
+
+This is a **different code path** from the sparse Chebyshev+Ritz eigensolver
+(`doc/prokop/reports/2025-09-06_sparse_cholesky_ritz_scaling.md`), which
+targets large PAHs, graphene flakes, and carbon nanoribbons (N=76..1156+)
+where the Hamiltonian is sparse and only frontier orbitals are needed.
+
+| Path | Method | Use case | Report |
+|------|--------|----------|--------|
+| Dense multi-system GPU | Batched Jacobi eigensolver, DIIS SCC | Small systems (N<100), many replicas | **this report** |
+| Sparse Chebyshev+Ritz | Cholesky-transformed implicit operator, polynomial filter | Large PAHs, ribbons, flakes (N=76..1156+) | `2025-09-06_sparse_cholesky_ritz_scaling.md` |
 
 ## Methodology
 
@@ -160,3 +179,8 @@ RUST_DFTB_SK_DIR=/path/to/mio-1-1 \
 RUST_DFTB_TIMING=1 \
 cargo test --test gpu_scc_bench -- --ignored --nocapture
 ```
+
+## Related
+
+- `doc/prokop/reports/2025-09-06_sparse_cholesky_ritz_scaling.md` — **sparse Chebyshev+Ritz eigensolver** scaling on large PAHs/ribbons (different code path)
+- `doc/prokop/topical_audit/gpu_scc_pipeline.md` — topical audit for the GPU SCC pipeline

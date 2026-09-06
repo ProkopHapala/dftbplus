@@ -197,3 +197,157 @@ pub fn build_inv_sqrt(
 
     Ok((x_buf, lambda_min_buf))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nalgebra::{DMatrix, DVector, SymmetricEigen};
+    use ocl::{enums::{DeviceInfo, KernelWorkGroupInfo, ProfilingInfo}, flags, Event, Queue};
+    use std::time::Instant;
+
+    fn fixture(n: usize, kind: usize) -> DMatrix<f64> {
+        let v = DVector::from_fn(n, |i, _| ((i + 1) as f64).sin());
+        let q = DMatrix::identity(n, n) - (&v * v.transpose()) * (2.0 / v.norm_squared());
+        let d = DMatrix::from_diagonal(&DVector::from_fn(n, |i, _| if kind == 1 { (i / 2) as f64 * 0.2 - 1.0 } else { i as f64 * 0.2 - 1.0 }));
+        let a = if kind == 2 { d } else { &q * d * q.transpose() };
+        DMatrix::from_fn(n, n, |i, j| a[(i.min(j), i.max(j))] as f32 as f64)
+    }
+
+    fn check_variants(configs: &[(usize, usize)], repeats: usize) {
+        assert!(repeats % 2 == 1, "Jacobi comparison needs odd repeats so the final readback is the old variant; repeats={repeats}");
+        let mut rt = GpuRuntime::new().expect("Jacobi verification requires a working OpenCL device");
+        let name = rt.device().name().expect("query Jacobi verification device name");
+        let vendor = rt.device().vendor().expect("query Jacobi verification device vendor");
+        assert!(vendor.contains("NVIDIA"), "Jacobi performance verification requires NVIDIA, selected {vendor}: {name}; select OCL_DEFAULT_PLATFORM_IDX from clinfo -l");
+        eprintln!("Jacobi verification: {name}, local={:?}, max_wg={:?}, repeats={repeats}", rt.device().info(DeviceInfo::LocalMemSize).expect("query device local memory"), rt.device().info(DeviceInfo::MaxWorkGroupSize).expect("query device WG limit"));
+        let queue = Queue::new(rt.context(), *rt.device(), Some(flags::CommandQueueProperties::new().profiling())).expect("create Jacobi profiling queue");
+        for &(n, batch) in configs {
+            let (_, _, _, _, wg) = spec_params(n);
+            let fixtures: Vec<DMatrix<f64>> = (0..3).map(|kind| fixture(n, kind)).collect();
+            let references: Vec<Vec<f64>> = fixtures.iter().map(|a| {
+                let mut vals = SymmetricEigen::new(a.clone()).eigenvalues.as_slice().to_vec();
+                vals.sort_by(f64::total_cmp);
+                vals
+            }).collect();
+            let mut input = vec![0.0f32; batch * n * n];
+            for b in 0..batch { for i in 0..n { for j in 0..n { input[b*n*n+i*n+j] = fixtures[b % 3][(i, j)] as f32; } } }
+            let src = rt.buffer_from_slice(&input).expect("upload Jacobi fixtures");
+            let a = rt.zero_buffer::<f32>(input.len()).expect("allocate Jacobi A");
+            let v = rt.zero_buffer::<f32>(input.len()).expect("allocate Jacobi V");
+            let mut ah = vec![0.0f32; input.len()];
+            let mut vh = vec![0.0f32; input.len()];
+            let mut block_a = vec![0.0f32; input.len()];
+            let mut block_v = vec![0.0f32; input.len()];
+            let mut accuracy_ok = true;
+            let kernels: Vec<Kernel> = (0..2).map(|mode| {
+                let source = format!("#define JACOBI_BLOCK_UPDATE {mode}\n{}", render_source(n));
+                let program = rt.build_program(&source).expect("compile Jacobi comparison variant");
+                let kernel = Kernel::builder().program(&program).name("jacobi_cyclic_local_batched").queue(queue.clone())
+                    .global_work_size(batch * wg).local_work_size(wg).arg(&a).arg(&v).arg(n as i32).arg(batch as i32)
+                    .build().expect("build persistent Jacobi comparison kernel");
+                eprintln!("  N={n} batch={batch} mode={mode} WG={wg} local={:?} private={:?} kernel_max_wg={:?}", kernel.wg_info(*rt.device(), KernelWorkGroupInfo::LocalMemSize).expect("query kernel local memory"), kernel.wg_info(*rt.device(), KernelWorkGroupInfo::PrivateMemSize).expect("query kernel private memory"), kernel.wg_info(*rt.device(), KernelWorkGroupInfo::WorkGroupSize).expect("query kernel WG limit"));
+                kernel
+            }).collect();
+            rt.finish().expect("finish fixture uploads before using profiling queue");
+            let mut times = [vec![0.0f64; repeats], vec![0.0f64; repeats]];
+            let mut walls = [vec![0.0f64; repeats], vec![0.0f64; repeats]];
+            for sample in 0..=repeats {
+                for turn in 0..2 {
+                    let mode = (sample + turn) % 2;
+                    src.cmd().queue(&queue).copy(&a, None, None).enq().expect("reset Jacobi input by device copy");
+                    queue.finish().expect("finish Jacobi input reset outside timing");
+                    let mut event = Event::empty();
+                    let start = Instant::now();
+                    unsafe { kernels[mode].cmd().enew(&mut event).enq().expect("enqueue Jacobi comparison"); }
+                    event.wait_for().expect("wait for Jacobi comparison event");
+                    let wall = start.elapsed().as_secs_f64() * 1e6;
+                    let t0 = event.profiling_info(ProfilingInfo::Start).expect("Jacobi event START").time().expect("START timestamp");
+                    let t1 = event.profiling_info(ProfilingInfo::End).expect("Jacobi event END").time().expect("END timestamp");
+                    assert!(t1 > t0, "invalid Jacobi timestamps: N={n} batch={batch} mode={mode} start={t0} end={t1}");
+                    if sample > 0 { times[mode][sample-1] = (t1 - t0) as f64 * 1e-3; walls[mode][sample-1] = wall; }
+                    if sample != repeats { continue; }
+                    a.cmd().queue(&queue).read(&mut ah).enq().expect("read Jacobi A for parity");
+                    v.cmd().queue(&queue).read(&mut vh).enq().expect("read Jacobi V for parity");
+                    assert!(ah.iter().chain(&vh).all(|x| x.is_finite()), "non-finite Jacobi output N={n} batch={batch} mode={mode}");
+                    let mut worst = [0.0f64; 4];
+                    for b in 0..batch {
+                        let vals = DVector::from_fn(n, |i, _| ah[b*n*n+i*n+i] as f64);
+                        let eig = DMatrix::from_fn(n, n, |i, j| vh[b*n*n+i*n+j] as f64);
+                        let d = DMatrix::from_diagonal(&vals);
+                        let orig = &fixtures[b % 3];
+                        let mut sorted = vals.as_slice().to_vec();
+                        sorted.sort_by(f64::total_cmp);
+                        let errors = [
+                            sorted.iter().zip(&references[b % 3]).map(|(a, b)| (a-b).abs()).fold(0.0, f64::max),
+                            (orig * &eig - &eig * &d).amax(),
+                            (&eig * &d * eig.transpose() - orig).amax(),
+                            (eig.transpose() * &eig - DMatrix::identity(n, n)).amax(),
+                        ];
+                        if batch <= 3 { eprintln!("    N={n} mode={mode} system={b} spectrum/residual/reconstruction/orthogonality={errors:?}"); }
+                        for i in 0..4 { worst[i] = worst[i].max(errors[i]); }
+                        if !errors.iter().all(|e| e.is_finite() && *e < 1e-4) {
+                            eprintln!("Jacobi accuracy violation N={n} batch={batch} mode={mode} system={b}, errors={errors:?}, tolerance=1e-4");
+                            accuracy_ok = false;
+                        }
+                    }
+                    if mode == 1 { block_a.copy_from_slice(&ah); block_v.copy_from_slice(&vh); }
+                    eprintln!("  N={n} batch={batch} mode={mode} worst_errors={worst:?}");
+                }
+            }
+            let differences = ah.iter().chain(&vh).zip(block_a.iter().chain(&block_v)).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+            eprintln!("  N={n} batch={batch} old/block bitwise-different outputs={differences}");
+            assert_eq!(differences, 0, "Jacobi block transform differs from original on NVIDIA: N={n} batch={batch}");
+            for mode in 0..2 { times[mode].sort_by(f64::total_cmp); walls[mode].sort_by(f64::total_cmp); }
+            eprintln!("Jacobi N={n} batch={batch}: event_us old={:.3} block={:.3} speedup={:.3}; enqueue+wait_us old={:.3} block={:.3}", times[0][repeats/2], times[1][repeats/2], times[0][repeats/2]/times[1][repeats/2], walls[0][repeats/2], walls[1][repeats/2]);
+            assert!(accuracy_ok, "Jacobi absolute accuracy failed N={n} batch={batch}; per-system old/block diagnostics above, tolerance=1e-4 (unchanged)");
+        }
+        eprintln!("Jacobi verification finished");
+    }
+
+    #[test]
+    #[ignore]
+    fn jacobi_sweep_diagnostic() {
+        let mut rt = GpuRuntime::new().expect("Jacobi sweep diagnostic requires OpenCL");
+        eprintln!("Jacobi sweep diagnostic on {}", rt.device().name().expect("query device name"));
+        let n = 64;
+        let orig = fixture(n, 0);
+        let input: Vec<f32> = (0..n*n).map(|ij| orig[(ij/n, ij%n)] as f32).collect();
+        let a = rt.buffer_from_slice(&input).expect("upload Jacobi diagnostic matrix");
+        let v = rt.zero_buffer::<f32>(input.len()).expect("allocate Jacobi diagnostic eigenvectors");
+        let mut ah = vec![0.0f32; input.len()];
+        let mut vh = vec![0.0f32; input.len()];
+        let (_, _, _, _, wg) = spec_params(n);
+        for (rsqrt_mode, sweeps) in (0..3).flat_map(|mode| [1, 2, 3, 4, 5, 8, 12, 20].map(|sweeps| (mode, sweeps))) {
+            let mut source = format!("#define JACOBI_NORMALIZE_ROTATION {}\n#define MAX_SWEEPS {sweeps}\n{}", usize::from(rsqrt_mode == 2), render_source(n))
+                .replace("gA[i] = (r == c) ? lA[r * JLD + c] : 0.0f;", "gA[i] = lA[r * JLD + c];");
+            if rsqrt_mode == 1 { source = source.replace("float c = 1.0f / sqrt(1.0f + t * t);", "float c = rsqrt(1.0f + t * t);"); }
+            let program = rt.build_program(&source).expect("compile Jacobi sweep diagnostic");
+            let kernel = Kernel::builder().program(&program).name("jacobi_cyclic_local_batched").queue(rt.queue().clone())
+                .global_work_size(wg).local_work_size(wg).arg(&a).arg(&v).arg(n as i32).arg(1i32)
+                .build().expect("build Jacobi sweep diagnostic");
+            a.write(&input).enq().expect("reset Jacobi diagnostic input");
+            unsafe { kernel.enq().expect("enqueue Jacobi sweep diagnostic"); }
+            rt.read_buffer(&a, &mut ah).expect("read full transformed Jacobi matrix");
+            rt.read_buffer(&v, &mut vh).expect("read diagnostic eigenvectors");
+            assert!(ah.iter().chain(&vh).all(|x| x.is_finite()), "Jacobi diagnostic nonfinite at sweeps={sweeps}");
+            let b = DMatrix::from_fn(n, n, |i, j| ah[i*n+j] as f64);
+            let eig = DMatrix::from_fn(n, n, |i, j| vh[i*n+j] as f64);
+            let d = DMatrix::from_diagonal(&b.diagonal());
+            let gram = eig.transpose() * &eig;
+            eprintln!("rsqrt_mode={rsqrt_mode} sweeps={sweeps}: offnorm={:.9e} AV-VD={:.9e} AV-VB={:.9e} reconstruction={:.9e} full_reconstruction={:.9e} orthogonality={:.9e} trace_drift={:.9e} frobenius_drift={:.9e} column_norm2_min={:.9e} max={:.9e}",
+                (&b-&d).norm(), (&orig*&eig-&eig*&d).amax(), (&orig*&eig-&eig*&b).amax(), (&eig*&d*eig.transpose()-&orig).amax(), (&eig*&b*eig.transpose()-&orig).amax(),
+                (&gram-DMatrix::identity(n,n)).amax(), b.trace()-orig.trace(), b.norm()-orig.norm(), gram.diagonal().min(), gram.diagonal().max());
+        }
+    }
+
+    #[test]
+    fn jacobi_block_parity() {
+        check_variants(&[(1, 3), (2, 3), (3, 3), (7, 3), (8, 3), (14, 3), (27, 3), (28, 3), (32, 3), (63, 3), (64, 3)], 1);
+    }
+
+    #[test]
+    #[ignore]
+    fn jacobi_block_benchmark() {
+        check_variants(&[(8, 100), (28, 1), (28, 100), (28, 1000), (32, 100), (64, 100)], 7);
+    }
+}

@@ -15,3 +15,16 @@ overcome, and open issues. Chronological order.
   (dense vs sparse Chebyshev+Ritz vs DFTB+ Fortran): eigenvalue parity, real-space
   wavefunction contour plots, and the S^{-1/2} dense transformation bottleneck
   for linear-scaling sparse eigensolving.
+- **2025-09-06_gpu_scc_benchmarks.md** — **GPU dense multi-system SCC** performance
+  benchmarks (batched Jacobi eigensolver + DIIS). Formic acid dimer, batch sizes
+  1–441. Jacobi bottleneck (50–65%), throughput scaling, GPU vs CPU 60–120× speedup.
+  Small-system path (N<100, many replicas).
+- **2025-09-06_sparse_cholesky_ritz_scaling.md** — **sparse Chebyshev+Ritz eigensolver**
+  scaling benchmarks on H-passivated carbon ribbons (N=76..1156). Cholesky-transformed
+  implicit operator, dense BLAS triangular solves, spectral rescaling, adaptive
+  parameters. 7.5× faster than dense at N=1156, all parities at machine precision.
+  Large-system path (PAHs, ribbons, flakes).
+- **2025-09-06_gpu_hs_assembly_bugfix.md** — GPU H0/S assembly bugfix (sp rotation
+  kernel, ss×sp block indexing).
+- **2025-09-06_scan_plots_and_gamma_fix.md** — formic dimer 2D scan plots and
+  gamma function fix.

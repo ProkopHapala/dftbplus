@@ -27,6 +27,12 @@
 //
 // ------------------------------------------------------------------
 
+#ifndef JACOBI_BLOCK_UPDATE
+#define JACOBI_BLOCK_UPDATE 1
+#endif
+#ifndef JACOBI_NORMALIZE_ROTATION
+#define JACOBI_NORMALIZE_ROTATION 1
+#endif
 #ifndef JN
 #define JN 8
 #endif
@@ -175,6 +181,11 @@ __kernel void jacobi_cyclic_local_batched(
                         : -1.0f / (-tau + sqrt(1.0f + tau * tau));
                     float c = 1.0f / sqrt(1.0f + t * t);
                     float s = t * c;
+#if JACOBI_NORMALIZE_ROTATION
+                    float err = fma(-s, s, fma(-c, c, 1.0f));
+                    c = fma(0.5f * c, err, c);
+                    s = fma(0.5f * s, err, s);
+#endif
                     rot_c[ipair] = c;
                     rot_s[ipair] = s;
                 }
@@ -183,6 +194,26 @@ __kernel void jacobi_cyclic_local_batched(
             }
             barrier(CLK_LOCAL_MEM_FENCE);
 
+#if JACOBI_BLOCK_UPDATE
+            for (int block = lid; block < JPAIR * JPAIR; block += lsz) {
+                int a = block / JPAIR;
+                int b = block % JPAIR;
+                int p = rot_p[a], q = rot_q[a];
+                int r = rot_p[b], s = rot_q[b];
+                float ca = rot_c[a], sa = rot_s[a];
+                float cb = rot_c[b], sb = rot_s[b];
+                float apr = lA[p * JLD + r], aps = lA[p * JLD + s];
+                float aqr = lA[q * JLD + r], aqs = lA[q * JLD + s];
+                float tpr = cb * apr - sb * aps;
+                float tps = sb * apr + cb * aps;
+                float tqr = cb * aqr - sb * aqs;
+                float tqs = sb * aqr + cb * aqs;
+                lA[p * JLD + r] = ca * tpr - sa * tqr;
+                lA[p * JLD + s] = ca * tps - sa * tqs;
+                lA[q * JLD + r] = sa * tpr + ca * tqr;
+                lA[q * JLD + s] = sa * tps + ca * tqs;
+            }
+#else
             // ---- Phase 2a: column update of A (A <- A · J) ----
             // For each pair (p,q), update columns p and q for ALL rows k.
             //   A[k][p]' = c·A[k][p] - s·A[k][q]
@@ -227,6 +258,7 @@ __kernel void jacobi_cyclic_local_batched(
                 }
             }
             barrier(CLK_LOCAL_MEM_FENCE);
+#endif
 
             // ---- Phase 3: apply rotations to V ----
             ipair = lid / PPG;

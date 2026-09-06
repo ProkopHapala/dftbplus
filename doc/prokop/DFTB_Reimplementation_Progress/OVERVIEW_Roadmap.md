@@ -138,7 +138,12 @@ file/function where the work should land.
 - [*] Full HC=SCε pipeline (H2, N2) — `tests/gpu_diagonalization.rs::test_gpu_full_diagonalization_h2`, `test_gpu_full_diagonalization_n2` (helper `gpu_diagonalize`)
 - [*] Batched Jacobi (3× 4×4 in one launch) — `tests/gpu_diagonalization.rs::test_gpu_batched_jacobi`
 
-### 4.3 Gaps
+### 4.3 Current Jacobi optimization (2026-09-06, awaiting USER acceptance)
+- [~] `gpu_eigen.cl`: disjoint 2×2 pair-block update, 4 → 2 barriers/round; two-pass reference retained with `JACOBI_BLOCK_UPDATE=0`. GTX 1650 event benchmark at equal accuracy: N28/batch100 4.261 → 2.647 ms (1.61×); no end-to-end speedup claimed.
+- [~] Rotation normalization refinement addresses measured f32 orthogonality drift without changing tolerances; N64 reconstruction error 4.47e-4 → 4.01e-5. New `gpu_eigen.rs` parity/profile tests pass through N64; existing `gpu_eigenproblem` 10/10 and `gpu_scc` 3/3 pass. Numerical derivation, benchmark protocol and handoff: `../chats/GPU_Optimization.chat.md`.
+- [ ] Remaining: production Jacobi residual/exhaustion reporting; NVIDIA `assemble_pairs` resource failure (reproduced before optimization), replica>=128 metadata OOB, persistent kernel/workspace lifetimes. H-bond full-pipeline acceptance is blocked by assembly, not established by the passing CPU-H/S SCC tests.
+
+### 4.4 Gaps
 - [ ] HCOOH test (N=14, mixed species) — target: `tests/gpu_diagonalization.rs::test_gpu_full_diagonalization_hcooh`
 - [ ] Block-Jacobi driver for N>64 (only subproblem kernel exists) — target: `qmqm/gpu_matrix.rs` (new driver using `brent_luk_rounds` + `batched_gemm` to apply rotations)
 - [ ] Purification path tested vs CPU density matrix — target: `tests/gpu_diagonalization.rs::test_gpu_purification_*` (uses `purify_palser_manolopoulos` / `purify_trace_correcting`)

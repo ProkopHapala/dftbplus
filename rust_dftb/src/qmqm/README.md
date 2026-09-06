@@ -22,5 +22,5 @@ for batched DFTB on many independent systems.
 - **gpu_runtime.rs** — OpenCL context/queue/program management.
 - **gpu_matrix.rs** — `GpuMatrixContext`: batched GEMM, Jacobi, purification kernels.
 - **gpu_prep.rs** — GPU system preparation (orbital mapping, species packing).
-- **gpu_eigen.rs** / **gpu_eigen.cl** — GPU-resident Jacobi eigensolver (Brent-Luk).
+- **gpu_eigen.rs** / **gpu_eigen.cl** — GPU-resident Jacobi eigensolver (Brent-Luk). Pair-block update uses two barriers/round; `JACOBI_BLOCK_UPDATE=0` retains the two-pass reference. FMA rotation-normalization refinement preserves orthogonality (`JACOBI_NORMALIZE_ROTATION=0` for original diagnostic reference). Release tests: `cargo test --release --lib jacobi_block -- --include-ignored --nocapture --test-threads=1`; select NVIDIA explicitly with `OCL_DEFAULT_PLATFORM_IDX` after checking `clinfo -l`. `jacobi_sweep_diagnostic` is an ignored per-sweep numerical diagnostic. Measurements and remaining convergence/assembly caveats: `doc/prokop/chats/GPU_Optimization.chat.md` (repo root).
 - **gpu_matrix_ops.cl** — OpenCL kernels: GEMM, Jacobi, density purification.
