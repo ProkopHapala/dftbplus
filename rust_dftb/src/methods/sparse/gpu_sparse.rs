@@ -61,6 +61,7 @@ pub struct SparseBsr4Gpu {
     k_mulliken_ks: Kernel,
     k_trace_partial: Kernel,
     k_reduce: Kernel,
+    k_identity_residual: Kernel,
     k_idempotency: Kernel,
 }
 
@@ -211,6 +212,13 @@ impl SparseBsr4Gpu {
             b.arg(0u32); b.arg(&dummy_f32); b.arg(&dummy_f32);
             b.build().map_err(map_ocl_err)?
         };
+        // bsr4_identity_residual_partial: nblock, diag_flag, A, partial
+        let k_identity_residual = {
+            let mut b = Kernel::builder();
+            b.program(&program).name("bsr4_identity_residual_partial").queue(queue.clone());
+            b.arg(0u32); b.arg(&dummy_u32); b.arg(&dummy_f32); b.arg(&dummy_f32);
+            b.build().map_err(map_ocl_err)?
+        };
         // bsr4_idempotency_partial: nblock, q_ksk, k, partial -> 1 u32, 3 f32 buf
         let k_idempotency = {
             let mut b = Kernel::builder();
@@ -227,6 +235,7 @@ impl SparseBsr4Gpu {
             config,
             k_spgemm_masked, k_spgemm_bsym, k_zero, k_axpby, k_mcweeny,
             k_tc2, k_symmetrize, k_mulliken_ks, k_trace_partial, k_reduce,
+            k_identity_residual,
             k_idempotency,
         })
     }
@@ -805,6 +814,26 @@ impl SparseBsr4Gpu {
         Ok(norm_sq)
     }
 
+    /// Direct identity residual `||A - I||_F` via the
+    /// `bsr4_identity_residual_partial` kernel.  This avoids the
+    /// catastrophic cancellation in `||A||² - 2·Tr(A) + N` when A ≈ I.
+    pub fn identity_residual(&self, a: &Bsr4Matrix) -> Result<f32> {
+        let nblock = a.nblock();
+        let a_buf = self.buf_f32(&a.values)?;
+        // Build diag_flag: 1 for diagonal blocks, 0 otherwise.
+        let diag = crate::methods::sparse::bsr4::diag_block_map(a)?;
+        let mut diag_flag = vec![0u32; nblock];
+        for &b in &diag { diag_flag[b as usize] = 1; }
+        let diag_flag_buf = self.buf_u32(&diag_flag)?;
+        // Partial reduction + recursive reduction.
+        let reduce_wg = self.config.reduce_wg as usize;
+        let n_groups = div_ceil(nblock * BS2, reduce_wg);
+        let partial = self.zero_f32(n_groups)?;
+        self.identity_residual_partial_dev(nblock, &diag_flag_buf, &a_buf, &partial)?;
+        let s2 = self.reduce_to_one_dev(n_groups, &partial)?;
+        Ok(s2.sqrt())
+    }
+
     /// Newton-Schulz / Hotelling iteration for sparse approximate inverse:
     ///
     ///   Z_{n+1} = 2 Z_n - Z_n S Z_n
@@ -847,18 +876,13 @@ impl SparseBsr4Gpu {
             // T = Z·S  (on M_T, S symmetric → Bsym)
             let t = self.matmul_masked_bsym(&z, s, t_mask)?;
 
-            // R_Z = ||I - T||_F / sqrt(N_orb)
-            //    = sqrt( ||T||_F^2 - 2*Tr(T) + N_orb ) / sqrt(N_orb)
-            let t_norm = self.frobenius_norm(&t)?;
-            let diag_t = crate::methods::sparse::bsr4::diag_block_map(&t)?;
-            let diag_buf = self.buf_u32(&diag_t)?;
-            let t_buf = self.buf_f32(&t.values)?;
-            let tr_t = self.trace_ks(n_atom, &diag_buf, &t_buf)?;
-            let rz_sq = t_norm * t_norm - 2.0 * tr_t + n_orb;
-            let rz = (rz_sq.max(0.0)).sqrt() / n_orb.sqrt();
+            // R_Z = ||I - T||_F / sqrt(N_orb) — direct identity residual,
+            // avoids catastrophic cancellation in ||T||² - 2·Tr(T) + N when
+            // T ≈ I (which falsely rounds to zero in f32).
+            let rz = self.identity_residual(&t)? / n_orb.sqrt();
 
             println!(
-                "  Newton-Schulz iter {iter}: R_Z = {rz:e}  (||T||_F={t_norm:.4}, Tr={tr_t:.4})"
+                "  Newton-Schulz iter {iter}: R_Z = {rz:e}"
             );
 
             if rz < tol {
@@ -868,7 +892,9 @@ impl SparseBsr4Gpu {
                 stall_count += 1;
                 if stall_count >= stall {
                     println!("  Newton-Schulz stalled after {iter_done} iters, R_Z = {rz:e}");
-                    return Ok((z, rz, iter_done));
+                    return Err(DftbError::InvalidInput(format!(
+                        "Newton-Schulz did not converge: stalled after {iter_done} iters, R_Z={rz:e} (tol={tol:e})"
+                    )));
                 }
             } else {
                 stall_count = 0;
@@ -890,15 +916,12 @@ impl SparseBsr4Gpu {
             z = self.symmetrize_mat(&z)?;
         }
 
-        // Final residual.
+        // Final residual — direct identity residual, no cancellation.
         let t = self.matmul_masked_bsym(&z, s, t_mask)?;
-        let t_norm = self.frobenius_norm(&t)?;
-        let diag_t = crate::methods::sparse::bsr4::diag_block_map(&t)?;
-        let diag_buf = self.buf_u32(&diag_t)?;
-        let t_buf = self.buf_f32(&t.values)?;
-        let tr_t = self.trace_ks(n_atom, &diag_buf, &t_buf)?;
-        let rz = ((t_norm * t_norm - 2.0 * tr_t + n_orb).max(0.0)).sqrt() / n_orb.sqrt();
-        Ok((z, rz, iter_done))
+        let rz = self.identity_residual(&t)? / n_orb.sqrt();
+        Err(DftbError::InvalidInput(format!(
+            "Newton-Schulz did not converge: exhausted {max_iter} iters, final R_Z={rz:e} (tol={tol:e})"
+        )))
     }
 
     /// Build the Hamiltonian-derived initial density kernel:
@@ -1089,21 +1112,27 @@ impl SparseBsr4Gpu {
                 println!(
                     "  TC2 diverging at iter {iter}: R_I={r_i:e} > 10×best={best_r_i:e}, returning best (iter {best_iter})"
                 );
-                return Ok((best_k, best_r_i, best_tr, best_iter + 1, history));
+                return Err(DftbError::InvalidInput(format!(
+                    "TC2 purification did not converge: diverged at iter {iter}, best R_I={best_r_i:e} at iter {best_iter} (tol={tol:e}, max_iter={max_iter})"
+                )));
             }
 
             let (knew, _) = self.tc2_step(&k, s, nocc, k_mask, t_mask, &diag_buf)?;
             k = self.symmetrize_mat(&knew)?;
         }
 
-        // If we exhausted iterations, return the best K found
+        // Exhausted iterations without converging.
         if best_r_i < r_i {
             println!(
-                "  TC2 exhausted {max_iter} iters, returning best (iter {best_iter}, R_I={best_r_i:e})"
+                "  TC2 exhausted {max_iter} iters, best R_I={best_r_i:e} at iter {best_iter}"
             );
-            Ok((best_k, best_r_i, best_tr, best_iter + 1, history))
+            Err(DftbError::InvalidInput(format!(
+                "TC2 purification did not converge: exhausted {max_iter} iters, best R_I={best_r_i:e} at iter {best_iter} (tol={tol:e})"
+            )))
         } else {
-            Ok((k, r_i, tr, max_iter, history))
+            Err(DftbError::InvalidInput(format!(
+                "TC2 purification did not converge: exhausted {max_iter} iters, final R_I={r_i:e} (tol={tol:e})"
+            )))
         }
     }
 }
@@ -1140,6 +1169,7 @@ pub struct GpuBsrStructure {
     row_ptr: Buffer<u32>,
     col_idx: Buffer<u32>,
     diag_block: Buffer<u32>,
+    diag_flag: Buffer<u32>,
     transpose_block: Buffer<u32>,
 }
 
@@ -1160,9 +1190,14 @@ impl GpuBsrStructure {
         let dummy = Bsr4Matrix::from_structure(n_atom, mask.0.clone(), mask.1.clone())?;
         let diag = crate::methods::sparse::bsr4::diag_block_map(&dummy)?;
         let transpose = crate::methods::sparse::bsr4::transpose_block_map(&dummy);
+        let mut diag_flag = vec![0u32; nblock];
+        for &b in &diag {
+            diag_flag[b as usize] = 1;
+        }
         let diag_block = gpu.buf_u32(&diag)?;
+        let diag_flag = gpu.buf_u32(&diag_flag)?;
         let transpose_block = gpu.buf_u32(&transpose)?;
-        Ok(Self { n_atom, nblock, row_ptr, col_idx, diag_block, transpose_block })
+        Ok(Self { n_atom, nblock, row_ptr, col_idx, diag_block, diag_flag, transpose_block })
     }
 
     pub fn n_atom(&self) -> usize { self.n_atom }
@@ -1481,6 +1516,117 @@ impl SparseBsr4Gpu {
         Ok(())
     }
 
+    /// Device-resident direct identity residual partial reduction. No
+    /// cancellation through a trace or matrix norm is used.
+    pub fn identity_residual_partial_dev(
+        &self,
+        nblock: usize,
+        diag_flag: &Buffer<u32>,
+        a: &Buffer<f32>,
+        partial: &Buffer<f32>,
+    ) -> Result<()> {
+        let reduce_wg = self.config.reduce_wg as usize;
+        let n = nblock * BS2;
+        let n_groups = div_ceil(n, reduce_wg);
+        let kern = &self.k_identity_residual;
+        kern.set_arg(0, nblock as u32).map_err(map_ocl_err)?;
+        kern.set_arg(1, diag_flag).map_err(map_ocl_err)?;
+        kern.set_arg(2, a).map_err(map_ocl_err)?;
+        kern.set_arg(3, partial).map_err(map_ocl_err)?;
+        unsafe {
+            kern.cmd()
+                .global_work_size(n_groups * reduce_wg)
+                .local_work_size(reduce_wg)
+                .enq()
+                .map_err(map_ocl_err)?;
+        }
+        Ok(())
+    }
+
+    /// Reduce a partial vector into a preallocated one-float device buffer.
+    /// scratch_a and scratch_b must not alias input or output.
+    fn reduce_to_output_dev(
+        &self,
+        mut n: usize,
+        input: &Buffer<f32>,
+        scratch_a: &Buffer<f32>,
+        scratch_b: &Buffer<f32>,
+        output: &Buffer<f32>,
+    ) -> Result<()> {
+        if n == 0 {
+            return Err(DftbError::InvalidInput("reduction input is empty".into()));
+        }
+        let reduce_wg = self.config.reduce_wg as usize;
+        let mut current = input;
+        let mut use_a = true;
+        loop {
+            let n_groups = div_ceil(n, reduce_wg);
+            let out = if n_groups == 1 {
+                output
+            } else if use_a {
+                scratch_a
+            } else {
+                scratch_b
+            };
+            self.reduce_dev(n, current, out)?;
+            if n_groups == 1 {
+                return Ok(());
+            }
+            current = out;
+            use_a = !use_a;
+            n = n_groups;
+        }
+    }
+
+    /// Enqueue Tr(KS) into a preallocated one-float device buffer.
+    pub fn trace_ks_to_dev(
+        &self,
+        struct_: &GpuBsrStructure,
+        ks: &Buffer<f32>,
+        partial: &Buffer<f32>,
+        scratch_a: &Buffer<f32>,
+        scratch_b: &Buffer<f32>,
+        output: &Buffer<f32>,
+    ) -> Result<()> {
+        let reduce_wg = self.config.reduce_wg as usize;
+        let n_groups = div_ceil(struct_.n_atom, reduce_wg);
+        self.trace_ks_partial_dev(struct_.n_atom, &struct_.diag_block, ks, partial)?;
+        self.reduce_to_output_dev(n_groups, partial, scratch_a, scratch_b, output)
+    }
+
+    /// Enqueue ||KSK-K||² into a preallocated one-float device buffer.
+    pub fn idempotency_to_dev(
+        &self,
+        nblock: usize,
+        q_ksk: &Buffer<f32>,
+        k: &Buffer<f32>,
+        partial: &Buffer<f32>,
+        scratch_a: &Buffer<f32>,
+        scratch_b: &Buffer<f32>,
+        output: &Buffer<f32>,
+    ) -> Result<()> {
+        let reduce_wg = self.config.reduce_wg as usize;
+        let n_groups = div_ceil(nblock * BS2, reduce_wg);
+        self.idempotency_partial_dev(nblock, q_ksk, k, partial)?;
+        self.reduce_to_output_dev(n_groups, partial, scratch_a, scratch_b, output)
+    }
+
+    /// Enqueue direct ||A-I||² reduction into a device scalar.
+    pub fn identity_residual_to_dev(
+        &self,
+        struct_: &GpuBsrStructure,
+        a: &Buffer<f32>,
+        partial: &Buffer<f32>,
+        scratch_a: &Buffer<f32>,
+        scratch_b: &Buffer<f32>,
+        output: &Buffer<f32>,
+    ) -> Result<()> {
+        let reduce_wg = self.config.reduce_wg as usize;
+        let n_groups = div_ceil(struct_.nblock * BS2, reduce_wg);
+        self.identity_residual_partial_dev(struct_.nblock, &struct_.diag_flag, a, partial)?;
+        self.reduce_to_output_dev(n_groups, partial, scratch_a, scratch_b, output)
+    }
+
     /// Device-resident full `Tr(KS)` reduction: enqueues partial + recursive
     /// reduction, returns one f32 to host. This is the **only** host transfer
     /// in the hot loop — a single scalar.
@@ -1552,6 +1698,26 @@ impl SparseBsr4Gpu {
         self.idempotency_err_dev(nblock, vals, &zero)
     }
 
+    /// Device-resident direct identity residual `||A-I||_F` via the
+    /// `bsr4_identity_residual_partial` kernel.  Avoids the catastrophic
+    /// cancellation in `||A||² - 2·Tr(A) + N` when A ≈ I. Reads 1 scalar.
+    pub fn identity_residual_scalar_dev(
+        &self,
+        struct_: &GpuBsrStructure,
+        a: &Buffer<f32>,
+    ) -> Result<f32> {
+        let reduce_wg = self.config.reduce_wg as usize;
+        let reduce_len = div_ceil(struct_.nblock * BS2, reduce_wg);
+        let partial = self.zero_f32(reduce_len)?;
+        let scratch_a = self.zero_f32(reduce_len)?;
+        let scratch_b = self.zero_f32(reduce_len)?;
+        let output = self.zero_f32(1)?;
+        self.identity_residual_to_dev(struct_, a, &partial, &scratch_a, &scratch_b, &output)?;
+        let mut host = [0.0f32; 1];
+        self.read_f32(&output, &mut host)?;
+        Ok(host[0])
+    }
+
     /// Device-resident Newton-Schulz / Hotelling iteration for sparse
     /// approximate inverse:
     ///
@@ -1561,15 +1727,14 @@ impl SparseBsr4Gpu {
     ///
     /// All matrices stay on the GPU for the entire loop. Per iteration:
     ///   T = Z·S          (spgemm_bsym_dev — 0 transfers)
-    ///   ||T||_F          (frobenius_norm_dev — 1 scalar read)
-    ///   Tr(T)            (trace_ks_dev — 1 scalar read)
-    ///   R_Z = sqrt(||T||² - 2·Tr(T) + N_orb) / sqrt(N_orb)  (host)
+    ///   ||I-T||_F        (identity_residual_scalar_dev — 1 scalar read)
+    ///   R_Z = ||I-T||_F / sqrt(N_orb)  (host)
     ///   Q = T·Z          (spgemm_bsym_dev — 0 transfers)
     ///   Znew = 2·Z - Q   (axpby_dev — 0 transfers)
     ///   symmetrize(Znew) (symmetrize_dev — 0 transfers)
     ///   swap(Z, Znew)
     ///
-    /// 2 SpGEMMs, 2 scalar reads per iteration. No matrix host transfers.
+    /// 2 SpGEMMs, 1 scalar read per iteration. No matrix host transfers.
     /// Returns (Z_host, final_R_Z, iterations).
     pub fn newton_schulz_inverse_dev(
         &self,
@@ -1607,14 +1772,12 @@ impl SparseBsr4Gpu {
             // T = Z·S (Bsym: S symmetric)
             self.spgemm_bsym_dev(&z, s, &t)?;
 
-            // ||T||_F and Tr(T) — 2 scalar reads.
-            let t_norm = self.frobenius_norm_dev(t_struct.nblock, &t.values)?;
-            let tr_t = self.trace_ks_dev(t_struct, &t.values)?;
-            let rz_sq = t_norm * t_norm - 2.0 * tr_t + n_orb;
-            let rz = (rz_sq.max(0.0)).sqrt() / n_orb.sqrt();
+            // R_Z = ||I - T||_F / sqrt(N_orb) — direct identity residual,
+            // avoids catastrophic cancellation in ||T||² - 2·Tr(T) + N.
+            let rz = self.identity_residual_scalar_dev(t_struct, &t.values)? / n_orb.sqrt();
 
             println!(
-                "  Newton-Schulz-dev iter {iter}: R_Z = {rz:e}  (||T||_F={t_norm:.4}, Tr={tr_t:.4})"
+                "  Newton-Schulz-dev iter {iter}: R_Z = {rz:e}"
             );
 
             if rz < tol {
@@ -1626,7 +1789,9 @@ impl SparseBsr4Gpu {
                 if stall_count >= stall {
                     println!("  Newton-Schulz-dev stalled after {iter_done} iters, R_Z = {rz:e}");
                     let z_out = z.to_host(self)?;
-                    return Ok((z_out, rz, iter_done));
+                    return Err(DftbError::InvalidInput(format!(
+                        "Newton-Schulz did not converge: stalled after {iter_done} iters, R_Z={rz:e} (tol={tol:e})"
+                    )));
                 }
             } else {
                 stall_count = 0;
@@ -1646,13 +1811,13 @@ impl SparseBsr4Gpu {
             std::mem::swap(&mut z.values, &mut znew.values);
         }
 
-        // Final residual.
+        // Final residual — direct identity residual, no cancellation.
         self.spgemm_bsym_dev(&z, s, &t)?;
-        let t_norm = self.frobenius_norm_dev(t_struct.nblock, &t.values)?;
-        let tr_t = self.trace_ks_dev(t_struct, &t.values)?;
-        let rz = ((t_norm * t_norm - 2.0 * tr_t + n_orb).max(0.0)).sqrt() / n_orb.sqrt();
+        let rz = self.identity_residual_scalar_dev(t_struct, &t.values)? / n_orb.sqrt();
         let z_out = z.to_host(self)?;
-        Ok((z_out, rz, iter_done))
+        Err(DftbError::InvalidInput(format!(
+            "Newton-Schulz did not converge: exhausted {max_iter} iters, final R_Z={rz:e} (tol={tol:e})"
+        )))
     }
 }
 
@@ -1692,8 +1857,12 @@ pub struct SparsePurifyWorkspace {
     /// 1-float buffer for Tr(KS) — written by reduction, read to host for
     /// the TC2 branch decision.
     trace_buf: Buffer<f32>,
+    /// 1-float device residual buffer.
+    residual_buf: Buffer<f32>,
     /// Scratch buffer for reductions (reused across iterations).
-    reduce_scratch: Buffer<f32>,
+    reduce_partial: Buffer<f32>,
+    reduce_a: Buffer<f32>,
+    reduce_b: Buffer<f32>,
     /// Number of occupied orbitals.
     nocc: f32,
 }
@@ -1729,13 +1898,20 @@ impl SparsePurifyWorkspace {
         let q = GpuBsrMatrix::zero(&gpu, &k_struct)?;
 
         let trace_buf = gpu.zero_f32(1)?;
+        let residual_buf = gpu.zero_f32(1)?;
         let nrow = k0.n_atom;
         let reduce_wg = gpu.config().reduce_wg as usize;
-        let reduce_scratch = gpu.zero_f32(div_ceil(nrow, reduce_wg))?;
+        let reduce_len = div_ceil(
+            nrow.max(k_struct.nblock * BS2),
+            reduce_wg,
+        );
+        let reduce_partial = gpu.zero_f32(reduce_len)?;
+        let reduce_a = gpu.zero_f32(reduce_len)?;
+        let reduce_b = gpu.zero_f32(reduce_len)?;
 
         Ok(Self {
             gpu, k_struct, t_struct, s: s_mat, k, knew, t, q,
-            trace_buf, reduce_scratch, nocc,
+            trace_buf, residual_buf, reduce_partial, reduce_a, reduce_b, nocc,
         })
     }
 
@@ -1754,34 +1930,62 @@ impl SparsePurifyWorkspace {
     /// kernels (only before the scalar read).
     ///
     /// Returns `Tr(KS)` for this iteration.
-    pub fn tc2_step_dev(&mut self) -> Result<f32> {
-        let nrow = self.k.struct_.n_atom;
-        let nblock = self.k.struct_.nblock;
-
-        // T = K·S (Bsym: S is symmetric)
+    fn tc2_products_dev(&mut self, with_residual: bool) -> Result<()> {
         self.gpu.spgemm_bsym_dev(&self.k, &self.s, &self.t)?;
-
-        // Q = T·K (Bsym: K is symmetric)
         self.gpu.spgemm_bsym_dev(&self.t, &self.k, &self.q)?;
+        self.gpu.trace_ks_to_dev(
+            &self.t_struct,
+            &self.t.values,
+            &self.reduce_partial,
+            &self.reduce_a,
+            &self.reduce_b,
+            &self.trace_buf,
+        )?;
+        if with_residual {
+            self.gpu.idempotency_to_dev(
+                self.k.struct_.nblock,
+                &self.q.values,
+                &self.k.values,
+                &self.reduce_partial,
+                &self.reduce_a,
+                &self.reduce_b,
+                &self.residual_buf,
+            )?;
+        }
+        Ok(())
+    }
 
-        // Tr(KS) = Tr(T) — partial reduction + recursive reduction.
-        // This is the only host transfer: 1 scalar.
-        let tr = self.gpu.trace_ks_dev(&self.t_struct, &self.t.values)?;
-
-        // Write trace to the 1-float buffer for the TC2 kernel.
-        let trace_val = vec![tr];
-        self.trace_buf.write(&trace_val[..]).enq().map_err(map_ocl_err)?;
-
-        // Knew = TC2(K, Q, trace, Nocc)
-        self.gpu.tc2_dev(nblock, &self.k.values, &self.q.values, &self.trace_buf, self.nocc, &self.knew.values)?;
-
-        // Symmetrize Knew in place.
-        self.gpu.symmetrize_dev(nblock, &self.k_struct.transpose_block, &self.knew.values)?;
-
-        // Swap K and Knew (just swap the value buffers, structure is shared).
+    fn tc2_update_dev(&mut self) -> Result<()> {
+        let nblock = self.k.struct_.nblock;
+        self.gpu.tc2_dev(
+            nblock,
+            &self.k.values,
+            &self.q.values,
+            &self.trace_buf,
+            self.nocc,
+            &self.knew.values,
+        )?;
+        self.gpu.symmetrize_dev(
+            nblock,
+            &self.k_struct.transpose_block,
+            &self.knew.values,
+        )?;
         std::mem::swap(&mut self.k.values, &mut self.knew.values);
+        Ok(())
+    }
 
-        Ok(tr)
+    pub fn tc2_step_dev(&mut self) -> Result<f32> {
+        self.tc2_products_dev(false)?;
+        self.tc2_update_dev()?;
+        let mut tr = [0.0f32; 1];
+        self.gpu.read_f32(&self.trace_buf, &mut tr)?;
+        if !tr[0].is_finite() {
+            return Err(DftbError::InvalidInput(format!(
+                "TC2 trace is non-finite after update: Tr(KS)={}",
+                tr[0]
+            )));
+        }
+        Ok(tr[0])
     }
 
     /// Compute `R_I = ||KSK - K||_F` on the device. Q already contains KSK
@@ -1797,6 +2001,23 @@ impl SparsePurifyWorkspace {
             self.gpu.spgemm_bsym_dev(&self.t, &self.k, &self.q)?;
         }
         self.gpu.idempotency_err_dev(nblock, &self.q.values, &self.k.values)
+    }
+
+    /// Compute `Tr(KS)` for the current K using the workspace's persistent
+    /// buffers.  Requires `self.t` to already contain K·S (e.g. after
+    /// `tc2_products_dev` or `idempotency_err_dev(true)`).  Reads 1 scalar.
+    fn trace_ks_current_dev(&self) -> Result<f32> {
+        self.gpu.trace_ks_to_dev(
+            &self.t_struct,
+            &self.t.values,
+            &self.reduce_partial,
+            &self.reduce_a,
+            &self.reduce_b,
+            &self.trace_buf,
+        )?;
+        let mut tr = [0.0f32; 1];
+        self.gpu.read_f32(&self.trace_buf, &mut tr)?;
+        Ok(tr[0])
     }
 
     /// Run the full TC2 purification loop on the device. Returns
@@ -1845,20 +2066,22 @@ impl SparsePurifyWorkspace {
             };
 
             if do_check && r_i < tol {
+                // Recompute Tr(KS) for the returned K (after swap).
+                // After idempotency_err_dev(true), self.t = K_new·S.
+                let tr_final = self.trace_ks_current_dev()?;
                 let k_host = self.k.to_host(&self.gpu)?;
-                return Ok((k_host, r_i, tr, iter + 1, history));
+                return Ok((k_host, r_i, tr_final, iter + 1, history));
             }
 
             // Divergence detection.
             if do_check && r_i > best_r_i * 10.0 && best_r_i < f32::INFINITY {
                 println!(
-                    "  TC2-dev diverging at iter {iter}: R_I={r_i:e} > 10×best={best_r_i:e}, returning best (iter {best_iter})"
+                    "  TC2-dev diverging at iter {iter}: R_I={r_i:e} > 10×best={best_r_i:e}"
                 );
-                // Read back the best K. We don't have it stored device-side
-                // (would need a backup buffer). For now, return current K
-                // and note the divergence.
                 let k_host = self.k.to_host(&self.gpu)?;
-                return Ok((k_host, best_r_i, last_tr, best_iter + 1, history));
+                return Err(DftbError::InvalidInput(format!(
+                    "TC2 purification did not converge: diverged at iter {iter}, best R_I={best_r_i:e} at iter {best_iter} (tol={tol:e}, max_iter={max_iter})"
+                )));
             }
         }
 
@@ -1868,14 +2091,27 @@ impl SparsePurifyWorkspace {
         } else {
             last_r_i
         };
+        // Recompute Tr(KS) for the final K if possible.
+        let final_tr = if last_r_i.is_nan() {
+            // idempotency_err_dev(true) already computed T = K·S.
+            self.trace_ks_current_dev()?
+        } else {
+            // T may be stale from before the last swap. Recompute.
+            self.gpu.spgemm_bsym_dev(&self.k, &self.s, &self.t)?;
+            self.trace_ks_current_dev()?
+        };
         if best_r_i < final_r_i {
             println!(
                 "  TC2-dev exhausted {} iters, best R_I={best_r_i:e} at iter {best_iter}",
                 max_iter
             );
-            Ok((k_host, best_r_i, last_tr, best_iter + 1, history))
+            Err(DftbError::InvalidInput(format!(
+                "TC2 purification did not converge: exhausted {max_iter} iters, best R_I={best_r_i:e} at iter {best_iter} (tol={tol:e})"
+            )))
         } else {
-            Ok((k_host, final_r_i, last_tr, max_iter, history))
+            Err(DftbError::InvalidInput(format!(
+                "TC2 purification did not converge: exhausted {max_iter} iters, final R_I={final_r_i:e} (tol={tol:e})"
+            )))
         }
     }
 

@@ -23,6 +23,7 @@ use rust_dftb::methods::sparse::bsr4::{
 };
 use rust_dftb::methods::sparse::gpu_sparse::{SparseBsr4Config, SparseBsr4Gpu, SparsePurifyWorkspace};
 use rust_dftb::methods::sparse::gpu_sparse;
+use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 
 /// Deterministic LCG for reproducible random-ish data.
 struct Rng(u64);
@@ -41,11 +42,26 @@ impl Rng {
 
 /// Try to create a SparseBsr4Gpu; return None if no OpenCL device.
 fn try_gpu() -> Option<SparseBsr4Gpu> {
-    match SparseBsr4Gpu::new(SparseBsr4Config::default()) {
-        Ok(g) => Some(g),
-        Err(e) => {
+    // ocl's Platform::default() panics when the ICD exposes zero platforms,
+    // instead of returning the Result used by SparseBsr4Gpu::new.  Preserve
+    // the test module's documented skip behavior for that one environment
+    // failure, while re-panicking on all unrelated constructor bugs.
+    match catch_unwind(AssertUnwindSafe(|| SparseBsr4Gpu::new(SparseBsr4Config::default()))) {
+        Ok(Ok(g)) => Some(g),
+        Ok(Err(e)) => {
             eprintln!("Skipping GPU sparse test: no OpenCL device ({e})");
             None
+        }
+        Err(payload) => {
+            let msg = payload.downcast_ref::<String>().map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&str>().copied())
+                .unwrap_or("non-string panic");
+            if msg.contains("GetPlatformIdsPlatformListUnavailable") {
+                eprintln!("Skipping GPU sparse test: no OpenCL platform ({msg})");
+                None
+            } else {
+                resume_unwind(payload)
+            }
         }
     }
 }
@@ -155,6 +171,17 @@ fn dmatrix_to_row_major_f32(m: &DMatrix<f64>) -> Vec<f32> {
 
 fn dense_trace(a: &[f32], n: usize) -> f32 {
     (0..n).map(|i| a[i * n + i]).sum()
+}
+
+/// Independent host reference for the two values returned by resident TC2.
+/// Keeping this in nalgebra avoids validating the GPU trace and residual with
+/// the same sparse helper implementation that produced them.
+fn reference_trace_and_idempotency(k: &[f32], s: &[f32], n: usize) -> (f32, f32) {
+    let km = row_major_to_dmatrix_f64(k, n);
+    let sm = row_major_to_dmatrix_f64(s, n);
+    let trace = (&km * &sm).trace() as f32;
+    let residual = ((&km * &sm * &km) - &km).norm() as f32;
+    (trace, residual)
 }
 
 // (dense_frobenius is now imported from bsr4.rs)
@@ -936,10 +963,79 @@ fn test_tc2_dev_resident_convergence() {
     let max_diff = dense_max_abs_diff(&k_final_dense, &k_exact_dense);
     println!("  TC2-dev max|K_final - K_exact| = {max_diff:e}");
     assert!(max_diff < 0.05, "TC2-dev result too far from exact: {max_diff:e}");
+
+    // The returned diagnostics must describe the returned K, not the K from
+    // the preceding iteration.  This catches the old tc2_step_dev contract,
+    // which reported Tr(K_old S) after swapping in K_new.
+    let (trace_ref, residual_ref) = reference_trace_and_idempotency(&k_final_dense, &s_dense, n);
+    println!(
+        "  returned-state reference: Tr(KS)={trace_ref:.8} R_I={residual_ref:e}; API: Tr={tr:.8} R_I={r_i:e}"
+    );
+    assert!((tr - trace_ref).abs() < 5e-4, "returned Tr(KS) is not for returned K: API={tr}, reference={trace_ref}");
+    assert!((r_i - residual_ref).abs() < 5e-5, "returned R_I is not for returned K: API={r_i:e}, reference={residual_ref:e}");
 }
 
 // =====================================================================
-// 15. Device-resident TC2 parity vs old host-roundtrip TC2
+// 15. Non-convergence must be an explicit error.
+//     A caller cannot safely consume a returned matrix when the requested
+//     tolerance was not reached (especially inside an SCC loop).
+// =====================================================================
+
+#[test]
+fn test_tc2_nonconvergence_is_error() {
+    let Some(gpu) = try_gpu() else { return };
+    let n_atom = 1;
+    let mask = build_full_mask(n_atom);
+    let n = n_atom * BS;
+    let mut k0_dense = vec![0.0f32; n * n];
+    k0_dense[0] = 0.8;
+    k0_dense[n + 1] = 0.8;
+    let k0 = bsr4_from_dense(n_atom, &k0_dense, &mask);
+    let s = build_identity(n_atom, &mask).unwrap();
+    let result = gpu.tc2_purify(&k0, &s, 2.0, &mask, &mask, 1, 1e-12);
+    match result {
+        Err(e) => {
+            let msg = format!("{e}");
+            println!("TC2 non-convergence error (expected): {msg}");
+            assert!(msg.to_ascii_lowercase().contains("converg"), "error lacks convergence context: {msg}");
+        }
+        Ok((_, r_i, _, iters, _)) => panic!(
+            "TC2 returned success after {iters} iteration(s) without reaching tol: R_I={r_i:e}"
+        ),
+    }
+}
+
+#[test]
+fn test_newton_schulz_near_identity_nonconvergence_is_not_cancelled() {
+    let Some(gpu) = try_gpu() else { return };
+    let n_atom = 1;
+    let mask = build_full_mask(n_atom);
+    let n = n_atom * BS;
+    let mut s_dense = vec![0.0f32; n * n];
+    s_dense[0] = 1.0001;
+    s_dense[n + 1] = 0.9999;
+    s_dense[2 * n + 2] = 1.0;
+    s_dense[3 * n + 3] = 1.0;
+    let s = bsr4_from_dense(n_atom, &s_dense, &mask);
+
+    // After one Newton-Schulz update the true residual is small but nonzero.
+    // The old ||T||² - 2Tr(T) + N formula can round it to zero in f32 and
+    // falsely report convergence, so use a tolerance below that residual.
+    let result = gpu.newton_schulz_inverse(&s, &mask, &mask, 1, 1e-9, 1);
+    match result {
+        Err(e) => {
+            let msg = format!("{e}");
+            println!("Newton-Schulz near-identity error (expected): {msg}");
+            assert!(msg.to_ascii_lowercase().contains("converg"), "error lacks convergence context: {msg}");
+        }
+        Ok((_, r_z, _,)) => panic!(
+            "Newton-Schulz falsely converged after cancellation: R_Z={r_z:e}"
+        ),
+    }
+}
+
+// =====================================================================
+// 16. Device-resident TC2 parity vs old host-roundtrip TC2
 //     Run both paths with the same K0 and verify they produce the same K
 //     after the same number of iterations.
 // =====================================================================
@@ -994,7 +1090,7 @@ fn test_tc2_dev_vs_host_parity() {
 }
 
 // =====================================================================
-// 16. Row-degree overflow check (fail-loud, not silent zero output)
+// 17. Row-degree overflow check (fail-loud, not silent zero output)
 //     Verify that GpuBsrStructure::new rejects masks with rows exceeding
 //     MAX_LEFT_BLOCKS, instead of silently producing incorrect results.
 // =====================================================================

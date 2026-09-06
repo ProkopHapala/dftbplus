@@ -21,6 +21,7 @@ use rust_dftb::methods::sparse::{
     Bsr4Matrix, SparseBsr4Config, SparseBsr4Gpu,
     build_full_mask, build_geometric_mask,
 };
+use rust_dftb::methods::sparse::gpu_sparse::{GpuBsrMatrix, GpuBsrStructure, SparsePurifyWorkspace};
 use rust_dftb::{
     HamiltonianBuilder, SccResult, SystemContext, load_sk_for_species,
 };
@@ -264,6 +265,9 @@ fn rhai_run_sparse_purify(name: &str, max_iter: INT, tol: f64) -> Dynamic {
 
     let n_atom = st.natom();
     let n_orbs = n_atom * 4; // BSR4: 4 orbitals per atom
+    if max_iter <= 0 || !tol.is_finite() || tol <= 0.0 {
+        panic!("sparse purification requires max_iter > 0 and finite tol > 0: max_iter={max_iter}, tol={tol}");
+    }
     if scc.h0.nrows() != n_orbs {
         eprintln!("ERROR: H0 size {} != expected {} (n_atom×4). BSR4 requires sp basis (4 orbs/atom).",
             scc.h0.nrows(), n_orbs);
@@ -291,13 +295,34 @@ fn rhai_run_sparse_purify(name: &str, max_iter: INT, tol: f64) -> Dynamic {
         Err(e) => { eprintln!("ERROR GPU init: {e}"); return Dynamic::from_float(f64::NAN); }
     };
 
-    // 1. Z ≈ S⁻¹
+    // The legacy host-roundtrip methods remain available on SparseBsr4Gpu as
+    // the reference path; production uses the resident APIs below.
+    // 1. Z ≈ S⁻¹ (resident Newton–Schulz)
     eprintln!("  Newton-Schulz Z ≈ S⁻¹ ...");
-    let (z, r_z, z_iters) = match gpu.newton_schulz_inverse(&s_bsr, &mask, &mask, 30, 1e-4, 3) {
+    let k_struct = match GpuBsrStructure::new(&gpu, n_atom, &mask) {
+        Ok(s) => Arc::new(s),
+        Err(e) => panic!("ERROR building resident K structure for {n_atom} atoms: {e}"),
+    };
+    let t_struct = match GpuBsrStructure::new(&gpu, n_atom, &mask) {
+        Ok(s) => Arc::new(s),
+        Err(e) => panic!("ERROR building resident T structure for {n_atom} atoms: {e}"),
+    };
+    let s_struct = match GpuBsrStructure::new(&gpu, n_atom, &(s_bsr.row_ptr.clone(), s_bsr.col_idx.clone())) {
+        Ok(s) => Arc::new(s),
+        Err(e) => panic!("ERROR building resident S structure for {n_atom} atoms: {e}"),
+    };
+    let s_dev = match gpu.buf_f32(&s_bsr.values) {
+        Ok(values) => GpuBsrMatrix { struct_: s_struct, values },
+        Err(e) => panic!("ERROR uploading resident S values for {n_atom} atoms: {e}"),
+    };
+    let (z, r_z, z_iters) = match gpu.newton_schulz_inverse_dev(&s_dev, &k_struct, &t_struct, 30, 1e-4, 3) {
         Ok(r) => r,
-        Err(e) => { eprintln!("ERROR Newton-Schulz: {e}"); return Dynamic::from_float(f64::NAN); }
+        Err(e) => panic!("ERROR Newton-Schulz: {e}"),
     };
     eprintln!("    Z: {z_iters} iters, R_Z = {r_z:e}");
+    if !r_z.is_finite() || r_z > 1e-4 {
+        panic!("Newton-Schulz failed to converge: R_Z={r_z:e}, iterations={z_iters}, tolerance=1e-4");
+    }
 
     // 2. Spectral bounds
     let (emin, emax) = match gpu.spectral_bounds(&h_bsr, &z, &mask, 0.1) {
@@ -314,28 +339,34 @@ fn rhai_run_sparse_purify(name: &str, max_iter: INT, tol: f64) -> Dynamic {
 
     // 4. TC2 purification
     eprintln!("  TC2 purification (max_iter={max_iter}, tol={tol}) ...");
-    let (k_final, r_i, tr_ks, tc2_iters, history) = match gpu.tc2_purify(&k0, &s_bsr, n_occ, &mask, &mask, max_iter as usize, tol as f32) {
+    let mut workspace = match SparsePurifyWorkspace::new(gpu, &k0, &s_bsr, &mask, &mask, n_occ) {
+        Ok(ws) => ws,
+        Err(e) => panic!("ERROR creating resident TC2 workspace: {e}"),
+    };
+    let (k_final, r_i, tr_ks, tc2_iters, history) = match workspace.tc2_purify_dev(max_iter as usize, tol as f32, 1) {
         Ok(r) => r,
-        Err(e) => { eprintln!("ERROR TC2: {e}"); return Dynamic::from_float(f64::NAN); }
+        Err(e) => panic!("ERROR TC2: {e}"),
     };
     eprintln!("    TC2: {tc2_iters} iters, R_I={r_i:e}, Tr(KS)={tr_ks:.6}");
+    if !r_i.is_finite() || r_i > tol as f32 || !tr_ks.is_finite() {
+        panic!("TC2 failed to converge: R_I={r_i:e}, Tr(KS)={tr_ks:.8}, iterations={tc2_iters}, tolerance={tol:e}");
+    }
 
     // 5. R_H = ||HKS - SKH||
-    let r_h = match gpu.hamiltonian_residual(&h_bsr, &k_final, &s_bsr, &mask) {
+    let r_h = match workspace.gpu().hamiltonian_residual(&h_bsr, &k_final, &s_bsr, &mask) {
         Ok(r) => r,
-        Err(e) => { eprintln!("ERROR R_H: {e}"); return Dynamic::from_float(f64::NAN); }
+        Err(e) => panic!("ERROR R_H: {e}"),
     };
     let r_h_norm = r_h / (n_orbs as f32).sqrt();
     eprintln!("    R_H = {r_h:e} (normalized {r_h_norm:e})");
+    if !r_h_norm.is_finite() {
+        panic!("Hamiltonian residual is non-finite: R_H={r_h:e}, normalized={r_h_norm:e}");
+    }
 
     // 6. Mulliken charges from sparse K
-    let ks = match gpu.matmul_masked_bsym(&k_final, &s_bsr, &mask) {
+    let mulliken = match workspace.mulliken_dev() {
         Ok(m) => m,
-        Err(e) => { eprintln!("ERROR KS: {e}"); return Dynamic::from_float(f64::NAN); }
-    };
-    let mulliken = match gpu.mulliken(&ks) {
-        Ok(m) => m,
-        Err(e) => { eprintln!("ERROR Mulliken: {e}"); return Dynamic::from_float(f64::NAN); }
+        Err(e) => panic!("ERROR Mulliken: {e}"),
     };
     eprintln!("    sparse Mulliken: {:?}", mulliken.iter()
         .map(|q| format!("{q:.4}")).collect::<Vec<_>>());

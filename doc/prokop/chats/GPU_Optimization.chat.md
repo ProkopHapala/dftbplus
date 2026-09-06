@@ -2939,3 +2939,77 @@ gpu_sparse_bsr4: 17 passed (15 original + 2 new TC2-dev + 1 row-degree + 1 NS-de
 gpu_eigenproblem: 10 passed
 gpu_scc: 3 passed
 ```
+
+---
+
+## §33 Codex additions + sanitization (2025-09-23)
+
+### What Codex did (preserved)
+
+Codex (GPT-5) made several improvements but ran out of tokens before finishing, leaving 3 tests failing. The work that was sound and is preserved:
+
+1. **`bsr4_identity_residual_partial` OpenCL kernel** — computes `||A-I||²_F` directly by subtracting 1.0 from diagonal elements before squaring, avoiding the catastrophic cancellation in `||A||² - 2·Tr(A) + N` when A ≈ I. This is a numerically superior formulation.
+
+2. **`GpuBsrStructure::diag_flag`** — a boolean mask (stored as `u32`) marking which blocks are diagonal, precomputed once at structure upload time for the identity residual kernel.
+
+3. **Cached `k_identity_residual` kernel handle** — built once at `SparseBsr4Gpu::new()`.
+
+4. **Device-resident reduction infrastructure** — `reduce_to_output_dev`, `trace_ks_to_dev`, `idempotency_to_dev`, `identity_residual_to_dev` — these write results into a preallocated 1-float device buffer instead of returning a scalar to host, enabling future use without host synchronization.
+
+5. **`SparsePurifyWorkspace` buffer split** — `reduce_scratch` split into `reduce_partial`, `reduce_a`, `reduce_b` for the recursive reduction, plus `residual_buf` for the identity residual scalar.
+
+6. **`try_gpu()` panic-safe** — wraps `SparseBsr4Gpu::new` in `catch_unwind` to handle the `ocl` panic when no OpenCL platform is available, preserving the test skip behavior.
+
+7. **`reference_trace_and_idempotency` test helper** — independent nalgebra-based reference for trace and idempotency, avoiding circular validation.
+
+8. **3 new tests** (tests 15, 15b, 16 in the renumbered suite):
+   - `test_tc2_nonconvergence_is_error` — verifies `tc2_purify` returns `Err` when tolerance is not reached.
+   - `test_newton_schulz_near_identity_nonconvergence_is_not_cancelled` — verifies the cancellation bug is fixed.
+   - `test_tc2_dev_resident_convergence` — now also verifies returned Tr(KS) matches the returned K.
+
+### What was broken and fixed (sanitization)
+
+The 3 tests Codex wrote were correct, but the implementation to satisfy them was incomplete. I completed the missing pieces without changing Codex's logic:
+
+#### Fix 1: `tc2_purify` returns `Err` on non-convergence
+
+**Root cause:** `tc2_purify` returned `Ok((best_k, best_r_i, ...))` when iterations were exhausted or diverged, silently handing the caller a K that did not meet the tolerance. This violates "Fail Fast, Fix the Physics".
+
+**Fix:** Changed the exhaustion and divergence paths to return `Err(DftbError::InvalidInput(...))` with a descriptive message including `best_r_i`, `tol`, `max_iter`, and the iteration where divergence was detected.
+
+#### Fix 2: `newton_schulz_inverse` uses direct identity residual
+
+**Root cause:** Both `newton_schulz_inverse` (host path) and `newton_schulz_inverse_dev` (device path) computed `R_Z = sqrt(||T||² - 2·Tr(T) + N) / sqrt(N)`. When T ≈ I (converged), `||T||² ≈ N` and `Tr(T) ≈ N`, so the formula becomes `sqrt(N - 2N + N) = sqrt(0)` — but in f32, `||T||² - 2·Tr(T) + N` can round to exactly 0 even when the true residual is ~1e-4, falsely reporting convergence.
+
+**Fix:** Codex already added the `bsr4_identity_residual_partial` kernel that computes `||A-I||²` directly. I wired it up:
+- Added host-path `identity_residual()` method on `SparseBsr4Gpu`.
+- Added device-path `identity_residual_scalar_dev()` method.
+- Replaced the cancellation-prone formula in both `newton_schulz_inverse` and `newton_schulz_inverse_dev` with the direct identity residual.
+- Changed non-convergence returns to `Err`.
+
+**Result:** The near-identity test now correctly reports `R_Z = 1.22e-4` (not 0) and returns `Err`.
+
+#### Fix 3: `tc2_purify_dev` returns Tr(KS) matching the returned K
+
+**Root cause:** `tc2_step_dev` computes `Tr(KS)` from T = K_old·S, then swaps K_old → K_new. The returned `tr` was from K_old, but the returned K was K_new. The test correctly caught this mismatch: `API: Tr=2.9952002` vs `reference: Tr=2.9999921`.
+
+**Fix:** Added `trace_ks_current_dev()` helper that recomputes `Tr(KS)` from the current (post-swap) T buffer. On convergence, `idempotency_err_dev(true)` already recomputes T = K_new·S, so the trace can be read without an extra SpGEMM. On exhaustion, an extra T = K·S SpGEMM is needed. All return paths now return `tr_final` matching the returned K.
+
+**Result:** `API: Tr=2.99999237` vs `reference: Tr=2.99999213` — now within tolerance.
+
+### Final test results (32 tests, all pass)
+
+```
+gpu_sparse_bsr4:  19 passed
+gpu_eigenproblem: 10 passed
+gpu_scc:           3 passed
+```
+
+Key numerical results after fixes:
+```
+Newton-Schulz (host):     5 iters, R_Z = 1.16e-5  (was 0e0 — cancellation fixed)
+Newton-Schulz (dev):      4 iters, R_Z = 1.87e-5  (was 0e0 — cancellation fixed)
+Newton-Schulz near-identity: R_Z = 1.22e-4, Err returned  (was false Ok with R_Z=0)
+TC2 non-convergence:      Err returned with "did not converge" message
+TC2-dev returned Tr:      2.99999237 vs reference 2.99999213  (was 2.9952002 — mismatch fixed)
+```

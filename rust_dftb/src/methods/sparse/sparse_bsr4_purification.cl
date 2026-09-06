@@ -947,6 +947,53 @@ __kernel void reduce_sum_f32(
 
 
 // ============================================================================
+// DIRECT IDENTITY RESIDUAL
+//
+//      R² = ||A - I||²_F
+//
+// This avoids the cancellation in ||A||² - 2 Tr(A) + N when A is close to I.
+// diag_flag[b] is one only for diagonal atom blocks.
+// ============================================================================
+
+__attribute__((reqd_work_group_size(REDUCE_WG,1,1)))
+__kernel void bsr4_identity_residual_partial(
+    const uint nblock,
+
+    __global const uint* diag_flag,
+
+    __global const float* A,
+
+    __global float* partial
+){
+    const uint lid = get_local_id(0);
+    const uint gid = get_global_id(0);
+    const uint gsize = get_global_size(0);
+    const uint n = nblock*BS2;
+
+    __local float buf[REDUCE_WG];
+    float sum = 0.0f;
+
+    for(uint i=gid; i<n; i+=gsize){
+        const uint b = i/BS2;
+        const uint lane = i & 15;
+        float d = A[i];
+        if(diag_flag[b] != 0u && (lane == 0u || lane == 5u || lane == 10u || lane == 15u)){
+            d -= 1.0f;
+        }
+        sum = fma(d, d, sum);
+    }
+
+    buf[lid] = sum;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for(uint step=REDUCE_WG>>1; step>0; step>>=1){
+        if(lid < step) buf[lid] += buf[lid+step];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if(lid == 0) partial[get_group_id(0)] = buf[0];
+}
+
+
+// ============================================================================
 // GENERALIZED IDEMPOTENCY ERROR
 //
 //      R² = || K S K - K ||²_F                            (8)
