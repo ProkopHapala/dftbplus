@@ -57,6 +57,23 @@
 #ifndef JACOBI_TOL
 #define JACOBI_TOL 1.0e-7f
 #endif
+#ifndef PAIR_SKIP_TOL
+// Pair skip threshold: if |A[p][q]| < PAIR_SKIP_TOL, the rotation is identity.
+// This must be SMALLER than JACOBI_TOL so that the global off-diagonal norm
+// can actually reach the convergence threshold. If PAIR_SKIP_TOL == JACOBI_TOL,
+// each remaining element is below the threshold but their Frobenius norm
+// (sqrt(N^2) * threshold) can never satisfy the global relative tolerance,
+// causing the kernel to waste all remaining sweeps doing nothing.
+//
+// With PAIR_SKIP_TOL = 0, every pair gets a rotation as long as |A[pq]| > 0,
+// which is the most aggressive setting. With a small nonzero value, truly
+// negligible pairs are skipped for efficiency. The default 1e-12 is small
+// enough that the global Frobenius-norm convergence can be reached for
+// N<=64 (worst case: N^2 * (1e-12)^2 = 4096e-24, sqrt = 6.4e-11, well
+// below JACOBI_TOL * off0), but large enough to avoid numerical issues
+// with denormalized floating-point values that can produce NaN rotations.
+#define PAIR_SKIP_TOL 1.0e-12f
+#endif
 #ifndef LAMBDA_FLOOR
 #define LAMBDA_FLOOR 1.0e-7f
 #endif
@@ -154,6 +171,8 @@ __kernel void jacobi_cyclic_local_batched(
     barrier(CLK_LOCAL_MEM_FENCE);
 
     // ================ Jacobi sweeps ================
+    float prev_off = fmax(off0, 1.0e-30f);  // for stagnation detection
+    int stall_count = 0;                     // consecutive non-improving sweeps
     for (int sweep = 0; sweep < MAX_SWEEPS; ++sweep) {
 
         for (int round = 0; round < JROUND; ++round) {
@@ -169,7 +188,7 @@ __kernel void jacobi_cyclic_local_batched(
                 // Ensure p < q for consistent 2x2 update.
                 if (p > q) { int tmp = p; p = q; q = tmp; }
                 float apq = lA[p * JLD + q];
-                if (fabs(apq) < JACOBI_TOL) {
+                if (fabs(apq) < PAIR_SKIP_TOL) {
                     rot_c[ipair] = 1.0f;
                     rot_s[ipair] = 0.0f;
                 } else {
@@ -293,7 +312,23 @@ __kernel void jacobi_cyclic_local_batched(
         }
         float off_cur = sqrt(reduce[0]);
         barrier(CLK_LOCAL_MEM_FENCE);
+        // Convergence: relative off-diagonal norm below tolerance.
         if (off_cur / off0 < JACOBI_TOL) break;
+        // Stagnation detection: if the off-diagonal norm did not improve by
+        // at least 10% for STALL_LIMIT consecutive sweeps, further sweeps
+        // are unlikely to help (all remaining pairs are at the PAIR_SKIP_TOL
+        // floor). Break to avoid wasting the remaining sweeps. This is the
+        // key fix for the "20 sweeps but 12 are useless" problem identified
+        // in GPU_Optimization.chat.md §2. Require multiple consecutive
+        // non-improving sweeps to avoid premature exit during transient
+        // plateaus.
+        if (sweep > 0 && off_cur > 0.9f * prev_off) {
+            stall_count++;
+            if (stall_count >= 3) break;
+        } else {
+            stall_count = 0;
+        }
+        prev_off = off_cur;
     }
 
     // ---- Store results back to global ----

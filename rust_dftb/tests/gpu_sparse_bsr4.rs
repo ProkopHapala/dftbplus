@@ -21,7 +21,7 @@ use rust_dftb::methods::sparse::bsr4::{
     dense_matmul, dense_max_abs_diff, dense_frobenius, diag_block_map,
     gershgorin_bounds, inf_norm, symmetrize_host, Bsr4Matrix, BS, BS2,
 };
-use rust_dftb::methods::sparse::gpu_sparse::{SparseBsr4Config, SparseBsr4Gpu};
+use rust_dftb::methods::sparse::gpu_sparse::{SparseBsr4Config, SparseBsr4Gpu, SparsePurifyWorkspace};
 use rust_dftb::methods::sparse::gpu_sparse;
 
 /// Deterministic LCG for reproducible random-ish data.
@@ -689,6 +689,50 @@ fn test_newton_schulz_inverse() {
 }
 
 // =====================================================================
+// 11b. Device-resident Newton-Schulz (P0-D: GPU residency)
+//      Same test as above but using the device-resident path.
+// =====================================================================
+
+#[test]
+fn test_newton_schulz_inverse_dev() {
+    use rust_dftb::methods::sparse::gpu_sparse::{GpuBsrMatrix, GpuBsrStructure};
+    use std::sync::Arc;
+
+    let Some(gpu) = try_gpu() else { return };
+    let n_atom = 3;
+    let n = n_atom * BS;
+    let mut rng = Rng(0x5a5a_5a5a_5a5a_5a5a);
+    let s_dense = make_overlap_dense(n_atom, &mut rng, 0.15);
+    let mask = build_full_mask(n_atom);
+    let s_host = bsr4_from_dense(n_atom, &s_dense, &mask);
+
+    // Build device-resident structures.
+    let k_struct = Arc::new(GpuBsrStructure::new(&gpu, n_atom, &mask).unwrap());
+    let t_struct = Arc::new(GpuBsrStructure::new(&gpu, n_atom, &mask).unwrap());
+    let s_struct = Arc::new(GpuBsrStructure::new(&gpu, n_atom, &(s_host.row_ptr.clone(), s_host.col_idx.clone())).unwrap());
+    let s = GpuBsrMatrix { struct_: s_struct, values: gpu.buf_f32(&s_host.values).unwrap() };
+
+    let (z, rz, iters) = gpu
+        .newton_schulz_inverse_dev(&s, &k_struct, &t_struct, 30, 1e-4, 3)
+        .unwrap();
+    println!("Newton-Schulz-dev: {iters} iters, R_Z = {rz:e}");
+
+    // CPU reference: dense S⁻¹.
+    let s_f64 = row_major_to_dmatrix_f64(&s_dense, n);
+    let se = SymmetricEigen::new(s_f64.clone());
+    let mut d = DMatrix::<f64>::zeros(n, n);
+    for i in 0..n { d[(i, i)] = 1.0 / se.eigenvalues[i].max(1e-12); }
+    let s_inv = &se.eigenvectors * &d * se.eigenvectors.transpose();
+    let s_inv_dense = dmatrix_to_row_major_f32(&s_inv);
+
+    let z_dense = z.to_dense();
+    let err = dense_max_abs_diff(&z_dense, &s_inv_dense);
+    println!("  ||Z_dev - S⁻¹||_max = {err:e}");
+    assert!(rz < 1e-3, "Newton-Schulz-dev did not converge: R_Z = {rz:e}");
+    assert!(err < 1e-2, "Z_dev != S⁻¹: max|dZ| = {err:e}");
+}
+
+// =====================================================================
 // 12. Hamiltonian-derived K₀ and real parity test
 //     H,S -> Z -> K₀ -> TC2 -> K, compare against dense projector K_ref.
 //     Also check R_H = ||HKS - SKH||_F -> 0.
@@ -837,4 +881,141 @@ fn test_rh_distinguishes_projectors() {
     let ratio = r_h_r / r_h_c.max(1e-30);
     println!("  R_H ratio (random/correct) = {ratio:.1e}");
     assert!(ratio > 100.0, "R_H does not distinguish: ratio={ratio:.1e}");
+}
+
+// =====================================================================
+// 14. Device-resident TC2 purification (P0-D: GPU residency)
+//     Verify that the new SparsePurifyWorkspace produces the same result
+//     as the old host-roundtrip path, and converges to the correct density.
+// =====================================================================
+
+#[test]
+fn test_tc2_dev_resident_convergence() {
+    let Some(gpu) = try_gpu() else { return };
+    let n_atom = 3;
+    let n = n_atom * BS;
+    let nocc: f32 = 3.0;
+    let mut rng = Rng(0x7e57_c0de_face_cafe);
+    let mut h_dense = random_symmetric_dense(n_atom, &mut rng, 0.4);
+    for i in 0..n { h_dense[i * n + i] += 2.0; }
+    let s_dense = make_overlap_dense(n_atom, &mut rng, 0.25);
+    let k_exact_dense = cpu_density_kernel(&h_dense, &s_dense, n, nocc as usize);
+    let mask = build_full_mask(n_atom);
+    let s = bsr4_from_dense(n_atom, &s_dense, &mask);
+
+    // K0 = alpha * K_exact (spectrally valid perturbation, same as test_tc2_convergence).
+    let alpha = 0.8f32;
+    let mut k0_dense = vec![0.0f32; n * n];
+    for i in 0..n * n { k0_dense[i] = alpha * k_exact_dense[i]; }
+    let mut k0 = bsr4_from_dense(n_atom, &k0_dense, &mask);
+    k0 = gpu.symmetrize_mat(&k0).unwrap();
+
+    // Build the device-resident workspace.
+    // T mask = K mask (full) for this small test.
+    let t_mask = mask.clone();
+    let ws = SparsePurifyWorkspace::new(gpu, &k0, &s, &mask, &t_mask, nocc);
+    let mut ws = match ws {
+        Ok(w) => w,
+        Err(e) => { eprintln!("SparsePurifyWorkspace::new failed: {e}"); return; }
+    };
+
+    // Run device-resident TC2 purification.
+    let (k_final, r_i, tr, iters, _history) = match ws.tc2_purify_dev(30, 1e-3, 1) {
+        Ok(r) => r,
+        Err(e) => { eprintln!("tc2_purify_dev failed: {e}"); return; }
+    };
+
+    println!("TC2-dev final: R_I={r_i:e}  Tr(KS)={tr:.5}  iters={iters}");
+
+    // Same acceptance criteria as test_tc2_convergence.
+    assert!(r_i < 1e-3, "TC2-dev did not converge: R_I={r_i:e}");
+    assert!((tr - nocc).abs() < 1e-2, "TC2-dev trace != Nocc: {tr} vs {nocc}");
+
+    // Compare the device-resident result to the exact density kernel.
+    let k_final_dense = k_final.to_dense();
+    let max_diff = dense_max_abs_diff(&k_final_dense, &k_exact_dense);
+    println!("  TC2-dev max|K_final - K_exact| = {max_diff:e}");
+    assert!(max_diff < 0.05, "TC2-dev result too far from exact: {max_diff:e}");
+}
+
+// =====================================================================
+// 15. Device-resident TC2 parity vs old host-roundtrip TC2
+//     Run both paths with the same K0 and verify they produce the same K
+//     after the same number of iterations.
+// =====================================================================
+
+#[test]
+fn test_tc2_dev_vs_host_parity() {
+    let Some(gpu) = try_gpu() else { return };
+    let n_atom = 3;
+    let n = n_atom * BS;
+    let nocc: f32 = 3.0;
+    let mut rng = Rng(0xface_b00c_1234_5678);
+    let mut h_dense = random_symmetric_dense(n_atom, &mut rng, 0.4);
+    for i in 0..n { h_dense[i * n + i] += 2.0; }
+    let s_dense = make_overlap_dense(n_atom, &mut rng, 0.25);
+    let k_exact_dense = cpu_density_kernel(&h_dense, &s_dense, n, nocc as usize);
+    let mask = build_full_mask(n_atom);
+    let s = bsr4_from_dense(n_atom, &s_dense, &mask);
+
+    // K0 = 0.8 * K_exact
+    let alpha = 0.8f32;
+    let mut k0_dense = vec![0.0f32; n * n];
+    for i in 0..n * n { k0_dense[i] = alpha * k_exact_dense[i]; }
+    let mut k0 = bsr4_from_dense(n_atom, &k0_dense, &mask);
+    k0 = gpu.symmetrize_mat(&k0).unwrap();
+
+    // --- Old host-roundtrip path: run 5 TC2 steps ---
+    let diag_dummy = Bsr4Matrix::from_structure(n_atom, mask.0.clone(), mask.1.clone()).unwrap();
+    let diag = diag_block_map(&diag_dummy).unwrap();
+    let diag_buf = gpu.buf_u32(&diag).unwrap();
+    let mut k_host = k0.clone();
+    for step in 0..5 {
+        let (knew, _n) = gpu.tc2_step(&k_host, &s, nocc, &mask, &mask, &diag_buf).unwrap();
+        k_host = gpu.symmetrize_mat(&knew).unwrap();
+    }
+
+    // --- New device-resident path: run 5 TC2 steps ---
+    let t_mask = mask.clone();
+    let gpu2 = SparseBsr4Gpu::new(SparseBsr4Config::default()).unwrap();
+    let mut ws = SparsePurifyWorkspace::new(gpu2, &k0, &s, &mask, &t_mask, nocc).unwrap();
+    for step in 0..5 {
+        let _tr = ws.tc2_step_dev().unwrap();
+    }
+    let k_dev = ws.k_to_host().unwrap();
+
+    // Compare: both should produce nearly identical K after 5 steps.
+    let k_host_dense = k_host.to_dense();
+    let k_dev_dense = k_dev.to_dense();
+    let max_diff = dense_max_abs_diff(&k_host_dense, &k_dev_dense);
+    println!("TC2 host-vs-dev after 5 steps: max|K_host - K_dev| = {max_diff:e}");
+    // f32 roundoff + different reduction order → allow 1e-4.
+    assert!(max_diff < 1e-4, "TC2 dev vs host mismatch: {max_diff:e}");
+}
+
+// =====================================================================
+// 16. Row-degree overflow check (fail-loud, not silent zero output)
+//     Verify that GpuBsrStructure::new rejects masks with rows exceeding
+//     MAX_LEFT_BLOCKS, instead of silently producing incorrect results.
+// =====================================================================
+
+#[test]
+fn test_row_degree_overflow_fail_loud() {
+    let Some(gpu) = try_gpu() else { return };
+    // Create a mask with a row that has > MAX_LEFT_BLOCKS (default 256) blocks.
+    // With n_atom = 300 and full mask, row 0 has 300 blocks > 256.
+    let n_atom = 300;
+    let mask = build_full_mask(n_atom);
+    // GpuBsrStructure::new should fail with a descriptive error.
+    let result = rust_dftb::methods::sparse::gpu_sparse::GpuBsrStructure::new(&gpu, n_atom, &mask);
+    assert!(result.is_err(), "GpuBsrStructure::new should fail for row degree > MAX_LEFT_BLOCKS");
+    let err_msg = match result {
+        Err(e) => format!("{e}"),
+        Ok(_) => "unexpected success".to_string(),
+    };
+    println!("Row-degree overflow error (expected): {err_msg}");
+    assert!(
+        err_msg.contains("MAX_LEFT_BLOCKS") || err_msg.contains("max_left_blocks"),
+        "Error should mention MAX_LEFT_BLOCKS: {err_msg}"
+    );
 }

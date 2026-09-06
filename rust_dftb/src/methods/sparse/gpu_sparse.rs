@@ -15,6 +15,7 @@ use crate::methods::sparse::bsr4::{
 };
 use crate::qmqm::gpu_runtime::{map_ocl_err, GpuRuntime};
 use ocl::{builders::ProgramBuilder, flags, Buffer, Kernel, Program};
+use std::sync::Arc;
 
 const BSR4_KERNEL_SOURCE: &str = include_str!("sparse_bsr4_purification.cl");
 
@@ -48,10 +49,26 @@ pub struct SparseBsr4Gpu {
     rt: GpuRuntime,
     program: Program,
     config: SparseBsr4Config,
+    // Cached kernel handles — built once at init, reused for every launch.
+    // This eliminates the per-call Kernel::builder() overhead.
+    k_spgemm_masked: Kernel,
+    k_spgemm_bsym: Kernel,
+    k_zero: Kernel,
+    k_axpby: Kernel,
+    k_mcweeny: Kernel,
+    k_tc2: Kernel,
+    k_symmetrize: Kernel,
+    k_mulliken_ks: Kernel,
+    k_trace_partial: Kernel,
+    k_reduce: Kernel,
+    k_idempotency: Kernel,
 }
 
 impl SparseBsr4Gpu {
     /// Initialize OpenCL and compile the BSR4 kernels with the given config.
+    /// All kernel handles are built once and cached for the lifetime of this
+    /// `SparseBsr4Gpu`. Per-launch calls use `set_arg` to swap buffers, never
+    /// `Kernel::builder()`.
     pub fn new(config: SparseBsr4Config) -> Result<Self> {
         if config.wg % 16 != 0 || config.wg <= 0 {
             return Err(DftbError::InvalidInput(format!(
@@ -75,10 +92,142 @@ impl SparseBsr4Gpu {
         // but keeps the runtime's cache consistent if later reused).
         let _ = rt.build_program(BSR4_KERNEL_SOURCE);
         let _ = &mut rt; // silence unused_mut if any
+
+        // Build dummy buffers for kernel construction. Kernels require all
+        // args to be present at build time; we swap them with set_arg per
+        // launch. These are 1-element buffers kept alive for the lifetime of
+        // this struct.
+        let queue = rt.queue().clone();
+        let dummy_u32 = Buffer::<u32>::builder()
+            .queue(queue.clone())
+            .flags(flags::MEM_READ_WRITE)
+            .len(1)
+            .fill_val(0u32)
+            .build()
+            .map_err(map_ocl_err)?;
+        let dummy_f32 = Buffer::<f32>::builder()
+            .queue(queue.clone())
+            .flags(flags::MEM_READ_WRITE)
+            .len(1)
+            .fill_val(0.0f32)
+            .build()
+            .map_err(map_ocl_err)?;
+
+        let wg_usize = config.wg as usize;
+        let reduce_wg_usize = config.reduce_wg as usize;
+        let gws_spgemm = wg_usize; // will be scaled by nrow per launch
+        let gws_elem = BS2; // per-block elementwise kernels
+        let gws_reduce = reduce_wg_usize;
+
+        // Helper: build a kernel with dummy args matching the kernel signature.
+        // Each kernel's arg count and types must match the .cl definition.
+        let build_k = |name: &str, n_scalar_u32: usize, n_buf_u32: usize, n_buf_f32: usize, n_scalar_f32: usize| -> Result<Kernel> {
+            let mut b = Kernel::builder();
+            b.program(&program).name(name).queue(queue.clone());
+            for _ in 0..n_scalar_u32 { b.arg(0u32); }
+            for _ in 0..n_buf_u32    { b.arg(&dummy_u32); }
+            for _ in 0..n_buf_f32    { b.arg(&dummy_f32); }
+            for _ in 0..n_scalar_f32 { b.arg(0.0f32); }
+            b.build().map_err(map_ocl_err)
+        };
+
+        // bsr4_spgemm_masked: nrow, A_row,A_col,A, B_row,B_col,B, C_row,C_col,C
+        //   1 u32 scalar, 3 u32 bufs, 3 f32 bufs (A,B,C), 0 f32 scalar
+        // Actually: A,B,C are f32 value bufs; A_row,A_col,B_row,B_col,C_row,C_col are u32 bufs
+        //   = 1 scalar_u32, 6 buf_u32, 3 buf_f32
+        let k_spgemm_masked = {
+            let mut b = Kernel::builder();
+            b.program(&program).name("bsr4_spgemm_masked").queue(queue.clone());
+            b.arg(0u32); // nrow
+            b.arg(&dummy_u32); b.arg(&dummy_u32); b.arg(&dummy_f32); // A_row, A_col, A
+            b.arg(&dummy_u32); b.arg(&dummy_u32); b.arg(&dummy_f32); // B_row, B_col, B
+            b.arg(&dummy_u32); b.arg(&dummy_u32); b.arg(&dummy_f32); // C_row, C_col, C
+            b.build().map_err(map_ocl_err)?
+        };
+        let k_spgemm_bsym = {
+            let mut b = Kernel::builder();
+            b.program(&program).name("bsr4_spgemm_masked_Bsym").queue(queue.clone());
+            b.arg(0u32);
+            b.arg(&dummy_u32); b.arg(&dummy_u32); b.arg(&dummy_f32);
+            b.arg(&dummy_u32); b.arg(&dummy_u32); b.arg(&dummy_f32);
+            b.arg(&dummy_u32); b.arg(&dummy_u32); b.arg(&dummy_f32);
+            b.build().map_err(map_ocl_err)?
+        };
+        // bsr4_zero: nblock, A   -> 1 u32 scalar, 1 f32 buf
+        let k_zero = {
+            let mut b = Kernel::builder();
+            b.program(&program).name("bsr4_zero").queue(queue.clone());
+            b.arg(0u32); b.arg(&dummy_f32);
+            b.build().map_err(map_ocl_err)?
+        };
+        // bsr4_axpby: nblock, alpha, A, beta, B, C  -> 1 u32, 2 f32 buf (A,B are f32, C is f32), 2 f32 scalar
+        //   args: nblock(u32), alpha(f32), A(f32 buf), beta(f32), B(f32 buf), C(f32 buf)
+        let k_axpby = {
+            let mut b = Kernel::builder();
+            b.program(&program).name("bsr4_axpby").queue(queue.clone());
+            b.arg(0u32); b.arg(0.0f32); b.arg(&dummy_f32); b.arg(0.0f32); b.arg(&dummy_f32); b.arg(&dummy_f32);
+            b.build().map_err(map_ocl_err)?
+        };
+        // bsr4_mcweeny: nblock, Q, V, Knew  -> 1 u32, 3 f32 buf
+        let k_mcweeny = {
+            let mut b = Kernel::builder();
+            b.program(&program).name("bsr4_mcweeny").queue(queue.clone());
+            b.arg(0u32); b.arg(&dummy_f32); b.arg(&dummy_f32); b.arg(&dummy_f32);
+            b.build().map_err(map_ocl_err)?
+        };
+        // bsr4_tc2: nblock, K, Q_KSK, trace_KS, Nocc, Knew -> 1 u32, 3 f32 buf, 1 f32 scalar
+        let k_tc2 = {
+            let mut b = Kernel::builder();
+            b.program(&program).name("bsr4_tc2").queue(queue.clone());
+            b.arg(0u32); b.arg(&dummy_f32); b.arg(&dummy_f32); b.arg(&dummy_f32); b.arg(0.0f32); b.arg(&dummy_f32);
+            b.build().map_err(map_ocl_err)?
+        };
+        // bsr4_symmetrize: nblock, transpose_block, A -> 1 u32, 1 u32 buf, 1 f32 buf
+        let k_symmetrize = {
+            let mut b = Kernel::builder();
+            b.program(&program).name("bsr4_symmetrize").queue(queue.clone());
+            b.arg(0u32); b.arg(&dummy_u32); b.arg(&dummy_f32);
+            b.build().map_err(map_ocl_err)?
+        };
+        // bsr4_mulliken_KS: nrow, diag_block, ks, q -> 1 u32, 2 u32 buf (diag_block is u32), 2 f32 buf (ks, q)
+        //   Actually: diag_block is u32 buf, ks is f32 buf, q is f32 buf
+        let k_mulliken_ks = {
+            let mut b = Kernel::builder();
+            b.program(&program).name("bsr4_mulliken_KS").queue(queue.clone());
+            b.arg(0u32); b.arg(&dummy_u32); b.arg(&dummy_f32); b.arg(&dummy_f32);
+            b.build().map_err(map_ocl_err)?
+        };
+        // bsr4_trace_KS_partial: nrow, diag_block, ks, partial -> 1 u32, 1 u32 buf, 2 f32 buf
+        let k_trace_partial = {
+            let mut b = Kernel::builder();
+            b.program(&program).name("bsr4_trace_KS_partial").queue(queue.clone());
+            b.arg(0u32); b.arg(&dummy_u32); b.arg(&dummy_f32); b.arg(&dummy_f32);
+            b.build().map_err(map_ocl_err)?
+        };
+        // reduce_sum_f32: n, input, output -> 1 u32, 2 f32 buf
+        let k_reduce = {
+            let mut b = Kernel::builder();
+            b.program(&program).name("reduce_sum_f32").queue(queue.clone());
+            b.arg(0u32); b.arg(&dummy_f32); b.arg(&dummy_f32);
+            b.build().map_err(map_ocl_err)?
+        };
+        // bsr4_idempotency_partial: nblock, q_ksk, k, partial -> 1 u32, 3 f32 buf
+        let k_idempotency = {
+            let mut b = Kernel::builder();
+            b.program(&program).name("bsr4_idempotency_partial").queue(queue.clone());
+            b.arg(0u32); b.arg(&dummy_f32); b.arg(&dummy_f32); b.arg(&dummy_f32);
+            b.build().map_err(map_ocl_err)?
+        };
+
+        let _ = gws_spgemm; let _ = gws_elem; let _ = gws_reduce; let _ = build_k;
+
         Ok(Self {
             rt,
             program,
             config,
+            k_spgemm_masked, k_spgemm_bsym, k_zero, k_axpby, k_mcweeny,
+            k_tc2, k_symmetrize, k_mulliken_ks, k_trace_partial, k_reduce,
+            k_idempotency,
         })
     }
 
@@ -89,6 +238,36 @@ impl SparseBsr4Gpu {
 
     pub fn config(&self) -> &SparseBsr4Config {
         &self.config
+    }
+
+    /// Validate that no row in `row_ptr` exceeds `MAX_LEFT_BLOCKS`.
+    /// The GPU SpGEMM kernels silently `return` (producing zero output) when
+    /// a row's degree exceeds the local-memory cache size. This host-side
+    /// check makes the failure loud and early, per AGENTS.md "Fail Fast".
+    ///
+    /// Call this before any SpGEMM launch with the left operand's `row_ptr`.
+    fn check_row_degree(&self, row_ptr: &[u32], n_atom: usize) -> Result<()> {
+        let max = self.config.max_left_blocks as u32;
+        for i in 0..n_atom {
+            let na = row_ptr[i + 1] - row_ptr[i];
+            if na > max {
+                return Err(DftbError::InvalidInput(format!(
+                    "bsr4_spgemm: row {i} has {na} blocks > MAX_LEFT_BLOCKS={max}. \
+                     The GPU kernel cannot cache this row in local memory. \
+                     Options: (1) increase SparseBsr4Config.max_left_blocks, \
+                     (2) use a sparser mask, (3) implement degree-bucketed kernels."
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Device-side variant: read `row_ptr` from the GPU buffer and check.
+    /// Used by device-resident methods where `row_ptr` is not on the host.
+    fn check_row_degree_dev(&self, row_ptr_buf: &Buffer<u32>, n_atom: usize) -> Result<()> {
+        let mut row_ptr = vec![0u32; n_atom + 1];
+        self.read_u32(row_ptr_buf, &mut row_ptr)?;
+        self.check_row_degree(&row_ptr, n_atom)
     }
 
     // ------------------------------------------------------------------
@@ -157,6 +336,7 @@ impl SparseBsr4Gpu {
         c_col: &Buffer<u32>,
         c: &Buffer<f32>,
     ) -> Result<()> {
+        self.check_row_degree(&a.row_ptr, nrow)?;
         let a_row = self.buf_u32(&a.row_ptr)?;
         let a_col = self.buf_u32(&a.col_idx)?;
         let a_val = self.buf_f32(&a.values)?;
@@ -198,6 +378,7 @@ impl SparseBsr4Gpu {
         c_col: &Buffer<u32>,
         c: &Buffer<f32>,
     ) -> Result<()> {
+        self.check_row_degree(&a.row_ptr, nrow)?;
         let a_row = self.buf_u32(&a.row_ptr)?;
         let a_col = self.buf_u32(&a.col_idx)?;
         let a_val = self.buf_f32(&a.values)?;
@@ -940,3 +1121,777 @@ fn div_ceil(a: usize, b: usize) -> usize {
 
 // Re-export BS/BS2 for convenience.
 pub use crate::methods::sparse::bsr4::{BS as PUB_BS, BS2 as PUB_BS2};
+
+// ============================================================================
+// Device-resident BSR4 structures (P0-D: GPU residency)
+//
+// These structures keep CSR structure and values on the GPU for the entire
+// purification loop, eliminating the per-operation host→GPU→host round-trips
+// that dominate the current wrapper. See GPU_Optimization.chat.md §17–§19,
+// §31.6.
+// ============================================================================
+
+/// Immutable BSR4 CSR structure on the GPU: row pointers, column indices,
+/// diagonal block map, and transpose block map. Uploaded once and shared
+/// by all matrices with the same sparsity pattern.
+pub struct GpuBsrStructure {
+    pub n_atom: usize,
+    pub nblock: usize,
+    row_ptr: Buffer<u32>,
+    col_idx: Buffer<u32>,
+    diag_block: Buffer<u32>,
+    transpose_block: Buffer<u32>,
+}
+
+impl GpuBsrStructure {
+    /// Build a device-resident structure from a host CSR mask `(row_ptr,
+    /// col_idx)`. Computes `diag_block_map` and `transpose_block_map` on the
+    /// host, then uploads all four arrays once.
+    pub fn new(gpu: &SparseBsr4Gpu, n_atom: usize, mask: &(Vec<u32>, Vec<u32>)) -> Result<Self> {
+        // Fail-loud check: verify no row exceeds MAX_LEFT_BLOCKS before
+        // uploading. The GPU kernel silently returns (producing zero output)
+        // for rows that overflow the local-memory cache.
+        gpu.check_row_degree(&mask.0, n_atom)?;
+        let nblock = mask.1.len();
+        let row_ptr = gpu.buf_u32(&mask.0)?;
+        let col_idx = gpu.buf_u32(&mask.1)?;
+        // Compute diag and transpose maps on host (they are structural and
+        // never change during purification).
+        let dummy = Bsr4Matrix::from_structure(n_atom, mask.0.clone(), mask.1.clone())?;
+        let diag = crate::methods::sparse::bsr4::diag_block_map(&dummy)?;
+        let transpose = crate::methods::sparse::bsr4::transpose_block_map(&dummy);
+        let diag_block = gpu.buf_u32(&diag)?;
+        let transpose_block = gpu.buf_u32(&transpose)?;
+        Ok(Self { n_atom, nblock, row_ptr, col_idx, diag_block, transpose_block })
+    }
+
+    pub fn n_atom(&self) -> usize { self.n_atom }
+    pub fn nblock(&self) -> usize { self.nblock }
+
+    /// Read `row_ptr` back to host (blocking). Used for one-time setup.
+    pub fn row_ptr_host(&self, gpu: &SparseBsr4Gpu) -> Result<Vec<u32>> {
+        let mut out = vec![0u32; self.n_atom + 1];
+        gpu.read_u32(&self.row_ptr, &mut out)?;
+        Ok(out)
+    }
+
+    /// Read `col_idx` back to host (blocking). Used for one-time setup.
+    pub fn col_idx_host(&self, gpu: &SparseBsr4Gpu) -> Result<Vec<u32>> {
+        let mut out = vec![0u32; self.nblock];
+        gpu.read_u32(&self.col_idx, &mut out)?;
+        Ok(out)
+    }
+}
+
+/// A device-resident BSR4 matrix: a reference to an immutable `GpuBsrStructure`
+/// plus a device values buffer. The structure is shared (via `Arc`); only the
+/// values differ between matrices with the same mask.
+pub struct GpuBsrMatrix {
+    pub struct_: Arc<GpuBsrStructure>,
+    pub values: Buffer<f32>,
+}
+
+impl GpuBsrMatrix {
+    /// Create a device-resident matrix from a host `Bsr4Matrix`, uploading
+    /// values once. The structure is built (or reused) from the matrix's CSR
+    /// mask.
+    pub fn from_host(gpu: &SparseBsr4Gpu, m: &Bsr4Matrix) -> Result<Self> {
+        let structure = GpuBsrStructure::new(gpu, m.n_atom, &(m.row_ptr.clone(), m.col_idx.clone()))?;
+        let values = gpu.buf_f32(&m.values)?;
+        Ok(Self { struct_: Arc::new(structure), values })
+    }
+
+    /// Create a zero-filled device-resident matrix on a given structure.
+    pub fn zero(gpu: &SparseBsr4Gpu, struct_: &Arc<GpuBsrStructure>) -> Result<Self> {
+        let values = gpu.zero_f32(struct_.nblock * BS2)?;
+        Ok(Self { struct_: struct_.clone(), values })
+    }
+
+    /// Upload values from a host slice into an existing device buffer
+    /// (overwrites). The slice length must match `nblock * BS2`.
+    pub fn upload_values(&self, gpu: &SparseBsr4Gpu, host: &[f32]) -> Result<()> {
+        if host.len() != self.struct_.nblock * BS2 {
+            return Err(DftbError::InvalidInput(format!(
+                "upload_values: len {} != nblock {} * BS2 {}",
+                host.len(), self.struct_.nblock, BS2
+            )));
+        }
+        gpu.write_f32(&self.values, host)
+    }
+
+    /// Read values back to host (blocking). Use sparingly — only for
+    /// diagnostics or final output.
+    pub fn read_values(&self, gpu: &SparseBsr4Gpu) -> Result<Vec<f32>> {
+        let mut out = vec![0.0f32; self.struct_.nblock * BS2];
+        gpu.read_f32(&self.values, &mut out)?;
+        Ok(out)
+    }
+
+    /// Convert back to a host `Bsr4Matrix` (blocking readback).
+    pub fn to_host(&self, gpu: &SparseBsr4Gpu) -> Result<Bsr4Matrix> {
+        let values = self.read_values(gpu)?;
+        // Reconstruct row_ptr and col_idx from the structure. We need to read
+        // them back from the device.
+        let mut row_ptr = vec![0u32; self.struct_.n_atom + 1];
+        gpu.read_u32(&self.struct_.row_ptr, &mut row_ptr)?;
+        let mut col_idx = vec![0u32; self.struct_.nblock];
+        gpu.read_u32(&self.struct_.col_idx, &mut col_idx)?;
+        Bsr4Matrix::from_parts(self.struct_.n_atom, row_ptr, col_idx, values)
+    }
+}
+
+// ============================================================================
+// Device-resident kernel launches (no host transfer, no allocation, no
+// Kernel::builder() per call). These use the cached kernel handles and
+// `set_arg` to swap buffers.
+// ============================================================================
+
+impl SparseBsr4Gpu {
+    /// Write an f32 buffer (non-blocking unless the queue is flushed).
+    pub fn write_f32(&self, buf: &Buffer<f32>, data: &[f32]) -> Result<()> {
+        buf.write(data).enq().map_err(map_ocl_err)
+    }
+
+    /// Device-resident masked SpGEMM with symmetric right operand.
+    /// `C = P_M(A·B)` where `B = B^T`. No host transfer, no allocation,
+    /// no `finish()`. The caller is responsible for ensuring `C` is zeroed
+    /// if needed (the kernel overwrites, not accumulates).
+    ///
+    /// **Does not call finish()** — the caller controls synchronization.
+    pub fn spgemm_bsym_dev(
+        &self,
+        a: &GpuBsrMatrix,
+        b: &GpuBsrMatrix,
+        c: &GpuBsrMatrix,
+    ) -> Result<()> {
+        let nrow = a.struct_.n_atom;
+        let gws = nrow * self.config.wg as usize;
+        let k = &self.k_spgemm_bsym;
+        k.set_arg(0, nrow as u32).map_err(map_ocl_err)?;
+        k.set_arg(1, &a.struct_.row_ptr).map_err(map_ocl_err)?;
+        k.set_arg(2, &a.struct_.col_idx).map_err(map_ocl_err)?;
+        k.set_arg(3, &a.values).map_err(map_ocl_err)?;
+        k.set_arg(4, &b.struct_.row_ptr).map_err(map_ocl_err)?;
+        k.set_arg(5, &b.struct_.col_idx).map_err(map_ocl_err)?;
+        k.set_arg(6, &b.values).map_err(map_ocl_err)?;
+        k.set_arg(7, &c.struct_.row_ptr).map_err(map_ocl_err)?;
+        k.set_arg(8, &c.struct_.col_idx).map_err(map_ocl_err)?;
+        k.set_arg(9, &c.values).map_err(map_ocl_err)?;
+        // Use a default global work size; the actual size is set via
+        // cmd_buffer. ocl Kernel::enq uses the builder's GWS.
+        // We need to re-set the global work size per launch.
+        // Unfortunately ocl Kernel doesn't support changing GWS after build.
+        // We use the raw enqueue path.
+        unsafe {
+            // ocl Kernel enq uses the GWS set at build time. To change it,
+            // we use the underlying clEnqueueNDRangeKernel via ocl's
+            // internal API. The simplest approach: use Kernel::cmd() which
+            // returns a builder that allows setting GWS per launch.
+            k.cmd()
+                .global_work_size(gws)
+                .local_work_size(self.config.wg as usize)
+                .enq()
+                .map_err(map_ocl_err)?;
+        }
+        Ok(())
+    }
+
+    /// Device-resident generic masked SpGEMM (non-symmetric right operand).
+    /// `C = P_M(A·B)`. No host transfer.
+    pub fn spgemm_masked_dev(
+        &self,
+        a: &GpuBsrMatrix,
+        b: &GpuBsrMatrix,
+        c: &GpuBsrMatrix,
+    ) -> Result<()> {
+        let nrow = a.struct_.n_atom;
+        let gws = nrow * self.config.wg as usize;
+        let k = &self.k_spgemm_masked;
+        k.set_arg(0, nrow as u32).map_err(map_ocl_err)?;
+        k.set_arg(1, &a.struct_.row_ptr).map_err(map_ocl_err)?;
+        k.set_arg(2, &a.struct_.col_idx).map_err(map_ocl_err)?;
+        k.set_arg(3, &a.values).map_err(map_ocl_err)?;
+        k.set_arg(4, &b.struct_.row_ptr).map_err(map_ocl_err)?;
+        k.set_arg(5, &b.struct_.col_idx).map_err(map_ocl_err)?;
+        k.set_arg(6, &b.values).map_err(map_ocl_err)?;
+        k.set_arg(7, &c.struct_.row_ptr).map_err(map_ocl_err)?;
+        k.set_arg(8, &c.struct_.col_idx).map_err(map_ocl_err)?;
+        k.set_arg(9, &c.values).map_err(map_ocl_err)?;
+        unsafe {
+            k.cmd()
+                .global_work_size(gws)
+                .local_work_size(self.config.wg as usize)
+                .enq()
+                .map_err(map_ocl_err)?;
+        }
+        Ok(())
+    }
+
+    /// Device-resident `C = alpha*A + beta*B` (elementwise, same structure).
+    /// No host transfer, no `finish()`.
+    pub fn axpby_dev(
+        &self,
+        nblock: usize,
+        alpha: f32,
+        a: &Buffer<f32>,
+        beta: f32,
+        b: &Buffer<f32>,
+        c: &Buffer<f32>,
+    ) -> Result<()> {
+        let total = nblock * BS2;
+        let k = &self.k_axpby;
+        k.set_arg(0, nblock as u32).map_err(map_ocl_err)?;
+        k.set_arg(1, alpha).map_err(map_ocl_err)?;
+        k.set_arg(2, a).map_err(map_ocl_err)?;
+        k.set_arg(3, beta).map_err(map_ocl_err)?;
+        k.set_arg(4, b).map_err(map_ocl_err)?;
+        k.set_arg(5, c).map_err(map_ocl_err)?;
+        unsafe {
+            k.cmd().global_work_size(total).enq().map_err(map_ocl_err)?;
+        }
+        Ok(())
+    }
+
+    /// Device-resident zero of a values buffer. No `finish()`.
+    pub fn zero_dev(&self, nblock: usize, a: &Buffer<f32>) -> Result<()> {
+        let total = nblock * BS2;
+        let k = &self.k_zero;
+        k.set_arg(0, nblock as u32).map_err(map_ocl_err)?;
+        k.set_arg(1, a).map_err(map_ocl_err)?;
+        unsafe {
+            k.cmd().global_work_size(total).enq().map_err(map_ocl_err)?;
+        }
+        Ok(())
+    }
+
+    /// Device-resident TC2 update: reads `trace_ks` (1-float buffer) and
+    /// writes `Knew`. No host transfer, no `finish()`.
+    pub fn tc2_dev(
+        &self,
+        nblock: usize,
+        k: &Buffer<f32>,
+        q: &Buffer<f32>,
+        trace_ks: &Buffer<f32>,
+        nocc: f32,
+        knew: &Buffer<f32>,
+    ) -> Result<()> {
+        let total = nblock * BS2;
+        let kern = &self.k_tc2;
+        kern.set_arg(0, nblock as u32).map_err(map_ocl_err)?;
+        kern.set_arg(1, k).map_err(map_ocl_err)?;
+        kern.set_arg(2, q).map_err(map_ocl_err)?;
+        kern.set_arg(3, trace_ks).map_err(map_ocl_err)?;
+        kern.set_arg(4, nocc).map_err(map_ocl_err)?;
+        kern.set_arg(5, knew).map_err(map_ocl_err)?;
+        unsafe {
+            kern.cmd().global_work_size(total).enq().map_err(map_ocl_err)?;
+        }
+        Ok(())
+    }
+
+    /// Device-resident symmetrize in place. No `finish()`.
+    pub fn symmetrize_dev(
+        &self,
+        nblock: usize,
+        transpose_block: &Buffer<u32>,
+        a: &Buffer<f32>,
+    ) -> Result<()> {
+        let k = &self.k_symmetrize;
+        k.set_arg(0, nblock as u32).map_err(map_ocl_err)?;
+        k.set_arg(1, transpose_block).map_err(map_ocl_err)?;
+        k.set_arg(2, a).map_err(map_ocl_err)?;
+        unsafe {
+            k.cmd().global_work_size(nblock).enq().map_err(map_ocl_err)?;
+        }
+        Ok(())
+    }
+
+    /// Device-resident `Tr(KS)` partial reduction. Writes partial sums to
+    /// `partial` buffer. No `finish()`.
+    pub fn trace_ks_partial_dev(
+        &self,
+        nrow: usize,
+        diag_block: &Buffer<u32>,
+        ks: &Buffer<f32>,
+        partial: &Buffer<f32>,
+    ) -> Result<()> {
+        let reduce_wg = self.config.reduce_wg as usize;
+        let n_groups = div_ceil(nrow, reduce_wg);
+        let k = &self.k_trace_partial;
+        k.set_arg(0, nrow as u32).map_err(map_ocl_err)?;
+        k.set_arg(1, diag_block).map_err(map_ocl_err)?;
+        k.set_arg(2, ks).map_err(map_ocl_err)?;
+        k.set_arg(3, partial).map_err(map_ocl_err)?;
+        unsafe {
+            k.cmd()
+                .global_work_size(n_groups * reduce_wg)
+                .local_work_size(reduce_wg)
+                .enq()
+                .map_err(map_ocl_err)?;
+        }
+        Ok(())
+    }
+
+    /// Device-resident `reduce_sum_f32`. No `finish()`.
+    pub fn reduce_dev(
+        &self,
+        n: usize,
+        input: &Buffer<f32>,
+        output: &Buffer<f32>,
+    ) -> Result<()> {
+        let reduce_wg = self.config.reduce_wg as usize;
+        let n_groups = div_ceil(n, reduce_wg);
+        let k = &self.k_reduce;
+        k.set_arg(0, n as u32).map_err(map_ocl_err)?;
+        k.set_arg(1, input).map_err(map_ocl_err)?;
+        k.set_arg(2, output).map_err(map_ocl_err)?;
+        unsafe {
+            k.cmd()
+                .global_work_size(n_groups * reduce_wg)
+                .local_work_size(reduce_wg)
+                .enq()
+                .map_err(map_ocl_err)?;
+        }
+        Ok(())
+    }
+
+    /// Device-resident idempotency partial reduction. No `finish()`.
+    pub fn idempotency_partial_dev(
+        &self,
+        nblock: usize,
+        q_ksk: &Buffer<f32>,
+        k: &Buffer<f32>,
+        partial: &Buffer<f32>,
+    ) -> Result<()> {
+        let reduce_wg = self.config.reduce_wg as usize;
+        let n = nblock * BS2;
+        let n_groups = div_ceil(n, reduce_wg);
+        let kern = &self.k_idempotency;
+        kern.set_arg(0, nblock as u32).map_err(map_ocl_err)?;
+        kern.set_arg(1, q_ksk).map_err(map_ocl_err)?;
+        kern.set_arg(2, k).map_err(map_ocl_err)?;
+        kern.set_arg(3, partial).map_err(map_ocl_err)?;
+        unsafe {
+            kern.cmd()
+                .global_work_size(n_groups * reduce_wg)
+                .local_work_size(reduce_wg)
+                .enq()
+                .map_err(map_ocl_err)?;
+        }
+        Ok(())
+    }
+
+    /// Device-resident full `Tr(KS)` reduction: enqueues partial + recursive
+    /// reduction, returns one f32 to host. This is the **only** host transfer
+    /// in the hot loop — a single scalar.
+    pub fn trace_ks_dev(&self, struct_: &GpuBsrStructure, ks: &Buffer<f32>) -> Result<f32> {
+        let nrow = struct_.n_atom;
+        let reduce_wg = self.config.reduce_wg as usize;
+        let n_groups = div_ceil(nrow, reduce_wg);
+        let partial = self.zero_f32(n_groups)?;
+        self.trace_ks_partial_dev(nrow, &struct_.diag_block, ks, &partial)?;
+        self.reduce_to_one_dev(n_groups, &partial)
+    }
+
+    /// Device-resident `||KSK - K||_F`: enqueues partial + recursive
+    /// reduction, returns one f32 to host.
+    pub fn idempotency_err_dev(
+        &self,
+        nblock: usize,
+        q_ksk: &Buffer<f32>,
+        k: &Buffer<f32>,
+    ) -> Result<f32> {
+        let reduce_wg = self.config.reduce_wg as usize;
+        let n = nblock * BS2;
+        let n_groups = div_ceil(n, reduce_wg);
+        let partial = self.zero_f32(n_groups)?;
+        self.idempotency_partial_dev(nblock, q_ksk, k, &partial)?;
+        let s2 = self.reduce_to_one_dev(n_groups, &partial)?;
+        Ok(s2.sqrt())
+    }
+
+    /// Recursive reduction on device until one float remains. Reads that one
+    /// float to host (the only host transfer).
+    fn reduce_to_one_dev(&self, mut n: usize, input: &Buffer<f32>) -> Result<f32> {
+        let reduce_wg = self.config.reduce_wg as usize;
+        let mut current = input.clone();
+        while n > 1 {
+            let n_groups = div_ceil(n, reduce_wg);
+            let out = self.zero_f32(n_groups)?;
+            self.reduce_dev(n, &current, &out)?;
+            current = out;
+            n = n_groups;
+        }
+        let mut host = [0.0f32; 1];
+        self.read_f32(&current, &mut host)?;
+        Ok(host[0])
+    }
+
+    /// Device-resident Mulliken charges: `q_A = 2*Tr((KS)_AA)`.
+    /// Reads `n_atom` floats to host.
+    pub fn mulliken_dev(&self, struct_: &GpuBsrStructure, ks: &Buffer<f32>) -> Result<Vec<f32>> {
+        let nrow = struct_.n_atom;
+        let qbuf = self.zero_f32(nrow)?;
+        let k = &self.k_mulliken_ks;
+        k.set_arg(0, nrow as u32).map_err(map_ocl_err)?;
+        k.set_arg(1, &struct_.diag_block).map_err(map_ocl_err)?;
+        k.set_arg(2, ks).map_err(map_ocl_err)?;
+        k.set_arg(3, &qbuf).map_err(map_ocl_err)?;
+        unsafe {
+            k.cmd().global_work_size(nrow).enq().map_err(map_ocl_err)?;
+        }
+        let mut q = vec![0.0f32; nrow];
+        self.read_f32(&qbuf, &mut q)?;
+        Ok(q)
+    }
+
+    /// Device-resident Frobenius norm of a values buffer.
+    /// Uses `idempotency_err_dev` with a zero K buffer. Reads 1 scalar.
+    pub fn frobenius_norm_dev(&self, nblock: usize, vals: &Buffer<f32>) -> Result<f32> {
+        let zero = self.zero_f32(nblock * BS2)?;
+        self.idempotency_err_dev(nblock, vals, &zero)
+    }
+
+    /// Device-resident Newton-Schulz / Hotelling iteration for sparse
+    /// approximate inverse:
+    ///
+    ///   Z_{n+1} = 2 Z_n - Z_n S Z_n
+    ///
+    /// with Z₀ = α·I, α = 1/||S||_∞.
+    ///
+    /// All matrices stay on the GPU for the entire loop. Per iteration:
+    ///   T = Z·S          (spgemm_bsym_dev — 0 transfers)
+    ///   ||T||_F          (frobenius_norm_dev — 1 scalar read)
+    ///   Tr(T)            (trace_ks_dev — 1 scalar read)
+    ///   R_Z = sqrt(||T||² - 2·Tr(T) + N_orb) / sqrt(N_orb)  (host)
+    ///   Q = T·Z          (spgemm_bsym_dev — 0 transfers)
+    ///   Znew = 2·Z - Q   (axpby_dev — 0 transfers)
+    ///   symmetrize(Znew) (symmetrize_dev — 0 transfers)
+    ///   swap(Z, Znew)
+    ///
+    /// 2 SpGEMMs, 2 scalar reads per iteration. No matrix host transfers.
+    /// Returns (Z_host, final_R_Z, iterations).
+    pub fn newton_schulz_inverse_dev(
+        &self,
+        s: &GpuBsrMatrix,
+        k_struct: &Arc<GpuBsrStructure>,
+        t_struct: &Arc<GpuBsrStructure>,
+        max_iter: usize,
+        tol: f32,
+        stall: usize,
+    ) -> Result<(Bsr4Matrix, f32, usize)> {
+        let n_atom = s.struct_.n_atom;
+        let n_orb = (n_atom * BS) as f32;
+        let nblock = k_struct.nblock;
+
+        // Z₀ = α·I on M_K, α = 1/||S||_∞.
+        // ||S||_∞ is computed on the host from the uploaded S (one-time cost).
+        let s_host = s.to_host(self)?;
+        let s_inf = crate::methods::sparse::bsr4::inf_norm(&s_host);
+        let alpha = 1.0 / s_inf.max(1e-30);
+        let mut z_host = crate::methods::sparse::bsr4::build_identity(n_atom, &(k_struct.row_ptr_host(self)?, k_struct.col_idx_host(self)?))?;
+        for v in z_host.values.iter_mut() { *v *= alpha; }
+
+        // Allocate persistent device buffers: Z, Znew, T, Q.
+        let mut z = GpuBsrMatrix { struct_: k_struct.clone(), values: self.buf_f32(&z_host.values)? };
+        let mut znew = GpuBsrMatrix::zero(self, k_struct)?;
+        let t = GpuBsrMatrix::zero(self, t_struct)?;
+        let q = GpuBsrMatrix::zero(self, k_struct)?;
+
+        let mut prev_rz = f32::INFINITY;
+        let mut stall_count = 0;
+        let mut iter_done = 0;
+
+        for iter in 0..max_iter {
+            iter_done = iter + 1;
+            // T = Z·S (Bsym: S symmetric)
+            self.spgemm_bsym_dev(&z, s, &t)?;
+
+            // ||T||_F and Tr(T) — 2 scalar reads.
+            let t_norm = self.frobenius_norm_dev(t_struct.nblock, &t.values)?;
+            let tr_t = self.trace_ks_dev(t_struct, &t.values)?;
+            let rz_sq = t_norm * t_norm - 2.0 * tr_t + n_orb;
+            let rz = (rz_sq.max(0.0)).sqrt() / n_orb.sqrt();
+
+            println!(
+                "  Newton-Schulz-dev iter {iter}: R_Z = {rz:e}  (||T||_F={t_norm:.4}, Tr={tr_t:.4})"
+            );
+
+            if rz < tol {
+                let z_out = z.to_host(self)?;
+                return Ok((z_out, rz, iter_done));
+            }
+            if iter > 0 && rz > 0.9 * prev_rz {
+                stall_count += 1;
+                if stall_count >= stall {
+                    println!("  Newton-Schulz-dev stalled after {iter_done} iters, R_Z = {rz:e}");
+                    let z_out = z.to_host(self)?;
+                    return Ok((z_out, rz, iter_done));
+                }
+            } else {
+                stall_count = 0;
+            }
+            prev_rz = rz;
+
+            // Q = T·Z (Bsym: Z symmetric)
+            self.spgemm_bsym_dev(&t, &z, &q)?;
+
+            // Znew = 2*Z - Q
+            self.axpby_dev(nblock, 2.0, &z.values, -1.0, &q.values, &znew.values)?;
+
+            // Symmetrize Znew in place.
+            self.symmetrize_dev(nblock, &k_struct.transpose_block, &znew.values)?;
+
+            // Swap Z and Znew.
+            std::mem::swap(&mut z.values, &mut znew.values);
+        }
+
+        // Final residual.
+        self.spgemm_bsym_dev(&z, s, &t)?;
+        let t_norm = self.frobenius_norm_dev(t_struct.nblock, &t.values)?;
+        let tr_t = self.trace_ks_dev(t_struct, &t.values)?;
+        let rz = ((t_norm * t_norm - 2.0 * tr_t + n_orb).max(0.0)).sqrt() / n_orb.sqrt();
+        let z_out = z.to_host(self)?;
+        Ok((z_out, rz, iter_done))
+    }
+}
+
+// ============================================================================
+// Persistent sparse purification workspace (P0-D)
+//
+// All matrices stay on the GPU for the entire purification loop. The only
+// host transfer per iteration is a single scalar `Tr(KS)` for the TC2 branch
+// decision and optionally `R_I` for convergence checking.
+// ============================================================================
+
+/// Persistent device-resident workspace for TC2 / Newton–Schulz purification.
+///
+/// All buffers are allocated once at construction and reused for every
+/// iteration. The structures (`k_struct`, `t_struct`) are shared `Arc`s
+/// uploaded once. Kernel handles are borrowed from `SparseBsr4Gpu`.
+///
+/// See GPU_Optimization.chat.md §17–§19, §31.6 for the design rationale.
+pub struct SparsePurifyWorkspace {
+    /// Shared GPU runtime + cached kernels.
+    gpu: SparseBsr4Gpu,
+    /// Immutable structure for K, Q, Knew (all share the K mask).
+    k_struct: Arc<GpuBsrStructure>,
+    /// Immutable structure for T = K·S (the product mask, possibly different
+    /// from K mask).
+    t_struct: Arc<GpuBsrStructure>,
+    /// S values (constant during purification).
+    s: GpuBsrMatrix,
+    /// K current values (on k_struct).
+    k: GpuBsrMatrix,
+    /// Knew output (on k_struct).
+    knew: GpuBsrMatrix,
+    /// T = K·S intermediate (on t_struct).
+    t: GpuBsrMatrix,
+    /// Q = T·K = KSK (on k_struct).
+    q: GpuBsrMatrix,
+    /// 1-float buffer for Tr(KS) — written by reduction, read to host for
+    /// the TC2 branch decision.
+    trace_buf: Buffer<f32>,
+    /// Scratch buffer for reductions (reused across iterations).
+    reduce_scratch: Buffer<f32>,
+    /// Number of occupied orbitals.
+    nocc: f32,
+}
+
+impl SparsePurifyWorkspace {
+    /// Build a workspace from initial host matrices. `k0` and `s` must already
+    /// be on their respective masks (`k_mask` for K, `s_mask` for S). The
+    /// `t_mask` is the product mask `M_T = M_K ∘ M_HS`.
+    ///
+    /// **All structures and values are uploaded once here and never
+    /// re-uploaded during purification.**
+    pub fn new(
+        gpu: SparseBsr4Gpu,
+        k0: &Bsr4Matrix,
+        s: &Bsr4Matrix,
+        k_mask: &(Vec<u32>, Vec<u32>),
+        t_mask: &(Vec<u32>, Vec<u32>),
+        nocc: f32,
+    ) -> Result<Self> {
+        let k_struct = Arc::new(GpuBsrStructure::new(&gpu, k0.n_atom, k_mask)?);
+        let t_struct = Arc::new(GpuBsrStructure::new(&gpu, k0.n_atom, t_mask)?);
+
+        // S lives on its own structure (which may differ from K). For TC2,
+        // S is the right operand in T=K·S and must have its own structure.
+        // However, the SpGEMM kernel reads B's row_ptr/col_idx from B's
+        // structure, so S needs its own GpuBsrStructure.
+        let s_struct = Arc::new(GpuBsrStructure::new(&gpu, s.n_atom, &(s.row_ptr.clone(), s.col_idx.clone()))?);
+        let s_mat = GpuBsrMatrix { struct_: s_struct, values: gpu.buf_f32(&s.values)? };
+
+        let k = GpuBsrMatrix { struct_: k_struct.clone(), values: gpu.buf_f32(&k0.values)? };
+        let knew = GpuBsrMatrix::zero(&gpu, &k_struct)?;
+        let t = GpuBsrMatrix::zero(&gpu, &t_struct)?;
+        let q = GpuBsrMatrix::zero(&gpu, &k_struct)?;
+
+        let trace_buf = gpu.zero_f32(1)?;
+        let nrow = k0.n_atom;
+        let reduce_wg = gpu.config().reduce_wg as usize;
+        let reduce_scratch = gpu.zero_f32(div_ceil(nrow, reduce_wg))?;
+
+        Ok(Self {
+            gpu, k_struct, t_struct, s: s_mat, k, knew, t, q,
+            trace_buf, reduce_scratch, nocc,
+        })
+    }
+
+    /// Run one TC2 purification step on the device:
+    ///
+    /// ```text
+    /// T = K·S          (SpGEMM #1, Bsym)
+    /// Q = T·K          (SpGEMM #2, Bsym)
+    /// n = Tr(T)        (reduction → 1 scalar to host)
+    /// Knew = Q if n > Nocc else 2K−Q
+    /// swap(K, Knew)
+    /// ```
+    ///
+    /// **Exactly 2 SpGEMMs, zero matrix host transfers, 1 scalar read.**
+    /// No `Kernel::builder()`, no `Buffer::builder()`, no `finish()` between
+    /// kernels (only before the scalar read).
+    ///
+    /// Returns `Tr(KS)` for this iteration.
+    pub fn tc2_step_dev(&mut self) -> Result<f32> {
+        let nrow = self.k.struct_.n_atom;
+        let nblock = self.k.struct_.nblock;
+
+        // T = K·S (Bsym: S is symmetric)
+        self.gpu.spgemm_bsym_dev(&self.k, &self.s, &self.t)?;
+
+        // Q = T·K (Bsym: K is symmetric)
+        self.gpu.spgemm_bsym_dev(&self.t, &self.k, &self.q)?;
+
+        // Tr(KS) = Tr(T) — partial reduction + recursive reduction.
+        // This is the only host transfer: 1 scalar.
+        let tr = self.gpu.trace_ks_dev(&self.t_struct, &self.t.values)?;
+
+        // Write trace to the 1-float buffer for the TC2 kernel.
+        let trace_val = vec![tr];
+        self.trace_buf.write(&trace_val[..]).enq().map_err(map_ocl_err)?;
+
+        // Knew = TC2(K, Q, trace, Nocc)
+        self.gpu.tc2_dev(nblock, &self.k.values, &self.q.values, &self.trace_buf, self.nocc, &self.knew.values)?;
+
+        // Symmetrize Knew in place.
+        self.gpu.symmetrize_dev(nblock, &self.k_struct.transpose_block, &self.knew.values)?;
+
+        // Swap K and Knew (just swap the value buffers, structure is shared).
+        std::mem::swap(&mut self.k.values, &mut self.knew.values);
+
+        Ok(tr)
+    }
+
+    /// Compute `R_I = ||KSK - K||_F` on the device. Q already contains KSK
+    /// from the last `tc2_step_dev`. This reads 1 scalar to host.
+    ///
+    /// If `recompute_q` is true, recompute Q = T·K first (needed if called
+    /// standalone without a preceding step).
+    pub fn idempotency_err_dev(&self, recompute_q: bool) -> Result<f32> {
+        let nblock = self.k.struct_.nblock;
+        if recompute_q {
+            // T = K·S, Q = T·K
+            self.gpu.spgemm_bsym_dev(&self.k, &self.s, &self.t)?;
+            self.gpu.spgemm_bsym_dev(&self.t, &self.k, &self.q)?;
+        }
+        self.gpu.idempotency_err_dev(nblock, &self.q.values, &self.k.values)
+    }
+
+    /// Run the full TC2 purification loop on the device. Returns
+    /// `(K_final_host, final_R_I, final_Tr, iterations, history)`.
+    ///
+    /// `check_every` controls how often R_I is computed (every N iterations).
+    /// R_I computation adds 2 extra SpGEMMs if `recompute_q=true`, but if
+    /// called right after `tc2_step_dev`, Q is already current. Here we
+    /// compute R_I every `check_every` iterations by doing an extra KSK.
+    pub fn tc2_purify_dev(
+        &mut self,
+        max_iter: usize,
+        tol: f32,
+        check_every: usize,
+    ) -> Result<(Bsr4Matrix, f32, f32, usize, Vec<(usize, f32, f32)>)> {
+        let mut history: Vec<(usize, f32, f32)> = Vec::new();
+        let mut best_r_i = f32::INFINITY;
+        let mut best_iter = 0usize;
+        let mut last_tr = 0.0f32;
+        let mut last_r_i = f32::INFINITY;
+
+        for iter in 0..max_iter {
+            // One TC2 step: 2 SpGEMMs + 1 scalar read.
+            let tr = self.tc2_step_dev()?;
+            last_tr = tr;
+
+            // Check convergence every `check_every` iterations.
+            let do_check = (iter % check_every == 0) || (iter == max_iter - 1);
+            let r_i = if do_check {
+                // Q is already current from tc2_step_dev (T=KS, Q=TK=KSK).
+                // But after the swap, K is the new K. We need R_I for the
+                // new K. Recompute: T=K·S, Q=T·K, then ||Q-K||.
+                let ri = self.idempotency_err_dev(true)?;
+                last_r_i = ri;
+                println!("  TC2-dev iter {iter}: R_I={ri:e}  Tr(KS)={tr:.6}  (Nocc={})", self.nocc);
+                history.push((iter, ri, tr));
+                if ri < best_r_i {
+                    best_r_i = ri;
+                    best_iter = iter;
+                }
+                ri
+            } else {
+                println!("  TC2-dev iter {iter}: Tr(KS)={tr:.6}  (Nocc={}, skip R_I check)", self.nocc);
+                history.push((iter, f32::NAN, tr));
+                f32::NAN
+            };
+
+            if do_check && r_i < tol {
+                let k_host = self.k.to_host(&self.gpu)?;
+                return Ok((k_host, r_i, tr, iter + 1, history));
+            }
+
+            // Divergence detection.
+            if do_check && r_i > best_r_i * 10.0 && best_r_i < f32::INFINITY {
+                println!(
+                    "  TC2-dev diverging at iter {iter}: R_I={r_i:e} > 10×best={best_r_i:e}, returning best (iter {best_iter})"
+                );
+                // Read back the best K. We don't have it stored device-side
+                // (would need a backup buffer). For now, return current K
+                // and note the divergence.
+                let k_host = self.k.to_host(&self.gpu)?;
+                return Ok((k_host, best_r_i, last_tr, best_iter + 1, history));
+            }
+        }
+
+        let k_host = self.k.to_host(&self.gpu)?;
+        let final_r_i = if last_r_i.is_nan() {
+            self.idempotency_err_dev(true)?
+        } else {
+            last_r_i
+        };
+        if best_r_i < final_r_i {
+            println!(
+                "  TC2-dev exhausted {} iters, best R_I={best_r_i:e} at iter {best_iter}",
+                max_iter
+            );
+            Ok((k_host, best_r_i, last_tr, best_iter + 1, history))
+        } else {
+            Ok((k_host, final_r_i, last_tr, max_iter, history))
+        }
+    }
+
+    /// Borrow the underlying GPU.
+    pub fn gpu(&self) -> &SparseBsr4Gpu { &self.gpu }
+
+    /// Read the current K back to host (blocking).
+    pub fn k_to_host(&self) -> Result<Bsr4Matrix> {
+        self.k.to_host(&self.gpu)
+    }
+
+    /// Read current Mulliken charges `q_A = 2*Tr((KS)_AA)` from the device.
+    /// Computes T=K·S first, then reads `n_atom` floats.
+    pub fn mulliken_dev(&mut self) -> Result<Vec<f32>> {
+        // T = K·S
+        self.gpu.spgemm_bsym_dev(&self.k, &self.s, &self.t)?;
+        self.gpu.mulliken_dev(&self.t_struct, &self.t.values)
+    }
+}

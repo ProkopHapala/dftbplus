@@ -10,9 +10,14 @@
 //! reside in `__local` memory (padded to JN×JLD where JN is the next even
 //! number >= N and JLD = JN+1 to avoid bank conflicts). The Brent-Luk
 //! parallel cyclic schedule pairs JN/2 independent element pairs per round;
-//! each pair is handled by PPG work-items that split the JN rows. One
-//! barrier per round. Up to MAX_SWEEPS sweeps with relative off-diagonal
-//! norm convergence check.
+//! each pair is handled by PPG work-items that split the JN rows. With the
+//! block-update path (JACOBI_BLOCK_UPDATE=1, default), two barriers per
+//! round: one after rotation publication, one after the A+V update. With the
+//! legacy two-pass path (JACOBI_BLOCK_UPDATE=0), four barriers per round.
+//! Up to MAX_SWEEPS sweeps with relative off-diagonal norm convergence check
+//! and stagnation detection (breaks if the off-norm does not improve by 10%
+//! between sweeps). Pair skip threshold PAIR_SKIP_TOL (default 0) is separate
+//! from the global convergence tolerance JACOBI_TOL (default 1e-7).
 //!
 //! # Specialization
 //!

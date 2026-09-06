@@ -1583,3 +1583,1359 @@ Everything shares the same runtime and buffers.
 | **P3**   | dynamic numerical sparsification                           | only after cutoff convergence tests                        |
 
 The most useful next engineering step is actually quite narrow: **fix the replica-128 bug, add real GPU event timings, then rewrite the sparse wrapper to keep structures and values resident and benchmark a TC2 iteration that contains exactly two SpGEMMs.** After those three changes, the next profiler run will tell us whether the Jacobi block transform or sparse symbolic-plan optimization deserves attention first.
+
+---
+
+# 31. Algorithmic-alternatives audit — 2026-09-06 (Devin, after Astra ran out of tokens)
+
+Astra's run (sections 1–30 above) ended mid-audit. Two read-only subagent audits were dispatched to finish the broader algorithmic comparison (NMP sparse methods + divide-and-conquer; current masking/purification hazards). This section records what survived that audit so it is not lost. No code was changed in this phase.
+
+## 31.1 What NumericalMathPlayground actually contains (verified, not claimed)
+
+The NMP repo is a collection of **proof-of-concept kernels and scripts**, not a production nonorthogonal DFTB pipeline. Treat all quoted speedups as unverified for DFTB.
+
+| File family | What it really does | What it does NOT do |
+|---|---|---|
+| `DensityMatrix/OrderN.py` | Dense `np.linalg.eigh` reference + Mulliken diagonal | No sparse DM, no forces, no SCC |
+| `DensityMatrix/FOE.py` | Chebyshev expansion of Fermi-Dirac, stochastic trace, **diagonal-only** `rho_est`. Handles `S` via dense `S^{-1/2}` orthogonalization or dense `S\x=Hv` solves. | No off-diagonal `rho`, no full DM, no Mulliken bond populations, no forces. Dense `O(N^3)` fallbacks for `S`. |
+| `DensityMatrix/GF.py` | Contour integration, **diagonal-only** `rho_accum`. Dense `np.linalg.solve` per pole per probe. | No finite-T, no full DM, no forces. |
+| `OMM/OMM_ocl.py` + `cl/OMM.cl` | Local-orbital halo machinery, ELLPACK `apply_operator`/`project_orbitals`/`assemble_gradient`. CPU still does Gram matrix, Lambda mixing, S-norm. | `spmv_expand_S` in the Python reference is **dense** (`for col in range(n_basis)`). Energy is only `sum(diag(h_ij))`, not total DFTB energy. No forces. |
+| `CheFSI/CheFSI.py` + `CheFSI.cl` | ELLPACK `spmm_ellpack_chebyshev` for **frontier orbitals only**. Inverse-sqrt and `eigh` on **CPU**. `n_vecs` hard-capped at 32. | No finite-T, no full DM, no charges/forces. Targets a single energy window, not the occupied manifold. |
+| `Kekule_BOP/*.py` | Local Chebyshev/Lanczos probes for **per-bond off-diagonal densities** `rho_{ij}`. | Assumes **orthonormal** tight-binding (no `S`). No charges, no total energy, no forces. |
+| `LinearAlgebra/FastDirectSolvers/nested_solver.py` | Geometric RCB / nested dissection, batched dense block-Jacobi on GPU (local-memory, `m<=48`), Ritz correction. | Vibration eigensolver, **not DFTB**. Diagonal mass matrix `M^{-1/2} K M^{-1/2}`. Root step is **dense `n×n` eigh** → still `O(N^3)`. All matrices converted to dense (`toarray()`). Assumes **positive semidefinite** spectrum. No `S`, no chemical potential, no occupation, no DM. |
+
+**Verdict:** No single NMP file returns a full, approximate, nonorthogonal DFTB density matrix with charges + energy + forces. The reusable pieces are: (1) FOE's finite-T Chebyshev diagonal-charge estimator; (2) CheFSI's ELLPACK SpMM for frontier orbitals; (3) OMM's local-orbital/halo machinery; (4) Kekule_BOP's local-probe bond-density idea; (5) the AMLS recursion skeleton — but only after replacing the dense root eigh and the diagonal-mass assumption.
+
+## 31.2 Why divide-and-conquer / nested dissection does not directly transfer
+
+The NMP `nested_solver.py` is a vibration solver. Five concrete blockers for DFTB carbon ribbons:
+
+1. **Overlap `S`, not diagonal mass.** `load_system_dense` builds `H = M^{-1/2} K M^{-1/2}` with a *diagonal* mass. DFTB needs a generalized eigensolver `H c = ε S c`, or `S^{-1/2} H S^{-1/2}`, or reduced generalized problems `X^T H X c = (X^T S X) c ε` inside each block and at each Ritz/AMLS level.
+2. **Indefinite spectrum.** DFTB has negative and positive eigenvalues. The NMP code assumes positive semidefinite (`sqrt(clip(...,0,None))`). "Lowest `k` modes per block" is the wrong truncation for DFTB — frontier orbitals sit near `μ`, which can be anywhere. Need shift-and-invert, an energy window around `μ`, or contour-integral DM methods.
+3. **Shared chemical potential / occupation.** No global `μ` or occupation logic exists in NMP. For full occupied DM you need a global Fermi level from the total/reduced DOS and electron count. For frontier eigenpairs, target `|ε−μ|<δ`.
+4. **Dense root step.** `recursive_exact_amls` builds a dense `n×n` `V_local`, dense `H_reduced`, and calls `np.linalg.eigh` on it at the root. The small leaf eighs do not change asymptotics; for the reported N≈500–1700 this makes AMLS *slower* than a single `numpy.eigh`. Only **truncated Ritz** (keeping `k` modes/block) actually reduces complexity: `H_proj = V^T H V` costs `O(N m²) + O(m³)` with `m = k·n_blocks`.
+5. **Dense conversions everywhere.** `toarray()`, dense `block_diag`, dense `V.T @ H @ V`. For large DFTB systems this runs out of memory long before the claimed "DOF > 5000" crossover.
+
+The geometric RCB/ND tree builders and DOF reordering are structurally reusable if a graph partitioner is substituted. The batched dense block-Jacobi with local memory and CPU-fallback split is a useful template. But the AMLS recursion requires a sparse root solve or truncation to be viable for ribbons.
+
+## 31.3 Astra's Cholesky-report critique (sections 27–29) — confirmed and sharpened
+
+- **Quadratic, not sub-quadratic fill.** `nnz(L): 23441 → 89441 → 348929` as `N: 292 → 580 → 1156`. Ratios `3.82`, `3.90` ≈ `N^2`. A constant ~26% fill fraction means quadratic storage, not linear. The report's "sub-`O(N^2)` fill-in" interpretation is backwards. This makes masked purification (no elimination fill) more attractive for the large-system route.
+- **Ordering is suspiciously poor.** The Python code uses `splu(... permc_spec='NATURAL', ...)`. For a quasi-1D width-4 ribbon with a local H/S graph, a geometry-aware ordering (atoms along ribbon axis, RCM, nested dissection / AMD) should produce something much closer to banded. At N=1156, `nnz(S)=51548` vs `nnz(L)=348929` is a ~6.8× blowup that a good ordering may largely remove. This matters only for the frontier-eigensolver route; TC2 purification does not need Cholesky.
+- **SpMV accounting is misreported.** The table's "SpMV/band=128040" for `nvec=20, degree=40, iters=20` is actually `20×40×20=16000` per band; the script stores `total_spmv = spmv_h + spmv_l` (both bands) and `run_chebyshev_ritz_band()` appears to double-count the square-filter factor (`spmv_per_app = degree*2` added after *both* applications). Timing is real; SpMV accounting must be audited before using it for complexity conclusions.
+
+## 31.4 Masking and approximation — physical safety requirements
+
+From the `DensityMatrix_Idenpotency_NearestNeighbor.chat.md` (Gemini) discussion and the current code:
+
+- **Mask of `P` must be ~2–3× larger than mask of `S`**, not equal to it. Forcing `mask(P) = mask(S)` makes "Pauli repulsion" too stiff and bond energies significantly off. The current `build_full_mask` in `dftb_engine.rs` is the opposite extreme (fully dense block structure) and destroys sparsity; `build_geometric_mask` and `build_product_mask` are the physically sensible middle ground but must be validated for closure under repeated TC2/Newton–Schulz products.
+- **Mulliken charges are necessary but not sufficient** for the Pauli principle. A matrix can have perfect Mulliken charges while having eigenvalues `2.0` and `-1.0`. Acceptance must include idempotency `R_I = ||KSK−K||` and Hamiltonian commutator `R_H = ||HKS−SKH||_F`, not just `Tr(KS)=N_occ` and per-atom charges.
+- **Truncation breaks idempotency.** Any `P_{ij}=0` cutoff must be followed by purification to re-enforce `PSP=P`. The question is whether the cutoff + purification cycle converges to a physically acceptable DM at the given gap. For insulators, yes (exponential decay). For small-gap/metallic ribbons, **linear scaling cannot be assumed at fixed physical accuracy** — the DM support grows as the gap shrinks.
+- **Symmetry preservation under thresholding.** `bsr4_drop_small` currently zeros values without compacting CSR and treats transpose blocks independently, which can break exact symmetry. Any production dynamic sparsification must either (a) threshold the symmetric pair `(i,j)` and `(j,i)` identically, or (b) symmetrize after dropping.
+- **Wide-row silent failure.** SpGEMM kernels `return` when `na > MAX_LEFT_BLOCKS`. A zero-initialized output is a *wrong answer*, not a safe fallback. Validate all participating row degrees against compiled capacity before launch; fail loudly on overflow.
+
+## 31.5 Approximation controls and acceptance criteria (must be defined before any approximate DM work)
+
+Controls to tune (one at a time, with a correct reference preserved):
+- TC2 iteration tolerance.
+- Newton–Schulz tolerance.
+- Mask cutoff radius / block drop threshold.
+- Periodic mask rebuilding frequency.
+- Convergence check frequency (every 1/2/4 iterations).
+- Approximate spectral bounds (`gershgorin` vs power-iteration `[λ_min, λ_max]`).
+- Reduced subspace dimension for any Ritz/CheFSI hybrid.
+
+Acceptance criteria (measured, not assumed):
+- Energy error vs dense reference.
+- Per-atom charge error.
+- Force error where available.
+- HOMO/LUMO or occupied-subspace error.
+- `Tr(KS) − N_occ`.
+- `R_I = ||KSK−K||`.
+- `R_H = ||HKS−SKH||_F`.
+- Symmetry preservation `||K−K^T||_F`.
+- Stability across geometries and system sizes (gapped molecules, narrow-gap ribbons, near-metallic ribbons).
+- Wall-clock and device-memory savings.
+
+**Do not report an optimization as successful without numerical verification AND a measured performance result on NVIDIA.**
+
+## 31.6 Strategic decision — what the next implementation should be
+
+The audit converges on the same conclusion Astra reached in section 30, now backed by the algorithmic comparison:
+
+**The largest payoff is fixing the sparse architecture first, not replacing the algorithm.**
+
+Rationale:
+- TC2 purification is already implemented and physically sound for gapped systems. The NMP alternatives (FOE, GF, OMM, CheFSI, nested dissection) are all proof-of-concept with dense fallbacks and no full nonorthogonal DM; porting any of them is a larger project than fixing the existing TC2 wrapper.
+- The current wrapper does ~5 SpGEMMs/iter with host round-trips between each. A persistent device-resident workspace with exactly 2 SpGEMMs/iter is a theoretical ~2.5× speedup *before* counting transfer elimination — likely much more in practice on GTX 1650 with 4 GB.
+- `build_full_mask` must be replaced with `build_geometric_mask` + `build_product_mask` (validated for closure) as a separate, parity-tested change. This is where the physical sparsity savings live.
+- Degree-specialized kernels and symbolic SpGEMM plans are P1 *after* residency, because profiling a host-bound wrapper would misattribute the bottleneck.
+- CheFSI / Davidson / nested-dissection are **not** the next step for the *full DM* route. They become attractive only if the user's actual target is *frontier orbitals only* (HOMO/LUMO) rather than the full occupied density — that requirement should be confirmed before investing in them.
+
+**Recommended next implementation (single change, parity-tested):**
+
+1. Introduce `GpuBsrStructure` (row_ptr, col_idx, diag/trans block maps on device, uploaded once) and `GpuBsrMatrix` (structure + values buffer).
+2. Build a persistent `SparsePurifyWorkspace` with `S, H0, H, Z0, Z1, K0, K1, T, Q, scratch, trace, residual` all device-resident.
+3. Cache kernel handles; never rebuild `Kernel::builder()` in the iteration loop.
+4. Rewrite `tc2_purify` to exactly: `T=K*S; Q=T*K; trace(T); Knew=2K−Q (or Q if trace>N_occ)`. Two SpGEMMs, zero host transfers, one scalar read for the trace/branch.
+5. Validate against the existing CPU reference with `R_I`, `R_H`, `Tr(KS)`, energy, charges. Preserve current masks/numerics for this first change.
+6. Then, as a separate change, swap `build_full_mask` → geometric+product masks and re-validate.
+
+This is a coherent workspace/API change, not a quick partial wrapper rewrite. It should be the next use of expensive reasoning. The degree-specialized kernels, symbolic plans, TEAM=16/32 benchmarking, fused KSK, and padded-BSR4 H-support all follow *after* residency is established and profiled.
+
+
+
+---
+
+# USER
+
+OK we implemented some optimization here, and also consider some algorithmic ideas and optimization from different repo, can you review it yet again with this updated infor, think it critically, and suggest what to do noxt what make sense and what less, what should be the priories, and eventally also estimate possible spead-up
+
+https://github.com/ProkopHapala/dftbplus/commit/fcd78958a5acd7e33df063693beb18f9c0e5cd79
+https://github.com/ProkopHapala/NumericalMathPlayground/tree/main/topics/LinearAlgebra/FastDirectSolvers
+https://github.com/ProkopHapala/NumericalMathPlayground/tree/main/topics/LinearScalingQM
+
+
+---
+
+
+# GPT 5.6 sol
+
+Yes. With the new commit and the other repository in view, I would change the priorities somewhat. The Jacobi work was worthwhile, but I would **not continue polishing Jacobi blindly** before fixing two larger architectural issues and measuring the real SCC sweep behavior.
+
+The most interesting new algorithmic idea I see is actually a simplification of the **large sparse density-matrix formulation**: work with the non-symmetric occupation projector
+
+$$
+P = KS
+$$
+
+rather than the symmetric density kernel \(K\). That potentially changes generalized TC2 from **two sparse matrix products per purification step to one**, and Mulliken populations become simply the diagonal of \(P\). I discuss this below because I think it deserves a prototype.
+
+## 1. What the latest commit actually achieved
+
+The pair-block Jacobi transformation was a good change. The controlled event benchmark gives roughly:
+
+* N=28, batch=100: **4.261 → 2.647 ms = 1.61×**
+* N=32, batch=100: **1.90×**
+* N=64, batch=100: **1.69×**
+
+at equal numerical settings, and the extra normalization refinement fixed a genuine f32 orthogonality problem: N=64 reconstruction dropped from \(4.47\times10^{-4}\) to \(4.01\times10^{-5}\).
+
+So I would accept this implementation.
+
+But compared with `b3073ef`, this commit changes only the Jacobi implementation/tests on the compute side. The sparse runtime, SCC dataflow, kernel caching, assembly, etc. remain essentially unchanged. That matters when deciding what to optimize next.
+
+There is also some documentation drift now: `gpu_eigen.cl`/`.rs` still describe “one barrier per round,” whereas the new path actually has two.
+
+---
+
+# 2. Before anything else: fix the Jacobi stopping semantics
+
+I think there is a potentially **very cheap large speedup still hiding here**.
+
+You currently have:
+
+```c
+if (fabs(apq) < 1e-7)
+    rotation = identity;
+```
+
+but the whole-sweep convergence condition is
+
+$$
+\frac{\|A_{\rm off}\|_F}{\|A_{\rm off}^{(0)}\|_F}<10^{-7}.
+$$
+
+These two tolerances are inconsistent.
+
+Suppose N=64. There are about 4000 off-diagonal entries. If each remaining element is individually below \(10^{-7}\), their Frobenius norm can still be of order
+
+$$
+\sqrt{4000}\,10^{-7}\approx6\times10^{-6}.
+$$
+
+And this is almost exactly what your diagnostic sees:
+
+$$
+\|A_{\rm off}\|_F =3.95\times10^{-6}
+$$
+
+after 8 sweeps — and it **does not improve at all between sweep 8 and sweep 20**.
+
+So the kernel can spend the last 12 sweeps doing essentially nothing because every remaining pair is below the rotation threshold, while the global convergence condition can never be satisfied.
+
+### This should be the next Jacobi experiment
+
+Add outputs:
+
+```text
+sweeps_used[system]
+final_offnorm[system]
+status[system]
+```
+
+and benchmark real H′ matrices captured from SCC iterations.
+
+Then separate:
+
+```text
+PAIR_SKIP_TOL
+GLOBAL_REL_TOL
+GLOBAL_ABS_TOL
+```
+
+I would initially try something like:
+
+$$
+\mathrm{converged} =
+\|A_{\rm off}\|
+<
+\max(
+\epsilon_{\rm rel}\|A_{\rm off}^{0}\|,
+\epsilon_{\rm abs})
+$$
+
+and make `PAIR_SKIP_TOL` smaller than the requested global floor.
+
+Alternatively, explicitly detect stagnation caused by the pair threshold and return `converged_to_pair_floor`.
+
+**Potential:** if the real SCC matrices behave like the N=64 diagnostic and become stationary after ~8 sweeps rather than 20, this alone is about:
+
+$$
+20/8=2.5\times
+$$
+
+on Jacobi, **without changing the result at all**.
+
+That is much more attractive than another heroic kernel rewrite.
+
+---
+
+# 3. Then optimize identity rotations
+
+Right now when a pair is below threshold you set
+
+$$
+c=1,\quad s=0,
+$$
+
+but the pair-block transformation still processes all \(JPAIR^2\) blocks.
+
+Late in convergence this means lots of operations like:
+
+```text
+1*x + 0*y
+```
+
+Use an `active[pair]` flag.
+
+For block \((a,b)\):
+
+* both inactive → do nothing
+* only `a` active → left rotation only
+* only `b` active → right rotation only
+* both active → full \(R_a^TBR_b\)
+
+This becomes particularly valuable together with a descending Jacobi threshold.
+
+A classical thresholded-Jacobi strategy would make sense:
+
+$$
+t_{\rm pair}^{(s)}
+\sim
+\frac{\|A_{\rm off}^{(s)}\|}{N}
+$$
+
+early, then reduce the threshold as the sweeps progress.
+
+I would expect another **1.2–1.5× Jacobi improvement** if late sweeps currently contain many identity rotations.
+
+---
+
+# 4. Another good Jacobi micro-optimization: exploit symmetry
+
+The new kernel processes all ordered pair blocks:
+
+$$
+JPAIR^2.
+$$
+
+For N=28:
+
+$$
+14^2=196.
+$$
+
+But A is symmetric. You really need only
+
+$$
+\frac{14(15)}2=105
+$$
+
+unique blocks.
+
+Calculate \(B'_{ab}\) once and explicitly write
+
+$$
+B'_{ba}=B_{ab}^{\prime T}.
+$$
+
+That almost halves the A-transform arithmetic.
+
+You deliberately avoided this initially so numerical asymmetry could remain visible; that was sensible for validation. Now that the independent implementation is verified, I would benchmark the symmetric version.
+
+It may even improve numerical stability because symmetry remains exact by construction.
+
+I would estimate roughly **1.2–1.4× further Jacobi speedup**, not 2×, because V rotation, barriers and rotation generation remain.
+
+---
+
+# 5. Don't forget the simple memory-load problem
+
+The matrix loading code still effectively has:
+
+```c
+for(i = lid; i < JN; i += WG)
+    for(j=0; j<JN; j++)
+        ...
+```
+
+For N=28/WG128, only 28 threads load the entire matrix.
+
+Better:
+
+```c
+for(idx=lid; idx<JN*JN; idx+=WG) {
+    i=idx/JN;
+    j=idx%JN;
+    ...
+}
+```
+
+Same for initializing V.
+
+This gives coalesced cooperative loading and uses the whole WG.
+
+Probably only **5–15%**, but extremely easy.
+
+---
+
+# 6. Do not port the FastDirectSolvers Jacobi kernel
+
+The old `FastDirectSolvers` block Jacobi is useful historically, but your current DFTB kernel is now considerably more sophisticated.
+
+The FastDirectSolvers implementation itself notes that its local block solver has size/padding problems and that persistent buffers and size-sorted batches are needed.
+
+So:
+
+> **Keep the ideas, not that kernel.**
+
+Useful ideas from that project are:
+
+* spatial reordering,
+* nested dissection,
+* size bucketing,
+* persistent device buffers,
+* Schur complements/domain decomposition.
+
+Its exact AMLS eigensolver, however, is **not currently an attractive replacement for DFTB SCC**.
+
+For the tested matrices, exact AMLS is actually slower than LAPACK through N≈1700:
+
+|    N | dense eigh |   AMLS |
+| ---: | ---------: | -----: |
+|  492 |      17 ms |  20 ms |
+|  810 |      41 ms |  68 ms |
+| 1242 |     123 ms | 197 ms |
+| 1674 |     225 ms | 452 ms |
+
+And more fundamentally: SCC needs the **whole occupied subspace/density**, not just a handful of lowest vibrational modes. If AMLS retains all relevant modes, most of the dimensional reduction disappears.
+
+So I would not invest in AMLS for the main SCC path now.
+
+---
+
+# 7. Nested dissection *is* useful — but mainly as an ordering
+
+This is where `FastDirectSolvers` becomes interesting for DFTB.
+
+Your previous sparse-Cholesky ribbon result had roughly
+
+$$
+nnz(L)\sim N^2
+$$
+
+even though H/S themselves are spatially local.
+
+That is very suspicious for a width-4 quasi-1D ribbon.
+
+The current Python Cholesky explicitly uses:
+
+```python
+permc_spec='NATURAL'
+```
+
+rather than a fill-reducing symmetric permutation.
+
+For a long narrow ribbon, after ordering atoms along its long axis, S should essentially be a **block-banded matrix with roughly fixed bandwidth**.
+
+Then block Cholesky has approximately:
+
+$$
+O(N w^2)
+$$
+
+work for constant ribbon width \(w\), i.e. close to linear.
+
+So I would absolutely test:
+
+1. geometric ordering along ribbon length,
+2. reverse Cuthill–McKee,
+3. simple recursive coordinate bisection,
+4. nested dissection.
+
+But apply these first as **permutations for S/H**, not as a replacement eigensolver.
+
+This could transform the Cholesky/CheFSI frontier-orbital route dramatically.
+
+---
+
+# 8. The assembly failure is still P0
+
+The newest commit explicitly says the real formic-dimer GPU H/S pipeline still dies in `assemble_pairs` with `CL_OUT_OF_RESOURCES`, and the replica>=128 OOB remains.
+
+That blocks a trustworthy end-to-end benchmark.
+
+And I think `assemble_pairs` itself should now be specialized.
+
+You already launch separate species-pair buckets, and `block_type` is uniform per launch, but the kernel still contains runtime branches for:
+
+```text
+1×1
+1×4
+4×4
+```
+
+and statically allocates worst-case local storage.
+
+I would produce three specialized kernels:
+
+```text
+assemble_pairs_1x1
+assemble_pairs_1x4
+assemble_pairs_4x4
+```
+
+or compile-time specialize `BLOCK_TYPE`.
+
+Also replace:
+
+```c
+__local Fragment l_frags[128];
+```
+
+with direct global fragment metadata, or homogeneous arithmetic offsets.
+
+And replace the statically worst-case SK cache:
+
+```c
+l_sk_h[512*5]
+l_sk_s[512*5]
+```
+
+with actual-size local arguments if practical.
+
+This should:
+
+* fix the replica bug,
+* reduce local memory,
+* reduce register pressure,
+* remove runtime branching,
+* possibly fix the NVIDIA resource error.
+
+`GpuDriver` currently uses WG=64 for this kernel.
+
+Query:
+
+```text
+CL_KERNEL_WORK_GROUP_SIZE
+CL_KERNEL_LOCAL_MEM_SIZE
+CL_KERNEL_PRIVATE_MEM_SIZE
+```
+
+for each specialized variant.
+
+I would do this **before any new major dense algorithm** because currently your actual H-bond application cannot run through the complete NVIDIA path.
+
+---
+
+# 9. Dense SCC: the next important optimization is not another GEMM kernel
+
+Your current SCC does approximately:
+
+$$
+H
+\rightarrow
+XHX
+\rightarrow
+\text{Jacobi}
+\rightarrow
+C
+\rightarrow
+D
+\rightarrow
+q.
+$$
+
+Several of those matrices are unnecessary.
+
+The nice DFTB identity is
+
+$$
+H =
+H^0+\frac12(SV+VS),
+$$
+
+with \(V\) diagonal in the AO basis.
+
+Let
+
+$$
+X=S^{-1/2},\qquad Y=S^{1/2}.
+$$
+
+Then
+
+$$
+H'
+=
+XHX
+=
+H_0'
++
+\frac12(XVY+YVX).
+$$
+
+Now exploit the fact that
+
+$$
+V=\sum_A V_A P_A,
+$$
+
+where \(P_A\) selects orbitals belonging to atom A.
+
+Define once per geometry
+
+$$
+\boxed{
+M_A=
+\frac12
+\left(
+X P_A Y+
+Y P_A X
+\right)
+}
+$$
+
+and
+
+$$
+H_0'=XH^0X.
+$$
+
+Then every SCC iteration becomes simply
+
+$$
+\boxed{
+H'(V)=H_0'+\sum_A V_A M_A.
+}
+$$
+
+For your formic dimer:
+
+* N=28,
+* \(N_A=10\).
+
+Per element this is ~10 FMAs.
+
+That is roughly
+
+$$
+N_A N^2 \approx 7840
+$$
+
+FMAs/system instead of order
+
+$$
+2N^3\approx43900
+$$
+
+for the current two Löwdin GEMMs.
+
+And you eliminate the physical `H_scc` matrix entirely.
+
+Memory cost is not problematic for these small systems:
+
+$$
+10\times28^2\times4\approx31\text{ kB/system}.
+$$
+
+Even batch100 is only ~3 MB.
+
+I actually prefer this over the previously suggested “one weighted GEMM”.
+
+**Likely benefit to whole SCC:** perhaps **5–10% currently**, but it also simplifies the pipeline and becomes more valuable after Jacobi gets faster.
+
+---
+
+# 10. Also remove D from the SCC iterations
+
+You only need D when you finally want forces or full density output.
+
+With orthogonal eigenvectors U:
+
+$$
+C=XU.
+$$
+
+And:
+
+$$
+SC=SXU=YU.
+$$
+
+Therefore the Mulliken population is directly
+
+$$
+\boxed{
+q_A=
+2\sum_{\mu\in A}
+\sum_{k\in occ}
+(XU)_{\mu k}(YU)_{\mu k}.
+}
+$$
+
+So use only occupied columns:
+
+```text
+Cocc  = X * Uocc
+SCocc = Y * Uocc
+
+q = rowwise dot(Cocc, SCocc), then sum per atom
+```
+
+No:
+
+```text
+full C[N,N]
+D[N,N]
+density build
+D*S Mulliken
+```
+
+during SCC.
+
+Construct D only after convergence if forces require it.
+
+This probably saves another **5–10% total** on the existing profile, but again becomes relatively more important once Jacobi drops.
+
+---
+
+# 11. A very interesting experiment: eigensolver warm-start
+
+Your SCC charge mixer is warm-started, but your **eigensolver is not**.
+
+Every SCC iteration takes the new H′ and Jacobi starts from the AO-orthogonal basis again:
+
+$$
+V=I.
+$$
+
+But consecutive SCC Hamiltonians differ only moderately.
+
+Suppose \(U_{\rm old}\) diagonalized the previous H′. Transform the new one:
+
+$$
+B=U_{\rm old}^T H'_{\rm new}U_{\rm old}.
+$$
+
+B should already be nearly diagonal.
+
+Then Jacobi may need perhaps 1–3 sweeps instead of 5–10+.
+
+Cost: two cheap small-matrix GEMMs.
+
+This is exactly the sort of trade that may win on a GPU because GEMM is cheap while Jacobi barriers are expensive.
+
+Don't implement it yet. First obtain:
+
+```text
+sweeps_per_SCC_iteration
+```
+
+from real formic-dimer/H2O runs.
+
+If ordinary Jacobi takes:
+
+```text
+2–3 sweeps
+```
+
+forget this idea.
+
+If it takes:
+
+```text
+8–20 sweeps
+```
+
+this may be one of the largest remaining dense improvements.
+
+Potential eigensolver speedup in the latter case: **2–4×**.
+
+---
+
+# 12. Now the sparse solver: residency is still overwhelmingly first
+
+Nothing in `fcd789...` changes the fact that sparse matrix operations repeatedly bounce through host `Bsr4Matrix` objects.
+
+For example `matmul_masked_bsym()` still:
+
+1. creates GPU row/col buffers,
+2. uploads both matrices,
+3. allocates output,
+4. launches,
+5. finishes,
+6. reads the entire result back,
+7. reconstructs a host matrix.
+
+And TC2 still recomputes products redundantly.
+
+So my sparse priority is unchanged:
+
+```text
+GpuBsrStructure        immutable
+    row_ptr
+    col_idx
+    diag map
+    transpose map
+    product plan
+
+GpuBsrValues
+    device buffer only
+
+SparseWorkspace
+    S,H,Z,K,T,Q,...
+```
+
+Then:
+
+```text
+T = K*S
+Q = T*K
+trace(T)
+TC2(K,Q)
+swap(K,Knew)
+```
+
+No readback.
+
+### Estimated improvement
+
+Even just the arithmetic count goes from roughly:
+
+$$
+5\ {\rm SpGEMM/iter}
+\rightarrow
+2.
+$$
+
+That's 2.5×.
+
+Removing full-matrix PCIe transfers, allocations, `finish()`, structure reuploads and kernel reconstruction should make the real improvement larger.
+
+I would consider **3–10× over the current prototype entirely plausible**.
+
+That estimate is much less speculative than estimating some future AMLS gain.
+
+---
+
+# 13. A new sparse formulation I think you should test: purify \(P=KS\), not K
+
+This is the most interesting mathematical simplification I found while comparing the approaches.
+
+Currently your symmetric density kernel K satisfies
+
+$$
+KSK=K.
+$$
+
+Define instead
+
+$$
+\boxed{P=KS}.
+$$
+
+Then immediately:
+
+$$
+P^2
+=
+KSKS
+=
+KS
+=
+P.
+$$
+
+So **P is an ordinary idempotent projector**.
+
+Also:
+
+$$
+\boxed{\operatorname{Tr}(P)=N_{\rm occ}}.
+$$
+
+And most importantly for DFTB Mulliken populations:
+
+$$
+\boxed{
+q_A=
+2\sum_{\mu\in A}P_{\mu\mu}.
+}
+$$
+
+No KS multiplication is needed to obtain charges — P already *is* KS.
+
+### How do we obtain P?
+
+The generalized eigenproblem is
+
+$$
+HC=SC\epsilon.
+$$
+
+Let
+
+$$
+Z=S^{-1}.
+$$
+
+Then
+
+$$
+A=ZH
+$$
+
+has the same eigenvalues and right eigenvectors C:
+
+$$
+AC=C\epsilon.
+$$
+
+Because
+
+$$
+C^{-1}=C^TS,
+$$
+
+the occupied spectral projector of A is exactly
+
+$$
+f(A)=C_{\rm occ}C_{\rm occ}^T S=P.
+$$
+
+Therefore you can run **ordinary SP2/TC2 purification on A**:
+
+$$
+P_0=f_0(A)
+$$
+
+then each iteration only requires
+
+$$
+P_2=P^2
+$$
+
+and
+
+$$
+P_{\rm new}=
+\begin{cases}
+P^2 & \operatorname{Tr}(P)>N_{\rm occ}\\
+2P-P^2 & \operatorname{Tr}(P)<N_{\rm occ}.
+\end{cases}
+$$
+
+### That is one SpGEMM per purification step
+
+instead of:
+
+```text
+T=K*S
+Q=T*K
+```
+
+two products.
+
+So after sparse residency:
+
+> metric K-TC2: **2 SpGEMM/step**
+> projector P-SP2: **1 SpGEMM/step**
+
+Potentially another **~1.5–2×**.
+
+### The catch
+
+A is non-symmetric.
+
+That is mathematically okay — it is similar to the symmetric orthogonalized Hamiltonian and has a real spectrum — but sparse truncation/f32 errors can make a non-normal representation more numerically delicate.
+
+And this formulation relies more strongly on \(Z\approx S^{-1}\) being accurate. Your current K-TC2 only uses Z to construct the initial guess; the exact S participates in every purification step.
+
+So I would first prototype P-SP2 on CPU/dense matrices and compare every iteration against the current metric K-TC2.
+
+Diagnostics should include:
+
+$$
+\|P^2-P\|,
+$$
+
+$$
+|\operatorname{Tr}P-N_{\rm occ}|,
+$$
+
+$$
+\|AP-PA\|,
+$$
+
+and the metric self-adjoint condition
+
+$$
+\|SP-P^TS\|.
+$$
+
+Finally reconstruct
+
+$$
+K=PZ
+$$
+
+and compare to dense DFTB.
+
+This is a **research P1**, but the possible payoff is large enough that I would definitely test it.
+
+---
+
+# 14. It generalizes beautifully to FOE
+
+This is where your `LinearScalingQM/DensityMatrix` work becomes directly relevant.
+
+That repository already explores Fermi operator expansions and Green's functions as alternatives to diagonalization.
+
+Instead of zero-temperature SP2:
+
+$$
+P=\theta(\mu I-A),
+$$
+
+at finite electronic temperature use:
+
+$$
+P=f_\beta(A-\mu I)
+$$
+
+via Chebyshev FOE.
+
+Again:
+
+$$
+q_A=2\,\mathrm{diag}(P).
+$$
+
+This gives a nice future solver split:
+
+| Electronic structure                   | Best candidate   |
+| -------------------------------------- | ---------------- |
+| decent gap, T≈0                        | **SP2/TC2 on P** |
+| small gap / metallic + smearing        | **FOE on P**     |
+| need frontier orbitals                 | **CheFSI**       |
+| strongly localized insulator, research | OMM              |
+
+I would **not replace TC2 with FOE for ordinary molecules**. TC2's nonlinear purification is usually much cheaper for a clear gap.
+
+But graphene / tiny-gap systems are exactly where fixed-range density truncation and zero-T purification become difficult; FOE with physical smearing may be much more robust.
+
+---
+
+# 15. CheFSI: useful, but for the right job
+
+Your separate CheFSI implementation is specifically designed for a **small frontier subspace**, with GPU ELLPACK SpMM + Gram/subspace operations.
+
+That is a good candidate to replace the current Python/SciPy frontier eigensolver **after SCC has converged**.
+
+It is *not* a good replacement for the SCC density solver when half the spectrum is occupied.
+
+If:
+
+$$
+N_{\rm occ}\sim N/2,
+$$
+
+CheFSI's “small subspace” advantage disappears.
+
+So:
+
+> TC2/FOE → SCC density
+> CheFSI → final HOMO/LUMO/wavefunctions.
+
+Also, don't port the current `CheFSI.cl` blindly. Its SpMM kernel keeps
+
+```c
+float sums[32];
+```
+
+per thread, which can become register-heavy.
+
+For DFTB I would use atom-block storage and tile the vector dimension.
+
+---
+
+# 16. ELLPACK gives one useful sparse-layout idea
+
+The CheFSI code uses ELLPACK because fixed neighbor counts are GPU-friendly.
+
+Your BSR4 CSR is better for 4×4 atomic blocks, but the same principle suggests:
+
+### Block-ELL / degree-bucket layout
+
+For regular graphene/ribbons:
+
+```text
+col[row][slot]
+block[row][slot][16]
+```
+
+with fixed or bucketed slots per row.
+
+This eliminates row-pointer chasing and gives very predictable memory access.
+
+However, I would **not rewrite BSR4 to ELL now**.
+
+A better immediate optimization is what your OMM project independently calls a precomputed `Atom_Inter_Map`: precompute all hot-loop interaction offsets once so numerical kernels perform only gather/FMA and no searching.
+
+That is essentially the symbolic SpGEMM plan we discussed:
+
+```text
+output block Cij:
+    [(offset Aik, offset Bkj),
+     (offset Aik, offset Bkj),
+     ...]
+```
+
+Once masks are fixed, there is no reason to run two-pointer intersections 40–50 times during purification.
+
+Expected SpGEMM benefit: roughly **1.2–2×**, depending on how traversal-bound the current kernel is.
+
+Do this **after residency**.
+
+---
+
+# 17. OMM is interesting scientifically, but I would not prioritize it
+
+OMM has conceptual appeal for large localized insulating systems:
+
+$$
+\text{optimize localized occupied orbitals directly}.
+$$
+
+But your own experiments already show the difficult part: maintaining orthogonality and localization becomes harder as the number of orbitals grows. The penalty method's overlap errors grow with system size and the method needs correction/projection machinery.
+
+There are also support recentering and support-boundary issues.
+
+So OMM is a legitimate **alternative research branch**, but not currently an optimization of the DFTB solver.
+
+I would first get a robust sparse density-projector solver.
+
+---
+
+# 18. Green's functions + nested dissection are a longer-term metallic-system route
+
+This is where `FastDirectSolvers` and `DensityMatrix/GF` could eventually meet.
+
+For metals/small-gap 2D systems, density-matrix locality deteriorates. Then a fixed-range \(O(N)\) TC2 representation may stop giving fixed accuracy.
+
+A more robust route is:
+
+$$
+G(z)=(zS-H)^{-1}
+$$
+
+at several complex contour points, with density obtained by contour integration.
+
+Nested dissection gives a good sparse factorization ordering for each shifted matrix.
+
+For:
+
+* quasi-1D ribbons: potentially near linear,
+* 2D flakes: typically much better than dense cubic, though not true O(N),
+* 3D: more expensive.
+
+This is much more interesting than using AMLS as an eigensolver.
+
+But implementation complexity is high, so I would keep it as a **fallback research direction if TC2/FOE locality fails**.
+
+---
+
+# 19. Updated priorities
+
+My current ordering would be:
+
+| Priority          | Work                                                                    | Why                                          |
+| ----------------- | ----------------------------------------------------------------------- | -------------------------------------------- |
+| **P0-A**          | Fix `assemble_pairs` OOB + NVIDIA resource failure                      | blocks real end-to-end application           |
+| **P0-B**          | Jacobi sweep/residual/status output; fix pair/global tolerance mismatch | may remove many completely useless sweeps    |
+| **P0-C**          | Real event-profiled full SCC using captured molecular H′ matrices       | tells us what actually dominates now         |
+| **P0-D**          | Sparse persistent GPU workspace, **5→2 SpGEMM**, zero transfers         | biggest obvious sparse gain                  |
+| **P1-A**          | GPU eigenvalue ranking/occupation + persistent dense kernels/workspace  | removes synchronization / allocation         |
+| **P1-B**          | \(H'=H'_0+\sum_A V_A M_A\)                                              | removes SCC H construction + Löwdin GEMMs    |
+| **P1-C**          | direct occupied Mulliken, no D during SCC                               | less memory/work                             |
+| **P1-D research** | prototype \(P=KS\) SP2                                                  | potentially **2→1 sparse product/step**      |
+| **P1-E**          | symbolic SpGEMM interaction plan + degree buckets                       | exploit fixed topology                       |
+| **P2**            | eigensolver warm-start from previous U                                  | only if sweep telemetry says worthwhile      |
+| **P2**            | GPU CheFSI for post-SCC HOMO/LUMO                                       | good reuse of other repo                     |
+| **P2/P3**         | RCM/ND ordering for sparse Cholesky / GF                                | valuable special large-system route          |
+| **P3**            | FOE fallback for small-gap/finite-T systems                             | alternative physics regime                   |
+| **P3**            | OMM / exact AMLS                                                        | interesting research, not current bottleneck |
+
+---
+
+# 20. Rough speedup budget
+
+These are deliberately ranges, because the old SCC phase table was not true device event profiling.
+
+### Dense small-system path
+
+Relative to the old `b307...` implementation:
+
+| Change                                |                   Expected gain |
+| ------------------------------------- | ------------------------------: |
+| already implemented pair-block Jacobi |             **1.6–1.9× Jacobi** |
+| fix useless 20-sweep tail             | potentially **1.5–2.5× Jacobi** |
+| active/threshold rotations + symmetry |  additional **1.2–1.5× Jacobi** |
+| persistent kernels + GPU occupation   |              **1.1–1.3× total** |
+| \(H'_0+\sum V_AM_A\)                  |            **1.05–1.15× total** |
+| no D during SCC                       |             **1.05–1.1× total** |
+
+I would consider an **overall 2–3× improvement over the original dense SCC benchmark plausible** without changing the physical algorithm.
+
+If the old reported 0.84 ms/system at batch100 were from a comparable device/run, a reasonable engineering target would therefore be around:
+
+$$
+\boxed{0.3-0.5\ {\rm ms/system}}
+$$
+
+for the same problem.
+
+Don't treat that as a benchmark prediction until the real NVIDIA full pipeline is running.
+
+### Sparse path
+
+From the current prototype:
+
+```text
+host-resident + 5 SpGEMM
+        ↓
+device-resident + 2 SpGEMM
+```
+
+I'd expect **3–10×** wall-clock improvement.
+
+Then, if the \(P=KS\) formulation works:
+
+```text
+2 SpGEMM / purification step
+        ↓
+1 SpGEMM / step
+```
+
+another **~1.5–2×**.
+
+Symbolic interaction maps / degree-specialized kernels could plausibly add another **1.2–2×**.
+
+So versus the present sparse prototype, a final improvement of **5–20× is not implausible**. The large uncertainty is because you still do not have a clean GPU-resident sparse timing baseline.
+
+---
+
+The one thing I would **not** do next is launch a large AMLS/OMM/Green-function implementation. There are still much cheaper improvements in the two algorithms you already have, and the \(P=KS\) projector idea in particular may simplify the large-system solver enough that some of those alternatives become unnecessary.
+
+---
+
+## §32 Implementation: GPU-Resident Sparse Workspace + Jacobi Stopping Fix (2025-09-22)
+
+### What was implemented
+
+Two of the highest-priority changes from the plan above are now implemented and tested on the NVIDIA GTX 1650 (platform 1).
+
+#### P0-D: Device-resident sparse purification (`gpu_sparse.rs`)
+
+**New types** (in `rust_dftb/src/methods/sparse/gpu_sparse.rs`):
+
+- `GpuBsrStructure` — immutable device CSR: `row_ptr`, `col_idx`, `diag_block`, `transpose_block`. Uploaded once, shared via `Arc`.
+- `GpuBsrMatrix` — `Arc<GpuBsrStructure>` + device `Buffer<f32>` values. The structure is shared; only values differ.
+- `SparsePurifyWorkspace` — persistent workspace holding `s`, `k`, `knew`, `t`, `q` as `GpuBsrMatrix`, plus a 1-float `trace_buf` and reduction scratch. All allocated once at construction.
+
+**Cached kernel handles** — `SparseBsr4Gpu` now builds all 11 kernels (`bsr4_spgemm_masked`, `bsr4_spgemm_masked_Bsym`, `bsr4_zero`, `bsr4_axpby`, `bsr4_mcweeny`, `bsr4_tc2`, `bsr4_symmetrize`, `bsr4_mulliken_KS`, `bsr4_trace_KS_partial`, `reduce_sum_f32`, `bsr4_idempotency_partial`) once at `new()` time using dummy buffers. Per-launch calls use `Kernel::set_arg` + `Kernel::cmd().global_work_size(...).enq()` — no `Kernel::builder()`, no `Buffer::builder()`, no `finish()` between kernels.
+
+**Device-resident methods** on `SparseBsr4Gpu`:
+
+| Method | Host transfers | Allocations | `finish()` calls |
+|---|---|---|---|
+| `spgemm_bsym_dev` | 0 | 0 | 0 |
+| `spgemm_masked_dev` | 0 | 0 | 0 |
+| `axpby_dev` | 0 | 0 | 0 |
+| `zero_dev` | 0 | 0 | 0 |
+| `tc2_dev` | 0 | 0 | 0 |
+| `symmetrize_dev` | 0 | 0 | 0 |
+| `trace_ks_dev` | 1 scalar (f32) | 1 scratch buffer | before scalar read |
+| `idempotency_err_dev` | 1 scalar (f32) | 1 scratch buffer | before scalar read |
+| `mulliken_dev` | `n_atom` floats | 1 output buffer | before read |
+
+**`SparsePurifyWorkspace::tc2_step_dev`** — one TC2 iteration:
+
+```text
+T = K·S          (spgemm_bsym_dev — 0 transfers)
+Q = T·K          (spgemm_bsym_dev — 0 transfers)
+n = Tr(T)         (trace_ks_dev — 1 scalar read)
+Knew = TC2(K,Q,n) (tc2_dev — 0 transfers)
+symmetrize(Knew)  (symmetrize_dev — 0 transfers)
+swap(K, Knew)     (std::mem::swap on Buffer handles)
+```
+
+**Exactly 2 SpGEMMs, 0 matrix host transfers, 1 scalar read per iteration.** This replaces the old 5-SpGEMM flow that allocated/uploaded/read back full matrices for every operation.
+
+**`tc2_purify_dev`** — full loop with convergence checking every `check_every` iterations, divergence detection (10× best R_I), and best-iteration tracking.
+
+#### P0-B: Jacobi stopping semantics (`gpu_eigen.cl`)
+
+**Problem:** `PAIR_SKIP_TOL` was hardcoded equal to `JACOBI_TOL` (both 1e-7). When every remaining pair is below 1e-7, the Frobenius norm of ~4000 elements is ~6e-6, which never satisfies the global relative tolerance `off_cur/off0 < 1e-7`. The kernel then runs all 20 sweeps doing nothing.
+
+**Fix:**
+
+1. **Separated `PAIR_SKIP_TOL` from `JACOBI_TOL`.** New default `PAIR_SKIP_TOL = 1e-12` — small enough that the global Frobenius norm can reach `JACOBI_TOL` (worst case: `sqrt(64²) * 1e-12 = 6.4e-11 << 1e-7 * off0`), large enough to avoid denormal-float NaN issues that appeared with `PAIR_SKIP_TOL = 0`.
+
+2. **Stagnation detection.** If the off-diagonal norm does not improve by 10% for 3 consecutive sweeps, break early. This requires multiple consecutive non-improving sweeps to avoid premature exit during transient plateaus.
+
+3. **Updated documentation** in `gpu_eigen.rs` to reflect the actual barrier count (2 per round with block update, not 1) and the new stopping semantics.
+
+### Test results (NVIDIA GTX 1650, platform 1)
+
+**Sparse suite** — 15/15 passed:
+
+```
+test test_spgemm_masked_vs_dense ... ok
+test test_spgemm_masked_bsym_vs_dense ... ok
+test test_spgemm_mask_truncation ... ok
+test test_trace_ks_vs_cpu ... ok
+test test_symmetrize_vs_host ... ok
+test test_mulliken_vs_cpu ... ok
+test test_idempotency_exact_kernel ... ok
+test test_mcweeny_convergence ... ok
+test test_tc2_convergence ... ok
+test test_boolean_product_mask ... ok
+test test_newton_schulz_inverse ... ok
+test test_k0_and_tc2_vs_dense_projector ... ok
+test test_rh_distinguishes_projectors ... ok
+test test_tc2_dev_resident_convergence ... ok   ← NEW
+test test_tc2_dev_vs_host_parity ... ok          ← NEW
+```
+
+**Key new test: `test_tc2_dev_vs_host_parity`**
+
+Runs 5 TC2 steps via the old host-roundtrip path and 5 via the new device-resident path, same K0.
+
+```
+TC2 host-vs-dev after 5 steps: max|K_host - K_dev| = 0e0
+```
+
+**Bitwise identical** — the device-resident path produces exactly the same result as the host-roundtrip path (same kernel, same arithmetic, just no intermediate host transfers).
+
+**Key new test: `test_tc2_dev_resident_convergence`**
+
+```
+TC2-dev iter 0: R_I=6.115388e-2  Tr(KS)=2.400000  (Nocc=3)
+TC2-dev iter 1: R_I=2.5439807e-3  Tr(KS)=2.880000  (Nocc=3)
+TC2-dev iter 2: R_I=4.071165e-6  Tr(KS)=2.995200  (Nocc=3)
+TC2-dev final: R_I=4.071165e-6  Tr(KS)=2.99520  iters=3
+TC2-dev max|K_final - K_exact| = 1.2516975e-6
+```
+
+Converges in 3 iterations to `R_I = 4.07e-6`, `max|K - K_exact| = 1.25e-6`.
+
+**Dense eigensolver suite** — 10/10 passed (with SK data):
+
+```
+test test_batched_jacobi ... ok   (10×H2O, max val diff = 3.97e-7, max vec diff = 9.84e-6)
+test test_inv_sqrt_h2 ... ok
+test test_inv_sqrt_h2o ... ok
+test test_inv_sqrt_n2 ... ok
+test test_jacobi_parity_ch4 ... ok
+test test_jacobi_parity_h2 ... ok
+test test_jacobi_parity_h2o ... ok
+test test_jacobi_parity_n2 ... ok
+test test_lambda_min_reporting ... ok
+```
+
+**SCC suite** — 3/3 passed:
+
+```
+test test_gpu_scc_parity_batched_h2o ... ok
+test test_gpu_scc_parity_h2o ... ok
+test test_gpu_scc_parity_n2 ... ok
+```
+
+### What remains
+
+- **Event profiling** — the device-resident methods do not call `finish()` between kernels, which is correct for pipelining but means host-side timing is meaningless. OpenCL event profiling (`clGetEventProfilingInfo` with `CL_PROFILING_COMMAND_START`/`END`) should be added to measure actual kernel execution time vs. host enqueue overhead.
+- **Dense assembly OOB** — `assemble_pairs` still indexes `l_frags[p.replica]` with `l_frags[128]`, causing corruption for batch > 127.
+- **P=KS projector prototype** — now that the resident two-product baseline exists and is verified, the one-product P=KS formulation can be prototyped and compared.
+- **Sparse masks** — the exposed sparse route still uses `build_full_mask`. Geometric/product masks should be added as a separate parity-tested change.
+
+### Additional fixes (2025-09-22, continued)
+
+#### Row-degree overflow — fail-loud fix
+
+**Problem:** Both SpGEMM kernels (`bsr4_spgemm_masked`, `bsr4_spgemm_masked_Bsym`) silently `return` when a row's degree `na > MAX_LEFT_BLOCKS`, producing zero output for that row without any error. This violates the repo's "Fail Fast, Fix the Physics" rule.
+
+**Fix:** Added `check_row_degree()` host-side validation in `SparseBsr4Gpu` that scans `row_ptr` before any SpGEMM launch and returns a descriptive `DftbError` if any row exceeds `MAX_LEFT_BLOCKS`. The check is called from:
+- `spgemm_masked` (old host-roundtrip path)
+- `spgemm_masked_bsym` (old host-roundtrip path)
+- `GpuBsrStructure::new` (device-resident path — catches the error at structure upload time, before any kernel launch)
+
+**Test:** `test_row_degree_overflow_fail_loud` — creates a 300-atom full mask (row degree 300 > 256) and verifies `GpuBsrStructure::new` fails with a message mentioning `MAX_LEFT_BLOCKS`.
+
+#### Newton-Schulz device-resident rewrite
+
+**Implemented:** `newton_schulz_inverse_dev` on `SparseBsr4Gpu` — device-resident version of the Newton-Schulz / Hotelling iteration for sparse approximate inverse. All matrices (Z, Znew, T, Q) stay on the GPU for the entire loop.
+
+Per iteration:
+- T = Z·S (spgemm_bsym_dev — 0 transfers)
+- ||T||_F (frobenius_norm_dev — 1 scalar read)
+- Tr(T) (trace_ks_dev — 1 scalar read)
+- R_Z computed on host from the 2 scalars
+- Q = T·Z (spgemm_bsym_dev — 0 transfers)
+- Znew = 2·Z - Q (axpby_dev — 0 transfers)
+- symmetrize(Znew) (symmetrize_dev — 0 transfers)
+- swap(Z, Znew)
+
+2 SpGEMMs, 2 scalar reads, 0 matrix host transfers per iteration.
+
+**Test:** `test_newton_schulz_inverse_dev` — converges in 5 iterations to `R_Z = 0`, same as the old host-roundtrip path.
+
+### Final test results (30 tests, all pass)
+
+```
+gpu_sparse_bsr4: 17 passed (15 original + 2 new TC2-dev + 1 row-degree + 1 NS-dev... actually 17 total)
+gpu_eigenproblem: 10 passed
+gpu_scc: 3 passed
+```

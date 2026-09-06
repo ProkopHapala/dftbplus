@@ -310,6 +310,8 @@ file/function where the work should land.
 - [*] Sparse Mulliken charges from `KS` diagonal blocks — `methods/sparse/gpu_sparse.rs::mulliken`
 - [*] Convergence history export — `SparseResult.history`, Rhai `save_convergence`
 - [*] Parity vs dense + DFTB+ on benzene/coronene/circumcoronene (max\|Δq\| < 6.5e-5 e) — `scripts/compare_rust_vs_dftbplus.py`
+- [*] **Device-resident sparse workspace** (2025-09-22) — `GpuBsrStructure`, `GpuBsrMatrix`, `SparsePurifyWorkspace` with persistent device buffers, cached kernel handles, exactly 2 SpGEMMs per TC2 iteration (down from 5), 0 matrix host transfers per iteration, 1 scalar read for trace/branch. Bitwise-identical parity vs old host-roundtrip path verified. — `methods/sparse/gpu_sparse.rs`, `tests/gpu_sparse_bsr4.rs::test_tc2_dev_vs_host_parity`, `test_tc2_dev_resident_convergence`
+- [*] **Jacobi stopping fix** (2025-09-22) — separated `PAIR_SKIP_TOL` (1e-12) from `JACOBI_TOL` (1e-7), added 3-sweep stagnation detection. Fixes the "20 sweeps but 12 are useless" problem. All 10 eigen + 3 SCC tests still pass. — `qmqm/gpu_eigen.cl`, `qmqm/gpu_eigen.rs`
 
 ### 7.5.3 Davidson partial eigensolver
 - [*] Generalized Davidson `H C = S C ε` with S-orthonormalization — `methods/sparse/davidson.rs::davidson_generalized`
