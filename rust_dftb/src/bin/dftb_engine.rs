@@ -18,7 +18,7 @@
 
 use rust_dftb::geometry::{self, A_CC, Element, FlakeShape, NanoStructure};
 use rust_dftb::methods::sparse::{
-    Bsr4Matrix, SparseBsr4Config, SparseBsr4Gpu,
+    Bsr4Matrix, SparseBsr4Config, SparseBsr4Gpu, SparsePerfStats,
     build_full_mask, build_geometric_mask,
 };
 use rust_dftb::methods::sparse::gpu_sparse::{GpuBsrMatrix, GpuBsrStructure, SparsePurifyWorkspace};
@@ -30,6 +30,7 @@ use rhai::{Array, Dynamic, Engine, Scope, INT};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::Instant;
 
 const ANG2BOHR: f64 = 1.889_726_133;
 
@@ -251,6 +252,10 @@ fn rhai_run_dftb_nonscc(name: &str, sk_dir: &str) -> Dynamic {
 /// Run sparse BSR4 purification on a stored DFTB result.
 /// Uses the H and S from the dense DFTB calculation.
 /// Stores the sparse result under `name`.
+///
+/// **Full mask** — every block (i,j) exists. Use for small-system validation
+/// against the dense reference. For large systems use
+/// `rhai_run_sparse_purify_geom` with a geometric mask instead.
 fn rhai_run_sparse_purify(name: &str, max_iter: INT, tol: f64) -> Dynamic {
     let payload = with_state(|s| {
         let scc = s.scc_results.get(name)?.clone();
@@ -276,7 +281,8 @@ fn rhai_run_sparse_purify(name: &str, max_iter: INT, tol: f64) -> Dynamic {
 
     eprintln!("Sparse BSR4 purification on '{name}' ({n_atom} atoms, {n_orbs} orbitals) ...");
 
-    // Convert dense H, S to BSR4 format with full mask
+    // Convert dense H, S to BSR4 format with full mask (validation path only;
+    // production uses run_sparse_purify_geom with geometric mask)
     let mask = build_full_mask(n_atom);
     let h_bsr = dense_to_bsr4(&scc.h_scc, n_atom, &mask);
     let s_bsr = dense_to_bsr4(&scc.s, n_atom, &mask);
@@ -381,7 +387,165 @@ fn rhai_run_sparse_purify(name: &str, max_iter: INT, tol: f64) -> Dynamic {
     Dynamic::from_float(r_i as f64)
 }
 
-/// Compare sparse K with dense density matrix.
+/// Run sparse BSR4 purification with a **geometric mask** (not full mask).
+///
+/// Uses `build_geometric_mask(pos, cutoff)` so only blocks within `cutoff`
+/// distance are stored — O(N·n_neigh) instead of O(N²). This is the
+/// production path for large systems; `run_sparse_purify` (full mask) remains
+/// as a dense-reference validation path for small systems.
+///
+/// `r_max` is the mask cutoff in Å (must exceed the SK interaction range).
+fn rhai_run_sparse_purify_geom(name: &str, r_max: f64, max_iter: INT, tol: f64) -> Dynamic {
+    let payload = with_state(|s| {
+        let scc = s.scc_results.get(name)?.clone();
+        let st = s.geometries.get(name)?.clone();
+        Some((scc, st))
+    });
+
+    let Some((scc, st)) = payload else {
+        eprintln!("ERROR: no DFTB result found for '{name}'. Run run_dftb_scc or run_dftb_nonscc first.");
+        return Dynamic::from_float(f64::NAN);
+    };
+
+    let n_atom = st.natom();
+    let n_orbs = n_atom * 4;
+    if max_iter <= 0 || !tol.is_finite() || tol <= 0.0 {
+        panic!("sparse purification requires max_iter > 0 and finite tol > 0: max_iter={max_iter}, tol={tol}");
+    }
+    if !r_max.is_finite() || r_max <= 0.0 {
+        panic!("r_max must be finite and positive, got {r_max}");
+    }
+    if scc.h0.nrows() != n_orbs {
+        eprintln!("ERROR: H0 size {} != expected {} (n_atom×4). BSR4 requires sp basis (4 orbs/atom).",
+            scc.h0.nrows(), n_orbs);
+        return Dynamic::from_float(f64::NAN);
+    }
+
+    eprintln!("Sparse BSR4 purification (geometric mask, r_max={r_max} Å) on '{name}' ({n_atom} atoms, {n_orbs} orbitals) ...");
+    let t_total_start = Instant::now();
+
+    // Geometric mask: only blocks within r_max. O(N²) construction for now
+    // (P0e will add cell list); the mask itself is O(N·n_neigh).
+    let t0 = Instant::now();
+    let mask = build_geometric_mask(&st.positions, r_max);
+    let nblock = mask.1.len();
+    let fill = nblock as f64 / (n_atom * n_atom) as f64;
+    eprintln!("  geometric mask: {nblock} blocks, fill ratio = {fill:.4} ({n_atom}² = {})", n_atom * n_atom);
+    if nblock == 0 {
+        panic!("geometric mask is empty — r_max={r_max} too small or positions invalid");
+    }
+    let t_hs = t0.elapsed();
+
+    let h_bsr = dense_to_bsr4(&scc.h_scc, n_atom, &mask);
+    let s_bsr = dense_to_bsr4(&scc.s, n_atom, &mask);
+
+    let n_electrons: f64 = st.elements.iter().map(|e| {
+        match e { Element::C => 4.0, Element::N => 5.0, Element::O => 6.0, Element::B => 3.0, _ => 1.0 }
+    }).sum();
+    let n_occ = (n_electrons / 2.0) as f32;
+    eprintln!("  n_occ = {n_occ}");
+
+    let config = SparseBsr4Config::default();
+    let gpu = match SparseBsr4Gpu::new(config) {
+        Ok(g) => g,
+        Err(e) => { eprintln!("ERROR GPU init: {e}"); return Dynamic::from_float(f64::NAN); }
+    };
+
+    eprintln!("  Newton-Schulz Z ≈ S⁻¹ ...");
+    let t0 = Instant::now();
+    let k_struct = match GpuBsrStructure::new(&gpu, n_atom, &mask) {
+        Ok(s) => Arc::new(s),
+        Err(e) => panic!("ERROR building resident K structure: {e}"),
+    };
+    let t_struct = match GpuBsrStructure::new(&gpu, n_atom, &mask) {
+        Ok(s) => Arc::new(s),
+        Err(e) => panic!("ERROR building resident T structure: {e}"),
+    };
+    let s_struct = match GpuBsrStructure::new(&gpu, n_atom, &(s_bsr.row_ptr.clone(), s_bsr.col_idx.clone())) {
+        Ok(s) => Arc::new(s),
+        Err(e) => panic!("ERROR building resident S structure: {e}"),
+    };
+    let s_dev = match gpu.buf_f32(&s_bsr.values) {
+        Ok(values) => GpuBsrMatrix { struct_: s_struct, values },
+        Err(e) => panic!("ERROR uploading resident S values: {e}"),
+    };
+    let (z, r_z, z_iters) = match gpu.newton_schulz_inverse_dev(&s_dev, &k_struct, &t_struct, 30, 1e-4, 3) {
+        Ok(r) => r,
+        Err(e) => panic!("ERROR Newton-Schulz: {e}"),
+    };
+    let t_ns = t0.elapsed();
+    eprintln!("    Z: {z_iters} iters, R_Z = {r_z:e}");
+    if !r_z.is_finite() || r_z > 1e-4 {
+        panic!("Newton-Schulz failed to converge: R_Z={r_z:e}, iterations={z_iters}, tolerance=1e-4");
+    }
+
+    let (emin, emax) = match gpu.spectral_bounds(&h_bsr, &z, &mask, 0.1) {
+        Ok(r) => r,
+        Err(e) => { eprintln!("ERROR spectral bounds: {e}"); return Dynamic::from_float(f64::NAN); }
+    };
+    eprintln!("    spectral bounds: emin={emin:.4} emax={emax:.4}");
+
+    let k0 = match gpu.build_k0(&h_bsr, &s_bsr, &z, &mask, &mask, emin, emax) {
+        Ok(k) => k,
+        Err(e) => { eprintln!("ERROR K0: {e}"); return Dynamic::from_float(f64::NAN); }
+    };
+
+    eprintln!("  TC2 purification (max_iter={max_iter}, tol={tol}) ...");
+    let t0 = Instant::now();
+    let mut workspace = match SparsePurifyWorkspace::new(gpu, &k0, &s_bsr, &mask, &mask, n_occ) {
+        Ok(ws) => ws,
+        Err(e) => panic!("ERROR creating resident TC2 workspace: {e}"),
+    };
+    let (k_final, r_i, tr_ks, tc2_iters, history) = match workspace.tc2_purify_dev(max_iter as usize, tol as f32, 1) {
+        Ok(r) => r,
+        Err(e) => panic!("ERROR TC2: {e}"),
+    };
+    let t_tc2 = t0.elapsed();
+    eprintln!("    TC2: {tc2_iters} iters, R_I={r_i:e}, Tr(KS)={tr_ks:.6}");
+    if !r_i.is_finite() || r_i > tol as f32 || !tr_ks.is_finite() {
+        panic!("TC2 failed to converge: R_I={r_i:e}, Tr(KS)={tr_ks:.8}, iterations={tc2_iters}, tolerance={tol:e}");
+    }
+
+    let r_h = match workspace.gpu().hamiltonian_residual(&h_bsr, &k_final, &s_bsr, &mask) {
+        Ok(r) => r,
+        Err(e) => panic!("ERROR R_H: {e}"),
+    };
+    let r_h_norm = r_h / (n_orbs as f32).sqrt();
+    eprintln!("    R_H = {r_h:e} (normalized {r_h_norm:e})");
+    if !r_h_norm.is_finite() {
+        panic!("Hamiltonian residual is non-finite: R_H={r_h:e}, normalized={r_h_norm:e}");
+    }
+
+    let mulliken = match workspace.mulliken_dev() {
+        Ok(m) => m,
+        Err(e) => panic!("ERROR Mulliken: {e}"),
+    };
+    eprintln!("    sparse Mulliken: {:?}", mulliken.iter()
+        .map(|q| format!("{q:.4}")).collect::<Vec<_>>());
+
+    let t_total = t_total_start.elapsed();
+    let stats = SparsePerfStats {
+        n_atom,
+        nnz_hs: nblock,
+        nnz_k: nblock,
+        nnz_z: nblock,
+        t_hs: t_hs.as_secs_f64(),
+        t_ns: t_ns.as_secs_f64(),
+        t_tc2: t_tc2.as_secs_f64(),
+        t_total: t_total.as_secs_f64(),
+        ..Default::default()
+    };
+    stats.print_audit();
+
+    let k_dense = k_final.to_dense();
+    let result = SparseResult {
+        k_dense, n_atom, n_occ, r_i, r_h: r_h_norm, tr_ks,
+        mulliken, iters: tc2_iters, history,
+    };
+    with_state(|s| { s.sparse_results.insert(name.to_string(), result); });
+
+    Dynamic::from_float(r_i as f64)
+}
 /// Returns max|K - D| where D is the dense density matrix.
 fn rhai_compare_density(name: &str) -> Dynamic {
     let payload = with_state(|s| {
@@ -840,6 +1004,7 @@ fn main() {
                 eprintln!("  run_dftb_scc(name, sk_dir, max_iter, tol) -> energy");
                 eprintln!("  run_dftb_nonscc(name, sk_dir) -> energy");
                 eprintln!("  run_sparse_purify(name, max_iter, tol) -> r_i");
+                eprintln!("  run_sparse_purify_geom(name, r_max, max_iter, tol) -> r_i  (geometric mask)");
                 eprintln!("  compare_density(name) -> max_diff");
                 eprintln!("  compare_charges(name) -> max_diff");
                 eprintln!("  get_energy(name) -> energy");
@@ -887,6 +1052,7 @@ fn main() {
     engine.register_fn("run_dftb_scc", rhai_run_dftb_scc);
     engine.register_fn("run_dftb_nonscc", rhai_run_dftb_nonscc);
     engine.register_fn("run_sparse_purify", rhai_run_sparse_purify);
+    engine.register_fn("run_sparse_purify_geom", rhai_run_sparse_purify_geom);
     engine.register_fn("compare_density", rhai_compare_density);
     engine.register_fn("compare_charges", rhai_compare_charges);
     engine.register_fn("get_energy", rhai_get_energy);

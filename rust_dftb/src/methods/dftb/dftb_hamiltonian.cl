@@ -115,6 +115,78 @@ inline float4 cubic_weights(float t) {
     );
 }
 
+// ------------------------------------------------------------------
+// Canonical C² cubic B-spline evaluator: V, dV/dr, d²V/dr²
+// (P1, manifest v3 §4.2)
+//
+// Returns (V, dV/dr, d²V/dr²) from the same control points. The derivatives
+// are analytic derivatives of exactly the same interpolated function — no
+// numerical finite differences. This is mandatory for Hessian-quality
+// forces: a C¹-only representation has discontinuous V'' at knots.
+//
+// Basis functions (partition of unity: Σ B_k = 1, Σ B'_k = 0, Σ B''_k = 0):
+//   B0 = (1-t)³ / 6
+//   B1 = (3t³ - 6t² + 4) / 6
+//   B2 = (-3t³ + 3t² + 3t + 1) / 6
+//   B3 = t³ / 6
+//
+// inv_dr = 1/Δr where Δr is the uniform grid spacing.
+// ------------------------------------------------------------------
+inline float3 bspline3_v_d1_d2(
+    float c0, float c1, float c2, float c3,
+    float t, float inv_dr
+) {
+    float t2 = t * t;
+    float t3 = t2 * t;
+    float u  = 1.0f - t;
+
+    // Value basis (partition of unity: Σ B_k = 1)
+    float b0 = u * u * u * 0.16666667f;
+    float b1 = (3.0f * t3 - 6.0f * t2 + 4.0f) * 0.16666667f;
+    float b2 = (-3.0f * t3 + 3.0f * t2 + 3.0f * t + 1.0f) * 0.16666667f;
+    float b3 = t3 * 0.16666667f;
+
+    // First derivative basis (Σ B'_k = 0)
+    float d0 = -0.5f * u * u;
+    float d1 =  1.5f * t2 - 2.0f * t;
+    float d2 = -1.5f * t2 + t + 0.5f;
+    float d3 =  0.5f * t2;
+
+    // Second derivative basis (Σ B''_k = 0)
+    float dd0 =  1.0f - t;
+    float dd1 =  3.0f * t - 2.0f;
+    float dd2 = -3.0f * t + 1.0f;
+    float dd3 =  t;
+
+    float v  = fma(c0, b0, fma(c1, b1, fma(c2, b2, c3 * b3)));
+    float dv = (fma(c0, d0, fma(c1, d1, fma(c2, d2, c3 * d3)))) * inv_dr;
+    float ddv = (fma(c0, dd0, fma(c1, dd1, fma(c2, dd2, c3 * dd3)))) * inv_dr * inv_dr;
+    return (float3)(v, dv, ddv);
+}
+
+// First derivative basis weights only (for force kernels that need V').
+// Returns (B'_0, B'_1, B'_2, B'_3) — sum is zero (partition of unity derivative).
+inline float4 cubic_weights_d1(float t) {
+    float u = 1.0f - t;
+    return (float4)(
+        -0.5f * u * u,
+         1.5f * t * t - 2.0f * t,
+        -1.5f * t * t + t + 0.5f,
+         0.5f * t * t
+    );
+}
+
+// Second derivative basis weights only (for Hessian/diagnostic kernels).
+// Returns (B''_0, B''_1, B''_2, B''_3) — sum is zero.
+inline float4 cubic_weights_d2(float t) {
+    return (float4)(
+        1.0f - t,
+        3.0f * t - 2.0f,
+        -3.0f * t + 1.0f,
+        t
+    );
+}
+
 // Compute base index and weights. Returns base = i-1 for 4-point stencil.
 inline int cubic_interp_params(float r, float dr, int n_grid, float4* out_w) {
     float u = r / dr;

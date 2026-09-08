@@ -347,6 +347,34 @@ file/function where the work should land.
 
 ---
 
+## 7.6 Sparse Nanocrystal Vibrations (Si/H)  ← `tasts/Sparse_Nanocrystal_Vibrations/`
+
+> **Manifest:** `tasts/Sparse_Nanocrystal_Vibrations/Sparse_Nanocrystal_Vibrations.manifest.md`
+> **Report:** `tasts/Sparse_Nanocrystal_Vibrations/Sparse_Nanocrystal_Vibrations.report.md`
+> **Topical audit:** `topical_audit/sparse_nanocrystal_vibrations.md`
+
+Goal: sparse GPU DFTB for vibrational calculations on 300–1000 atom Si/H
+nanocrystals. f32 GPU arithmetic, analytic forces, finite-difference Hessians,
+~5% frequency accuracy, no pathological imaginary modes.
+
+### 7.6.1 Completed (P0–P4 + Gates C, D, E)
+- [*] **P0** — Sparse perf stats + `sparse_firewall` feature — `methods/sparse/bsr4.rs`, `gpu_sparse.rs`
+- [*] **P1** — CPU f64 + GPU OpenCL C² cubic B-spline evaluators — `methods/dftb/spline_resample.rs`, `dftb_hamiltonian.cl`, `tests/gpu_bspline_eval.rs`
+- [*] **P2** — Analytic SK derivatives in production force path — `methods/dftb/forces.rs::build_pair_block_with_derivs`, `rotation.rs::rotate_block_with_derivs_into`; Gate B: 9 tests pass
+- [*] **P3** — Sparse D=2K, W=2KHK via masked SpGEMM — `methods/sparse/sparse_forces.rs::build_dw_sparse`; 2 parity tests pass
+- [*] **P4** — Symbolic SpGEMM plan (precomputed intersection) — `bsr4.rs::SpgemmPlan`, `gpu_sparse.rs::spgemm_plan_bsym_dev`, `sparse_bsr4_purification.cl::bsr4_spgemm_plan_Bsym`; parity exact, `tests/spgemm_plan.rs`
+- [*] **Gate C** — Locality sweep R_K × R_Z — `tests/locality_sweep.rs`; plateau R_K=7, R_Z=7, energy err ~5e-6
+- [*] **Gate D** — Nonsingular padded Si/H basis — `tests/sih_padded_basis.rs`; SiH4, dummy occ ~0, parity |dE|~1e-7
+- [*] **Gate E** — Determinism + Hessian h plateau — `tests/gate_e_determinism.rs`; spread=0, TC2 tol spread 7.7e-5, h plateau=0.02 Å
+
+### 7.6.2 Blocked
+- [ ] **Gate F** — Geometry optimization — **BLOCKED**: needs sparse analytic force bridge (padded BSR4 D/W → variable-orbital `non_scc_electronic_force`). Current test uses finite-difference forces (6000 pipeline runs, ~5 min, against performance policy). The analytic force path exists (`build_pair_block_with_derivs` + `build_dw_sparse`) but the adapter to extract physical sub-blocks from padded BSR4 D/W is missing.
+- [ ] **Gate G** — Same-geometry Hessian parity (sparse f32 vs dense f64) — depends on Gate F
+- [ ] **Gate H** — Spectra at each method's own minimum — depends on Gate G
+- [ ] **Gate I** — Scaling and whole-program profile (N ~ 60, 150, 300, 600, 1000, 1600)
+
+---
+
 ## 8. I/O, Tooling & Test Infrastructure
 
 ### 8.1 I/O
@@ -395,6 +423,7 @@ file/function where the work should land.
 | GPU multi-system (QM/QM coupling) | ❌ | Not started — Stage 8 of revised plan |
 | Scan / NEB driver | ✅ | CPU scan: 2/2 tests pass; GPU scan: 1D+2D formic dimer with plots — `examples/scan.rs`, `tests/scan.rs`, `tests/formic_scan_plots.rs`, `scripts/plot_formic_scan.py` |
 | Sparse TC2 purification | ✅ | Benzene/coronene/circumcoronene parity < 6.5e-5 e — `methods/sparse/gpu_sparse.rs` |
+| Sparse nanocrystal vibrations | ⚠️ | P0–P4 + Gates C/D/E pass; Gate F blocked on sparse analytic force bridge — `tasts/Sparse_Nanocrystal_Vibrations/` |
 | Davidson partial eigensolver | ⚠️ | Benzene OK; coronene/circumcoronene do not converge (diagonal preconditioner) — `methods/sparse/davidson.rs` |
 | DFTB+ parity harness | ✅ | `scripts/run_dftbplus_ref.py` + `compare_rust_vs_dftbplus.py` |
 | Test infra / CI | ⚠️ | Drivers exist, no CI |

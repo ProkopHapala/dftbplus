@@ -38,6 +38,7 @@ After convergence: E = Tr(D·H0) + 0.5·Σ Δq·V
 | Rust+OpenCL | `rust_dftb/src/qmqm/gpu_scc.rs` | active | `gpu_solve_scc_batched` (simple mix), `gpu_solve_scc_batched_diis` (DIIS), `gpu_solve_scc_batched_diis_warmstart` (warm-start + best-effort) |
 | OpenCL kernels | `rust_dftb/src/qmqm/gpu_matrix_ops.cl` | active | gamma_matvec, h_scc_update, mulliken, residual_and_mix, build_density_masked, frobenius_trace, dot — all batched |
 | OpenCL eigensolver | `rust_dftb/src/qmqm/gpu_eigen.rs`/`.cl` | active | `jacobi_cyclic_local_batched` (Brent-Luk), `build_inv_sqrt` (S^{-1/2}) |
+| OpenCL forces | `rust_dftb/src/qmqm/gpu_forces.rs`/`.cl` | experimental | Phase 4 analytic non-SCC electronic forces; synthetic H2/sp3 pass, real-SK H2O 1×4 bucket crashes |
 | OpenCL GEMM | `rust_dftb/src/qmqm/gpu_matrix.rs` | active | `matmul_full_local_batched` (both matrices in __local, N ≤ 64) |
 | Rust (CPU ref) | `rust_dftb/src/methods/dftb/hamiltonian.rs` | reference | `HamiltonianBuilder::build_scc` — f64, LAPACK dsyevd, DIIS |
 | Rust (CPU ref) | `rust_dftb/src/qmqm/solver.rs` | reference | `MultiSystemSolver::solve_scc` — multi-fragment |
@@ -90,6 +91,9 @@ oscillation between competing charge transfer states. Not a GPU bug.
 
 ## Open Issues
 
+- **Analytic GPU forces (Phase 4) blocked** — `gpu_forces.cl` crashes on the
+  real-SK H2O 1×4 s-p bucket with `CL_INVALID_COMMAND_QUEUE`; synthetic tests
+  pass. See `doc/prokop/tasts/HBond_Relaxed_Scan_GPU/HBond_Relaxed_Scan_GPU.report.md`.
 - **Kernel objects rebuilt each call** — `Kernel::builder().build()` per
   iteration. Program cache hits, but Kernel handle creation is a performance
   TODO. Target: cache Kernel objects in `GpuRuntime`.

@@ -28,3 +28,11 @@ implementations of the same concept across Rust, Fortran, Python, and OpenCL.
 - **sk_interpolation.md** — SK integral interpolation: Fortran Neville 8-point,
   Rust cubic Hermite spline (CPU), Rust cubic B-spline (GPU). Parity, performance,
   analytic derivative paths.
+- **gpu_scc_pipeline.md** — device-resident GPU SCC loop; also lists the Phase 4
+  analytic GPU force work in `qmqm/gpu_forces.rs`/`.cl` and its current blocker
+  (real-SK H2O 1×4 crash).
+- **sparse_nanocrystal_vibrations.md** — sparse GPU DFTB for vibrational
+  calculations on Si/H nanocrystals. BSR4 padded basis, analytic forces, SpGEMM
+  plans, locality sweeps, Hessian plateau. Gates C–E passed; Gate F blocked on
+  sparse analytic force bridge. See
+  `tasts/Sparse_Nanocrystal_Vibrations/Sparse_Nanocrystal_Vibrations.report.md`.

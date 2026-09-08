@@ -21,11 +21,12 @@
 pub mod bsr4;
 pub mod gpu_sparse;
 pub mod davidson;
+pub mod sparse_forces;
 
 pub use bsr4::{
     build_geometric_mask, build_identity, build_product_mask, build_full_mask,
     diag_block_map, gershgorin_bounds, inf_norm, transpose_block_map,
-    Bsr4Matrix, Bsr4Mask,
+    Bsr4Matrix, Bsr4Mask, SpgemmPlan, build_spgemm_plan_bsym,
 };
-pub use gpu_sparse::{SparseBsr4Config, SparseBsr4Gpu};
+pub use gpu_sparse::{SparseBsr4Config, SparseBsr4Gpu, SparsePerfStats, SpgemmPlanGpu};
 pub use davidson::davidson_homo_lumo;

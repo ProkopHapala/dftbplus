@@ -57,6 +57,11 @@ match to ~1e-5–1e-4 e, consistent with the TC2 tolerance.
   per-atom orbital counts from `SystemContext::atom_n_orb`. H-passivated
   ribbons up to N=1156 (388 atoms, 132 H) are validated. The BSR4 TC2 path
   remains pure-C only.
+  **Update (Gate D):** the sparse nanocrystal vibrations task
+  (`sparse_nanocrystal_vibrations.md`) solved this for Si/H systems by padding
+  H atoms with 3 dummy orbitals (S_dd=1, H_dd=E_dummy), making the padded
+  overlap nonsingular while preserving the physical electron count. See
+  `tests/sih_padded_basis.rs`.
 - **TC2 convergence depends on spectral bounds** — the Newton-Schulz `Z≈S⁻¹`
   step must converge first; if it fails, TC2 diverges. Fail-loud checks present.
 - **No sparse matvec operator for Davidson** — the partial eigensolver currently
@@ -69,5 +74,6 @@ match to ~1e-5–1e-4 e, consistent with the TC2 tolerance.
 
 - `/doc/prokop/reports/2025-09-05_scc_charges_davidson_parity.md` — session report.
 - `/doc/prokop/topical_audit/chebyshev_ritz_eigensolver.md` — sparse Chebyshev+Ritz eigensolver (handles mixed C/H, alternative to TC2 for frontier orbitals).
+- `/doc/prokop/topical_audit/sparse_nanocrystal_vibrations.md` — Si/H nanocrystal vibrations: padded BSR4 basis, analytic forces, SpGEMM plans, Hessian plateau.
 - `/rust_dftb/scripts/test_charges_homo_lumo.rhai` — end-to-end test.
 - `/debug/graphene_sparse/` — plots, TSVs, convergence history.

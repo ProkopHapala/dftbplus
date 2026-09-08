@@ -345,23 +345,26 @@ fn pack_sk_tables(
                 }
                 (n_gpu, dr, sk_h, sk_s)
             } else {
-                // Resample to SK_RESAMPLE_N points (with prepended zero)
-                let n_resampled = SK_RESAMPLE_N - 1; // -1 to leave room for prepended zero
-                let n_gpu = n_resampled + 1;
+                // Include the r=0 dummy before resampling: original SK row k is
+                // at r=(k+1)*dr, not k*dr. Prepending after resampling would shift
+                // the physical table by dr_new instead of the original dr.
+                let n_gpu = SK_RESAMPLE_N;
                 let mut sk_h = vec![0.0f32; n_gpu * n_sk_cols];
                 let mut sk_s = vec![0.0f32; n_gpu * n_sk_cols];
                 let mut dr_new = 0.0f32;
                 for col in 0..n_sk_cols {
-                    let (h_vals, dr) =
-                        spline_resample::resample_sk_column(&h_cols[col], dr_orig, n_resampled);
-                    let (s_vals, _) =
-                        spline_resample::resample_sk_column(&s_cols[col], dr_orig, n_resampled);
+                    let mut h_src = Vec::with_capacity(n_grid_orig + 1);
+                    h_src.push(0.0);
+                    h_src.extend_from_slice(&h_cols[col]);
+                    let mut s_src = Vec::with_capacity(n_grid_orig + 1);
+                    s_src.push(0.0);
+                    s_src.extend_from_slice(&s_cols[col]);
+                    let (h_vals, dr) = spline_resample::resample_sk_column(&h_src, dr_orig, n_gpu);
+                    let (s_vals, _) = spline_resample::resample_sk_column(&s_src, dr_orig, n_gpu);
                     dr_new = dr;
-                    sk_h[col] = 0.0; // r=0 dummy
-                    sk_s[col] = 0.0;
-                    for k in 0..n_resampled {
-                        sk_h[(k + 1) * n_sk_cols + col] = h_vals[k];
-                        sk_s[(k + 1) * n_sk_cols + col] = s_vals[k];
+                    for k in 0..n_gpu {
+                        sk_h[k * n_sk_cols + col] = h_vals[k];
+                        sk_s[k * n_sk_cols + col] = s_vals[k];
                     }
                 }
                 (n_gpu, dr_new, sk_h, sk_s)
@@ -627,11 +630,9 @@ fn build_pair_buckets(
 
                 let sp_i = global_atom_species[atom_off + atom_i as usize] as u8;
                 let sp_j = global_atom_species[atom_off + atom_j as usize] as u8;
-                let sp_min = sp_i.min(sp_j);
-                let sp_max = sp_i.max(sp_j);
 
                 let bucket_idx = block_type as usize * n_species * n_species
-                    + sp_min as usize * n_species + sp_max as usize;
+                    + sp_i as usize * n_species + sp_j as usize;
 
                 let entry = GpuPairEntry {
                     replica: fi as u32,
@@ -654,7 +655,7 @@ fn build_pair_buckets(
     let mut out = Vec::new();
     for block_type in 0u8..=2 {
         for sp_i in 0..n_species {
-            for sp_j in sp_i..n_species {
+            for sp_j in 0..n_species {
                 let bucket_idx = block_type as usize * n_species * n_species
                     + sp_i * n_species + sp_j;
                 let entries = &mut buckets[bucket_idx];

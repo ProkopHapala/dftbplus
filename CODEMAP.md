@@ -79,13 +79,16 @@ QM/QM fragment solver with OpenCL GPU offload. Python utilities (`pyBall/`,
     `multipole_integrals.rs`.
   - `sparse/` — BSR4 sparse + GPU sparse purification + partial eigensolver:
     `bsr4.rs`, `gpu_sparse.rs`, `sparse_bsr4_purification.cl`,
-    `davidson.rs` (generalized Davidson for `H C = S C ε`, frontier orbitals).
+    `davidson.rs` (generalized Davidson for `H C = S C ε`, frontier orbitals),
+    `sparse_forces.rs` (P3: sparse D=2K, W=2KHK via masked SpGEMM).
 - `src/qmqm/` — multi-fragment QM/QM solver + GPU runtime: `fragment.rs`,
   `solver.rs`, `mixer.rs`, `shifts.rs`, `gamma.rs`, `charges.rs`,
   `gpu_driver.rs`, `gpu_runtime.rs`, `gpu_matrix.rs`, `gpu_prep.rs`,
   `gpu_eigen.rs`/`.cl`, `gpu_matrix_ops.cl`, `gpu_scc.rs` (device-resident
   SCC loop driver with DIIS, warm-start, best-effort mode, per-system RMS
-  diagnostics).
+  diagnostics), `gpu_forces.rs`/`.cl` (Phase 4: analytic non-SCC electronic
+  GPU force kernel; currently blocked on real-SK 1×4 bucket crash, see
+  `doc/prokop/tasts/HBond_Relaxed_Scan_GPU/HBond_Relaxed_Scan_GPU.report.md`).
 - `src/bin/` — executables: `dftb_engine.rs`, `graphene_build.rs`.
 - `examples/` — runnable demos: `hbond_ref.rs`, `scan.rs`, `neb.rs`, `test_h2.rs`,
   `debug_h2.rs`, `debug_sk.rs`.
@@ -114,6 +117,8 @@ QM/QM fragment solver with OpenCL GPU offload. Python utilities (`pyBall/`,
   - `tasts/<task>/` — **task specs only** (Markdown). e.g.
     `tasts/GPU_MultiSystem/` → `task_master.md` + `agent*.md`. No scripts/artifacts
     here; specs may *reference* `debug/...` paths.
+    `tasts/Sparse_Nanocrystal_Vibrations/` → `*.manifest.md` (source of truth),
+    `*.chat.md` (design discussion), `*.report.md` (implementation report).
   - `chats/` — design chat logs (`MultiSystemOpenCL.chat.md`, …).
   - `reports/` — written session reports (e.g.
     `2025-09-05_scc_charges_davidson_parity.md`,

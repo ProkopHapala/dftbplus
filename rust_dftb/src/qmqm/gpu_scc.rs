@@ -27,11 +27,11 @@
 //!   back + N*batch ints uploaded — negligible for N≤64, batch≤1000).
 
 use crate::core::error::{DftbError, Result};
-use crate::qmqm::gpu_eigen::{build_inv_sqrt, jacobi_cyclic_local_batched};
+use crate::qmqm::gpu_eigen::{build_inv_sqrt_batched, jacobi_batched};
 use crate::qmqm::gpu_matrix::{
-    build_density_masked_batched, delta_q_batched, dot_batched, frobenius_trace_batched,
-    gamma_matvec_batched, h_scc_update_batched, matmul_full_local_batched,
-    mulliken_charges_batched, residual_and_mix_batched,
+    build_density_masked_batched, delta_q_batched, dot_batched, extract_diagonal_batched,
+    frobenius_trace_batched, gamma_matvec_batched, h_scc_update_batched,
+    matmul_batched, mulliken_charges_batched, residual_and_mix_batched,
 };
 use crate::qmqm::gpu_runtime::GpuRuntime;
 use ocl::Buffer;
@@ -167,11 +167,7 @@ pub fn gpu_solve_scc_batched(
     tol: f32,
     alpha: f32,
 ) -> Result<GpuSccResult> {
-    if n > 64 {
-        return Err(DftbError::InvalidInput(format!(
-            "gpu_solve_scc_batched: n={n} exceeds max supported 64 (local memory limit)"
-        )));
-    }
+    // Phase 3: N>64 is now supported via tiled Jacobi + tiled GEMM + tiled S^{-1/2}.
     if n_occ > n {
         return Err(DftbError::InvalidInput(format!(
             "gpu_solve_scc_batched: n_occ={n_occ} > n={n}"
@@ -179,7 +175,7 @@ pub fn gpu_solve_scc_batched(
     }
 
     // --- Precompute X = S^{-1/2} (once per geometry) ---
-    let (x_buf, _lambda_min) = build_inv_sqrt(rt, s_buf, n, batch)?;
+    let (x_buf, _lambda_min) = build_inv_sqrt_batched(rt, s_buf, n, batch)?;
 
     // --- Allocate working buffers (once, outside SCC loop) ---
     let nn = n * n;
@@ -201,16 +197,16 @@ pub fn gpu_solve_scc_batched(
     let tr = rt.zero_buffer::<f32>(batch)?;
     let dot = rt.zero_buffer::<f32>(batch)?;
     let occ_mask = rt.zero_buffer::<i32>(batch * n)?;
+    let eig_diag_buf = rt.zero_buffer::<f32>(batch * n)?; // Phase 0d: diagonal extraction
 
     // Double-buffered charges: q_bufs[q_cur] = current, q_bufs[1-q_cur] = next mixed
     let q_bufs = [q_a, q_b];
     let mut q_cur = 0usize;
 
     // Host staging for eigenvalue extraction + occupation mask.
-    // eig_diag receives the full hp (N*N*batch) — we only use the diagonal
-    // but ocl read_buffer requires the full length. TODO: add a
-    // diagonal-extract kernel to avoid the full N*N readback.
-    let mut eig_full = vec![0.0f32; batch * nn];
+    // Phase 0d: extract only the diagonal (N*batch floats) instead of
+    // reading the full N²*batch matrix.
+    let mut eig_diag = vec![0.0f32; batch * n];
     let mut mask_host = vec![0i32; batch * n];
 
     // --- SCC loop ---
@@ -232,11 +228,11 @@ pub fn gpu_solve_scc_batched(
         h_scc_update_batched(rt, h0_buf, s_buf, &v, &h_scc, orb_atom_buf, n, n_atoms, batch)?;
 
         // 4. H' = X · H_scc · X  (2 GEMMs)
-        matmul_full_local_batched(rt, &x_buf, &h_scc, &temp, n, batch)?;
-        matmul_full_local_batched(rt, &temp, &x_buf, &hp, n, batch)?;
+        matmul_batched(rt, &x_buf, &h_scc, &temp, n, batch)?;
+        matmul_batched(rt, &temp, &x_buf, &hp, n, batch)?;
 
         // 5. Jacobi(H') → eigenvalues on diag(hp), eigenvectors in cp
-        jacobi_cyclic_local_batched(rt, &hp, &cp, n, batch)?;
+        jacobi_batched(rt, &hp, &cp, n, batch)?;
 
         if verbose && iter < 5 {
             // Debug: read back charges and eigenvalues for first system
@@ -255,15 +251,16 @@ pub fn gpu_solve_scc_batched(
             eprintln!("    [gpu_scc] iter {iter}: eig(diag)={:?}", &diags[..n.min(6)]);
         }
 
-        // 6. Read diag(H') → sort → build occ_mask → upload
-        // TODO: add a diagonal-extract kernel to avoid full N*N readback.
-        //       For N≤64, batch≤1000 this is ≤256 KB — acceptable for now.
-        rt.read_buffer(&hp, &mut eig_full)?;
+        // 6. Extract diag(H') on GPU → read N*batch floats → sort → occ_mask → upload
+        // Phase 0d: uses extract_diagonal_batched kernel instead of reading
+        // the full N²*batch matrix. Reduces readback by factor of N.
+        extract_diagonal_batched(rt, &hp, &eig_diag_buf, n, batch)?;
+        rt.read_buffer(&eig_diag_buf, &mut eig_diag)?;
         for bi in 0..batch {
             let mut idxs: Vec<usize> = (0..n).collect();
             idxs.sort_unstable_by(|&a, &b| {
-                eig_full[bi * nn + a * n + a]
-                    .partial_cmp(&eig_full[bi * nn + b * n + b])
+                eig_diag[bi * n + a]
+                    .partial_cmp(&eig_diag[bi * n + b])
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
             for (rank, &k) in idxs.iter().enumerate() {
@@ -276,7 +273,7 @@ pub fn gpu_solve_scc_batched(
             .map_err(crate::qmqm::gpu_runtime::map_ocl_err)?;
 
         // 7. C = X · C'
-        matmul_full_local_batched(rt, &x_buf, &cp, &c, n, batch)?;
+        matmul_batched(rt, &x_buf, &cp, &c, n, batch)?;
 
         // 8. D = 2·Σ_{k∈occ} C[:,k]·C[:,k]^T
         build_density_masked_batched(rt, &c, &occ_mask, &d, n, batch)?;
@@ -332,11 +329,12 @@ pub fn gpu_solve_scc_batched(
     let mut charges = vec![0.0f32; batch * n_atoms];
     rt.read_buffer(&q_bufs[q_cur], &mut charges)?;
 
-    // Eigenvalues: re-read hp diagonal and sort ascending
-    rt.read_buffer(&hp, &mut eig_full)?;
+    // Eigenvalues: extract diagonal on GPU and sort ascending (Phase 0d)
+    extract_diagonal_batched(rt, &hp, &eig_diag_buf, n, batch)?;
+    rt.read_buffer(&eig_diag_buf, &mut eig_diag)?;
     let mut eigenvalues = vec![0.0f32; batch * n];
     for bi in 0..batch {
-        let mut eigs: Vec<f32> = (0..n).map(|i| eig_full[bi * nn + i * n + i]).collect();
+        let mut eigs: Vec<f32> = eig_diag[bi * n..(bi + 1) * n].to_vec();
         eigs.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         eigenvalues[bi * n..(bi + 1) * n].copy_from_slice(&eigs);
     }
@@ -426,22 +424,18 @@ pub fn gpu_solve_scc_batched_diis_warmstart(
 ) -> Result<GpuSccResult> {
     use crate::qmqm::mixer::{DiisMixer, Mixer};
 
-    if n > 64 {
-        return Err(DftbError::InvalidInput(format!(
-            "gpu_solve_scc_batched_diis_warmstart: n={n} exceeds max supported 64"
-        )));
-    }
+    // Phase 3: N>64 is now supported via tiled Jacobi + tiled GEMM + tiled S^{-1/2}.
 
     let do_timing = timing_enabled();
     let mut tm: Option<GpuSccTiming> = if do_timing { Some(GpuSccTiming::default()) } else { None };
     let t_total_start = std::time::Instant::now();
 
     // --- Precompute X = S^{-1/2} (once) ---
-    let (x_buf, _) = timed!(tm, t_inv_sqrt, build_inv_sqrt(rt, s_buf, n, batch)?);
+    let (x_buf, _) = timed!(tm, t_inv_sqrt, build_inv_sqrt_batched(rt, s_buf, n, batch)?);
 
     // --- Allocate working buffers (once) ---
     let nn = n * n;
-    let (q0_host, init_q_host, q_gpu, dq, v, h_scc, temp, hp, cp, c, d, q_new, tr, dot, occ_mask) = timed!(tm, t_alloc, {
+    let (q0_host, init_q_host, q_gpu, dq, v, h_scc, temp, hp, cp, c, d, q_new, tr, dot, occ_mask, eig_diag_buf) = timed!(tm, t_alloc, {
     let q0_host = {
         let mut tmp = vec![0.0f32; batch * n_atoms];
         rt.read_buffer(q0_buf, &mut tmp)?;
@@ -466,15 +460,20 @@ pub fn gpu_solve_scc_batched_diis_warmstart(
     let tr = rt.zero_buffer::<f32>(batch)?;
     let dot = rt.zero_buffer::<f32>(batch)?;
     let occ_mask = rt.zero_buffer::<i32>(batch * n)?;
-    (q0_host, init_q_host, q_gpu, dq, v, h_scc, temp, hp, cp, c, d, q_new, tr, dot, occ_mask)
+    let eig_diag_buf = rt.zero_buffer::<f32>(batch * n)?; // Phase 0d
+    (q0_host, init_q_host, q_gpu, dq, v, h_scc, temp, hp, cp, c, d, q_new, tr, dot, occ_mask, eig_diag_buf)
     });
 
     // Host staging buffers
-    let mut eig_full = vec![0.0f32; batch * nn];
+    // Phase 0d: extract only the diagonal (N*batch floats) instead of
+    // reading the full N²*batch matrix.
+    let mut eig_diag = vec![0.0f32; batch * n];
     let mut mask_host = vec![0i32; batch * n];
     let mut q_new_host = vec![0.0f32; batch * n_atoms];
     let mut q_cur_host = vec![0.0f32; batch * n_atoms];
-    let mut q_mixed_host = vec![0.0f32; batch * n_atoms];
+    // Phase 0e: q_mixed_host starts as init_q_host — it's the host mirror
+    // of q_gpu and is updated each iteration after the DIIS mix + upload.
+    let mut q_mixed_host = init_q_host.clone();
     let mut rms_per_sys = vec![0.0f32; batch]; // per-system RMS for diagnostics
 
     // Per-system DIIS mixers
@@ -504,21 +503,24 @@ pub fn gpu_solve_scc_batched_diis_warmstart(
 
         // 4. H' = X · H_scc · X
         timed!(tm, t_gemm, {
-            matmul_full_local_batched(rt, &x_buf, &h_scc, &temp, n, batch)?;
-            matmul_full_local_batched(rt, &temp, &x_buf, &hp, n, batch)?;
+            matmul_batched(rt, &x_buf, &h_scc, &temp, n, batch)?;
+            matmul_batched(rt, &temp, &x_buf, &hp, n, batch)?;
         });
 
         // 5. Jacobi(H') → eigenvalues/eigenvectors
-        timed!(tm, t_jacobi, jacobi_cyclic_local_batched(rt, &hp, &cp, n, batch)?);
+        timed!(tm, t_jacobi, jacobi_batched(rt, &hp, &cp, n, batch)?);
 
-        // 6. Read diag → sort → occ_mask → upload
+        // 6. Extract diag on GPU → read N*batch floats → sort → occ_mask → upload
+        // Phase 0d: uses extract_diagonal_batched kernel instead of reading
+        // the full N²*batch matrix. Reduces readback by factor of N.
         timed!(tm, t_occ_sort, {
-        rt.read_buffer(&hp, &mut eig_full)?;
+        extract_diagonal_batched(rt, &hp, &eig_diag_buf, n, batch)?;
+        rt.read_buffer(&eig_diag_buf, &mut eig_diag)?;
         for bi in 0..batch {
             let mut idxs: Vec<usize> = (0..n).collect();
             idxs.sort_unstable_by(|&a, &b| {
-                eig_full[bi * nn + a * n + a]
-                    .partial_cmp(&eig_full[bi * nn + b * n + b])
+                eig_diag[bi * n + a]
+                    .partial_cmp(&eig_diag[bi * n + b])
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
             for (rank, &k) in idxs.iter().enumerate() {
@@ -529,7 +531,7 @@ pub fn gpu_solve_scc_batched_diis_warmstart(
         });
 
         // 7. C = X · C'
-        timed!(tm, t_back_gemm, matmul_full_local_batched(rt, &x_buf, &cp, &c, n, batch)?);
+        timed!(tm, t_back_gemm, matmul_batched(rt, &x_buf, &cp, &c, n, batch)?);
 
         // 8. D = 2·Σ_{k∈occ} C[:,k]·C[:,k]^T
         timed!(tm, t_density, build_density_masked_batched(rt, &c, &occ_mask, &d, n, batch)?);
@@ -538,10 +540,13 @@ pub fn gpu_solve_scc_batched_diis_warmstart(
         timed!(tm, t_mulliken, mulliken_charges_batched(rt, &d, s_buf, &q_new, orb_atom_buf, n, n_atoms, batch)?);
 
         // 10. CPU-driven DIIS mixing
+        // Phase 0e: eliminated redundant q_gpu read — q_mixed_host from the
+        // previous iteration is already the current q_gpu content (we just
+        // uploaded it). Only q_new (Mulliken output) needs to be read.
         let max_rms = timed!(tm, t_diis_mix, {
-        // Read back q_new and q_cur (small: batch*n_atoms floats)
         rt.read_buffer(&q_new, &mut q_new_host)?;
-        rt.read_buffer(&q_gpu, &mut q_cur_host)?;
+        // q_cur_host = q_mixed_host from previous iter (or init_q_host on iter 0)
+        q_cur_host.copy_from_slice(&q_mixed_host);
 
         let mut max_rms = 0.0f32;
         rms_per_sys.fill(0.0f32);
@@ -621,10 +626,12 @@ pub fn gpu_solve_scc_batched_diis_warmstart(
         let mut charges = vec![0.0f32; batch * n_atoms];
         rt.read_buffer(&q_gpu, &mut charges)?;
 
-        rt.read_buffer(&hp, &mut eig_full)?;
+        // Phase 0d: extract diagonal on GPU instead of reading full N²*batch
+        extract_diagonal_batched(rt, &hp, &eig_diag_buf, n, batch)?;
+        rt.read_buffer(&eig_diag_buf, &mut eig_diag)?;
         let mut eigenvalues = vec![0.0f32; batch * n];
         for bi in 0..batch {
-            let mut eigs: Vec<f32> = (0..n).map(|i| eig_full[bi * nn + i * n + i]).collect();
+            let mut eigs: Vec<f32> = eig_diag[bi * n..(bi + 1) * n].to_vec();
             eigs.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
             eigenvalues[bi * n..(bi + 1) * n].copy_from_slice(&eigs);
         }

@@ -968,3 +968,24 @@ __kernel void dot_batched(
     }
     if (lid == 0) dot[sid] = scratch[0];
 }
+
+// ------------------------------------------------------------------
+// extract_diagonal_batched
+//
+// Extracts the diagonal of a batched N×N matrix: diag[sid*N + i] = A[sid*N*N + i*N + i].
+// One thread per (system, orbital) pair. No barriers, no local memory.
+// This replaces reading the full N²×batch matrix to host just to get N eigenvalues.
+// ------------------------------------------------------------------
+__kernel void extract_diagonal_batched(
+    const int n,
+    const int batch,
+    __global const float* a,
+    __global float* diag
+) {
+    const int gid = get_global_id(0);
+    const int total = n * batch;
+    if (gid >= total) return;
+    const int sid = gid / n;
+    const int i = gid % n;
+    diag[gid] = a[(size_t)sid * n * n + i * n + i];
+}

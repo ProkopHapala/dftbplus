@@ -656,6 +656,105 @@ pub fn matmul_full_local_batched(
     Ok(())
 }
 
+/// Tiled batched matrix multiply: C_b = A_b · B_b (no transpose, α=1, β=0).
+///
+/// Phase 1: general N>64 GEMM using the existing `batched_gemm` kernel from
+/// `gpu_matrix_ops.cl`. Tiles of A and B are loaded into local memory.
+/// Works for any N (boundary handled with `if (row < n && col < n)` guards).
+///
+/// Tile sizes are baked into the source via `#define` (default 16×16×32).
+/// The compiled program is cached by `GpuRuntime`.
+///
+/// All buffers are `[batch][N*N]` row-major `Buffer<f32>`.
+pub fn matmul_tiled_batched(
+    rt: &mut GpuRuntime,
+    a_buf: &Buffer<f32>,
+    b_buf: &Buffer<f32>,
+    c_buf: &Buffer<f32>,
+    n: usize,
+    batch: usize,
+) -> Result<()> {
+    matmul_tiled_batched_params(rt, a_buf, b_buf, c_buf, n, batch, false, false, 1.0, 0.0)
+}
+
+/// Tiled batched GEMM with full parameters: C = α·op(A)·op(B) + β·C.
+///
+/// `trans_a`/`trans_b`: true = transpose. `alpha`/`beta`: scaling.
+/// Tile sizes default to 16×16×32 (from `MATRIX_KERNEL_TEMPLATE`).
+pub fn matmul_tiled_batched_params(
+    rt: &mut GpuRuntime,
+    a_buf: &Buffer<f32>,
+    b_buf: &Buffer<f32>,
+    c_buf: &Buffer<f32>,
+    n: usize,
+    batch: usize,
+    trans_a: bool,
+    trans_b: bool,
+    alpha: f32,
+    beta: f32,
+) -> Result<()> {
+    if n == 0 || batch == 0 {
+        return Ok(());
+    }
+    // Tile sizes must match the #define in gpu_matrix_ops.cl.
+    const TILE_M: usize = 16;
+    const TILE_N: usize = 16;
+    const TILE_K: usize = 32;
+    let row_groups = div_ceil(n, TILE_M);
+    let col_groups = div_ceil(n, TILE_N);
+    // 3D NDRange: (col_groups*TILE_N, row_groups*TILE_M, batch)
+    // Workgroup: (TILE_N, TILE_M) — 2D, 256 threads.
+    let gws = ocl::SpatialDims::Three(
+        col_groups * TILE_N,
+        row_groups * TILE_M,
+        batch,
+    );
+    let lws = ocl::SpatialDims::Two(TILE_N, TILE_M);
+    let a_local = TILE_M * TILE_K;
+    let b_local = TILE_K * TILE_N;
+    let source = MATRIX_KERNEL_TEMPLATE;
+    let program = rt.build_program(source)?;
+    let kernel = Kernel::builder()
+        .program(&program)
+        .name("batched_gemm")
+        .queue(rt.queue().clone())
+        .global_work_size(gws)
+        .local_work_size(lws)
+        .arg(n as i32)
+        .arg(batch as i32)
+        .arg(if trans_a { 1 } else { 0 })
+        .arg(if trans_b { 1 } else { 0 })
+        .arg(alpha)
+        .arg(beta)
+        .arg(a_buf)
+        .arg(b_buf)
+        .arg(c_buf)
+        .arg_local::<f32>(a_local)
+        .arg_local::<f32>(b_local)
+        .build()
+        .map_err(map_ocl_err)?;
+    unsafe { kernel.enq().map_err(map_ocl_err)?; }
+    Ok(())
+}
+
+/// Dispatch GEMM: use full-local for N≤64 (faster), tiled for N>64.
+/// This is the production entry point — callers should use this instead
+/// of `matmul_full_local_batched` directly.
+pub fn matmul_batched(
+    rt: &mut GpuRuntime,
+    a_buf: &Buffer<f32>,
+    b_buf: &Buffer<f32>,
+    c_buf: &Buffer<f32>,
+    n: usize,
+    batch: usize,
+) -> Result<()> {
+    if n <= 64 {
+        matmul_full_local_batched(rt, a_buf, b_buf, c_buf, n, batch)
+    } else {
+        matmul_tiled_batched(rt, a_buf, b_buf, c_buf, n, batch)
+    }
+}
+
 /// Atom-resolved gamma matvec: V_b = G_b · Δq_b for each batch element.
 ///
 /// One workgroup per system, one thread per atom. `g_buf` is
@@ -914,6 +1013,32 @@ pub fn dot_batched(
         .arg(n as i32).arg(batch as i32)
         .arg(x_buf).arg(y_buf).arg(dot_buf)
         .arg_local::<f32>(wg)
+        .build().map_err(map_ocl_err)?;
+    unsafe { kernel.enq().map_err(map_ocl_err)?; }
+    Ok(())
+}
+
+/// Extract diagonal of a batched N×N matrix: `diag[sid*N + i] = A[sid*N*N + i*N + i]`.
+/// One thread per (system, orbital) pair. Replaces reading the full N²×batch
+/// matrix to host just to get N eigenvalues (Phase 0d).
+pub fn extract_diagonal_batched(
+    rt: &mut GpuRuntime,
+    a_buf: &Buffer<f32>,
+    diag_buf: &Buffer<f32>,
+    n: usize,
+    batch: usize,
+) -> Result<()> {
+    if n == 0 || batch == 0 { return Ok(()); }
+    let total = n * batch;
+    // Round up to next multiple of 64 for wave efficiency.
+    let gws = ((total + 63) / 64) * 64;
+    let source = MATRIX_KERNEL_TEMPLATE;
+    let program = rt.build_program(source)?;
+    let kernel = Kernel::builder()
+        .program(&program).name("extract_diagonal_batched").queue(rt.queue().clone())
+        .global_work_size(gws).local_work_size(64)
+        .arg(n as i32).arg(batch as i32)
+        .arg(a_buf).arg(diag_buf)
         .build().map_err(map_ocl_err)?;
     unsafe { kernel.enq().map_err(map_ocl_err)?; }
     Ok(())

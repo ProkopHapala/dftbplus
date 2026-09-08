@@ -413,6 +413,107 @@ __kernel void bsr4_spgemm_masked_Bsym(
 
 
 // ============================================================================
+// P4: SYMBOLIC SpGEMM PLAN — Bsym variant
+//
+// Precomputed intersection plan for C = P_M(A · B) where B is symmetric.
+//
+// For each output block C_ij (global block index cb), the plan stores the
+// exact list of contributing (A_ik, B_jk) block pairs:
+//
+//   plan_ptr[cb] .. plan_ptr[cb+1]  ->  range of terms for output block cb
+//   plan_a_idx[t]                    ->  local index of A_ik in row i (0-based)
+//   plan_b_idx[t]                    ->  global block index of B_jk in B
+//
+// The kernel loads A's row into local memory (as before), then for each
+// output block iterates the plan terms — no intersection, no binary search.
+// Only loads + 4x4 FMAs.
+//
+// Fail-loud: if plan_a_idx[t] >= na (left degree), the kernel writes NaN.
+// ============================================================================
+
+__attribute__((reqd_work_group_size(WG,1,1)))
+__kernel void bsr4_spgemm_plan_Bsym(
+    const uint nrow,
+
+    __global const uint*  A_row,
+    __global const uint*  A_col,
+    __global const float* A,
+
+    __global const float* B,
+    __global const uint*  plan_ptr,
+    __global const uint*  plan_a_idx,
+    __global const uint*  plan_b_idx,
+
+    __global const uint*  C_row,
+    __global const uint*  C_col,
+    __global float*       C
+){
+    const uint i   = get_group_id(0);
+    const uint lid = get_local_id(0);
+
+    if(i >= nrow) return;
+
+    const uint a0 = A_row[i];
+    const uint a1 = A_row[i+1];
+    const uint na = a1-a0;
+
+    if(na > MAX_LEFT_BLOCKS) return;
+
+    // Cache complete left sparse row into local memory.
+    __local uint  lcol[MAX_LEFT_BLOCKS];
+    __local float lA[MAX_LEFT_BLOCKS*BS2];
+
+    for(uint a=lid; a<na; a+=WG){
+        lcol[a] = A_col[a0+a];
+    }
+    for(uint t=lid; t<na*BS2; t+=WG){
+        lA[t] = A[a0*BS2+t];
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    const uint team = lid >> 4;
+    const uint lane = lid & 15;
+    const uint r = lane >> 2;
+    const uint c = lane & 3;
+
+    const uint c0 = C_row[i];
+    const uint c1 = C_row[i+1];
+
+    for(uint cb=c0+team; cb<c1; cb+=NTEAM){
+
+        const uint t0 = plan_ptr[cb];
+        const uint t1 = plan_ptr[cb+1];
+
+        float sum = 0.0f;
+
+        // Iterate precomputed plan terms — no intersection, no search.
+        for(uint t=t0; t<t1; ++t){
+
+            const uint ia = plan_a_idx[t];
+            const uint bb = plan_b_idx[t];
+
+            // Fail-loud: ia out of range means the plan is corrupt.
+            if(ia >= na){
+                sum = NAN;
+                break;
+            }
+
+            __local const float* Ab = lA + ia*BS2;
+            __global const float* Bjk = B + bb*BS2;
+
+            // C_ij[r,c] += sum_m A_ik[r,m] * B_jk[c,m]  (B_kj = B_jk^T)
+            sum = fma(Ab[4*r+0], Bjk[4*c+0], sum);
+            sum = fma(Ab[4*r+1], Bjk[4*c+1], sum);
+            sum = fma(Ab[4*r+2], Bjk[4*c+2], sum);
+            sum = fma(Ab[4*r+3], Bjk[4*c+3], sum);
+        }
+
+        C[cb*BS2 + lane] = sum;
+    }
+}
+
+
+// ============================================================================
 // SIMPLE ELEMENTWISE OPERATIONS
 // ============================================================================
 

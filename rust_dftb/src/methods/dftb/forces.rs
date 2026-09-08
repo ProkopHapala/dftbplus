@@ -429,6 +429,10 @@ fn build_density_matrices(
 /// Returns flat buffers `out_h`, `out_s` of length `n_orb_i * n_orb_j`,
 /// row-major (rows = orbitals of j, cols = orbitals of i) — matching the
 /// convention used by `Rotation::rotate_diatomic_block_into`.
+///
+/// **P2:** Now test/reference-only — production force code uses
+/// `build_pair_block_with_derivs` (analytic derivatives) instead.
+#[cfg(test)]
 fn build_pair_block(
     ctx: &SystemContext<'_>,
     coords_i: [f64; 3],
@@ -468,11 +472,71 @@ fn build_pair_block(
     )
 }
 
+/// Build a pair H/S block AND its analytic Cartesian derivatives for atoms
+/// (i, j) using the SK tables. This is the **production analytic force path**
+/// (P2, manifest v3 §4.3): replaces the nested finite-difference
+/// `pair_block_derivative` with analytic SK radial + angular derivatives.
+///
+/// Outputs (all row-major, size `n_orb_j * n_orb_i`):
+///   out_h, out_s: H and S blocks
+///   dh_dx, dh_dy, dh_dz: dH/dR_a for a=x,y,z (derivative w.r.t. atom j)
+///   ds_dx, ds_dy, ds_z: dS/dR_a for a=x,y,z
+///
+/// Derivatives are w.r.t. atom j's position in Å, and the SK radial
+/// derivatives are in Hartree/Bohr, so the Cartesian derivatives are in
+/// Hartree/Bohr (matching the SK convention). The force functions convert
+/// to Hartree/Å using ANG2BOHR.
+fn build_pair_block_with_derivs(
+    ctx: &SystemContext<'_>,
+    coords: &[[f64; 3]],
+    i: usize,
+    j: usize,
+    out_h: &mut [f64], out_s: &mut [f64],
+    dh_dx: &mut [f64], dh_dy: &mut [f64], dh_dz: &mut [f64],
+    ds_dx: &mut [f64], ds_dy: &mut [f64], ds_dz: &mut [f64],
+) -> Result<()> {
+    let si = ctx.atom_species[i];
+    let sj = ctx.atom_species[j];
+
+    let tab_fwd = ctx.pair_table(si, sj).ok_or_else(|| {
+        DftbError::InvalidInput(format!("missing SK table fwd ({si},{sj})"))
+    })?;
+    let tab_rev = ctx.pair_table(sj, si).ok_or_else(|| {
+        DftbError::InvalidInput(format!("missing SK table rev ({sj},{si})"))
+    })?;
+
+    let v = [
+        coords[j][0] - coords[i][0],
+        coords[j][1] - coords[i][1],
+        coords[j][2] - coords[i][2],
+    ];
+    let r_bohr = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt() * ANG2BOHR;
+    let dc = DirectionCosines::from_vec(v)?;
+
+    Rotation::rotate_block_with_derivs_into(
+        tab_fwd,
+        tab_rev,
+        ctx.species_ang[si as usize],
+        ctx.species_ang[sj as usize],
+        r_bohr,
+        dc,
+        out_h, out_s,
+        dh_dx, dh_dy, dh_dz,
+        ds_dx, ds_dy, ds_dz,
+    )
+}
+
 /// Compute the central finite-difference derivative of the pair H/S block
 /// with respect to Cartesian direction `dir` (0=x, 1=y, 2=z) of atom j.
 ///
 /// Matches Fortran `getFirstDerivFiniteDiff`: displaces atom j by ±delta
 /// along `dir`, rebuilds the block, and returns `(dH, dS)` as flat buffers.
+///
+/// **P2 firewall (manifest v3 §4.3):** This is a **test/reference helper
+/// only**. Production sparse/dense force code must use
+/// `build_pair_block_with_derivs` (analytic SK derivatives) instead.
+/// The only production finite difference is force → nuclear Hessian.
+#[cfg(test)]
 fn pair_block_derivative(
     ctx: &SystemContext<'_>,
     coords: &[[f64; 3]],
@@ -541,6 +605,10 @@ fn extract_pair_dm_edm(
 ///
 /// The factor of 2 accounts for the implicit lower-triangle summation,
 /// matching `derivativeNonSccEuclidian` in `forces.F90`.
+///
+/// **P2 (manifest v3 §4.3):** Uses analytic SK radial + angular derivatives
+/// via `build_pair_block_with_derivs`. No finite differences of H/S blocks.
+/// The only production finite difference is force → nuclear Hessian.
 pub fn non_scc_electronic_force(
     ctx: &SystemContext<'_>,
     neigh: &NeighborList,
@@ -549,8 +617,8 @@ pub fn non_scc_electronic_force(
     edm: &DMatrix<f64>,
     forces: &mut [[f64; 3]],
 ) -> Result<()> {
-    let max_block = ctx.species_n_orb.iter().copied().map(|n| n as usize).max().unwrap_or(0);
-    let max_block = max_block * max_block;
+    let max_n = ctx.species_n_orb.iter().copied().map(|n| n as usize).max().unwrap_or(0);
+    let max_block = max_n * max_n;
 
     for p in &neigh.pairs {
         let i = p.i;
@@ -561,20 +629,43 @@ pub fn non_scc_electronic_force(
 
         let (sqr_dm, sqr_edm) = extract_pair_dm_edm(dm, edm, ctx, i, j);
 
-        for dir in 0..3 {
-            let (dh, ds) = pair_block_derivative(
-                ctx, coords, i, j, dir, DELTA_X_DIFF_ANG, block_size,
-            )?;
+        // P2: analytic derivatives — one SK evaluation, all 3 directions at once.
+        let mut h = vec![0.0f64; max_block];
+        let mut s = vec![0.0f64; max_block];
+        let mut dh_dx = vec![0.0f64; max_block];
+        let mut dh_dy = vec![0.0f64; max_block];
+        let mut dh_dz = vec![0.0f64; max_block];
+        let mut ds_dx = vec![0.0f64; max_block];
+        let mut ds_dy = vec![0.0f64; max_block];
+        let mut ds_dz = vec![0.0f64; max_block];
 
-            let mut contr = 0.0f64;
-            for k in 0..block_size {
-                contr += sqr_dm[k] * dh[k] - sqr_edm[k] * ds[k];
-            }
-            // Factor of 2 for lower-triangle summation.
-            let f = 2.0 * contr;
-            forces[i][dir] += f;
-            forces[j][dir] -= f;
+        build_pair_block_with_derivs(
+            ctx, coords, i, j,
+            &mut h, &mut s,
+            &mut dh_dx, &mut dh_dy, &mut dh_dz,
+            &mut ds_dx, &mut ds_dy, &mut ds_dz,
+        )?;
+
+        // Force contribution: F_i += 2 * Σ (DM·dH - EDM·dS) for each direction.
+        // dH/dR_a is in Hartree/Bohr (SK convention), R is in Å, so the
+        // derivative w.r.t. R_Å is dH/dR_bohr * dR_bohr/dR_Å = dH/dR_bohr * ANG2BOHR.
+        let mut contr_x = 0.0f64;
+        let mut contr_y = 0.0f64;
+        let mut contr_z = 0.0f64;
+        for k in 0..block_size {
+            contr_x += sqr_dm[k] * dh_dx[k] - sqr_edm[k] * ds_dx[k];
+            contr_y += sqr_dm[k] * dh_dy[k] - sqr_edm[k] * ds_dy[k];
+            contr_z += sqr_dm[k] * dh_dz[k] - sqr_edm[k] * ds_dz[k];
         }
+        // Factor of 2 for lower-triangle summation.
+        // Convert from Hartree/Bohr to Hartree/Å (the force unit convention).
+        let f = 2.0 * ANG2BOHR;
+        forces[i][0] += f * contr_x;
+        forces[i][1] += f * contr_y;
+        forces[i][2] += f * contr_z;
+        forces[j][0] -= f * contr_x;
+        forces[j][1] -= f * contr_y;
+        forces[j][2] -= f * contr_z;
     }
     Ok(())
 }
@@ -595,6 +686,9 @@ pub fn non_scc_electronic_force(
 /// when the SCC potential is purely atom-resolved (which is the case for
 /// the standard DFTB SCC model used here — there are no orbital-resolved
 /// contributions in mio-1-1).
+///
+/// **P2 (manifest v3 §4.3):** Uses analytic dS/dR via
+/// `build_pair_block_with_derivs`. No finite differences.
 pub fn scc_shift_force(
     ctx: &SystemContext<'_>,
     neigh: &NeighborList,
@@ -616,33 +710,45 @@ pub fn scc_shift_force(
         let shift_i = shifts[i];
         let shift_j = shifts[j];
 
-        // Per-atom block shifts: shift_atom * I.
-        // shift_i_block is ni x ni, shift_j_block is nj x nj.
-
         let (sqr_dm, _sqr_edm) = extract_pair_dm_edm(dm, dm, ctx, i, j);
 
-        for dir in 0..3 {
-            let (_dh, ds) = pair_block_derivative(
-                ctx, coords, i, j, dir, DELTA_X_DIFF_ANG, block_size,
-            )?;
+        // P2: analytic dS/dR — one SK evaluation, all 3 directions at once.
+        let mut h = vec![0.0f64; max_block];
+        let mut s = vec![0.0f64; max_block];
+        let mut dh_dx = vec![0.0f64; max_block];
+        let mut dh_dy = vec![0.0f64; max_block];
+        let mut dh_dz = vec![0.0f64; max_block];
+        let mut ds_dx = vec![0.0f64; max_block];
+        let mut ds_dy = vec![0.0f64; max_block];
+        let mut ds_dz = vec![0.0f64; max_block];
 
-            // shiftSprime[a, b] = 0.5 * ( Σ_c S'[a,c]·shift_i_block[c,b]
-            //                           + Σ_c shift_j_block[a,c]·S'[c,b] )
-            // With shift_atom_block = shift_atom * I:
-            //   shiftSprime[a,b] = 0.5 * ( shift_i * S'[a,b] + shift_j * S'[a,b] )
-            //                    = 0.5 * (shift_i + shift_j) * S'[a,b]
-            //
-            // Then the force contribution is:
-            //   2 * Σ_{a,b} shiftSprime[a,b] * DM_block[a,b]
-            let avg_shift = 0.5 * (shift_i + shift_j);
-            let mut contr = 0.0f64;
-            for k in 0..block_size {
-                contr += avg_shift * ds[k] * sqr_dm[k];
-            }
-            let f = 2.0 * contr;
-            forces[i][dir] += f;
-            forces[j][dir] -= f;
+        build_pair_block_with_derivs(
+            ctx, coords, i, j,
+            &mut h, &mut s,
+            &mut dh_dx, &mut dh_dy, &mut dh_dz,
+            &mut ds_dx, &mut ds_dy, &mut ds_dz,
+        )?;
+
+        // shiftSprime[a,b] = 0.5 * ( shift_i * S'[a,b] + shift_j * S'[a,b] )
+        //                  = 0.5 * (shift_i + shift_j) * S'[a,b]
+        // F = 2 * Σ shiftSprime · DM_block
+        // dS/dR is in Hartree/Bohr; convert to Hartree/Å with ANG2BOHR.
+        let avg_shift = 0.5 * (shift_i + shift_j);
+        let mut contr_x = 0.0f64;
+        let mut contr_y = 0.0f64;
+        let mut contr_z = 0.0f64;
+        for k in 0..block_size {
+            contr_x += avg_shift * ds_dx[k] * sqr_dm[k];
+            contr_y += avg_shift * ds_dy[k] * sqr_dm[k];
+            contr_z += avg_shift * ds_dz[k] * sqr_dm[k];
         }
+        let f = 2.0 * ANG2BOHR;
+        forces[i][0] += f * contr_x;
+        forces[i][1] += f * contr_y;
+        forces[i][2] += f * contr_z;
+        forces[j][0] -= f * contr_x;
+        forces[j][1] -= f * contr_y;
+        forces[j][2] -= f * contr_z;
     }
     Ok(())
 }
@@ -1181,5 +1287,324 @@ mod tests {
         let (e, de) = spline.eval(5.0);
         assert_eq!(e, 0.0);
         assert_eq!(de, 0.0);
+    }
+
+    // ==================================================================
+    // P2 Gate B test #2: full analytic f64 force vs f64 total-energy FD
+    // (manifest v3 §4.3)
+    //
+    // Builds a synthetic H2 molecule with smooth exponential SK tables,
+    // computes the non-SCC electronic energy E = Tr(D·H0), and compares
+    // the analytic force F = -dE/dR against central finite differences of E.
+    //
+    // This is the "full system: analytic f64 force against finite difference
+    // of total f64 energy" test. It validates the entire force pipeline:
+    //   SK eval → rotation → H0 assembly → diagonalize → DM/EDM → force
+    //
+    // The test is self-contained — no external SK files needed.
+    // ==================================================================
+
+    use crate::methods::dftb::interpolation::EqGridTable;
+    use crate::methods::dftb::sk_data::{AtomicParamsSp, SkTableSp, SpeciesOrbitals};
+    use std::collections::HashMap;
+
+    /// Build a synthetic SkData for H (1s orbital) with smooth exponential SK tables.
+    /// Uses the extended 20-integral DFTB+ format: ss integral at index 19
+    /// (sk_map(0,0,0)=20, extended path: out = h_all[20-1] = h_all[19]).
+    fn make_h2_sk_data() -> SkData {
+        let dr = 0.1; // Bohr
+        let n_grid = 100;
+        let r_max = dr * n_grid as f64;
+
+        // H-H pair table: 20 integrals, only ss (index 19) is non-zero.
+        // V(r) = -0.3 * exp(-1.0 * r)
+        let hh_values: Vec<Vec<f64>> = (0..n_grid)
+            .map(|i| {
+                let r = i as f64 * dr;
+                let tail = if r > r_max - 1.0 {
+                    let t = (r_max - r) / 1.0;
+                    t * t
+                } else { 1.0 };
+                let v = -0.3 * (-1.0 * r).exp() * tail;
+                let mut row = vec![0.0f64; 20];
+                row[19] = v;  // ss integral (sk_map(0,0,0)=20 → index 19)
+                row
+            })
+            .collect();
+        let hh_h = EqGridTable::new(dr, hh_values.clone());
+        let hh_s = EqGridTable::new(dr, hh_values);
+        let hh_table = SkTableSp {
+            sp1: "H".to_string(),
+            sp2: "H".to_string(),
+            h: hh_h,
+            s: hh_s,
+        };
+
+        let mut pairs = HashMap::new();
+        pairs.insert(("H".to_string(), "H".to_string()), hh_table);
+
+        let mut onsite = HashMap::new();
+        onsite.insert("H".to_string(), AtomicParamsSp {
+            e_s: -0.4,  // Onsite energy (Hartree)
+            e_p: 0.0,
+            q0: 1.0,    // 1 electron
+            u_hubbard: 0.5,
+        });
+
+        let mut orbital_info = HashMap::new();
+        orbital_info.insert("H".to_string(), SpeciesOrbitals::from_ang_momenta(&[0]));
+
+        SkData {
+            onsite,
+            pairs,
+            orbital_info,
+        }
+    }
+
+    /// Compute the non-SCC electronic energy E = Tr(D·H0) for a given geometry.
+    fn non_scc_electronic_energy(
+        builder: &HamiltonianBuilder,
+        species: &[String],
+        coords: &[[f64; 3]],
+        n_electrons: f64,
+    ) -> Result<f64> {
+        let ham = builder.build_non_scc(species, coords)?;
+        let (c, _eigs) = diagonalize_non_scc(&ham, n_electrons)?;
+        let n_occ = (n_electrons / 2.0).round() as usize;
+        let c_occ = c.columns(0, n_occ).into_owned();
+        let dm = &c_occ * c_occ.transpose() * 2.0;
+        let e = (&dm * &ham.h0).trace();
+        Ok(e)
+    }
+
+    #[test]
+    fn test_analytic_force_vs_energy_fd_h2() {
+        let sk = make_h2_sk_data();
+        let builder = HamiltonianBuilder::new(sk);
+        let species = vec!["H".to_string(), "H".to_string()];
+        let n_electrons = 2.0; // H2 has 2 electrons
+
+        // Bond length ~1.0 Å (well within cutoff, non-trivial force)
+        let r_ang = 1.0;
+        let coords = vec![[0.0, 0.0, 0.0], [r_ang, 0.0, 0.0]];
+
+        // Compute analytic non-SCC electronic force
+        let ctx = SystemContext::from_sk_data(&builder.sk, &species).unwrap();
+        let cutoff = builder.sk.pairs.values()
+            .map(|t| t.cutoff())
+            .fold(0.0_f64, f64::max);
+        let neigh = NeighborBuilder { cutoff }.build(&coords).unwrap();
+        let ham = builder.build_non_scc(&species, &coords).unwrap();
+        let (c, eigs) = diagonalize_non_scc(&ham, n_electrons).unwrap();
+        let n_occ = (n_electrons / 2.0).round() as usize;
+        let c_occ = c.columns(0, n_occ).into_owned();
+        let eps_occ: Vec<f64> = eigs.iter().take(n_occ).copied().collect();
+        let (dm, edm) = build_density_matrices(&c_occ, &eps_occ);
+
+        let mut forces = vec![[0.0f64; 3]; 2];
+        non_scc_electronic_force(&ctx, &neigh, &coords, &dm, &edm, &mut forces).unwrap();
+
+        // Finite difference: F = -dE/dR
+        let delta = 1e-5; // Å (small for 2nd-order FD accuracy)
+        let mut max_err = 0.0f64;
+        let mut max_force = 0.0f64;
+        for atom in 0..2 {
+            for dir in 0..3 {
+                let mut coords_plus = coords.clone();
+                let mut coords_minus = coords.clone();
+                coords_plus[atom][dir] += delta;
+                coords_minus[atom][dir] -= delta;
+
+                let e_plus = non_scc_electronic_energy(&builder, &species, &coords_plus, n_electrons).unwrap();
+                let e_minus = non_scc_electronic_energy(&builder, &species, &coords_minus, n_electrons).unwrap();
+
+                // F = -dE/dR ≈ -(E+ - E-) / (2*delta)
+                let fd_force = -(e_plus - e_minus) / (2.0 * delta);
+                let analytic_force = forces[atom][dir];
+
+                let err = (fd_force - analytic_force).abs();
+                max_err = max_err.max(err);
+                max_force = max_force.max(analytic_force.abs());
+
+                eprintln!("atom {atom} dir {dir}: analytic={analytic_force:.6e} fd={fd_force:.6e} err={err:.3e}");
+            }
+        }
+        // Relative tolerance: the force should match FD to ~1e-4 relative
+        // (limited by FD step size and numerical roundoff in diagonalization).
+        let rel_err = if max_force > 1e-10 { max_err / max_force } else { max_err };
+        eprintln!("max|F|={max_force:.3e}  max|err|={max_err:.3e}  rel_err={rel_err:.3e}");
+        assert!(rel_err < 1e-4,
+            "analytic force vs energy FD: rel_err={rel_err:.3e} too large (max|F|={max_force:.3e}, max|err|={max_err:.3e})");
+    }
+
+    #[test]
+    fn test_analytic_force_vs_energy_fd_h2_tilted() {
+        // Same test but with a tilted geometry to exercise all 3 directions
+        let sk = make_h2_sk_data();
+        let builder = HamiltonianBuilder::new(sk);
+        let species = vec!["H".to_string(), "H".to_string()];
+        let n_electrons = 2.0;
+
+        // Tilted bond: not aligned with any axis
+        let coords = vec![
+            [0.0, 0.0, 0.0],
+            [0.5, 0.6, 0.7],  // ~1.05 Å bond length
+        ];
+
+        let ctx = SystemContext::from_sk_data(&builder.sk, &species).unwrap();
+        let cutoff = builder.sk.pairs.values()
+            .map(|t| t.cutoff())
+            .fold(0.0_f64, f64::max);
+        let neigh = NeighborBuilder { cutoff }.build(&coords).unwrap();
+        let ham = builder.build_non_scc(&species, &coords).unwrap();
+        let (c, eigs) = diagonalize_non_scc(&ham, n_electrons).unwrap();
+        let n_occ = (n_electrons / 2.0).round() as usize;
+        let c_occ = c.columns(0, n_occ).into_owned();
+        let eps_occ: Vec<f64> = eigs.iter().take(n_occ).copied().collect();
+        let (dm, edm) = build_density_matrices(&c_occ, &eps_occ);
+
+        let mut forces = vec![[0.0f64; 3]; 2];
+        non_scc_electronic_force(&ctx, &neigh, &coords, &dm, &edm, &mut forces).unwrap();
+
+        let delta = 1e-5;
+        let mut max_err = 0.0f64;
+        let mut max_force = 0.0f64;
+        for atom in 0..2 {
+            for dir in 0..3 {
+                let mut coords_plus = coords.clone();
+                let mut coords_minus = coords.clone();
+                coords_plus[atom][dir] += delta;
+                coords_minus[atom][dir] -= delta;
+
+                let e_plus = non_scc_electronic_energy(&builder, &species, &coords_plus, n_electrons).unwrap();
+                let e_minus = non_scc_electronic_energy(&builder, &species, &coords_minus, n_electrons).unwrap();
+
+                let fd_force = -(e_plus - e_minus) / (2.0 * delta);
+                let analytic_force = forces[atom][dir];
+                let err = (fd_force - analytic_force).abs();
+                max_err = max_err.max(err);
+                max_force = max_force.max(analytic_force.abs());
+            }
+        }
+        let rel_err = if max_force > 1e-10 { max_err / max_force } else { max_err };
+        eprintln!("tilted: max|F|={max_force:.3e}  max|err|={max_err:.3e}  rel_err={rel_err:.3e}");
+        assert!(rel_err < 1e-4,
+            "analytic force vs energy FD (tilted): rel_err={rel_err:.3e} too large");
+    }
+
+    /// Synthetic 4-orbital (sp) species for a multi-atom test.
+    /// Uses the extended 20-integral DFTB+ format:
+    ///   ss  → sk_map(0,0,0)=20 → index 19
+    ///   sp  → sk_map(0,1,0)=19 → index 18
+    ///   ppσ → sk_map(0,1,1)=15 → index 14
+    ///   ppπ → sk_map(1,1,1)=16 → index 15
+    fn make_c_like_sk_data() -> SkData {
+        let dr = 0.1;
+        let n_grid = 100;
+        let r_max = dr * n_grid as f64;
+
+        let make_values = |decay: f64, amp: f64| -> Vec<Vec<f64>> {
+            (0..n_grid)
+                .map(|i| {
+                    let r = i as f64 * dr;
+                    let tail = if r > r_max - 1.0 {
+                        let t = (r_max - r) / 1.0;
+                        t * t
+                    } else { 1.0 };
+                    let base = amp * (-decay * r).exp() * tail;
+                    let mut row = vec![0.0f64; 20];
+                    row[19] = base;           // ss
+                    row[18] = 0.8 * base;     // sp
+                    row[14] = 0.6 * base;     // pp_sigma
+                    row[15] = 0.3 * base;     // pp_pi
+                    row
+                })
+                .collect()
+        };
+
+        let x_h = EqGridTable::new(dr, make_values(1.0, -0.3));
+        let x_s = EqGridTable::new(dr, make_values(1.0, 0.2));
+        let xx_table = SkTableSp {
+            sp1: "X".to_string(),
+            sp2: "X".to_string(),
+            h: x_h,
+            s: x_s,
+        };
+
+        let mut pairs = HashMap::new();
+        pairs.insert(("X".to_string(), "X".to_string()), xx_table);
+
+        let mut onsite = HashMap::new();
+        onsite.insert("X".to_string(), AtomicParamsSp {
+            e_s: -0.5,
+            e_p: -0.1,
+            q0: 4.0,    // 4 valence electrons
+            u_hubbard: 0.5,
+        });
+
+        let mut orbital_info = HashMap::new();
+        orbital_info.insert("X".to_string(), SpeciesOrbitals::from_ang_momenta(&[0, 1]));
+
+        SkData { onsite, pairs, orbital_info }
+    }
+
+    #[test]
+    fn test_analytic_force_vs_energy_fd_sp3() {
+        // 2-atom sp3 system (like C2) — exercises pp, sp, ps blocks.
+        // Using 2 atoms avoids near-degeneracy issues that cause eigenvalue
+        // ordering flips in the FD energy, which would make the FD force
+        // discontinuous and not comparable to the analytic force.
+        let sk = make_c_like_sk_data();
+        let builder = HamiltonianBuilder::new(sk);
+        let species = vec!["X".to_string(), "X".to_string()];
+        let n_electrons = 8.0; // 2 atoms × 4 electrons
+
+        // Tilted bond to exercise all 3 directions
+        let coords = vec![
+            [0.0, 0.0, 0.0],
+            [1.3, 0.4, 0.2],
+        ];
+
+        let ctx = SystemContext::from_sk_data(&builder.sk, &species).unwrap();
+        let cutoff = builder.sk.pairs.values()
+            .map(|t| t.cutoff())
+            .fold(0.0_f64, f64::max);
+        let neigh = NeighborBuilder { cutoff }.build(&coords).unwrap();
+        let ham = builder.build_non_scc(&species, &coords).unwrap();
+        let (c, eigs) = diagonalize_non_scc(&ham, n_electrons).unwrap();
+        let n_occ = (n_electrons / 2.0).round() as usize;
+        let c_occ = c.columns(0, n_occ).into_owned();
+        let eps_occ: Vec<f64> = eigs.iter().take(n_occ).copied().collect();
+        let (dm, edm) = build_density_matrices(&c_occ, &eps_occ);
+
+        let mut forces = vec![[0.0f64; 3]; 2];
+        non_scc_electronic_force(&ctx, &neigh, &coords, &dm, &edm, &mut forces).unwrap();
+
+        let delta = 1e-5;
+        let mut max_err = 0.0f64;
+        let mut max_force = 0.0f64;
+        for atom in 0..2 {
+            for dir in 0..3 {
+                let mut coords_plus = coords.clone();
+                let mut coords_minus = coords.clone();
+                coords_plus[atom][dir] += delta;
+                coords_minus[atom][dir] -= delta;
+
+                let e_plus = non_scc_electronic_energy(&builder, &species, &coords_plus, n_electrons).unwrap();
+                let e_minus = non_scc_electronic_energy(&builder, &species, &coords_minus, n_electrons).unwrap();
+
+                let fd_force = -(e_plus - e_minus) / (2.0 * delta);
+                let analytic_force = forces[atom][dir];
+                let err = (fd_force - analytic_force).abs();
+                max_err = max_err.max(err);
+                max_force = max_force.max(analytic_force.abs());
+
+                eprintln!("atom {atom} dir {dir}: analytic={analytic_force:.6e} fd={fd_force:.6e} err={err:.3e}");
+            }
+        }
+        let rel_err = if max_force > 1e-10 { max_err / max_force } else { max_err };
+        eprintln!("sp3: max|F|={max_force:.3e}  max|err|={max_err:.3e}  rel_err={rel_err:.3e}");
+        assert!(rel_err < 1e-4,
+            "analytic force vs energy FD (sp3): rel_err={rel_err:.3e} too large (max|F|={max_force:.3e}, max|err|={max_err:.3e})");
     }
 }

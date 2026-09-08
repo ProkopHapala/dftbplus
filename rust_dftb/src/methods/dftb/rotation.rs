@@ -439,3 +439,211 @@ impl Rotation {
         (val, dx, dy, dz)
     }
 }
+
+// ======================================================================
+// P2 Gate B test #1: analytic pair derivatives vs f64 FD test helper
+// (manifest v3 §4.3)
+//
+// Creates synthetic SK tables with known smooth functions and verifies
+// that `rotate_block_with_derivs_into` produces Cartesian derivatives
+// matching central finite differences of `rotate_diatomic_block_into`.
+// This is self-contained — no external SK files needed.
+// ======================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::methods::dftb::interpolation::EqGridTable;
+
+    /// Create a synthetic `SkTableSp` with exponential-decay SK integrals.
+    /// `n_integ` is the number of integrals per grid point (1 for ss-only,
+    /// 4 for sp+pp). The integrals are simple exponentials with different
+    /// decay rates so that derivatives are non-trivial.
+    fn make_synthetic_table(sp1: &str, sp2: &str, n_integ: usize) -> SkTableSp {
+        let dr = 0.1; // Bohr
+        let n_grid = 100;
+        let r_max = dr * n_grid as f64;
+        // Different decay rates for each integral channel
+        let decay_rates: Vec<f64> = (0..n_integ)
+            .map(|k| 1.0 + 0.3 * k as f64)
+            .collect();
+        let amplitudes: Vec<f64> = (0..n_integ)
+            .map(|k| 0.5 - 0.1 * k as f64)
+            .collect();
+        let values: Vec<Vec<f64>> = (0..n_grid)
+            .map(|i| {
+                let r = i as f64 * dr;
+                (0..n_integ)
+                    .map(|k| {
+                        if r > r_max - 1.0 {
+                            // Smooth tail to zero near cutoff
+                            let tail = (r_max - r) / 1.0;
+                            amplitudes[k] * (-decay_rates[k] * r).exp() * tail * tail
+                        } else {
+                            amplitudes[k] * (-decay_rates[k] * r).exp()
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+        let h = EqGridTable::new(dr, values.clone());
+        let s = EqGridTable::new(dr, values);
+        SkTableSp {
+            sp1: sp1.to_string(),
+            sp2: sp2.to_string(),
+            h,
+            s,
+        }
+    }
+
+    /// Compare analytic derivatives from `rotate_block_with_derivs_into`
+    /// against central finite differences of `rotate_diatomic_block_into`.
+    fn check_analytic_vs_fd(
+        tab_fwd: &SkTableSp,
+        tab_rev: &SkTableSp,
+        ang1: &[i32],
+        ang2: &[i32],
+        r_bohr: f64,
+        dc: DirectionCosines,
+        delta: f64,
+        tol: f64,
+        label: &str,
+    ) {
+        let n1: usize = ang1.iter().map(|&l| (2 * l + 1) as usize).sum();
+        let n2: usize = ang2.iter().map(|&l| (2 * l + 1) as usize).sum();
+        let bs = n1 * n2;
+
+        let mut h = vec![0.0f64; bs];
+        let mut s = vec![0.0f64; bs];
+        let mut dh_dx = vec![0.0f64; bs];
+        let mut dh_dy = vec![0.0f64; bs];
+        let mut dh_dz = vec![0.0f64; bs];
+        let mut ds_dx = vec![0.0f64; bs];
+        let mut ds_dy = vec![0.0f64; bs];
+        let mut ds_dz = vec![0.0f64; bs];
+
+        Rotation::rotate_block_with_derivs_into(
+            tab_fwd, tab_rev, ang1, ang2, r_bohr, dc,
+            &mut h, &mut s,
+            &mut dh_dx, &mut dh_dy, &mut dh_dz,
+            &mut ds_dx, &mut ds_dy, &mut ds_dz,
+        ).unwrap();
+
+        // Direction vector from dc (unit vector)
+        let u = [dc.l, dc.m, dc.n];
+        // For FD, we displace atom j along x/y/z and recompute.
+        // The derivative is w.r.t. R_a (Cartesian component of the bond vector).
+        // dR_a = displacement of atom j along a (in Bohr).
+        for dir in 0..3 {
+            let mut h_plus = vec![0.0f64; bs];
+            let mut s_plus = vec![0.0f64; bs];
+            let mut h_minus = vec![0.0f64; bs];
+            let mut s_minus = vec![0.0f64; bs];
+
+            // Displace the bond vector by ±delta along `dir`
+            let mut v_plus = [u[0] * r_bohr, u[1] * r_bohr, u[2] * r_bohr];
+            let mut v_minus = [u[0] * r_bohr, u[1] * r_bohr, u[2] * r_bohr];
+            v_plus[dir] += delta;
+            v_minus[dir] -= delta;
+            let r_plus = (v_plus[0].powi(2) + v_plus[1].powi(2) + v_plus[2].powi(2)).sqrt();
+            let r_minus = (v_minus[0].powi(2) + v_minus[1].powi(2) + v_minus[2].powi(2)).sqrt();
+            let dc_plus = DirectionCosines::from_vec(v_plus).unwrap();
+            let dc_minus = DirectionCosines::from_vec(v_minus).unwrap();
+
+            Rotation::rotate_diatomic_block_into(
+                tab_fwd, tab_rev, ang1, ang2, r_plus, dc_plus,
+                &mut h_plus, &mut s_plus,
+            ).unwrap();
+            Rotation::rotate_diatomic_block_into(
+                tab_fwd, tab_rev, ang1, ang2, r_minus, dc_minus,
+                &mut h_minus, &mut s_minus,
+            ).unwrap();
+
+            // Central FD: dH/dR_a ≈ (H+ - H-) / (2*delta)
+            let analytic_dh = match dir { 0 => &dh_dx, 1 => &dh_dy, _ => &dh_dz };
+            let analytic_ds = match dir { 0 => &ds_dx, 1 => &ds_dy, _ => &ds_dz };
+
+            let mut max_err_h = 0.0f64;
+            let mut max_err_s = 0.0f64;
+            for k in 0..bs {
+                let fd_h = (h_plus[k] - h_minus[k]) / (2.0 * delta);
+                let fd_s = (s_plus[k] - s_minus[k]) / (2.0 * delta);
+                max_err_h = max_err_h.max((fd_h - analytic_dh[k]).abs());
+                max_err_s = max_err_s.max((fd_s - analytic_ds[k]).abs());
+            }
+            let dir_name = ["x", "y", "z"][dir];
+            assert!(max_err_h < tol,
+                "{label}: dH/d{dir_name} analytic vs FD error {max_err_h:.3e} > tol {tol:.3e}");
+            assert!(max_err_s < tol,
+                "{label}: dS/d{dir_name} analytic vs FD error {max_err_s:.3e} > tol {tol:.3e}");
+        }
+    }
+
+    #[test]
+    fn test_analytic_vs_fd_ss() {
+        // s-s shell pair (e.g., H-H)
+        let tab = make_synthetic_table("H", "H", 1);
+        let r = 3.0; // Bohr
+        let dc = DirectionCosines { l: 0.6, m: 0.0, n: 0.8 };
+        check_analytic_vs_fd(&tab, &tab, &[0], &[0], r, dc, 1e-5, 1e-6, "ss");
+    }
+
+    #[test]
+    fn test_analytic_vs_fd_sp() {
+        // s-p shell pair (e.g., H-C)
+        let tab_hc = make_synthetic_table("H", "C", 4);
+        let tab_ch = make_synthetic_table("C", "H", 4);
+        let r = 3.0;
+        let dc = DirectionCosines { l: 0.6, m: 0.0, n: 0.8 };
+        check_analytic_vs_fd(&tab_hc, &tab_ch, &[0], &[1], r, dc, 1e-5, 1e-6, "sp");
+        // Also test the reverse: p-s
+        check_analytic_vs_fd(&tab_ch, &tab_hc, &[1], &[0], r, dc, 1e-5, 1e-6, "ps");
+    }
+
+    #[test]
+    fn test_analytic_vs_fd_pp() {
+        // p-p shell pair (e.g., C-C)
+        let tab = make_synthetic_table("C", "C", 4);
+        let r = 3.0;
+        let dc = DirectionCosines { l: 0.6, m: 0.0, n: 0.8 };
+        check_analytic_vs_fd(&tab, &tab, &[1], &[1], r, dc, 1e-5, 1e-6, "pp");
+    }
+
+    #[test]
+    fn test_analytic_vs_fd_spd_block() {
+        // Full s-p block (like C-C with s and p shells)
+        let tab = make_synthetic_table("C", "C", 4);
+        let r = 2.5;
+        // Use a non-trivial direction
+        let dc = DirectionCosines { l: 0.5773502691896258, m: 0.5773502691896258, n: 0.5773502691896258 };
+        check_analytic_vs_fd(&tab, &tab, &[0, 1], &[0, 1], r, dc, 1e-5, 1e-6, "spd-block");
+    }
+
+    #[test]
+    fn test_analytic_vs_fd_various_directions() {
+        // Test with various bond directions to exercise all angular derivative terms
+        let tab = make_synthetic_table("C", "C", 4);
+        let r = 3.0;
+        let directions = [
+            ("x-axis", DirectionCosines { l: 1.0, m: 0.0, n: 0.0 }),
+            ("y-axis", DirectionCosines { l: 0.0, m: 1.0, n: 0.0 }),
+            ("z-axis", DirectionCosines { l: 0.0, m: 0.0, n: 1.0 }),
+            ("xy-diag", DirectionCosines { l: 0.7071067811865476, m: 0.7071067811865476, n: 0.0 }),
+            ("xyz-diag", DirectionCosines { l: 0.5773502691896258, m: 0.5773502691896258, n: 0.5773502691896258 }),
+            ("tilted", DirectionCosines { l: 0.3, m: 0.5, n: 0.8104590383770608 }),
+        ];
+        for (name, dc) in &directions {
+            check_analytic_vs_fd(&tab, &tab, &[0, 1], &[0, 1], r, *dc, 1e-5, 1e-6, &format!("spd-{name}"));
+        }
+    }
+
+    #[test]
+    fn test_analytic_vs_fd_various_distances() {
+        // Test at various distances to ensure no distance-dependent bugs
+        let tab = make_synthetic_table("C", "C", 4);
+        let dc = DirectionCosines { l: 0.6, m: 0.0, n: 0.8 };
+        for r in [1.5, 2.0, 3.0, 5.0, 8.0] {
+            check_analytic_vs_fd(&tab, &tab, &[0, 1], &[0, 1], r, dc, 1e-5, 1e-6, &format!("r={r}"));
+        }
+    }
+}

@@ -3,6 +3,14 @@ name = "rust_dftb"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# P0 sparse-path firewall (manifest v3 §4.1): when enabled, any call to
+# `Bsr4Matrix::to_dense()` or `compare_to_dense()` panics with a clear message.
+# This prevents hidden dense allocations from masquerading as sparse in
+# production. Enable in production builds with `--features sparse_firewall`.
+# Tests run without it so they can use dense references for validation.
+sparse_firewall = []
+
 [dependencies]
 nalgebra = "0.33"
 ndarray = "0.16"

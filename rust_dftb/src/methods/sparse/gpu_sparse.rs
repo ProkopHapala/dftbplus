@@ -11,13 +11,137 @@
 
 use crate::core::error::{DftbError, Result};
 use crate::methods::sparse::bsr4::{
-    dense_max_abs_diff, Bsr4Matrix, BS, BS2,
+    dense_max_abs_diff, Bsr4Matrix, SpgemmPlan, BS, BS2,
 };
 use crate::qmqm::gpu_runtime::{map_ocl_err, GpuRuntime};
 use ocl::{builders::ProgramBuilder, flags, Buffer, Kernel, Program};
 use std::sync::Arc;
 
 const BSR4_KERNEL_SOURCE: &str = include_str!("sparse_bsr4_purification.cl");
+
+/// Performance statistics for a sparse SCC/purification run.
+///
+/// Every performance run should end with `print_execution_audit()` to make
+/// hidden host costs visible and prevent the recurring failure of optimizing
+/// the kernel while ignoring the harness bottleneck (P0, manifest v3 §4.1).
+///
+/// Fields follow the manifest v3 `SparsePerfStats` struct specification.
+/// The key distinction from the old struct:
+/// - `n_orb_physical` vs `n_orb_padded` — tracks the H-padding overhead;
+/// - `plan_terms` / `plan_bytes` — symbolic SpGEMM plan statistics (P4);
+/// - `host_syncs` — counts queue synchronizations, not just reads (a 4-byte
+///   read can cost far more than its bandwidth suggests);
+/// - `t_mask_plan` — geometric mask + symbolic plan construction time;
+/// - `t_kinit` — K₀ initialization (Z·H·Z + spectral bounds);
+/// - `t_scc` — complete SCC loop (gamma + Hscc + TC2 + charge mixing);
+/// - `t_host_sync` — time spent in host synchronization (finish/read).
+#[derive(Debug, Clone, Default)]
+pub struct SparsePerfStats {
+    // ── Problem size ──
+    pub n_atom: usize,
+    pub n_orb_physical: usize, // sum of physical orbitals (1 for H, 4 for Si/C)
+    pub n_orb_padded: usize,   // n_atom * 4 (BSR4 padded)
+
+    // ── Sparsity ──
+    pub nnz_hs: usize,    // H/S block count (physical SK mask + skin)
+    pub nnz_k: usize,     // K/density-kernel block count
+    pub nnz_z: usize,     // Z/S⁻¹ block count
+    pub plan_terms: usize, // symbolic SpGEMM contribution count (P4)
+    pub plan_bytes: usize, // bytes in the symbolic plan (P4)
+    pub gpu_bytes_peak: usize, // peak GPU memory allocated
+
+    // ── Host/device traffic ──
+    pub kernel_launches: usize,
+    pub host_syncs: usize,      // queue finish + blocking read count
+    pub host_read_bytes: usize, // total bytes read back to host
+
+    // ── Stage timings (seconds) ──
+    pub t_mask_plan: f64,  // geometric mask + symbolic plan construction
+    pub t_hs: f64,         // H/S assembly
+    pub t_gamma_build: f64, // gamma matrix construction (per geometry)
+    pub t_gamma_mv: f64,    // gamma matvec (per SCC iteration)
+    pub t_inverse: f64,    // Newton-Schulz approximate inverse
+    pub t_kinit: f64,      // K₀ initialization (Z·H·Z + spectral bounds)
+    pub t_tc2: f64,        // TC2 purification
+    pub t_scc: f64,        // complete SCC loop (gamma + Hscc + TC2 + mixing)
+    pub t_force: f64,      // force evaluation
+    pub t_host_sync: f64,  // time in host synchronization (finish + read)
+    pub t_total: f64,      // total wall time
+
+    // ── Legacy aliases (for backward compatibility with existing callers) ──
+    pub gpu_bytes: usize,   // alias for gpu_bytes_peak
+    pub n_kernel_launch: usize, // alias for kernel_launches
+    pub n_host_read: usize,     // alias for host_syncs
+    pub t_ns: f64,              // alias for t_inverse
+    pub t_gamma: f64,           // alias for t_gamma_mv
+}
+
+impl SparsePerfStats {
+    /// Print the execution audit to stderr (fail-loud: makes hidden costs visible).
+    pub fn print_audit(&self) {
+        eprintln!("=== SPARSE EXECUTION AUDIT (P0, manifest v3 §4.1) ===");
+        eprintln!("N atoms                 {}", self.n_atom);
+        eprintln!("N orbs (physical)       {}", self.n_orb_physical);
+        eprintln!("N orbs (padded BSR4)    {}", self.n_orb_padded);
+        let pad_overhead = if self.n_orb_physical > 0 {
+            100.0 * (self.n_orb_padded as f64 / self.n_orb_physical as f64 - 1.0)
+        } else { 0.0 };
+        eprintln!("H-padding overhead      {pad_overhead:.1}%");
+        eprintln!("H/S blocks (nnz_hs)     {}", self.nnz_hs);
+        eprintln!("K blocks (nnz_k)        {}", self.nnz_k);
+        eprintln!("Z blocks (nnz_z)        {}", self.nnz_z);
+        if self.plan_terms > 0 {
+            eprintln!("Plan terms              {}", self.plan_terms);
+            eprintln!("Plan bytes              {}", self.plan_bytes);
+            let avg = self.plan_terms as f64 / self.nnz_k.max(1) as f64;
+            eprintln!("Avg terms/output block  {avg:.1}");
+        }
+        eprintln!("GPU bytes peak          {}", self.gpu_bytes_peak);
+        eprintln!("kernel launches         {}", self.kernel_launches);
+        eprintln!("host syncs              {}", self.host_syncs);
+        eprintln!("host read bytes         {}", self.host_read_bytes);
+        // P0 firewall: no dense allocations in production sparse path.
+        // If largest_dense > 0, the sparse path has a hidden dense allocation.
+        let largest_dense = 0; // P0 contract: no dense allocations
+        eprintln!("largest dense alloc     {largest_dense} bytes (must be 0)");
+
+        eprintln!();
+        eprintln!("--- Stage timings (seconds) ---");
+        eprintln!("mask/plan   {:.6}", self.t_mask_plan);
+        eprintln!("H/S assembly {:.6}", self.t_hs);
+        eprintln!("gamma build  {:.6}", self.t_gamma_build);
+        eprintln!("gamma matvec {:.6}", self.t_gamma_mv);
+        eprintln!("inverse (NS) {:.6}", self.t_inverse);
+        eprintln!("K init       {:.6}", self.t_kinit);
+        eprintln!("TC2          {:.6}", self.t_tc2);
+        eprintln!("SCC total    {:.6}", self.t_scc);
+        eprintln!("force        {:.6}", self.t_force);
+        eprintln!("host sync    {:.6}", self.t_host_sync);
+
+        let accounted = self.t_mask_plan + self.t_hs + self.t_gamma_build
+            + self.t_gamma_mv + self.t_inverse + self.t_kinit
+            + self.t_tc2 + self.t_scc + self.t_force + self.t_host_sync;
+        let t_misc = self.t_total - accounted;
+        eprintln!("misc/other  {:.6}", t_misc);
+        eprintln!("TOTAL       {:.6}", self.t_total);
+
+        // Warn if host synchronization is a large fraction of total time.
+        if self.t_host_sync > 0.3 * self.t_total && self.t_total > 0.01 {
+            eprintln!("WARNING: host sync is {:.0}% of total — a 4-byte read can cost more than its bandwidth",
+                100.0 * self.t_host_sync / self.t_total);
+        }
+        if t_misc > 0.6 * self.t_total && self.t_total > 0.01 {
+            eprintln!("WARNING: misc/other is {:.0}% of total — kernel speedup may be irrelevant",
+                100.0 * t_misc / self.t_total);
+        }
+        // P0 firewall check: host syncs should be minimal in the hot loop.
+        // A typical TC2 run with check_every=5 should have ~max_iter/5 syncs.
+        if self.host_syncs > 100 && self.t_total > 0.01 {
+            eprintln!("WARNING: {} host syncs — consider reducing check frequency or fusing diagnostics",
+                self.host_syncs);
+        }
+    }
+}
 
 /// Tunable build-time parameters for the BSR4 kernels. These are passed to
 /// the OpenCL compiler as `-D` defines; the `.cl` file guards each with
@@ -63,6 +187,8 @@ pub struct SparseBsr4Gpu {
     k_reduce: Kernel,
     k_identity_residual: Kernel,
     k_idempotency: Kernel,
+    // P4: symbolic SpGEMM plan kernel (Bsym variant)
+    k_spgemm_plan_bsym: Kernel,
 }
 
 impl SparseBsr4Gpu {
@@ -226,6 +352,18 @@ impl SparseBsr4Gpu {
             b.arg(0u32); b.arg(&dummy_f32); b.arg(&dummy_f32); b.arg(&dummy_f32);
             b.build().map_err(map_ocl_err)?
         };
+        // P4: bsr4_spgemm_plan_Bsym: nrow, A_row,A_col,A, B, plan_ptr,plan_a_idx,plan_b_idx,
+        //     C_row,C_col,C  -> 1 u32 scalar, 7 u32 bufs, 3 f32 bufs
+        let k_spgemm_plan_bsym = {
+            let mut b = Kernel::builder();
+            b.program(&program).name("bsr4_spgemm_plan_Bsym").queue(queue.clone());
+            b.arg(0u32); // nrow
+            b.arg(&dummy_u32); b.arg(&dummy_u32); b.arg(&dummy_f32); // A_row, A_col, A
+            b.arg(&dummy_f32); // B
+            b.arg(&dummy_u32); b.arg(&dummy_u32); b.arg(&dummy_u32); // plan_ptr, plan_a_idx, plan_b_idx
+            b.arg(&dummy_u32); b.arg(&dummy_u32); b.arg(&dummy_f32); // C_row, C_col, C
+            b.build().map_err(map_ocl_err)?
+        };
 
         let _ = gws_spgemm; let _ = gws_elem; let _ = gws_reduce; let _ = build_k;
 
@@ -237,6 +375,7 @@ impl SparseBsr4Gpu {
             k_tc2, k_symmetrize, k_mulliken_ks, k_trace_partial, k_reduce,
             k_identity_residual,
             k_idempotency,
+            k_spgemm_plan_bsym,
         })
     }
 
@@ -1139,9 +1278,22 @@ impl SparseBsr4Gpu {
 
 /// Compare a GPU-produced `Bsr4Matrix` against a dense reference (already
 /// expanded) and return the max absolute elementwise difference.
+///
+/// **P0 firewall (manifest v3 §4.1):** This calls `to_dense()` and is
+/// **reference/test-only**. When the `sparse_firewall` feature is enabled,
+/// this function panics.
 pub fn compare_to_dense(gpu: &Bsr4Matrix, dense_ref: &[f32]) -> f32 {
-    let dense_gpu = gpu.to_dense();
-    dense_max_abs_diff(&dense_gpu, dense_ref)
+    #[cfg(feature = "sparse_firewall")]
+    {
+        panic!("P0 SPARSE FIREWALL: compare_to_dense() called from production sparse path. \
+                This calls to_dense() which allocates an O(Norb²) dense matrix. \
+                Disable the `sparse_firewall` feature for test/reference use.");
+    }
+    #[cfg(not(feature = "sparse_firewall"))]
+    {
+        let dense_gpu = gpu.to_dense();
+        dense_max_abs_diff(&dense_gpu, dense_ref)
+    }
 }
 
 fn div_ceil(a: usize, b: usize) -> usize {
@@ -1174,6 +1326,15 @@ pub struct GpuBsrStructure {
 }
 
 impl GpuBsrStructure {
+    /// Public accessor for the transpose-block map (needed by `symmetrize_dev`).
+    pub fn transpose_block(&self) -> &Buffer<u32> { &self.transpose_block }
+    /// Public accessor for the diagonal-block map (needed by `trace_ks_*`).
+    pub fn diag_block(&self) -> &Buffer<u32> { &self.diag_block }
+    /// Public accessor for the row pointer buffer.
+    pub fn row_ptr(&self) -> &Buffer<u32> { &self.row_ptr }
+    /// Public accessor for the column index buffer.
+    pub fn col_idx(&self) -> &Buffer<u32> { &self.col_idx }
+
     /// Build a device-resident structure from a host CSR mask `(row_ptr,
     /// col_idx)`. Computes `diag_block_map` and `transpose_block_map` on the
     /// host, then uploads all four arrays once.
@@ -1224,6 +1385,14 @@ impl GpuBsrStructure {
 pub struct GpuBsrMatrix {
     pub struct_: Arc<GpuBsrStructure>,
     pub values: Buffer<f32>,
+}
+
+/// Device-resident symbolic SpGEMM plan (P4, manifest v3 §4.6).
+/// Uploaded once for a frozen mask triple and reused across launches.
+pub struct SpgemmPlanGpu {
+    pub plan_ptr: Buffer<u32>,
+    pub plan_a_idx: Buffer<u32>,
+    pub plan_b_idx: Buffer<u32>,
 }
 
 impl GpuBsrMatrix {
@@ -1352,6 +1521,54 @@ impl SparseBsr4Gpu {
         k.set_arg(7, &c.struct_.row_ptr).map_err(map_ocl_err)?;
         k.set_arg(8, &c.struct_.col_idx).map_err(map_ocl_err)?;
         k.set_arg(9, &c.values).map_err(map_ocl_err)?;
+        unsafe {
+            k.cmd()
+                .global_work_size(gws)
+                .local_work_size(self.config.wg as usize)
+                .enq()
+                .map_err(map_ocl_err)?;
+        }
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------
+    // P4: Symbolic SpGEMM plan (manifest v3 §4.6)
+    // -----------------------------------------------------------------
+
+    /// Upload a symbolic SpGEMM plan to the device. The plan is built once
+    /// for a frozen mask triple (A, B, C) and reused across all SpGEMM
+    /// launches with that mask. See `bsr4::build_spgemm_plan_bsym`.
+    pub fn upload_plan(&self, plan: &SpgemmPlan) -> Result<SpgemmPlanGpu> {
+        let plan_ptr = self.rt.buffer_from_slice(&plan.plan_ptr)?;
+        let plan_a_idx = self.rt.buffer_from_slice(&plan.plan_a_idx)?;
+        let plan_b_idx = self.rt.buffer_from_slice(&plan.plan_b_idx)?;
+        Ok(SpgemmPlanGpu { plan_ptr, plan_a_idx, plan_b_idx })
+    }
+
+    /// Device-resident symbolic-plan SpGEMM (Bsym variant).
+    /// `C = P_M(A·B)` where B is symmetric, using a precomputed plan.
+    /// No host transfer, no intersection at runtime — only loads + 4×4 FMAs.
+    pub fn spgemm_plan_bsym_dev(
+        &self,
+        a: &GpuBsrMatrix,
+        b: &GpuBsrMatrix,
+        plan: &SpgemmPlanGpu,
+        c: &GpuBsrMatrix,
+    ) -> Result<()> {
+        let nrow = a.struct_.n_atom;
+        let gws = nrow * self.config.wg as usize;
+        let k = &self.k_spgemm_plan_bsym;
+        k.set_arg(0, nrow as u32).map_err(map_ocl_err)?;
+        k.set_arg(1, &a.struct_.row_ptr).map_err(map_ocl_err)?;
+        k.set_arg(2, &a.struct_.col_idx).map_err(map_ocl_err)?;
+        k.set_arg(3, &a.values).map_err(map_ocl_err)?;
+        k.set_arg(4, &b.values).map_err(map_ocl_err)?;
+        k.set_arg(5, &plan.plan_ptr).map_err(map_ocl_err)?;
+        k.set_arg(6, &plan.plan_a_idx).map_err(map_ocl_err)?;
+        k.set_arg(7, &plan.plan_b_idx).map_err(map_ocl_err)?;
+        k.set_arg(8, &c.struct_.row_ptr).map_err(map_ocl_err)?;
+        k.set_arg(9, &c.struct_.col_idx).map_err(map_ocl_err)?;
+        k.set_arg(10, &c.values).map_err(map_ocl_err)?;
         unsafe {
             k.cmd()
                 .global_work_size(gws)

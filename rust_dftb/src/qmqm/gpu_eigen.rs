@@ -27,6 +27,7 @@
 //! compiler unroll and optimize the fixed-size local memory operations.
 
 use crate::core::error::{DftbError, Result};
+use crate::qmqm::gpu_matrix::{matmul_tiled_batched, matmul_tiled_batched_params};
 use crate::qmqm::gpu_runtime::{map_ocl_err, GpuRuntime};
 use ocl::{Buffer, Kernel};
 
@@ -123,7 +124,103 @@ pub fn jacobi_cyclic_local_batched(
     unsafe {
         kernel.enq().map_err(map_ocl_err)?;
     }
-    rt.finish()
+    // No rt.finish() — in-order queue preserves command order. The caller
+    // must synchronize only when the host genuinely needs the result (e.g.
+    // via read_buffer, which finishes the queue before returning).
+    Ok(())
+}
+
+// ------------------------------------------------------------------
+// Phase 2: Tiled block Jacobi for N > 64
+// ------------------------------------------------------------------
+
+const GPU_TILED_JACOBI_TEMPLATE: &str = include_str!("gpu_tiled_jacobi.cl");
+
+/// Maximum sweeps for the tiled block Jacobi (N>64).
+/// Block Jacobi converges slower than full-local element Jacobi because
+/// block pairs are processed sequentially, not in parallel.
+const TILED_MAX_SWEEPS: usize = 50;
+
+/// Render the tiled Jacobi OpenCL template with block-size specialization.
+fn render_tiled_source(b: usize, wg: usize) -> String {
+    let pb = 2 * b;
+    let pld = pb + 1;
+    GPU_TILED_JACOBI_TEMPLATE
+        .replace("#define B 32", &format!("#define B {}", b))
+        .replace("#define PB 64", &format!("#define PB {}", pb))
+        .replace("#define PLD 65", &format!("#define PLD {}", pld))
+        .replace("#define WG 256", &format!("#define WG {}", wg))
+        .replace("#define STRIP_R 32", &format!("#define STRIP_R {}", b))
+        .replace("#define MAX_SWEEPS 50", &format!("#define MAX_SWEEPS {}", TILED_MAX_SWEEPS))
+}
+
+/// Tiled block Jacobi eigensolver for N > 64.
+///
+/// Diagonalizes `batch` symmetric N×N matrices. One workgroup per system.
+/// A and V reside in global memory; only the 2B×2B compound pivot and strip
+/// workspace live in local memory. Block size B=32 (default), WG=256.
+///
+/// Uses the existing `jacobi_cyclic_local_batched` for N ≤ 64; this function
+/// is the N > 64 path. Use `jacobi_batched` (below) for automatic dispatch.
+///
+/// # Arguments
+/// - `rt` — shared OpenCL runtime
+/// - `a_buf` — `[batch][N*N]` symmetric matrices (in/out: eigenvalues on diagonal)
+/// - `v_buf` — `[batch][N*N]` buffer (out: eigenvectors)
+/// - `n` — matrix dimension (N > 64)
+/// - `batch` — number of matrices
+pub fn tiled_jacobi_batched(
+    rt: &mut GpuRuntime,
+    a_buf: &Buffer<f32>,
+    v_buf: &Buffer<f32>,
+    n: usize,
+    batch: usize,
+) -> Result<()> {
+    if n == 0 || batch == 0 {
+        return Ok(());
+    }
+    if n <= 64 {
+        return Err(DftbError::InvalidInput(format!(
+            "tiled_jacobi_batched: n={n} <= 64, use jacobi_cyclic_local_batched instead"
+        )));
+    }
+    let b = 32usize;  // block size
+    let wg = 256usize; // workgroup size
+    let source = render_tiled_source(b, wg);
+    let program = rt.build_program(&source)?;
+    let kernel = Kernel::builder()
+        .program(&program)
+        .name("tiled_jacobi_batched")
+        .queue(rt.queue().clone())
+        .global_work_size(batch * wg)
+        .local_work_size(wg)
+        .arg(a_buf)
+        .arg(v_buf)
+        .arg(n as i32)
+        .arg(batch as i32)
+        .build()
+        .map_err(map_ocl_err)?;
+    unsafe {
+        kernel.enq().map_err(map_ocl_err)?;
+    }
+    Ok(())
+}
+
+/// Dispatch eigensolver: full-local Jacobi for N≤64, tiled block Jacobi for N>64.
+/// This is the production entry point — callers should use this instead of
+/// `jacobi_cyclic_local_batched` directly.
+pub fn jacobi_batched(
+    rt: &mut GpuRuntime,
+    a_buf: &Buffer<f32>,
+    v_buf: &Buffer<f32>,
+    n: usize,
+    batch: usize,
+) -> Result<()> {
+    if n <= 64 {
+        jacobi_cyclic_local_batched(rt, a_buf, v_buf, n, batch)
+    } else {
+        tiled_jacobi_batched(rt, a_buf, v_buf, n, batch)
+    }
 }
 
 /// Compute S^{-1/2} via Jacobi eigendecomposition.
@@ -160,11 +257,8 @@ pub fn build_inv_sqrt(
     }
 
     // Step 1: copy S to a working buffer (Jacobi modifies in place).
-    // We read S back to host and re-upload — simple and correct. The
-    // coordinator can optimize this to a device-to-device copy in Wave 3.
-    let mut s_host = vec![0.0f32; n * n * batch];
-    rt.read_buffer(s_buf, &mut s_host)?;
-    let a_work = rt.buffer_from_slice(&s_host)?;
+    // Device-to-device copy — no host roundtrip (Phase 0b cleanup).
+    let a_work = rt.copy_buffer(s_buf, n * n * batch)?;
 
     // Step 2: allocate V buffer (kernel initializes to identity).
     let v_buf = rt.zero_buffer::<f32>(n * n * batch)?;
@@ -198,9 +292,90 @@ pub fn build_inv_sqrt(
     unsafe {
         kernel.enq().map_err(map_ocl_err)?;
     }
-    rt.finish()?;
+    // No rt.finish() — caller synchronizes via read_buffer when needed.
 
     Ok((x_buf, lambda_min_buf))
+}
+
+// ------------------------------------------------------------------
+// Phase 3: N>64 S^{-1/2} via tiled GEMM
+// ------------------------------------------------------------------
+
+/// Build S^{-1/2} for N>64 using tiled GEMM.
+///
+/// X = V · diag(rsqrt(λ)) · V^T
+///
+/// Steps:
+/// 1. Diagonalize S via `jacobi_batched` (tiled for N>64)
+/// 2. Scale V → V_scaled = V · diag(rsqrt(λ)) via `scale_eigenvectors_batched`
+/// 3. X = V_scaled · V^T via `matmul_tiled_batched`
+///
+/// All operations use global memory only — no N² local memory limit.
+fn build_inv_sqrt_tiled(
+    rt: &mut GpuRuntime,
+    s_buf: &Buffer<f32>,
+    n: usize,
+    batch: usize,
+) -> Result<(Buffer<f32>, Buffer<f32>)> {
+    if n == 0 || batch == 0 {
+        let x = rt.zero_buffer::<f32>(n * n * batch)?;
+        let lm = rt.zero_buffer::<f32>(batch)?;
+        return Ok((x, lm));
+    }
+
+    // Step 1: copy S to working buffer and diagonalize.
+    let a_work = rt.copy_buffer(s_buf, n * n * batch)?;
+    let v_buf = rt.zero_buffer::<f32>(n * n * batch)?;
+    jacobi_batched(rt, &a_work, &v_buf, n, batch)?;
+
+    // Step 2: scale V → V_scaled = V · rsqrt(λ), get λ_min.
+    let v_scaled = rt.zero_buffer::<f32>(n * n * batch)?;
+    let lambda_min_buf = rt.zero_buffer::<f32>(batch)?;
+    // Use a simple 1D launch: one workgroup per system, 256 threads.
+    let wg = 256usize;
+    let source = render_source(64);  // reuse the template (LAMBDA_FLOOR define)
+    let program = rt.build_program(&source)?;
+    let kernel = Kernel::builder()
+        .program(&program)
+        .name("scale_eigenvectors_batched")
+        .queue(rt.queue().clone())
+        .global_work_size(batch * wg)
+        .local_work_size(wg)
+        .arg(&a_work)
+        .arg(&v_buf)
+        .arg(&v_scaled)
+        .arg(&lambda_min_buf)
+        .arg(n as i32)
+        .arg(batch as i32)
+        .build()
+        .map_err(map_ocl_err)?;
+    unsafe { kernel.enq().map_err(map_ocl_err)?; }
+
+    // Step 3: X = V_scaled · V^T (tiled GEMM, transpose B).
+    let x_buf = rt.zero_buffer::<f32>(n * n * batch)?;
+    // C = V_scaled · V^T → trans_a=false, trans_b=true
+    // Use matmul_tiled_batched_params for the transpose.
+    matmul_tiled_batched_params(
+        rt, &v_scaled, &v_buf, &x_buf, n, batch,
+        false, true, 1.0, 0.0,
+    )?;
+
+    Ok((x_buf, lambda_min_buf))
+}
+
+/// Dispatch S^{-1/2} construction: full-local for N≤64, tiled for N>64.
+/// This is the production entry point.
+pub fn build_inv_sqrt_batched(
+    rt: &mut GpuRuntime,
+    s_buf: &Buffer<f32>,
+    n: usize,
+    batch: usize,
+) -> Result<(Buffer<f32>, Buffer<f32>)> {
+    if n <= 64 {
+        build_inv_sqrt(rt, s_buf, n, batch)
+    } else {
+        build_inv_sqrt_tiled(rt, s_buf, n, batch)
+    }
 }
 
 #[cfg(test)]

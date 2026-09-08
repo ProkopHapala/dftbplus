@@ -1115,3 +1115,112 @@ fn test_row_degree_overflow_fail_loud() {
         "Error should mention MAX_LEFT_BLOCKS: {err_msg}"
     );
 }
+
+// =====================================================================
+// 18. P0 regression: sparse gershgorin_bounds and inf_norm must not
+//     densify. Verify they produce the same result as the old dense
+//     path, computed independently here from to_dense + manual scan.
+//     Also verify they work on geometric (sparse) masks, not just full.
+// =====================================================================
+
+#[test]
+fn test_sparse_gershgorin_no_densify() {
+    let n_atom = 8;
+    let mut rng = Rng(0x1234_5678_9abc_def0);
+    // Build a random sparse matrix with a geometric mask.
+    let pos: Vec<[f64; 3]> = (0..n_atom).map(|i| {
+        [(i as f64 * 1.5) % 6.0, (i as f64 * 0.7) % 4.0, (i as f64 * 2.3) % 5.0]
+    }).collect();
+    let mask = build_geometric_mask(&pos, 4.0);
+    let nblock = mask.1.len();
+    assert!(nblock < n_atom * n_atom, "mask should be sparse");
+
+    // Fill blocks with random values.
+    let mut bsr = Bsr4Matrix::from_structure(n_atom, mask.0.clone(), mask.1.clone()).unwrap();
+    for v in &mut bsr.values {
+        *v = rng.next();
+    }
+
+    // Sparse gershgorin (new path — no to_dense).
+    let (emin_sparse, emax_sparse) = gershgorin_bounds(&bsr).unwrap();
+
+    // Dense reference: expand and compute manually.
+    let dense = bsr.to_dense();
+    let n_orb = n_atom * BS;
+    let mut emin_dense = f32::INFINITY;
+    let mut emax_dense = f32::NEG_INFINITY;
+    for mu in 0..n_orb {
+        let diag = dense[mu * n_orb + mu];
+        let mut offdiag = 0.0f32;
+        for nu in 0..n_orb {
+            if nu != mu { offdiag += dense[mu * n_orb + nu].abs(); }
+        }
+        emin_dense = emin_dense.min(diag - offdiag);
+        emax_dense = emax_dense.max(diag + offdiag);
+    }
+
+    let tol = 1e-5f32;
+    assert!((emin_sparse - emin_dense).abs() < tol,
+        "gershgorin emin mismatch: sparse={emin_sparse:e} dense={emin_dense:e}");
+    assert!((emax_sparse - emax_dense).abs() < tol,
+        "gershgorin emax mismatch: sparse={emax_sparse:e} dense={emax_dense:e}");
+    println!("gershgorin (sparse mask, {nblock} blocks): emin={emin_sparse:.4} emax={emax_sparse:.4} — matches dense");
+}
+
+#[test]
+fn test_sparse_inf_norm_no_densify() {
+    let n_atom = 8;
+    let mut rng = Rng(0xaabb_ccdd_eeff_0011);
+    let pos: Vec<[f64; 3]> = (0..n_atom).map(|i| {
+        [(i as f64 * 1.3) % 5.0, (i as f64 * 1.9) % 3.0, (i as f64 * 0.5) % 7.0]
+    }).collect();
+    let mask = build_geometric_mask(&pos, 3.5);
+    let nblock = mask.1.len();
+    assert!(nblock < n_atom * n_atom, "mask should be sparse");
+
+    let mut bsr = Bsr4Matrix::from_structure(n_atom, mask.0.clone(), mask.1.clone()).unwrap();
+    for v in &mut bsr.values {
+        *v = rng.next();
+    }
+
+    // Sparse inf_norm (new path — no to_dense).
+    let norm_sparse = inf_norm(&bsr);
+
+    // Dense reference.
+    let dense = bsr.to_dense();
+    let n_orb = n_atom * BS;
+    let mut norm_dense = 0.0f32;
+    for mu in 0..n_orb {
+        let row_sum: f32 = (0..n_orb).map(|nu| dense[mu * n_orb + nu].abs()).sum();
+        norm_dense = norm_dense.max(row_sum);
+    }
+
+    let tol = 1e-5f32;
+    assert!((norm_sparse - norm_dense).abs() < tol,
+        "inf_norm mismatch: sparse={norm_sparse:e} dense={norm_dense:e}");
+    println!("inf_norm (sparse mask, {nblock} blocks): {norm_sparse:.6} — matches dense");
+}
+
+// =====================================================================
+// 19. P0 regression: SparsePerfStats struct exists and audit prints.
+// =====================================================================
+
+#[test]
+fn test_sparse_perf_stats_audit() {
+    let stats = rust_dftb::methods::sparse::SparsePerfStats {
+        n_atom: 100,
+        nnz_hs: 1200,
+        nnz_k: 1200,
+        nnz_z: 1200,
+        t_hs: 0.001,
+        t_ns: 0.05,
+        t_tc2: 0.2,
+        t_gamma: 0.01,
+        t_force: 0.0,
+        t_total: 0.3,
+        ..Default::default()
+    };
+    stats.print_audit();
+    // No assertion needed — if it prints without panic, the struct works.
+    println!("SparsePerfStats audit printed successfully");
+}

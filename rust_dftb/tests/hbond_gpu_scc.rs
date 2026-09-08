@@ -376,3 +376,102 @@ fn test_formic_dimer_1d_scan_gpu_vs_cpu() {
     // than the reactant. This is a physical invariant of the proton transfer.
     assert!(barrier > 0.0, "PES barrier should be positive (TS > reactant): got {barrier:.2e}");
 }
+
+// ==================================================================
+// Phase 3 (P3d): AT and GC single-point SCC parity (N>64 tiled path)
+// ==================================================================
+//
+// Adenine-Thymine: 30 atoms, ~87 orbitals — exercises the full tiled path
+// (tiled Jacobi + tiled GEMM + tiled S^{-1/2}).
+// Guanine-Cytosine: 29 atoms, ~86 orbitals — same.
+//
+// Tolerances (manifest §4.3, N>64):
+//   - Energy: < 1e-2 Ha (f32 block Jacobi)
+//   - Charges: < 1e-2 e
+//   - Eigenvalues: < 1e-2 Ha
+
+fn run_nucleobase_pair_scc_parity(xyz_path: &str, name: &str) {
+    let Some(mut rt) = try_runtime() else { return; };
+    let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else {
+        eprintln!("Skipping: RUST_DFTB_SK_DIR not set");
+        return;
+    };
+    let candidates = [
+        xyz_path.to_string(),
+        format!("{}/data/xyz/{xyz_path}", env!("CARGO_MANIFEST_DIR")),
+        format!("{}/../data/xyz/{xyz_path}", env!("CARGO_MANIFEST_DIR")),
+    ];
+    let mut xyz = None;
+    for path in &candidates {
+        if let Ok(x) = parse_xyz(path) { xyz = Some(x); break; }
+    }
+    let xyz = match xyz {
+        Some(x) => x,
+        None => { eprintln!("Skipping: cannot load {xyz_path}"); return; }
+    };
+    let species = xyz.species.clone();
+    let coords = xyz.coords.clone();
+    let n_atoms = species.len();
+    eprintln!("[{name}] {n_atoms} atoms, species={:?}", species.iter().take(5).collect::<Vec<_>>());
+
+    let sk = load_sk_for_species(&sk_dir, &species).unwrap();
+    let u_per_atom = per_atom_u(&sk, &species);
+    let g = build_gamma_matrix(&coords, &u_per_atom);
+
+    // CPU reference
+    let builder = HamiltonianBuilder::new(sk.clone());
+    let scc = builder.build_scc(&species, &coords, 200, 1e-9).unwrap();
+    let n = scc.h0.nrows();
+    let n_occ = (scc.q0.iter().sum::<f64>() / 2.0).round() as usize;
+    eprintln!("[{name}] n_orbs={n}, n_atoms={n_atoms}, n_occ={n_occ}");
+    assert!(n > 64, "{name} should exercise N>64 tiled path, got N={n}");
+
+    let tmpl = FragmentTemplate::new(&sk, species.to_vec(), coords.to_vec()).unwrap();
+    let orb_atom = orb_atom_map(&tmpl.atom_orb_off, n);
+
+    // Flatten H0, S, q0 to f32 row-major
+    let mut h0_flat = vec![0.0f32; n * n];
+    let mut s_flat = vec![0.0f32; n * n];
+    for i in 0..n {
+        for j in 0..n {
+            h0_flat[i * n + j] = scc.h0[(i, j)] as f32;
+            s_flat[i * n + j] = scc.s[(i, j)] as f32;
+        }
+    }
+    let q0: Vec<f32> = scc.q0.iter().map(|&q| q as f32).collect();
+
+    let batch = 1usize;
+    let h0_buf = rt.buffer_from_slice(&h0_flat).unwrap();
+    let s_buf = rt.buffer_from_slice(&s_flat).unwrap();
+    let g_buf = rt.buffer_from_slice(&g).unwrap();
+    let q0_buf = rt.buffer_from_slice(&q0).unwrap();
+    let oa_buf = rt.buffer_from_slice(&orb_atom).unwrap();
+
+    let gpu = gpu_solve_scc_batched_diis(
+        &mut rt, &h0_buf, &s_buf, &g_buf, &q0_buf, &oa_buf,
+        n, n_atoms, n_occ, batch,
+        500, 1e-5, 0.3, 8, 5,
+    ).expect(&format!("{name} GPU SCC (DIIS) must converge"));
+
+    let de = (gpu.energies[0] as f64 - scc.energy).abs();
+    let dq = max_abs_diff(&gpu.charges, &scc.charges.iter().map(|&q| q as f32).collect::<Vec<_>>());
+    let d_eig = max_abs_diff(&gpu.eigenvalues, &scc.eigenvalues.iter().map(|&e| e as f32).collect::<Vec<_>>());
+
+    eprintln!("[{name}] N={n} SCC parity:");
+    eprintln!("  E_cpu={:.8}, E_gpu={:.8}, |dE|={de:.2e}", scc.energy, gpu.energies[0]);
+    eprintln!("  |dq|={dq:.2e}, |d_eig|={d_eig:.2e}, n_iters={}", gpu.n_iters);
+
+    assert!(de < 1e-2, "{name} energy parity failed: |dE|={de:.2e} > 1e-2");
+    assert!(dq < 1e-2, "{name} charges parity failed: |dq|={dq:.2e} > 1e-2");
+    assert!(d_eig < 1e-2, "{name} eigenvalues parity failed: |d_eig|={d_eig:.2e} > 1e-2");
+}
+
+#[test]
+fn test_at_scc_parity() {
+    run_nucleobase_pair_scc_parity("adenine-thymine.xyz", "AT");
+}
+
+#[test]
+fn test_gc_scc_parity() {
+    run_nucleobase_pair_scc_parity("guanine-cytosine.xyz", "GC");
+}

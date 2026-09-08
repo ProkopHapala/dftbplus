@@ -430,3 +430,51 @@ __kernel void build_inv_sqrt_from_eig(
         gX[i * n + j] = sum;
     }
 }
+
+// ------------------------------------------------------------------
+// scale_eigenvectors_batched
+//
+// Phase 3: N>64 S^{-1/2} reconstruction helper.
+// Computes V_scaled[i][k] = V[i][k] · rsqrt(max(λ_k, LAMBDA_FLOOR))
+// and reports λ_min per system. Works for any N (global memory only).
+// One workgroup per system; each thread handles a subset of (i,k) pairs.
+//
+// On exit:
+//   V_scaled[batch][N*N] — V scaled by rsqrt(λ)
+//   lambda_min_out[batch] — smallest eigenvalue per system
+// ------------------------------------------------------------------
+__kernel void scale_eigenvectors_batched(
+    __global const float* A,        // [batch][N*N] eigenvalues on diagonal
+    __global const float* V,        // [batch][N*N] eigenvectors
+    __global float* V_scaled,       // [batch][N*N] output: V · rsqrt(λ)
+    __global float* lambda_min_out, // [batch]
+    const int n,
+    const int batch
+) {
+    const int gid = get_group_id(0);
+    const int lid = get_local_id(0);
+    const int lsz = get_local_size(0);
+
+    __global const float* gA = A + (size_t)gid * n * n;
+    __global const float* gV = V + (size_t)gid * n * n;
+    __global float* gVs = V_scaled + (size_t)gid * n * n;
+
+    // Find λ_min (thread 0 does it; could parallelize but n is small)
+    if (lid == 0) {
+        float lmin = 1.0e30f;
+        for (int k = 0; k < n; ++k) {
+            float lam = gA[k * n + k];
+            if (lam < lmin) lmin = lam;
+        }
+        lambda_min_out[gid] = lmin;
+    }
+
+    // V_scaled[i][k] = V[i][k] · rsqrt(max(λ_k, LAMBDA_FLOOR))
+    for (int idx = lid; idx < n * n; idx += lsz) {
+        int i = idx / n;
+        int k = idx - i * n;
+        float lam = gA[k * n + k];
+        float rlam = rsqrt(fmax(lam, LAMBDA_FLOOR));
+        gVs[idx] = gV[idx] * rlam;
+    }
+}

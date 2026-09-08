@@ -186,6 +186,9 @@ impl Mixer for DiisMixer {
         }
 
         // q_new = Σ_i c_i · q_out_i  where q_out_i = q_in_i + residual_i
+        // Phase 0e safeguard (manifest §4.9): reject non-finite or catastrophic
+        // DIIS extrapolation, fall back to damped simple mixing.
+        let prev_norm: f64 = residual.iter().map(|r| r * r).sum::<f64>().sqrt();
         q_inout.fill(0.0);
         for i in 0..n_hist {
             let c = self.work[i];
@@ -193,6 +196,19 @@ impl Mixer for DiisMixer {
             let res_i = &self.res_bufs[i];
             for (q, (&q_in_val, &res_val)) in q_inout.iter_mut().zip(q_in_i.iter().zip(res_i.iter())) {
                 *q += c * (q_in_val + res_val);
+            }
+        }
+        // Safeguard: if DIIS produced non-finite values or the extrapolated
+        // charge vector is wildly larger than the input, reject and fall back.
+        let new_norm: f64 = q_inout.iter().map(|q| q * q).sum::<f64>().sqrt();
+        let max_q: f64 = q_inout.iter().fold(0.0f64, |m, &q| m.max(q.abs()));
+        if !q_inout.iter().all(|q| q.is_finite()) || max_q > 10.0 || new_norm > 100.0 * prev_norm.max(1e-10) {
+            // Reject DIIS, take damped simple mixing step instead.
+            // Restore q_inout to the pre-DIIS state (q_in before overwrite).
+            let idx = (self.buf_idx + self.max_history - 1) % self.max_history;
+            q_inout.copy_from_slice(&self.q_in_bufs[idx]);
+            for (q, &r) in q_inout.iter_mut().zip(residual.iter()) {
+                *q += self.alpha * r;
             }
         }
     }

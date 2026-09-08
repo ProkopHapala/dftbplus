@@ -320,3 +320,134 @@ fn test_gpu_scc_parity_batched_h2o() {
     assert!(dq < 1e-3, "Batched H2O charges parity failed: |dq|={dq:.2e} > 1e-3");
     assert!(d_eig < 1e-3, "Batched H2O eigenvalues parity failed: |d_eig|={d_eig:.2e} > 1e-3");
 }
+
+// ==================================================================
+// 4. GpuSccPlan parity — verify persistent plan matches gpu_solve_scc_batched
+// ==================================================================
+
+#[test]
+fn test_gpu_scc_plan_parity_h2o() {
+    use rust_dftb::qmqm::gpu_scc_plan::GpuSccPlan;
+
+    let Some(mut rt) = try_runtime() else { return; };
+    let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else {
+        eprintln!("Skipping: RUST_DFTB_SK_DIR not set");
+        return;
+    };
+    let species = vec!["O".to_string(), "H".to_string(), "H".to_string()];
+    let coords = vec![
+        [0.0, 0.0, 0.0],
+        [-0.7580632005, 0.6358101311, 0.0],
+        [0.7580632005, 0.6358101311, 0.0],
+    ];
+    let sk = load_sk_for_species(&sk_dir, &species).unwrap();
+    let cpu = cpu_scc_ref(&sk, &species, &coords);
+
+    let u_per_atom = per_atom_u(&sk, &species);
+    let g = build_gamma_matrix(&coords, &u_per_atom);
+    let batch = 1usize;
+
+    let h0_buf = rt.buffer_from_slice(&cpu.h0).unwrap();
+    let s_buf = rt.buffer_from_slice(&cpu.s).unwrap();
+    let g_buf = rt.buffer_from_slice(&g).unwrap();
+    let q0_buf = rt.buffer_from_slice(&cpu.q0).unwrap();
+    let oa_buf = rt.buffer_from_slice(&cpu.orb_atom).unwrap();
+
+    // Run with the persistent plan
+    let mut plan = GpuSccPlan::new(&mut rt, &s_buf, cpu.n, cpu.n_atoms, batch)
+        .expect("GpuSccPlan::new must succeed");
+    plan.set_initial_charges(&rt, &cpu.q0).unwrap();
+
+    let mut max_rms = f32::INFINITY;
+    let mut n_iters = 0;
+    for iter in 0..500 {
+        n_iters = iter + 1;
+        max_rms = plan.scc_step(&mut rt, &h0_buf, &s_buf, &g_buf, &q0_buf, &oa_buf, cpu.n_occ, 0.3)
+            .expect("scc_step must succeed");
+        if max_rms < 1e-5 { break; }
+    }
+    assert!(max_rms < 1e-5, "GpuSccPlan did not converge in {n_iters} iters (max_rms={max_rms:.3e})");
+
+    let energies = plan.compute_energy(&mut rt, &h0_buf, &g_buf, &q0_buf).unwrap();
+    let charges = plan.read_charges(&rt).unwrap();
+    let eigenvalues = plan.read_eigenvalues(&mut rt).unwrap();
+
+    let de = (energies[0] as f64 - cpu.energy).abs();
+    let dq = max_abs_diff(&charges, &cpu.charges.iter().map(|&q| q as f32).collect::<Vec<_>>());
+    let d_eig = max_abs_diff(&eigenvalues, &cpu.eigenvalues.iter().map(|&e| e as f32).collect::<Vec<_>>());
+
+    eprintln!("GpuSccPlan H2O parity: E_cpu={:.8}, E_plan={:.8}, |dE|={de:.2e}, iters={n_iters}", cpu.energy, energies[0]);
+    eprintln!("  |dq|={dq:.2e}, |d_eig|={d_eig:.2e}");
+
+    assert!(de < 1e-3, "GpuSccPlan energy parity failed: |dE|={de:.2e} > 1e-3");
+    assert!(dq < 1e-3, "GpuSccPlan charges parity failed: |dq|={dq:.2e} > 1e-3");
+    assert!(d_eig < 1e-3, "GpuSccPlan eigenvalues parity failed: |d_eig|={d_eig:.2e} > 1e-3");
+}
+
+// ==================================================================
+// 5. N>64 SCC parity — 12× H2O cluster (72 orbitals, tiled path)
+// Phase 3: verifies the full N>64 pipeline (tiled Jacobi + tiled GEMM
+// + tiled S^{-1/2}) against the CPU reference.
+// ==================================================================
+
+#[test]
+fn test_gpu_scc_parity_n64_h2o_cluster() {
+    let Some(mut rt) = try_runtime() else { return; };
+    let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else {
+        eprintln!("Skipping: RUST_DFTB_SK_DIR not set");
+        return;
+    };
+    // 12 H2O molecules = 36 atoms, 12*6 = 72 orbitals (> 64, forces tiled path)
+    let mut species = Vec::new();
+    let mut coords = Vec::new();
+    // Arrange 12 H2O in a 3×4×1 grid, ~3 Å apart
+    let h2o = [
+        [0.0, 0.0, 0.0],
+        [-0.7580632005, 0.6358101311, 0.0],
+        [0.7580632005, 0.6358101311, 0.0],
+    ];
+    for ix in 0..3 {
+        for iy in 0..4 {
+            let ox = ix as f64 * 3.0;
+            let oy = iy as f64 * 3.0;
+            for &a in &h2o {
+                species.push(if a == h2o[0] { "O" } else { "H" }.to_string());
+                coords.push([a[0] + ox, a[1] + oy, a[2]]);
+            }
+        }
+    }
+    assert_eq!(species.len(), 36, "12 H2O = 36 atoms");
+    let sk = load_sk_for_species(&sk_dir, &species).unwrap();
+    let cpu = cpu_scc_ref(&sk, &species, &coords);
+    eprintln!("12× H2O cluster: n_orbs={}, n_atoms={}, n_occ={}", cpu.n, cpu.n_atoms, cpu.n_occ);
+    assert!(cpu.n > 64, "test requires N>64 to exercise tiled path, got N={}", cpu.n);
+
+    let u_per_atom = per_atom_u(&sk, &species);
+    let g = build_gamma_matrix(&coords, &u_per_atom);
+    let batch = 1usize;
+
+    let h0_buf = rt.buffer_from_slice(&cpu.h0).unwrap();
+    let s_buf = rt.buffer_from_slice(&cpu.s).unwrap();
+    let g_buf = rt.buffer_from_slice(&g).unwrap();
+    let q0_buf = rt.buffer_from_slice(&cpu.q0).unwrap();
+    let oa_buf = rt.buffer_from_slice(&cpu.orb_atom).unwrap();
+
+    let gpu = gpu_solve_scc_batched(
+        &mut rt, &h0_buf, &s_buf, &g_buf, &q0_buf, &oa_buf,
+        cpu.n, cpu.n_atoms, cpu.n_occ, batch,
+        500, 1e-5, 0.3,
+    ).expect("GPU SCC must converge for N>64 H2O cluster");
+
+    let de = (gpu.energies[0] as f64 - cpu.energy).abs();
+    let dq = max_abs_diff(&gpu.charges, &cpu.charges.iter().map(|&q| q as f32).collect::<Vec<_>>());
+    let d_eig = max_abs_diff(&gpu.eigenvalues, &cpu.eigenvalues.iter().map(|&e| e as f32).collect::<Vec<_>>());
+
+    eprintln!("N>64 (N={}) H2O cluster SCC parity:", cpu.n);
+    eprintln!("  E_cpu={:.8}, E_gpu={:.8}, |dE|={de:.2e}", cpu.energy, gpu.energies[0]);
+    eprintln!("  |dq|={dq:.2e}, |d_eig|={d_eig:.2e}, n_iters={}", gpu.n_iters);
+
+    // N>64 tolerances (manifest §4.3): relaxed from N≤64 due to f32 block Jacobi
+    assert!(de < 1e-2, "N>64 energy parity failed: |dE|={de:.2e} > 1e-2");
+    assert!(dq < 1e-2, "N>64 charges parity failed: |dq|={dq:.2e} > 1e-2");
+    assert!(d_eig < 1e-2, "N>64 eigenvalues parity failed: |d_eig|={d_eig:.2e} > 1e-2");
+}

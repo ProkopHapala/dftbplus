@@ -117,22 +117,39 @@ impl Bsr4Matrix {
 
     /// Expand to a dense `(4*n_atom) × (4*n_atom)` row-major f32 matrix.
     /// Missing blocks are zero. Useful for CPU reference checks.
+    ///
+    /// **P0 firewall (manifest v3 §4.1):** This function allocates an
+    /// `O(Norb²)` dense matrix and is **reference/test-only**. When the
+    /// `sparse_firewall` feature is enabled, this function panics to prevent
+    /// hidden dense allocations from masquerading as sparse in production.
+    /// Production sparse SCC/force code must never call this.
+    #[cfg_attr(feature = "sparse_firewall", track_caller)]
     pub fn to_dense(&self) -> Vec<f32> {
-        let n = self.n_atom * BS;
-        let mut d = vec![0.0f32; n * n];
-        for i in 0..self.n_atom {
-            let (a, b) = (self.row_ptr[i] as usize, self.row_ptr[i + 1] as usize);
-            for blk in a..b {
-                let j = self.col_idx[blk] as usize;
-                let v = &self.values[blk * BS2..(blk + 1) * BS2];
-                for r in 0..BS {
-                    for c in 0..BS {
-                        d[(i * BS + r) * n + (j * BS + c)] = v[r * BS + c];
+        #[cfg(feature = "sparse_firewall")]
+        {
+            panic!("P0 SPARSE FIREWALL: Bsr4Matrix::to_dense() called from production sparse path. \
+                    This allocates an O(Norb²) dense matrix. \
+                    Disable the `sparse_firewall` feature for test/reference use. \
+                    Caller: {}", std::panic::Location::caller());
+        }
+        #[cfg(not(feature = "sparse_firewall"))]
+        {
+            let n = self.n_atom * BS;
+            let mut d = vec![0.0f32; n * n];
+            for i in 0..self.n_atom {
+                let (a, b) = (self.row_ptr[i] as usize, self.row_ptr[i + 1] as usize);
+                for blk in a..b {
+                    let j = self.col_idx[blk] as usize;
+                    let v = &self.values[blk * BS2..(blk + 1) * BS2];
+                    for r in 0..BS {
+                        for c in 0..BS {
+                            d[(i * BS + r) * n + (j * BS + c)] = v[r * BS + c];
+                        }
                     }
                 }
             }
+            d
         }
-        d
     }
 
     /// Fill block (i,j) from a 4×4 row-major slice. Block must already exist
@@ -143,6 +160,34 @@ impl Bsr4Matrix {
         })?;
         self.values[b * BS2..(b + 1) * BS2].copy_from_slice(v);
         Ok(())
+    }
+
+    /// Get a block's 4×4 values by reference. Returns None if (i,j) not in mask.
+    pub fn get_block(&self, i: usize, j: usize) -> Option<&[f32; BS2]> {
+        self.find(i, j).map(|b| {
+            // Safety: values has nblock * BS2 elements, b < nblock
+            let start = b * BS2;
+            self.values[start..start + BS2].try_into().unwrap()
+        })
+    }
+
+    /// Project this matrix onto a different mask: for each block (i,j) in
+    /// `target_mask`, copy the value from `self` if it exists, else zero.
+    /// Blocks in `self` but not in `target_mask` are dropped (truncated).
+    /// Used to transfer Z from M_Z to M_K for independent R_K/R_Z sweeps.
+    pub fn project_to_mask(&self, target_mask: &(Vec<u32>, Vec<u32>)) -> Result<Self> {
+        let mut m = Self::from_structure(self.n_atom, target_mask.0.clone(), target_mask.1.clone())?;
+        for i in 0..self.n_atom {
+            let (start, end) = (target_mask.0[i] as usize, target_mask.0[i + 1] as usize);
+            for blk in start..end {
+                let j = target_mask.1[blk] as usize;
+                if let Some(src) = self.get_block(i, j) {
+                    m.set_block(i, j, src)?;
+                }
+                // else: block stays zero (missing from source)
+            }
+        }
+        Ok(m)
     }
 }
 
@@ -325,6 +370,128 @@ pub fn build_product_mask(
     (row_ptr, col_idx)
 }
 
+// ---------------------------------------------------------------------
+// P4: Symbolic SpGEMM plan (manifest v3 §4.6)
+// ---------------------------------------------------------------------
+
+/// A precomputed symbolic plan for one masked SpGEMM `C = P_M(A·B)`.
+///
+/// For each output block `C_ij` (global block index `cb` in C's CSR), the
+/// plan stores the exact list of contributing `(A_ik, B_jk)` block pairs:
+///
+/// ```text
+/// plan_ptr[cb] .. plan_ptr[cb+1]  ->  range of terms for output block cb
+/// plan_a_idx[t]                   ->  local index of A_ik in row i (0-based)
+/// plan_b_idx[t]                   ->  global block index of B_jk in B
+/// ```
+///
+/// For the Bsym variant, `B_kj = B_jk^T`, so the kernel uses `B_jk` directly.
+///
+/// The hot GPU loop performs only loads + 4×4 FMAs — no intersection, no
+/// binary search. This is a performance hypothesis (manifest §4.6), not a
+/// law: if a wide mask makes the plan consume unreasonable memory, keep the
+/// intersection kernel for that case.
+#[derive(Debug, Clone)]
+pub struct SpgemmPlan {
+    /// `plan_ptr[nblock_C + 1]` — range of terms per output block.
+    pub plan_ptr: Vec<u32>,
+    /// `plan_a_idx[nterms]` — local A block index within row i.
+    pub plan_a_idx: Vec<u32>,
+    /// `plan_b_idx[nterms]` — global B block index (for B_jk).
+    pub plan_b_idx: Vec<u32>,
+    /// Number of output blocks (C.nblock).
+    pub nblock_c: usize,
+}
+
+impl SpgemmPlan {
+    /// Number of plan terms (total intersection entries).
+    pub fn nterms(&self) -> usize { self.plan_a_idx.len() }
+
+    /// Average terms per output block.
+    pub fn avg_terms(&self) -> f64 {
+        if self.nblock_c == 0 { 0.0 }
+        else { self.nterms() as f64 / self.nblock_c as f64 }
+    }
+
+    /// Total bytes consumed by the plan on device:
+    /// `plan_ptr` (u32) + `plan_a_idx` (u32) + `plan_b_idx` (u32).
+    pub fn bytes(&self) -> usize {
+        (self.plan_ptr.len() + self.plan_a_idx.len() + self.plan_b_idx.len()) * 4
+    }
+}
+
+/// Build a symbolic SpGEMM plan for `C = P_M(A·B)` where B is symmetric.
+///
+/// For each output block `C_ij`, intersect A's row `i` with B's row `j`
+/// (both sorted CSR rows), and store the matching `(ia, bb)` pairs where:
+/// - `ia` is the local index of `A_ik` in A's row `i` (0-based)
+/// - `bb` is the global block index of `B_jk` in B's CSR
+///
+/// This is the same intersection the `bsr4_spgemm_masked_Bsym` kernel does
+/// at runtime, but precomputed once for frozen masks.
+///
+/// # Arguments
+/// - `a` — left matrix (any structure; A need not be symmetric)
+/// - `b` — right matrix (must be symmetric; B_kj = B_jk^T)
+/// - `c_mask` — output mask (C_row, C_col)
+///
+/// # Errors
+/// Fails loudly if any output block `C_ij` requires an `A_ik` block that
+/// does not exist in A's row, or a `B_jk` block that does not exist in B's
+/// row j (structural mismatch between masks).
+pub fn build_spgemm_plan_bsym(
+    a: &Bsr4Matrix,
+    b: &Bsr4Matrix,
+    c_mask: &(Vec<u32>, Vec<u32>),
+) -> Result<SpgemmPlan> {
+    let n_atom = a.n_atom;
+    let mut plan_ptr: Vec<u32> = Vec::with_capacity(c_mask.1.len() + 1);
+    let mut plan_a_idx: Vec<u32> = Vec::new();
+    let mut plan_b_idx: Vec<u32> = Vec::new();
+    plan_ptr.push(0);
+
+    for i in 0..n_atom {
+        let a0 = a.row_ptr[i] as usize;
+        let a1 = a.row_ptr[i + 1] as usize;
+        let na = a1 - a0;
+
+        let c0 = c_mask.0[i] as usize;
+        let c1 = c_mask.0[i + 1] as usize;
+
+        for cb in c0..c1 {
+            let j = c_mask.1[cb] as usize;
+
+            // Intersect A's row i (sorted) with B's row j (sorted).
+            // A's row: a.col_idx[a0..a1], local index ia = 0..na
+            // B's row: b.col_idx[b0..b1], global block index bb = b0..b1
+            let b0 = b.row_ptr[j] as usize;
+            let b1 = b.row_ptr[j + 1] as usize;
+
+            let mut ia = 0usize;
+            let mut ib = b0;
+            while ia < na && ib < b1 {
+                let ka = a.col_idx[a0 + ia];
+                let kb = b.col_idx[ib];
+                if ka < kb {
+                    ia += 1;
+                } else if kb < ka {
+                    ib += 1;
+                } else {
+                    // Match: A_ik (local ia) × B_jk (global ib)
+                    plan_a_idx.push(ia as u32);
+                    plan_b_idx.push(ib as u32);
+                    ia += 1;
+                    ib += 1;
+                }
+            }
+            plan_ptr.push(plan_a_idx.len() as u32);
+        }
+    }
+
+    let nblock_c = c_mask.1.len();
+    Ok(SpgemmPlan { plan_ptr, plan_a_idx, plan_b_idx, nblock_c })
+}
+
 /// Build a Bsr4Matrix representing the identity (4×4 identity on each
 /// diagonal block, zero elsewhere) on the given mask. The mask must include
 /// all diagonal blocks (i,i).
@@ -345,44 +512,66 @@ pub fn build_identity(n_atom: usize, mask: &(Vec<u32>, Vec<u32>)) -> Result<Bsr4
 /// Gershgorin spectral bounds of a BSR4 matrix B at the **orbital** level.
 ///
 /// Returns (emin, emax) where:
-///   emin = min_i ( B_ii - sum_{j≠i} |B_ij| )
-///   emax = max_i ( B_ii + sum_{j≠i} |B_ij| )
+///   emin = min_mu ( B_{mu,mu} - sum_{nu≠mu} |B_{mu,nu}| )
+///   emax = max_mu ( B_{mu,mu} + sum_{nu≠mu} |B_{mu,nu}| )
 ///
-/// with i,j running over individual orbitals (not atom blocks).
+/// with mu,nu running over individual orbitals (not atom blocks).
 /// B must include all diagonal blocks.
+///
+/// Computes directly from sparse 4×4 blocks — no `to_dense()` (P0: no hidden
+/// dense O(N²) allocations in the sparse path).
 pub fn gershgorin_bounds(b: &Bsr4Matrix) -> Result<(f32, f32)> {
     let n_atom = b.n_atom;
-    let n_orb = n_atom * BS;
-    // Build dense to compute orbital-level row sums. For the sizes we expect
-    // (masks are sparse but bounds need full row sums), this is acceptable
-    // as a one-time-per-geometry computation.
-    let dense = b.to_dense();
-    let mut emin = f32::INFINITY;
-    let mut emax = f32::NEG_INFINITY;
-    for mu in 0..n_orb {
-        let diag = dense[mu * n_orb + mu];
-        let mut offdiag_sum = 0.0f32;
-        for nu in 0..n_orb {
-            if nu != mu {
-                offdiag_sum += dense[mu * n_orb + nu].abs();
+    // Per-orbital diagonal and off-diagonal absolute row sums, accumulated
+    // directly from the sparse 4×4 blocks.
+    let mut diag = vec![0.0f32; n_atom * BS];
+    let mut offdiag_sum = vec![0.0f32; n_atom * BS];
+    for i in 0..n_atom {
+        let (a0, a1) = (b.row_ptr[i] as usize, b.row_ptr[i + 1] as usize);
+        for blk in a0..a1 {
+            let j = b.col_idx[blk] as usize;
+            let v = &b.values[blk * BS2..(blk + 1) * BS2];
+            for r in 0..BS {
+                let mu = i * BS + r;
+                for c in 0..BS {
+                    let val = v[r * BS + c];
+                    if j == i && r == c {
+                        diag[mu] = val;
+                    } else {
+                        offdiag_sum[mu] += val.abs();
+                    }
+                }
             }
         }
-        emin = emin.min(diag - offdiag_sum);
-        emax = emax.max(diag + offdiag_sum);
+    }
+    let mut emin = f32::INFINITY;
+    let mut emax = f32::NEG_INFINITY;
+    for mu in 0..n_atom * BS {
+        emin = emin.min(diag[mu] - offdiag_sum[mu]);
+        emax = emax.max(diag[mu] + offdiag_sum[mu]);
     }
     Ok((emin, emax))
 }
 
 /// Infinity norm of a BSR4 matrix (max orbital-level absolute row sum).
+///
+/// Computes directly from sparse 4×4 blocks — no `to_dense()` (P0).
 pub fn inf_norm(b: &Bsr4Matrix) -> f32 {
-    let n_orb = b.n_atom * BS;
-    let dense = b.to_dense();
-    let mut max_row = 0.0f32;
-    for mu in 0..n_orb {
-        let row_sum: f32 = (0..n_orb).map(|nu| dense[mu * n_orb + nu].abs()).sum();
-        max_row = max_row.max(row_sum);
+    let n_atom = b.n_atom;
+    let mut row_sum = vec![0.0f32; n_atom * BS];
+    for i in 0..n_atom {
+        let (a0, a1) = (b.row_ptr[i] as usize, b.row_ptr[i + 1] as usize);
+        for blk in a0..a1 {
+            let v = &b.values[blk * BS2..(blk + 1) * BS2];
+            for r in 0..BS {
+                let mu = i * BS + r;
+                for c in 0..BS {
+                    row_sum[mu] += v[r * BS + c].abs();
+                }
+            }
+        }
     }
-    max_row
+    row_sum.into_iter().fold(0.0f32, f32::max)
 }
 
 /// Frobenius norm of a dense matrix.

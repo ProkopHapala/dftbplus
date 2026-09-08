@@ -126,6 +126,23 @@ impl GpuRuntime {
             .map_err(map_ocl_err)
     }
 
+    /// Device-to-device copy: allocate a new buffer and copy `src` into it.
+    /// No host roundtrip — uses OpenCL `clEnqueueCopyBuffer`.
+    pub fn copy_buffer<T: ocl::OclPrm>(&self, src: &Buffer<T>, len: usize) -> Result<Buffer<T>> {
+        let dst = Buffer::<T>::builder()
+            .queue(self.queue.clone())
+            .flags(flags::MEM_READ_WRITE)
+            .len(len)
+            .build()
+            .map_err(map_ocl_err)?;
+        src.cmd()
+            .queue(&self.queue)
+            .copy(&dst, None, None)
+            .enq()
+            .map_err(map_ocl_err)?;
+        Ok(dst)
+    }
+
     /// Copy a GPU buffer back to host memory (blocking).
     pub fn read_buffer<T: ocl::OclPrm>(&self, buf: &Buffer<T>, out: &mut [T]) -> Result<()> {
         buf.read(out).enq().map_err(map_ocl_err)?;
@@ -138,22 +155,45 @@ impl GpuRuntime {
     }
 }
 
-/// Query device capabilities at startup. Best-effort: uses the ocl `info`
-/// API with string-based parsing. Defaults are used if a query fails.
+/// Query device capabilities at startup using real OpenCL device queries.
+/// Falls back to conservative defaults only if a specific query fails.
 fn query_capabilities(device: &Device) -> GpuCapabilities {
-    // Device name is available via the Display trait or string conversion.
+    use ocl::enums::DeviceInfo;
+
     let name = format!("{device}");
 
-    // Default capabilities for a typical NVIDIA consumer GPU (RTX 3090).
-    // Agents should query specific limits they need via ocl::Device::info
-    // directly. These defaults are for logging and rough planning only.
+    let local_mem_size = device.info(DeviceInfo::LocalMemSize)
+        .ok()
+        .and_then(|v| if let ocl::enums::DeviceInfoResult::LocalMemSize(n) = v { Some(n) } else { None })
+        .unwrap_or(48 * 1024);
+
+    let max_work_group_size = device.info(DeviceInfo::MaxWorkGroupSize)
+        .ok()
+        .and_then(|v| if let ocl::enums::DeviceInfoResult::MaxWorkGroupSize(n) = v { Some(n as usize) } else { None })
+        .unwrap_or(1024);
+
+    // PreferredWorkGroupSizeMultiple is a kernel property, not a device
+    // property in OpenCL 1.2. Use 32 (NVIDIA warp size) as default; agents
+    // should query kernel-specific values via Kernel::wg_info if needed.
+    let preferred_wg_multiple = 32;
+
+    let compute_units = device.info(DeviceInfo::MaxComputeUnits)
+        .ok()
+        .and_then(|v| if let ocl::enums::DeviceInfoResult::MaxComputeUnits(n) = v { Some(n) } else { None })
+        .unwrap_or(1);
+
+    let global_mem_size = device.info(DeviceInfo::GlobalMemSize)
+        .ok()
+        .and_then(|v| if let ocl::enums::DeviceInfoResult::GlobalMemSize(n) = v { Some(n) } else { None })
+        .unwrap_or(0);
+
     GpuCapabilities {
-        local_mem_size: 48 * 1024, // 48 KB typical for NVIDIA
-        max_work_group_size: 1024,
-        preferred_wg_multiple: 32, // NVIDIA warp size
+        local_mem_size,
+        max_work_group_size,
+        preferred_wg_multiple,
         name,
-        compute_units: 82, // RTX 3090 SMs
-        global_mem_size: 24 * 1024 * 1024 * 1024, // 24 GB
+        compute_units,
+        global_mem_size,
     }
 }
 
