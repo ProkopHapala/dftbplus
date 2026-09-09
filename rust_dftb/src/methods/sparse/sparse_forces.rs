@@ -29,8 +29,8 @@
 //! Hessian implementation is blocked until this passes.
 
 use crate::core::error::Result;
-use crate::methods::sparse::bsr4::{build_product_mask, Bsr4Matrix, BS, BS2};
-use crate::methods::sparse::gpu_sparse::{GpuBsrMatrix, GpuBsrStructure, SparseBsr4Gpu};
+use crate::methods::sparse::bsr4::{build_product_mask, build_spgemm_plan_bsym, Bsr4Matrix, SpgemmPlan, BS, BS2};
+use crate::methods::sparse::gpu_sparse::{GpuBsrMatrix, GpuBsrStructure, SparseBsr4Gpu, SpgemmPlanGpu};
 use std::sync::Arc;
 
 /// Output of `build_dw_sparse`: device-resident `D` and `W` matrices.
@@ -44,7 +44,142 @@ pub struct SparseDW {
     pub w: GpuBsrMatrix,
 }
 
+/// Persistent workspace for `D = 2K` and `W = 2 K H_scc K` construction.
+///
+/// GPT-5.6 issue #8 / manifest §1.4: all structures, buffers, and symbolic
+/// plans are built once at construction and reused across all calls.
+/// No allocation in the hot loop — `build_dw_into` only enqueues kernels
+/// and swaps `set_arg`s.
+///
+/// The workspace owns:
+/// - `tw_struct`: GPU structure for T = K·H_scc (on M_TW = M_K ∘ M_HS)
+/// - `t`: scratch GPU matrix on M_TW
+/// - `w`: GPU matrix on M_HS (the output W)
+/// - `d`: GPU matrix on M_K (the output D)
+/// - `plan_kh`: symbolic plan for T = K·H_scc (A=K, B=H_scc sym, C=T)
+/// - `plan_tk`: symbolic plan for W = T·K (A=T, B=K sym, C=W on M_HS)
+pub struct SparseDWWorkspace {
+    /// GPU structure for T = K·H_scc on M_TW.
+    tw_struct: Arc<GpuBsrStructure>,
+    /// Scratch T = K·H_scc (on M_TW).
+    t: GpuBsrMatrix,
+    /// Output W = 2·T·K (on M_HS, reuses h_scc structure).
+    w: GpuBsrMatrix,
+    /// Output D = 2·K (on M_K, reuses k structure).
+    d: GpuBsrMatrix,
+    /// P4: symbolic plan for T = K·H_scc.
+    plan_kh: Option<SpgemmPlanGpu>,
+    /// P4: symbolic plan for W = T·K.
+    plan_tk: Option<SpgemmPlanGpu>,
+}
+
+impl SparseDWWorkspace {
+    /// Build a persistent workspace for D/W construction on the given masks.
+    ///
+    /// `k_struct` is the K mask structure (M_K), `h_struct` is the H/S mask
+    /// structure (M_HS). Both must have the same `n_atom`.
+    ///
+    /// All GPU structures and buffers are allocated once here. The symbolic
+    /// plans for the two SpGEMMs are built and uploaded. If plan building
+    /// fails (e.g., row degree overflow), falls back to the intersection
+    /// kernel.
+    pub fn new(
+        gpu: &SparseBsr4Gpu,
+        k_struct: &Arc<GpuBsrStructure>,
+        h_struct: &Arc<GpuBsrStructure>,
+    ) -> Result<Self> {
+        let n_atom = k_struct.n_atom;
+        assert_eq!(h_struct.n_atom, n_atom, "K and H_scc must have same n_atom");
+
+        // M_TW = boolean_product(M_K, M_HS) — host-side, one-time.
+        let k_mask = (k_struct.row_ptr_host(gpu)?, k_struct.col_idx_host(gpu)?);
+        let hs_mask = (h_struct.row_ptr_host(gpu)?, h_struct.col_idx_host(gpu)?);
+        let m_tw = build_product_mask(n_atom, &k_mask, &hs_mask);
+
+        // Allocate device structures and buffers once.
+        let tw_struct = Arc::new(GpuBsrStructure::new(gpu, n_atom, &m_tw)?);
+        let t = GpuBsrMatrix::zero(gpu, &tw_struct)?;
+        let w = GpuBsrMatrix::zero(gpu, h_struct)?;
+        let d = GpuBsrMatrix::zero(gpu, k_struct)?;
+
+        // P4: Build symbolic plans for the two SpGEMMs.
+        // Plan for T = K·H_scc: A=K (k_mask), B=H_scc (hs_mask, sym), C=T (m_tw).
+        // Plan for W = T·K: A=T (m_tw), B=K (k_mask, sym), C=W (hs_mask).
+        let plan_kh = {
+            let k_dummy = Bsr4Matrix::from_structure(n_atom, k_mask.0.clone(), k_mask.1.clone())?;
+            let h_dummy = Bsr4Matrix::from_structure(n_atom, hs_mask.0.clone(), hs_mask.1.clone())?;
+            match build_spgemm_plan_bsym(&k_dummy, &h_dummy, &m_tw) {
+                Ok(plan) => Some(gpu.upload_plan(&plan)?),
+                Err(e) => {
+                    eprintln!("P4: plan_kh build failed, falling back to intersection: {e}");
+                    None
+                }
+            }
+        };
+        let plan_tk = {
+            let t_dummy = Bsr4Matrix::from_structure(n_atom, m_tw.0.clone(), m_tw.1.clone())?;
+            let k_dummy = Bsr4Matrix::from_structure(n_atom, k_mask.0.clone(), k_mask.1.clone())?;
+            match build_spgemm_plan_bsym(&t_dummy, &k_dummy, &hs_mask) {
+                Ok(plan) => Some(gpu.upload_plan(&plan)?),
+                Err(e) => {
+                    eprintln!("P4: plan_tk build failed, falling back to intersection: {e}");
+                    None
+                }
+            }
+        };
+
+        Ok(Self { tw_struct, t, w, d, plan_kh, plan_tk })
+    }
+
+    /// Build `D = 2K` and `W = 2 K H_scc K` into the workspace's persistent
+    /// buffers. No allocation, no host transfer — only kernel launches.
+    ///
+    /// Returns references to the device-resident D and W. The caller must
+    /// not hold these references across another `build_dw_into` call
+    /// (they point into the same workspace buffers).
+    pub fn build_dw_into(
+        &mut self,
+        gpu: &SparseBsr4Gpu,
+        k: &GpuBsrMatrix,
+        h_scc: &GpuBsrMatrix,
+    ) -> Result<(&GpuBsrMatrix, &GpuBsrMatrix)> {
+        // 1. T = K * H_scc on M_TW (SpGEMM, device-resident).
+        match &self.plan_kh {
+            Some(plan) => gpu.spgemm_plan_bsym_dev(k, h_scc, plan, &self.t)?,
+            None => gpu.spgemm_masked_dev(k, h_scc, &self.t)?,
+        }
+
+        // 2. W = T * K on M_HS (SpGEMM, device-resident).
+        match &self.plan_tk {
+            Some(plan) => gpu.spgemm_plan_bsym_dev(&self.t, k, plan, &self.w)?,
+            None => gpu.spgemm_masked_dev(&self.t, k, &self.w)?,
+        }
+
+        // 3. Scale W by 2: W = 2 * project_MHS(T * K).
+        let nblock_w = self.w.struct_.nblock;
+        gpu.axpby_dev(nblock_w, 2.0, &self.w.values, 0.0, &self.w.values, &self.w.values)?;
+
+        // 4. symmetrize(W).
+        gpu.symmetrize_dev(nblock_w, self.w.struct_.transpose_block(), &self.w.values)?;
+
+        // 5. D = 2 * K (scale K values by 2, same mask M_K).
+        let nblock_k = self.d.struct_.nblock;
+        gpu.axpby_dev(nblock_k, 2.0, &k.values, 0.0, &k.values, &self.d.values)?;
+
+        Ok((&self.d, &self.w))
+    }
+
+    /// Access the D matrix (last computed).
+    pub fn d(&self) -> &GpuBsrMatrix { &self.d }
+    /// Access the W matrix (last computed).
+    pub fn w(&self) -> &GpuBsrMatrix { &self.w }
+}
+
 /// Build `D = 2K` and `W = 2 K H_scc K` on the GPU using masked SpGEMM.
+///
+/// **Legacy one-shot API.** Allocates structures and buffers per call.
+/// Production code should use `SparseDWWorkspace::build_dw_into` instead,
+/// which pre-allocates once and reuses across all calls (GPT-5.6 #8).
 ///
 /// Inputs:
 /// - `k`: density kernel (purified) on mask `M_K`
@@ -356,5 +491,57 @@ mod tests {
         };
         check_sym(&d_host, "D");
         check_sym(&w_host, "W");
+    }
+
+    /// Test: SparseDWWorkspace produces the same D and W as the one-shot
+    /// build_dw_sparse, verifying that the persistent workspace + symbolic
+    /// plans give identical results to the per-call allocation path.
+    #[test]
+    fn test_dw_workspace_vs_oneshot() {
+        let Some(gpu) = try_gpu() else { return; };
+
+        let n_atom = 4;
+        let pos: Vec<[f64; 3]> = vec![
+            [0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [1.0, 1.0, 0.0],
+        ];
+        let m_hs = build_geometric_mask(&pos, 3.0);
+        let m_k = m_hs.clone();
+
+        let k_host = random_symmetric_bsr4(n_atom, &m_k, 42);
+        let h_scc_host = random_symmetric_bsr4(n_atom, &m_hs, 123);
+
+        // One-shot path
+        let k_dev = GpuBsrMatrix::from_host(&gpu, &k_host).unwrap();
+        let h_scc_dev = GpuBsrMatrix::from_host(&gpu, &h_scc_host).unwrap();
+        let dw_oneshot = build_dw_sparse(&gpu, &k_dev, &h_scc_dev, &m_k, &m_hs).unwrap();
+        let d_oneshot = dw_oneshot.d.to_host(&gpu).unwrap();
+        let w_oneshot = dw_oneshot.w.to_host(&gpu).unwrap();
+
+        // Persistent workspace path
+        let mut ws = SparseDWWorkspace::new(&gpu, &k_dev.struct_, &h_scc_dev.struct_).unwrap();
+        let (d_ws_ref, w_ws_ref) = ws.build_dw_into(&gpu, &k_dev, &h_scc_dev).unwrap();
+        let d_ws = d_ws_ref.to_host(&gpu).unwrap();
+        let w_ws = w_ws_ref.to_host(&gpu).unwrap();
+
+        // Compare: should be identical (same kernels, same order, just
+        // different buffer ownership).
+        let d_diff = bsr4_max_abs_diff(&d_oneshot, &d_ws);
+        let w_diff = bsr4_max_abs_diff(&w_oneshot, &w_ws);
+        eprintln!("DW workspace vs oneshot: D max|diff|={d_diff:e}, W max|diff|={w_diff:e}");
+        assert!(d_diff < 1e-6, "D mismatch: {d_diff:e}");
+        assert!(w_diff < 1e-6, "W mismatch: {w_diff:e}");
+
+        // Verify workspace is reusable: second call should give same result.
+        let (d2_ref, w2_ref) = ws.build_dw_into(&gpu, &k_dev, &h_scc_dev).unwrap();
+        let d2 = d2_ref.to_host(&gpu).unwrap();
+        let w2 = w2_ref.to_host(&gpu).unwrap();
+        let d2_diff = bsr4_max_abs_diff(&d_oneshot, &d2);
+        let w2_diff = bsr4_max_abs_diff(&w_oneshot, &w2);
+        eprintln!("DW workspace reuse: D max|diff|={d2_diff:e}, W max|diff|={w2_diff:e}");
+        assert!(d2_diff < 1e-6, "D reuse mismatch: {d2_diff:e}");
+        assert!(w2_diff < 1e-6, "W reuse mismatch: {w2_diff:e}");
     }
 }

@@ -9,6 +9,7 @@
 //! tolerance (~1e-3 relative).
 
 use rust_dftb::qmqm::gpu_forces::GpuForceDriver;
+use rust_dftb::qmqm::gpu_runtime::GpuRuntime;
 use rust_dftb::qmqm::gpu_prep::GpuBatch;
 use rust_dftb::qmqm::{Fragment, FragmentTemplate, GammaTable};
 use rust_dftb::{
@@ -21,9 +22,12 @@ use nalgebra::{Cholesky, DMatrix, DVector, SymmetricEigen};
 
 use std::collections::HashMap;
 
-fn try_gpu() -> Option<GpuForceDriver> {
-    match GpuForceDriver::new() {
-        Ok(d) => Some(d),
+fn try_gpu() -> Option<(GpuRuntime, GpuForceDriver)> {
+    match GpuRuntime::new() {
+        Ok(mut rt) => match GpuForceDriver::new(&mut rt) {
+            Ok(d) => Some((rt, d)),
+            Err(e) => { eprintln!("Skipping: force driver failed ({e})"); None }
+        },
         Err(e) => { eprintln!("Skipping: no OpenCL ({e})"); None }
     }
 }
@@ -137,6 +141,7 @@ fn make_fragment(sk: &SkData, species: &[String], coords: &[[f64; 3]]) -> Fragme
 
 /// Run CPU non-SCC electronic force and GPU force, compare.
 fn run_parity(
+    rt: &GpuRuntime,
     driver: &GpuForceDriver,
     sk: &SkData,
     species: &[String],
@@ -176,7 +181,7 @@ fn run_parity(
     for f in &batch.fragments {
         eprintln!("  frag: n_atoms={} n_orbs={} atom_off={}", f.n_atoms, f.n_orbs, f.atom_off);
     }
-    let gpu_forces = driver.gpu_force_batched(&batch, &dm_flat, &edm_flat).unwrap();
+    let gpu_forces = driver.gpu_force_batched(rt, &batch, &dm_flat, &edm_flat).unwrap();
 
     // Compare
     let mut max_err = 0.0f64;
@@ -211,34 +216,34 @@ fn run_parity(
 
 #[test]
 fn test_gpu_force_parity_h2() {
-    let Some(driver) = try_gpu() else { return; };
+    let Some((rt, driver)) = try_gpu() else { return; };
     let sk = make_h2_sk_data();
     let species = vec!["H".to_string(), "H".to_string()];
     let coords = vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]];
-    run_parity(&driver, &sk, &species, &coords, 2.0, "H2");
+    run_parity(&rt, &driver,&sk, &species, &coords, 2.0, "H2");
 }
 
 #[test]
 fn test_gpu_force_parity_h2_tilted() {
-    let Some(driver) = try_gpu() else { return; };
+    let Some((rt, driver)) = try_gpu() else { return; };
     let sk = make_h2_sk_data();
     let species = vec!["H".to_string(), "H".to_string()];
     let coords = vec![[0.0, 0.0, 0.0], [0.5, 0.6, 0.7]];
-    run_parity(&driver, &sk, &species, &coords, 2.0, "H2_tilted");
+    run_parity(&rt, &driver,&sk, &species, &coords, 2.0, "H2_tilted");
 }
 
 #[test]
 fn test_gpu_force_parity_sp3() {
-    let Some(driver) = try_gpu() else { return; };
+    let Some((rt, driver)) = try_gpu() else { return; };
     let sk = make_c_like_sk_data();
     let species = vec!["X".to_string(), "X".to_string()];
     let coords = vec![[0.0, 0.0, 0.0], [1.3, 0.4, 0.2]];
-    run_parity(&driver, &sk, &species, &coords, 8.0, "sp3");
+    run_parity(&rt, &driver,&sk, &species, &coords, 8.0, "sp3");
 }
 
 #[test]
 fn test_gpu_force_parity_h2o() {
-    let Some(driver) = try_gpu() else { return; };
+    let Some((rt, driver)) = try_gpu() else { return; };
     let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else {
         eprintln!("Skipping: RUST_DFTB_SK_DIR not set");
         return;
@@ -251,12 +256,12 @@ fn test_gpu_force_parity_h2o() {
     ];
     let sk = rust_dftb::load_sk_for_species(&sk_dir, &species).unwrap();
     let n_electrons: f64 = 6.0 + 1.0 + 1.0; // O:6, H:1, H:1
-    run_parity(&driver, &sk, &species, &coords, n_electrons, "H2O");
+    run_parity(&rt, &driver,&sk, &species, &coords, n_electrons, "H2O");
 }
 
 #[test]
 fn test_gpu_force_parity_formic_dimer() {
-    let Some(driver) = try_gpu() else { return; };
+    let Some((rt, driver)) = try_gpu() else { return; };
     let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else {
         eprintln!("Skipping: RUST_DFTB_SK_DIR not set");
         return;
@@ -272,5 +277,5 @@ fn test_gpu_force_parity_formic_dimer() {
     // Formic dimer HCOOH·HCOOH: C2O2H4 → 2*(4+6+4+1) = ... let's count valence e-
     // C:4 each, O:6 each, H:1 each. 2C + 4O + 4H = 2*4 + 4*6 + 4*1 = 8+24+4 = 36
     let n_electrons = 36.0;
-    run_parity(&driver, &sk, &species, &coords, n_electrons, "formic_dimer");
+    run_parity(&rt, &driver,&sk, &species, &coords, n_electrons, "formic_dimer");
 }

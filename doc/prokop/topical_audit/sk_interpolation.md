@@ -1,66 +1,125 @@
 ---
 type: TopicalAudit
 title: SK Interpolation
-tags: [topic, cross-language, interpolation, dftb]
+tags: [topic, cross-language, interpolation, dftb, bspline, boundary-conditions]
+timestamp: 2026-09-09
 ---
 
 # SK Interpolation
 
 ## Summary
 
-Slater–Koster integral tables are stored on a uniform 1D grid (spacing `dr`,
-typically 0.02 Bohr, ~500 points). At runtime, the SK integrals V(r) must be
-evaluated at arbitrary interatomic distances r. The interpolation method
-determines accuracy, performance, and whether analytic derivatives are
-available for the force path.
+Slater–Koster tables live on a uniform 1D grid (`dr` typically 0.02 Bohr,
+~500 points). Production evaluation is a **C² cubic B-spline** on both CPU
+(f64, reference) and GPU (f32). Analytic `dV/dr` is the derivative of that
+same spline — not a finite difference, not a second interpolant.
+
+The old 8-point Neville + `poly5_to_zero` tail is **not** the production
+path. On a nearly-flat SK tail (~1e-5 Ha at last H–H grid point) that
+polynomial exploded to **−0.4 Ha** at 10.39 Bohr. GPU already clamped to ~0.
+AT/GC “H assembly failed” was that CPU garbage, not a GPU assembly bug.
 
 ## Implementations
 
 | Language | Location | Status | Notes |
 |----------|----------|--------|-------|
-| Fortran | `src/dftbp/dftb/slakoeqgrid.F90` | active | 8-point Neville (`polyInterUniform`), `poly5ToZero` tail. Reference implementation. |
-| Rust (CPU) | `rust_dftb/src/methods/dftb/interpolation.rs` | active | Cubic Hermite spline (`eval_hermite_into`), precomputed derivatives. Neville retained as `eval_neville_into` for parity + tail. |
-| Rust (GPU) | `rust_dftb/src/methods/dftb/dftb_hamiltonian.cl` | active | Cubic B-spline (`cubic_interp_params`, `interp_sk_*_indexed`), host-resampled to ≤256 points. |
+| Fortran | `src/dftbp/dftb/slakoeqgrid.F90` | reference | 8-point Neville + `poly5ToZero` over `distFudge=1` Bohr. Physical reference for *interior* SK; the tail polynomial is **not** a physics we copy. |
+| Rust CPU f64 | `rust_dftb/src/methods/dftb/interpolation.rs` | active (stopgap BC) | Production: `eval_into` / `eval_with_deriv_into` → B-spline. Hermite and Neville kept as unused reference paths. |
+| Rust fit | `rust_dftb/src/methods/dftb/spline_resample.rs` | active | `function_to_bspline_control_points`, `fit_bspline_controls_zero_end`, `bspline3_eval_v_d1_d2`. |
+| GPU f32 | `dftb_hamiltonian.cl`, `gpu_forces.cl`, packed in `qmqm/gpu_prep.rs` | active (same stopgap) | Same 4-point stencil + analytic `cubic_weights_d1`. Dense H-bond tables: original grid + r=0 dummy + `N_PAD_END` (fits `SK_GRID_MAX=512` for mio). |
 
-## Parity Status
+## What was done (2026-09-09) — stopgap, not the design
 
-| Pair | Tolerance | Test | Notes |
-|------|-----------|------|-------|
-| Rust Hermite vs Rust Neville (interior) | <1e-10 | `examples/test_hermite.rs` (temporary) | Exact match in interior [dr, last_grid_r] |
-| Rust Hermite vs Rust Neville (tail) | <1.2e-7 | same | Tail delegates to Neville `poly5_to_zero` |
-| Rust Neville vs Fortran Neville | — | `tests/parity_non_scc.rs` | Historical parity, 8-point Neville ported directly |
-| Rust Hermite energy vs Neville energy | 7 sig figs | `examples/hbond_ref.rs` | -3.2112994345e1 vs -3.2112994161e1 (100 opt iters) |
-| Rust Hermite forces vs Neville finite-diff | exact | `examples/hbond_ref.rs` | max\|F\|=4.7305, rms\|F\|=1.2098 (identical) |
+Two different end treatments. Do not confuse them.
 
-## Methods Compared
+**Left end (the better *kind* of thing):** at evaluation, a **phantom control**
+`c_{-1} = 2 c_0 − c_1` implements the natural-spline condition `V''=0` at the
+first tabulated knot. SK values at small `r` are large — we do **not** pad
+zeros on the left.
 
-### Neville 8-point polynomial (Fortran, Rust fallback)
-- Degree-7 polynomial through 8 grid points
-- O(n²) per evaluation (~64 FMAs per channel)
-- No precomputation — every eval re-derives the polynomial
-- Derivatives require 3 separate evaluations (r, r±dr) for finite differences
-- Tail: `poly5_to_zero` with derivatives computed via 8-point polynomial finite differences
+**Right end (blunt stopgap):** append `N_PAD_END=4` **function samples of
+exact 0** after the last SK point, then refit the whole tridiagonal
+(`fit_bspline_controls_zero_end`). That interpolates zeros in the pad and
+killed the Neville explosion. It is **not** an optimal extra-control fit:
 
-### Cubic Hermite spline (Rust CPU, current)
-- Degree-3 polynomial per interval, C¹ continuous
-- Precomputes f'(x_i) at each grid point at load time (4th-order central differences)
-- O(1) per evaluation (4 FMAs per channel)
-- Analytic derivative dV/dr in same call (`eval_hermite_with_deriv_into`) — no finite differences
-- Tail [last_grid_r, r_max]: delegates to Neville `poly5_to_zero` (the tail derivative
-  is sensitive to the finite-difference order; 2nd-order backward difference was
-  insufficient — caused 0.5 Hartree energy error)
+- extra knots are hardcoded 0, not solved for;
+- the global tridiagonal couples those zeros back into the last original
+  samples;
+- cutoff shrinks from DFTB+ `last_grid + 1 Bohr` to `last_grid + 4·dr`
+  (~0.08 Bohr). Distant pairs (AT H–H at 10.39 Bohr) are now exact 0, which
+  is physical for a ~1e-5 table, but the *method* is blunt.
 
-### Cubic B-spline (Rust GPU)
-- Precomputed B-spline coefficients, host-resampled to ≤256 grid points
-- GPU-friendly (uniform grid, local stencil)
-- Used in `dftb_hamiltonian.cl` for GPU H0/S assembly
+GPU packing prepends a dummy 0 at `r=0` for 0-based indexing. That dummy is
+also blunt, not a fitted left control.
+
+Neville / `poly5_to_zero` / `DIST_FUDGE` remain in the file, unused in
+production. Do not restore them for “Fortran tail parity”.
+
+## What should be done — extra controls as a general BC fitter
+
+Cubic B-splines need a few extra control points **before and after** the
+tabulated domain to implement boundary conditions. Those points must be
+**computed**, not bluntly zeroed.
+
+Need one general fitter (CPU f64, then pack the same controls to GPU f32):
+
+1. **Inputs:** original samples on the valid grid; optional extra conditions
+   (values and/or derivatives at selected knots).
+2. **Unknowns:** a small number of extra controls left of sample 0 and right
+   of the last sample (2–4 per side is enough for a 4-point stencil).
+3. **Solve** (linear / least-squares) so that:
+   - the interpolant on the **valid domain** reproduces the original samples
+     (or the unconstrained spline) accurately — extra points must not pollute
+     the interior polynomial;
+   - `V`, `V'` (and preferably `V''`) are continuous at the first/last
+     tabulated knot;
+   - at cutoff: `V → 0`, `V' → 0` (optionally `V'' → 0`);
+   - left end: **not** `V=0`. Phantom `c_{-1}=2c_0−c_1` is one valid
+     condition; fitted left controls are the generalization.
+4. Cutoff length is then a consequence of how far the extra right controls
+   go, not a 1 Bohr polynomial fudge.
+
+The phantom-knot formula is the pattern to generalize. The zero-sample pad
+is only a temporary way to stop the tail explosion.
+
+## Parity Status (measured 2026-09-09, NVIDIA RTX 3090, mio-1-1)
+
+CPU f64 is the reference. GPU f32 must match it. Tests:
+`cargo test --lib interpolation` and
+`RUST_DFTB_SK_DIR=.../mio-1-1 cargo test --test gpu_hbond_physics`.
+
+| Check | Result |
+|-------|--------|
+| B-spline reproduces grid values | pass (`<1e-10`) |
+| Analytic V' vs FD of same V (synthetic) | max rel `1.5e-8` |
+| Real H–H SK: analytic dHss/dr vs FD | max rel `8.6e-10` |
+| H–H at 10.00 Bohr (in zero-pad) | Hss `~2e-22` (was `−0.4`) |
+| H–H at 10.39 Bohr (AT pair, past cutoff) | exact 0 |
+| AT / GC / H2O H/S GPU vs CPU | max\|dH\| `8.6e-8` / `7.4e-8` / `4.4e-8` |
+| H2O CPU analytic F vs FD of E (h=1e-3 Å) | rel `1.05e-5` |
+| H2O four GPU force kernels vs CPU | rel `~3e-5` |
+
+Do not chase Fortran Neville-tail values past last grid. That tail is the
+bug we replaced.
 
 ## Open Issues
 
-- [ ] All-channel evaluation reuse (Rule 9 in `efficiency.md`): `rotate_diatomic_block_into`
-  still calls `eval_shell_integrals_into` separately for ss, sp, ps, pp. Could
-  evaluate all channels once per pair and reuse.
-- [ ] Consider quintic Hermite (C², degree 5) if higher smoothness needed — would
-  require 2nd derivatives in precomputation but only 2 extra FMAs per eval.
-- [ ] GPU B-spline and CPU Hermite are different algorithms — cross-parity not
-  formally verified (both match Fortran independently).
+- [ ] **Replace blunt zero-sample pad with the general extra-control fitter**
+  described above. Shared CPU/GPU controls. This is the next interpolator
+  work — do not re-Neville, do not restore `DIST_FUDGE` poly5.
+- [ ] GPU dummy at `r=0` should become a fitted left control (or stay a
+  pure index shift with the phantom applied in the kernel), not a stored 0
+  that the stencil can eat at small `r`.
+- [ ] All-channel evaluation reuse (Rule 9 in `efficiency.md`):
+  `rotate_diatomic_block_into` still interpolates per shell pair.
+- AT/GC GPU SCC charge-rms plateaus `~1e-5` with matching H/S — **not this
+  interpolator.** Hypothesis: f32 floor (`100 × 1e-8` → `1e-6`), see H-bond
+  manifest §3.0.1. Do not chase `<1e-6` as a mixer bug until the Hamiltonian
+  scale is checked.
+
+## Related
+
+- `/doc/prokop/tasts/HBond_Relaxed_Scan_GPU/HBond_Relaxed_Scan_GPU.manifest..md`
+- `/doc/prokop/AGENTS/guidelines/efficiency.md` (Rule 8)
+- `/rust_dftb/tests/gpu_hbond_physics.rs`
+- Fortran: `src/dftbp/math/interpolation.F90`, `src/dftbp/dftb/slakoeqgrid.F90`

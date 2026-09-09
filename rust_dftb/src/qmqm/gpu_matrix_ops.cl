@@ -989,3 +989,427 @@ __kernel void extract_diagonal_batched(
     const int i = gid % n;
     diag[gid] = a[(size_t)sid * n * n + i * n + i];
 }
+
+// ------------------------------------------------------------------
+// select_occupation_batched
+//
+// GPU-side occupation selection: sorts eigenvalues per system and marks
+// the n_occ lowest as occupied. Eliminates the CPU read → sort → upload
+// roundtrip from the SCC hot loop.
+//
+// One workgroup per system. Bitonic sort of (eigenvalue, index) pairs in
+// local memory. Pads to the next power of 2 with (+inf, dummy) sentinels.
+//
+// Arguments:
+//   n        — number of orbitals per system
+//   n_occ    — number of occupied orbitals
+//   batch    — number of systems
+//   eig_diag — [batch][N] eigenvalues (from extract_diagonal_batched)
+//   occ_mask — [batch][N] output: 1=occupied, 0=virtual
+//
+// Specialization: OCC_MAX_N must be the next power of 2 ≥ max N.
+// ------------------------------------------------------------------
+#ifndef OCC_MAX_N
+#define OCC_MAX_N 128
+#endif
+
+__kernel void select_occupation_batched(
+    const int n,
+    const int n_occ,
+    const int batch,
+    __global const float* eig_diag,
+    __global int* occ_mask
+) {
+    const int sid = get_group_id(0);
+    const int lid = get_local_id(0);
+    const int lsz = get_local_size(0);
+    if (sid >= batch) return;
+
+    // Local arrays for bitonic sort: (value, original_index) pairs
+    __local float lval[OCC_MAX_N];
+    __local int   lidx[OCC_MAX_N];
+
+    // Load eigenvalues into local memory, pad with +inf
+    for (int i = lid; i < OCC_MAX_N; i += lsz) {
+        if (i < n) {
+            lval[i] = eig_diag[(size_t)sid * n + i];
+            lidx[i] = i;
+        } else {
+            lval[i] = 1.0e30f;  // +inf sentinel for padding
+            lidx[i] = -1;        // dummy index
+        }
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    // Bitonic sort ascending (OCC_MAX_N must be a power of 2)
+    for (int k = 2; k <= OCC_MAX_N; k <<= 1) {
+        for (int j = k >> 1; j > 0; j >>= 1) {
+            for (int i = lid; i < OCC_MAX_N; i += lsz) {
+                int ij = i ^ j;
+                if (ij > i) {
+                    // Compare and swap: ascending sort
+                    bool ascending = ((i & k) == 0);
+                    float vi = lval[i], vj = lval[ij];
+                    bool swap = ascending ? (vj < vi) : (vi < vj);
+                    if (swap) {
+                        lval[i] = vj; lval[ij] = vi;
+                        int ti = lidx[i]; lidx[i] = lidx[ij]; lidx[ij] = ti;
+                    }
+                }
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
+        }
+    }
+
+    // After sort, lval[0..n] are the n smallest eigenvalues in ascending order.
+    // Mark the first n_occ original indices as occupied.
+    for (int i = lid; i < n; i += lsz) {
+        int orig_idx = lidx[i];
+        if (orig_idx >= 0) {
+            occ_mask[(size_t)sid * n + orig_idx] = (i < n_occ) ? 1 : 0;
+        }
+    }
+}
+
+// ------------------------------------------------------------------
+// repulsive_energy_batched
+//
+// Computes the repulsive pair-potential energy per system:
+//   E_rep[sid] = Σ_{i<j} E_rep^{s_i,s_j}(|r_i - r_j|)
+//
+// One workgroup per system. Each thread handles a subset of atom pairs.
+// Local reduction sums the per-thread contributions.
+//
+// Spline data layout (flat buffer, f32):
+//   For each species pair p (at offset spline_offsets[p]):
+//     n_intervals  (1 i32)  — number of spline intervals
+//     cutoff       (1 f32)  — cutoff distance
+//     exp_coeffs   (3 f32)  — (a, b, c) for exponential head
+//     x_start      (REP_MAX_INTERVALS f32) — interval start points
+//     sp_coeffs    ((REP_MAX_INTERVALS-1)*4 f32) — cubic coefficients per interval
+//     sp_last_coeffs (6 f32) — polynomial tail coefficients
+//
+// Arguments:
+//   n_atoms     — atoms per system
+//   batch       — number of systems
+//   coords      — [batch][n_atoms*3] atom coordinates (Bohr)
+//   species_idx — [batch][n_atoms] species index per atom
+//   spline_offsets — [n_species*n_species] offset into spline_data (-1 = no spline)
+//   n_species   — number of species
+//   spline_data — flat buffer with all spline coefficients
+//   e_rep       — [batch] output repulsive energy per system
+//
+// Specialization: REP_MAX_INTERVALS must be set to the max number of
+// spline intervals across all species pairs.
+// ------------------------------------------------------------------
+#ifndef REP_MAX_INTERVALS
+#define REP_MAX_INTERVALS 30
+#endif
+
+__kernel void repulsive_energy_batched(
+    const int n_atoms,
+    const int batch,
+    __global const float* coords,        // [batch][n_atoms*3]
+    __global const int* species_idx,      // [batch][n_atoms]
+    __global const int* spline_offsets,  // [n_species*n_species]
+    const int n_species,
+    __global const float* spline_data,   // flat
+    __global float* e_rep                // [batch]
+) {
+    const int sid = get_group_id(0);
+    const int lid = get_local_id(0);
+    const int lsz = get_local_size(0);
+    if (sid >= batch) return;
+
+    __global const float* crd = coords + (size_t)sid * n_atoms * 3;
+    __global const int* spc = species_idx + (size_t)sid * n_atoms;
+
+    // Each thread accumulates its partial energy, then reduce.
+    float my_e = 0.0f;
+    const int npairs = n_atoms * (n_atoms - 1) / 2;
+
+    // Linear mapping: pair_id → (i, j) with i < j
+    // pair_id = i*(2*n_atoms - i - 1)/2 + (j - i - 1)
+    // We iterate i from 0 to n_atoms-1, j from i+1 to n_atoms-1
+    for (int pair_id = lid; pair_id < npairs; pair_id += lsz) {
+        // Find (i, j) from pair_id — linear search (n_atoms is small, ≤ ~30)
+        int i = 0, j = 0, acc = 0, found = 0;
+        for (int ii = 0; ii < n_atoms - 1 && !found; ++ii) {
+            int n_j = n_atoms - 1 - ii;
+            if (acc + n_j > pair_id) {
+                i = ii;
+                j = ii + 1 + (pair_id - acc);
+                found = 1;
+            }
+            acc += n_j;
+        }
+        if (!found) continue;
+
+        int si = spc[i], sj = spc[j];
+        int off_idx = si * n_species + sj;
+        int offset = spline_offsets[off_idx];
+        if (offset < 0) continue;  // no spline for this pair
+
+        // Compute distance
+        float dx = crd[j*3+0] - crd[i*3+0];
+        float dy = crd[j*3+1] - crd[i*3+1];
+        float dz = crd[j*3+2] - crd[i*3+2];
+        float r = sqrt(dx*dx + dy*dy + dz*dz);
+
+        // Load spline data
+        __global const float* sd = spline_data + offset;
+        int n_int = as_int(sd[0]);
+        float cutoff = sd[1];
+        if (r >= cutoff || r < 1.0e-6f) continue;
+
+        float exp_a = sd[2], exp_b = sd[3], exp_c = sd[4];
+        __global const float* x_start = sd + 5;
+        __global const float* sp_coeffs = sd + 5 + REP_MAX_INTERVALS;
+        __global const float* sp_last = sd + 5 + REP_MAX_INTERVALS + (REP_MAX_INTERVALS - 1) * 4;
+
+        float e_val = 0.0f;
+
+        if (r < x_start[0]) {
+            // Exponential head: E = exp(-a*r + b) + c
+            e_val = exp(-exp_a * r + exp_b) + exp_c;
+        } else if (r >= x_start[n_int - 1]) {
+            // Polynomial tail: E = c0 + c1*dr + ... + c5*dr^5
+            float dr = r - x_start[n_int - 1];
+            float xh = dr;
+            e_val = sp_last[0];
+            for (int k = 1; k < 6; ++k) {
+                e_val += sp_last[k] * xh;
+                xh *= dr;
+            }
+        } else {
+            // Bisection: find interval i such that x_start[i] <= r < x_start[i+1]
+            int lo = 0, hi = n_int - 1;
+            while (hi - lo > 1) {
+                int mid = (lo + hi) / 2;
+                if (x_start[mid] <= r) lo = mid; else hi = mid;
+            }
+            float dr = r - x_start[lo];
+            // Cubic: E = c0 + c1*dr + c2*dr^2 + c3*dr^3
+            __global const float* c = sp_coeffs + lo * 4;
+            e_val = c[0] + c[1]*dr + c[2]*dr*dr + c[3]*dr*dr*dr;
+        }
+
+        my_e += e_val;
+    }
+
+    // Local reduction
+    __local float reduce[256];
+    reduce[lid] = my_e;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int off = lsz >> 1; off > 0; off >>= 1) {
+        if (lid < off) reduce[lid] += reduce[lid + off];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (lid == 0) e_rep[sid] = reduce[0];
+}
+
+// ------------------------------------------------------------------
+// diis_step_batched
+//
+// GPU-resident DIIS mixing (R9b). One workgroup per system.
+//
+// Steps:
+//   1. Compute residual = q_new - q_old, store in history ring buffer
+//   2. Store q_old (current q_in) in history ring buffer
+//   3. Compute B_ij = <F_i, F_j> for all history pairs (parallel dot products)
+//   4. One thread solves the augmented DIIS system [B 1; 1 0][c; λ] = [0; 1]
+//      via Gaussian elimination with partial pivoting
+//   5. Mix: q_out = Σ c_i * (q_in_i + res_i) = Σ c_i * q_out_i
+//   6. Compute RMS of current residual
+//
+// If not enough history (n_filled < 1), falls back to simple mixing.
+//
+// Buffers (all per-system, indexed by sid * stride + ...):
+//   q_new       — [batch*n_atoms] current SCC output charges
+//   q_old       — [batch*n_atoms] current input charges (overwritten with mixed)
+//   q_hist      — [batch*max_hist*n_atoms] ring buffer of q_in vectors
+//   r_hist      — [batch*max_hist*n_atoms] ring buffer of residual vectors
+//   buf_idx     — [batch] ring buffer write position (i32)
+//   n_filled    — [batch] number of valid history entries (i32)
+//   b_mat       — [batch*(max_hist+1)*(max_hist+1)] DIIS B matrix workspace
+//   rhs         — [batch*(max_hist+1)] RHS workspace
+//   coeffs      — [batch*max_hist] DIIS coefficients output
+//   rms         — [batch] residual RMS output
+//
+// Specialization: DIIS_MAX_HIST must be set (default 10).
+// ------------------------------------------------------------------
+#ifndef DIIS_MAX_HIST
+#define DIIS_MAX_HIST 10
+#endif
+#define DIIS_NP1 (DIIS_MAX_HIST + 1)
+
+__kernel void diis_step_batched(
+    const int n_atoms,
+    const int batch,
+    const float alpha,           // simple mixing fallback parameter
+    __global const float* q_new, // [batch*n_atoms]
+    __global float* q_old,       // [batch*n_atoms] — overwritten with mixed result
+    __global float* q_hist,      // [batch*DIIS_MAX_HIST*n_atoms]
+    __global float* r_hist,      // [batch*DIIS_MAX_HIST*n_atoms]
+    __global int* buf_idx,       // [batch]
+    __global int* n_filled,       // [batch]
+    __global float* b_mat,        // [batch*DIIS_NP1*DIIS_NP1]
+    __global float* rhs,         // [batch*DIIS_NP1]
+    __global float* coeffs,      // [batch*DIIS_MAX_HIST]
+    __global float* rms,         // [batch]
+    __local float* scratch        // workgroup scratch (≥ n_atoms + DIIS_NP1*DIIS_NP1)
+) {
+    const int sid = get_group_id(0);
+    const int lid = get_local_id(0);
+    const int lsz = get_local_size(0);
+    if (sid >= batch) return;
+
+    __global const float* qn = q_new + (size_t)sid * n_atoms;
+    __global float* qo = q_old + (size_t)sid * n_atoms;
+    __global float* qh = q_hist + (size_t)sid * DIIS_MAX_HIST * n_atoms;
+    __global float* rh = r_hist + (size_t)sid * DIIS_MAX_HIST * n_atoms;
+    __global float* B = b_mat + (size_t)sid * DIIS_NP1 * DIIS_NP1;
+    __global float* b = rhs + (size_t)sid * DIIS_NP1;
+    __global float* c = coeffs + (size_t)sid * DIIS_MAX_HIST;
+
+    int idx = buf_idx[sid];
+    int nf = n_filled[sid];
+
+    // Step 1: Compute residual = q_new - q_old, store in ring buffer
+    // Also compute RMS of residual
+    float partial = 0.0f;
+    for (int a = lid; a < n_atoms; a += lsz) {
+        float res = qn[a] - qo[a];
+        rh[idx * n_atoms + a] = res;
+        qh[idx * n_atoms + a] = qo[a];  // store q_in
+        partial += res * res;
+    }
+
+    // RMS reduction
+    scratch[lid] = partial;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int off = lsz >> 1; off > 0; off >>= 1) {
+        if (lid < off) scratch[lid] += scratch[lid + off];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (lid == 0) rms[sid] = sqrt(scratch[0]);
+
+    // Update ring buffer state
+    if (lid == 0) {
+        buf_idx[sid] = (idx + 1) % DIIS_MAX_HIST;
+        if (nf < DIIS_MAX_HIST) n_filled[sid] = nf + 1;
+    }
+    barrier(CLK_GLOBAL_MEM_FENCE | CLK_LOCAL_MEM_FENCE);
+
+    int n = n_filled[sid];
+    int np1 = n + 1;
+
+    // Step 2: If no history, fall back to simple mixing
+    if (n == 0) {
+        for (int a = lid; a < n_atoms; a += lsz) {
+            qo[a] = alpha * qn[a] + (1.0f - alpha) * qo[a];
+        }
+        return;
+    }
+
+    // Step 3: Compute B_ij = <F_i, F_j> for all history pairs
+    // Each thread handles one (i,j) pair if within range
+    for (int ij = lid; ij < n * n; ij += lsz) {
+        int i = ij / n;
+        int j = ij % n;
+        float dot = 0.0f;
+        __global float* ri = rh + i * n_atoms;
+        __global float* rj = rh + j * n_atoms;
+        for (int a = 0; a < n_atoms; a++) {
+            dot += ri[a] * rj[a];
+        }
+        B[i * np1 + j] = dot;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
+
+    // Step 4: Set up constraint row/column and RHS
+    if (lid == 0) {
+        for (int i = 0; i < n; i++) {
+            B[i * np1 + n] = 1.0f;
+            B[n * np1 + i] = 1.0f;
+        }
+        B[n * np1 + n] = 0.0f;
+        for (int i = 0; i < np1; i++) b[i] = 0.0f;
+        b[n] = 1.0f;
+
+        // Gaussian elimination with partial pivoting (single-threaded, tiny system)
+        for (int k = 0; k < np1; k++) {
+            // Find pivot
+            int max_row = k;
+            float max_val = fabs(B[k * np1 + k]);
+            for (int i = k + 1; i < np1; i++) {
+                float v = fabs(B[i * np1 + k]);
+                if (v > max_val) { max_val = v; max_row = i; }
+            }
+            // Swap rows
+            if (max_row != k) {
+                for (int j = k; j < np1; j++) {
+                    float tmp = B[k * np1 + j];
+                    B[k * np1 + j] = B[max_row * np1 + j];
+                    B[max_row * np1 + j] = tmp;
+                }
+                float tmp = b[k]; b[k] = b[max_row]; b[max_row] = tmp;
+            }
+            // Eliminate
+            if (fabs(B[k * np1 + k]) < 1e-14f) continue;
+            for (int i = k + 1; i < np1; i++) {
+                float factor = B[i * np1 + k] / B[k * np1 + k];
+                B[i * np1 + k] = 0.0f;
+                for (int j = k + 1; j < np1; j++) {
+                    B[i * np1 + j] -= factor * B[k * np1 + j];
+                }
+                b[i] -= factor * b[k];
+            }
+        }
+        // Back substitution
+        for (int i = np1 - 1; i >= 0; i--) {
+            float sum = b[i];
+            for (int j = i + 1; j < np1; j++) {
+                sum -= B[i * np1 + j] * b[j];
+            }
+            if (fabs(B[i * np1 + i]) > 1e-14f) {
+                b[i] = sum / B[i * np1 + i];
+            } else {
+                b[i] = 0.0f;
+            }
+        }
+        // Copy coefficients
+        for (int i = 0; i < n; i++) c[i] = b[i];
+    }
+    barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
+
+    // Step 5: Mix — q_out = Σ c_i * (q_in_i + res_i) = Σ c_i * q_out_i
+    // Safeguard: check for non-finite coefficients
+    bool diis_ok = true;
+    if (lid == 0) {
+        for (int i = 0; i < n; i++) {
+            if (!isfinite(c[i])) { diis_ok = false; break; }
+            if (fabs(c[i]) > 10.0f) { diis_ok = false; break; }
+        }
+    }
+    // Broadcast diis_ok via local memory
+    __local int l_diis_ok;
+    if (lid == 0) l_diis_ok = diis_ok ? 1 : 0;
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    if (l_diis_ok) {
+        // DIIS mixing: q_out = Σ c_i * (q_in_i + res_i)
+        for (int a = lid; a < n_atoms; a += lsz) {
+            float sum = 0.0f;
+            for (int i = 0; i < n; i++) {
+                sum += c[i] * (qh[i * n_atoms + a] + rh[i * n_atoms + a]);
+            }
+            qo[a] = sum;
+        }
+    } else {
+        // Fallback: simple mixing
+        for (int a = lid; a < n_atoms; a += lsz) {
+            qo[a] = alpha * qn[a] + (1.0f - alpha) * qo[a];
+        }
+    }
+}

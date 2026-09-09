@@ -4,18 +4,16 @@ DFTB Hamiltonian assembly, SK table interpolation, SCC, and forces — the core
 of the DFTB method reimplementation.
 
 - **sk_data.rs** — SK file I/O and shell integral extraction. `SkData` holds
-  onsite parameters + pair tables. `eval_shell_integrals_into` evaluates the
-  spline at distance r into stack buffers (zero allocation).
-  `eval_shell_integrals_and_derivs_into` returns V(r) and dV/dr in one Hermite
-  eval (no finite differences).
-- **interpolation.rs** — Cubic Hermite spline on uniform grid.
-  `EqGridTable::new` precomputes per-grid-point derivatives (4th-order central
-  differences) at load time. `eval_into` is O(n_integ) — 4 FMAs per channel vs
-  Neville's O(n²)=64. `eval_with_deriv_into` returns value + analytic derivative
-  in one call. Tail region [last_grid_r, r_max] delegates to Neville
-  `poly5_to_zero` for exact DFTB+ parity (the tail derivative is sensitive to
-  the finite-difference order). Neville code retained as `eval_neville_into`
-  for parity verification.
+  onsite parameters + pair tables. `eval_shell_integrals_into` / `_and_derivs_into`
+  evaluate the production B-spline (V and analytic dV/dr) into stack buffers.
+- **interpolation.rs** — Production: C² cubic B-spline, analytic V' from the
+  same controls. Left end: phantom `c_{-1}=2c_0−c_1`. Right end (stopgap):
+  `N_PAD_END` blunt zero *samples*, then refit — kills the old Neville
+  `poly5_to_zero` explosion (H–H 10.4 Bohr → −0.4 Ha). **Next (not done):**
+  general extra-control fitter that *solves* for pad points so the valid-domain
+  polynomial is preserved and V,V'→0 at cutoff; see
+  `doc/prokop/topical_audit/sk_interpolation.md`. Hermite/Neville kept as
+  unused reference paths.
 - **rotation.rs** — direction-cosines rotation of diatomic SK integrals into the
   molecular frame. `rotate_diatomic_block_into` writes H and S blocks in-place.
   `rotate_block_with_derivs_into` also returns dH/dR_a, dS/dR_a for all 3

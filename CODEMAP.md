@@ -86,9 +86,9 @@ QM/QM fragment solver with OpenCL GPU offload. Python utilities (`pyBall/`,
   `gpu_driver.rs`, `gpu_runtime.rs`, `gpu_matrix.rs`, `gpu_prep.rs`,
   `gpu_eigen.rs`/`.cl`, `gpu_matrix_ops.cl`, `gpu_scc.rs` (device-resident
   SCC loop driver with DIIS, warm-start, best-effort mode, per-system RMS
-  diagnostics), `gpu_forces.rs`/`.cl` (Phase 4: analytic non-SCC electronic
-  GPU force kernel; currently blocked on real-SK 1×4 bucket crash, see
-  `doc/prokop/tasts/HBond_Relaxed_Scan_GPU/HBond_Relaxed_Scan_GPU.report.md`).
+  diagnostics), `gpu_forces.rs`/`.cl` (analytic GPU forces; H2O vs CPU rel ~3e-5).
+  SK interpolator: `doc/prokop/topical_audit/sk_interpolation.md`. H-bond tests:
+  `rust_dftb/tests/gpu_hbond_physics.rs`.
 - `src/bin/` — executables: `dftb_engine.rs`, `graphene_build.rs`.
 - `examples/` — runnable demos: `hbond_ref.rs`, `scan.rs`, `neb.rs`, `test_h2.rs`,
   `debug_h2.rs`, `debug_sk.rs`.

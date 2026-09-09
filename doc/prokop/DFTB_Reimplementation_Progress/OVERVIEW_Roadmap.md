@@ -1,6 +1,6 @@
 # rust_dftb — Master Roadmap & Status Checklist
 
-**Last updated:** 2025-09-06
+**Last updated:** 2026-09-09
 **Maintained by:** prokop / Devin
 **Purpose:** Single source of truth for what is done (`[*]`) and what is not (`[ ]`)
 across the whole `rust_dftb` reimplementation (DFTB, xTB, QM/QM multi-system, OpenCL GPU).
@@ -27,9 +27,10 @@ file/function where the work should land.
 
 ### 1.1 Non-SCC H0 / S assembly
 - [*] SK file I/O & shell integral extraction — `methods/dftb/sk_data.rs::load_sk_folder`, `::eval_shell_integrals_into`, `::onsite`
-- [*] Cubic Hermite spline interpolation on uniform grid (replaces Neville 8-point) — `methods/dftb/interpolation.rs::EqGridTable::new` (precomputes derivatives), `eval_hermite_into`, `eval_hermite_with_deriv_into`. O(n_integ) per eval (4 FMAs/ch) vs Neville O(n²)=64. Tail [last_grid_r, r_max] delegates to Neville `poly5_to_zero` for exact parity.
-- [*] Neville 8-point interpolation retained as fallback/parity reference — `methods/dftb/interpolation.rs::eval_eqgrid_new_into`, `EqGridTable::eval_neville_into`
-- [*] `r_max` hard cutoff matching Fortran `slakoeqgrid.F90` (bug fixed) — `methods/dftb/interpolation.rs::eval_eqgrid_new_into`
+- [*] Cubic B-spline interpolation on uniform grid (production; replaces Neville) — `methods/dftb/interpolation.rs::EqGridTable::eval_into`, `::eval_with_deriv_into`. Analytic V' from the same controls (`spline_resample.rs::bspline3_eval_v_d1_d2`). Left: phantom `c_{-1}=2c_0−c_1`. Right (stopgap): `N_PAD_END=4` blunt zero *samples* then refit (`fit_bspline_controls_zero_end`) — kills unphysical Neville `poly5_to_zero` (H–H 10.4 Bohr was −0.4 Ha). Hermite/Neville kept unused.
+- [ ] **Extra-control BC fitter** (do not blunt-zero pad) — extra controls before/after the table must be *solved* so the valid-domain interpolant stays accurate and V,V'→0 at cutoff. See `doc/prokop/topical_audit/sk_interpolation.md`.
+- [*] Neville 8-point retained as unused parity reference — `interpolation.rs::eval_eqgrid_new_into`, `EqGridTable::eval_neville_into` (not production)
+- [*] `r_max` hard cutoff — now `(n_data + N_PAD_END)*dr`, not `n_grid*dr + DIST_FUDGE`. Fortran 1 Bohr fudge is intentionally not copied.
 - [*] Diatomic rotation matrices, direction cosines — `methods/dftb/rotation.rs::Rotation::rotate_diatomic_block_into`, `DirectionCosines::from_vec`
 - [*] Generic `build_non_scc()` (s,p,d) — `methods/dftb/hamiltonian.rs::HamiltonianBuilder::build_non_scc`, `fill_pairs`, `fill_onsite`
 - [*] Hand-unrolled `build_non_scc_sp_only()` fast path — `methods/dftb/hamiltonian.rs::build_non_scc_sp_only`, `fill_pairs_sp_only`, `fill_onsite_sp_only`
@@ -51,7 +52,7 @@ file/function where the work should land.
 ### 1.3 Forces  ← `Forces_Implementation_Notes.md`
 - [*] Density matrix DM exposed in `SccResult` — `methods/dftb/hamiltonian.rs::SccResult`
 - [*] Energy-weighted density matrix EDM — `methods/dftb/hamiltonian.rs::build_scc`
-- [*] Analytic dH0/dx, dS/dx (replaces finite-difference, P7/P8/P12) — `methods/dftb/rotation.rs::rotate_block_with_derivs_into` + `interpolation.rs::eval_with_deriv_into` (Hermite analytic derivative)
+- [*] Analytic dH0/dx, dS/dx — `rotation.rs::rotate_block_with_derivs_into` + production `interpolation.rs::eval_with_deriv_into` (B-spline analytic V', not Hermite). H2O CPU F vs FD of energy rel `1.05e-5` (`tests/gpu_hbond_physics.rs::test_cpu_energy_gradient_h2o`).
 - [*] Repulsive spline parsing from SK file — `methods/dftb/sk_data.rs::read_skf_all`
 - [*] F_nonSCC = 2·(DM·dH0' − EDM·dS') — `methods/dftb/forces.rs::non_scc_forces`
 - [*] F_rep = dE_rep/dr · r_hat — `methods/dftb/forces.rs::repulsive_forces`
@@ -161,14 +162,14 @@ file/function where the work should land.
 - [*] `dftb_hamiltonian.cl` kernels — `methods/dftb/dftb_hamiltonian.cl::assemble_pairs`, `onsite_and_va`, `onsite_diagonal`
 - [*] Pair-bucket sorted launch (by species-pair + block type 1×1/1×4/4×4) — `qmqm/gpu_prep.rs::build_pair_buckets`, `GpuPairBucket`
 - [*] `__local` SK table caching — `methods/dftb/dftb_hamiltonian.cl::assemble_pairs` (loads `GpuSkTable` into `__local`)
-- [*] Cubic B-spline interpolation (GPU-friendly, replaces Neville) — `methods/dftb/dftb_hamiltonian.cl::cubic_interp_params`, `interp_sk_*_indexed`; host resample `methods/dftb/spline_resample.rs::resample_bspline`, `resample_sk_column`
+- [*] Cubic B-spline interpolation (GPU, same controls as CPU) — `dftb_hamiltonian.cl` / `gpu_forces.cl` `cubic_interp_params` + analytic `cubic_weights_d1`. Host pack: `gpu_prep.rs` uses `fit_bspline_controls_zero_end` (same stopgap as CPU). Mio tables: original grid + r=0 dummy + 4 pad ≤ `SK_GRID_MAX=512` (no 64-point resample on mio).
 - [*] Heterogeneous fragment support (prefix-sum offsets) — `qmqm/gpu_prep.rs::GpuFragment` (atom_off, h_base), `GpuBatch::from_fragments`
 - [*] f32 throughout — all kernels in `dftb_hamiltonian.cl` + `gpu_matrix_ops.cl`
 
 ### 5.2 Host prep
 - [*] `gpu_prep.rs` — pack fragments/pairs/SK/gamma into flat arrays — `qmqm/gpu_prep.rs::GpuBatch::from_fragments`, `build_global_species`, `pack_sk_tables`, `build_gamma_neigh`
 - [*] `GpuFragment`, `GpuPairEntry` structs (match OpenCL layout) — `qmqm/gpu_prep.rs::GpuFragment`, `GpuPairEntry`, `GpuPairBucket`, `GpuSkTable`, `GpuGammaNeigh`
-- [*] SK table resampling to ≤256 grid points — `methods/dftb/spline_resample.rs::resample_bspline`, `resample_sk_column`, `cubic_spline_d2_uniform`; const `gpu_prep.rs::SK_GRID_MAX`
+- [~] SK table packing — `gpu_prep.rs::pack_sk_tables`. Mio: full grid + pad (no resample). Resample-to-`SK_RESAMPLE_N` only if `n_grid+1+N_PAD_END > SK_GRID_MAX`. Old “H/S parity 1e-2 from 64-point resample” is **not** the current mio H-bond path (AT max\|dH\| `8.6e-8`).
 - [*] Pair bucketing by species-pair + block type — `qmqm/gpu_prep.rs::build_pair_buckets`, `determine_block_type`, `extract_shell_old_or_new`, `n_orb_from_ang`
 - [*] `gpu_prep` wired into `qmqm/mod.rs` — `qmqm/mod.rs:17 pub mod gpu_prep;`
 
@@ -176,11 +177,11 @@ file/function where the work should land.
 - [*] OpenCL driver module (device init, buffer upload, kernel enqueue) — `qmqm/gpu_driver.rs::GpuDriver::new`, `::gpu_assemble_batched`
 - [*] Compile `dftb_hamiltonian.cl` at runtime — `qmqm/gpu_driver.rs::GpuDriver::new` (Program::build)
 - [*] Smoke test: build batch → upload → `assemble_pairs` → read back H/S — `tests/gpu_hamiltonian.rs::test_gpu_assemble_pairs_smoke`
-- [*] H/S parity vs CPU reference — `tests/gpu_hamiltonian.rs::test_gpu_hs_parity_h2`, `_n2` (max|dH| ~3e-3..8e-3, tol 1e-2; contract 1e-5 NOT met — SK resampling precision gap)
-- [*] Multi-replica batched H assembly test — `tests/gpu_hamiltonian.rs::test_gpu_multi_replica` (10× H2)
+- [*] H/S parity vs CPU (dense H-bond, mio, padded B-spline) — `tests/gpu_hbond_physics.rs`: H2/H2O/formic/AT/GC max\|dH\| `~1e-8`–`8.6e-8`. Older `gpu_hamiltonian.rs` 1e-2 numbers were the 64-point resample gap.
+- [*] Multi-replica batched H assembly test — `tests/gpu_hamiltonian.rs::test_gpu_multi_replica` (10× H2); `gpu_hbond_physics.rs` batch=200 H2 (replica cap)
 - [ ] Performance benchmark vs CPU — target: `tests/gpu_hamiltonian.rs::bench_gpu_assemble` (or `examples/bench_gpu.rs`)
-- [~] 5 kernel bug fixes in `dftb_hamiltonian.cl` (onsite overflow, SK cache OOB, float4 cast, write_symmetric_4x4, rotate_4x4) — user-authorized scope deviation
-- [ ] **Fix SK resampling precision** (BLOCKING for Stage 2) — increase `SK_RESAMPLE_N` from 64 to ≥256, or interpolate on GPU — target: `qmqm/gpu_prep.rs::SK_RESAMPLE_N`, `methods/dftb/spline_resample.rs`
+- [~] 5 kernel bug fixes in `dftb_hamiltonian.cl` (onsite overflow, SK cache OOB, float4 cast, write_symmetric_4x4, rotate_4x4); later: `vload2` for 1×4 (NVIDIA alignment)
+- [ ] **Fix SK resampling precision** — only for tables that still hit the resample branch (`n_gpu > SK_GRID_MAX`). Mio H-bond does not.
 
 ### 5.4 Known optimization opportunities (from `OpenCL_DFTB_optimization.md`)
 - [ ] Replace `if (du<0) du=-du` with `fabs()`; pre-sort pairs by same-U — `methods/dftb/dftb_hamiltonian.cl::gamma_full` (L78-91); host sort in `gpu_prep.rs::build_pair_buckets`
@@ -351,27 +352,38 @@ file/function where the work should land.
 
 > **Manifest:** `tasts/Sparse_Nanocrystal_Vibrations/Sparse_Nanocrystal_Vibrations.manifest.md`
 > **Report:** `tasts/Sparse_Nanocrystal_Vibrations/Sparse_Nanocrystal_Vibrations.report.md`
+> **Master task:** `tasts/Sparse_Nanocrystal_Vibrations/Sparse_Nanocrystal_Vibrations.tasks.md`
 > **Topical audit:** `topical_audit/sparse_nanocrystal_vibrations.md`
+> **GPT-5.6 review:** `tasts/Sparse_Nanocrystal_Vibrations/Sparse_Nanocrystal_Vibrations.chat.md` line 2064+ (22 issues + 10-step plan)
 
 Goal: sparse GPU DFTB for vibrational calculations on 300–1000 atom Si/H
 nanocrystals. f32 GPU arithmetic, analytic forces, finite-difference Hessians,
-~5% frequency accuracy, no pathological imaginary modes.
+~5% frequency accuracy, no pathological imaginary modes. Everything
+GPU-resident — no CPU bridges, no hybrid paths.
 
-### 7.6.1 Completed (P0–P4 + Gates C, D, E)
-- [*] **P0** — Sparse perf stats + `sparse_firewall` feature — `methods/sparse/bsr4.rs`, `gpu_sparse.rs`
-- [*] **P1** — CPU f64 + GPU OpenCL C² cubic B-spline evaluators — `methods/dftb/spline_resample.rs`, `dftb_hamiltonian.cl`, `tests/gpu_bspline_eval.rs`
-- [*] **P2** — Analytic SK derivatives in production force path — `methods/dftb/forces.rs::build_pair_block_with_derivs`, `rotation.rs::rotate_block_with_derivs_into`; Gate B: 9 tests pass
-- [*] **P3** — Sparse D=2K, W=2KHK via masked SpGEMM — `methods/sparse/sparse_forces.rs::build_dw_sparse`; 2 parity tests pass
-- [*] **P4** — Symbolic SpGEMM plan (precomputed intersection) — `bsr4.rs::SpgemmPlan`, `gpu_sparse.rs::spgemm_plan_bsym_dev`, `sparse_bsr4_purification.cl::bsr4_spgemm_plan_Bsym`; parity exact, `tests/spgemm_plan.rs`
-- [*] **Gate C** — Locality sweep R_K × R_Z — `tests/locality_sweep.rs`; plateau R_K=7, R_Z=7, energy err ~5e-6
-- [*] **Gate D** — Nonsingular padded Si/H basis — `tests/sih_padded_basis.rs`; SiH4, dummy occ ~0, parity |dE|~1e-7
-- [*] **Gate E** — Determinism + Hessian h plateau — `tests/gate_e_determinism.rs`; spread=0, TC2 tol spread 7.7e-5, h plateau=0.02 Å
+### 7.6.1 Status (revised after GPT-5.6 review, 2026-09-09)
 
-### 7.6.2 Blocked
-- [ ] **Gate F** — Geometry optimization — **BLOCKED**: needs sparse analytic force bridge (padded BSR4 D/W → variable-orbital `non_scc_electronic_force`). Current test uses finite-difference forces (6000 pipeline runs, ~5 min, against performance policy). The analytic force path exists (`build_pair_block_with_derivs` + `build_dw_sparse`) but the adapter to extract physical sub-blocks from padded BSR4 D/W is missing.
-- [ ] **Gate G** — Same-geometry Hessian parity (sparse f32 vs dense f64) — depends on Gate F
-- [ ] **Gate H** — Spectra at each method's own minimum — depends on Gate G
-- [ ] **Gate I** — Scaling and whole-program profile (N ~ 60, 150, 300, 600, 1000, 1600)
+GPT-5.6 reviewed commit `b269ab6` and found several "completed" items are not
+actually wired into the production numerical path. See manifest §13 for the
+full 22-issue checklist and `tasks.md` for the phased master task breakdown.
+
+- [*] **P0** — Sparse perf stats + `sparse_firewall` feature — correct
+- [~] **P1** — C² B-spline evaluator built but **not canonical** in production force path; `SkTableSp` still uses C¹ Hermite + numerical FD tail derivative
+- [~] **P2** — Angular derivatives correct; but radial V,V' still from Hermite, not C²
+- [~] **P3** — D/W formula correct; but allocation-heavy and attached to dense SCC (not self-consistent sparse)
+- [~] **P4** — Plan infrastructure built; **not integrated** into TC2/NS/K0/W
+- [ ] **Gate C** — False positive — 5-atom toy system, +2I doesn't create gap
+- [*] **Gate D** — Nonsingular padded Si/H basis — correct
+- [ ] **Gate E** — False positive — FD-of-energy forces, symmetrized Hessian tautology
+
+### 7.6.2 Current plan (Phases A–E, see `tasks.md`)
+
+- **Phase A** — Foundation: canonical C² spline (A1), TC2 fix 2 SpGEMMs/iter (A2), plan integration (A3)
+- **Phase B** — Sparse SCC solver, GPU-resident, self-consistent — **current focus**
+  - B1: `SparseSystemWorkspace`, B2: GPU H0/S assembly, B3: GPU gamma, B4: GPU Hscc, B5: GPU K0+bounds, B6: SCC loop, B7: Mulliken
+- **Phase C** — GPU-resident sparse analytic forces (pair-force + atom-gather kernel, after dense agent finishes)
+- **Phase D** — Correctness gates: redo C (D1), E (D2), then F (D3), G (D4), H (D5)
+- **Phase E** — Performance: real counters (E1), cell-list masks (E2), degree buckets (E3), packed plans (E4), lane benchmark (E5), symmetrization policy (E6), scaling Gate I (E7), production Gate J (E8)
 
 ---
 
@@ -423,7 +435,7 @@ nanocrystals. f32 GPU arithmetic, analytic forces, finite-difference Hessians,
 | GPU multi-system (QM/QM coupling) | ❌ | Not started — Stage 8 of revised plan |
 | Scan / NEB driver | ✅ | CPU scan: 2/2 tests pass; GPU scan: 1D+2D formic dimer with plots — `examples/scan.rs`, `tests/scan.rs`, `tests/formic_scan_plots.rs`, `scripts/plot_formic_scan.py` |
 | Sparse TC2 purification | ✅ | Benzene/coronene/circumcoronene parity < 6.5e-5 e — `methods/sparse/gpu_sparse.rs` |
-| Sparse nanocrystal vibrations | ⚠️ | P0–P4 + Gates C/D/E pass; Gate F blocked on sparse analytic force bridge — `tasts/Sparse_Nanocrystal_Vibrations/` |
+| Sparse nanocrystal vibrations | ⚠️ | GPT-5.6 review: P1/P2/Gate C/Gate E unmarked (not wired into production); Phase B (sparse SCC) in progress — `tasts/Sparse_Nanocrystal_Vibrations/` |
 | Davidson partial eigensolver | ⚠️ | Benzene OK; coronene/circumcoronene do not converge (diagonal preconditioner) — `methods/sparse/davidson.rs` |
 | DFTB+ parity harness | ✅ | `scripts/run_dftbplus_ref.py` + `compare_rust_vs_dftbplus.py` |
 | Test infra / CI | ⚠️ | Drivers exist, no CI |
@@ -443,9 +455,13 @@ Full plan: `GPU_MultiSystem_Design.md`.
 > Brent-Luk Jacobi, S^{-1/2} on GPU, f32 only, homogeneous templates.
 > See `GPU_MultiSystem_Design.md` for the full revised staged plan (D1–D17).
 
-1. **Fix SK resampling precision** (BLOCKING) — increase `SK_RESAMPLE_N` from 64
-   to ≥256, or interpolate on GPU. Current H/S parity ~1e-2, need ~1e-4 for SCC.
-   — `qmqm/gpu_prep.rs::SK_RESAMPLE_N`, `methods/dftb/spline_resample.rs`
+1. **SK extra-control BC fitter** — replace blunt zero-sample pad. Extra
+   controls before/after the table must be *solved* (valid-domain accuracy +
+   V,V'→0 at cutoff), not hardcoded zeros. Do not restore Neville/`DIST_FUDGE`.
+   — `doc/prokop/topical_audit/sk_interpolation.md`, `interpolation.rs`,
+   `spline_resample.rs`
+   (Old “64-point resample H/S ~1e-2” is **not** the current mio H-bond path;
+   AT max|dH| is `8.6e-8`. Resample branch only if `n_grid+1+N_PAD_END > SK_GRID_MAX`.)
 2. ~~**Brent-Luk parallel cyclic Jacobi kernel** (D8)~~ — ✅ DONE — `qmqm/gpu_eigen.rs::jacobi_cyclic_local_batched`
 3. ~~**S^{-1/2} on GPU** (D9)~~ — ✅ DONE — `qmqm/gpu_eigen.rs::build_inv_sqrt`
 4. ~~**Full-local batched GEMM** for N≤64~~ — ✅ DONE — `qmqm/gpu_matrix.rs::matmul_full_local_batched`

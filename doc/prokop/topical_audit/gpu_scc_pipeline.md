@@ -38,7 +38,7 @@ After convergence: E = Tr(D·H0) + 0.5·Σ Δq·V
 | Rust+OpenCL | `rust_dftb/src/qmqm/gpu_scc.rs` | active | `gpu_solve_scc_batched` (simple mix), `gpu_solve_scc_batched_diis` (DIIS), `gpu_solve_scc_batched_diis_warmstart` (warm-start + best-effort) |
 | OpenCL kernels | `rust_dftb/src/qmqm/gpu_matrix_ops.cl` | active | gamma_matvec, h_scc_update, mulliken, residual_and_mix, build_density_masked, frobenius_trace, dot — all batched |
 | OpenCL eigensolver | `rust_dftb/src/qmqm/gpu_eigen.rs`/`.cl` | active | `jacobi_cyclic_local_batched` (Brent-Luk), `build_inv_sqrt` (S^{-1/2}) |
-| OpenCL forces | `rust_dftb/src/qmqm/gpu_forces.rs`/`.cl` | experimental | Phase 4 analytic non-SCC electronic forces; synthetic H2/sp3 pass, real-SK H2O 1×4 bucket crashes |
+| OpenCL forces | `rust_dftb/src/qmqm/gpu_forces.rs`/`.cl` | active | Analytic GPU forces (nonSCC + shift + gamma' + rep). H2O vs CPU rel ~3e-5 (`gpu_hbond_physics.rs`). 1×4 crash fixed (`vload2`). |
 | OpenCL GEMM | `rust_dftb/src/qmqm/gpu_matrix.rs` | active | `matmul_full_local_batched` (both matrices in __local, N ≤ 64) |
 | Rust (CPU ref) | `rust_dftb/src/methods/dftb/hamiltonian.rs` | reference | `HamiltonianBuilder::build_scc` — f64, LAPACK dsyevd, DIIS |
 | Rust (CPU ref) | `rust_dftb/src/qmqm/solver.rs` | reference | `MultiSystemSolver::solve_scc` — multi-fragment |
@@ -91,9 +91,10 @@ oscillation between competing charge transfer states. Not a GPU bug.
 
 ## Open Issues
 
-- **Analytic GPU forces (Phase 4) blocked** — `gpu_forces.cl` crashes on the
-  real-SK H2O 1×4 s-p bucket with `CL_INVALID_COMMAND_QUEUE`; synthetic tests
-  pass. See `doc/prokop/tasts/HBond_Relaxed_Scan_GPU/HBond_Relaxed_Scan_GPU.report.md`.
+- **SK interpolator stopgap (2026-09-09)** — blunt extra zero *samples* on
+  the right + left phantom knot. Kills Neville-tail explosion. **Not** the
+  intended BC: extra controls must be *fitted*. See `sk_interpolation.md`.
+- **AT/GC GPU SCC rms `~1e-5`** — H/S matches CPU (`max|dH|~1e-7`). Charge rms plateaus `~1e-5` (CPU f64 on the same H/S goes to `~1e-9`). **Hypothesis: f32 floor, not a broken mixer.** Relative f32 error `~1e-8` times values `~100` (e.g. ~100 eV `H_ij` near r=0) gives absolute `~1e-6`–`1e-5`. Do not chase rms `<1e-6` on f32 N~90 until `max|H|` / energy scale is printed. Spec: H-bond manifest §3.0.1.
 - **Kernel objects rebuilt each call** — `Kernel::builder().build()` per
   iteration. Program cache hits, but Kernel handle creation is a performance
   TODO. Target: cache Kernel objects in `GpuRuntime`.
@@ -115,4 +116,5 @@ oscillation between competing charge transfer states. Not a GPU bug.
 - `/doc/prokop/reports/2025-09-06_gpu_hs_assembly_bugfix.md` — H0/S assembly bug fixes
 - `/doc/prokop/reports/2025-09-06_scan_plots_and_gamma_fix.md` — scan validation, gamma fix
 - `/doc/prokop/reports/2025-09-06_gpu_scc_benchmarks.md` — timing benchmarks
+- `/doc/prokop/topical_audit/sk_interpolation.md` — SK B-spline BCs (stopgap vs intended fitter)
 - `/doc/prokop/DFTB_Reimplementation_Progress/GPU_MultiSystem_Design.md` — design doc

@@ -155,7 +155,7 @@ impl SkTableSp {
         dh_dr: &mut [f64],
         ds_dr: &mut [f64],
     ) -> Result<usize> {
-        // Single Hermite evaluation with analytic derivative — O(n_integ), no finite diff
+        // Analytic dV/dr of the production C² B-spline (same controls as V) — no finite diff
         let mut h_all = [0.0f64; 20]; let mut s_all = [0.0f64; 20];
         let mut dh_all = [0.0f64; 20]; let mut ds_all = [0.0f64; 20];
         self.h.eval_with_deriv_into(r, &mut h_all, &mut dh_all)?;

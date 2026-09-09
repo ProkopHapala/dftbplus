@@ -319,16 +319,12 @@ __kernel void force_pairs(
         l_sk_h[i] = sk_h[i];
         l_sk_s[i] = sk_s[i];
     }
-    __local Fragment l_frags[128];
-    for (int i = tid; i < n_frags && i < 128; i += wg) {
-        l_frags[i] = fragments[i];
-    }
     barrier(CLK_LOCAL_MEM_FENCE);
 
     if (gid >= n_pairs) return;
 
     PairEntry p = pairs[gid];
-    Fragment frag = l_frags[p.replica];
+    Fragment frag = fragments[p.replica];
     int n_orbs = frag.n_orbs;
     int atom_off = frag.atom_off;
     int ga_i = atom_off + p.atom_i;
@@ -439,4 +435,356 @@ __kernel void force_pairs(
 #if GPU_FORCE_DEBUG
     if (gid == 0) printf("GPU_FORCE done: gid=%d fi=%d fj=%d f=(%f,%f,%f)\n", gid, fi, fj, f.x, f.y, f.z);
 #endif
+}
+
+// ─── SCC shift force kernel (R6 component 2) ──────────────────────────
+//
+// Computes the SCC shift force contribution from pair blocks:
+//   F_i[a] += 2 * ANG2BOHR * Σ_{μ∈i,ν∈j} (0.5*(V_i+V_j) * dS[μ,ν]/dR_a * DM[μ,ν])
+//   F_j[a] -= same
+//
+// where V_i is the SCC potential (gamma·Δq) on atom i.
+// Only needs dS/dR and DM (not EDM or dH/dR). Reuses the same SK table
+// interpolation and block rotation derivative infrastructure.
+//
+// Arguments: same as force_pairs, but with v_shift replacing edm.
+//   v_shift — [n_frags*n_atoms_frag] SCC potential per atom (Hartree)
+//   dm      — density matrix (same as force_pairs)
+__kernel void force_pairs_scc_shift(
+    __global const PairEntry* pairs,
+    __global const Fragment* fragments,
+    __global const float* sk_s,       // only S table needed
+    __global const float* dm,
+    __global const float* v_shift,    // [total_atoms] SCC potential per atom
+    __global float* forces,
+    const float dr,
+    const int n_grid,
+    const int n_pairs,
+    const int n_frags,
+    const int block_type,
+    const int n_sk_cols
+) {
+    const int tid = get_local_id(0);
+    const int wg  = get_local_size(0);
+    const int gid = get_global_id(0);
+
+    __local float l_sk_s[SK_GRID_MAX * N_SK_COLS];
+    int n_sk_elements = n_grid * n_sk_cols;
+    for (int i = tid; i < n_sk_elements; i += wg) {
+        l_sk_s[i] = sk_s[i];
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    if (gid >= n_pairs) return;
+
+    PairEntry p = pairs[gid];
+    Fragment frag = fragments[p.replica];
+    int n_orbs = frag.n_orbs;
+    int atom_off = frag.atom_off;
+    int ga_i = atom_off + p.atom_i;
+    int ga_j = atom_off + p.atom_j;
+    int dm_base = p.replica * n_orbs * n_orbs;
+
+    // SCC shift: 0.5*(V_i + V_j) — the average SCC potential on atoms i and j
+    float avg_shift = 0.5f * (v_shift[ga_i] + v_shift[ga_j]);
+
+    // Value and derivative weights
+    float4 w, wd;
+    int base_idx = interp_params(p.r, dr, n_grid, &w, &wd);
+    float inv_dr = 1.0f / dr;
+
+    float l = p.l, m = p.m, n = p.n;
+    float r = p.r;
+    float3 f = (float3)(0.0f, 0.0f, 0.0f);
+
+    if (block_type == 0) {
+        // 1×1 (s-s)
+        float sk_s_val = interp_sk_1(l_sk_s, base_idx, w);
+        float dsk_s = interp_sk_1_d(l_sk_s, base_idx, wd) * inv_dr;
+
+        float s_val, ds_dx, ds_dy, ds_dz;
+        block_1x1_with_derivs(sk_s_val, dsk_s, l, m, n, r, &s_val, &ds_dx, &ds_dy, &ds_dz);
+
+        int dm_idx = dm_base + p.orb_j * n_orbs + p.orb_i;
+        float dm_val = dm[dm_idx];
+
+        f.x = avg_shift * dm_val * ds_dx;
+        f.y = avg_shift * dm_val * ds_dy;
+        f.z = avg_shift * dm_val * ds_dz;
+    } else if (block_type == 1) {
+        // 1×4 (s-p)
+        float2 sk_s_val = interp_sk_2(l_sk_s, base_idx, w);
+        float2 dsk_s = interp_sk_2_d(l_sk_s, base_idx, wd) * inv_dr;
+
+        float4 blk_s, ds_dx, ds_dy, ds_dz;
+        block_1x4_with_derivs(sk_s_val, dsk_s, l, m, n, r, &blk_s, &ds_dx, &ds_dy, &ds_dz);
+
+        for (int k = 0; k < 4; k++) {
+            int dm_idx = dm_base + (p.orb_j + k) * n_orbs + p.orb_i;
+            float dm_val = dm[dm_idx];
+            f.x += avg_shift * dm_val * ds_dx[k];
+            f.y += avg_shift * dm_val * ds_dy[k];
+            f.z += avg_shift * dm_val * ds_dz[k];
+        }
+    } else {
+        // 4×4 (p-p)
+        float ps_s;
+        float4 sk_s_val = interp_sk_5(l_sk_s, base_idx, w, &ps_s);
+        float dps_s;
+        float4 dsk_s = interp_sk_5_d(l_sk_s, base_idx, wd, &dps_s) * inv_dr;
+        dps_s *= inv_dr;
+
+        float4 blk_s[4], ds_dx[4], ds_dy[4], ds_dz[4];
+        block_4x4_with_derivs(sk_s_val, dsk_s, ps_s, dps_s, l, m, n, r, blk_s, ds_dx, ds_dy, ds_dz);
+
+        for (int row = 0; row < 4; row++) {
+            for (int col = 0; col < 4; col++) {
+                int dm_idx = dm_base + (p.orb_j + row) * n_orbs + (p.orb_i + col);
+                float dm_val = dm[dm_idx];
+                f.x += avg_shift * dm_val * ds_dx[row][col];
+                f.y += avg_shift * dm_val * ds_dy[row][col];
+                f.z += avg_shift * dm_val * ds_dz[row][col];
+            }
+        }
+    }
+
+    // Convert: factor 2 (lower-triangle) * ANG2BOHR (Bohr→Å)
+    float scale = 2.0f * ANG2BOHR_F;
+    f *= scale;
+
+    // Atomic add: F_i += f, F_j -= f
+    int fi = 3 * ga_i;
+    int fj = 3 * ga_j;
+    atomic_add_f32(&forces[fi + 0], f.x);
+    atomic_add_f32(&forces[fi + 1], f.y);
+    atomic_add_f32(&forces[fi + 2], f.z);
+    atomic_add_f32(&forces[fj + 0], -f.x);
+    atomic_add_f32(&forces[fj + 1], -f.y);
+    atomic_add_f32(&forces[fj + 2], -f.z);
+}
+
+// ─── Gamma derivative (SCC double-counting) force kernel (R6 component 3) ─
+//
+// Computes the SCC double-counting (Coulomb) force contribution:
+//   F_i[a] += -dq_i * dq_j * gamma'(r) / r * (coord_i - coord_j)_a * ANG2BOHR^2
+//   F_j[a] -= same
+//
+// where gamma'(r) is the full gamma derivative (short-range + Coulomb 1/R^2).
+// One workgroup per system, threads handle pairs.
+//
+// Arguments:
+//   n_atoms     — atoms per system
+//   batch       — number of systems
+//   coords      — [batch*n_atoms*3] coordinates (Å)
+//   species_idx — [batch*n_atoms] species index
+//   delta_q     — [batch*n_atoms] Δq = q_elec - q0
+//   u_hub       — [n_species] Hubbard U per species (Hartree)
+//   n_species   — number of species
+//   forces      — [batch*n_atoms*3] force accumulator (Hartree/Å)
+
+#define TAU_FACTOR_F 3.2f
+#define SAME_U_C0_F 0.6875f
+#define SAME_U_C1_F 0.1875f
+#define SAME_U_C2_F 0.0208333333f
+#define MIN_HUB_DIFF_F 1e-4f
+#define TOL_SAME_DIST_F 1e-10f
+
+// gamma_full'(R) = -1/R^2 - S'(R)
+inline float gamma_prime_full_f32(float r, float u1, float u2) {
+    if (r < TOL_SAME_DIST_F) return 0.0f;
+    float short_prime;
+    if (fabs(u1 - u2) < MIN_HUB_DIFF_F) {
+        float tau = TAU_FACTOR_F * 0.5f * (u1 + u2);
+        float e = exp(-tau * r);
+        float poly = 1.0f/r + SAME_U_C0_F*tau + SAME_U_C1_F*r*tau*tau
+                   + SAME_U_C2_F*r*r*tau*tau*tau;
+        float poly_prime = -1.0f/(r*r) + SAME_U_C1_F*tau*tau
+                        + 2.0f*SAME_U_C2_F*r*tau*tau*tau;
+        short_prime = -tau*e*poly + e*poly_prime;
+    } else {
+        float tau1 = TAU_FACTOR_F * u1;
+        float tau2 = TAU_FACTOR_F * u2;
+        float dt2_a = tau1*tau1 - tau2*tau2;
+        float dt2_b = tau2*tau2 - tau1*tau1;
+        float s_a, s_b;
+        {
+            float dt2 = dt2_a;
+            float dt2_sq = dt2*dt2;
+            float dt2_cu = dt2_sq*dt2;
+            float term_a = 0.5f * pown(tau2,4) * tau1 / dt2_sq;
+            float term_b = (pown(tau2,6) - 3.0f*pown(tau2,4)*tau1*tau1) / (r * dt2_cu);
+            float e = exp(-tau1 * r);
+            s_a = -tau1*e*(term_a - term_b) + e*(term_b/r);
+        }
+        {
+            float dt2 = dt2_b;
+            float dt2_sq = dt2*dt2;
+            float dt2_cu = dt2_sq*dt2;
+            float term_a = 0.5f * pown(tau1,4) * tau2 / dt2_sq;
+            float term_b = (pown(tau1,6) - 3.0f*pown(tau1,4)*tau2*tau2) / (r * dt2_cu);
+            float e = exp(-tau2 * r);
+            s_b = -tau2*e*(term_a - term_b) + e*(term_b/r);
+        }
+        short_prime = s_a + s_b;
+    }
+    return -1.0f/(r*r) - short_prime;
+}
+
+__kernel void force_gamma_deriv_batched(
+    const int n_atoms,
+    const int batch,
+    __global const float* coords,     // [batch*n_atoms*3] Å
+    __global const int* species_idx,   // [batch*n_atoms]
+    __global const float* delta_q,    // [batch*n_atoms]
+    __global const float* u_hub,      // [n_species]
+    const int n_species,
+    __global float* forces            // [batch*n_atoms*3] Hartree/Å
+) {
+    const int sid = get_group_id(0);
+    const int lid = get_local_id(0);
+    const int lsz = get_local_size(0);
+    if (sid >= batch) return;
+
+    __global const float* crd = coords + (size_t)sid * n_atoms * 3;
+    __global const int* spc = species_idx + (size_t)sid * n_atoms;
+    __global const float* dq = delta_q + (size_t)sid * n_atoms;
+    __global float* frc = forces + (size_t)sid * n_atoms * 3;
+
+    const int npairs = n_atoms * (n_atoms - 1) / 2;
+    for (int pair_id = lid; pair_id < npairs; pair_id += lsz) {
+        int i = 0, j = 0, acc = 0, found = 0;
+        for (int ii = 0; ii < n_atoms - 1 && !found; ++ii) {
+            int n_j = n_atoms - 1 - ii;
+            if (acc + n_j > pair_id) {
+                i = ii; j = ii + 1 + (pair_id - acc); found = 1;
+            }
+            acc += n_j;
+        }
+        if (!found) continue;
+
+        float dx = crd[i*3+0] - crd[j*3+0];
+        float dy = crd[i*3+1] - crd[j*3+1];
+        float dz = crd[i*3+2] - crd[j*3+2];
+        float r2_ang = dx*dx + dy*dy + dz*dz;
+        if (r2_ang < TOL_SAME_DIST_F) continue;
+        float r_ang = sqrt(r2_ang);
+        float r_bohr = r_ang * ANG2BOHR_F;
+
+        int si = spc[i], sj = spc[j];
+        float u_i = u_hub[si];
+        float u_j = u_hub[sj];
+
+        float gprime = gamma_prime_full_f32(r_bohr, u_i, u_j);
+        float dq_i = dq[i], dq_j = dq[j];
+
+        float coeff = -dq_i * dq_j * gprime / r_bohr * ANG2BOHR_F * ANG2BOHR_F;
+        float fx = coeff * dx;
+        float fy = coeff * dy;
+        float fz = coeff * dz;
+
+        atomic_add_f32(&frc[i*3+0], fx);
+        atomic_add_f32(&frc[i*3+1], fy);
+        atomic_add_f32(&frc[i*3+2], fz);
+        atomic_add_f32(&frc[j*3+0], -fx);
+        atomic_add_f32(&frc[j*3+1], -fy);
+        atomic_add_f32(&frc[j*3+2], -fz);
+    }
+}
+
+// ─── Repulsive pair force kernel (R6 component 4) ──────────────────────
+//
+// Computes the repulsive pair-potential force contribution:
+//   F_i[a] += dE_rep/dr * (coord_j - coord_i)_a / r_ang * ANG2BOHR
+//   F_j[a] -= same
+//
+// One workgroup per system. Spline layout matches repulsive_energy_batched.
+
+#ifndef REP_MAX_INTERVALS
+#define REP_MAX_INTERVALS 30
+#endif
+
+__kernel void force_repulsive_batched(
+    const int n_atoms,
+    const int batch,
+    __global const float* coords,
+    __global const int* species_idx,
+    __global const int* spline_offsets,
+    const int n_species,
+    __global const float* spline_data,
+    __global float* forces
+) {
+    const int sid = get_group_id(0);
+    const int lid = get_local_id(0);
+    const int lsz = get_local_size(0);
+    if (sid >= batch) return;
+
+    __global const float* crd = coords + (size_t)sid * n_atoms * 3;
+    __global const int* spc = species_idx + (size_t)sid * n_atoms;
+    __global float* frc = forces + (size_t)sid * n_atoms * 3;
+
+    const int npairs = n_atoms * (n_atoms - 1) / 2;
+    for (int pair_id = lid; pair_id < npairs; pair_id += lsz) {
+        int i = 0, j = 0, acc = 0, found = 0;
+        for (int ii = 0; ii < n_atoms - 1 && !found; ++ii) {
+            int n_j = n_atoms - 1 - ii;
+            if (acc + n_j > pair_id) {
+                i = ii; j = ii + 1 + (pair_id - acc); found = 1;
+            }
+            acc += n_j;
+        }
+        if (!found) continue;
+
+        int si = spc[i], sj = spc[j];
+        int off_idx = si * n_species + sj;
+        int offset = spline_offsets[off_idx];
+        if (offset < 0) continue;
+
+        float dx = crd[j*3+0] - crd[i*3+0];
+        float dy = crd[j*3+1] - crd[i*3+1];
+        float dz = crd[j*3+2] - crd[i*3+2];
+        float r = sqrt(dx*dx + dy*dy + dz*dz);
+
+        __global const float* sd = spline_data + offset;
+        int n_int = as_int(sd[0]);
+        float cutoff = sd[1];
+        if (r >= cutoff || r < 1.0e-6f) continue;
+
+        float exp_a = sd[2], exp_b = sd[3];
+        __global const float* x_start = sd + 5;
+        __global const float* sp_coeffs = sd + 5 + REP_MAX_INTERVALS;
+        __global const float* sp_last = sd + 5 + REP_MAX_INTERVALS + (REP_MAX_INTERVALS - 1) * 4;
+
+        float de_val = 0.0f;
+
+        if (r < x_start[0]) {
+            de_val = -exp_a * exp(-exp_a * r + exp_b);
+        } else if (r >= x_start[n_int - 1]) {
+            float dr = r - x_start[n_int - 1];
+            de_val = sp_last[1] + 2.0f*sp_last[2]*dr + 3.0f*sp_last[3]*dr*dr
+                  + 4.0f*sp_last[4]*dr*dr*dr + 5.0f*sp_last[5]*dr*dr*dr*dr;
+        } else {
+            int lo = 0, hi = n_int - 1;
+            while (hi - lo > 1) {
+                int mid = (lo + hi) / 2;
+                if (x_start[mid] <= r) lo = mid; else hi = mid;
+            }
+            float dr = r - x_start[lo];
+            __global const float* c = sp_coeffs + lo * 4;
+            de_val = c[1] + 2.0f*c[2]*dr + 3.0f*c[3]*dr*dr;
+        }
+
+        if (de_val == 0.0f) continue;
+        float de_ang = de_val * ANG2BOHR_F;
+        float inv_r = 1.0f / r;
+        float fx = de_ang * dx * inv_r;
+        float fy = de_ang * dy * inv_r;
+        float fz = de_ang * dz * inv_r;
+
+        atomic_add_f32(&frc[i*3+0], fx);
+        atomic_add_f32(&frc[i*3+1], fy);
+        atomic_add_f32(&frc[i*3+2], fz);
+        atomic_add_f32(&frc[j*3+0], -fx);
+        atomic_add_f32(&frc[j*3+1], -fy);
+        atomic_add_f32(&frc[j*3+2], -fz);
+    }
 }

@@ -344,8 +344,14 @@ pub fn build_product_mask(
     let mut row_ptr = Vec::with_capacity(n_atom + 1);
     let mut col_idx = Vec::new();
     row_ptr.push(0u32);
+    // GPT-5.6 #12: stamping array replaces O(n²) neighbors.contains().
+    // marks[j] == stamp  =>  j is already in the current row's neighbor set.
+    // Reset is implicit: incrementing stamp invalidates all previous marks.
+    let mut marks = vec![0u32; n_atom];
+    let mut stamp: u32 = 0;
     for i in 0..n_atom {
-        let mut neighbors: Vec<u32> = Vec::new();
+        stamp = stamp.wrapping_add(1);
+        let mut row_len = 0u32;
         // For each k in K.neighbors(i):
         let k0 = k_mask.0[i] as usize;
         let k1 = k_mask.0[i + 1] as usize;
@@ -355,17 +361,18 @@ pub fn build_product_mask(
             let s0 = s_mask.0[k] as usize;
             let s1 = s_mask.0[k + 1] as usize;
             for blk_s in s0..s1 {
-                let j = s_mask.1[blk_s];
-                if !neighbors.contains(&j) {
-                    neighbors.push(j);
+                let j = s_mask.1[blk_s] as usize;
+                if marks[j] != stamp {
+                    marks[j] = stamp;
+                    col_idx.push(j as u32);
+                    row_len += 1;
                 }
             }
         }
-        neighbors.sort();
-        // Deduplicate (already sorted, just remove consecutive dups).
-        neighbors.dedup();
-        col_idx.extend(neighbors);
-        row_ptr.push(col_idx.len() as u32);
+        // Sort this row's slice in-place (needed for CSR sorted invariant).
+        let row_start = *row_ptr.last().unwrap() as usize;
+        col_idx[row_start..row_start + row_len as usize].sort_unstable();
+        row_ptr.push(row_ptr.last().unwrap() + row_len);
     }
     (row_ptr, col_idx)
 }

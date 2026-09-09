@@ -202,13 +202,13 @@ inline float interp_sk_1(__local const float* tab, int base, float4 w) {
     return tab[base] * w.x + tab[base + 1] * w.y + tab[base + 2] * w.z + tab[base + 3] * w.w;
 }
 
-// 2-channel: float2 cast (1x4: ss, sp)
+// 2-channel (1x4: ss, sp), interleaved stride 2. vload2: __local float is 4-byte
+// aligned, a float2* cast is UB and crashes NVIDIA on mixed s-p buckets (H2O/formic).
 inline float2 interp_sk_2(__local const float* tab, int base, float4 w) {
-    __local float2* tab2 = (__local float2*)tab;
-    float2 v0 = tab2[base    ];
-    float2 v1 = tab2[base + 1];
-    float2 v2 = tab2[base + 2];
-    float2 v3 = tab2[base + 3];
+    float2 v0 = vload2(0, tab + 2 * base);
+    float2 v1 = vload2(0, tab + 2 * (base + 1));
+    float2 v2 = vload2(0, tab + 2 * (base + 2));
+    float2 v3 = vload2(0, tab + 2 * (base + 3));
     return v0 * w.x + v1 * w.y + v2 * w.z + v3 * w.w;
 }
 
@@ -487,19 +487,14 @@ __kernel void assemble_pairs(
         l_sk_s[i] = sk_s[i];
     }
 
-    // --- CACHE FRAGMENT METADATA INTO __local ---
-    __local Fragment l_frags[128];
-    for (int i = tid; i < n_frags && i < 128; i += wg) {
-        l_frags[i] = fragments[i];
-    }
     barrier(CLK_LOCAL_MEM_FENCE);
 
     if (gid >= n_pairs) return;
 
     PairEntry p = pairs[gid];
 
-    // --- PER-FRAGMENT LOOKUP (from __local) ---
-    Fragment frag = l_frags[p.replica];
+    // Global fragment lookup — do not cache a 128-cap local copy (batch is 200–1000).
+    Fragment frag = fragments[p.replica];
     int n_orbs  = frag.n_orbs;
     int atom_off = frag.atom_off;
     int base = frag.H_base;

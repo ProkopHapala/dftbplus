@@ -160,7 +160,10 @@ impl GpuRuntime {
 fn query_capabilities(device: &Device) -> GpuCapabilities {
     use ocl::enums::DeviceInfo;
 
-    let name = format!("{device}");
+    let name = match device.info(DeviceInfo::Name) {
+        Ok(ocl::enums::DeviceInfoResult::Name(s)) => s,
+        _ => format!("{device}"),
+    };
 
     let local_mem_size = device.info(DeviceInfo::LocalMemSize)
         .ok()

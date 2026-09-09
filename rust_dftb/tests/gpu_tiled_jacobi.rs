@@ -137,8 +137,8 @@ fn test_tiled_jacobi_residual_orthogonality() {
             let res = residual(a_orig, v_slice, &eigs, n);
             let orth = orthogonality(v_slice, n);
             eprintln!("tiled Jacobi N={n} batch {b}: residual={res:.2e}, orthogonality={orth:.2e}");
-            assert!(res < 1e-3, "tiled Jacobi N={n} residual {res:.2e} too large");
-            assert!(orth < 1e-3, "tiled Jacobi N={n} orthogonality {orth:.2e} too large");
+            assert!(res < 1e-5, "tiled Jacobi N={n} residual {res:.2e} too large (target 1e-5)");
+            assert!(orth < 1e-5, "tiled Jacobi N={n} orthogonality {orth:.2e} too large (target 1e-5)");
         }
     }
 }
@@ -174,9 +174,8 @@ fn test_tiled_jacobi_eigenvalue_parity() {
             max_diff = max_diff.max(d);
         }
         eprintln!("tiled Jacobi N={n}: eigenvalue parity max|dλ|={max_diff:.2e}");
-        // f32 block Jacobi: tolerance 5e-3 (block Jacobi converges slower than
-        // element Jacobi; residual < 1e-4 is the primary correctness metric).
-        assert!(max_diff < 5e-3, "tiled Jacobi N={n} eigenvalue parity {max_diff:.2e} too large");
+        // GPT 5.6 target: eigenvalue parity < 1e-4 Ha
+        assert!(max_diff < 1e-4, "tiled Jacobi N={n} eigenvalue parity {max_diff:.2e} too large (target 1e-4)");
     }
 }
 
@@ -199,6 +198,6 @@ fn test_jacobi_batched_dispatcher() {
         for i in 0..n { eigs[i] = gpu_a[i*n+i]; }
         let res = residual(&a_orig, &gpu_v, &eigs, n);
         eprintln!("jacobi_batched N={n}: residual={res:.2e}");
-        assert!(res < 1e-3, "jacobi_batched N={n} residual {res:.2e} too large");
+        assert!(res < 1e-5, "jacobi_batched N={n} residual {res:.2e} too large (target 1e-5)");
     }
 }

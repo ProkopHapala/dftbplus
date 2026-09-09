@@ -25,9 +25,11 @@ implementations of the same concept across Rust, Fortran, Python, and OpenCL.
   warm-start, best-effort mode. 1D/2D formic dimer scan validation.
 - **wavefunction_projection.md** — projecting MOs onto a real-space grid using
   pyBall OpenCL GridProjector + STO basis. Rust eigenvectors → 2D contour plots.
-- **sk_interpolation.md** — SK integral interpolation: Fortran Neville 8-point,
-  Rust cubic Hermite spline (CPU), Rust cubic B-spline (GPU). Parity, performance,
-  analytic derivative paths.
+- **sk_interpolation.md** — SK radial interpolation. Production is C² cubic
+  B-spline (CPU f64 reference, GPU f32). 2026-09-09: Neville `poly5_to_zero`
+  tail removed (it exploded on H–H). Stopgap = blunt extra zero *samples* on
+  the right + phantom control on the left. Next: general extra-control fitter
+  (solve for pad points; do not hardcode zeros).
 - **gpu_scc_pipeline.md** — device-resident GPU SCC loop; also lists the Phase 4
   analytic GPU force work in `qmqm/gpu_forces.rs`/`.cl` and its current blocker
   (real-SK H2O 1×4 crash).

@@ -139,7 +139,7 @@ const GPU_TILED_JACOBI_TEMPLATE: &str = include_str!("gpu_tiled_jacobi.cl");
 /// Maximum sweeps for the tiled block Jacobi (N>64).
 /// Block Jacobi converges slower than full-local element Jacobi because
 /// block pairs are processed sequentially, not in parallel.
-const TILED_MAX_SWEEPS: usize = 50;
+const TILED_MAX_SWEEPS: usize = 100;
 
 /// Render the tiled Jacobi OpenCL template with block-size specialization.
 fn render_tiled_source(b: usize, wg: usize) -> String {

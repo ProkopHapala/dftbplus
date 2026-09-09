@@ -249,14 +249,15 @@ lto = false
 coefficients at load time. Runtime becomes Horner's method (~7 FMAs), not
 Neville recursion (nested loops + stack matrices).**
 
-**Status: ADDRESSED** — Replaced 8-point Neville with cubic Hermite spline.
-`EqGridTable::new` precomputes per-grid-point derivatives (4th-order central
-differences) at load time. `eval_hermite_into` is O(n_integ) — 4 FMAs per
-channel vs Neville's O(n²)=64. `eval_hermite_with_deriv_into` returns value +
-analytic derivative in one call (no 3× finite-difference evals).
-Tail region delegates to Neville `poly5_to_zero` for exact DFTB+ parity.
-Neville code retained as `eval_neville_into` for parity verification.
-See `methods/dftb/interpolation.rs`.
+**Status: ADDRESSED (interior); tail BC is a stopgap.** Production path is
+the C² cubic B-spline (`eval_into` / `eval_with_deriv_into`), 4-point stencil,
+analytic V' from the same controls. Neville is unused in production.
+The old `poly5_to_zero` tail (8-point Neville slopes into a 1 Bohr fudge) is
+unphysical on flat SK ends (H–H last sample ~1e-5 → Hss −0.4 Ha). Current
+right-end treatment appends 4 zero *samples* and refits — blunt, works.
+Intended design: extra control points before/after the table, **solved** for
+interior accuracy + V,V'→0 at cutoff, not hardcoded zeros. Left already uses
+a phantom knot `c_{-1}=2c_0−c_1`. See `doc/prokop/topical_audit/sk_interpolation.md`.
 
 **Original violation (for reference)**: `eval_eqgrid_new_into()` did 8-point
 Neville interpolation at runtime, with `xa[8]` and `yb[20][8]` stack arrays and

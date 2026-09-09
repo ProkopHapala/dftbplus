@@ -95,7 +95,7 @@ fn cubic_spline_eval(y: &[f64], d2: &[f64], h: f64, r: f64) -> f64 {
 /// values as control points, not function values. Without this conversion, the
 /// GPU produces a smoothed (approximate) version of the data, causing ~1e-3
 /// parity error even with dense grids.
-fn function_to_bspline_control_points(f: &[f64]) -> Vec<f64> {
+pub fn function_to_bspline_control_points(f: &[f64]) -> Vec<f64> {
     let n = f.len();
     if n <= 2 {
         return f.to_vec();
@@ -134,6 +134,21 @@ fn function_to_bspline_control_points(f: &[f64]) -> Vec<f64> {
     c[n - 1] = f[n - 1];
     c[1..n - 1].copy_from_slice(&c_inner);
     c
+}
+
+/// Extra knots of exact zero after the last SK grid point. Cubic B-spline
+/// needs a 4-point stencil, so 4 trailing zeros let the interpolant land on
+/// V=V'=0 without a separate polynomial tail (and without Neville).
+pub const N_PAD_END: usize = 4;
+
+/// Fit B-spline controls to `f` with `n_pad` trailing zeros.
+/// The spline still interpolates every original sample; past the last sample
+/// it is C² into V=0. Left end keeps endpoint interpolation (`c_0 = f_0`).
+pub fn fit_bspline_controls_zero_end(f: &[f64], n_pad: usize) -> Vec<f64> {
+    let mut ext = Vec::with_capacity(f.len() + n_pad);
+    ext.extend_from_slice(f);
+    ext.resize(f.len() + n_pad, 0.0);
+    function_to_bspline_control_points(&ext)
 }
 
 /// Resample a function from a uniform grid to a target number of points.

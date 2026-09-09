@@ -323,13 +323,12 @@ uses analytic derivatives of the SK interpolation + rotation, which are faster
 and more accurate.
 
 **Implementation:**
-- `interpolation.rs::eval_hermite_with_deriv_into` — cubic Hermite spline with
-  analytic dV/dr (precomputed derivatives at load time, O(1) per eval)
+- `interpolation.rs::eval_with_deriv_into` — production C² B-spline, analytic dV/dr from the same controls (not Hermite). See `doc/prokop/topical_audit/sk_interpolation.md`.
 - `rotation.rs::shell_pair_with_derivs` — closed-form analytic derivatives of
   the direction-cosine rotation for ss, sp, ps, pp shell pairs
 - `rotation.rs::rotate_block_with_derivs_into` — returns H, S, dH/dR_a, dS/dR_a
   for all 3 Cartesian directions in one call
-- `sk_data.rs::eval_shell_integrals_and_derivs_into` — one Hermite eval returns
+- `sk_data.rs::eval_shell_integrals_and_derivs_into` — one B-spline eval returns
   V(r) and dV/dr (no 3× finite-difference evals)
 
 **Parity verified:**

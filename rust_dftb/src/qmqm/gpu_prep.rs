@@ -5,7 +5,7 @@
 
 use crate::core::error::{DftbError, Result};
 use crate::methods::dftb::sk_data::SkData;
-use crate::methods::dftb::spline_resample;
+use crate::methods::dftb::spline_resample::{self, fit_bspline_controls_zero_end, N_PAD_END};
 use crate::qmqm::fragment::Fragment;
 use crate::qmqm::gamma::GammaTable;
 use std::collections::HashMap;
@@ -319,28 +319,23 @@ fn pack_sk_tables(
                 }
             }
 
-            // Use original grid directly if it fits in SK_GRID_MAX, with B-spline
-            // control point conversion. Otherwise resample to SK_RESAMPLE_N points.
-            //
-            // IMPORTANT: CPU SK tables use 1-based grid (tab.values[k] is at r=(k+1)*dr).
-            // The GPU interpolation assumes 0-based (tab[k] at r=k*dr). To fix this
-            // off-by-one, we prepend a dummy zero at r=0, so GPU tab[k] = CPU tab.values[k-1].
-            // This requires n_grid_orig+1 points (500 for mio-1-1, within SK_GRID_MAX=512).
-            let (n_grid, dr_new, sk_h, sk_s) = if n_grid_orig + 1 <= SK_GRID_MAX {
-                // Use original grid directly with prepended zero at r=0
-                let n_gpu = n_grid_orig + 1;
+            // CPU SK tables use 1-based grid (values[k] at r=(k+1)*dr). GPU is 0-based
+            // (tab[k] at r=k*dr): prepend a dummy zero at r=0. Trailing N_PAD_END zeros
+            // match the CPU B-spline end BC (V→0, no Neville tail).
+            let n_gpu_full = n_grid_orig + 1 + N_PAD_END;
+            let (n_grid, dr_new, sk_h, sk_s) = if n_gpu_full <= SK_GRID_MAX {
+                let n_gpu = n_gpu_full;
                 let dr = dr_orig as f32;
                 let mut sk_h = vec![0.0f32; n_gpu * n_sk_cols];
                 let mut sk_s = vec![0.0f32; n_gpu * n_sk_cols];
                 for col in 0..n_sk_cols {
-                    let (h_ctrl, _) = spline_resample::resample_bspline(&h_cols[col], dr_orig, n_grid_orig);
-                    let (s_ctrl, _) = spline_resample::resample_bspline(&s_cols[col], dr_orig, n_grid_orig);
-                    // sk_h[0] = 0.0 (dummy at r=0), sk_h[k] = control_point[k-1] for k>=1
-                    sk_h[col] = 0.0; // r=0 dummy
+                    let h_ctrl = fit_bspline_controls_zero_end(&h_cols[col], N_PAD_END);
+                    let s_ctrl = fit_bspline_controls_zero_end(&s_cols[col], N_PAD_END);
+                    sk_h[col] = 0.0;
                     sk_s[col] = 0.0;
-                    for k in 0..n_grid_orig {
-                        sk_h[(k + 1) * n_sk_cols + col] = h_ctrl[k];
-                        sk_s[(k + 1) * n_sk_cols + col] = s_ctrl[k];
+                    for k in 0..h_ctrl.len() {
+                        sk_h[(k + 1) * n_sk_cols + col] = h_ctrl[k] as f32;
+                        sk_s[(k + 1) * n_sk_cols + col] = s_ctrl[k] as f32;
                     }
                 }
                 (n_gpu, dr, sk_h, sk_s)
@@ -534,8 +529,7 @@ fn build_pair_buckets(
     }
 
     // Precompute per-species-pair cutoff lookup.
-    // CPU uses per-pair r_max = n_grid*dr + DIST_FUDGE; GPU must match to avoid
-    // including pairs that the CPU excludes (e.g. H-H at 11.98 Bohr vs H-H cutoff 10.98).
+    // Per-pair cutoff is EqGridTable::r_max() = (n_data + N_PAD_END)*dr.
     let n_sp = species_to_global.len();
     let mut global_species = vec![String::new(); n_sp];
     for (sp, &idx) in species_to_global.iter() {

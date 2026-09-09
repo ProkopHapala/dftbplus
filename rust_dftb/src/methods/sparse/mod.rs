@@ -22,6 +22,7 @@ pub mod bsr4;
 pub mod gpu_sparse;
 pub mod davidson;
 pub mod sparse_forces;
+pub mod sparse_system;
 
 pub use bsr4::{
     build_geometric_mask, build_identity, build_product_mask, build_full_mask,

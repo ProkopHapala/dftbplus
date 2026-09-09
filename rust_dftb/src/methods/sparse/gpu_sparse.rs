@@ -189,6 +189,14 @@ pub struct SparseBsr4Gpu {
     k_idempotency: Kernel,
     // P4: symbolic SpGEMM plan kernel (Bsym variant)
     k_spgemm_plan_bsym: Kernel,
+    // GPT-5.6 #9: device-side inf_norm, identity, scale for NS Z0 init
+    k_row_abs_sum: Kernel,
+    k_reduce_max: Kernel,
+    k_build_identity: Kernel,
+    k_scale: Kernel,
+    // GPT-5.6 #19: device-side Gershgorin spectral bounds
+    k_gershgorin_partial: Kernel,
+    k_reduce_min: Kernel,
 }
 
 impl SparseBsr4Gpu {
@@ -352,16 +360,67 @@ impl SparseBsr4Gpu {
             b.arg(0u32); b.arg(&dummy_f32); b.arg(&dummy_f32); b.arg(&dummy_f32);
             b.build().map_err(map_ocl_err)?
         };
-        // P4: bsr4_spgemm_plan_Bsym: nrow, A_row,A_col,A, B, plan_ptr,plan_a_idx,plan_b_idx,
-        //     C_row,C_col,C  -> 1 u32 scalar, 7 u32 bufs, 3 f32 bufs
+        // P4: bsr4_spgemm_plan_Bsym: nrow, A_row, A, B, plan_ptr, plan_a_idx,
+        //     plan_b_idx, C_row, C  (GPT-5.6 #5: removed A_col, C_col — dead code)
+        //   -> 1 u32 scalar, 5 u32 bufs, 3 f32 bufs
         let k_spgemm_plan_bsym = {
             let mut b = Kernel::builder();
             b.program(&program).name("bsr4_spgemm_plan_Bsym").queue(queue.clone());
             b.arg(0u32); // nrow
-            b.arg(&dummy_u32); b.arg(&dummy_u32); b.arg(&dummy_f32); // A_row, A_col, A
+            b.arg(&dummy_u32); b.arg(&dummy_f32); // A_row, A
             b.arg(&dummy_f32); // B
             b.arg(&dummy_u32); b.arg(&dummy_u32); b.arg(&dummy_u32); // plan_ptr, plan_a_idx, plan_b_idx
-            b.arg(&dummy_u32); b.arg(&dummy_u32); b.arg(&dummy_f32); // C_row, C_col, C
+            b.arg(&dummy_u32); b.arg(&dummy_f32); // C_row, C
+            b.build().map_err(map_ocl_err)?
+        };
+        // GPT-5.6 #9: device-side inf_norm, identity, scale
+        // bsr4_row_abs_sum: n_atom, row_ptr, col_idx, values, row_sums
+        //   -> 1 u32 scalar, 2 u32 bufs, 2 f32 bufs
+        let k_row_abs_sum = {
+            let mut b = Kernel::builder();
+            b.program(&program).name("bsr4_row_abs_sum").queue(queue.clone());
+            b.arg(0u32); b.arg(&dummy_u32); b.arg(&dummy_u32); b.arg(&dummy_f32); b.arg(&dummy_f32);
+            b.build().map_err(map_ocl_err)?
+        };
+        // reduce_max_f32: n, x, out -> 1 u32 scalar, 2 f32 bufs
+        let k_reduce_max = {
+            let mut b = Kernel::builder();
+            b.program(&program).name("reduce_max_f32").queue(queue.clone());
+            b.arg(0u32); b.arg(&dummy_f32); b.arg(&dummy_f32);
+            b.build().map_err(map_ocl_err)?
+        };
+        // bsr4_build_identity_dev: n_atom, diag_block, values
+        //   -> 1 u32 scalar, 1 u32 buf, 1 f32 buf
+        let k_build_identity = {
+            let mut b = Kernel::builder();
+            b.program(&program).name("bsr4_build_identity_dev").queue(queue.clone());
+            b.arg(0u32); b.arg(&dummy_u32); b.arg(&dummy_f32);
+            b.build().map_err(map_ocl_err)?
+        };
+        // bsr4_scale_dev: nblock, alpha, values -> 1 u32 scalar, 1 f32 scalar, 1 f32 buf
+        let k_scale = {
+            let mut b = Kernel::builder();
+            b.program(&program).name("bsr4_scale_dev").queue(queue.clone());
+            b.arg(0u32); b.arg(0.0f32); b.arg(&dummy_f32);
+            b.build().map_err(map_ocl_err)?
+        };
+        // GPT-5.6 #19: Gershgorin bounds + min reduction
+        // bsr4_gershgorin_partial: n_atom, row_ptr, col_idx, values, diag_flag,
+        //   emin_partial, emax_partial -> 1 u32 scalar, 4 u32 bufs, 3 f32 bufs
+        let k_gershgorin_partial = {
+            let mut b = Kernel::builder();
+            b.program(&program).name("bsr4_gershgorin_partial").queue(queue.clone());
+            b.arg(0u32); // n_atom
+            b.arg(&dummy_u32); b.arg(&dummy_u32); b.arg(&dummy_f32); // row_ptr, col_idx, values
+            b.arg(&dummy_u32); // diag_flag
+            b.arg(&dummy_f32); b.arg(&dummy_f32); // emin_partial, emax_partial
+            b.build().map_err(map_ocl_err)?
+        };
+        // reduce_min_f32: n, x, out -> 1 u32 scalar, 2 f32 bufs
+        let k_reduce_min = {
+            let mut b = Kernel::builder();
+            b.program(&program).name("reduce_min_f32").queue(queue.clone());
+            b.arg(0u32); b.arg(&dummy_f32); b.arg(&dummy_f32);
             b.build().map_err(map_ocl_err)?
         };
 
@@ -376,6 +435,8 @@ impl SparseBsr4Gpu {
             k_identity_residual,
             k_idempotency,
             k_spgemm_plan_bsym,
+            k_row_abs_sum, k_reduce_max, k_build_identity, k_scale,
+            k_gershgorin_partial, k_reduce_min,
         })
     }
 
@@ -1560,15 +1621,13 @@ impl SparseBsr4Gpu {
         let k = &self.k_spgemm_plan_bsym;
         k.set_arg(0, nrow as u32).map_err(map_ocl_err)?;
         k.set_arg(1, &a.struct_.row_ptr).map_err(map_ocl_err)?;
-        k.set_arg(2, &a.struct_.col_idx).map_err(map_ocl_err)?;
-        k.set_arg(3, &a.values).map_err(map_ocl_err)?;
-        k.set_arg(4, &b.values).map_err(map_ocl_err)?;
-        k.set_arg(5, &plan.plan_ptr).map_err(map_ocl_err)?;
-        k.set_arg(6, &plan.plan_a_idx).map_err(map_ocl_err)?;
-        k.set_arg(7, &plan.plan_b_idx).map_err(map_ocl_err)?;
-        k.set_arg(8, &c.struct_.row_ptr).map_err(map_ocl_err)?;
-        k.set_arg(9, &c.struct_.col_idx).map_err(map_ocl_err)?;
-        k.set_arg(10, &c.values).map_err(map_ocl_err)?;
+        k.set_arg(2, &a.values).map_err(map_ocl_err)?;
+        k.set_arg(3, &b.values).map_err(map_ocl_err)?;
+        k.set_arg(4, &plan.plan_ptr).map_err(map_ocl_err)?;
+        k.set_arg(5, &plan.plan_a_idx).map_err(map_ocl_err)?;
+        k.set_arg(6, &plan.plan_b_idx).map_err(map_ocl_err)?;
+        k.set_arg(7, &c.struct_.row_ptr).map_err(map_ocl_err)?;
+        k.set_arg(8, &c.values).map_err(map_ocl_err)?;
         unsafe {
             k.cmd()
                 .global_work_size(gws)
@@ -1935,6 +1994,242 @@ impl SparseBsr4Gpu {
         Ok(host[0])
     }
 
+    // ------------------------------------------------------------------
+    // GPT-5.6 #9: Device-side inf_norm, identity, scale.
+    // These avoid downloading S and row_ptr/col_idx for NS Z0 init.
+    // ------------------------------------------------------------------
+
+    /// Compute ||A||_inf on the device (max absolute orbital-level row sum).
+    /// Reads 1 scalar to host. Uses two kernels: row_abs_sum + reduce_max.
+    pub fn inf_norm_dev(
+        &self,
+        struct_: &GpuBsrStructure,
+        a: &Buffer<f32>,
+    ) -> Result<f32> {
+        let n_atom = struct_.n_atom;
+        let n_orb = n_atom * BS;
+        // Step 1: per-orbital absolute row sums.
+        let row_sums = self.zero_f32(n_orb)?;
+        let k = &self.k_row_abs_sum;
+        k.set_arg(0, n_atom as u32).map_err(map_ocl_err)?;
+        k.set_arg(1, &struct_.row_ptr).map_err(map_ocl_err)?;
+        k.set_arg(2, &struct_.col_idx).map_err(map_ocl_err)?;
+        k.set_arg(3, a).map_err(map_ocl_err)?;
+        k.set_arg(4, &row_sums).map_err(map_ocl_err)?;
+        unsafe {
+            k.cmd().global_work_size(n_orb).enq().map_err(map_ocl_err)?;
+        }
+        // Step 2: max-reduce the row sums to a single scalar.
+        let reduce_wg = self.config.reduce_wg as usize;
+        let mut n = n_orb;
+        let mut current = row_sums;
+        loop {
+            let n_groups = div_ceil(n, reduce_wg);
+            let out = self.zero_f32(n_groups)?;
+            let kr = &self.k_reduce_max;
+            kr.set_arg(0, n as u32).map_err(map_ocl_err)?;
+            kr.set_arg(1, &current).map_err(map_ocl_err)?;
+            kr.set_arg(2, &out).map_err(map_ocl_err)?;
+            unsafe {
+                kr.cmd()
+                    .global_work_size(n_groups * reduce_wg)
+                    .local_work_size(reduce_wg)
+                    .enq()
+                    .map_err(map_ocl_err)?;
+            }
+            current = out;
+            n = n_groups;
+            if n <= 1 { break; }
+        }
+        let mut host = [0.0f32; 1];
+        self.read_f32(&current, &mut host)?;
+        Ok(host[0])
+    }
+
+    /// Build identity matrix on the device into `values` (on the given
+    /// structure). Uses `diag_block` map — no host download of row_ptr/col_idx.
+    pub fn build_identity_dev(
+        &self,
+        struct_: &GpuBsrStructure,
+        values: &Buffer<f32>,
+    ) -> Result<()> {
+        let n_atom = struct_.n_atom;
+        let k = &self.k_build_identity;
+        k.set_arg(0, n_atom as u32).map_err(map_ocl_err)?;
+        k.set_arg(1, &struct_.diag_block).map_err(map_ocl_err)?;
+        k.set_arg(2, values).map_err(map_ocl_err)?;
+        unsafe {
+            k.cmd().global_work_size(n_atom * BS2).enq().map_err(map_ocl_err)?;
+        }
+        Ok(())
+    }
+
+    /// Scale all elements of a BSR4 values buffer by `alpha` on the device.
+    pub fn scale_dev(
+        &self,
+        nblock: usize,
+        alpha: f32,
+        values: &Buffer<f32>,
+    ) -> Result<()> {
+        let total = nblock * BS2;
+        let k = &self.k_scale;
+        k.set_arg(0, nblock as u32).map_err(map_ocl_err)?;
+        k.set_arg(1, alpha).map_err(map_ocl_err)?;
+        k.set_arg(2, values).map_err(map_ocl_err)?;
+        unsafe {
+            k.cmd().global_work_size(total).enq().map_err(map_ocl_err)?;
+        }
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // GPT-5.6 #19: Device-side Gershgorin spectral bounds.
+    // ------------------------------------------------------------------
+
+    /// Compute Gershgorin spectral bounds (emin, emax) of a BSR4 matrix
+    /// on the device. Reads 2 scalars to host. No matrix download.
+    pub fn gershgorin_bounds_dev(
+        &self,
+        struct_: &GpuBsrStructure,
+        values: &Buffer<f32>,
+    ) -> Result<(f32, f32)> {
+        let n_atom = struct_.n_atom;
+        let n_orb = n_atom * BS;
+        // Step 1: per-orbital Gershgorin bounds.
+        let emin_partial = self.zero_f32(n_orb)?;
+        let emax_partial = self.zero_f32(n_orb)?;
+        let k = &self.k_gershgorin_partial;
+        k.set_arg(0, n_atom as u32).map_err(map_ocl_err)?;
+        k.set_arg(1, &struct_.row_ptr).map_err(map_ocl_err)?;
+        k.set_arg(2, &struct_.col_idx).map_err(map_ocl_err)?;
+        k.set_arg(3, values).map_err(map_ocl_err)?;
+        k.set_arg(4, &struct_.diag_flag).map_err(map_ocl_err)?;
+        k.set_arg(5, &emin_partial).map_err(map_ocl_err)?;
+        k.set_arg(6, &emax_partial).map_err(map_ocl_err)?;
+        unsafe {
+            k.cmd().global_work_size(n_orb).enq().map_err(map_ocl_err)?;
+        }
+        // Step 2: reduce emin (min) and emax (max) to single scalars.
+        let emin = self.reduce_min_dev(n_orb, &emin_partial)?;
+        let emax = self.reduce_max_scalar_dev(n_orb, &emax_partial)?;
+        Ok((emin, emax))
+    }
+
+    /// Device-side min reduction to a single scalar. Reads 1 float to host.
+    fn reduce_min_dev(&self, mut n: usize, input: &Buffer<f32>) -> Result<f32> {
+        let reduce_wg = self.config.reduce_wg as usize;
+        let mut current = input.clone();
+        while n > 1 {
+            let n_groups = div_ceil(n, reduce_wg);
+            let out = self.zero_f32(n_groups)?;
+            let k = &self.k_reduce_min;
+            k.set_arg(0, n as u32).map_err(map_ocl_err)?;
+            k.set_arg(1, &current).map_err(map_ocl_err)?;
+            k.set_arg(2, &out).map_err(map_ocl_err)?;
+            unsafe {
+                k.cmd()
+                    .global_work_size(n_groups * reduce_wg)
+                    .local_work_size(reduce_wg)
+                    .enq()
+                    .map_err(map_ocl_err)?;
+            }
+            current = out;
+            n = n_groups;
+        }
+        let mut host = [0.0f32; 1];
+        self.read_f32(&current, &mut host)?;
+        Ok(host[0])
+    }
+
+    /// Device-side max reduction to a single scalar. Reads 1 float to host.
+    fn reduce_max_scalar_dev(&self, mut n: usize, input: &Buffer<f32>) -> Result<f32> {
+        let reduce_wg = self.config.reduce_wg as usize;
+        let mut current = input.clone();
+        while n > 1 {
+            let n_groups = div_ceil(n, reduce_wg);
+            let out = self.zero_f32(n_groups)?;
+            let k = &self.k_reduce_max;
+            k.set_arg(0, n as u32).map_err(map_ocl_err)?;
+            k.set_arg(1, &current).map_err(map_ocl_err)?;
+            k.set_arg(2, &out).map_err(map_ocl_err)?;
+            unsafe {
+                k.cmd()
+                    .global_work_size(n_groups * reduce_wg)
+                    .local_work_size(reduce_wg)
+                    .enq()
+                    .map_err(map_ocl_err)?;
+            }
+            current = out;
+            n = n_groups;
+        }
+        let mut host = [0.0f32; 1];
+        self.read_f32(&current, &mut host)?;
+        Ok(host[0])
+    }
+
+    /// Device-resident spectral bounds of B = Z·H with fractional padding.
+    /// Computes B on device, then Gershgorin bounds on device, reads only
+    /// 2 scalars (emin, emax) to host. No matrix download.
+    ///
+    /// `b` must be a preallocated scratch buffer on `t_struct` for B = Z·H.
+    pub fn spectral_bounds_dev(
+        &self,
+        z: &GpuBsrMatrix,
+        h: &GpuBsrMatrix,
+        b: &GpuBsrMatrix,
+        padding: f32,
+    ) -> Result<(f32, f32)> {
+        // B = Z·H on device (generic SpGEMM — Z·H not symmetric).
+        self.spgemm_masked_dev(z, h, b)?;
+        let (mut emin, mut emax) = self.gershgorin_bounds_dev(&b.struct_, &b.values)?;
+        let span = (emax - emin).abs() * padding;
+        emin -= span;
+        emax += span;
+        Ok((emin, emax))
+    }
+
+    /// Device-resident K0 construction:
+    ///
+    ///   K₀ = (εmax·Z - Z·H·Z) / (εmax - εmin)
+    ///
+    /// All products on device, no host roundtrip. Uses preallocated
+    /// scratch buffers:
+    /// - `b`: scratch for B = Z·H (on t_struct)
+    /// - `a`: scratch for A = B·Z (on k_struct)
+    /// - `k0`: output K0 (on k_struct)
+    ///
+    /// Returns nothing — K0 is written into `k0.values`. Caller should
+    /// symmetrize if needed.
+    pub fn build_k0_dev(
+        &self,
+        z: &GpuBsrMatrix,
+        h: &GpuBsrMatrix,
+        b: &GpuBsrMatrix,
+        a: &GpuBsrMatrix,
+        k0: &GpuBsrMatrix,
+        emin: f32,
+        emax: f32,
+    ) -> Result<()> {
+        let delta = (emax - emin).max(1e-12);
+        let alpha_k = emax / delta;
+        let beta_k = -1.0 / delta;
+
+        // B = Z·H on device (generic SpGEMM — Z·H not symmetric).
+        self.spgemm_masked_dev(z, h, b)?;
+
+        // A = B·Z on device (Bsym — Z symmetric right operand).
+        self.spgemm_bsym_dev(b, z, a)?;
+
+        // K₀ = alpha_k * Z + beta_k * A  (axpby)
+        let nblock = z.struct_.nblock;
+        self.axpby_dev(nblock, alpha_k, &z.values, beta_k, &a.values, &k0.values)?;
+
+        // Symmetrize K0.
+        self.symmetrize_dev(nblock, &k0.struct_.transpose_block, &k0.values)?;
+
+        Ok(())
+    }
+
     /// Device-resident Newton-Schulz / Hotelling iteration for sparse
     /// approximate inverse:
     ///
@@ -1966,19 +2261,26 @@ impl SparseBsr4Gpu {
         let n_orb = (n_atom * BS) as f32;
         let nblock = k_struct.nblock;
 
-        // Z₀ = α·I on M_K, α = 1/||S||_∞.
-        // ||S||_∞ is computed on the host from the uploaded S (one-time cost).
-        let s_host = s.to_host(self)?;
-        let s_inf = crate::methods::sparse::bsr4::inf_norm(&s_host);
-        let alpha = 1.0 / s_inf.max(1e-30);
-        let mut z_host = crate::methods::sparse::bsr4::build_identity(n_atom, &(k_struct.row_ptr_host(self)?, k_struct.col_idx_host(self)?))?;
-        for v in z_host.values.iter_mut() { *v *= alpha; }
+        // GPT-5.6 #9: Z₀ = α·I on M_K, α = 1/||S||_∞.
+        // ||S||_∞ and identity construction happen entirely on the device —
+        // no S download, no row_ptr/col_idx download, no host identity build.
+        let s_inf = self.inf_norm_dev(&s.struct_, &s.values)?;
+        if !s_inf.is_finite() || s_inf < 1e-30 {
+            return Err(DftbError::InvalidInput(format!(
+                "Newton-Schulz Z0 init: ||S||_inf = {s_inf:e} is non-finite or near-zero"
+            )));
+        }
+        let alpha = 1.0 / s_inf;
 
         // Allocate persistent device buffers: Z, Znew, T, Q.
-        let mut z = GpuBsrMatrix { struct_: k_struct.clone(), values: self.buf_f32(&z_host.values)? };
+        let mut z = GpuBsrMatrix::zero(self, k_struct)?;
         let mut znew = GpuBsrMatrix::zero(self, k_struct)?;
         let t = GpuBsrMatrix::zero(self, t_struct)?;
         let q = GpuBsrMatrix::zero(self, k_struct)?;
+
+        // Build identity on device, then scale by alpha.
+        self.build_identity_dev(k_struct, &z.values)?;
+        self.scale_dev(nblock, alpha, &z.values)?;
 
         let mut prev_rz = f32::INFINITY;
         let mut stall_count = 0;
@@ -2082,6 +2384,12 @@ pub struct SparsePurifyWorkspace {
     reduce_b: Buffer<f32>,
     /// Number of occupied orbitals.
     nocc: f32,
+    /// P4: Precomputed symbolic plans for the two recurring SpGEMMs.
+    /// Built once at construction, reused across all TC2 iterations.
+    /// plan_ks: T = K·S (A=K on k_mask, B=S on s_mask, C=T on t_mask)
+    /// plan_tk: Q = T·K (A=T on t_mask, B=K on k_mask, C=Q on k_mask)
+    plan_ks: Option<SpgemmPlanGpu>,
+    plan_tk: Option<SpgemmPlanGpu>,
 }
 
 impl SparsePurifyWorkspace {
@@ -2091,6 +2399,11 @@ impl SparsePurifyWorkspace {
     ///
     /// **All structures and values are uploaded once here and never
     /// re-uploaded during purification.**
+    ///
+    /// P4: Symbolic SpGEMM plans for the two recurring products (K·S and
+    /// T·K) are built here and reused across all TC2 iterations. If plan
+    /// building fails (e.g., row degree overflow), the workspace falls
+    /// back to the runtime intersection kernel.
     pub fn new(
         gpu: SparseBsr4Gpu,
         k0: &Bsr4Matrix,
@@ -2126,9 +2439,36 @@ impl SparsePurifyWorkspace {
         let reduce_a = gpu.zero_f32(reduce_len)?;
         let reduce_b = gpu.zero_f32(reduce_len)?;
 
+        // P4: Build symbolic plans for the two recurring SpGEMMs.
+        // Plan for T = K·S: A=K (k_mask), B=S (s_mask, sym), C=T (t_mask).
+        // Plan for Q = T·K: A=T (t_mask), B=K (k_mask, sym), C=Q (k_mask).
+        let plan_ks = {
+            let k_dummy = Bsr4Matrix::from_structure(k0.n_atom, k_mask.0.clone(), k_mask.1.clone())?;
+            let s_dummy = Bsr4Matrix::from_structure(s.n_atom, s.row_ptr.clone(), s.col_idx.clone())?;
+            match crate::methods::sparse::bsr4::build_spgemm_plan_bsym(&k_dummy, &s_dummy, t_mask) {
+                Ok(plan) => Some(gpu.upload_plan(&plan)?),
+                Err(e) => {
+                    eprintln!("P4: plan_ks build failed, falling back to intersection kernel: {e}");
+                    None
+                }
+            }
+        };
+        let plan_tk = {
+            let t_dummy = Bsr4Matrix::from_structure(k0.n_atom, t_mask.0.clone(), t_mask.1.clone())?;
+            let k_dummy = Bsr4Matrix::from_structure(k0.n_atom, k_mask.0.clone(), k_mask.1.clone())?;
+            match crate::methods::sparse::bsr4::build_spgemm_plan_bsym(&t_dummy, &k_dummy, k_mask) {
+                Ok(plan) => Some(gpu.upload_plan(&plan)?),
+                Err(e) => {
+                    eprintln!("P4: plan_tk build failed, falling back to intersection kernel: {e}");
+                    None
+                }
+            }
+        };
+
         Ok(Self {
             gpu, k_struct, t_struct, s: s_mat, k, knew, t, q,
             trace_buf, residual_buf, reduce_partial, reduce_a, reduce_b, nocc,
+            plan_ks, plan_tk,
         })
     }
 
@@ -2148,8 +2488,15 @@ impl SparsePurifyWorkspace {
     ///
     /// Returns `Tr(KS)` for this iteration.
     fn tc2_products_dev(&mut self, with_residual: bool) -> Result<()> {
-        self.gpu.spgemm_bsym_dev(&self.k, &self.s, &self.t)?;
-        self.gpu.spgemm_bsym_dev(&self.t, &self.k, &self.q)?;
+        // P4: Use symbolic plan if available; else fall back to intersection kernel.
+        match &self.plan_ks {
+            Some(plan) => self.gpu.spgemm_plan_bsym_dev(&self.k, &self.s, plan, &self.t)?,
+            None => self.gpu.spgemm_bsym_dev(&self.k, &self.s, &self.t)?,
+        }
+        match &self.plan_tk {
+            Some(plan) => self.gpu.spgemm_plan_bsym_dev(&self.t, &self.k, plan, &self.q)?,
+            None => self.gpu.spgemm_bsym_dev(&self.t, &self.k, &self.q)?,
+        }
         self.gpu.trace_ks_to_dev(
             &self.t_struct,
             &self.t.values,
@@ -2240,10 +2587,16 @@ impl SparsePurifyWorkspace {
     /// Run the full TC2 purification loop on the device. Returns
     /// `(K_final_host, final_R_I, final_Tr, iterations, history)`.
     ///
-    /// `check_every` controls how often R_I is computed (every N iterations).
-    /// R_I computation adds 2 extra SpGEMMs if `recompute_q=true`, but if
-    /// called right after `tc2_step_dev`, Q is already current. Here we
-    /// compute R_I every `check_every` iterations by doing an extra KSK.
+    /// **A2 fix (GPT-5.6 issue #3, manifest §4.7):** Residual is computed
+    /// BEFORE the update, using the Q already computed from the 2 SpGEMMs.
+    /// No extra KSK for convergence check. No per-iteration host sync.
+    ///
+    /// Normal iteration: 2 SpGEMMs, 0 host reads, 0 queue finish.
+    /// Diagnostic iteration: 2 SpGEMMs + 2 cheap reductions + 1 combined
+    /// scalar read (trace + residual).
+    ///
+    /// If residual < tol on a diagnostic iteration, returns OLD K without
+    /// swapping to the unnecessary next iterate.
     pub fn tc2_purify_dev(
         &mut self,
         max_iter: usize,
@@ -2257,65 +2610,75 @@ impl SparsePurifyWorkspace {
         let mut last_r_i = f32::INFINITY;
 
         for iter in 0..max_iter {
-            // One TC2 step: 2 SpGEMMs + 1 scalar read.
-            let tr = self.tc2_step_dev()?;
-            last_tr = tr;
-
-            // Check convergence every `check_every` iterations.
+            // Compute T=K·S, Q=T·K=KSK, trace=Tr(T) on device.
+            // On diagnostic iterations, also compute R_I=||Q-K|| on device.
+            // Both use the SAME Q from the SAME 2 SpGEMMs — no extra products.
             let do_check = (iter % check_every == 0) || (iter == max_iter - 1);
-            let r_i = if do_check {
-                // Q is already current from tc2_step_dev (T=KS, Q=TK=KSK).
-                // But after the swap, K is the new K. We need R_I for the
-                // new K. Recompute: T=K·S, Q=T·K, then ||Q-K||.
-                let ri = self.idempotency_err_dev(true)?;
+            self.tc2_products_dev(do_check)?;
+
+            if do_check {
+                // Read 2 scalars: trace and residual (the only host sync).
+                let mut tr = [0.0f32; 1];
+                self.gpu.read_f32(&self.trace_buf, &mut tr)?;
+                if !tr[0].is_finite() {
+                    return Err(DftbError::InvalidInput(format!(
+                        "TC2 trace non-finite at iter {iter}: Tr(KS)={}", tr[0]
+                    )));
+                }
+                let mut ri_sq = [0.0f32; 1];
+                self.gpu.read_f32(&self.residual_buf, &mut ri_sq)?;
+                let ri = ri_sq[0].sqrt();
+                if !ri.is_finite() {
+                    return Err(DftbError::InvalidInput(format!(
+                        "TC2 residual non-finite at iter {iter}: R_I={}", ri
+                    )));
+                }
+                last_tr = tr[0];
                 last_r_i = ri;
-                println!("  TC2-dev iter {iter}: R_I={ri:e}  Tr(KS)={tr:.6}  (Nocc={})", self.nocc);
-                history.push((iter, ri, tr));
+                println!("  TC2-dev iter {iter}: R_I={ri:e}  Tr(KS)={:.6}  (Nocc={})", tr[0], self.nocc);
+                history.push((iter, ri, tr[0]));
                 if ri < best_r_i {
                     best_r_i = ri;
                     best_iter = iter;
                 }
-                ri
-            } else {
-                println!("  TC2-dev iter {iter}: Tr(KS)={tr:.6}  (Nocc={}, skip R_I check)", self.nocc);
-                history.push((iter, f32::NAN, tr));
-                f32::NAN
-            };
 
-            if do_check && r_i < tol {
-                // Recompute Tr(KS) for the returned K (after swap).
-                // After idempotency_err_dev(true), self.t = K_new·S.
-                let tr_final = self.trace_ks_current_dev()?;
-                let k_host = self.k.to_host(&self.gpu)?;
-                return Ok((k_host, r_i, tr_final, iter + 1, history));
+                // Convergence: return OLD K (before update) — it is already
+                // good enough. No swap needed.
+                if ri < tol {
+                    let k_host = self.k.to_host(&self.gpu)?;
+                    return Ok((k_host, ri, tr[0], iter + 1, history));
+                }
+
+                // Divergence detection.
+                if ri > best_r_i * 10.0 && best_r_i < f32::INFINITY {
+                    println!(
+                        "  TC2-dev diverging at iter {iter}: R_I={ri:e} > 10×best={best_r_i:e}"
+                    );
+                    let k_host = self.k.to_host(&self.gpu)?;
+                    return Err(DftbError::InvalidInput(format!(
+                        "TC2 purification did not converge: diverged at iter {iter}, best R_I={best_r_i:e} at iter {best_iter} (tol={tol:e}, max_iter={max_iter})"
+                    )));
+                }
             }
 
-            // Divergence detection.
-            if do_check && r_i > best_r_i * 10.0 && best_r_i < f32::INFINITY {
-                println!(
-                    "  TC2-dev diverging at iter {iter}: R_I={r_i:e} > 10×best={best_r_i:e}"
-                );
-                let k_host = self.k.to_host(&self.gpu)?;
-                return Err(DftbError::InvalidInput(format!(
-                    "TC2 purification did not converge: diverged at iter {iter}, best R_I={best_r_i:e} at iter {best_iter} (tol={tol:e}, max_iter={max_iter})"
-                )));
-            }
+            // Update K: Knew = TC2_branch(K, Q, trace, Nocc), symmetrize, swap.
+            // trace_buf is already on device — no host read needed.
+            self.tc2_update_dev()?;
         }
 
+        // Exhausted max_iter without convergence.
         let k_host = self.k.to_host(&self.gpu)?;
-        let final_r_i = if last_r_i.is_nan() {
+        let final_r_i = if last_r_i.is_nan() || last_r_i.is_infinite() {
+            // Never checked — compute now.
             self.idempotency_err_dev(true)?
         } else {
             last_r_i
         };
-        // Recompute Tr(KS) for the final K if possible.
-        let final_tr = if last_r_i.is_nan() {
-            // idempotency_err_dev(true) already computed T = K·S.
-            self.trace_ks_current_dev()?
-        } else {
-            // T may be stale from before the last swap. Recompute.
+        let final_tr = if last_r_i.is_nan() || last_r_i.is_infinite() {
             self.gpu.spgemm_bsym_dev(&self.k, &self.s, &self.t)?;
             self.trace_ks_current_dev()?
+        } else {
+            last_tr
         };
         if best_r_i < final_r_i {
             println!(

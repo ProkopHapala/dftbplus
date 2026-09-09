@@ -436,7 +436,6 @@ __kernel void bsr4_spgemm_plan_Bsym(
     const uint nrow,
 
     __global const uint*  A_row,
-    __global const uint*  A_col,
     __global const float* A,
 
     __global const float* B,
@@ -445,7 +444,6 @@ __kernel void bsr4_spgemm_plan_Bsym(
     __global const uint*  plan_b_idx,
 
     __global const uint*  C_row,
-    __global const uint*  C_col,
     __global float*       C
 ){
     const uint i   = get_group_id(0);
@@ -459,13 +457,10 @@ __kernel void bsr4_spgemm_plan_Bsym(
 
     if(na > MAX_LEFT_BLOCKS) return;
 
-    // Cache complete left sparse row into local memory.
-    __local uint  lcol[MAX_LEFT_BLOCKS];
+    // Cache complete left sparse row values into local memory.
+    // GPT-5.6 #5: removed lcol[] — never used (plan_a_idx indexes lA directly).
     __local float lA[MAX_LEFT_BLOCKS*BS2];
 
-    for(uint a=lid; a<na; a+=WG){
-        lcol[a] = A_col[a0+a];
-    }
     for(uint t=lid; t<na*BS2; t+=WG){
         lA[t] = A[a0*BS2+t];
     }
@@ -1366,4 +1361,168 @@ __kernel void bsr4_gradient_step(
                 L[i]
             );
     }
+}
+
+// ============================================================================
+// GPT-5.6 #9: Device-side inf_norm and identity construction.
+//
+// These avoid downloading S to compute ||S||_inf and avoid downloading
+// row_ptr/col_idx to build the identity. Used by Newton-Schulz Z0 init.
+// ============================================================================
+
+// Compute per-orbital absolute row sums into a buffer of size n_atom*BS.
+// Each work-item handles one orbital (i_atom, r) and sums |A[i,j][r,c]|
+// over all blocks j in row i and all columns c.
+//
+// row_ptr, col_idx: CSR structure of the matrix
+// values: BSR4 values
+// row_sums: output, size n_atom*BS
+__kernel void bsr4_row_abs_sum(
+    const uint n_atom,
+    __global const uint* row_ptr,
+    __global const uint* col_idx,
+    __global const float* values,
+    __global float* row_sums
+){
+    const uint idx = get_global_id(0);
+    if (idx >= n_atom * BS) return;
+    const uint i = idx / BS;
+    const uint r = idx % BS;
+    float sum = 0.0f;
+    const uint row_start = row_ptr[i];
+    const uint row_end   = row_ptr[i+1];
+    for (uint blk = row_start; blk < row_end; blk++) {
+        const uint base = blk * BS2 + r * BS;
+        for (uint c = 0; c < BS; c++) {
+            sum += fabs(values[base + c]);
+        }
+    }
+    row_sums[idx] = sum;
+}
+
+// Max reduction: finds the maximum value in input[0..n) into output[0].
+// Same structure as reduce_sum_f32 but with max instead of sum.
+__attribute__((reqd_work_group_size(REDUCE_WG,1,1)))
+__kernel void reduce_max_f32(
+    const uint n,
+    __global const float* x,
+    __global float* out
+){
+    const uint lid = get_local_id(0);
+    const uint gid = get_global_id(0);
+    const uint gsize = get_global_size(0);
+    __local float buf[REDUCE_WG];
+    float mx = -INFINITY;
+    for (uint i = gid; i < n; i += gsize) {
+        mx = fmax(mx, fabs(x[i]));
+    }
+    buf[lid] = mx;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (uint step = REDUCE_WG >> 1; step > 0; step >>= 1) {
+        if (lid < step) buf[lid] = fmax(buf[lid], buf[lid + step]);
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (lid == 0) out[get_group_id(0)] = buf[0];
+}
+
+// Build identity matrix on the device: I[i,i] = 1 on diagonal blocks,
+// 0 elsewhere. Uses diag_block map to find diagonal blocks.
+// Each work-item handles one element of one diagonal block.
+__kernel void bsr4_build_identity_dev(
+    const uint n_atom,
+    __global const uint* diag_block,
+    __global float* values
+){
+    const uint idx = get_global_id(0);
+    if (idx >= n_atom * BS2) return;
+    const uint i = idx / BS2;
+    const uint lane = idx % BS2;
+    const uint blk = diag_block[i];
+    // Identity: 1.0 on diagonal elements (lane 0, 5, 10, 15), 0.0 elsewhere.
+    values[blk * BS2 + lane] = (lane == 0u || lane == 5u || lane == 10u || lane == 15u) ? 1.0f : 0.0f;
+}
+
+// Scale all elements of a BSR4 values buffer by a scalar alpha.
+// Used to scale identity by alpha = 1/||S||_inf for Z0 initialization.
+__kernel void bsr4_scale_dev(
+    const uint nblock,
+    const float alpha,
+    __global float* values
+){
+    const uint idx = get_global_id(0);
+    if (idx >= nblock * BS2) return;
+    values[idx] *= alpha;
+}
+
+// ============================================================================
+// GPT-5.6 #19: Device-side Gershgorin spectral bounds.
+//
+// Computes per-orbital emin_i and emax_i contributions, then host reduces
+// to global min/max. Used by spectral_bounds_dev for K0 construction.
+// ============================================================================
+
+// Compute per-orbital Gershgorin bounds:
+//   emin_i = B_{i,i} - sum_{j!=i} |B_{i,j}|
+//   emax_i = B_{i,i} + sum_{j!=i} |B_{i,j}|
+// where i,j run over individual orbitals (not atom blocks).
+//
+// row_ptr, col_idx: CSR structure
+// values: BSR4 values
+// diag_flag: 1 for diagonal blocks, 0 otherwise
+// emin_partial, emax_partial: output, size n_atom*BS
+__kernel void bsr4_gershgorin_partial(
+    const uint n_atom,
+    __global const uint* row_ptr,
+    __global const uint* col_idx,
+    __global const float* values,
+    __global const uint* diag_flag,
+    __global float* emin_partial,
+    __global float* emax_partial
+){
+    const uint idx = get_global_id(0);
+    if (idx >= n_atom * BS) return;
+    const uint i_atom = idx / BS;
+    const uint r = idx % BS;
+    float diag = 0.0f;
+    float offdiag = 0.0f;
+    const uint row_start = row_ptr[i_atom];
+    const uint row_end   = row_ptr[i_atom + 1];
+    for (uint blk = row_start; blk < row_end; blk++) {
+        const uint j_atom = col_idx[blk];
+        const uint base = blk * BS2 + r * BS;
+        for (uint c = 0; c < BS; c++) {
+            float v = values[base + c];
+            if (j_atom == i_atom && r == c) {
+                diag = v;
+            } else {
+                offdiag += fabs(v);
+            }
+        }
+    }
+    emin_partial[idx] = diag - offdiag;
+    emax_partial[idx] = diag + offdiag;
+}
+
+// Min reduction: finds the minimum value in input[0..n) into output[0].
+__attribute__((reqd_work_group_size(REDUCE_WG,1,1)))
+__kernel void reduce_min_f32(
+    const uint n,
+    __global const float* x,
+    __global float* out
+){
+    const uint lid = get_local_id(0);
+    const uint gid = get_global_id(0);
+    const uint gsize = get_global_size(0);
+    __local float buf[REDUCE_WG];
+    float mn = INFINITY;
+    for (uint i = gid; i < n; i += gsize) {
+        mn = fmin(mn, x[i]);
+    }
+    buf[lid] = mn;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (uint step = REDUCE_WG >> 1; step > 0; step >>= 1) {
+        if (lid < step) buf[lid] = fmin(buf[lid], buf[lid + step]);
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (lid == 0) out[get_group_id(0)] = buf[0];
 }

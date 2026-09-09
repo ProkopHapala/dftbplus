@@ -673,6 +673,12 @@ assembly; Agent_4 will pass real Δq for SCC.
 - H/S parity ~1e-2 (tolerance gap due to 64-point f32 B-spline resampling).
 - 5 kernel bugs fixed.
 
+> **2026-09-09:** mio H-bond no longer uses 64-point resample. Full grid +
+> stopgap right pad packs into `SK_GRID_MAX=512`. AT GPU vs CPU max|dH|
+> `8.6e-8`. Stage 1.5 as written is **not** the current blocker. Remaining
+> interpolator work is extra-control *fitting* (not more resampling, not
+> Neville). See `doc/prokop/topical_audit/sk_interpolation.md`.
+
 ### Stage 1.5: Fix SK resampling precision (BLOCKING for Stage 2)
 - Increase `SK_RESAMPLE_N` from 64 to ≥256, OR
 - Upload original SK table and interpolate on GPU with higher-order method.

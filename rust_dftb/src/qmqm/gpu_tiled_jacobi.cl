@@ -11,7 +11,8 @@
 // - A and V stored in GLOBAL memory (N×N per system, no N² local limit)
 // - Local memory: 2B×2B compound pivot + U rotation + strip workspace
 // - Block size B=32 → pivot capacity 2B=64 (fits local memory)
-// - Inner pivot diagonalized by row-parallel cyclic Jacobi
+// - Inner pivot diagonalized by Brent–Luk parallel cyclic Jacobi
+//   (32 independent pairs/round, 8 threads/pair, all 256 threads active)
 // - Strip updates: load [A_kp|A_kq], multiply by U, store + symmetric transpose
 // - One kernel launch per batched eigensolve; all sync is WG-local barriers
 //
@@ -39,11 +40,39 @@
 #define MAX_SWEEPS 50
 #endif
 #ifndef JACOBI_TOL
-#define JACOBI_TOL 1.0e-7f
+#define JACOBI_TOL 1.0e-9f
 #endif
 #ifndef PAIR_SKIP_TOL
 #define PAIR_SKIP_TOL 1.0e-12f
 #endif
+
+// ---- Inner pivot Brent–Luk parallel Jacobi parameters ----
+// PB=64 → JPAIR_INNER=32 independent pairs/round, PPG_INNER=8 threads/pair,
+// JROUND_INNER=63 rounds/sweep. 32×8=256=WG threads all active.
+#ifndef JPAIR_INNER
+#define JPAIR_INNER (PB / 2)
+#endif
+#ifndef PPG_INNER
+#define PPG_INNER (WG / JPAIR_INNER)
+#endif
+#ifndef JROUND_INNER
+#define JROUND_INNER (PB - 1)
+#endif
+#ifndef INNER_SWEEPS
+#define INNER_SWEEPS 20
+#endif
+
+// ------------------------------------------------------------------
+// Round-robin pair schedule (Brent–Luk parallel cyclic ordering).
+// For PB elements (PB even), PB-1 rounds. In each round, PB/2 disjoint
+// pairs. Element PB-1 stays fixed; the remaining PB-1 elements rotate.
+// Over PB-1 rounds, every pair of elements is visited exactly once.
+// ------------------------------------------------------------------
+inline int2 inner_jacobi_pair(int round, int ipair) {
+    int m = PB - 1;
+    if (ipair == 0) return (int2)(m, round);
+    return (int2)((round + ipair) % m, (round + m - ipair) % m);
+}
 
 // ------------------------------------------------------------------
 // tiled_jacobi_batched
@@ -70,7 +99,11 @@ __kernel void tiled_jacobi_batched(
     __local float lU[PLD * PB];     // rotation matrix from local Jacobi (64×65)
     __local float strip[STRIP_R * PB]; // strip workspace (32×64)
     __local float reduce[WG];        // reduction buffer
-    __local float cs[2];             // (c, s) broadcast for row-parallel Jacobi
+    // Brent–Luk parallel Jacobi rotation params (32 pairs)
+    __local double rot_c[JPAIR_INNER];
+    __local double rot_s[JPAIR_INNER];
+    __local int   rot_p[JPAIR_INNER];
+    __local int   rot_q[JPAIR_INNER];
 
     __global float* gA = A + (size_t)gid * n * n;
     __global float* gV = V + (size_t)gid * n * n;
@@ -81,7 +114,8 @@ __kernel void tiled_jacobi_batched(
         int c = idx - r * n;
         gV[idx] = (r == c) ? 1.0f : 0.0f;
     }
-    barrier(CLK_LOCAL_MEM_FENCE);
+    // V is in global memory — need global fence before first pivot reads gV
+    barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
 
     // ---- Compute initial off-diagonal norm (for relative convergence) ----
     float off_part = 0.0f;
@@ -153,77 +187,97 @@ __kernel void tiled_jacobi_batched(
                 }
                 barrier(CLK_LOCAL_MEM_FENCE);
 
-                // ---- Step 2: Local row-parallel cyclic Jacobi on lA ----
+                // ---- Step 2: Local Brent–Luk parallel cyclic Jacobi on lA ----
                 // Diagonalizes the PB×PB local matrix (including dummies).
-                // Thread 0 computes (c,s); all threads update rows.
-                // Fixed 10 sweeps — sufficient for PB≤64 (typically 6-8 converge to 1e-7).
-                for (int jsweep = 0; jsweep < 10; ++jsweep) {
-                    for (int p = 0; p < PB; ++p) {
-                        for (int q = p + 1; q < PB; ++q) {
-                            // Thread 0 computes rotation
-                            if (lid == 0) {
-                                float apq = lA[p * PLD + q];
-                                if (fabs(apq) < PAIR_SKIP_TOL) {
-                                    cs[0] = 1.0f;
-                                    cs[1] = 0.0f;
-                                } else {
-                                    float app = lA[p * PLD + p];
-                                    float aqq = lA[q * PLD + q];
-                                    float tau = (aqq - app) / (2.0f * apq);
-                                    float t = (tau >= 0.0f)
-                                        ? 1.0f / (tau + sqrt(1.0f + tau * tau))
-                                        : -1.0f / (-tau + sqrt(1.0f + tau * tau));
-                                    float c = 1.0f / sqrt(1.0f + t * t);
-                                    float s = t * c;
-                                    cs[0] = c;
-                                    cs[1] = s;
-                                }
-                            }
-                            barrier(CLK_LOCAL_MEM_FENCE);
-                            float c = cs[0];
-                            float s = cs[1];
+                // JPAIR_INNER=32 independent rotations per round, PPG_INNER=8
+                // threads per pair → all 256 threads active (vs serial: thread 0
+                // computes one rotation, 75% idle).
+                // Block update: J^T·A·J applied via JPAIR² 2×2 blocks in parallel.
+                for (int jsweep = 0; jsweep < INNER_SWEEPS; ++jsweep) {
+                    for (int round = 0; round < JROUND_INNER; ++round) {
 
-                            // All threads update rows of lA (symmetric)
-                            for (int k = lid; k < PB; k += lsz) {
-                                if (k != p && k != q) {
-                                    float akp = lA[k * PLD + p];
-                                    float akq = lA[k * PLD + q];
-                                    float npv = c * akp - s * akq;
-                                    float nqv = s * akp + c * akq;
-                                    lA[k * PLD + p] = npv;
-                                    lA[p * PLD + k] = npv;
-                                    lA[k * PLD + q] = nqv;
-                                    lA[q * PLD + k] = nqv;
-                                }
-                                // Update lU (eigenvectors)
-                                float vkp = lU[k * PLD + p];
-                                float vkq = lU[k * PLD + q];
-                                lU[k * PLD + p] = c * vkp - s * vkq;
-                                lU[k * PLD + q] = s * vkp + c * vkq;
+                        // Phase 1: compute rotation params for each pair
+                        // f64 for rotation computation: the rotation parameters
+                        // propagate through all strip updates across all sweeps,
+                        // so f32 rounding here accumulates to ~N*eps*||A||.
+                        int ipair = lid / PPG_INNER;
+                        int sub   = lid % PPG_INNER;
+                        if (sub == 0 && ipair < JPAIR_INNER) {
+                            int2 pr = inner_jacobi_pair(round, ipair);
+                            int p = pr.x;
+                            int q = pr.y;
+                            if (p > q) { int tmp = p; p = q; q = tmp; }
+                            double apq = (double)lA[p * PLD + q];
+                            if (fabs(apq) < (double)PAIR_SKIP_TOL) {
+                                rot_c[ipair] = 1.0;
+                                rot_s[ipair] = 0.0;
+                            } else {
+                                double app = (double)lA[p * PLD + p];
+                                double aqq = (double)lA[q * PLD + q];
+                                double tau = (aqq - app) / (2.0 * apq);
+                                double t = (tau >= 0.0)
+                                    ? 1.0 / (tau + sqrt(1.0 + tau * tau))
+                                    : -1.0 / (-tau + sqrt(1.0 + tau * tau));
+                                double c = 1.0 / sqrt(1.0 + t * t);
+                                double s = t * c;
+                                rot_c[ipair] = c;
+                                rot_s[ipair] = s;
                             }
-                            barrier(CLK_LOCAL_MEM_FENCE);
-
-                            // Update 2×2 diagonal block
-                            if (lid == 0) {
-                                float app = lA[p * PLD + p];
-                                float aqq = lA[q * PLD + q];
-                                float apq = lA[p * PLD + q];
-                                lA[p * PLD + p] = c*c*app - 2.0f*c*s*apq + s*s*aqq;
-                                lA[q * PLD + q] = s*s*app + 2.0f*c*s*apq + c*c*aqq;
-                                lA[p * PLD + q] = 0.0f;
-                                lA[q * PLD + p] = 0.0f;
-                            }
-                            barrier(CLK_LOCAL_MEM_FENCE);
+                            rot_p[ipair] = p;
+                            rot_q[ipair] = q;
                         }
+                        barrier(CLK_LOCAL_MEM_FENCE);
+
+                        // Phase 2: block update of lA (J^T · lA · J)
+                        // Process all JPAIR² 2×2 blocks; 1024 blocks / 256 threads = 4 per thread.
+                        // f64 for rotation params (ca,sa,cb,sb) to preserve precision.
+                        for (int blk = lid; blk < JPAIR_INNER * JPAIR_INNER; blk += lsz) {
+                            int a = blk / JPAIR_INNER;
+                            int b = blk % JPAIR_INNER;
+                            int p = rot_p[a], q = rot_q[a];
+                            int r = rot_p[b], sc = rot_q[b];
+                            double ca = rot_c[a], sa = rot_s[a];
+                            double cb = rot_c[b], sb = rot_s[b];
+                            double apr = (double)lA[p * PLD + r], aps = (double)lA[p * PLD + sc];
+                            double aqr = (double)lA[q * PLD + r], aqs = (double)lA[q * PLD + sc];
+                            double tpr = cb * apr - sb * aps;
+                            double tps = sb * apr + cb * aps;
+                            double tqr = cb * aqr - sb * aqs;
+                            double tqs = sb * aqr + cb * aqs;
+                            lA[p * PLD + r] = (float)(ca * tpr - sa * tqr);
+                            lA[p * PLD + sc] = (float)(ca * tps - sa * tqs);
+                            lA[q * PLD + r] = (float)(sa * tpr + ca * tqr);
+                            lA[q * PLD + sc] = (float)(sa * tps + ca * tqs);
+                        }
+                        barrier(CLK_LOCAL_MEM_FENCE);
+
+                        // Phase 3: apply rotations to lU (eigenvectors)
+                        ipair = lid / PPG_INNER;
+                        sub   = lid % PPG_INNER;
+                        if (ipair < JPAIR_INNER) {
+                            double c = rot_c[ipair];
+                            double s = rot_s[ipair];
+                            int p = rot_p[ipair];
+                            int q = rot_q[ipair];
+                            for (int k = sub; k < PB; k += PPG_INNER) {
+                                double vkp = (double)lU[k * PLD + p];
+                                double vkq = (double)lU[k * PLD + q];
+                                lU[k * PLD + p] = (float)(c * vkp - s * vkq);
+                                lU[k * PLD + q] = (float)(s * vkp + c * vkq);
+                            }
+                        }
+                        barrier(CLK_LOCAL_MEM_FENCE);
                     }
                 }
 
                 // ---- Step 3: Store transformed principal block back to global ----
-                // lA now has eigenvalues on diagonal, lU has eigenvectors.
-                // Store the diagonalized principal block: D = U^T · P · U
+                // lA now has U^T·P·U = D + R (eigenvalues on diagonal + residual
+                // off-diagonal R). Store the ACTUAL lA values, not just the
+                // diagonal — zeroing R breaks the invariant A_k = V_k^T A_0 V_k
+                // because with finite inner sweeps R is not guaranteed tiny.
                 for (int i = lid; i < m; i += lsz) {
                     for (int j = 0; j < m; ++j) {
-                        float val = (i == j) ? lA[i * PLD + j] : 0.0f;
+                        float val = lA[i * PLD + j];  // R1: store actual value, not (i==j)?diag:0
                         // Map back to global (i,j) in the compound block
                         int gi, gj;
                         if (i < Bp && j < Bp) {
@@ -238,7 +292,8 @@ __kernel void tiled_jacobi_batched(
                         gA[gi * n + gj] = val;
                     }
                 }
-                barrier(CLK_LOCAL_MEM_FENCE);
+                // R3: strip updates read gA — need global fence
+                barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
 
                 // ---- Step 4: Update off-diagonal A strips ----
                 // For each row tile k not in {p,q}: A[k][p] = A[k][p]·U, A[k][q] = A[k][q]·U
@@ -263,21 +318,24 @@ __kernel void tiled_jacobi_batched(
                         barrier(CLK_LOCAL_MEM_FENCE);
 
                         // Y = strip × lU (nrows × m) × (m × m) → (nrows × m)
+                        // f64 accumulation: strip updates are the dominant source
+                        // of f32 accumulation error (m≤64 terms × many sweeps).
                         for (int i = lid; i < nrows * m; i += lsz) {
                             int r = i / m;
                             int c = i - r * m;
-                            float sum = 0.0f;
+                            double sum = 0.0;
                             for (int k = 0; k < m; ++k) {
-                                sum += strip[r * PB + k] * lU[k * PLD + c];
+                                sum += (double)strip[r * PB + k] * (double)lU[k * PLD + c];
                             }
+                            float sumf = (float)sum;
                             // Store Y → [A_kp | A_kq]
                             int gr = kt*B + koff + r;
                             int gc;
                             if (c < Bp) gc = bp*B + c;
                             else gc = bq*B + (c - Bp);
-                            gA[gr * n + gc] = sum;
+                            gA[gr * n + gc] = sumf;
                             // Store Y^T → [A_pk | A_qk] (symmetry)
-                            gA[gc * n + gr] = sum;
+                            gA[gc * n + gr] = sumf;
                         }
                         barrier(CLK_LOCAL_MEM_FENCE);
                     }
@@ -301,24 +359,25 @@ __kernel void tiled_jacobi_batched(
                         }
                         barrier(CLK_LOCAL_MEM_FENCE);
 
-                        // Y = strip × lU
+                        // Y = strip × lU (f64 accumulation for precision)
                         for (int i = lid; i < nrows * m; i += lsz) {
                             int r = i / m;
                             int c = i - r * m;
-                            float sum = 0.0f;
+                            double sum = 0.0;
                             for (int k = 0; k < m; ++k) {
-                                sum += strip[r * PB + k] * lU[k * PLD + c];
+                                sum += (double)strip[r * PB + k] * (double)lU[k * PLD + c];
                             }
                             int gr = kt*B + koff + r;
                             int gc;
                             if (c < Bp) gc = bp*B + c;
                             else gc = bq*B + (c - Bp);
-                            gV[gr * n + gc] = sum;
+                            gV[gr * n + gc] = (float)sum;
                         }
                         barrier(CLK_LOCAL_MEM_FENCE);
                     }
                 }
-                barrier(CLK_LOCAL_MEM_FENCE);
+                // R3: next pivot and convergence check read gA/gV — need global fence
+                barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
             }
         }
 
@@ -338,7 +397,8 @@ __kernel void tiled_jacobi_batched(
         float off_cur = sqrt(reduce[0]);
         barrier(CLK_LOCAL_MEM_FENCE);
         if (off_cur / off0 < JACOBI_TOL) break;
-        // Stagnation detection
+        // Stagnation detection: if off-diagonal norm hasn't improved by 10%
+        // for 3 consecutive sweeps, further sweeps won't help (f32 floor).
         if (sweep > 0 && off_cur > 0.9f * prev_off) {
             stall_count++;
             if (stall_count >= 3) break;

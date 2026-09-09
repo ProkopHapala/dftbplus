@@ -368,7 +368,7 @@ fn test_gpu_scc_plan_parity_h2o() {
     }
     assert!(max_rms < 1e-5, "GpuSccPlan did not converge in {n_iters} iters (max_rms={max_rms:.3e})");
 
-    let energies = plan.compute_energy(&mut rt, &h0_buf, &g_buf, &q0_buf).unwrap();
+    let energies = plan.compute_energy(&mut rt, &h0_buf, &s_buf, &g_buf, &q0_buf, &oa_buf, cpu.n_occ).unwrap();
     let charges = plan.read_charges(&rt).unwrap();
     let eigenvalues = plan.read_eigenvalues(&mut rt).unwrap();
 
@@ -382,6 +382,69 @@ fn test_gpu_scc_plan_parity_h2o() {
     assert!(de < 1e-3, "GpuSccPlan energy parity failed: |dE|={de:.2e} > 1e-3");
     assert!(dq < 1e-3, "GpuSccPlan charges parity failed: |dq|={dq:.2e} > 1e-3");
     assert!(d_eig < 1e-3, "GpuSccPlan eigenvalues parity failed: |d_eig|={d_eig:.2e} > 1e-3");
+}
+
+// ==================================================================
+// 4b. GpuSccPlan DIIS parity — H2O with GPU-side DIIS mixing (R9b)
+// Same as test 4 but uses scc_step_diis instead of scc_step (simple mix).
+// Verifies that GPU-resident DIIS converges to the same answer as CPU.
+// ==================================================================
+#[test]
+fn test_gpu_scc_plan_diis_parity_h2o() {
+    use rust_dftb::qmqm::gpu_scc_plan::GpuSccPlan;
+    let sk_dir = match std::env::var("RUST_DFTB_SK_DIR") {
+        Ok(d) => d,
+        Err(_) => { eprintln!("Skipping: RUST_DFTB_SK_DIR not set"); return; }
+    };
+    let mut rt = match GpuRuntime::new() {
+        Ok(rt) => rt,
+        Err(e) => { eprintln!("Skipping: no GPU ({e})"); return; }
+    };
+    let species = vec!["O".to_string(), "H".to_string(), "H".to_string()];
+    let coords = vec![
+        [0.0, 0.0, 0.0],
+        [-0.7580632005, 0.6358101311, 0.0],
+        [0.7580632005, 0.6358101311, 0.0],
+    ];
+    let sk = load_sk_for_species(&sk_dir, &species).unwrap();
+    let cpu = cpu_scc_ref(&sk, &species, &coords);
+
+    let u_per_atom = per_atom_u(&sk, &species);
+    let g = build_gamma_matrix(&coords, &u_per_atom);
+    let batch = 1usize;
+
+    let h0_buf = rt.buffer_from_slice(&cpu.h0).unwrap();
+    let s_buf = rt.buffer_from_slice(&cpu.s).unwrap();
+    let g_buf = rt.buffer_from_slice(&g).unwrap();
+    let q0_buf = rt.buffer_from_slice(&cpu.q0).unwrap();
+    let oa_buf = rt.buffer_from_slice(&cpu.orb_atom).unwrap();
+
+    let mut plan = GpuSccPlan::new(&mut rt, &s_buf, cpu.n, cpu.n_atoms, batch)
+        .expect("GpuSccPlan::new must succeed");
+    plan.set_initial_charges(&rt, &cpu.q0).unwrap();
+    plan.reset_diis(&rt).unwrap();
+
+    let mut max_rms = f32::INFINITY;
+    let mut n_iters = 0;
+    for iter in 0..500 {
+        n_iters = iter + 1;
+        max_rms = plan.scc_step_diis(&mut rt, &h0_buf, &s_buf, &g_buf, &q0_buf, &oa_buf, cpu.n_occ, 0.3)
+            .expect("scc_step_diis must succeed");
+        if max_rms < 1e-5 { break; }
+    }
+    assert!(max_rms < 1e-5, "GpuSccPlan DIIS did not converge in {n_iters} iters (max_rms={max_rms:.3e})");
+
+    let energies = plan.compute_energy(&mut rt, &h0_buf, &s_buf, &g_buf, &q0_buf, &oa_buf, cpu.n_occ).unwrap();
+    let charges = plan.read_charges(&rt).unwrap();
+
+    let de = (energies[0] as f64 - cpu.energy).abs();
+    let dq = max_abs_diff(&charges, &cpu.charges.iter().map(|&q| q as f32).collect::<Vec<_>>());
+
+    eprintln!("GpuSccPlan DIIS H2O parity: E_cpu={:.8}, E_plan={:.8}, |dE|={de:.2e}, iters={n_iters}", cpu.energy, energies[0]);
+    eprintln!("  |dq|={dq:.2e}");
+
+    assert!(de < 1e-3, "GpuSccPlan DIIS energy parity failed: |dE|={de:.2e} > 1e-3");
+    assert!(dq < 1e-3, "GpuSccPlan DIIS charges parity failed: |dq|={dq:.2e} > 1e-3");
 }
 
 // ==================================================================

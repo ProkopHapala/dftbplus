@@ -110,6 +110,72 @@ Production sparse SCC/force code must satisfy all of the following:
    particular `R_K`, `R_Z`, SCC tolerance, arithmetic mode, and Hessian `h` are
    not to be collapsed into one vague “precision” setting.
 
+### 1.4 Performance mandate — fastest GPU DFTB in the world
+
+This project aspires to be the **fastest GPU-accelerated DFTB+ implementation
+in the world**, not a toy for one afternoon. Every design decision is judged
+against three ordered criteria:
+
+1. **Physical correctness** — the math must be right, the model must be
+   self-consistent, the forces must be the exact gradient of the energy.
+2. **Scientific rigor** — tests must prove what they claim; tolerances must
+   reflect the science (meV barriers, not 0.27 eV); no test is green by
+   loosening its contract.
+3. **Maximum performance** — eliminate every avoidable overhead: no
+   allocation in hot loops, no host roundtrip in an iteration, no kernel
+   rebuild per step, no `finish()` for bookkeeping, no dense fallback hidden
+   in a sparse path, no atomic where a deterministic reduction suffices, no
+   CPU sort of structural indices that one WG can do in local memory.
+
+**KISS, but not at the cost of speed.** Simple code is preferred when it is
+*also* fast. When "simple" means "slow" — e.g. a CPU bridge through an
+allocation-heavy dense force function, a serial spectral-bound computation
+where a GPU row-sum reduction exists, a per-iteration `finish()` for a 4-byte
+trace read, a CAS-loop atomic where a one-WG local reduction is deterministic
+and cheaper — the answer is **no**. We write the fast version. The code may be
+longer; that is acceptable.
+
+**The recurring failure mode this section exists to prevent:** a coding agent
+takes a shortcut that is locally simpler, the test passes because the
+shortcut is correct in isolation, and the result is a 2–10× performance
+regression or a hidden correctness bug that only surfaces under real
+workloads (N=300–1000, 6N Hessian displacements, 200 FIRE steps). The GPT-5.6
+review (section 13) catalogs exactly this pattern. Every item there is a case
+where "simple and easy" was chosen over "fast and correct", and the cost was
+paid in either physics or throughput.
+
+**Concrete implications for the sparse solver:**
+
+- One persistent `SparseSystemWorkspace` owns positions → H/S → SCC → D/W →
+  forces. No second context, no per-displacement uploads, no force driver that
+  allocates and downloads. All frozen patterns, GPU structures, symbolic plans,
+  and scratch matrices live in the workspace for the lifetime of the topology.
+- D and W are GPU buffers after SCC/purification. Forces stay on GPU for FIRE.
+  No CPU copy between SCC and force evaluation. Do not materialize D=2K as a
+  separate matrix — pass K + spin_factor=2 to the force contraction.
+- TC2 convergence, Mulliken charge extraction, and spectral-bound reductions
+  happen on device. A 4-byte scalar read per iteration is a synchronization,
+  and synchronization dominates when 6N Hessian displacements each run dozens
+  of SCC/TC2 iterations.
+- The SpGEMM, purification, Newton-Schulz, and force kernels are built once and
+  reused. Buffer capacity is preallocated; changing arguments is `set_arg`,
+  not `Buffer::builder()`. Symbolic plans are built once at frozen topology
+  and reused across all SCC iterations, force calls, and Hessian displacements.
+- Analytic derivatives are the production route. Finite differences of H/S are
+  test/reference only. The only production finite difference is force → Hessian.
+- The sparse SCC loop is self-consistent: K from sparse purification of a
+  sparse Hscc built from sparse Mulliken charges — no dense `SccResult`
+  anywhere. The force must be the gradient of the same sparse energy whose
+  Hessian we diagonalize.
+- Tests prove what they claim. A test that says "residual < 1e-5" must assert
+  `< 1e-5`, not `< 1e-3` because the solver misses. Fix the solver. A test that
+  claims "locality plateau" must test a real insulating system at growing N,
+  not a 5-atom toy where R=7Å covers everything.
+
+This mandate is the lens through which the GPT-5.6 review (section 13) and all
+subsequent implementation should be read. See `Sparse_Nanocrystal_Vibrations.tasks.md`
+for the phased breakdown that enforces it.
+
 ---
 
 ## 2. Physics and numerical invariants
@@ -1462,3 +1528,287 @@ workflow easier to run and understand.
 | Accuracy concern | SCC convergence on polar systems | Imaginary modes from force noise / spline discontinuity / mask jitter |
 | SK set | mio-1-1 (H,C,N,O) | siband-1-1 (Si) or matsci-0-3 (C,Si) |
 | Geometry source | SPAMMM (ASCII art + coordinate_scan) | FireCore (Nanocrystals.js + gen_nanocrystals.py) |
+
+---
+
+## 13. GPT-5.6 code review — corrections and action checklist
+
+**Source:** GPT-5.6 review of commit `b269ab6`, transcribed in
+`Sparse_Nanocrystal_Vibrations.chat.md` from line 2064 onward.
+
+**Summary:** The commit moved the project in the right direction (analytic SK
+angular derivatives, D/W formulation, symbolic-plan concept), but several
+"completed" items are **not actually wired into the production numerical
+path**. The largest gains are not another OpenCL micro-optimization — they are
+removing whole unnecessary matrix products, eliminating
+synchronization/allocation from the harness, and ensuring the force is
+genuinely the derivative of the same smooth self-consistent sparse model whose
+Hessian we intend to diagonalize.
+
+**Checkbox convention:**
+- `[*]` — done correctly and verified
+- `[ ]` — not done / needs fixing / needs rework
+- `[~]` — partially done (implemented but not wired into production, or test
+  passes but does not test what it claims)
+
+### 13.1 Critical blockers (must fix before phonons)
+
+- [~] **#1 — C² spline not canonical in production force path.** **FIXED:**
+  `EqGridTable` now stores canonical C² B-spline control points (computed
+  via tridiagonal solve at construction). `eval_into` and
+  `eval_with_deriv_into` now use the B-spline path (`eval_bspline_into`
+  and `eval_bspline_with_deriv_into`). The tail derivative uses analytic
+  B-spline V' and V'' at the last grid point (no finite differences).
+  Hermite path retained as `eval_hermite_into` / `eval_hermite_with_deriv_into`
+  for reference. Verified: `test_bspline_reproduces_grid_values` (exact at
+  grid points), `test_bspline_deriv_c2_continuity` (V and V' continuous at
+  knots), `test_bspline_derivative_smoothness` (smooth derivatives),
+  `test_bspline_vs_hermite_values` (close to Hermite). The production force
+  path (`rotation.rs` → `SkTableSp::eval_shell_integrals_and_derivs_into`
+  → `EqGridTable::eval_with_deriv_into`) now uses the canonical C² B-spline.
+  *(Manifest §4.2, §3.3)*
+
+- [ ] **#2 — No sparse SCC solver; sparse purification attached to dense SCC.**
+  `rhai_run_sparse_purify_geom()` retrieves an already-converged dense
+  `SccResult`, converts dense `h_scc`/`s` to BSR4, then purifies. The sparse K
+  is computed for a Hamiltonian whose SCC charges came from the **dense**
+  solution. For Hessian variational consistency, the production path must be:
+  `sparse H0/S → q init → γ·Δq → sparse Hscc → sparse K0+TC2 → Mulliken q → mix
+  → repeat`, with no dense `SccResult` anywhere in the loop. *(Manifest §4.12)*
+
+- [~] **#3 — TC2 does ~4 SpGEMMs/iter instead of 2.** **FIXED (A2):**
+  `tc2_purify_dev` now computes `R_I=||Q-K||` **before** the update, using
+  the same Q from the 2 SpGEMMs. No extra KSK for convergence check. No
+  per-iteration host sync — trace and residual are read together only on
+  diagnostic iterations. Normal iteration: 2 SpGEMMs, 0 host reads, 0
+  queue finish. Verified: `test_tc2_dev_resident_convergence`,
+  `test_tc2_dev_vs_host_parity`, `test_tc2_nonconvergence_is_error` all
+  pass. *(Manifest §4.7)*
+
+- [~] **#4 — P4 symbolic plans not integrated into TC2/NS/K0/W.** **PARTIALLY
+  FIXED (A3):** `SparsePurifyWorkspace::new` now builds and uploads symbolic
+  plans for `K*S` and `T*K` at construction. `tc2_products_dev` uses
+  `spgemm_plan_bsym_dev` when a plan is available, falls back to
+  `spgemm_bsym_dev` otherwise. `SparseDWWorkspace` also builds plans for
+  `K*Hscc` and `T*K`. Remaining: `Z*S`, `T_ZS*Z`, `Z*H`, `T_ZH*Z` in the
+  Newton-Schulz path. Verified: all 22 `gpu_sparse_bsr4` tests pass, plus
+  `test_dw_workspace_vs_oneshot` with zero diff. *(Manifest §4.6)*
+
+- [~] **#8 — `build_dw_sparse()` is an allocation machine.** **FIXED:**
+  New `SparseDWWorkspace` pre-allocates all structures, buffers, and
+  symbolic plans once at construction. `build_dw_into` enqueues only
+  kernels — no allocation, no host transfer. Verified:
+  `test_dw_workspace_vs_oneshot` shows zero diff vs one-shot API, and
+  workspace is reusable across calls. Legacy `build_dw_sparse` kept for
+  backward compatibility. *(Manifest §4.4, AGENTS.md hot-loop rule)*
+
+- [ ] **#13 — Gate E is a false positive.** (a) "Sparse force" is FD of sparse
+  **energy**, not analytic sparse D/W force. (b) Hessian h-sweep uses dense f64
+  non-SCC path only. (c) Hessian is symmetrized by construction
+  (`hess[i][j]=h_ij; hess[j][i]=h_ij`) so measured "asymmetry" is identically
+  zero. (d) `h_ref=0.05` is in the candidate list → that entry has exactly
+  zero diff, guaranteeing a "plateau." (e) `band_energy()` sums occupied
+  eigenvalues without the closed-shell factor 2. **Fix:** wait for analytic
+  sparse force (#7), then redo Gate E per §5 Gate E and §13.2 item 9. *(Manifest
+  §5 Gate E)*
+
+- [ ] **#10 — Gate C should be marked NOT passed.** (a) 5 atoms on a 1.5Å line
+  — at R=7Å the entire 6Å system is inside the mask, so the "plateau"
+  approaches dense/full support. (b) `h[i,i]+=2.0` shifts **every eigenvalue by
+  exactly 2** and leaves all level spacings (including HOMO-LUMO gap) unchanged
+  — it does **not** create a gap. **Fix:** use real passivated Si/H systems
+  (Si29H36, Si~80H..., Si~150H...) and test whether a **fixed** R_K gives
+  stable errors as N grows. *(Manifest §4.5, §5 Gate C)*
+
+### 13.2 Required rework (correctness/architecture)
+
+- [~] **#5 — Planned SpGEMM kernel contains dead code.** **PARTIALLY FIXED:**
+  Removed `A_col`, `C_col` arguments and `lcol[MAX_LEFT_BLOCKS]` local
+  array from `bsr4_spgemm_plan_Bsym` kernel. Saves ~256 uint of local
+  memory and eliminates useless global loads. Updated Rust kernel
+  construction and `spgemm_plan_bsym_dev` to match. Verified: all 24
+  `gpu_sparse_bsr4` + `spgemm_plan` tests pass. Remaining: pack
+  `plan_a_idx` (8 bits) + `plan_b_idx` (24 bits) into one `uint` to halve
+  plan-term traffic. *(Manifest §4.6)*
+
+- [ ] **#6 — 16-lane mapping may reload B 4× unnecessarily.** Current: 16
+  lanes = 16 scalar `C_rc`; each lane does 4 global B loads per contribution →
+  ~64 B loads. Alternative: 16 lanes = `(m,c)`; each lane reads one `B_mc` and
+  accumulates 4 output rows. **Benchmark, don't assume** — NVIDIA caches may
+  already handle it. Also: P4 perf test uses 8-atom chain / 10 launches — use
+  realistic N=300/600/1000 with degree distributions at R_K~5-10Å, 100-1000
+  repeated products. *(Manifest §4.6)*
+
+- [ ] **#7 — Degree buckets not implemented.** `MAX_LEFT_BLOCKS=256` reserved
+  for every workgroup regardless of row degree. Implement buckets: ≤32, ≤64,
+  ≤128, ≤256. For Si density at ~7Å, expect 64/128 to dominate. *(Manifest
+  §4.6)*
+
+- [ ] **#9 — W symmetrization should be diagnostic, not error-hiding.** For
+  symmetric H and K, `KHK` is symmetric. If the intermediate mask is the exact
+  symbolic product support, the first multiplication should not introduce
+  structural truncation. Measure `η_W = ||W-W^T||/||W||`. If ~f32 roundoff,
+  don't launch a full symmetrization pass. For force contraction, cheaply use
+  `(W_ij + W_ji^T)/2` on the pair. Same question for K symmetrization after
+  every TC2 iteration — benchmark every-iter vs diagnostic-iter vs
+  threshold-gated. *(Manifest §4.4)*
+
+- [ ] **#11 — `R_leak` formula is mathematically wrong.** Current:
+  `R_leak ≈ ||Q_val|| - ||Q_K||` (difference of norms, not norm of omitted
+  residual). Correct: `R_leak = sqrt(||Q_val||² - ||Q_inside||²)`. Better:
+  compute `Q=KSK` once on validation support, tag each output block
+  inside/outside `M_K`, accumulate `sum_{outside M_K} |Q_ij|²` via GPU
+  reduction, then `R_leak = sqrt(sum)`. No approximation. *(Manifest §2.1)*
+
+- [ ] **#12 — R_K and R_Z mixed in locality experiment.** Test does
+  `z = z_on_mz.project_to_mask(&m_k)` **before** constructing K0, destroying
+  R_Z/R_K independence. Correct: `K0 = P_MK[(ε_max·Z - ZHZ)/(ε_max-ε_min)]`
+  using full Z on M_Z in `ZHZ`; only the **final result** is projected to M_K.
+  When R_Z > R_K, projecting first throws away the extra inverse-overlap
+  accuracy. *(Manifest §4.5)*
+
+- [ ] **#16 — Do not bridge to dense force function for production.**
+  `non_scc_electronic_force()` allocates multiple `Vec<f64>` per pair (DM
+  block, EDM block, H, S, dH/dx,y,z, dS/dx,y,z). Fine as CPU reference. Do
+  **not** build a bridge by repeatedly extracting BSR blocks into those Vecs.
+  Production: dedicated GPU sparse force path — kernel 1: one pair, evaluate
+  SK V,V' + analytic angular derivatives, read K_ij/W_ij, output
+  `float4 pair_force[p]`; kernel 2: one atom, gather incident pair_forces, sum
+  into F_atom. Precompute pair→BSR block index, transpose index, physical
+  orbital counts, species-pair table id. No CSR binary searches in force loop.
+  *(Manifest §4.3, §7)*
+
+- [ ] **#17 — E_dummy should not control TC2 condition number.** Since dummy
+  orbitals are exactly decoupled (`S_dummy=I`, `Z_dummy=I`, `K_dummy=0` is a TC2
+  invariant): exclude dummy orbitals from the physical spectral-bound
+  calculation, explicitly init `K0 dummy rows/cols = 0`. Then E_dummy only
+  makes the padded generalized matrix nonsingular. Also: ensure SCC H update
+  does not turn `H_dummy=E_dummy` into `H_dummy=E_dummy+V_H` (because
+  `S_dd=1`). Keep dummy diagonal explicitly fixed. Use `active_orbital_mask`
+  (4 bits/atom). *(Manifest §4.10)*
+
+- [~] **#18 — Newton-Schulz not fully device-resident.** **PARTIALLY FIXED:**
+  `newton_schulz_inverse_dev()` now computes `||S||∞` on the device via
+  `inf_norm_dev()` (row_abs_sum + reduce_max kernels), builds identity on
+  the device via `build_identity_dev()` (using diag_block map), and scales
+  on the device via `scale_dev()`. No S download, no row_ptr/col_idx
+  download, no host identity build. Remaining: Z is still downloaded at
+  convergence (needed for K0 construction); for Hessian, `Z = Z0 + few NS
+  corrections against new S` without download/reupload is not yet
+  implemented. Verified: `test_newton_schulz_inverse_dev` passes. *(Manifest
+  §4.12)*
+
+- [~] **#19 — K0/spectral_bounds use allocation-heavy wrappers.** **FIXED:**
+  New `spectral_bounds_dev` computes B = Z·H on device, then Gershgorin
+  bounds on device (new `bsr4_gershgorin_partial` + `reduce_min_f32`
+  kernels), reads only 2 scalars (emin, emax) to host. New `build_k0_dev`
+  computes B = Z·H and A = B·Z on device, then K₀ = (emax·Z - A)/Δε via
+  `axpby_dev`, symmetrizes on device. No matrix download, no host
+  roundtrip. Verified: `test_k0_dev_vs_host` shows zero diff vs host path,
+  and TC2 from device K0 converges (R_I=1.6e-7, Tr=3.000000). *(Manifest
+  §4.12)*
+
+- [ ] **#20 — Performance audit currently lies.** `let largest_dense = 0` does
+  not check anything. The engine has dense `SccResult`, dense H/S, dense→BSR
+  conversion, `K.to_dense()`, while audit prints "largest dense alloc 0 bytes."
+  Fix: real counters at GPU wrapper/runtime level — buffer allocation count,
+  current/peak GPU bytes, kernel launch count, blocking read count/bytes,
+  queue finish count, structure/plan upload bytes. Make stage timings
+  explicitly exclusive or hierarchical, never sum overlapping timers. The
+  `sparse_firewall` catches `Bsr4Matrix::to_dense()` but not a dense
+  `DMatrix` created elsewhere — type-level separation of the production sparse
+  API is more robust. *(Manifest §4.1)*
+
+- [~] **#21 — Mask construction is O(N²).** **PARTIALLY FIXED:**
+  `build_product_mask()` now uses a stamping array (`marks[j] != stamp`)
+  instead of `neighbors.contains(&j)`, reducing per-row dedup from O(n²)
+  to O(candidates). `build_geometric_mask()` still uses all-pairs distance
+  loop — cell list not yet implemented (setup only, not hot loop).
+  Verified: `test_boolean_product_mask` passes. *(Manifest §4.5)*
+
+- [ ] **#22 — GPU B-spline cutoff behavior needs boundary tests.**
+  `cubic_interp_params()` clamps `i = clamp(i, 1, n_grid-3)`, can extrapolate
+  with `t<0` or `t>1` unless caller rejects out-of-range distances. Test real
+  Si-Si and Si-H SKF tables at: each knot ±ε, first physical sample, SK bond
+  distances, start of cutoff tail, cutoff−ε, cutoff, cutoff+ε — for V, V',
+  V''. Verify SKF physical grid origin convention is preserved in the
+  canonical sparse H/S path. *(Manifest §4.2)*
+
+### 13.3 What was done correctly (keep)
+
+- [*] **#15 — Analytic angular derivatives are mathematically correct.** The
+  ss/sp/pp differentiation follows `∂r/∂R_a = u_a`,
+  `∂u_i/∂R_a = (δ_ia - u_i·u_a)/r`, with the pp decomposition
+  `V_π·δ_ij + (V_σ-V_π)·u_i·u_j`. Unit handling is consistent (SK radial
+  derivative per Bohr, angular 1/r with r in Bohr, final ×ANG2BOHR). **Keep
+  this machinery.** The correction is to feed it V,V' from the canonical C²
+  spline instead of `EqGridTable` Hermite. *(Manifest §4.3)*
+
+### 13.4 Ordered implementation plan (from GPT-5.6)
+
+The following order is from the GPT-5.6 review's "What I would tell the coding
+agent to do next" section. Items 1-9 are required before secondary kernel
+tuning (item 10).
+
+- [ ] **Step 1 — Unmark P1/P2/Gate C/Gate E as completed.** P2 angular
+  differentiation is implemented, but P1 is not canonical in the sparse force
+  call graph; Gate C and E do not yet test their advertised properties. Update
+  the report and roadmap accordingly.
+
+- [~] **Step 2 — Unify SK interpolation.** **FIXED:** `EqGridTable` now stores
+  canonical C² B-spline control points. `eval_into` and `eval_with_deriv_into`
+  use the B-spline path with analytic derivatives. Tail derivative uses
+  B-spline V' and V'' (no finite differences). Hermite/Neville retained as
+  reference only. *(= issue #1)*
+
+- [ ] **Step 3 — Build genuinely sparse SCC workspace.** Not a sparse
+  postprocessor of `SccResult`. H0/S, Hscc, K, q and force must form one
+  self-consistent sparse calculation. *(= issue #2)*
+
+- [ ] **Step 4 — Fix TC2 immediately.** Residual before update, no recomputed
+  KSK, no trace host read each iteration. Reduces normal iteration from ~4
+  SpGEMMs to 2. *(= issue #3)*
+
+- [ ] **Step 5 — Integrate symbolic plans into TC2/NS/K0/W.** Rather than
+  leaving P4 as a standalone test. *(= issue #4)*
+
+- [~] **Step 6 — Make one persistent `SparseSystemWorkspace`.** **IMPLEMENTED:**
+  New `sparse_system.rs` module with `SparseSystemWorkspace` struct owning all
+  GPU structures, buffers, and symbolic plans for the lifetime of a frozen
+  topology. Pipeline: Z≈S⁻¹ (device-resident NS) → spectral_bounds (device
+  Gershgorin) → K0 (device) → TC2 (device) → Mulliken charges. All SpGEMMs
+  use symbolic plans when available. No allocation in hot loops. Verified:
+  `test_sparse_system_scc_pipeline` (full pipeline converges, R_I=9.5e-6,
+  Tr=3.000010) and `test_sparse_system_reuse` (workspace reusable, both runs
+  converge to same state). *(= issues #8, #18, #19)*
+
+- [ ] **Step 7 — Implement sparse analytic force directly on BSR blocks.**
+  Preferably pair-force + atom-gather, not through the allocation-heavy dense
+  CPU force API. *(= issue #16)*
+
+- [ ] **Step 8 — Redo Gate C on real passivated Si/H systems.** Compute exact
+  outside-mask leakage, test whether fixed R_K/R_Z remains accurate as N grows.
+  *(= issues #10, #11, #12)*
+
+- [ ] **Step 9 — Redo Gate E only after Step 7.** Using actual SCC analytic
+  sparse forces and unsymmetrized force-difference Hessians. *(= issue #13)*
+
+- [ ] **Step 10 — Secondary kernel tuning (only after 1-9 pass).** Packed
+  plans, degree buckets, alternative lane mapping, selective compensated
+  reductions. *(= issues #5, #6, #7, #9)*
+
+### 13.5 Status corrections to propagate
+
+When Step 1 is executed, the following status corrections must be propagated
+to `Sparse_Nanocrystal_Vibrations.report.md`,
+`doc/prokop/DFTB_Reimplementation_Progress/OVERVIEW_Roadmap.md`, and
+`doc/prokop/topical_audit/sparse_nanocrystal_vibrations.md`:
+
+| Item | Was | Should be |
+|---|---|---|
+| P1 | "completed" | `[x]` canonical C² B-spline in production force path |
+| P2 | "completed" | `[x]` angular + radial derivatives from canonical C² B-spline |
+| Gate C | "passed" | `[ ]` false positive — 5-atom toy system, +2I doesn't create gap |
+| Gate E | "passed" | `[ ]` false positive — FD-of-energy forces, symmetrized Hessian tautology |
+| P4 | "completed" | `[~]` plan infrastructure built, not integrated into TC2/NS/K0/W |
+| P3 | "completed" | `[~]` D/W formula correct, but allocation-heavy and attached to dense SCC |

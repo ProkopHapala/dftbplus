@@ -1224,3 +1224,78 @@ fn test_sparse_perf_stats_audit() {
     // No assertion needed — if it prints without panic, the struct works.
     println!("SparsePerfStats audit printed successfully");
 }
+
+// =====================================================================
+// 20. GPT-5.6 #19: Device-resident K0/spectral_bounds.
+//     Verify that device-side spectral_bounds_dev and build_k0_dev produce
+//     the same results as the host-roundtrip path.
+// =====================================================================
+
+#[test]
+fn test_k0_dev_vs_host() {
+    use rust_dftb::methods::sparse::gpu_sparse::{GpuBsrMatrix, GpuBsrStructure};
+    use std::sync::Arc;
+
+    let Some(gpu) = try_gpu() else { return };
+    let n_atom = 3;
+    let n = n_atom * BS;
+    let nocc = 3;
+    let mut rng = Rng(0x5a5a_c0de_1234_5678);
+    let mut h_dense = random_symmetric_dense(n_atom, &mut rng, 0.4);
+    for i in 0..n { h_dense[i * n + i] += 2.0; }
+    let s_dense = make_overlap_dense(n_atom, &mut rng, 0.2);
+    let mask = build_full_mask(n_atom);
+    let h = bsr4_from_dense(n_atom, &h_dense, &mask);
+    let s = bsr4_from_dense(n_atom, &s_dense, &mask);
+
+    // 1. Z ≈ S⁻¹ via device-resident NS.
+    let s_dev = GpuBsrMatrix::from_host(&gpu, &s).unwrap();
+    let k_struct = Arc::new(GpuBsrStructure::new(&gpu, n_atom, &mask).unwrap());
+    let t_struct = Arc::new(GpuBsrStructure::new(&gpu, n_atom, &mask).unwrap());
+    let (z_host, rz, z_iters) = gpu
+        .newton_schulz_inverse_dev(&s_dev, &k_struct, &t_struct, 30, 1e-4, 3)
+        .unwrap();
+    println!("Z (dev): {z_iters} iters, R_Z = {rz:e}");
+    assert!(rz < 1e-3, "Z did not converge: R_Z={rz:e}");
+
+    // 2. Host spectral bounds (reference).
+    let (emin_host, emax_host) = gpu.spectral_bounds(&h, &z_host, &mask, 0.1).unwrap();
+    println!("spectral bounds (host): emin={emin_host:.4} emax={emax_host:.4}");
+
+    // 3. Device spectral bounds.
+    let h_dev = GpuBsrMatrix::from_host(&gpu, &h).unwrap();
+    let z_dev = GpuBsrMatrix::from_host(&gpu, &z_host).unwrap();
+    let b_dev = GpuBsrMatrix::zero(&gpu, &t_struct).unwrap();
+    let (emin_dev, emax_dev) = gpu.spectral_bounds_dev(&z_dev, &h_dev, &b_dev, 0.1).unwrap();
+    println!("spectral bounds (dev):  emin={emin_dev:.4} emax={emax_dev:.4}");
+
+    // Should match to f32 roundoff (same kernels, same order).
+    let emin_err = (emin_host - emin_dev).abs();
+    let emax_err = (emax_host - emax_dev).abs();
+    println!("spectral bounds diff: emin_err={emin_err:e} emax_err={emax_err:e}");
+    assert!(emin_err < 1e-5, "emin mismatch: host={emin_host:e} dev={emin_dev:e}");
+    assert!(emax_err < 1e-5, "emax mismatch: host={emax_host:e} dev={emax_dev:e}");
+
+    // 4. Device K0 construction.
+    let a_dev = GpuBsrMatrix::zero(&gpu, &k_struct).unwrap();
+    let k0_dev = GpuBsrMatrix::zero(&gpu, &k_struct).unwrap();
+    gpu.build_k0_dev(&z_dev, &h_dev, &b_dev, &a_dev, &k0_dev, emin_dev, emax_dev)
+        .unwrap();
+    let k0_dev_host = k0_dev.to_host(&gpu).unwrap();
+
+    // 5. Host K0 construction (reference).
+    let k0_host = gpu.build_k0(&h, &s, &z_host, &mask, &mask, emin_host, emax_host).unwrap();
+
+    // 6. Compare.
+    let k0_diff = dense_max_abs_diff(&k0_host.to_dense(), &k0_dev_host.to_dense());
+    println!("K0 dev vs host: max|diff| = {k0_diff:e}");
+    assert!(k0_diff < 1e-5, "K0 mismatch: {k0_diff:e}");
+
+    // 7. Verify K0 leads to correct TC2 convergence.
+    let t_mask = mask.clone();
+    let mut ws = SparsePurifyWorkspace::new(gpu, &k0_dev_host, &s, &mask, &t_mask, nocc as f32).unwrap();
+    let (k_final, r_i, tr, iters, _) = ws.tc2_purify_dev(40, 1e-5, 1).unwrap();
+    println!("TC2 from dev K0: {iters} iters, R_I={r_i:e}, Tr(KS)={tr:.6}");
+    assert!(r_i < 1e-3, "TC2 did not converge: R_I={r_i:e}");
+    assert!((tr - nocc as f32).abs() < 1e-2, "Tr(KS) mismatch: {tr} vs {nocc}");
+}
