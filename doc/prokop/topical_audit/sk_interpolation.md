@@ -28,6 +28,12 @@ AT/GC “H assembly failed” was that CPU garbage, not a GPU assembly bug.
 | Rust fit | `rust_dftb/src/methods/dftb/spline_resample.rs` | active | `function_to_bspline_control_points`, `fit_bspline_controls_zero_end`, `bspline3_eval_v_d1_d2`. |
 | GPU f32 | `dftb_hamiltonian.cl`, `gpu_forces.cl`, packed in `qmqm/gpu_prep.rs` | active (same stopgap) | Same 4-point stencil + analytic `cubic_weights_d1`. Dense H-bond tables: original grid + r=0 dummy + `N_PAD_END` (fits `SK_GRID_MAX=512` for mio). |
 
+## What “extra-control fitter” means (plain language)
+
+The SK file is a table `V(r_k)`. A cubic B-spline needs extra **control points** off both ends of that table — they are not extra physics samples, they are degrees of freedom that implement boundary conditions (how the curve starts; how it goes to zero).
+
+**Fitter** = those extra controls are **unknowns in a linear solve**, given: match the table on the valid grid; `V,V'→0` at cutoff; left end not forced to 0. **Stopgap** = we instead *wrote zeros into extra samples and refit*. That is a different (blunt) operation. Do not “fix” the stopgap by padding more zeros.
+
 ## What was done (2026-09-09) — stopgap, not the design
 
 Two different end treatments. Do not confuse them.
@@ -120,6 +126,7 @@ bug we replaced.
 ## Related
 
 - `/doc/prokop/tasts/HBond_Relaxed_Scan_GPU/HBond_Relaxed_Scan_GPU.manifest..md`
+- `/doc/prokop/topical_audit/f32_floor_dense_hbond.md` — remaining energy/charge floors are eigenpairs, not this interpolator
 - `/doc/prokop/AGENTS/guidelines/efficiency.md` (Rule 8)
 - `/rust_dftb/tests/gpu_hbond_physics.rs`
 - Fortran: `src/dftbp/math/interpolation.F90`, `src/dftbp/dftb/slakoeqgrid.F90`

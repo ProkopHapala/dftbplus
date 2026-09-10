@@ -7,9 +7,9 @@
 use rust_dftb::methods::sparse::bsr4::{
     build_geometric_mask, build_product_mask, Bsr4Matrix, BS,
 };
-use rust_dftb::methods::sparse::gpu_sparse::{SparseBsr4Config, SparseBsr4Gpu, GpuBsrMatrix};
+use rust_dftb::methods::sparse::gpu_sparse::{SparseBsr4Gpu, GpuBsrMatrix};
 use rust_dftb::methods::sparse::bsr4::build_spgemm_plan_bsym;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use rust_dftb::methods::sparse::harness::require_sparse_gpu;
 use std::time::Instant;
 
 struct Rng(u64);
@@ -56,13 +56,7 @@ fn random_symmetric_dense(n_atom: usize, rng: &mut Rng, scale: f32) -> Vec<f32> 
 }
 
 fn try_gpu() -> Option<SparseBsr4Gpu> {
-    match catch_unwind(AssertUnwindSafe(|| {
-        SparseBsr4Gpu::new(SparseBsr4Config::default())
-    })) {
-        Ok(Ok(gpu)) => Some(gpu),
-        Ok(Err(e)) => { eprintln!("Skipping P4: no OpenCL ({e})"); None }
-        Err(_) => { eprintln!("Skipping P4: OpenCL panic"); None }
-    }
+    require_sparse_gpu()
 }
 
 #[test]

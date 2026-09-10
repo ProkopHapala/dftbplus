@@ -118,6 +118,7 @@ __kernel void batched_gemm(
     __global float* Cb = C + ib * stride;
 
     float sum = 0.0f;
+    float kahan_c = 0.0f; // f32 Kahan across K (not f64 GEMM — that reverted: worse E, DIIS blowup)
     const int lid = ly * TILE_N + lx;
     const int wg = TILE_M * TILE_N;
 
@@ -148,7 +149,11 @@ __kernel void batched_gemm(
 
         if (row < n && col < n) {
             for (int kk = 0; kk < TILE_K; ++kk) {
-                sum += As[ly * TILE_K + kk] * Bs[kk * TILE_N + lx];
+                float prod = As[ly * TILE_K + kk] * Bs[kk * TILE_N + lx];
+                float y = prod - kahan_c;
+                float t = sum + y;
+                kahan_c = (t - sum) - y;
+                sum = t;
             }
         }
         barrier(CLK_LOCAL_MEM_FENCE);
@@ -805,7 +810,7 @@ __kernel void mulliken_charges_batched(
 //
 // Simple mixing step + residual norm:
 //   q_mixed = α·q_new + (1-α)·q_old
-//   rms     = ||q_new - q_old||_2  (L2 norm, sqrt of sum of squares)
+//   rms     = √(Σ (q_new-q_old)² / n_atoms)  — RMS, same contract as CPU/DIIS
 //
 // One workgroup per system; tree reduction in __local for the rms.
 // ------------------------------------------------------------------
@@ -839,7 +844,7 @@ __kernel void residual_and_mix_batched(
         if (lid < off) scratch[lid] += scratch[lid + off];
         barrier(CLK_LOCAL_MEM_FENCE);
     }
-    if (lid == 0) rms[sid] = sqrt(scratch[0]);
+    if (lid == 0) rms[sid] = sqrt(scratch[0] / (float)n_atoms);
 }
 
 // ------------------------------------------------------------------
@@ -870,17 +875,19 @@ __kernel void delta_q_batched(
 // ------------------------------------------------------------------
 // build_density_masked_batched
 //
-// D = 2 * sum_{k: occ[k]!=0} C[:,k] * C[:,k]^T  (closed-shell density).
-// C is [batch][N*N] row-major: C[i*N + k] = coefficient of orbital i
-// in MO k.  occ_mask is [batch][N] int (1=occupied, 0=virtual).
-// One workgroup per system, threads stride over N*N elements.
+// D = 2 * sum_{k: occ[k]!=0} s_k * C[:,k] * C[:,k]^T
+// s_k = 1        when use_eig==0  → closed-shell density D
+// s_k = eig[k]   when use_eig==1  → energy-weighted density W
+// One kernel for both (no extra program). use_eig is uniform across the WG.
 // ------------------------------------------------------------------
 __kernel void build_density_masked_batched(
     const int n,
     const int batch,
     __global const float* C,
     __global const int* occ_mask,
-    __global float* D
+    __global float* D,
+    const int use_eig,
+    __global const float* eig
 ) {
     const int sid = get_group_id(0);
     const int lid = get_local_id(0);
@@ -889,13 +896,15 @@ __kernel void build_density_masked_batched(
     __global const float* Cb = C + (size_t)sid * n * n;
     __global const int* mb   = occ_mask + (size_t)sid * n;
     __global float* Db       = D + (size_t)sid * n * n;
+    __global const float* eb = eig + (size_t)sid * n;
     const int nn = n * n;
     for (int idx = lid; idx < nn; idx += lsz) {
         const int i = idx / n;
         const int j = idx - i * n;
         float s = 0.0f;
         for (int k = 0; k < n; ++k) {
-            s += (float)mb[k] * Cb[i * n + k] * Cb[j * n + k];
+            float sk = use_eig ? eb[k] : 1.0f;
+            s += (float)mb[k] * sk * Cb[i * n + k] * Cb[j * n + k];
         }
         Db[idx] = 2.0f * s;
     }
@@ -1211,18 +1220,13 @@ __kernel void repulsive_energy_batched(
 // ------------------------------------------------------------------
 // diis_step_batched
 //
-// GPU-resident DIIS mixing (R9b). One workgroup per system.
+// GPU-resident DIIS mixing. One workgroup per system.
 //
-// Steps:
-//   1. Compute residual = q_new - q_old, store in history ring buffer
-//   2. Store q_old (current q_in) in history ring buffer
-//   3. Compute B_ij = <F_i, F_j> for all history pairs (parallel dot products)
-//   4. One thread solves the augmented DIIS system [B 1; 1 0][c; λ] = [0; 1]
-//      via Gaussian elimination with partial pivoting
-//   5. Mix: q_out = Σ c_i * (q_in_i + res_i) = Σ c_i * q_out_i
-//   6. Compute RMS of current residual
-//
-// If not enough history (n_filled < 1), falls back to simple mixing.
+//   1. residual = q_new - q_old; store (q_in, res) in the ring buffer
+//   2. rms = √(Σ res² / n_atoms)   — RMS, not L2; matches CPU SCC tol
+//   3. n < 2 after this store: α-mix (never 1-vector DIIS; that is undamped q_new)
+//   4. n ≥ 2: Gram in f64, scale by max|B_ij|, tiny GE in f64
+//   5. small pivot / non-finite / |Σc−1|>tol → α-mix + printf, never silent c_i=0
 //
 // Buffers (all per-system, indexed by sid * stride + ...):
 //   q_new       — [batch*n_atoms] current SCC output charges
@@ -1231,8 +1235,8 @@ __kernel void repulsive_energy_batched(
 //   r_hist      — [batch*max_hist*n_atoms] ring buffer of residual vectors
 //   buf_idx     — [batch] ring buffer write position (i32)
 //   n_filled    — [batch] number of valid history entries (i32)
-//   b_mat       — [batch*(max_hist+1)*(max_hist+1)] DIIS B matrix workspace
-//   rhs         — [batch*(max_hist+1)] RHS workspace
+//   b_mat       — [batch*(max_hist+1)*(max_hist+1)] unused host-visible workspace
+//   rhs         — [batch*(max_hist+1)] unused host-visible workspace
 //   coeffs      — [batch*max_hist] DIIS coefficients output
 //   rms         — [batch] residual RMS output
 //
@@ -1242,6 +1246,8 @@ __kernel void repulsive_energy_batched(
 #define DIIS_MAX_HIST 10
 #endif
 #define DIIS_NP1 (DIIS_MAX_HIST + 1)
+
+#pragma OPENCL EXTENSION cl_khr_fp64 : enable
 
 __kernel void diis_step_batched(
     const int n_atoms,
@@ -1262,39 +1268,35 @@ __kernel void diis_step_batched(
     const int sid = get_group_id(0);
     const int lid = get_local_id(0);
     const int lsz = get_local_size(0);
+    __local int l_diis_ok;
     if (sid >= batch) return;
 
     __global const float* qn = q_new + (size_t)sid * n_atoms;
     __global float* qo = q_old + (size_t)sid * n_atoms;
     __global float* qh = q_hist + (size_t)sid * DIIS_MAX_HIST * n_atoms;
     __global float* rh = r_hist + (size_t)sid * DIIS_MAX_HIST * n_atoms;
-    __global float* B = b_mat + (size_t)sid * DIIS_NP1 * DIIS_NP1;
-    __global float* b = rhs + (size_t)sid * DIIS_NP1;
     __global float* c = coeffs + (size_t)sid * DIIS_MAX_HIST;
+    // b_mat / rhs kept in the signature (bound at GpuSccPlan::new); solve uses private f64.
 
     int idx = buf_idx[sid];
     int nf = n_filled[sid];
 
-    // Step 1: Compute residual = q_new - q_old, store in ring buffer
-    // Also compute RMS of residual
     float partial = 0.0f;
     for (int a = lid; a < n_atoms; a += lsz) {
         float res = qn[a] - qo[a];
         rh[idx * n_atoms + a] = res;
-        qh[idx * n_atoms + a] = qo[a];  // store q_in
+        qh[idx * n_atoms + a] = qo[a];
         partial += res * res;
     }
 
-    // RMS reduction
     scratch[lid] = partial;
     barrier(CLK_LOCAL_MEM_FENCE);
     for (int off = lsz >> 1; off > 0; off >>= 1) {
         if (lid < off) scratch[lid] += scratch[lid + off];
         barrier(CLK_LOCAL_MEM_FENCE);
     }
-    if (lid == 0) rms[sid] = sqrt(scratch[0]);
+    if (lid == 0) rms[sid] = sqrt(scratch[0] / (float)n_atoms);
 
-    // Update ring buffer state
     if (lid == 0) {
         buf_idx[sid] = (idx + 1) % DIIS_MAX_HIST;
         if (nf < DIIS_MAX_HIST) n_filled[sid] = nf + 1;
@@ -1304,101 +1306,105 @@ __kernel void diis_step_batched(
     int n = n_filled[sid];
     int np1 = n + 1;
 
-    // Step 2: If no history, fall back to simple mixing
-    if (n == 0) {
+    // First history point: α-mix. 1-vector DIIS is Σc=1 → c_0=1 → undamped q_new.
+    if (n < 2) {
         for (int a = lid; a < n_atoms; a += lsz) {
             qo[a] = alpha * qn[a] + (1.0f - alpha) * qo[a];
         }
         return;
     }
 
-    // Step 3: Compute B_ij = <F_i, F_j> for all history pairs
-    // Each thread handles one (i,j) pair if within range
-    for (int ij = lid; ij < n * n; ij += lsz) {
-        int i = ij / n;
-        int j = ij % n;
-        float dot = 0.0f;
-        __global float* ri = rh + i * n_atoms;
-        __global float* rj = rh + j * n_atoms;
-        for (int a = 0; a < n_atoms; a++) {
-            dot += ri[a] * rj[a];
+    if (lid == 0) {
+        double Bd[DIIS_NP1 * DIIS_NP1];
+        double bd[DIIS_NP1];
+        int ok = 1;
+        int reason = 0;
+        double scale = 0.0;
+        for (int i = 0; i < n; i++) {
+            for (int j = 0; j < n; j++) {
+                double dot = 0.0;
+                __global float* ri = rh + i * n_atoms;
+                __global float* rj = rh + j * n_atoms;
+                for (int a = 0; a < n_atoms; a++) {
+                    dot += (double)ri[a] * (double)rj[a];
+                }
+                Bd[i * np1 + j] = dot;
+                scale = fmax(scale, fabs(dot));
+            }
         }
-        B[i * np1 + j] = dot;
+        if (!isfinite(scale) || scale < 1.0e-30) {
+            ok = 0; reason = 1;
+        } else {
+            for (int i = 0; i < n; i++) {
+                for (int j = 0; j < n; j++) Bd[i * np1 + j] /= scale;
+                Bd[i * np1 + n] = 1.0;
+                Bd[n * np1 + i] = 1.0;
+            }
+            Bd[n * np1 + n] = 0.0;
+            for (int i = 0; i < np1; i++) bd[i] = 0.0;
+            bd[n] = 1.0;
+
+            for (int k = 0; k < np1 && ok; k++) {
+                int max_row = k;
+                double max_val = fabs(Bd[k * np1 + k]);
+                for (int i = k + 1; i < np1; i++) {
+                    double v = fabs(Bd[i * np1 + k]);
+                    if (v > max_val) { max_val = v; max_row = i; }
+                }
+                if (max_row != k) {
+                    for (int j = k; j < np1; j++) {
+                        double tmp = Bd[k * np1 + j];
+                        Bd[k * np1 + j] = Bd[max_row * np1 + j];
+                        Bd[max_row * np1 + j] = tmp;
+                    }
+                    double tmp = bd[k]; bd[k] = bd[max_row]; bd[max_row] = tmp;
+                }
+                if (!isfinite(max_val) || max_val < 1.0e-12) {
+                    ok = 0; reason = 1;
+                    break;
+                }
+                double piv = Bd[k * np1 + k];
+                for (int i = k + 1; i < np1; i++) {
+                    double factor = Bd[i * np1 + k] / piv;
+                    Bd[i * np1 + k] = 0.0;
+                    for (int j = k + 1; j < np1; j++) {
+                        Bd[i * np1 + j] -= factor * Bd[k * np1 + j];
+                    }
+                    bd[i] -= factor * bd[k];
+                }
+            }
+            if (ok) {
+                for (int i = np1 - 1; i >= 0; i--) {
+                    double sum = bd[i];
+                    for (int j = i + 1; j < np1; j++) sum -= Bd[i * np1 + j] * bd[j];
+                    double piv = Bd[i * np1 + i];
+                    if (!isfinite(piv) || fabs(piv) < 1.0e-12 || !isfinite(sum)) {
+                        ok = 0; reason = 2;
+                        break;
+                    }
+                    bd[i] = sum / piv;
+                }
+            }
+            if (ok) {
+                double csum = 0.0;
+                for (int i = 0; i < n; i++) {
+                    if (!isfinite(bd[i]) || fabs(bd[i]) > 10.0) { ok = 0; reason = 2; break; }
+                    csum += bd[i];
+                }
+                if (ok && fabs(csum - 1.0) > 1.0e-4) { ok = 0; reason = 3; }
+            }
+            if (ok) {
+                for (int i = 0; i < n; i++) c[i] = (float)bd[i];
+            }
+        }
+        if (!ok) {
+            printf("DIIS fallback sid=%d n=%d reason=%d (1=pivot/scale 2=nonfinite 3=sum(c)!=1) — α-mix\n", sid, n, reason);
+        }
+        l_diis_ok = ok;
     }
     barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
-
-    // Step 4: Set up constraint row/column and RHS
-    if (lid == 0) {
-        for (int i = 0; i < n; i++) {
-            B[i * np1 + n] = 1.0f;
-            B[n * np1 + i] = 1.0f;
-        }
-        B[n * np1 + n] = 0.0f;
-        for (int i = 0; i < np1; i++) b[i] = 0.0f;
-        b[n] = 1.0f;
-
-        // Gaussian elimination with partial pivoting (single-threaded, tiny system)
-        for (int k = 0; k < np1; k++) {
-            // Find pivot
-            int max_row = k;
-            float max_val = fabs(B[k * np1 + k]);
-            for (int i = k + 1; i < np1; i++) {
-                float v = fabs(B[i * np1 + k]);
-                if (v > max_val) { max_val = v; max_row = i; }
-            }
-            // Swap rows
-            if (max_row != k) {
-                for (int j = k; j < np1; j++) {
-                    float tmp = B[k * np1 + j];
-                    B[k * np1 + j] = B[max_row * np1 + j];
-                    B[max_row * np1 + j] = tmp;
-                }
-                float tmp = b[k]; b[k] = b[max_row]; b[max_row] = tmp;
-            }
-            // Eliminate
-            if (fabs(B[k * np1 + k]) < 1e-14f) continue;
-            for (int i = k + 1; i < np1; i++) {
-                float factor = B[i * np1 + k] / B[k * np1 + k];
-                B[i * np1 + k] = 0.0f;
-                for (int j = k + 1; j < np1; j++) {
-                    B[i * np1 + j] -= factor * B[k * np1 + j];
-                }
-                b[i] -= factor * b[k];
-            }
-        }
-        // Back substitution
-        for (int i = np1 - 1; i >= 0; i--) {
-            float sum = b[i];
-            for (int j = i + 1; j < np1; j++) {
-                sum -= B[i * np1 + j] * b[j];
-            }
-            if (fabs(B[i * np1 + i]) > 1e-14f) {
-                b[i] = sum / B[i * np1 + i];
-            } else {
-                b[i] = 0.0f;
-            }
-        }
-        // Copy coefficients
-        for (int i = 0; i < n; i++) c[i] = b[i];
-    }
-    barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
-
-    // Step 5: Mix — q_out = Σ c_i * (q_in_i + res_i) = Σ c_i * q_out_i
-    // Safeguard: check for non-finite coefficients
-    bool diis_ok = true;
-    if (lid == 0) {
-        for (int i = 0; i < n; i++) {
-            if (!isfinite(c[i])) { diis_ok = false; break; }
-            if (fabs(c[i]) > 10.0f) { diis_ok = false; break; }
-        }
-    }
-    // Broadcast diis_ok via local memory
-    __local int l_diis_ok;
-    if (lid == 0) l_diis_ok = diis_ok ? 1 : 0;
-    barrier(CLK_LOCAL_MEM_FENCE);
 
     if (l_diis_ok) {
-        // DIIS mixing: q_out = Σ c_i * (q_in_i + res_i)
         for (int a = lid; a < n_atoms; a += lsz) {
             float sum = 0.0f;
             for (int i = 0; i < n; i++) {
@@ -1407,7 +1413,6 @@ __kernel void diis_step_batched(
             qo[a] = sum;
         }
     } else {
-        // Fallback: simple mixing
         for (int a = lid; a < n_atoms; a += lsz) {
             qo[a] = alpha * qn[a] + (1.0f - alpha) * qo[a];
         }

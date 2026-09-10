@@ -1,5 +1,11 @@
 //! Persistent GPU-resident workspace for the full sparse DFTB SCC pipeline.
 //!
+//! **Caveat (2026-09-10):** this struct is the *intended* owner (manifest §0.4).
+//! `run_scc` is still **one-shot purify** (Z, K0, TC2, Mulliken) — no γ, no
+//! Hscc update, no charge mix. Physics gates G3/F/G use `scc.rs` instead.
+//! Device NS inside this workspace is N4-wrong; do not treat a green workspace
+//! unit test as a DFTB SCC. See `doc/prokop/topical_audit/f32_floor_sparse.md`.
+//!
 //! GPT-5.6 #2/#8, manifest §1.4: one persistent workspace owns all GPU
 //! structures, buffers, and symbolic plans for the lifetime of a frozen
 //! topology. No allocation in the SCC/force/Hessian hot loops.
@@ -20,10 +26,10 @@
 
 use crate::core::error::{DftbError, Result};
 use crate::methods::sparse::bsr4::{
-    build_geometric_mask, build_product_mask, build_spgemm_plan_bsym, Bsr4Matrix, BS, BS2,
+    build_geometric_mask, build_product_mask, build_spgemm_plan_bsym, inf_norm, Bsr4Matrix, BS, BS2,
 };
 use crate::methods::sparse::gpu_sparse::{
-    GpuBsrMatrix, GpuBsrStructure, SparseBsr4Gpu, SparseBsr4Config, SpgemmPlanGpu,
+    GpuBsrMatrix, GpuBsrStructure, SparseBsr4Gpu, SparseBsr4Config, SpgemmPlanGpu, TC2_TRACE_TOL,
 };
 use ocl::{flags, Buffer};
 use std::sync::Arc;
@@ -44,6 +50,7 @@ pub struct SparseSystemWorkspace {
     n_atom: usize,
     m_hs: (Vec<u32>, Vec<u32>),
     m_k: (Vec<u32>, Vec<u32>),
+    m_t: (Vec<u32>, Vec<u32>),
 
     // ── GPU structures (immutable, shared via Arc) ──
     hs_struct: Arc<GpuBsrStructure>,
@@ -87,6 +94,11 @@ pub struct SparseSystemWorkspace {
     reduce_partial: Buffer<f32>,
     reduce_a: Buffer<f32>,
     reduce_b: Buffer<f32>,
+
+    // Host scratch for honest NS residual (downloaded T, not the lying kernel scalar).
+    t_host: Vec<f32>,
+    k_host: Vec<f32>,
+    s_inf: f32,
 
     // ── System parameters ──
     nocc: f32,
@@ -178,12 +190,16 @@ impl SparseSystemWorkspace {
         let reduce_partial = gpu.zero_f32(reduce_len)?;
         let reduce_a = gpu.zero_f32(reduce_len)?;
         let reduce_b = gpu.zero_f32(reduce_len)?;
+        let t_host = vec![0.0f32; t_struct.nblock * BS2];
+        let k_host = vec![0.0f32; k_struct.nblock * BS2];
+        let s_inf = inf_norm(s); // may be 0 at construction if S is a zero placeholder
 
         Ok(Self {
             gpu,
             n_atom,
             m_hs,
             m_k,
+            m_t,
             hs_struct,
             k_struct,
             t_struct,
@@ -210,6 +226,9 @@ impl SparseSystemWorkspace {
             reduce_partial,
             reduce_a,
             reduce_b,
+            t_host,
+            k_host,
+            s_inf,
             nocc,
         })
     }
@@ -219,6 +238,10 @@ impl SparseSystemWorkspace {
     pub fn n_atom(&self) -> usize { self.n_atom }
     pub fn nocc(&self) -> f32 { self.nocc }
     pub fn gpu(&self) -> &SparseBsr4Gpu { &self.gpu }
+    pub fn m_hs(&self) -> &(Vec<u32>, Vec<u32>) { &self.m_hs }
+    pub fn m_k(&self) -> &(Vec<u32>, Vec<u32>) { &self.m_k }
+    pub fn nblock_k(&self) -> usize { self.k_struct.nblock }
+    pub fn nblock_hs(&self) -> usize { self.hs_struct.nblock }
 
     /// Read current K back to host (blocking). Use only for diagnostics.
     pub fn k_to_host(&self) -> Result<Bsr4Matrix> {
@@ -255,7 +278,44 @@ impl SparseSystemWorkspace {
                 s.values.len(), self.s.struct_.nblock * BS2
             )));
         }
-        self.s.upload_values(&self.gpu, &s.values)
+        self.s.upload_values(&self.gpu, &s.values)?;
+        self.s_inf = inf_norm(s);
+        if !self.s_inf.is_finite() || self.s_inf < 1e-30 {
+            return Err(DftbError::InvalidInput(format!(
+                "upload_s: ||S||_inf={:e} non-finite or near-zero", self.s_inf
+            )));
+        }
+        Ok(())
+    }
+
+    /// Upload H_scc values (same M_HS as H0).
+    pub fn upload_h_scc(&mut self, h: &Bsr4Matrix) -> Result<()> {
+        if h.values.len() != self.h_scc.struct_.nblock * BS2 {
+            return Err(DftbError::InvalidInput(format!(
+                "upload_h_scc: values len {} != expected {}",
+                h.values.len(), self.h_scc.struct_.nblock * BS2
+            )));
+        }
+        self.h_scc.upload_values(&self.gpu, &h.values)
+    }
+
+    /// Upload H_scc from a packed BSR value slice (same length as M_HS).
+    pub fn upload_h_scc_values(&mut self, values: &[f32]) -> Result<()> {
+        self.h_scc.upload_values(&self.gpu, values)
+    }
+
+    /// Upload H0 from a packed BSR value slice.
+    pub fn upload_h0_values(&mut self, values: &[f32]) -> Result<()> {
+        self.h0.upload_values(&self.gpu, values)
+    }
+
+    /// Upload S from a packed BSR value slice. `s_inf` must be set by the caller (host inf_norm of the same values).
+    pub fn upload_s_values(&mut self, values: &[f32], s_inf: f32) -> Result<()> {
+        if !s_inf.is_finite() || s_inf < 1e-30 {
+            return Err(DftbError::InvalidInput(format!("upload_s_values: ||S||_inf={s_inf:e}")));
+        }
+        self.s_inf = s_inf;
+        self.s.upload_values(&self.gpu, values)
     }
 
     // ── SpGEMM helpers (use plans when available) ──
@@ -278,38 +338,32 @@ impl SparseSystemWorkspace {
 
     // ── Newton-Schulz inverse (device-resident) ──
 
-    /// Compute Z ≈ S⁻¹ via Newton-Schulz iteration on the device.
-    /// Z₀ = α·I, α = 1/||S||_∞ (all on device). Z stays on GPU.
+    /// Compute Z ≈ S⁻¹ via Newton-Schulz on persistent GPU buffers.
     ///
-    /// Returns (final_R_Z, iterations).
+    /// Products use the **intersection** `spgemm_bsym_dev` kernel (same family as
+    /// G3 host NS). Residual is `||I−T||_F/√N` of the **downloaded** T — not
+    /// `identity_residual_scalar_dev`, which lies about the returned Z (N4).
+    /// No `Buffer::builder` / `Kernel::builder` in this loop.
     pub fn compute_z(&mut self, max_iter: usize, tol: f32, stall: usize) -> Result<(f32, usize)> {
         let n_orb = (self.n_atom * BS) as f32;
         let nblock = self.k_struct.nblock;
-
-        // Z₀ = α·I on device.
-        let s_inf = self.gpu.inf_norm_dev(&self.s.struct_, &self.s.values)?;
-        if !s_inf.is_finite() || s_inf < 1e-30 {
-            return Err(DftbError::InvalidInput(format!(
-                "compute_z: ||S||_inf = {s_inf:e} is non-finite or near-zero"
-            )));
-        }
-        let alpha = 1.0 / s_inf;
+        let alpha = 1.0 / self.s_inf;
         self.gpu.build_identity_dev(&self.k_struct, &self.z.values)?;
         self.gpu.scale_dev(nblock, alpha, &self.z.values)?;
 
         let mut prev_rz = f32::INFINITY;
         let mut stall_count = 0;
-
         for iter in 0..max_iter {
-            // T = Z·S
-            match &self.plan_zs {
-                Some(plan) => self.gpu.spgemm_plan_bsym_dev(&self.z, &self.s, plan, &self.t_zs)?,
-                None => self.gpu.spgemm_bsym_dev(&self.z, &self.s, &self.t_zs)?,
+            // T = Z·S  — intersection kernel, not the P4 plan (N4 diagnostic).
+            self.gpu.spgemm_bsym_dev(&self.z, &self.s, &self.t_zs)?;
+            self.gpu.read_f32(&self.t_zs.values, &mut self.t_host)?;
+            let rz = host_identity_rz(&self.t_host, &self.m_t.0, &self.m_t.1, self.n_atom) / n_orb.sqrt();
+            if crate::methods::sparse::gpu_sparse::algebra_verbose() {
+                eprintln!("  Newton-Schulz (workspace) iter {iter}: R_Z = {rz:e}  (host ||I−T|| of downloaded T)");
             }
-
-            // R_Z = ||I - T||_F / sqrt(N_orb)
-            let rz = self.gpu.identity_residual_scalar_dev(&self.t_struct, &self.t_zs.values)? / n_orb.sqrt();
-
+            if !rz.is_finite() {
+                return Err(DftbError::InvalidInput(format!("compute_z: non-finite R_Z={rz:e} at iter {iter}")));
+            }
             if rz < tol {
                 return Ok((rz, iter + 1));
             }
@@ -324,25 +378,14 @@ impl SparseSystemWorkspace {
                 stall_count = 0;
             }
             prev_rz = rz;
-
-            // Q = T·Z
-            match &self.plan_tz {
-                Some(plan) => self.gpu.spgemm_plan_bsym_dev(&self.t_zs, &self.z, plan, &self.q)?,
-                None => self.gpu.spgemm_bsym_dev(&self.t_zs, &self.z, &self.q)?,
-            }
-
-            // Znew = 2*Z - Q
+            self.gpu.spgemm_bsym_dev(&self.t_zs, &self.z, &self.q)?;
             self.gpu.axpby_dev(nblock, 2.0, &self.z.values, -1.0, &self.q.values, &self.znew.values)?;
             self.gpu.symmetrize_dev(nblock, &self.k_struct.transpose_block(), &self.znew.values)?;
             std::mem::swap(&mut self.z.values, &mut self.znew.values);
         }
-
-        // Final residual.
-        match &self.plan_zs {
-            Some(plan) => self.gpu.spgemm_plan_bsym_dev(&self.z, &self.s, plan, &self.t_zs)?,
-            None => self.gpu.spgemm_bsym_dev(&self.z, &self.s, &self.t_zs)?,
-        }
-        let rz = self.gpu.identity_residual_scalar_dev(&self.t_struct, &self.t_zs.values)? / n_orb.sqrt();
+        self.gpu.spgemm_bsym_dev(&self.z, &self.s, &self.t_zs)?;
+        self.gpu.read_f32(&self.t_zs.values, &mut self.t_host)?;
+        let rz = host_identity_rz(&self.t_host, &self.m_t.0, &self.m_t.1, self.n_atom) / n_orb.sqrt();
         Err(DftbError::InvalidInput(format!(
             "compute_z: exhausted {max_iter} iters, final R_Z={rz:e} (tol={tol:e})"
         )))
@@ -364,6 +407,18 @@ impl SparseSystemWorkspace {
             emin, emax,
         )?;
 
+        Ok((emin, emax))
+    }
+
+    /// K₀ from the current **H_scc** (not H0). Call after `upload_h_scc`.
+    pub fn compute_k0_from_hscc(&mut self, padding: f32) -> Result<(f32, f32)> {
+        let (emin, emax) = self.gpu.spectral_bounds_dev(&self.z, &self.h_scc, &self.b_zh, padding)?;
+        if !emin.is_finite() || !emax.is_finite() || emax <= emin {
+            return Err(DftbError::InvalidInput(format!(
+                "compute_k0_from_hscc: bad ZH Gershgorin emin={emin} emax={emax}"
+            )));
+        }
+        self.gpu.build_k0_dev(&self.z, &self.h_scc, &self.b_zh, &self.a_zhz, &self.k, emin, emax)?;
         Ok((emin, emax))
     }
 
@@ -417,7 +472,12 @@ impl SparseSystemWorkspace {
                 if ri < best_r_i { best_r_i = ri; }
 
                 if ri < tol {
-                    return Ok((ri, tr[0], iter + 1));
+                    if (tr[0] - self.nocc).abs() <= TC2_TRACE_TOL {
+                        return Ok((ri, tr[0], iter + 1));
+                    }
+                    if crate::methods::sparse::gpu_sparse::algebra_verbose() {
+                        eprintln!("  TC2 R_I={ri:e} < tol but Tr(KS)={} != Nocc={} (wrong-rank projector not accepted)", tr[0], self.nocc);
+                    }
                 }
                 if ri > best_r_i * 10.0 && best_r_i < f32::INFINITY {
                     return Err(DftbError::InvalidInput(format!(
@@ -437,8 +497,31 @@ impl SparseSystemWorkspace {
         }
 
         Err(DftbError::InvalidInput(format!(
-            "TC2 exhausted {max_iter} iters, final R_I={last_r_i:e} (tol={tol:e})"
+            "TC2 exhausted {max_iter} iters, final R_I={last_r_i:e} Tr(KS)={last_tr} (tol={tol:e} Nocc={})",
+            self.nocc
         )))
+    }
+
+    /// K0 + TC2 of the current device H_scc using the current Z. No NS.
+    pub fn purify_hscc(&mut self, tc2_max: usize, tc2_tol: f32) -> Result<(f32, f32, usize)> {
+        let (emin, emax) = self.compute_k0_from_hscc(0.1)?;
+        if crate::methods::sparse::gpu_sparse::algebra_verbose() {
+            eprintln!("  bounds (ZH Gershgorin, H_scc): emin={emin:.4} emax={emax:.4}");
+        }
+        self.tc2_purify(tc2_max, tc2_tol, 1)
+    }
+
+    /// Download K values into persistent `k_host` (no extra alloc).
+    pub fn k_values_host(&mut self) -> Result<&[f32]> {
+        self.gpu.read_f32(&self.k.values, &mut self.k_host)?;
+        Ok(&self.k_host)
+    }
+
+    /// Read K into a caller dense pad buffer (full mask: BSR order is row-major blocks).
+    pub fn k_to_dense_into(&mut self, out: &mut [f32]) -> Result<()> {
+        self.gpu.read_f32(&self.k.values, &mut self.k_host)?;
+        crate::methods::sparse::bsr4::bsr_values_to_dense(self.n_atom, &self.m_k.0, &self.m_k.1, &self.k_host, out);
+        Ok(())
     }
 
     // ── Full SCC pipeline ──
@@ -475,21 +558,35 @@ impl SparseSystemWorkspace {
     }
 }
 
+/// `||T − I||_F` from downloaded BSR values (f64 accum). Diagonal blocks subtract I.
+fn host_identity_rz(t: &[f32], row_ptr: &[u32], col_idx: &[u32], n_atom: usize) -> f32 {
+    assert_eq!(t.len(), col_idx.len() * BS2);
+    let mut s2 = 0.0f64;
+    for i in 0..n_atom {
+        let (a, b) = (row_ptr[i] as usize, row_ptr[i + 1] as usize);
+        for blk in a..b {
+            let j = col_idx[blk] as usize;
+            let v = &t[blk * BS2..(blk + 1) * BS2];
+            for r in 0..BS {
+                for c in 0..BS {
+                    let mut x = v[r * BS + c] as f64;
+                    if i == j && r == c { x -= 1.0; }
+                    s2 += x * x;
+                }
+            }
+        }
+    }
+    s2.sqrt() as f32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::methods::sparse::bsr4::build_full_mask;
-    use crate::methods::sparse::gpu_sparse::SparseBsr4Config;
-    use std::panic::{catch_unwind, AssertUnwindSafe};
+    use crate::methods::sparse::harness::require_sparse_gpu;
 
     fn try_gpu() -> Option<SparseBsr4Gpu> {
-        match catch_unwind(AssertUnwindSafe(|| {
-            SparseBsr4Gpu::new(SparseBsr4Config::default())
-        })) {
-            Ok(Ok(gpu)) => Some(gpu),
-            Ok(Err(e)) => { eprintln!("Skip: no OpenCL ({e})"); None }
-            Err(_) => { eprintln!("Skip: OpenCL panic"); None }
-        }
+        require_sparse_gpu()
     }
 
     /// Simple LCG for reproducible random matrices.
@@ -578,21 +675,25 @@ mod tests {
         println!("Mulliken charges: {:?}", &charges);
 
         // Verify convergence.
-        assert!(r_i < 1e-3, "TC2 did not converge: R_I={r_i:e}");
-        assert!((tr - nocc).abs() < 1e-2, "Tr(KS) mismatch: {tr} vs {nocc}");
+        assert!(r_i < 1e-5, "TC2 did not converge: R_I={r_i:e} (G2)");
+        assert!((tr - nocc).abs() < 1e-5, "Tr(KS) mismatch: {tr} vs {nocc} (G2)");
         assert_eq!(charges.len(), n_atom);
 
-        // Verify K is reasonable (read back and check).
+        // G1.8: Tr(KS)=Nocc, never Tr(K²) for a non-orthogonal metric.
         let k_host = ws.k_to_host().unwrap();
         let k_dense = k_host.to_dense();
+        let s_dense = s.to_dense();
         let n = n_atom * BS;
-        // K should have trace(KS) ≈ nocc and be approximately idempotent.
-        let trace_ks: f32 = (0..n).map(|i| {
-            let mut s = 0.0f32;
-            for j in 0..n { s += k_dense[i*n+j] * k_dense[j*n+i]; } // approx
-            s
-        }).sum();
-        println!("Trace(K²) ≈ {trace_ks:.4} (should be ≈ {nocc})");
+        let mut tr_ks = 0.0f32;
+        for i in 0..n {
+            let mut ks_ii = 0.0f32;
+            for j in 0..n {
+                ks_ii += k_dense[i * n + j] * s_dense[j * n + i];
+            }
+            tr_ks += ks_ii;
+        }
+        println!("Tr(KS) = {tr_ks:.4} (Nocc={nocc})");
+        assert!((tr_ks - nocc).abs() < 1e-5, "host Tr(KS)={tr_ks} != Nocc={nocc} (G1.8)");
     }
 
     /// Test: workspace is reusable across multiple SCC runs.
@@ -612,13 +713,8 @@ mod tests {
         println!("Run 1: R_I={r_i1:e}, Tr={tr1:.6}");
 
         // Second run with same geometry (should give same result).
-        let (_, r_i2, tr2, _) = match ws.run_scc(30, 1e-4, 60, 1e-5, 1) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("Run 2 failed: {e}");
-                return;
-            }
-        };
+        let (_, r_i2, tr2, _) = ws.run_scc(30, 1e-4, 60, 1e-5, 1)
+            .unwrap_or_else(|e| panic!("Run 2 failed (no skip): {e}"));
         println!("Run 2: R_I={r_i2:e}, Tr={tr2:.6}");
 
         // Both runs should converge to the same state.

@@ -21,9 +21,9 @@ use nalgebra::{DMatrix, SymmetricEigen};
 use rust_dftb::methods::sparse::bsr4::{
     build_full_mask, build_geometric_mask, build_product_mask, Bsr4Matrix, BS,
 };
-use rust_dftb::methods::sparse::gpu_sparse::{SparseBsr4Config, SparseBsr4Gpu, GpuBsrMatrix};
+use rust_dftb::methods::sparse::gpu_sparse::{SparseBsr4Gpu, GpuBsrMatrix};
+use rust_dftb::methods::sparse::harness::{require_sih_sk_dir, require_sparse_gpu};
 use rust_dftb::{load_sk_for_species, HamiltonianBuilder};
-use std::panic::{catch_unwind, AssertUnwindSafe};
 
 const E_DUMMY: f32 = 2.0;
 const ANG2BOHR: f64 = 1.889_726_133;
@@ -33,13 +33,7 @@ const ANG2BOHR: f64 = 1.889_726_133;
 // ---------------------------------------------------------------------
 
 fn try_gpu() -> Option<SparseBsr4Gpu> {
-    match catch_unwind(AssertUnwindSafe(|| {
-        SparseBsr4Gpu::new(SparseBsr4Config::default())
-    })) {
-        Ok(Ok(gpu)) => Some(gpu),
-        Ok(Err(e)) => { eprintln!("Skipping Gate E: no OpenCL ({e})"); None }
-        Err(_) => { eprintln!("Skipping Gate E: OpenCL panic"); None }
-    }
+    require_sparse_gpu()
 }
 
 fn bsr4_from_dense(n_atom: usize, dense: &[f32], mask: &(Vec<u32>, Vec<u32>)) -> Bsr4Matrix {
@@ -247,20 +241,11 @@ fn sparse_energy(
 // ---------------------------------------------------------------------
 
 #[test]
+#[allow(unreachable_code)]
 fn test_gate_e_determinism_and_h_plateau() {
     let Some(gpu) = try_gpu() else { return };
 
-    let sk_dir = match std::env::var("RUST_DFTB_SK_DIR") {
-        Ok(d) => d,
-        Err(_) => {
-            let d = "/home/prokop/SIMULATIONS/dftbplus/slakos/matsci-0-3";
-            if !std::path::Path::new(d).exists() {
-                eprintln!("Skipping Gate E: RUST_DFTB_SK_DIR not set and default {d} not found");
-                return;
-            }
-            d.to_string()
-        }
-    };
+    let sk_dir = require_sih_sk_dir();
 
     // SiH4 near equilibrium (tetrahedral, bond ~1.48 Å)
     let species = vec!["Si".to_string(), "H".to_string(), "H".to_string(), "H".to_string(), "H".to_string()];
@@ -354,10 +339,11 @@ fn test_gate_e_determinism_and_h_plateau() {
     }
     let rel_bias = if max_force > 1e-12 { max_bias / max_force } else { 0.0 };
     eprintln!("  max|F|={max_force:.3e}, max|bias|={max_bias:.3e}, rel_bias={rel_bias:.3e}");
-    // The bias is dominated by f32 vs f64 and sparse truncation. For a
-    // full-mask system the bias should be small.
-    assert!(rel_bias < 0.1 || max_bias < 1e-3,
-        "Gate E-B: sparse-dense force bias too large: max|bias|={max_bias:.3e}, rel={rel_bias:.3e}");
+    panic!(
+        "Gate E-B is not a force test (review G1.4): both F are 3-point FD of spinless Tr(K H0), \
+         no E_rep, no SCC, no analytic D/W. Measured rel_bias={rel_bias:.3e}, max|bias|={max_bias:.3e}. \
+         This gate stays red until the analytic sparse force of E_el+E_rep exists."
+    );
 
     // =================================================================
     // C. h sweep — Hessian plateau

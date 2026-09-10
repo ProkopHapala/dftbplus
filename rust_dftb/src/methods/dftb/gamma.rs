@@ -62,7 +62,7 @@ fn gamma_sub_exprn(r: f64, tau1: f64, tau2: f64) -> f64 {
     (-tau1 * r).exp() * (term_a - term_b)
 }
 
-use crate::core::error::Result;
+use crate::core::error::{DftbError, Result};
 use crate::methods::dftb::sk_data::SkData;
 
 #[derive(Debug, Clone)]
@@ -82,10 +82,9 @@ impl GammaTable {
                 unique.push(sp.clone());
             }
         }
-        let hubbard_u: Vec<f64> = unique
-            .iter()
-            .map(|sp| sk.onsite(sp).map(|p| p.u_hubbard).unwrap_or(0.4))
-            .collect();
+        let hubbard_u: Vec<f64> = unique.iter().map(|sp| {
+            sk.onsite(sp).map(|p| p.u_hubbard).map_err(|e| DftbError::InvalidInput(format!("Hubbard U missing for species {sp}: {e}")))
+        }).collect::<Result<Vec<_>>>()?;
         Ok(Self::from_hubbard_u(hubbard_u))
     }
 

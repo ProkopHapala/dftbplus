@@ -2,6 +2,10 @@
 
 **Created:** 2026-09-07  
 **Revision:** v3 — scientific/numerical review of agent-produced v2  
+**Last wrap (2026-09-10):** read **§0** first. Floor vs bug map:
+`doc/prokop/topical_audit/f32_floor_sparse.md`. Interpolator:
+`doc/prokop/topical_audit/sk_interpolation.md`. Dense H-bond is a **separate**
+agent — do not edit `qmqm/gpu_forces.cl`.
 **Status:** implementation manifest / source of truth  
 **Owner:** prokop / coding agent
 
@@ -36,6 +40,216 @@
 > - uniform nonsingular BSR4 padding for H is promoted from a throw-away
 >   prototype to the **baseline production representation**. Variable-size
 >   blocks are only justified if profiling proves padding materially expensive.
+
+---
+
+## 0. State for the next LLM (2026-09-10) — read this, then the rest
+
+Job of the current sparse-physics agent: **map the algorithm**, separate
+**bugs / physical misconceptions / method stopgaps / arithmetic floor**, keep
+tests **truthful** (not fake-green, not demanding f32 miracles), and **document
+the floor** so a later dedicated pass can do Kahan / hybrid f64 islands /
+error-compensated SpGEMM **without guessing**. That compensation pass is not
+one-shot and must be benchmarked; it needs this map first.
+
+NVIDIA RTX 3090, `RUST_DFTB_SK_DIR=.../matsci-0-3`. Nothing below is “done”
+until USER confirms.
+
+### 0.1 What was resolved (do not re-open as if unknown)
+
+| Item | Outcome |
+|------|---------|
+| Energy was `Tr(K H0)` without E_rep / without SCC | **Fixed in physics gates.** Canonical `E = 2 Tr(K H0) + ½ Δq·V + E_rep`. Gate F old path collapsed Si–H 1.60→**0.93 Å**; new FIRE → **1.477 Å**. |
+| SK file `q0` used as SiH4 valence | **Misconception.** matsci Si=0, H≈0.49 (sum ≈ 2 e⁻). Physical `[4,1,1,1,1]`. First G3.2 \|dE\|=3.71 Ha was this, not TC2. |
+| Sparse K from dense `build_scc` Hamiltonian | **Fixed in G3.2/F/G.** `run_sparse_scc` is a real mix loop (host NS + TC2). `SparseSystemWorkspace::run_scc` is still purify-once — do not confuse them. |
+| Analytic F | **G3.3.** `D=2K`, `W=2KHK`, CPU `compute_forces_from_dw`. vs dense max\|dF\|=3.7e-6. `qmqm/gpu_forces.cl` **read-only**. |
+| Gate G Hessian | **Unsymmetrized FD of F**, h=0.01 Å, same Gate F coords. η_asym from H_raw (not Gate E triangle-copy). vs dense \|\|ΔH\|\|_F/\|\|H\|\|_F=**1.10e-3**, ordinary \|Δν\|≤4 cm⁻¹. |
+| C² B-spline **evaluation** in the force path | **Fixed.** `eval_with_deriv_into` is B-spline. GPT-5.6 “Hermite still production” is stale. Remaining interpolator work is the **fitter** (§0.3), not switching evaluators again. |
+| Neville `poly5_to_zero` tail −0.4 Ha | **Fixed** (shared with dense). Do not restore for Fortran-tail parity. |
+| Host NS identity residual cancellation | Host path uses `\|I−T\|_F` directly. **Device NS is still N4-wrong** (§0.2 A). |
+
+G3.1 \|dE_h0\|=1.92e-7; G3.2 \|dE_el\|=1.13e-7, max\|dq\|=2.07e-5. Gate F
+E_tot=−2.826057, \|F\|=4.18e-4. Tests: `gate_g3_energy.rs`, `gate_f_geom_opt.rs`,
+`gate_g_hessian.rs`.
+
+### 0.2 Open problems (four different kinds — do not mix them)
+
+**A. Bugs** — fix the code; compensation will not help.
+
+| ID | What | Action |
+|----|------|--------|
+| N4 / B1 | `newton_schulz_inverse_dev`: R_Z≈1.9e-5 but max\|Z−S⁻¹\|≈2.18e-3 | Keep `test_newton_schulz_inverse_dev` **red**. Production `SparseDftb` uses workspace intersection NS + host `\|I−T\|`. Leftover `run_sparse_purify` has `_dev` **commented** — do not restore. |
+| B2 | `SparseSystemWorkspace::run_scc` is purify-once | Real SCC is `SparseDftb::scc`. Rename or leave as one-shot purify. Do not call `run_scc` from jobs. |
+| B4 | Gates C and E still in tree as false positives | Do not copy. Do not treat green-there as locality/Hessian proof. |
+
+**B. Interpolator extra-control fitter** — method, not f32. Plain language §0.3.
+Spec: `sk_interpolation.md`.
+
+**C. f32 / mixer / FD floor** — mapped in `f32_floor_sparse.md`. Do not chase:
+
+- G3.4 rel \< 1e-3 at h=1e-3 Å (energy FD is noisier than the force; G3.3 is 3.7e-6);
+- Gate G rigid modes to 0 cm⁻¹ (`n_unstable≤6` was a cheat);
+- SiH4 charge rms \< 1e-8.
+
+Measured floor worth compensating later: Gate G Hessian \|\|ΔH\|\|_F/\|\|H\|\|_F
+≈ **0.11%** vs dense f64; η_asym ≈ **3.9e-4** on **both** sparse and dense
+(so it is the 3-point F stencil + SCC residual, not a unique sparse bug).
+Kahan on host `Tr(K H0)` will not move that Hessian. Device SpGEMM / NS
+reductions might — **after** N4 is a real inverse.
+
+**D. Production sparse run loop is coded, not a nanocrystal yet.** `SparseDftb`
++ `dftb_engine` `sparse_*` + `scripts/test_sparse_dftb_sih4.rhai`. Lab numbers
+§0.7. Remaining: CPU H0/S, CPU γ+Hscc upload/iter, CPU F. Do not publish
+timings from `cargo test`. Geometric mask (\(n>64\)) not exercised.
+
+### 0.3 What “interpolator fitter” means
+
+Slater–Koster files are **numbers on a 1D grid** (typically `dr=0.02` Bohr).
+We interpolate with a **cubic B-spline**. A cubic B-spline needs extra
+**control points** off each end of that table. They are not extra SK
+measurements; they are the degrees of freedom that implement boundary
+conditions (how the curve starts; how it dies at cutoff).
+
+- **Left (already the right kind of thing):** phantom `c_{-1}=2c_0−c_1` at
+  evaluation. Small-r SK values are large — never zero-pad the left.
+- **Right (current stopgap, blunt):** glue on four **function values
+  hardcoded to 0**, then refit (`fit_bspline_controls_zero_end`). Stopped the
+  −0.4 Ha explosion. Those zeros **leak** into the last real samples; cutoff
+  is only `~0.08` Bohr past the last grid.
+- **GPU dummy 0 at r=0:** index padding, not a fitted left control.
+
+**The fitter** is the missing linear solve: extra controls are **unknowns**.
+Solve so (1) the interpolant on the **tabulated** region still matches the SK
+file, (2) `V` and `V'` go smoothly to 0 at a chosen cutoff. Do **not**
+implement this as “pad with more zeros.” Do not restore Neville.
+
+Independent of the sparse f32 Hessian floor. Interior H/S already ~1e-7.
+**Shared with the dense H-bond task** — one fitter, both consumers.
+
+### 0.4 Production pipeline — we do **not** have it, and we **must**
+
+A normal DFT/DFTB code does:
+
+```
+INIT (once)          load SK, compile kernels, preallocate all buffers
+PER GEOMETRY         update coords → neighbors → H0, S, γ
+SCC (warm-started)   iterate until Δq plateaus
+FORCES               D, W already available → F
+MD / FIRE / Hessian  move atoms → go to PER GEOMETRY
+```
+
+**CPU already follows this:** `rust_dftb/src/methods/dftb/dftb_cpu.rs` (`DftbCpu`)
++ FIRE in `examples/hbond_ref.rs`.
+
+**Sparse GPU now has the owner.** `SparseDftb` (`sparse_dftb.rs`) is the GPU
+analogue of `DftbCpu`. User path is **one binary** `dftb_engine` + a `.rhai`
+script (`sparse_new` / `sparse_scc` / `sparse_eval` / `sparse_fire_step` /
+`sparse_md_step` / `sparse_relax`). Docs: `doc/prokop/userguide/sparse_dftb.md`.
+Do **not** add `src/bin` / `examples/` / `tests/*.rs` per molecule.
+
+| Piece | Role now |
+|-------|----------|
+| `SparseDftb` | Production solver. INIT once; `set_coords` / `scc` / `forces` / FIRE / MD. |
+| `dftb_engine` `sparse_*` | Script API onto that object. |
+| `run_sparse_scc` / `eval_sparse_energy_forces` | Leftover allocating path. Do not grow. Gates should call `SparseDftb`. |
+| `run_sparse_purify` | Leftover: GPU purify of a **dense CPU** SCC. Not `SparseDftb`. |
+| `cargo test --test sparse_dftb` | SiH4 smoke. Same physics as `test_sparse_dftb_sih4.rhai`. **Not a benchmark.** |
+
+```
+SparseDftb::new(sk, sk_dir, species, coords)  // INIT
+  .set_coords(R)                               // values only; frozen mask
+  .scc()                                       // workspace NS + device TC2
+  .forces() / .fire_step() / .md_step() / .relax()
+```
+
+Host `‖I−T‖` of downloaded T is the production Z check until B1 is a real
+inverse. No `Kernel::builder` / `Program::build` / `Buffer::builder` in `scc` /
+`fire_step`. Remaining host work: CPU H0/S, CPU γ + Hscc upload per mix iter,
+CPU `compute_forces_from_dw`. Benchmark in `--release` on NVIDIA, long-lived
+process, warm-up discarded. Never quote `cargo test` wall time as GPU DFTB.
+
+### 0.5 Honest tests vs impossible tests
+
+Truthful: print the numbers; assert physical invariants (Si–H window, Newton
+ΣF, η_asym from H_raw, valence q0).
+
+Impossible / wrong: G3.4 rel 1e-3 at h=1e-3; η_asym identically 0; device NS
+green while max\|Z−S⁻¹\| is 2e-3; SK q0 as SiH4; timings of test setup.
+
+Keep N4 **red**. Keep G3.3 tight. Gate G 0.11% Hessian vs dense is the
+compensation target, not a reason to loosen G3.3.
+
+### 0.6 Pointers
+
+| Doc | Role |
+|-----|------|
+| `doc/prokop/topical_audit/f32_floor_sparse.md` | Algorithm map, ID table B/P/M/F, pipeline, handoff |
+| `doc/prokop/topical_audit/sk_interpolation.md` | Extra-control fitter spec |
+| `doc/prokop/topical_audit/f32_floor_dense_hbond.md` | Dense cousin (do not mix solvers) |
+| `OVERVIEW_Roadmap.md` §7.6 | Status checkboxes (investigating until USER confirms) |
+| `doc/prokop/userguide/sparse_dftb.md` | User CLI (same binary as dense `gpu_*`) |
+| This file §0.7 | Lab notebook: measured CLI / SparseDftb numbers |
+
+### 0.7 Lab notebook — 2026-09-10 (SparseDftb CLI)
+
+Recorded so we can return. **Not** “USER confirmed done.” Distorted SiH₄
+(1.48 Å construction, not tetrahedral). SK: matsci-0-3. Device: **NVIDIA
+GeForce RTX 3090**. Command (from `rust_dftb/`):
+
+```
+RUST_DFTB_SPARSE_ALGEBRA_VERBOSE=0
+cargo run --release --bin dftb_engine -- \
+  --script scripts/test_sparse_dftb_sih4.rhai \
+  --sk-dir $RUST_DFTB_SK_DIR
+```
+
+| Quantity | Value |
+|----------|-------|
+| Device | NVIDIA GeForce RTX 3090 (local_mem=49152, wg=1024, CUs=82) |
+| n_atom / n_orbs / nocc / mask | 5 / 8 / 4 / full (25 BSR blocks) |
+| valence q0 | `[4, 1, 1, 1, 1]` (not SK parser) |
+| NS (once / geom) | 7 iters, **R_Z = 6.265×10⁻⁸** (host ‖I−T‖ of downloaded T) |
+| SCC 1 | **E = −2.76420524 Ha**, rms=9.23×10⁻⁶, **17** mix iters, Tr(KS)=4.000002, R_I=3.88×10⁻⁶, r_scc=1.97×10⁻⁵, max\|F\|=8.83×10⁻² Ha/Å |
+| Mulliken q | 3.947, 1.025, 1.074, 0.981, 0.973 |
+| SCC 2 (reuse, same R) | E = −2.76420569 Ha, **4** mix iters, \|ΔE\|≈4.5×10⁻⁷ Ha |
+| 1 FIRE + SCC | E = −2.76442147 Ha, 8 mix iters (NS again, R_Z=5.2×10⁻⁸) |
+| 1 MD (dt=0.05) + SCC | E = −2.76464354 Ha, 8 mix iters |
+
+Earlier **allocating** gates (`scc.rs` / `eval_sparse_energy_forces`), same
+device/SK, different start (Gate F from 1.60 Å) and different FIRE:
+
+| Gate | Recorded (2026-09-10, still on `scc.rs` until switched to `SparseDftb`) |
+|------|---------|
+| G3.1 | \|dE_h0\|=1.92×10⁻⁷ vs dense non-SCC |
+| G3.2 | \|dE_el\|=1.13×10⁻⁷, max\|dq\|=2.07×10⁻⁵, r_scc≈2.0×10⁻⁵ |
+| G3.3 | max\|dF\| vs dense 3.7×10⁻⁶ |
+| G3.4 | \|F_ana−F_fd\| 1.8×10⁻⁵, rel 1.3×10⁻³ at h=1e-3 Å (not an f32 law) |
+| Gate F | FIRE Si–H mean **1.477 Å**, E_tot=−2.826057, \|F\|=4.18×10⁻⁴ |
+| Gate G | same frozen coords; ‖ΔH‖_F/‖H‖_F=**1.10×10⁻³**, η_asym≈3.9×10⁻⁴ (H_raw); ordinary \|Δν\|≤4 cm⁻¹ |
+
+**CLI / engine work this session (do not re-invent):**
+
+- Same binary as dense: `dftb_engine` gained `sparse_*` (no second `src/bin`).
+- Script: `rust_dftb/scripts/test_sparse_dftb_sih4.rhai`.
+- User guide: `doc/prokop/userguide/sparse_dftb.md` (sibling of `dftb_engine.md`).
+- Geometry `Element` table: F, Si, P, S, Cl + `valence_electrons()` (Si=4, H=1).
+- `SparseDftb::energy()` fails if `n_scc==0` (was returning 0.0).
+- Leftover `run_sparse_purify` is **not** this solver.
+
+Next: nanocrystal `.rhai` with geometric mask (\(n>64\)). Device NS `_dev` stays red.
+G3.1 still uses `energy_non_scc` (non-SCC diagnostic). `run_sparse_purify` leftover.
+
+**Same day, after unifying G3.2–G / F onto `SparseDftb` (NVIDIA 3090):**
+
+| Gate | SparseDftb result |
+|------|-------------------|
+| G3.2 | \|dE_el\|=3.47×10⁻⁷, max\|dq\|=1.87×10⁻⁵, r_scc=1.97×10⁻⁵, E=−2.76420524 (matches CLI) |
+| G3.3 | max\|dF\|=5.30×10⁻⁶ vs dense, rel=6.0×10⁻⁵ |
+| G3.4 | \|F_ana−F_fd\|=6.0×10⁻⁵, **rel=4.4×10⁻³** at h=1e-3 Å (passes on abs\<1e-4; rel is mixer/FD, not an f32 law) |
+| Gate F | 72 FIRE steps, E=**−2.826054**, \|F\|=9.32×10⁻⁴, Si–H 1.477 Å. Coords in `gate_g_hessian.rs::gate_f_sih4_coords`. |
+| Gate G | η_asym sp=3.25×10⁻⁴ / dn=3.88×10⁻⁴; ‖ΔH‖_F/‖H‖_F=**1.16×10⁻³**; ordinary stretch Δν ≈ −5 cm⁻¹ (2314 vs 2319) |
+
+CLI smoke (1.48 Å distorted, not Gate F min) and Gate F (relaxed) are **different geometries**. Do not mix the two energies (−2.764 vs −2.826).
 
 ---
 
@@ -1504,9 +1718,10 @@ workflow easier to run and understand.
 - `doc/prokop/topical_audit/davidson_eigensolver.md` — Davidson (frontier
   orbitals / gap diagnostics).
 - `test/app/phonons/Si/` — DFTB+ Fortran Si₂ phonon reference.
-- `doc/prokop/AGENTS/guidelines/efficiency.md` — efficiency rules (no
-  allocation in hot loops, three-tier data lifetime, verify library internals
-  before claiming).
+- `doc/prokop/topical_audit/f32_floor_sparse.md` — **bugs vs floor vs missing
+  pipeline** (2026-09-10). Read with manifest §0.
+- `doc/prokop/topical_audit/sk_interpolation.md` — extra-control B-spline fitter.
+- `doc/prokop/topical_audit/f32_floor_dense_hbond.md` — dense H-bond cousin.
 
 ---
 

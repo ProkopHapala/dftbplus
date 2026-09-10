@@ -7,7 +7,15 @@ timestamp: 2026-09-09
 
 # HBond_Relaxed_Scan_GPU — Phase 4 hand-off report
 
-> **2026-09-09 addendum (read this first).** The 1×4 `CL_OUT_OF_RESOURCES`
+> **2026-09-10 addendum (read this first).** Package 2 on `GpuDftb` (NVIDIA 3090
+> `--release`) refutes “AT `|dE|~2.6e-5` = occupied-ε 2.5e-5”. Frozen-H
+> `max|δε_occ|~1e-6`; `|dE|` tracks `δ_CH` (band vs `CᵀHC`). Löwdin Newton is in;
+> f32 GEMM Kahan is in and does **not** cut `δ_CH`. Formic relative `|ΔΔE|` 4.6e-6
+> after Newton. AT/GC still stall ~25 SCC iters. SSOT:
+> `doc/prokop/topical_audit/f32_floor_dense_hbond.md` §3.1 and manifest §0.
+> The 1×4 crash and Neville tail below are **stale** (fixed earlier). Do not edit sparse.
+>
+> **2026-09-09 addendum.** The 1×4 `CL_OUT_OF_RESOURCES`
 > crash below is **stale** — fixed by `vload2` in both force and assembly
 > kernels. AT/GC `max|dH|~0.4` was **not** GPU assembly: CPU Neville
 > `poly5_to_zero` exploded on the H–H tail (Hss −0.4 Ha at 10.39 Bohr).
@@ -19,9 +27,8 @@ timestamp: 2026-09-09
 > re-Neville. Spec: `doc/prokop/topical_audit/sk_interpolation.md`.
 >
 > Honest tests: `rust_dftb/tests/gpu_hbond_physics.rs`. H2O GPU forces match
-> CPU (rel ~3e-5). AT/GC GPU SCC rms plateaus `~1e-5` — **hypothesis: f32
-> floor** (`~1e-8` relative × values `~100` → abs `~1e-6`–`1e-5`), not a
-> proven mixer/Jacobi failure. Manifest §3.0.1. Do not edit sparse.
+> CPU (rel ~3e-5). AT `|dE|` is `δ_CH` (~3e-5), not occupied-ε 2.5e-5 — see
+> 2026-09-10 addendum above. Manifest §0. Do not edit sparse.
 
 ## Scope
 

@@ -27,6 +27,11 @@ pub enum Element {
     N,
     B,
     O,
+    F,
+    Si,
+    P,
+    S,
+    Cl,
 }
 
 impl Element {
@@ -37,6 +42,11 @@ impl Element {
             Element::N => "N",
             Element::B => "B",
             Element::O => "O",
+            Element::F => "F",
+            Element::Si => "Si",
+            Element::P => "P",
+            Element::S => "S",
+            Element::Cl => "Cl",
         }
     }
     pub fn from_symbol(s: &str) -> Option<Element> {
@@ -46,6 +56,11 @@ impl Element {
             "N" => Some(Element::N),
             "B" => Some(Element::B),
             "O" => Some(Element::O),
+            "F" => Some(Element::F),
+            "Si" => Some(Element::Si),
+            "P" => Some(Element::P),
+            "S" => Some(Element::S),
+            "Cl" => Some(Element::Cl),
             _ => None,
         }
     }
@@ -57,6 +72,26 @@ impl Element {
             Element::N => 0.71,
             Element::B => 0.82,
             Element::O => 0.66,
+            Element::F => 0.57,
+            Element::Si => 1.11,
+            Element::P => 1.07,
+            Element::S => 1.05,
+            Element::Cl => 0.99,
+        }
+    }
+    /// s/p DFTB valence electrons. Not SK onsite `q0` (parser reads trailing fields).
+    pub fn valence_electrons(&self) -> f64 {
+        match self {
+            Element::H => 1.0,
+            Element::B => 3.0,
+            Element::C => 4.0,
+            Element::N => 5.0,
+            Element::O => 6.0,
+            Element::F => 7.0,
+            Element::Si => 4.0,
+            Element::P => 5.0,
+            Element::S => 6.0,
+            Element::Cl => 7.0,
         }
     }
 }

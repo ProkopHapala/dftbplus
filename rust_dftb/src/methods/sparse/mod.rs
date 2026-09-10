@@ -23,11 +23,18 @@ pub mod gpu_sparse;
 pub mod davidson;
 pub mod sparse_forces;
 pub mod sparse_system;
+pub mod sparse_dftb;
+pub mod harness;
+pub mod scc;
 
 pub use bsr4::{
     build_geometric_mask, build_identity, build_product_mask, build_full_mask,
     diag_block_map, gershgorin_bounds, inf_norm, transpose_block_map,
+    pad_physical_to_bsr4, pad_physical_to_bsr4_into, fill_bsr_values_from_dense, bsr_values_to_dense,
     Bsr4Matrix, Bsr4Mask, SpgemmPlan, build_spgemm_plan_bsym,
 };
 pub use gpu_sparse::{SparseBsr4Config, SparseBsr4Gpu, SparsePerfStats, SpgemmPlanGpu};
 pub use davidson::davidson_homo_lumo;
+pub use scc::{energy_non_scc, eval_sparse_energy_forces, run_sparse_scc, apply_shift_padded, apply_shift_padded_into, SparseDftbEnergy};
+pub use sparse_forces::{sparse_analytic_forces, dw_from_k_padded, unpad_to_physical};
+pub use sparse_dftb::{SparseDftb, SparseDftbConfig, SparseDftbScc, valence_q0};

@@ -171,8 +171,8 @@ fn test_gpu_scc_benchmark() {
 
     let mut rt = GpuRuntime::new().expect("GpuRuntime init failed");
 
-    // Benchmark at various batch sizes
-    let batch_sizes = [1, 10, 41, 100, 441];
+    // Quote ms/SCC-iter at batch=1 and batch=100 (N=28 here; AT N=87 below).
+    let batch_sizes = [1, 100];
     let mut results: Vec<(usize, GpuSccTiming, usize, f32)> = Vec::new();
 
     for &batch in &batch_sizes {
@@ -239,4 +239,55 @@ fn test_gpu_scc_benchmark() {
     }
     std::fs::write(&tsv_path, tsv).unwrap();
     eprintln!("\nBenchmark results saved to {tsv_path}");
+
+    // Adenine-thymine N=87 — same batch=1 / 100 quote as formic.
+    let at_candidates = [
+        "data/xyz/adenine-thymine.xyz".to_string(),
+        format!("{}/data/xyz/adenine-thymine.xyz", env!("CARGO_MANIFEST_DIR")),
+        format!("{}/../data/xyz/adenine-thymine.xyz", env!("CARGO_MANIFEST_DIR")),
+    ];
+    let mut at_xyz = None;
+    for path in &at_candidates {
+        if let Ok(x) = parse_xyz(path) { at_xyz = Some(x); break; }
+    }
+    let at_xyz = match at_xyz {
+        Some(x) => x,
+        None => { eprintln!("Skipping AT bench: cannot load adenine-thymine.xyz"); return; }
+    };
+    let at_coords = at_xyz.coords.clone();
+    let at_species = at_xyz.species.clone();
+    let at_n_atoms = at_species.len();
+    let at_sk = load_sk_for_species(&sk_dir, &at_species).unwrap();
+    let at_gamma = GammaTable::from_sk_data(&at_sk, &at_species).unwrap();
+    let at_builder = HamiltonianBuilder::new(at_sk.clone());
+    let at_scc = at_builder.build_scc(&at_species, &at_coords, 200, 1e-9).unwrap();
+    let at_n_orbs = at_scc.h0.nrows();
+    let at_n_occ = (at_scc.q0.iter().sum::<f64>() / 2.0).round() as usize;
+    eprintln!("\nAdenine-thymine: N_orbs={at_n_orbs}, N_occ={at_n_occ}, N_atoms={at_n_atoms}");
+    eprintln!("CPU reference energy: {:.8}", at_scc.energy);
+
+    let mut at_results: Vec<(usize, GpuSccTiming, usize, f32)> = Vec::new();
+    for &batch in &[1usize, 100] {
+        let (tm, n_iters, max_e) = bench_batch(
+            &mut rt, &at_sk, &at_gamma, &at_species, &at_coords,
+            at_n_atoms, at_n_orbs, at_n_occ, batch,
+            &format!("adenine_thymine N={at_n_orbs}"),
+        );
+        at_results.push((batch, tm, n_iters, max_e));
+    }
+    eprintln!("NOTE: this bench uses legacy gpu_solve_scc_batched_diis_warmstart; AT per_iter is dominated by host occ_sort+upload, not Jacobi/GEMM. Production timing is GpuDftb.");
+    eprintln!("\n=== BENCHMARK SUMMARY (adenine-thymine, N={}, N_occ={}) ===", at_n_orbs, at_n_occ);
+    eprintln!("  {:>6}  {:>6}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}  {:>10}",
+        "batch", "iters", "total_s", "per_iter_ms", "jacobi_ms", "gemm_ms", "diis_ms", "systems/s");
+    for (batch, tm, n_iters, _max_e) in &at_results {
+        let per_iter = (tm.t_delta_q + tm.t_gamma_matvec + tm.t_h_scc_update
+            + tm.t_gemm + tm.t_jacobi + tm.t_occ_sort + tm.t_back_gemm
+            + tm.t_density + tm.t_mulliken + tm.t_diis_mix) / *n_iters as f64;
+        let jacobi_per = tm.t_jacobi / *n_iters as f64 * 1e3;
+        let gemm_per = tm.t_gemm / *n_iters as f64 * 1e3;
+        let diis_per = tm.t_diis_mix / *n_iters as f64 * 1e3;
+        let sys_per_sec = *batch as f64 / tm.t_total;
+        eprintln!("  {:>6}  {:>6}  {:>10.4}  {:>10.3}  {:>10.3}  {:>10.3}  {:>10.3}  {:>10.1}",
+            batch, n_iters, tm.t_total, per_iter * 1e3, jacobi_per, gemm_per, diis_per, sys_per_sec);
+    }
 }

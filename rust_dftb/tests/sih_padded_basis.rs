@@ -20,9 +20,9 @@ use nalgebra::{DMatrix, SymmetricEigen};
 use rust_dftb::methods::sparse::bsr4::{
     build_geometric_mask, build_full_mask, build_product_mask, Bsr4Matrix, BS,
 };
-use rust_dftb::methods::sparse::gpu_sparse::{SparseBsr4Config, SparseBsr4Gpu};
+use rust_dftb::methods::sparse::gpu_sparse::SparseBsr4Gpu;
+use rust_dftb::methods::sparse::harness::{require_sih_sk_dir, require_sparse_gpu};
 use rust_dftb::{load_sk_for_species, HamiltonianBuilder};
-use std::panic::{catch_unwind, AssertUnwindSafe};
 
 const ANG2BOHR: f64 = 1.889_726_133;
 const E_DUMMY: f32 = 2.0;  // dummy orbital onsite energy (above occupied spectrum, not too high)
@@ -32,13 +32,7 @@ const E_DUMMY: f32 = 2.0;  // dummy orbital onsite energy (above occupied spectr
 // ---------------------------------------------------------------------
 
 fn try_gpu() -> Option<SparseBsr4Gpu> {
-    match catch_unwind(AssertUnwindSafe(|| {
-        SparseBsr4Gpu::new(SparseBsr4Config::default())
-    })) {
-        Ok(Ok(gpu)) => Some(gpu),
-        Ok(Err(e)) => { eprintln!("Skipping Gate D: no OpenCL ({e})"); None }
-        Err(_) => { eprintln!("Skipping Gate D: OpenCL panic"); None }
-    }
+    require_sparse_gpu()
 }
 
 fn bsr4_from_dense(n_atom: usize, dense: &[f32], mask: &(Vec<u32>, Vec<u32>)) -> Bsr4Matrix {
@@ -224,19 +218,7 @@ fn cpu_mulliken_charges(k_dense: &[f32], s_dense: &[f32], n_atom: usize) -> Vec<
 fn test_sih_padded_basis_gate_d() {
     let Some(gpu) = try_gpu() else { return };
 
-    // Use matsci-0-3 SK set for Si/H
-    let sk_dir = match std::env::var("RUST_DFTB_SK_DIR") {
-        Ok(d) => d,
-        Err(_) => {
-            // Try default location
-            let d = "/home/prokop/SIMULATIONS/dftbplus/slakos/matsci-0-3";
-            if !std::path::Path::new(d).exists() {
-                eprintln!("Skipping Gate D: RUST_DFTB_SK_DIR not set and default {d} not found");
-                return;
-            }
-            d.to_string()
-        }
-    };
+    let sk_dir = require_sih_sk_dir();
     eprintln!("Using SK dir: {sk_dir}");
 
     // SiH4 (silane): 1 Si + 4 H, tetrahedral geometry
@@ -342,8 +324,8 @@ fn test_sih_padded_basis_gate_d() {
     // 1. Correct electron count: Tr(KS) → physical Nocc
     let tr_err = (tr as f64 - n_occ_phys as f64).abs();
     eprintln!("  Tr(KS) = {tr:.6}, Nocc_phys = {n_occ_phys}, |err| = {tr_err:.3e}");
-    assert!(tr_err < 1e-2,
-        "Gate D: Tr(KS)={tr:.6} != Nocc_phys={n_occ_phys}, err={tr_err:.3e}");
+    assert!(tr_err < 1e-4,
+        "Gate D: Tr(KS)={tr:.6} != Nocc_phys={n_occ_phys}, err={tr_err:.3e} (G2)");
 
     // 2. Dummy occupation negligible
     let k_sparse_dense = k_final.to_dense();
@@ -369,10 +351,10 @@ fn test_sih_padded_basis_gate_d() {
         total_dummy_occ_sparse += occ.abs();
     }
     eprintln!("  Sparse dummy occ: max={max_dummy_occ_sparse:.3e}, total={total_dummy_occ_sparse:.3e}");
-    assert!(max_dummy_occ_sparse < 1e-2,
-        "Gate D: max dummy occupation {max_dummy_occ_sparse:.3e} too large");
-    assert!(total_dummy_occ_sparse < 1e-2,
-        "Gate D: total dummy occupation {total_dummy_occ_sparse:.3e} too large");
+    assert!(max_dummy_occ_sparse < 1e-8,
+        "Gate D: max dummy occupation {max_dummy_occ_sparse:.3e} too large (G2)");
+    assert!(total_dummy_occ_sparse < 1e-8,
+        "Gate D: total dummy occupation {total_dummy_occ_sparse:.3e} too large (G2)");
 
     // 3. Active Mulliken electron sum has correct physical count
     // Note: K is the spinless density kernel, Tr(KS) = Nocc. The electron
@@ -382,20 +364,20 @@ fn test_sih_padded_basis_gate_d() {
     let q_sparse = cpu_mulliken_charges(&k_sparse_dense, &s_pad, species.len());
     let active_electrons: f64 = 2.0 * q_sparse.iter().sum::<f64>();
     eprintln!("  Active Mulliken sum = {active_electrons:.6} (expected {n_electrons:.6})");
-    assert!((active_electrons - n_electrons).abs() < 1e-1,
-        "Gate D: active Mulliken electron sum {active_electrons:.6} != {n_electrons:.6}");
+    assert!((active_electrons - n_electrons).abs() < 1e-4,
+        "Gate D: active Mulliken electron sum {active_electrons:.6} != {n_electrons:.6} (G2)");
 
     // 4. Dense/sparse energy/charge parity
     let e_sparse = cpu_energy(&k_sparse_dense, &h_pad, n_padded);
     let energy_err = (e_sparse - e_ref).abs();
     eprintln!("  E_sparse={e_sparse:.6}, E_ref={e_ref:.6}, |dE|={energy_err:.3e}");
-    assert!(energy_err < 1e-2,
-        "Gate D: energy parity failed |dE|={energy_err:.3e} > 1e-2");
+    assert!(energy_err < 1e-6,
+        "Gate D: energy parity failed |dE|={energy_err:.3e} (measured 8.6e-8; G2)");
 
     let charge_err = q_sparse.iter().zip(q_ref.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f64, f64::max);
     eprintln!("  |dq|={charge_err:.3e}");
-    assert!(charge_err < 1e-2,
-        "Gate D: charge parity failed |dq|={charge_err:.3e} > 1e-2");
+    assert!(charge_err < 1e-5,
+        "Gate D: charge parity failed |dq|={charge_err:.3e} (measured 3e-6; G2)");
 
     // 5. K parity (sparse vs dense)
     let k_err = dense_max_abs_diff(&k_sparse_dense, &k_ref_dense);

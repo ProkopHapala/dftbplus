@@ -19,6 +19,10 @@ use std::sync::Arc;
 
 const BSR4_KERNEL_SOURCE: &str = include_str!("sparse_bsr4_purification.cl");
 
+/// Occupation contract for a claimed TC2 projector (second review §3.5).
+/// `||KSK−K||` alone accepts a wrong-rank projector, including K=0.
+pub const TC2_TRACE_TOL: f32 = 5e-2;
+
 /// Performance statistics for a sparse SCC/purification run.
 ///
 /// Every performance run should end with `print_execution_audit()` to make
@@ -54,6 +58,9 @@ pub struct SparsePerfStats {
     pub kernel_launches: usize,
     pub host_syncs: usize,      // queue finish + blocking read count
     pub host_read_bytes: usize, // total bytes read back to host
+    /// Largest dense host allocation observed in this run (bytes). 0 means
+    /// uninstrumented, not a proof that no dense alloc happened (review G1.9).
+    pub largest_dense: usize,
 
     // ── Stage timings (seconds) ──
     pub t_mask_plan: f64,  // geometric mask + symbolic plan construction
@@ -100,10 +107,12 @@ impl SparsePerfStats {
         eprintln!("kernel launches         {}", self.kernel_launches);
         eprintln!("host syncs              {}", self.host_syncs);
         eprintln!("host read bytes         {}", self.host_read_bytes);
-        // P0 firewall: no dense allocations in production sparse path.
-        // If largest_dense > 0, the sparse path has a hidden dense allocation.
-        let largest_dense = 0; // P0 contract: no dense allocations
-        eprintln!("largest dense alloc     {largest_dense} bytes (must be 0)");
+        // P0: print the measured counter, not a hardcoded 0 (review G1.9).
+        if self.largest_dense == 0 {
+            eprintln!("largest dense alloc     0 bytes (uninstrumented — not a P0 proof)");
+        } else {
+            eprintln!("largest dense alloc     {} bytes (must be 0 in production sparse path)", self.largest_dense);
+        }
 
         eprintln!();
         eprintln!("--- Stage timings (seconds) ---");
@@ -168,6 +177,15 @@ impl Default for SparseBsr4Config {
     }
 }
 
+/// Host NS/TC2 iteration prints. Default on (G3 diagnostics). Set
+/// `RUST_DFTB_SPARSE_ALGEBRA_VERBOSE=0` to silence inside FIRE loops.
+pub(crate) fn algebra_verbose() -> bool {
+    match std::env::var("RUST_DFTB_SPARSE_ALGEBRA_VERBOSE") {
+        Ok(v) if v == "0" || v.eq_ignore_ascii_case("false") => false,
+        _ => true,
+    }
+}
+
 /// Compiled BSR4 sparse kernel set bound to an OpenCL device.
 pub struct SparseBsr4Gpu {
     rt: GpuRuntime,
@@ -212,6 +230,7 @@ impl SparseBsr4Gpu {
             )));
         }
         let mut rt = GpuRuntime::new()?;
+        super::harness::check_sparse_device(&rt)?;
         let device = rt.device().clone();
         let context = rt.context().clone();
 
@@ -1081,9 +1100,9 @@ impl SparseBsr4Gpu {
             // T ≈ I (which falsely rounds to zero in f32).
             let rz = self.identity_residual(&t)? / n_orb.sqrt();
 
-            println!(
-                "  Newton-Schulz iter {iter}: R_Z = {rz:e}"
-            );
+            if algebra_verbose() {
+                println!("  Newton-Schulz iter {iter}: R_Z = {rz:e}");
+            }
 
             if rz < tol {
                 return Ok((z, rz, iter_done));
@@ -1289,9 +1308,9 @@ impl SparseBsr4Gpu {
             let t_buf = self.buf_f32(&t.values)?;
             tr = self.trace_ks(k.n_atom, &diag_buf, &t_buf)?;
 
-            println!(
-                "  TC2 iter {iter}: R_I={r_i:e}  Tr(KS)={tr:.6}  (Nocc={nocc})"
-            );
+            if algebra_verbose() {
+                println!("  TC2 iter {iter}: R_I={r_i:e}  Tr(KS)={tr:.6}  (Nocc={nocc})");
+            }
             history.push((iter, r_i, tr));
 
             // Track best (minimum R_I) iteration
@@ -1303,7 +1322,14 @@ impl SparseBsr4Gpu {
             }
 
             if r_i < tol {
-                return Ok((k, r_i, tr, iter + 1, history));
+                if (tr - nocc).abs() <= TC2_TRACE_TOL {
+                    return Ok((k, r_i, tr, iter + 1, history));
+                }
+                if algebra_verbose() {
+                    println!(
+                        "  TC2 R_I={r_i:e} < tol but Tr(KS)={tr:.6} != Nocc={nocc} (wrong-rank projector not accepted)"
+                    );
+                }
             }
 
             // Divergence detection: if R_I has grown by >10x from the best,
@@ -2645,8 +2671,14 @@ impl SparsePurifyWorkspace {
                 // Convergence: return OLD K (before update) — it is already
                 // good enough. No swap needed.
                 if ri < tol {
-                    let k_host = self.k.to_host(&self.gpu)?;
-                    return Ok((k_host, ri, tr[0], iter + 1, history));
+                    if (tr[0] - self.nocc).abs() <= TC2_TRACE_TOL {
+                        let k_host = self.k.to_host(&self.gpu)?;
+                        return Ok((k_host, ri, tr[0], iter + 1, history));
+                    }
+                    println!(
+                        "  TC2-dev R_I={ri:e} < tol but Tr(KS)={:.6} != Nocc={} (wrong-rank projector not accepted)",
+                        tr[0], self.nocc
+                    );
                 }
 
                 // Divergence detection.

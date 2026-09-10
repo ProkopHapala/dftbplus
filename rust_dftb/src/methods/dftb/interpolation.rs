@@ -24,17 +24,12 @@ pub enum InterpolationMethod {
     EqGridNew,
 }
 
-/// SK integral table on a uniform grid, with precomputed Hermite spline coefficients.
+/// SK integral table on a uniform grid.
 ///
-/// Interpolation: cubic Hermite spline (degree 3, C¹ continuous).
-/// - Precomputed at load time: f'(x_i) at each grid point via 4th-order central differences.
-/// - Per-evaluation cost: O(n_integ) — 4 FMAs per channel (find interval + Hermite basis).
-/// - Derivative cost: O(n_integ) — same precomputed data, different basis derivatives.
-///
-/// This replaces the old 8-point Neville interpolation (degree 7, O(n²) per eval,
-/// no precomputation, derivatives required 3 separate evaluations).
-///
-/// The Neville code is retained as a fallback and for parity verification.
+/// Production interpolation: C² cubic B-spline (`controls`, `eval_into`).
+/// Hermite (`derivs`, `eval_hermite_*`) is an unused reference path.
+/// Extra right-end controls are a blunt zero-sample **stopgap**, not the
+/// extra-control fitter (`doc/prokop/topical_audit/sk_interpolation.md`).
 #[derive(Debug, Clone)]
 pub struct EqGridTable {
     pub dr: f64,

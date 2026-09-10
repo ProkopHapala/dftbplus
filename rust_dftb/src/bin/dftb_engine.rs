@@ -11,23 +11,29 @@
 //!   - Frontier orbitals: `davidson_homo_lumo(name, n_target)` — partial
 //!     generalized eigensolver (see `sparse::davidson`)
 //!   - Convergence history: `save_convergence(name, path)`
+//!   - Persistent GPU DFTB: `gpu_new` / `gpu_scc` / `gpu_eval` (`GpuDftb`)
+//!   - Persistent sparse DFTB: `sparse_new` / `sparse_scc` / `sparse_eval` (`SparseDftb`)
 //!
 //! Usage:
 //!   dftb_engine --script test_graphene.rhai
-//!   dftb_engine --script test_graphene.rhai --sk-dir /path/to/mio-1-1
+//!   dftb_engine --script test_gpu_dftb_molecules.rhai --sk-dir /path/to/mio-1-1
+//!   dftb_engine --script test_sparse_dftb_sih4.rhai --sk-dir /path/to/matsci-0-3
 
 use rust_dftb::geometry::{self, A_CC, Element, FlakeShape, NanoStructure};
 use rust_dftb::methods::sparse::{
-    Bsr4Matrix, SparseBsr4Config, SparseBsr4Gpu, SparsePerfStats,
+    Bsr4Matrix, SparseBsr4Config, SparseBsr4Gpu, SparseDftb, SparsePerfStats,
     build_full_mask, build_geometric_mask,
 };
 use rust_dftb::methods::sparse::gpu_sparse::{GpuBsrMatrix, GpuBsrStructure, SparsePurifyWorkspace};
 use rust_dftb::{
-    HamiltonianBuilder, SccResult, SystemContext, load_sk_for_species,
+    HamiltonianBuilder, SccResult, SystemContext, load_sk_for_species, parse_xyz, parse_species,
 };
+use rust_dftb::qmqm::{GpuDftb, GpuDftbEval};
 use nalgebra::{DMatrix, DVector, SymmetricEigen};
 use rhai::{Array, Dynamic, Engine, Scope, INT};
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Instant;
@@ -288,9 +294,7 @@ fn rhai_run_sparse_purify(name: &str, max_iter: INT, tol: f64) -> Dynamic {
     let s_bsr = dense_to_bsr4(&scc.s, n_atom, &mask);
 
     // Count occupied orbitals
-    let n_electrons: f64 = st.elements.iter().map(|e| {
-        match e { Element::C => 4.0, Element::N => 5.0, Element::O => 6.0, Element::B => 3.0, _ => 1.0 }
-    }).sum();
+    let n_electrons: f64 = st.elements.iter().map(|e| e.valence_electrons()).sum();
     let n_occ = (n_electrons / 2.0) as f32;
     eprintln!("  n_occ = {n_occ}");
 
@@ -321,10 +325,16 @@ fn rhai_run_sparse_purify(name: &str, max_iter: INT, tol: f64) -> Dynamic {
         Ok(values) => GpuBsrMatrix { struct_: s_struct, values },
         Err(e) => panic!("ERROR uploading resident S values for {n_atom} atoms: {e}"),
     };
-    let (z, r_z, z_iters) = match gpu.newton_schulz_inverse_dev(&s_dev, &k_struct, &t_struct, 30, 1e-4, 3) {
+    let _ = (&k_struct, &t_struct, &s_dev);
+    // Host NS is the physics path until device NS is reverified (second review §3.6).
+    let (z, r_z, z_iters) = match gpu.newton_schulz_inverse(&s_bsr, &mask, &mask, 50, 1e-5, 5) {
         Ok(r) => r,
-        Err(e) => panic!("ERROR Newton-Schulz: {e}"),
+        Err(e) => panic!("ERROR Newton-Schulz (host): {e}"),
     };
+    // let (z, r_z, z_iters) = match gpu.newton_schulz_inverse_dev(&s_dev, &k_struct, &t_struct, 30, 1e-4, 3) {
+    //     Ok(r) => r,
+    //     Err(e) => panic!("ERROR Newton-Schulz: {e}"),
+    // };
     eprintln!("    Z: {z_iters} iters, R_Z = {r_z:e}");
     if !r_z.is_finite() || r_z > 1e-4 {
         panic!("Newton-Schulz failed to converge: R_Z={r_z:e}, iterations={z_iters}, tolerance=1e-4");
@@ -439,9 +449,7 @@ fn rhai_run_sparse_purify_geom(name: &str, r_max: f64, max_iter: INT, tol: f64) 
     let h_bsr = dense_to_bsr4(&scc.h_scc, n_atom, &mask);
     let s_bsr = dense_to_bsr4(&scc.s, n_atom, &mask);
 
-    let n_electrons: f64 = st.elements.iter().map(|e| {
-        match e { Element::C => 4.0, Element::N => 5.0, Element::O => 6.0, Element::B => 3.0, _ => 1.0 }
-    }).sum();
+    let n_electrons: f64 = st.elements.iter().map(|e| e.valence_electrons()).sum();
     let n_occ = (n_electrons / 2.0) as f32;
     eprintln!("  n_occ = {n_occ}");
 
@@ -469,10 +477,15 @@ fn rhai_run_sparse_purify_geom(name: &str, r_max: f64, max_iter: INT, tol: f64) 
         Ok(values) => GpuBsrMatrix { struct_: s_struct, values },
         Err(e) => panic!("ERROR uploading resident S values: {e}"),
     };
-    let (z, r_z, z_iters) = match gpu.newton_schulz_inverse_dev(&s_dev, &k_struct, &t_struct, 30, 1e-4, 3) {
+    let _ = (&k_struct, &t_struct, &s_dev);
+    let (z, r_z, z_iters) = match gpu.newton_schulz_inverse(&s_bsr, &mask, &mask, 50, 1e-5, 5) {
         Ok(r) => r,
-        Err(e) => panic!("ERROR Newton-Schulz: {e}"),
+        Err(e) => panic!("ERROR Newton-Schulz (host): {e}"),
     };
+    // let (z, r_z, z_iters) = match gpu.newton_schulz_inverse_dev(&s_dev, &k_struct, &t_struct, 30, 1e-4, 3) {
+    //     Ok(r) => r,
+    //     Err(e) => panic!("ERROR Newton-Schulz: {e}"),
+    // };
     let t_ns = t0.elapsed();
     eprintln!("    Z: {z_iters} iters, R_Z = {r_z:e}");
     if !r_z.is_finite() || r_z > 1e-4 {
@@ -981,6 +994,530 @@ fn dense_to_bsr4(
         .expect("BSR4 from_parts failed")
 }
 
+// ─── GpuDftb (persistent GPU engine; one object per named template) ──
+
+struct GpuHandle {
+    eng: GpuDftb,
+    last_e: Vec<f64>,
+    last_f: Option<Vec<f32>>,
+    last_rms: f32,
+    last_q_rms: f64,
+    last_q_max: f64,
+    last_iters: i64,
+    last_stalled: bool,
+}
+
+thread_local! {
+    static GPU: RefCell<HashMap<String, GpuHandle>> = RefCell::new(HashMap::new());
+}
+
+fn with_gpu<F, R>(f: F) -> R
+where F: FnOnce(&mut HashMap<String, GpuHandle>) -> R {
+    GPU.with(|g| f(&mut g.borrow_mut()))
+}
+
+// ─── SparseDftb (persistent sparse engine; one object per named system) ──
+
+struct SparseHandle {
+    eng: SparseDftb,
+    last_rms: f64,
+    last_iters: i64,
+    last_fmax: f64,
+    have_forces: bool,
+}
+
+thread_local! {
+    static SPARSE: RefCell<HashMap<String, SparseHandle>> = RefCell::new(HashMap::new());
+}
+
+fn with_sparse<F, R>(f: F) -> R
+where F: FnOnce(&mut HashMap<String, SparseHandle>) -> R {
+    SPARSE.with(|g| f(&mut g.borrow_mut()))
+}
+
+fn geom_species_coords(name: &str, ctx: &str) -> (Vec<String>, Vec<[f64; 3]>) {
+    with_state(|s| {
+        let st = s.geometries.get(name).unwrap_or_else(|| panic!("{ctx} '{name}': no geometry — load_xyz/make_geom first"));
+        let species: Vec<String> = st.elements.iter().map(|e| e.symbol().to_string()).collect();
+        (species, st.positions.clone())
+    })
+}
+
+fn sync_geom_coords(name: &str, coords: &[[f64; 3]]) {
+    with_state(|s| {
+        let st = s.geometries.get_mut(name).unwrap_or_else(|| panic!("sync_geom '{name}': no geometry"));
+        if st.positions.len() != coords.len() {
+            panic!("sync_geom '{name}': n_atom {} != coords {}", st.positions.len(), coords.len());
+        }
+        st.positions.copy_from_slice(coords);
+    });
+}
+
+/// Compile/allocate SparseDftb once for a stored geometry. Not a replica batch (one system).
+fn rhai_sparse_new(name: &str, sk_dir: &str) -> INT {
+    let (species, coords) = geom_species_coords(name, "sparse_new");
+    let n_atom = species.len();
+    eprintln!("[sparse] sparse_new '{name}' n_atom={n_atom} sk={sk_dir}");
+    let sk = load_sk_for_species(sk_dir, &species).unwrap_or_else(|e| panic!("sparse_new '{name}' load SK from {sk_dir}: {e}"));
+    let eng = SparseDftb::new(sk, sk_dir, species, coords)
+        .unwrap_or_else(|e| panic!("sparse_new '{name}' SparseDftb::new: {e}"));
+    let n_orbs = eng.n_orbs() as INT;
+    eprintln!("[sparse] sparse_new '{name}' n_orbs={n_orbs}");
+    with_sparse(|g| {
+        g.insert(name.to_string(), SparseHandle {
+            eng, last_rms: f64::NAN, last_iters: 0, last_fmax: f64::NAN, have_forces: false,
+        });
+    });
+    n_orbs
+}
+
+fn rhai_sparse_scc(name: &str, max_iter: INT, tol: f64) -> f64 {
+    with_sparse(|g| {
+        let h = g.get_mut(name).unwrap_or_else(|| panic!("sparse_scc '{name}': no engine — sparse_new first"));
+        let scc = h.eng.scc(max_iter as usize, tol)
+            .unwrap_or_else(|e| panic!("sparse_scc '{name}': {e}"));
+        h.last_rms = scc.rms;
+        h.last_iters = scc.n_iters as i64;
+        h.have_forces = false;
+        eprintln!("[sparse] sparse_scc '{name}' rms={:.3e} iters={} Tr(KS)={:.6} R_I={:.3e} r_scc={:.3e}",
+            scc.rms, scc.n_iters, scc.tr_ks, scc.r_i, scc.r_scc);
+        scc.rms
+    })
+}
+
+/// Energy of the last SCC. `want_forces=true` also builds analytic F (CPU contract of D,W).
+fn rhai_sparse_eval(name: &str, want_forces: bool) -> f64 {
+    with_sparse(|g| {
+        let h = g.get_mut(name).unwrap_or_else(|| panic!("sparse_eval '{name}': no engine — sparse_new first"));
+        let e = h.eng.energy().unwrap_or_else(|e| panic!("sparse_eval '{name}': {e} — call sparse_scc first"));
+        if !e.is_finite() { panic!("sparse_eval '{name}': E={e} non-finite"); }
+        if want_forces {
+            let f = h.eng.forces().unwrap_or_else(|err| panic!("sparse_eval '{name}' forces: {err}"));
+            let mut max_f = 0.0f64;
+            for fi in &f.forces {
+                for &c in fi {
+                    if !c.is_finite() { panic!("sparse_eval '{name}': non-finite force {c}"); }
+                    max_f = max_f.max(c.abs());
+                }
+            }
+            h.last_fmax = max_f;
+            h.have_forces = true;
+            eprintln!("[sparse] sparse_eval '{name}' E={e:.8} Ha  max|F|={max_f:.4e}");
+        } else {
+            eprintln!("[sparse] sparse_eval '{name}' E={e:.8} Ha  (no forces)");
+        }
+        e
+    })
+}
+
+fn rhai_sparse_max_force(name: &str) -> f64 {
+    with_sparse(|g| {
+        let h = g.get(name).unwrap_or_else(|| panic!("sparse_max_force '{name}': no engine"));
+        if !h.have_forces { panic!("sparse_max_force '{name}': last sparse_eval had want_forces=false"); }
+        h.last_fmax
+    })
+}
+
+fn rhai_sparse_fire_step(name: &str, f_tol: f64) -> f64 {
+    let max_f = with_sparse(|g| {
+        let h = g.get_mut(name).unwrap_or_else(|| panic!("sparse_fire_step '{name}': no engine — sparse_scc first"));
+        let mf = h.eng.fire_step(f_tol).unwrap_or_else(|e| panic!("sparse_fire_step '{name}': {e}"));
+        h.have_forces = true;
+        h.last_fmax = mf;
+        sync_geom_coords(name, h.eng.coords());
+        eprintln!("[sparse] sparse_fire_step '{name}' max|F|={mf:.4e}");
+        mf
+    });
+    max_f
+}
+
+fn rhai_sparse_md_step(name: &str, dt: f64) -> f64 {
+    with_sparse(|g| {
+        let h = g.get_mut(name).unwrap_or_else(|| panic!("sparse_md_step '{name}': no engine"));
+        let mf = h.eng.md_step(dt).unwrap_or_else(|e| panic!("sparse_md_step '{name}': {e}"));
+        h.have_forces = true;
+        h.last_fmax = mf;
+        sync_geom_coords(name, h.eng.coords());
+        eprintln!("[sparse] sparse_md_step '{name}' dt={dt} max|F|={mf:.4e}");
+        mf
+    })
+}
+
+fn rhai_sparse_relax(name: &str, max_steps: INT, f_tol: f64, scc_tol: f64) -> f64 {
+    with_sparse(|g| {
+        let h = g.get_mut(name).unwrap_or_else(|| panic!("sparse_relax '{name}': no engine"));
+        let (n, max_f, rms0) = h.eng.relax(max_steps as usize, f_tol, scc_tol)
+            .unwrap_or_else(|e| panic!("sparse_relax '{name}': {e}"));
+        h.last_iters = n as i64;
+        h.last_rms = rms0;
+        h.last_fmax = max_f;
+        h.have_forces = true;
+        sync_geom_coords(name, h.eng.coords());
+        eprintln!("[sparse] sparse_relax '{name}' steps={n} max|F|={max_f:.4e} rms0={rms0:.3e}");
+        max_f
+    })
+}
+
+fn rhai_sparse_set_coords(name: &str, xyz: Array) -> INT {
+    let n_atom = with_sparse(|g| {
+        g.get(name).unwrap_or_else(|| panic!("sparse_set_coords '{name}': no engine")).eng.n_atom()
+    });
+    if xyz.len() != n_atom * 3 {
+        panic!("sparse_set_coords '{name}': xyz len {} != 3*n_atom {}", xyz.len(), n_atom * 3);
+    }
+    let mut coords = Vec::with_capacity(n_atom);
+    for i in 0..n_atom {
+        coords.push([
+            dyn_f64(&xyz[3 * i], &format!("sparse_set_coords '{name}' x[{i}]")),
+            dyn_f64(&xyz[3 * i + 1], &format!("sparse_set_coords '{name}' y[{i}]")),
+            dyn_f64(&xyz[3 * i + 2], &format!("sparse_set_coords '{name}' z[{i}]")),
+        ]);
+    }
+    with_sparse(|g| {
+        let h = g.get_mut(name).unwrap_or_else(|| panic!("sparse_set_coords '{name}': no engine"));
+        h.eng.set_coords(&coords).unwrap_or_else(|e| panic!("sparse_set_coords '{name}': {e}"));
+        h.have_forces = false;
+    });
+    sync_geom_coords(name, &coords);
+    eprintln!("[sparse] sparse_set_coords '{name}' n_atom={n_atom}");
+    n_atom as INT
+}
+
+fn rhai_sparse_n_atoms(name: &str) -> INT {
+    with_sparse(|g| g.get(name).unwrap_or_else(|| panic!("sparse_n_atoms '{name}': no engine")).eng.n_atom() as INT)
+}
+
+fn rhai_sparse_n_orbs(name: &str) -> INT {
+    with_sparse(|g| g.get(name).unwrap_or_else(|| panic!("sparse_n_orbs '{name}': no engine")).eng.n_orbs() as INT)
+}
+
+fn rhai_sparse_scc_iters(name: &str) -> INT {
+    with_sparse(|g| g.get(name).unwrap_or_else(|| panic!("sparse_scc_iters '{name}': no engine")).last_iters)
+}
+
+fn rhai_sparse_tr_ks(name: &str) -> f64 {
+    with_sparse(|g| g.get(name).unwrap_or_else(|| panic!("sparse_tr_ks '{name}': no engine")).eng.last_energy().tr_ks as f64)
+}
+
+fn rhai_sparse_charges(name: &str) -> String {
+    with_sparse(|g| {
+        let h = g.get(name).unwrap_or_else(|| panic!("sparse_charges '{name}': no engine"));
+        h.eng.last_energy().q.iter().map(|q| format!("{q:.8}")).collect::<Vec<_>>().join(",")
+    })
+}
+
+fn dyn_f64(d: &Dynamic, ctx: &str) -> f64 {
+    if let Ok(x) = d.as_float() { return x; }
+    if let Ok(x) = d.as_int() { return x as f64; }
+    panic!("{ctx}: expected number, got {d}");
+}
+
+fn nano_from_species_coords(species: &[String], coords: &[[f64; 3]], ctx: &str) -> NanoStructure {
+    if species.len() != coords.len() {
+        panic!("{ctx}: species {} != coords {}", species.len(), coords.len());
+    }
+    let mut st = NanoStructure::new();
+    for (sp, xyz) in species.iter().zip(coords.iter()) {
+        let el = Element::from_symbol(sp).unwrap_or_else(|| panic!("{ctx}: unknown element {sp}"));
+        st.elements.push(el);
+        st.positions.push(*xyz);
+    }
+    st
+}
+
+/// Load an XYZ file into the geometry registry.
+fn rhai_load_xyz(name: &str, path: &str) -> INT {
+    let mol = parse_xyz(path).unwrap_or_else(|e| panic!("load_xyz '{name}' path={path}: {e}"));
+    let n = mol.species.len();
+    if n == 0 { panic!("load_xyz '{name}': empty XYZ {path}"); }
+    let st = nano_from_species_coords(&mol.species, &mol.coords, &format!("load_xyz '{name}'"));
+    with_state(|s| { s.geometries.insert(name.to_string(), st); });
+    eprintln!("[gpu] load_xyz '{name}' {n} atoms from {path}");
+    n as INT
+}
+
+/// Build a geometry from species CSV + flat xyz array (Å).
+fn rhai_make_geom(name: &str, species_csv: &str, xyz: Array) -> INT {
+    let species = parse_species(species_csv);
+    if species.is_empty() { panic!("make_geom '{name}': empty species"); }
+    if xyz.len() != species.len() * 3 {
+        panic!("make_geom '{name}': xyz len {} != 3*n_atoms {}", xyz.len(), species.len() * 3);
+    }
+    let mut coords = Vec::with_capacity(species.len());
+    for i in 0..species.len() {
+        coords.push([
+            dyn_f64(&xyz[3 * i], &format!("make_geom '{name}' x[{i}]")),
+            dyn_f64(&xyz[3 * i + 1], &format!("make_geom '{name}' y[{i}]")),
+            dyn_f64(&xyz[3 * i + 2], &format!("make_geom '{name}' z[{i}]")),
+        ]);
+    }
+    let n = species.len();
+    let st = nano_from_species_coords(&species, &coords, &format!("make_geom '{name}'"));
+    with_state(|s| { s.geometries.insert(name.to_string(), st); });
+    eprintln!("[gpu] make_geom '{name}' {n} atoms");
+    n as INT
+}
+
+/// Create / replace a GpuDftb for a stored geometry. `batch` copies of the same molecule.
+fn rhai_gpu_new(name: &str, sk_dir: &str, batch: INT) -> INT {
+    let batch = batch as usize;
+    if batch == 0 { panic!("gpu_new '{name}': batch=0"); }
+    let (species, xyz0) = with_state(|s| {
+        let st = s.geometries.get(name).unwrap_or_else(|| panic!("gpu_new '{name}': no geometry — load_xyz/make_geom first"));
+        let species: Vec<String> = st.elements.iter().map(|e| e.symbol().to_string()).collect();
+        (species, st.positions.clone())
+    });
+    let n_atoms = species.len();
+    let mut coords = Vec::with_capacity(batch * n_atoms);
+    for _ in 0..batch { coords.extend_from_slice(&xyz0); }
+    eprintln!("[gpu] gpu_new '{name}' n_atoms={n_atoms} batch={batch} sk={sk_dir}");
+    let sk = load_sk_for_species(sk_dir, &species).unwrap_or_else(|e| panic!("gpu_new '{name}' load SK from {sk_dir}: {e}"));
+    let eng = GpuDftb::new(sk, sk_dir, species, coords, batch)
+        .unwrap_or_else(|e| panic!("gpu_new '{name}' GpuDftb::new: {e}"));
+    let n_orbs = eng.n() as INT;
+    eprintln!("[gpu] gpu_new '{name}' N={n_orbs} device={}", eng.rt.caps().name);
+    with_gpu(|g| {
+        g.insert(name.to_string(), GpuHandle {
+            eng, last_e: Vec::new(), last_f: None, last_rms: f32::NAN, last_q_rms: f64::NAN, last_q_max: f64::NAN, last_iters: 0, last_stalled: false,
+        });
+    });
+    n_orbs
+}
+
+fn rhai_gpu_scc(name: &str, max_iter: INT, tol: f64) -> f64 {
+    with_gpu(|g| {
+        let h = g.get_mut(name).unwrap_or_else(|| panic!("gpu_scc '{name}': no engine — gpu_new first"));
+        let scc = h.eng.scc(max_iter as usize, tol as f32)
+            .unwrap_or_else(|e| panic!("gpu_scc '{name}': {e}"));
+        h.last_rms = scc.rms;
+        h.last_iters = scc.n_iters as i64;
+        h.last_stalled = scc.stalled;
+        eprintln!("[gpu] gpu_scc '{name}' rms={:.3e} iters={} stalled={}", scc.rms, scc.n_iters, scc.stalled);
+        scc.rms as f64
+    })
+}
+
+/// One finalize. `want_forces=true` also builds W and F on GPU. Returns replica-0 energy (Ha).
+fn rhai_gpu_eval(name: &str, want_forces: bool) -> f64 {
+    with_gpu(|g| {
+        let h = g.get_mut(name).unwrap_or_else(|| panic!("gpu_eval '{name}': no engine — gpu_new first"));
+        let ev = h.eng.eval(want_forces).unwrap_or_else(|e| panic!("gpu_eval '{name}' want_forces={want_forces}: {e}"));
+        for (i, &e) in ev.energy.iter().enumerate() {
+            if !e.is_finite() { panic!("gpu_eval '{name}': E[{i}]={e} non-finite"); }
+        }
+        if let Some(ref f) = ev.forces {
+            for (i, &x) in f.iter().enumerate() {
+                if !x.is_finite() { panic!("gpu_eval '{name}': F[{i}]={x} non-finite"); }
+            }
+        }
+        h.last_e = ev.energy;
+        h.last_f = ev.forces;
+        h.last_q_rms = ev.q_rms;
+        h.last_q_max = ev.q_max;
+        let e0 = h.last_e[0];
+        let mut max_f = 0.0f32;
+        if let Some(ref f) = h.last_f { for &x in f { max_f = max_f.max(x.abs()); } }
+        eprintln!("[gpu] gpu_eval '{name}' want_forces={want_forces} n_batch={} q_rms={:.3e} q_max={:.3e} max|F|={:.4e}",
+            h.last_e.len(), h.last_q_rms, h.last_q_max, if h.last_f.is_some() { max_f } else { f32::NAN });
+        for (i, &e) in h.last_e.iter().enumerate() {
+            eprintln!("[gpu]   E[{i}]={e:.12} Ha");
+        }
+        e0
+    })
+}
+
+fn rhai_gpu_energy_i(name: &str, i: INT) -> f64 {
+    with_gpu(|g| {
+        let h = g.get(name).unwrap_or_else(|| panic!("gpu_energy_i '{name}': no engine"));
+        let i = i as usize;
+        if h.last_e.is_empty() { panic!("gpu_energy_i '{name}': call gpu_eval first"); }
+        if i >= h.last_e.len() { panic!("gpu_energy_i '{name}': i={i} >= batch {}", h.last_e.len()); }
+        h.last_e[i]
+    })
+}
+
+fn rhai_gpu_max_force(name: &str) -> f64 {
+    with_gpu(|g| {
+        let h = g.get(name).unwrap_or_else(|| panic!("gpu_max_force '{name}': no engine"));
+        let f = h.last_f.as_ref().unwrap_or_else(|| panic!("gpu_max_force '{name}': last gpu_eval had want_forces=false"));
+        let mut m = 0.0f32;
+        for &x in f { m = m.max(x.abs()); }
+        m as f64
+    })
+}
+
+fn rhai_gpu_n_batch(name: &str) -> INT {
+    with_gpu(|g| {
+        let h = g.get(name).unwrap_or_else(|| panic!("gpu_n_batch '{name}': no engine"));
+        h.eng.batch() as INT
+    })
+}
+
+fn rhai_gpu_n_orbs(name: &str) -> INT {
+    with_gpu(|g| {
+        let h = g.get(name).unwrap_or_else(|| panic!("gpu_n_orbs '{name}': no engine"));
+        h.eng.n() as INT
+    })
+}
+
+fn rhai_gpu_scc_iters(name: &str) -> INT {
+    with_gpu(|g| {
+        let h = g.get(name).unwrap_or_else(|| panic!("gpu_scc_iters '{name}': no engine"));
+        h.last_iters
+    })
+}
+
+fn rhai_gpu_scc_stalled(name: &str) -> INT {
+    with_gpu(|g| {
+        let h = g.get(name).unwrap_or_else(|| panic!("gpu_scc_stalled '{name}': no engine"));
+        if h.last_stalled { 1 } else { 0 }
+    })
+}
+
+fn rhai_gpu_q_rms(name: &str) -> f64 {
+    with_gpu(|g| {
+        let h = g.get(name).unwrap_or_else(|| panic!("gpu_q_rms '{name}': no engine — gpu_eval/gpu_measure first"));
+        if !h.last_q_rms.is_finite() { panic!("gpu_q_rms '{name}': no finalize yet (gpu_eval/gpu_measure)"); }
+        h.last_q_rms
+    })
+}
+
+fn rhai_gpu_n_atoms(name: &str) -> INT {
+    with_gpu(|g| {
+        let h = g.get(name).unwrap_or_else(|| panic!("gpu_n_atoms '{name}': no engine"));
+        h.eng.n_atoms() as INT
+    })
+}
+
+fn store_gpu_eval(h: &mut GpuHandle, ev: GpuDftbEval, ctx: &str) -> f64 {
+    for (i, &e) in ev.energy.iter().enumerate() {
+        if !e.is_finite() { panic!("{ctx}: E[{i}]={e} non-finite"); }
+    }
+    if let Some(ref f) = ev.forces {
+        for (i, &x) in f.iter().enumerate() {
+            if !x.is_finite() { panic!("{ctx}: F[{i}]={x} non-finite"); }
+        }
+    }
+    h.last_e = ev.energy;
+    h.last_f = ev.forces;
+    h.last_q_rms = ev.q_rms;
+    h.last_q_max = ev.q_max;
+    h.last_e[0]
+}
+
+fn rhai_gpu_reset_q(name: &str) {
+    with_gpu(|g| {
+        let h = g.get_mut(name).unwrap_or_else(|| panic!("gpu_reset_q '{name}': no engine — gpu_new first"));
+        h.eng.reset_q0().unwrap_or_else(|e| panic!("gpu_reset_q '{name}': {e}"));
+        eprintln!("[gpu] gpu_reset_q '{name}'");
+    });
+}
+
+fn rhai_gpu_scc_mixer(name: &str, max_iter: INT, tol: f64, mix: INT) -> f64 {
+    with_gpu(|g| {
+        let h = g.get_mut(name).unwrap_or_else(|| panic!("gpu_scc_mixer '{name}': no engine — gpu_new first"));
+        let scc = h.eng.scc_mix(max_iter as usize, tol as f32, mix as i32)
+            .unwrap_or_else(|e| panic!("gpu_scc_mixer '{name}' mix={mix}: {e}"));
+        h.last_rms = scc.rms;
+        h.last_iters = scc.n_iters as i64;
+        h.last_stalled = scc.stalled;
+        eprintln!("[gpu] gpu_scc_mixer '{name}' mix={mix} rms={:.3e} iters={} stalled={}", scc.rms, scc.n_iters, scc.stalled);
+        scc.rms as f64
+    })
+}
+
+fn rhai_gpu_measure(name: &str, want_cpu: bool) -> f64 {
+    with_gpu(|g| {
+        let h = g.get_mut(name).unwrap_or_else(|| panic!("gpu_measure '{name}': no engine — gpu_new first"));
+        let ev = h.eng.measure(want_cpu).unwrap_or_else(|e| panic!("gpu_measure '{name}' want_cpu={want_cpu}: {e}"));
+        let e0 = store_gpu_eval(h, ev, &format!("gpu_measure '{name}'"));
+        eprintln!("[gpu] gpu_measure '{name}' want_cpu={want_cpu} E[0]={e0:.12} q_rms={:.3e} q_max={:.3e}", h.last_q_rms, h.last_q_max);
+        e0
+    })
+}
+
+fn rhai_gpu_cpu_energy(name: &str) -> f64 {
+    with_gpu(|g| {
+        let h = g.get(name).unwrap_or_else(|| panic!("gpu_cpu_energy '{name}': no engine — gpu_new first"));
+        let (e, _, _) = h.eng.cpu_ref().unwrap_or_else(|e| panic!("gpu_cpu_energy '{name}': {e}"));
+        if !e.is_finite() { panic!("gpu_cpu_energy '{name}': E={e} non-finite"); }
+        eprintln!("[gpu] gpu_cpu_energy '{name}' E={e:.12} Ha");
+        e
+    })
+}
+
+fn rhai_gpu_set_coords(name: &str, xyz: Array) -> INT {
+    let (n_atoms, batch) = with_gpu(|g| {
+        let h = g.get(name).unwrap_or_else(|| panic!("gpu_set_coords '{name}': no engine — gpu_new first"));
+        (h.eng.n_atoms(), h.eng.batch())
+    });
+    let need = batch * n_atoms * 3;
+    if xyz.len() != need {
+        panic!("gpu_set_coords '{name}': xyz len {} != 3*batch*n_atoms 3*{batch}*{n_atoms}={need}", xyz.len());
+    }
+    let ntot = batch * n_atoms;
+    let mut coords = Vec::with_capacity(ntot);
+    for i in 0..ntot {
+        coords.push([
+            dyn_f64(&xyz[3 * i], &format!("gpu_set_coords '{name}' x[{i}]")),
+            dyn_f64(&xyz[3 * i + 1], &format!("gpu_set_coords '{name}' y[{i}]")),
+            dyn_f64(&xyz[3 * i + 2], &format!("gpu_set_coords '{name}' z[{i}]")),
+        ]);
+    }
+    with_gpu(|g| {
+        let h = g.get_mut(name).unwrap_or_else(|| panic!("gpu_set_coords '{name}': no engine"));
+        h.eng.set_coords(&coords).unwrap_or_else(|e| panic!("gpu_set_coords '{name}': {e}"));
+    });
+    if batch == 1 {
+        sync_geom_coords(name, &coords);
+    }
+    eprintln!("[gpu] gpu_set_coords '{name}' n_atoms={n_atoms} batch={batch}");
+    n_atoms as INT
+}
+
+fn rhai_get_xyz(name: &str) -> Array {
+    with_state(|s| {
+        let st = s.geometries.get(name).unwrap_or_else(|| panic!("get_xyz '{name}': no geometry — load_xyz/make_geom first"));
+        let mut a = Array::new();
+        for p in &st.positions {
+            a.push(Dynamic::from_float(p[0]));
+            a.push(Dynamic::from_float(p[1]));
+            a.push(Dynamic::from_float(p[2]));
+        }
+        a
+    })
+}
+
+fn rhai_assert_finite(x: f64, msg: &str) {
+    if !x.is_finite() { panic!("assert_finite failed: {msg}: {x}"); }
+}
+
+fn rhai_assert_close(a: f64, b: f64, tol: f64, msg: &str) {
+    let d = (a - b).abs();
+    if !a.is_finite() || !b.is_finite() || d > tol {
+        panic!("assert_close failed: {msg}: a={a} b={b} |d|={d} tol={tol}");
+    }
+}
+
+fn rhai_die(msg: &str) { panic!("{msg}"); }
+
+fn find_repo_root() -> PathBuf {
+    let cwd = std::env::current_dir().unwrap_or_else(|e| panic!("cwd: {e}"));
+    let mut cands = vec![cwd.clone(), cwd.join(".."), cwd.join("../..")];
+    if let Ok(manifest) = std::env::var("CARGO_MANIFEST_DIR") {
+        cands.push(PathBuf::from(manifest).join(".."));
+    }
+    for cand in cands {
+        let xyz = cand.join("data/xyz/adenine-thymine.xyz");
+        if xyz.is_file() {
+            return cand.canonicalize().unwrap_or_else(|e| panic!("canonicalize {}: {e}", cand.display()));
+        }
+    }
+    panic!("cannot find data/xyz/adenine-thymine.xyz from cwd={}", cwd.display());
+}
+
+// ─── Main: set up Rhai engine and run script ────────────────────────
+
 // ─── Main: set up Rhai engine and run script ────────────────────────
 
 fn main() {
@@ -1000,7 +1537,30 @@ fn main() {
                 eprintln!("  build_pah(name, shells, acc) -> n_atoms");
                 eprintln!("  build_flake(name, radius, shape, passivate, acc) -> n_atoms");
                 eprintln!("  build_zigzag(name, width, length, passivate, acc) -> n_atoms");
-                eprintln!("  save_xyz(name, path) -> bool");
+                eprintln!("  load_xyz(name, path) -> n_atoms");
+                eprintln!("  make_geom(name, species_csv, xyz_flat) -> n_atoms");
+                eprintln!("  gpu_new(name, sk_dir, batch) -> n_orbs   (GpuDftb, homogeneous replicas)");
+                eprintln!("  gpu_scc(name, max_iter, tol) -> rms");
+                eprintln!("  gpu_scc_mixer(name, max_iter, tol, mix) -> rms   mix 0=GPU DIIS, 1=GPU simple, 2=host f64 DIIS");
+                eprintln!("  gpu_reset_q(name)                       reload q0 + reset DIIS");
+                eprintln!("  gpu_set_coords(name, xyz_flat) -> n_atoms");
+                eprintln!("  gpu_eval(name, want_forces) -> E[0]      (one finalize; forces optional)");
+                eprintln!("  gpu_measure(name, want_cpu) -> E[0]     frozen-H + energy identities; CPU if true");
+                eprintln!("  gpu_cpu_energy(name) -> E               independent CPU f64 SCC+rep at replica 0");
+                eprintln!("  gpu_energy_i(name, i) -> E[i]");
+                eprintln!("  gpu_max_force(name) -> max|F|           (after gpu_eval(..., true))");
+                eprintln!("  get_xyz(name) -> xyz_flat               geometry table, Å");
+                eprintln!("  gpu_n_batch / gpu_n_orbs / gpu_n_atoms / gpu_scc_iters / gpu_scc_stalled / gpu_q_rms");
+                eprintln!("  sparse_new(name, sk_dir) -> n_orbs      (SparseDftb, one system)");
+                eprintln!("  sparse_scc(name, max_iter, tol) -> rms");
+                eprintln!("  sparse_eval(name, want_forces) -> E     (after sparse_scc; forces optional)");
+                eprintln!("  sparse_max_force / sparse_n_atoms / sparse_n_orbs / sparse_scc_iters / sparse_tr_ks");
+                eprintln!("  sparse_charges(name) -> csv");
+                eprintln!("  sparse_set_coords(name, xyz_flat) -> n_atoms");
+                eprintln!("  sparse_fire_step(name, f_tol) -> max|F|");
+                eprintln!("  sparse_md_step(name, dt) -> max|F|");
+                eprintln!("  sparse_relax(name, max_steps, f_tol, scc_tol) -> max|F|");
+                eprintln!("  assert_finite(x, msg) / assert_close(a, b, tol, msg) / die(msg)");
                 eprintln!("  run_dftb_scc(name, sk_dir, max_iter, tol) -> energy");
                 eprintln!("  run_dftb_nonscc(name, sk_dir) -> energy");
                 eprintln!("  run_sparse_purify(name, max_iter, tol) -> r_i");
@@ -1049,6 +1609,41 @@ fn main() {
     engine.register_fn("build_flake", rhai_build_flake);
     engine.register_fn("build_zigzag", rhai_build_zigzag);
     engine.register_fn("save_xyz", rhai_save_xyz);
+    engine.register_fn("load_xyz", rhai_load_xyz);
+    engine.register_fn("make_geom", rhai_make_geom);
+    engine.register_fn("gpu_new", rhai_gpu_new);
+    engine.register_fn("gpu_scc", rhai_gpu_scc);
+    engine.register_fn("gpu_scc_mixer", rhai_gpu_scc_mixer);
+    engine.register_fn("gpu_reset_q", rhai_gpu_reset_q);
+    engine.register_fn("gpu_set_coords", rhai_gpu_set_coords);
+    engine.register_fn("gpu_eval", rhai_gpu_eval);
+    engine.register_fn("gpu_measure", rhai_gpu_measure);
+    engine.register_fn("gpu_cpu_energy", rhai_gpu_cpu_energy);
+    engine.register_fn("gpu_energy_i", rhai_gpu_energy_i);
+    engine.register_fn("gpu_max_force", rhai_gpu_max_force);
+    engine.register_fn("gpu_n_batch", rhai_gpu_n_batch);
+    engine.register_fn("gpu_n_orbs", rhai_gpu_n_orbs);
+    engine.register_fn("gpu_n_atoms", rhai_gpu_n_atoms);
+    engine.register_fn("gpu_scc_iters", rhai_gpu_scc_iters);
+    engine.register_fn("gpu_scc_stalled", rhai_gpu_scc_stalled);
+    engine.register_fn("gpu_q_rms", rhai_gpu_q_rms);
+    engine.register_fn("get_xyz", rhai_get_xyz);
+    engine.register_fn("sparse_new", rhai_sparse_new);
+    engine.register_fn("sparse_scc", rhai_sparse_scc);
+    engine.register_fn("sparse_eval", rhai_sparse_eval);
+    engine.register_fn("sparse_max_force", rhai_sparse_max_force);
+    engine.register_fn("sparse_fire_step", rhai_sparse_fire_step);
+    engine.register_fn("sparse_md_step", rhai_sparse_md_step);
+    engine.register_fn("sparse_relax", rhai_sparse_relax);
+    engine.register_fn("sparse_set_coords", rhai_sparse_set_coords);
+    engine.register_fn("sparse_n_atoms", rhai_sparse_n_atoms);
+    engine.register_fn("sparse_n_orbs", rhai_sparse_n_orbs);
+    engine.register_fn("sparse_scc_iters", rhai_sparse_scc_iters);
+    engine.register_fn("sparse_tr_ks", rhai_sparse_tr_ks);
+    engine.register_fn("sparse_charges", rhai_sparse_charges);
+    engine.register_fn("assert_finite", rhai_assert_finite);
+    engine.register_fn("assert_close", rhai_assert_close);
+    engine.register_fn("die", rhai_die);
     engine.register_fn("run_dftb_scc", rhai_run_dftb_scc);
     engine.register_fn("run_dftb_nonscc", rhai_run_dftb_nonscc);
     engine.register_fn("run_sparse_purify", rhai_run_sparse_purify);
@@ -1077,6 +1672,7 @@ fn main() {
     scope.push_constant("A_CC", A_CC);
     scope.push_constant("DEFAULT_TOL", 1e-10f64);
     scope.push_constant("DEFAULT_MAX_ITER", 1000i64);
+    scope.push_constant("REPO_ROOT", find_repo_root().to_string_lossy().into_owned());
 
     // Read and run the script
     let script = match std::fs::read_to_string(&script_path) {

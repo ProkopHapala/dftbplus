@@ -65,6 +65,13 @@ impl GpuRuntime {
         })
     }
 
+    /// Sparse/physics GPU tests must run on NVIDIA. PoCL/CPU OpenCL hides
+    /// fence, atomic, and OOB bugs (review G0.2). Override with
+    /// `RUST_DFTB_ALLOW_CPU_CL=1` only for an explicit CPU-OpenCL experiment.
+    pub fn require_nvidia(&self) -> Result<()> {
+        require_nvidia_device(&self.caps)
+    }
+
     /// Get the OpenCL context (for buffer allocation).
     pub fn context(&self) -> &Context {
         &self.context
@@ -135,18 +142,35 @@ impl GpuRuntime {
             .len(len)
             .build()
             .map_err(map_ocl_err)?;
+        self.copy_into(src, &dst, len)?;
+        Ok(dst)
+    }
+
+    /// Device-to-device copy into an existing buffer. No allocation.
+    pub fn copy_into<T: ocl::OclPrm>(&self, src: &Buffer<T>, dst: &Buffer<T>, len: usize) -> Result<()> {
+        if src.len() < len || dst.len() < len {
+            return Err(DftbError::InvalidInput(format!(
+                "copy_into: len={len} exceeds src.len()={} or dst.len()={}", src.len(), dst.len()
+            )));
+        }
         src.cmd()
             .queue(&self.queue)
-            .copy(&dst, None, None)
+            .copy(dst, None, Some(len))
             .enq()
             .map_err(map_ocl_err)?;
-        Ok(dst)
+        Ok(())
     }
 
     /// Copy a GPU buffer back to host memory (blocking).
     pub fn read_buffer<T: ocl::OclPrm>(&self, buf: &Buffer<T>, out: &mut [T]) -> Result<()> {
         buf.read(out).enq().map_err(map_ocl_err)?;
         self.queue.finish().map_err(map_ocl_err)
+    }
+
+    /// Write host data into an existing buffer (no alloc).
+    pub fn write_buffer<T: ocl::OclPrm>(&self, buf: &Buffer<T>, data: &[T]) -> Result<()> {
+        buf.write(data).enq().map_err(map_ocl_err)?;
+        Ok(())
     }
 
     /// Finish all queued operations (blocking).
@@ -213,4 +237,21 @@ fn hash_str(s: &str) -> u64 {
 /// Map ocl errors to DftbError. Same pattern as gpu_driver.rs.
 pub fn map_ocl_err(err: ocl::Error) -> DftbError {
     DftbError::InvalidInput(format!("OpenCL error: {err}"))
+}
+
+/// Abort unless `caps.name` looks like NVIDIA, or `RUST_DFTB_ALLOW_CPU_CL=1`.
+pub fn require_nvidia_device(caps: &GpuCapabilities) -> Result<()> {
+    let allow_cpu = std::env::var("RUST_DFTB_ALLOW_CPU_CL").ok().as_deref() == Some("1");
+    if allow_cpu {
+        eprintln!("[gpu] RUST_DFTB_ALLOW_CPU_CL=1 — accepting non-NVIDIA device '{}'", caps.name);
+        return Ok(());
+    }
+    if !caps.name.to_uppercase().contains("NVIDIA") {
+        return Err(DftbError::InvalidInput(format!(
+            "NVIDIA GPU required, got '{}'. PoCL/CPU OpenCL hides fence/atomic/OOB bugs. \
+             Set RUST_DFTB_ALLOW_CPU_CL=1 only for an explicit CPU-OpenCL experiment.",
+            caps.name
+        )));
+    }
+    Ok(())
 }

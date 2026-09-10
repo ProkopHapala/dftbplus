@@ -8,14 +8,26 @@
 //! which has been verified against the natural cubic spline through the same
 //! grid points to near-machine precision.
 //!
-//! Tests skip gracefully if no OpenCL device is available.
+//! GPU B-spline evaluator parity test (P1, manifest v3 §4.2 Gate A).
+//!
+//! Verifies that the f32 GPU `bspline3_v_d1_d2` evaluator matches the f64
+//! CPU canonical spline in V, V', V'' at many points.
+//!
+//! This is the "f32 GPU matches the same f64 canonical spline" test from
+//! Gate A. The CPU reference is `bspline3_eval_at` in `spline_resample.rs`,
+//! which has been verified against the natural cubic spline through the same
+//! grid points to near-machine precision.
+//!
+//! Skip only if the ICD exposes zero OpenCL platforms. A device that
+//! errors, or a non-NVIDIA device without `RUST_DFTB_ALLOW_CPU_CL=1`, is a
+//! failure.
 
 use ocl::{builders::ProgramBuilder, flags, Buffer, Kernel, Program};
 use rust_dftb::methods::dftb::spline_resample::{
     bspline3_eval_at, resample_bspline,
 };
 use rust_dftb::qmqm::gpu_runtime::{map_ocl_err, GpuRuntime};
-use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
+use rust_dftb::methods::sparse::harness::require_nvidia_runtime;
 
 /// Minimal OpenCL source: just the bspline3_v_d1_d2 function + a test kernel
 /// that evaluates it at N points and writes (V, dV, d²V) to an output buffer.
@@ -86,26 +98,8 @@ __kernel void test_bspline_eval(
 }
 "#;
 
-/// Try to create a GpuRuntime; return None if no OpenCL device.
 fn try_gpu() -> Option<GpuRuntime> {
-    match catch_unwind(AssertUnwindSafe(|| GpuRuntime::new())) {
-        Ok(Ok(rt)) => Some(rt),
-        Ok(Err(e)) => {
-            eprintln!("Skipping GPU bspline test: no OpenCL device ({e})");
-            None
-        }
-        Err(payload) => {
-            let msg = payload.downcast_ref::<String>().map(String::as_str)
-                .or_else(|| payload.downcast_ref::<&str>().copied())
-                .unwrap_or("non-string panic");
-            if msg.contains("GetPlatformIdsPlatformListUnavailable") {
-                eprintln!("Skipping GPU bspline test: no OpenCL platform ({msg})");
-                None
-            } else {
-                resume_unwind(payload)
-            }
-        }
-    }
+    require_nvidia_runtime()
 }
 
 #[test]

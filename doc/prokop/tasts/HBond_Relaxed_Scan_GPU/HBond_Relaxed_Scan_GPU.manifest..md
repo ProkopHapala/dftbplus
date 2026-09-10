@@ -1,13 +1,213 @@
 # Task 1: GPU Multi-System Relaxed Scan of Hydrogen-Bonded Nucleobase Pairs
 
 **Created:** 2026-09-07
-**Status:** dense H-bond kernel — interpolator stopgap + analytic forces measured. AT/GC GPU SCC rms plateaus `~1e-5` — **hypothesis: f32 floor, not a broken mixer** (see §3.0.1). Sparse is a **separate** agent — do not edit `rust_dftb/src/methods/sparse/`.
+**Last wrap (2026-09-10):** read **§0** first. Sparse is a **separate** agent — do not edit `rust_dftb/src/methods/sparse/`.
 **Owner:** prokop / Devin
-**Interpolator spec:** `doc/prokop/topical_audit/sk_interpolation.md` (what was done vs what must be done next)
+**Interpolator spec:** `doc/prokop/topical_audit/sk_interpolation.md`
+**f32 floor + harness map:** `doc/prokop/topical_audit/f32_floor_dense_hbond.md`
+
+---
+
+## 0. State for the next LLM (2026-09-10) — read this, then the rest
+
+### 0.1 What was resolved (do not re-open)
+
+| Item | Outcome |
+|------|---------|
+| AT/GC `max\|dH\|~0.4 Ha` | **CPU SK tail bug**, not GPU. Neville + `poly5_to_zero` exploded on H–H at 10.39 Bohr. Production is B-spline. **Do not restore Neville** for Fortran-tail parity. |
+| NVIDIA 1×4 crash | `__local float2*` alignment; fixed with `vload2`. |
+| Replica cap | `l_frags[128]` silent truncation; fixed. |
+| AT/GC gamma-force 1% off | Ill-conditioned f32 `Ua≠Ub` (mio N–H). Kernel `gamma_prime_full_f32` now **f64 island**. |
+| AT SCC “mixer broken” | Mixer **does** stall (~25 it, rms~1.3e-6). Frozen-H Jacobi is **not** the `|dE|` floor: AT `max|δε_occ|~1.1e-6` vs `|dE|~2.8e-5`. AT `|dE|` tracks `δ_CH=E_band−2ΣCᵀHC` (~5e-5), not `δε_occ`. |
+| Fake-green energy tests | Two-tier: H2O `|dE|<1e-5` (measured 3e-7). AT/GC `|dE|<1e-4` is a **regression line**, not f64 parity. SCC cap **100** (stall at 25). |
+| f64 `batched_gemm` acc | Tried, **reverted** (worse energy, DIIS no plateau). |
+
+### 0.2 Open problems (three different kinds — do not mix them)
+
+**A. Accuracy (not one “f32 floor”)** — Package 1 `[*]`, Package 2 measure `[*]`, GPU DIIS hist cap `[*]` (H2O), Löwdin Newton `[*]`, f32 GEMM Kahan `[*]` (does not cut `δ_CH`). AT `|dE|` is `δ_CH` / Jacobi `C'`. Next: AT stall, Jacobi residual, origin recenter. **Master checklist:** `OVERVIEW_Roadmap.md` §6.4.
+
+**B. Interpolator fitter** — method, not f32. Plain language in §0.3. Spec: `sk_interpolation.md`.
+
+**C. Production GPU run loop — `GpuDftb`.** Drive **this** object. Do not add throwaway `GpuRuntime::new` tests.
+
+CPU analogue: `DftbCpu`. GPU: `rust_dftb/src/qmqm/gpu_dftb.rs`.
+User/test entry: **`dftb_engine --script foo.rhai`** (see §0.5). Do not add a new `cargo test` / `src/bin` / `examples/` target per molecule.
+
+```
+GpuDftb::new(sk, sk_dir, species, coords, batch)  // INIT once
+  .set_coords(...)                                 // pairs in place → H0/S, G, X
+  .scc()
+  .eval(want_forces)                               // one finalize; forces optional
+  .fire_step() / .md_step()
+```
+
+**Status on this object (2026-09-10):**
+
+1. **W on GPU, same kernel as D.** Done. `s_k=1` → D, `s_k=ε_k` → W. No C/ε host roundtrip.
+2. **`set_coords` in-place pairs.** Done. No `GpuBatch::from_fragments` on the geometry step.
+3. **`eval(want_forces)`.** One electronic finalize. Energy always; forces only if asked. Do not call `energy()` then `forces()` (that double-solves). Thin wrappers remain for old call sites.
+4. **Neighbor list + G on CPU is OK.** Once per geometry, not per SCC. Same O(n_atoms²) distances — a later optional **one GPU kernel** can write pairs `(r,l,m,n)` and G together. Not a must-fix; do not rebuild SK when doing it.
+5. **Homogeneous batch only.** Replicas = copies of **one** template. AT and GC are two `GpuDftb` objects (or two script steps), not one mixed launch. Different replica counts = `batch` on that template.
+6. Exercise AT, GC, azaindole, H2O-replicas through the **Rhai script**, not a new Rust test file. `gpu_hbond_physics.rs` is leftover bisect.
+
+Topology / pair overflow → fail loud, rebuild `new`. FIRE/MD cap 0.1 Å.
+
+### 0.3 What “interpolator fitter” means
+
+Slater–Koster files are **numbers on a 1D grid** (typically `dr=0.02` Bohr). We interpolate with a **cubic B-spline**. A cubic B-spline does not live only on those samples: it needs a few extra **control points** off each end of the table so the curve knows how to start and how to die.
+
+- **Left end (already the right kind of thing):** a phantom control `c_{-1}=2c_0−c_1` at evaluation. SK values at small `r` are large — never force them to zero.
+- **Right end (current stopgap, blunt):** glue on four **function values hardcoded to 0**, then refit. That stopped the −0.4 Ha explosion. It is **not** a boundary-condition solve: those zeros leak into the last real samples, and cutoff is only `~0.08` Bohr past the last grid (DFTB+ used a 1 Bohr polynomial fudge; we are not copying that fudge).
+- **GPU dummy 0 at `r=0`:** same kind of cheat (index padding), not a fitted left control.
+
+**The fitter** is the missing linear solve: extra controls are **unknowns**. Solve so (1) the interpolant on the **tabulated** region still matches the SK file, (2) `V` and `V'` go smoothly to 0 at a chosen cutoff. Do **not** implement this as “pad with more zeros.” Do not restore Neville.
+
+This is independent of the f32 eigen floor. Interior H2O/AT H/S already match at `~1e-7`.
+
+### 0.4 Production pipeline — we do **not** have it, and we **must**
+
+A normal DFT/DFTB code does:
+
+```
+INIT (once)          load SK, compile kernels, preallocate all buffers
+PER GEOMETRY         update coords → neighbors → H0,S,G,X=S^{-1/2}
+SCC (warm-started)   iterate until Δq plateaus
+FORCES               P,W already on device → F
+MD / FIRE            move atoms → go to PER GEOMETRY
+```
+
+**CPU already follows this:** `rust_dftb/src/methods/dftb/dftb_cpu.rs` (`DftbCpu`) + FIRE in `examples/hbond_ref.rs`.
+
+**GPU owner of that lifetime:** `rust_dftb/src/qmqm/gpu_dftb.rs` (`GpuDftb`).
+**How a human (and a test) runs it:** `dftb_engine --script rust_dftb/scripts/<case>.rhai --sk-dir …` (§0.5).
+
+| Piece | Role now |
+|-------|----------|
+| `GpuDftb` | **Use this.** `new` / `set_coords` / `scc` / **`eval(want_forces)`** / `fire_step` / `relax`. |
+| `GpuSccPlan` | Inner SCC, owned by `GpuDftb`. Do not construct one per test. |
+| `dftb_engine` + `.rhai` | **Product CLI.** New scenarios are scripts. |
+| `GpuDriver` / `GpuForceDriver` / `gpu_scc.rs` | Legacy one-shot. Do not use for production or benches. |
+| `gpu_hbond_physics.rs` | Physics diagnostics. Still throwaway runtimes — do not grow. |
+
+Gaps inside `GpuDftb` (fix here, do not bypass):
+
+| Gap | Status |
+|-----|--------|
+| W on host from C,ε | **Done.** Same density kernel, `s_k=ε_k`. |
+| `set_coords` → `GpuBatch::from_fragments` | **Done.** In-place `refill_pairs`. |
+| Separate `energy()` + `forces()` double finalize | **`eval(want_forces)`** — one solve. |
+| Neighbor + G on CPU | **Accepted** (per-geometry). Optional later: one GPU kernel, same distance loop. |
+| `orb_atom` not tiled over batch | **Fixed.** Kernels index `[batch][N]`; one copy made replica>0 read garbage (H2O batch=4 \|dE\|~0.20 Ha). |
+| AT / GC / azaindole / replica counts on this object | Via `scripts/test_gpu_dftb_molecules.rhai`, not a new `tests/*.rs`. |
+| `gpu_hbond_physics.rs` throwaway runtimes | Diagnostics only. |
+| FIRE \|F\| vs CPU on this object | Open. |
+
+**Production and all timing** (`--release`, NVIDIA) go through `GpuDftb` driven by `dftb_engine`.
+
+### 0.5 HARD RULE — one engine, scripts as tests (stop new binaries)
+
+The user-facing program is **`dftb_engine`**. A calculation is an input script (`.rhai` now; `.ron` later if we want data-only input). That is also how we test. A test that cannot be a script means the CLI is missing a function — **add the function to `dftb_engine`, do not add a binary.**
+
+**Do not** create any of these for a new molecule, scan, FIRE run, or replica count:
+
+- `rust_dftb/tests/<name>.rs` (each file is a separate cargo test crate / compile target)
+- `rust_dftb/src/bin/<name>.rs`
+- `rust_dftb/examples/<name>.rs`
+
+**Do** this instead:
+
+```
+cargo run --release --bin dftb_engine -- --script rust_dftb/scripts/<case>.rhai --sk-dir $RUST_DFTB_SK_DIR
+```
+
+Existing cargo tests (`parity_*.rs`, `gpu_hbond_physics.rs`, `gpu_dftb.rs` H2O smoke) stay as physics bisects / compile checks. **Do not grow them.** Do not add `gpu_dftb_at.rs`. New AT/GC/azaindole/replica work is a `.rhai` file.
+
+`GpuDftb` is homogeneous: one species template, `batch` identical replicas in one launch. Different molecules = sequential `gpu_new` in the same script (two engines), not AT+GC packed together.
+
+### 0.6 Astra review (2026-09-10) — implement this order
+
+Source: `doc/prokop/reports/2026-09-10_gpu_accuracy_physics_performance_second_review.md`.
+**Dense only here.** Do not edit `rust_dftb/src/methods/sparse/`. Keep H/S/D/C/W in **f32**. Drive via `dftb_engine` + `.rhai`, not a new cargo test. f64 `batched_gemm` stays reverted. f32 Kahan on GEMM is in; it did not remove `δ_CH`.
+
+The review is right on the diagnosis: several different errors were lumped into “f32 floor” (mixer, incomplete SCC, stale diagnostics, output rounding, Jacobi stop). It is **stale** on pipeline items we already closed after the inspect (W on GPU, in-place pairs, `eval(want_forces)`, `orb_atom` tiled over batch).
+
+**Do not** convert matrices to f64. **Do** keep γ' in f64 until a stable rewrite exists.
+
+#### Already done (do not re-open)
+
+- [*] W on GPU, same density kernel as D (`s_k = 1` or `ε_k`)
+- [*] `set_coords` in-place pair refill (no `GpuBatch::from_fragments` / SK re-pack)
+- [*] `eval(want_forces)` — one finalize, not `energy()` then `forces()`
+- [*] `orb_atom` length `[batch][N]` (replica>0 was OOB)
+- [*] Neighbor list + G on CPU accepted (per-geometry)
+- [*] AT/GC/azaindole + replica counts via `scripts/test_gpu_dftb_molecules.rhai`
+- [*] γ' force kernel is an f64 island (`gamma_prime_full_f32`)
+- [ ] f64 `batched_gemm` — tried, **reverted**; do not re-enable without frozen-H evidence
+
+#### Package 1 — contracts + cheap f64 (do first)
+
+Honest numbers, then the two cheap precision islands. Matrices stay f32.
+
+NVIDIA RTX 3090 `--release`, `scripts/test_gpu_dftb_molecules.rhai`, 2026-09-10. Mixer RMS is now `√(Σres²/n_atoms)` (was L2). Do not retune physics to match old L2.
+
+| case | mixer rms | iters | stall | E (f64 Ha) | q_rms (finalize) | q_max | max\|F\| |
+|------|-----------|-------|-------|------------|------------------|-------|----------|
+| H2O×1 | 8.881e-7 | 19 | no | −4.076143626124 | 1.177e-6 | 1.907e-6 | 6.85e-2 |
+| H2O×4 | 8.881e-7 | 19 | no | bit-identical replicas | 1.177e-6 | 1.907e-6 | 6.85e-2 |
+| AT×1/×2 | 1.680e-6 | 25 | yes | −44.626055076718 | 9.435e-7 | 1.907e-6 | 8.49e-2 |
+| GC | 1.436e-6 | 25 | yes | −44.921077474952 | 1.572e-6 | 5.245e-6 | 7.64e-2 |
+| azaindole | 6.203e-7 | 12 | no | −38.090388506651 | 6.445e-7 | 1.431e-6 | 2.83e-2 |
+
+H2O DIIS: GPU hist is now `min(10,n_atoms)` (H2O=3 → 6 SCC iters, one leftover pivot fallback). Cap-history on the kernel is done; AT stall is not (hist already 10).
+
+- [*] **f64 energy out** — `eval` / `energy_from_state` keep the total in f64 (band sum already f64; do not cast to f32 before adding E_rep or returning). Print Ha in f64 from `dftb_engine`.
+- [*] **Finalize proves charges** — after D, Mulliken → `q_D`. Print `max|q_D−q_in|` and true RMS (`/√n_atoms` vs current L2). Do not call the state “converged” from mixer rms alone.
+- [*] **Stale `E_h0` diagnostic** — `plan.tr` is `q0·V`, not `Tr(D·H0)`. Do not grow `gpu_hbond_physics.rs`. New prints live in `gpu_eval`.
+- [*] **DIIS, same kernel** — (1) first two history points: α-mix, not 1-vector DIIS. (2) residual **RMS** = `√(Σres²/n_atoms)` so `tol` matches CPU. (3) Gram + tiny GE in **f64**, scale Gram before the 1-constraint. (4) small pivot / non-finite / `|Σc−1|>tol` → explicit simple-mix + print, **never** silent `c_i=0`. (5) host max(rms) fails on NaN.
+- [*] **`set_coords` resets DIIS** — charges may warm-start; residual history must not.
+- [*] **Overlap λ_min** — after `X=S^{-1/2}`, fail loud if λ≤0 or λ too small (today `rsqrt(max(λ,1e-7))` hides it).
+- [*] **No `U=0.4` fallback** — missing onsite Hubbard fails with species.
+- [*] **Occupation** — reject odd/charged systems; do not round `Σq0/2` into a different molecule.
+
+#### Package 2 — mixer experiment, then arithmetic (only after Package 1 prints exist)
+
+Measured 2026-09-10 NVIDIA 3090 `--release`, `scripts/test_gpu_dftb_measure.rhai`.
+
+- [*] Frozen-H: GPU-rounded `H_scc`/`S`, host Löwdin+GEVP vs GPU Jacobi. H2O `max|δε_occ|=2.09e-7` `||HC−SCε||=2.78e-7`; AT `max|δε_occ|=1.35e-6` `||HC−SCε||_occ=1.02e-6`. Not “SCC then compare ε”.
+- [*] Mixer A/B on unchanged kernels (H2O): GPU DIIS **hist=3, 6 it** `|dE_CPU|=4.0e-7`; GPU simple 28 it; host f64 DIIS 17 it. AT GPU DIIS still stalls 25 it (hist=10).
+- [*] H2O **forces vs CPU** on `GpuDftb` (full SCC→F): `max|F_gpu−F_cpu|=1.53e-6` (`max|F|=6.85e-2`).
+- [*] Relative `ΔE` formic dimer z-scan: `|ΔE_gpu−ΔE_cpu|` up to **1.54e-5 Ha** — absolute bias does not reliably cancel.
+- [*] AT `δ_eig=4.62e-5` splits as `δ_CH=4.56e-5` + `δ_D=5.9e-7` (`||D−2CCᵀ||_F=1.2e-6`). Not `Tr(DH)` Kahan. `rms(q_D−q_cpu)=6.1e-6`.
+- [*] **Löwdin Newton** once per geometry (`gpu_scc_plan.rs::repair_lowdin_x`): `M=XᵀSX=I+E` → `X←X(I−E/2)`, skip if `e1≥e0`. AT `||XᵀSX−I||` 2.9e-6→2.0e-7; `||CᵀSC−I||` 5.0e-6→2.1e-6. Formic `|ΔΔE|` 1.54e-5→**4.6e-6**. `δ_CH` **not** reduced (leftover is `||C'ᵀC'−I||~2e-6`).
+- [*] **f32 Kahan** in `batched_gemm` (compensation across K; not f64 GEMM). H2O/formic **bit-identical** to Newton-only. AT `δ_CH` 4.71e-5→5.03e-5 (not better); `|dE|` 3.36e-5→2.79e-5 (cancellation); still stall 25. No DIIS blowup.
+
+Numbers after Newton+Kahan (NVIDIA 3090 `--release`): H2O `|dE|=5.4e-7` 8 it; AT `|dE|=2.79e-5` `δ_CH=5.03e-5` `max|δε_occ|=1.07e-6` `max|F_diff|=4.4e-6`. SSOT table: `f32_floor_dense_hbond.md` §3.1.
+
+#### Package 3 — engine honesty (not “f32”)
+
+- [ ] Jacobi: surface residual / stop reason; do not treat a zeroed off-diagonal as a solved eigenproblem.
+- [ ] FIRE: Bitzek mix uses `|v|`, not `|F|`; per-replica `dt/α` (today all replicas share one FIRE state).
+- [ ] `md_step` is not velocity-Verlet (missing half-kick). Rename or fix; do not document as MD.
+- [ ] `relax` returns **final** rms, not the first SCC’s; do not ignore `stalled`.
+- [ ] Optional: fuse neighbor+G in one GPU kernel (same O(n²) distances).
+- [ ] Profile tiled Jacobi f64 inner sweeps before touching them (already a large f64 island).
+
+#### Sparse (other agent — listed so we do not “fix f32” there by accident)
+
+- [ ] `run_scc` is not an SCC loop; `purify_h` rebuilds Z every iter
+- [ ] Host dense W from K; TC2 idempotency without trace
+- [ ] NS `||ZS−I||` reverification
+- [ ] Gate G / Hessian: stopping error vs arithmetic; fixture is not tetrahedral
+
+#### Explicitly out of this pass
+
+Interpolator extra-control **fitter** (`sk_interpolation.md`). On-device γ value rewrite. All-f64 matrices. New `tests/*.rs`.
+
 
 ---
 
 ## 1. Goal
+
 
 Build a **production-grade** GPU pipeline that screens large numbers of
 hydrogen-bonded tautomerization configurations (nucleobase-pair-like systems)
@@ -158,17 +358,19 @@ The phantom formula is the pattern to generalize. The zero-sample pad is only a 
 
 **Measured (mio-1-1, RTX 3090, `tests/gpu_hbond_physics.rs`):** H–H at 10.00 Bohr Hss `2e-22`; at 10.39 Bohr exact 0. AT/GC/H2O GPU vs CPU max|dH| `8.6e-8` / `7.4e-8` / `4.4e-8`. CPU analytic F vs FD of energy (h=1e-3 Å) rel `1.05e-5`. GPU four force kernels vs CPU rel `~3e-5`.
 
-#### 3.0.1 AT/GC GPU SCC rms `~1e-5` — f32 floor hypothesis (not a proven bug)
+#### 3.0.1 AT/GC GPU SCC rms `~1e-5` — f32 floor (scale now measured)
 
-Observation: GPU SCC on AT/GC (N=87/86) does not reach charge-rms `<1e-6` in 500 steps; it plateaus `~1e-5`. CPU f64 on the **same** H/S goes to `~1e-9` in ~20 steps. H/S GPU vs CPU already matches (`max|dH|~1e-7`), so this is **not** the interpolator.
+Observation: GPU SCC on AT/GC (N=87/86) plateaus charge-rms `~7e-6`. CPU f64 on the **same** H/S goes to `~1e-9` in ~20 steps. H/S GPU vs CPU matches (`max|dH|~3e-7`). Occupation is correct (49/49), HOMO–LUMO gap `0.124` Ha both sides.
 
-**Hypothesis (do not treat as a mixer/Jacobi failure until checked):** this is the f32 dynamical range.
+**Measured scale (AT, mio-1-1):** `max|H0|=0.88` Ha (not ~100). f32 ε×|H| `~1e-7`. Charge rms `~7e-6` is consistent with that.
 
-- f32 relative rounding is `~1e-7` (machine ε) to `~1e-8` after a well-conditioned chain. Take `~1e-8` as the optimistic relative floor.
-- Hamiltonian / potential entries of order `~100` are normal (e.g. ~100 eV electron–nuclei / onsite-scale `H_ij` near `r=0`; equivalently a few Hartree). Absolute noise is then `100 × 1e-7 … 1e-8` **`= 1e-5 … 1e-6`**.
-- Charge rms `~1e-5` is therefore **consistent with f32**, not evidence that DIIS or tiled Jacobi is stuck. CPU f64 (ε `~1e-16`) can honestly go to `1e-9`; GPU f32 cannot.
+**Energy split (AT), not a mixer bug:**
+- `½Δq·V` GPU vs CPU `2.9e-6` (fine).
+- `Tr(D·H0)` was `7.1e-5` off — `max|D_gpu−D_cpu|=6.7e-6`. Host f64 `Tr` of the same D recovers the GPU kernel to `1e-6` (reduction is not the 7e-5). f64-D from GPU C does not help: the error is in **C / ε**, not the density contraction.
+- Band identity `E = 2Σ_{occ}ε − ½Δq·V − q0·V` holds on CPU to `5e-10`. `GpuSccPlan::compute_energy` now uses it. AT `|dE|` drops `6.8e-5 → 2.6e-5`. H2O stays `3e-7`.
+- Remaining `|dE|~3e-5` Ha is **`δ_CH`** (`E_band−2ΣCᵀHC`), not frozen `max|δε_occ|~1e-6` and not `max|δε|=2.5e-5` from SCC-then-compare. See §0 Package 2 and `f32_floor_dense_hbond.md` §3.1. f64 acc in `batched_gemm` was tried and **reverted**. f32 Kahan on GEMM is in and does **not** cut `δ_CH`.
 
-Do **not** chase rms `<1e-6` on f32 AT/GC by loosening the mixer or the test. First check the scale: print `max|H|`, `max|S|`, onsite, energy, and whether rms is a plateau vs a slow drift. If energy vs CPU is already at f32-noise and charges oscillate at `1e-5`, the production contract for N~90 f32 SCC is rms `~1e-5`, not `1e-6`. H2O (N=6, smaller `|H|` span) already reaches `~1e-7` — that does not contradict a larger-system floor.
+**Accepted as the N~90 `δ_CH` floor until Jacobi `C'` is repaired.** Honest test contract (`gpu_hbond_physics.rs` G3.4): H2O `|dE|<1e-5` (measured ~5e-7); AT/GC `|dE|<1e-4` is a **regression / bug line**, not f64 parity. Print `FLOOR`. Do **not** chase rms `<1e-6`. Do not require AT `|dE|<1e-5`. Kahan on `Tr(D·H0)` will **not** move F3. f32 GEMM Kahan did **not** move `δ_CH`. See `f32_floor_dense_hbond.md` §3.1.
 
 ### 3.1 GPU multi-system SCC solver (N≤64, dense)
 
@@ -1057,7 +1259,7 @@ Do **not** require monotonic SCC residual or monotonic FIRE energy/force.
 - [ ] General N>64 S⁻¹/² reconstruction.
 - [ ] Device occupation/index selection.
 - [ ] Build P and W on GPU (W required later by forces).
-- [~] AT/GC/azaindole SCC: H/S matches; GPU charge-rms plateaus `~1e-5`. **Hypothesis: f32 floor** (manifest §3.0.1), not a proven mixer bug. Do not chase `<1e-6` until `max|H|` scale is checked.
+- [~] AT/GC/azaindole SCC: see **§0 Package 2** (not this stale occupied-ε line). Frozen `max|δε_occ|~1e-6`; `|dE|` is `δ_CH`. G3.4 AT/GC asserts `|dE|<1e-4` (regression), not `<1e-5`. SSOT `f32_floor_dense_hbond.md` §3.1.
 - [ ] Fixed-geometry relative PES parity tests.
 
 Optional only after the baseline works:
@@ -1068,13 +1270,22 @@ Optional only after the baseline works:
 
 - [~] CPU analytic H/S derivatives vs FD of the same B-spline — pass (`gpu_hbond_physics.rs`, H–H rel `8.6e-10`). Remaining: replace blunt zero-sample pad with fitted extra controls (`sk_interpolation.md`).
 - [~] CPU total analytic forces vs FD of energy — H2O rel `1.05e-5`. Fortran force parity (`parity_forces.rs`) is older; re-check after the extra-control fitter, not by restoring Neville.
-- [~] Port to OpenCL — H2O four components vs CPU rel `~3e-5`. `vload2` fixed the 1×4 NVIDIA crash. Gamma' and repulsive' are in the same test.
+- [~] Port to OpenCL — H2O/AT/GC four components vs CPU (CPU-fed P/W). H2O TOTAL rel `2.1e-5`. AT/GC gamma' was 1% off: OpenCL f32 `Ua≠Ub` S' cancels two O(10³) terms (mio N–H ΔU≈0.011); kernel now evaluates γ' in f64 (`gpu_forces.cl::gamma_prime_full_f32`). After that: AT/GC gamma rel `4e-7`, TOTAL rel `~4e-5`. Same f32 VALUE cancellation still lives in `dftb_hamiltonian.cl::gamma_full` (on-device γ); the AT SCC test uploads host f64→f32 γ so that is not the |dE| path.
 - [~] Pairwise on-the-fly P/W contraction — H2O full-chain GPU P then forces rel `3.4e-5`.
-- [~] GPU-vs-CPU force parity + Newton — H2O pass. AT/GC forces not yet, because GPU SCC rms plateaus `~1e-5` (f32-floor hypothesis, §3.0.1).
+- [~] GPU-vs-CPU force parity + Newton — H2O/AT/GC four-component tests pass (`test_force_four_components_*`). AT/GC **GPU SCC** plateaus rms `~7e-6`, `|dE|~2.6e-5` (eigen floor, §3.0.1 / `f32_floor_dense_hbond.md`). Four-component forces (CPU-fed P/W) are not full-chain FIRE-ready.
 
-### Phase 5 — Device-resident constrained FIRE relaxation
+### Phase 5 — Production GPU lifetime + FIRE (must-build)
 
-- [ ] GPU FIRE state and update.
+**The run loop is `GpuDftb`.** CPU already has `DftbCpu`. GPU: `qmqm/gpu_dftb.rs`. See §0.4.
+
+- [x] **`GpuDftb`** — one persistent object. Drive via `dftb_engine` + `.rhai` (§0.5). `tests/gpu_dftb.rs` is H2O smoke only — do not add more cargo tests.
+- [x] **W on device** — `build_density_masked_batched` per-MO scale (`1` → D, `ε_k` → W). Same kernel.
+- [x] **`set_coords` in-place pairs** — no `GpuBatch::from_fragments`. Fill `pair_staging`. Fail loud if `n_pairs > pair_cap` or a new (block, species) slot.
+- [x] **`eval(want_forces)`** — one finalize; energy always, forces optional. `energy()`/`forces()` are wrappers.
+- [ ] **Optional:** fuse neighbor list + G into one GPU kernel (same O(n²) distances). CPU is fine until profiled.
+- [~] AT / GC / azaindole / replica counts — `scripts/test_gpu_dftb_molecules.rhai` (not a new `tests/*.rs`).
+- [~] Four force kernels + repulsive already on `GpuDftb`. After W-on-GPU: F from device P,W.
+- [~] GPU FIRE / MD — exists; 0.1 Å cap. Not done until \|F\| vs CPU on this object.
 - [ ] Scalar proton-transfer reaction-coordinate constraints.
 - [ ] Constraint Jacobian, projected force/velocity, and position correction.
 - [ ] Convergence on projected force + constraint residual.

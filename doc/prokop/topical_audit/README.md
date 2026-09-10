@@ -22,7 +22,8 @@ implementations of the same concept across Rust, Fortran, Python, and OpenCL.
   and DFTB+ reference. Sign convention documentation.
 - **gpu_scc_pipeline.md** — device-resident GPU SCC loop (gamma matvec, H_scc
   update, GEMM, Jacobi, density, Mulliken, DIIS). Batched homogeneous templates,
-  warm-start, best-effort mode. 1D/2D formic dimer scan validation.
+  warm-start, best-effort mode. 1D/2D formic dimer scan validation. Analytic GPU
+  forces in `qmqm/gpu_forces.rs`/`.cl` (1×4 crash fixed by `vload2`).
 - **wavefunction_projection.md** — projecting MOs onto a real-space grid using
   pyBall OpenCL GridProjector + STO basis. Rust eigenvectors → 2D contour plots.
 - **sk_interpolation.md** — SK radial interpolation. Production is C² cubic
@@ -30,11 +31,13 @@ implementations of the same concept across Rust, Fortran, Python, and OpenCL.
   tail removed (it exploded on H–H). Stopgap = blunt extra zero *samples* on
   the right + phantom control on the left. Next: general extra-control fitter
   (solve for pad points; do not hardcode zeros).
-- **gpu_scc_pipeline.md** — device-resident GPU SCC loop; also lists the Phase 4
-  analytic GPU force work in `qmqm/gpu_forces.rs`/`.cl` and its current blocker
-  (real-SK H2O 1×4 crash).
+- **f32_floor_dense_hbond.md** — dense H-bond GPU: bugs vs method stopgaps vs
+  measured floors. Package 2: AT `|dE|` tracks `δ_CH` (band vs `CᵀHC`), not
+  frozen `δε_occ` (~1e-6). Löwdin Newton kept; f32 GEMM Kahan did not cut `δ_CH`.
+  Honest two-tier test contract. Do not require AT `|dE|<1e-5`.
+- **f32_floor_sparse.md** — sparse BSR4 Si/H: bugs (device NS N4) vs SK-q0
+  misconception vs interpolator fitter vs **missing SparseDftb pipeline** vs
+  measured Hessian floor (Gate G \|\|ΔH\|\|_F/\|\|H\|\|_F ≈ 0.11%). Manifest §0.
 - **sparse_nanocrystal_vibrations.md** — sparse GPU DFTB for vibrational
-  calculations on Si/H nanocrystals. BSR4 padded basis, analytic forces, SpGEMM
-  plans, locality sweeps, Hessian plateau. Gates C–E passed; Gate F blocked on
-  sparse analytic force bridge. See
-  `tasts/Sparse_Nanocrystal_Vibrations/Sparse_Nanocrystal_Vibrations.report.md`.
+  calculations on Si/H nanocrystals. See
+  `tasts/Sparse_Nanocrystal_Vibrations/Sparse_Nanocrystal_Vibrations.manifest.md` §0.

@@ -985,6 +985,119 @@ pub fn parse_all_repulsive(
     Ok(out)
 }
 
+/// Pack repulsive splines into the GPU kernel record layout
+/// (`gpu_matrix_ops.cl::repulsive_energy_batched`, `gpu_forces.cl::force_repulsive_batched`).
+///
+/// `tables` is `n_species × n_species` in the same order as GPU `atom_species`.
+/// Fails loud if any species pair has no Spline (silent skip would drop E_rep / F_rep).
+pub fn pack_repulsive_gpu(tables: &[Option<RepulsiveSpline>], n_species: usize, species_names: &[String]) -> Result<(Vec<i32>, Vec<f32>, usize)> {
+    if tables.len() != n_species * n_species {
+        return Err(DftbError::InvalidInput(format!(
+            "pack_repulsive_gpu: tables.len()={} != n_species² {n_species}²", tables.len()
+        )));
+    }
+    if species_names.len() != n_species {
+        return Err(DftbError::InvalidInput(format!(
+            "pack_repulsive_gpu: species_names.len()={} != n_species={n_species}", species_names.len()
+        )));
+    }
+    let mut max_int = 1usize;
+    for (p, s) in tables.iter().enumerate() {
+        match s {
+            Some(sp) => { max_int = max_int.max(sp.x_start.len()); }
+            None => {
+                let i = p / n_species; let j = p % n_species;
+                if tables[j * n_species + i].is_none() {
+                    return Err(DftbError::InvalidInput(format!(
+                        "pack_repulsive_gpu: no Spline for {}-{}", species_names[i], species_names[j]
+                    )));
+                }
+            }
+        }
+    }
+    let rec = 5 + max_int + (max_int.saturating_sub(1)) * 4 + 6;
+    let mut offsets = vec![-1i32; n_species * n_species];
+    let mut data = Vec::new();
+    for (p, s) in tables.iter().enumerate() {
+        let Some(sp) = s else { continue };
+        offsets[p] = data.len() as i32;
+        let n_int = sp.x_start.len();
+        data.push(f32::from_bits(n_int as u32));
+        data.push(sp.cutoff as f32);
+        data.push(sp.exp_coeffs[0] as f32);
+        data.push(sp.exp_coeffs[1] as f32);
+        data.push(sp.exp_coeffs[2] as f32);
+        for k in 0..max_int { data.push(if k < n_int { sp.x_start[k] as f32 } else { 0.0 }); }
+        let n_cubic = max_int.saturating_sub(1);
+        for k in 0..n_cubic {
+            if k < sp.sp_coeffs.len() {
+                for c in 0..4 { data.push(sp.sp_coeffs[k][c] as f32); }
+            } else {
+                for _ in 0..4 { data.push(0.0); }
+            }
+        }
+        for c in 0..6 { data.push(sp.sp_last_coeffs[c] as f32); }
+        if data.len() - offsets[p] as usize != rec {
+            return Err(DftbError::InvalidInput(format!(
+                "pack_repulsive_gpu: record length {} != {rec} at pair {p}", data.len() - offsets[p] as usize
+            )));
+        }
+    }
+    Ok((offsets, data, max_int))
+}
+
+/// DFTB repulsive pair energy (Hartree) for a geometry in Å.
+///
+/// Fail-loud: a pair that appears in the molecule must have a Spline section
+/// in the SK file. Silent `continue` on a missing spline would drop E_rep
+/// (Gate F collapsed SiH4 to 0.93 Å for exactly that class of omission).
+pub fn repulsive_energy(
+    sk_dir: &str,
+    species: &[String],
+    coords: &[[f64; 3]],
+) -> Result<f64> {
+    assert_eq!(species.len(), coords.len(), "repulsive_energy: species/coords length mismatch");
+    let mut names: Vec<String> = Vec::new();
+    for s in species {
+        if !names.iter().any(|n| n == s) {
+            names.push(s.clone());
+        }
+    }
+    let n_species = names.len();
+    let tables = parse_all_repulsive(sk_dir, &names, n_species)?;
+    let atom_sp: Vec<usize> = species.iter().map(|s| {
+        names.iter().position(|n| n == s).unwrap_or_else(|| panic!("species {s} missing from unique list {names:?}"))
+    }).collect();
+    let n = coords.len();
+    let mut e_rep = 0.0f64;
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let si = atom_sp[i];
+            let sj = atom_sp[j];
+            let spline = tables[si * n_species + sj].as_ref()
+                .or(tables[sj * n_species + si].as_ref())
+                .ok_or_else(|| DftbError::InvalidInput(format!(
+                    "no repulsive Spline for {}-{} in {sk_dir}", species[i], species[j]
+                )))?;
+            let dx = coords[j][0] - coords[i][0];
+            let dy = coords[j][1] - coords[i][1];
+            let dz = coords[j][2] - coords[i][2];
+            let r2 = dx * dx + dy * dy + dz * dz;
+            if r2 < MIN_NEIGH_DIST * MIN_NEIGH_DIST {
+                return Err(DftbError::InvalidInput(format!(
+                    "repulsive_energy: atoms {i}-{} on top of each other, |r|={:.3e} Å", j, r2.sqrt()
+                )));
+            }
+            let (e, _) = spline.eval(r2.sqrt() * ANG2BOHR);
+            if !e.is_finite() {
+                panic!("repulsive_energy: non-finite E_rep for {}-{} at r={:.4} Å: {e}", species[i], species[j], r2.sqrt());
+            }
+            e_rep += e;
+        }
+    }
+    Ok(e_rep)
+}
+
 /// Sanity check: assert no NaN/Inf in the force array (fail-loud).
 pub fn check_finite(forces: &[[f64; 3]], label: &str) {
     for (i, f) in forces.iter().enumerate() {
@@ -1160,6 +1273,83 @@ pub fn compute_scc_forces(
     check_finite(&out.forces, "SCC total");
     check_newton(&out.forces, "SCC total", 1e-6);
 
+    Ok(out)
+}
+
+/// Four DFTB force components from caller-supplied `D` and `W` (Hartree/Å).
+///
+/// Used by the sparse path (`D = 2K`, `W = 2 K H_scc K`) and by tests that
+/// already have dense eig `D`/`W`. Does **not** diagonalize. Same contraction
+/// as `compute_scc_forces` (`non_scc_electronic_force` + `scc_shift_force` +
+/// `scc_double_counting_force` + `repulsive_force_cached`).
+///
+/// The H-bond GPU kernels in `qmqm/gpu_forces.cl` implement the same formulas
+/// for the dense multi-system path. That file is a separate in-progress
+/// codepath — do not merge until both sparse and H-bond forces are tested.
+pub fn compute_forces_from_dw(
+    sk: &SkData,
+    species: &[String],
+    coords: &[[f64; 3]],
+    dm: &DMatrix<f64>,
+    edm: &DMatrix<f64>,
+    q: &[f64],
+    q0: &[f64],
+    sk_dir: &str,
+) -> Result<Forces> {
+    let n_atoms = species.len();
+    assert_eq!(coords.len(), n_atoms);
+    assert_eq!(q.len(), n_atoms);
+    assert_eq!(q0.len(), n_atoms);
+    let ctx = SystemContext::from_sk_data(sk, species)?;
+    if dm.nrows() != ctx.n_orbs || dm.ncols() != ctx.n_orbs {
+        return Err(DftbError::InvalidInput(format!(
+            "compute_forces_from_dw: D is {}×{}, ctx.n_orbs={}",
+            dm.nrows(), dm.ncols(), ctx.n_orbs
+        )));
+    }
+    if edm.nrows() != ctx.n_orbs || edm.ncols() != ctx.n_orbs {
+        return Err(DftbError::InvalidInput(format!(
+            "compute_forces_from_dw: W is {}×{}, ctx.n_orbs={}",
+            edm.nrows(), edm.ncols(), ctx.n_orbs
+        )));
+    }
+    let cutoff = sk.pairs.values().map(|t| t.cutoff()).fold(0.0_f64, f64::max);
+    let neigh = NeighborBuilder { cutoff }.build(coords)?;
+    let mut out = Forces::zeros(n_atoms);
+    non_scc_electronic_force(&ctx, &neigh, coords, dm, edm, &mut out.non_scc)?;
+    let gamma_tbl = GammaTable::from_sk_data(sk, species)?;
+    let delta_q: Vec<f64> = q.iter().zip(q0.iter()).map(|(qi, q0i)| qi - q0i).collect();
+    let shifts = compute_atom_shifts(coords, &ctx.atom_species, &delta_q, &gamma_tbl);
+    scc_shift_force(&ctx, &neigh, coords, dm, &shifts, &mut out.scc_shift)?;
+    scc_double_counting_force(coords, &ctx.atom_species, &delta_q, &gamma_tbl, &mut out.scc_dc);
+    let mut names: Vec<String> = Vec::new();
+    for s in species {
+        if !names.iter().any(|n| n == s) {
+            names.push(s.clone());
+        }
+    }
+    let repulsive = parse_all_repulsive(sk_dir, &names, names.len())?;
+    for i in 0..n_atoms {
+        for j in (i + 1)..n_atoms {
+            let si = ctx.atom_species[i] as usize;
+            let sj = ctx.atom_species[j] as usize;
+            let nsp = names.len();
+            if repulsive[si * nsp + sj].is_none() && repulsive[sj * nsp + si].is_none() {
+                return Err(DftbError::InvalidInput(format!(
+                    "compute_forces_from_dw: no repulsive Spline for {}-{} in {sk_dir}",
+                    species[i], species[j]
+                )));
+            }
+        }
+    }
+    repulsive_force_cached(coords, &ctx, &repulsive, &mut out.repulsive)?;
+    for i in 0..n_atoms {
+        for c in 0..3 {
+            out.forces[i][c] = out.non_scc[i][c] + out.scc_shift[i][c] + out.scc_dc[i][c] + out.repulsive[i][c];
+        }
+    }
+    check_finite(&out.forces, "forces_from_dw total");
+    check_newton(&out.forces, "forces_from_dw total", 1e-6);
     Ok(out)
 }
 

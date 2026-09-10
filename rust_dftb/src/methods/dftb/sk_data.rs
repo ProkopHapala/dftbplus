@@ -141,7 +141,7 @@ impl SkTableSp {
     }
 
     /// Evaluate shell integrals AND their radial derivatives dV/dr at distance r.
-    /// Uses analytic Hermite spline derivatives — no finite differences.
+    /// Uses analytic C² B-spline V' (same controls as V) — not Hermite, not FD.
     /// Returns n_mm (number of magnetic quantum numbers = l_min+1).
     /// out_h, out_s: values [n_mm]
     /// dh_dr, ds_dr: radial derivatives [n_mm]

@@ -340,7 +340,7 @@ fn map_ocl_err(err: ocl::Error) -> DftbError {
 /// replica and orbital; everything else stays 0.0. This matches the CPU
 /// reference `HamiltonianBuilder::build_non_scc`, which initializes
 /// `s = DMatrix::identity(n_orbs, n_orbs)` before filling off-diagonal pairs.
-fn build_s_identity_init(fragments: &[GpuFragment], total_h: usize) -> Vec<f32> {
+pub(crate) fn build_s_identity_init(fragments: &[GpuFragment], total_h: usize) -> Vec<f32> {
     let mut s = vec![0.0f32; total_h];
     for frag in fragments {
         let n = frag.n_orbs as usize;
@@ -363,7 +363,7 @@ fn build_s_identity_init(fragments: &[GpuFragment], total_h: usize) -> Vec<f32> 
 /// This is needed by the `onsite_diagonal` kernel to avoid writing e_p into
 /// diagonal slots that belong to the next atom (the original kernel
 /// unconditionally wrote 4 entries per atom).
-fn build_n_orb_per_atom(fragments: &[GpuFragment], atom_orb_off: &[i32]) -> Vec<i32> {
+pub(crate) fn build_n_orb_per_atom(fragments: &[GpuFragment], atom_orb_off: &[i32]) -> Vec<i32> {
     let mut out = Vec::with_capacity(atom_orb_off.len());
     for frag in fragments {
         let off = frag.atom_off as usize;

@@ -80,26 +80,40 @@ QM/QM fragment solver with OpenCL GPU offload. Python utilities (`pyBall/`,
   - `sparse/` — BSR4 sparse + GPU sparse purification + partial eigensolver:
     `bsr4.rs`, `gpu_sparse.rs`, `sparse_bsr4_purification.cl`,
     `davidson.rs` (generalized Davidson for `H C = S C ε`, frontier orbitals),
-    `sparse_forces.rs` (P3: sparse D=2K, W=2KHK via masked SpGEMM).
+    `sparse_forces.rs` (P3: sparse D=2K, W=2KHK via masked SpGEMM),
+    `sparse_system.rs` (GPU BSR workspace), **`sparse_dftb.rs`** (production
+    owner: `SparseDftb::new` / `set_coords` / `scc` / `forces` / `fire_step` /
+    `md_step` / `relax` — compile once, persistent buffers). Drive with
+    **`dftb_engine --script rust_dftb/scripts/test_sparse_dftb_sih4.rhai`**
+    (userguide `sparse_dftb.md`). Smoke: `tests/sparse_dftb.rs`. Physics gates
+    G3/F/G still use `scc.rs` (allocating).
 - `src/qmqm/` — multi-fragment QM/QM solver + GPU runtime: `fragment.rs`,
   `solver.rs`, `mixer.rs`, `shifts.rs`, `gamma.rs`, `charges.rs`,
   `gpu_driver.rs`, `gpu_runtime.rs`, `gpu_matrix.rs`, `gpu_prep.rs`,
-  `gpu_eigen.rs`/`.cl`, `gpu_matrix_ops.cl`, `gpu_scc.rs` (device-resident
-  SCC loop driver with DIIS, warm-start, best-effort mode, per-system RMS
-  diagnostics), `gpu_forces.rs`/`.cl` (analytic GPU forces; H2O vs CPU rel ~3e-5).
-  SK interpolator: `doc/prokop/topical_audit/sk_interpolation.md`. H-bond tests:
-  `rust_dftb/tests/gpu_hbond_physics.rs`.
-- `src/bin/` — executables: `dftb_engine.rs`, `graphene_build.rs`.
-- `examples/` — runnable demos: `hbond_ref.rs`, `scan.rs`, `neb.rs`, `test_h2.rs`,
-  `debug_h2.rs`, `debug_sk.rs`.
-- `tests/` — Rust integration tests: `parity_*.rs` (vs Fortran), `gpu_*.rs`,
-  `qmqm_integration.rs`, `xtb_parity.rs`, `scan.rs`, `formic_scan_plots.rs`
-  (1D/2D proton-transfer scan with plotting, `--ignored`), `hbond_gpu_scc.rs`
-  (H-bond GPU SCC parity) + Python runners (`run_parity.py`, `run_scc_full.py`,
-  `run_forces.py`).
+  `gpu_eigen.rs`/`.cl`, `gpu_matrix_ops.cl`, `gpu_scc.rs` (legacy one-shot SCC;
+  do not use for production), `gpu_scc_plan.rs` (persistent SCC inner loop),
+  `gpu_dftb.rs` (**production run loop** — `GpuDftb::new` / `set_coords` / `scc` /
+  **`eval(want_forces)`** / `fire_step` / `md_step`; compile once, reuse buffers),
+  `gpu_forces.rs`/`.cl` (analytic GPU forces; H2O vs CPU rel ~3e-5).
+  Drive it with **`dftb_engine --script rust_dftb/scripts/*.rhai`** (see
+  `scripts/test_gpu_dftb_molecules.rhai`). Do **not** add a new cargo test /
+  `src/bin` / `examples/` target per molecule. `tests/gpu_dftb.rs` is H2O smoke
+  only. Diagnostics still in `rust_dftb/tests/gpu_hbond_physics.rs` (throwaway
+  runtimes — not the product). SK interpolator:
+  `doc/prokop/topical_audit/sk_interpolation.md`. f32 floor vs bugs (dense):
+  `doc/prokop/topical_audit/f32_floor_dense_hbond.md`. Sparse floor vs pipeline:
+  `doc/prokop/topical_audit/f32_floor_sparse.md`.
+- `src/bin/` — executables: **`dftb_engine.rs`** (the user CLI; Rhai scripts are
+  the tests), `graphene_build.rs`. Do not add a binary per scenario.
+- `examples/` — leftover demos (`hbond_ref.rs`, `scan.rs`, …). New runs go through
+  `dftb_engine`, not a new example.
+- `tests/` — Rust integration tests: `parity_*.rs` (vs Fortran), physics bisects
+  (`gpu_hbond_physics.rs`). **Do not grow this list for new molecules.**
+- `scripts/` — **Rhai test/user scripts** (e.g. `test_gpu_dftb_molecules.rhai`,
+  `test_sparse_dftb_sih4.rhai`, `test_graphene_sparse.rhai`). Run:
+  `cargo run --release --bin dftb_engine -- --script scripts/<file>.rhai --sk-dir …`.
 - `tools/` — crate-local Python tools: `sk_compress/` (SK table compression),
   `make_diatomic_hsd.py`, `run_dftbcore_dump.py`.
-- `scripts/` — Rhai test scripts (e.g. `test_graphene_sparse.rhai`).
 
 ## `doc/` — documentation
 
@@ -126,10 +140,14 @@ QM/QM fragment solver with OpenCL GPU offload. Python utilities (`pyBall/`,
     `2025-09-06_gpu_hs_assembly_bugfix.md`,
     `2025-09-06_scan_plots_and_gamma_fix.md`,
     `2025-09-06_gpu_scc_benchmarks.md`).
-  - `topical_audit/` — cross-implementation topic maps (one `.md` per topic:
+  - `userguide/` — **user-facing CLI docs.** Start with
+    `userguide/dftb_engine.md` (one binary, `.rhai` scripts, dense `gpu_*`) and
+    `userguide/sparse_dftb.md` (same binary, sparse `sparse_*`). Not agent notes.
+    Dense GPU: `gpu_scc_pipeline.md`, `sk_interpolation.md`,
+    `f32_floor_dense_hbond.md` (bugs vs arithmetic floor). Also
     `davidson_eigensolver.md`, `eigensolver_performance.md`,
     `sparse_tc2_purification.md`, `dftbplus_parity_harness.md`,
-    `scc_mulliken_charges.md`).
+    `scc_mulliken_charges.md`.
 
 ## Folder & artifact policy (concise)
 

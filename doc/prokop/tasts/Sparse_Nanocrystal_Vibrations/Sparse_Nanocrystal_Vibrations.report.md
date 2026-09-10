@@ -283,3 +283,32 @@ self-consistent sparse model (Phase B).
 | `Cargo.toml` | P0: `sparse_firewall` feature |
 
 ### Not committed, not pushed.
+
+---
+
+## Lab notebook — 2026-09-10 (SparseDftb + CLI)
+
+Appended here so we do not lose the numbers. Manifest **§0.7** is the short
+table. User guide: `doc/prokop/userguide/sparse_dftb.md`.
+
+**Product shape:** one binary `dftb_engine`. Dense jobs = `gpu_*`. Sparse jobs
+= `sparse_*` → `SparseDftb`. New molecule = new `.rhai`, not a new Rust target.
+
+**NVIDIA RTX 3090, matsci-0-3, `scripts/test_sparse_dftb_sih4.rhai`:**
+
+- NS `R_Z = 6.265e-8` (7 iters, host ‖I−T‖). n_orbs=8, nocc=4, full mask.
+- SCC E=**−2.76420524 Ha**, 17 mix iters, Tr(KS)=4.000002, max\|F\|=0.0883 Ha/Å.
+- Reuse SCC: 4 iters, E=−2.76420569 Ha.
+- One FIRE + SCC: E=−2.76442147 Ha. One MD (dt=0.05) + SCC: E=−2.76464354 Ha.
+- Not USER-confirmed; distorted 1.48 Å SiH₄, not a Gate F minimum.
+
+**Allocating-path gates (same morning, `scc.rs`, superseded the same afternoon):**
+G3.2 \|dE_el\|=1.13e-7; G3.3 max\|dF\|=3.7e-6; Gate F FIRE 1.477 Å,
+E=−2.826057; Gate G Hessian rel 0.11%. Kept as history.
+
+**After unification onto `SparseDftb` (same NVIDIA, afternoon):**
+G3.2 \|dE_el\|=3.47e-7; G3.3 max\|dF\|=5.30e-6; G3.4 rel=4.4e-3 (abs 6e-5);
+Gate F 72 steps E=−2.826054 \|F\|=9.3e-4 Si–H 1.477 Å; Gate G rel 0.116%,
+η_asym 3.25e-4. See manifest §0.7.
+
+**Do not quote `cargo test` wall time as GPU performance.**

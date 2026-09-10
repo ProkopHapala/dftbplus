@@ -26,8 +26,19 @@ CARGO_TARGET_DIR=/home/prokophapala/.cargo-target-shared cargo build
 
 ## Run
 
+The program users (and new tests) run is **`dftb_engine`**. A job is a `.rhai`
+script, not a new example or cargo test. Guide:
+[`doc/prokop/userguide/dftb_engine.md`](../doc/prokop/userguide/dftb_engine.md).
+
 ```bash
-# H-bond optimization example (needs SK files):
+export RUST_DFTB_SK_DIR=/path/to/slakos/mio-1-1
+
+cargo run --release --bin dftb_engine -- \
+  --script scripts/test_gpu_dftb_molecules.rhai \
+  --sk-dir "$RUST_DFTB_SK_DIR"
+```
+
+Leftover example (CPU H-bond, not the GPU CLI):
 RUST_DFTB_SK_DIR=/path/to/slakos/mio/mio-1-1 \
 cargo run --example hbond_ref -- \
   --xyz ../data/xyz/formic_azaindole_dimer.xyz \

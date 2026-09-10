@@ -945,13 +945,15 @@ pub fn delta_q_batched(
     Ok(())
 }
 
-/// D = 2·Σ_{k: occ[k]≠0} C[:,k]·C[:,k]^T (closed-shell density with occupation mask).
-/// `C`/`D` are `[batch][N*N]`, `occ_mask` is `[batch][N]` int32 (1=occ, 0=virt).
+/// D = 2·Σ_{k: occ[k]≠0} s_k·C[:,k]·C[:,k]^T. `use_eig=0` → s_k=1 (density);
+/// `use_eig=1` → s_k=ε_k (energy-weighted W). Same kernel. `eig` is `[batch][N]`.
 pub fn build_density_masked_batched(
     rt: &mut GpuRuntime,
     c_buf: &Buffer<f32>,
     occ_mask_buf: &Buffer<i32>,
     d_buf: &Buffer<f32>,
+    eig_buf: &Buffer<f32>,
+    use_eig: i32,
     n: usize,
     batch: usize,
 ) -> Result<()> {
@@ -963,7 +965,7 @@ pub fn build_density_masked_batched(
         .program(&program).name("build_density_masked_batched").queue(rt.queue().clone())
         .global_work_size(batch * wg).local_work_size(wg)
         .arg(n as i32).arg(batch as i32)
-        .arg(c_buf).arg(occ_mask_buf).arg(d_buf)
+        .arg(c_buf).arg(occ_mask_buf).arg(d_buf).arg(use_eig).arg(eig_buf)
         .build().map_err(map_ocl_err)?;
     unsafe { kernel.enq().map_err(map_ocl_err)?; }
     Ok(())

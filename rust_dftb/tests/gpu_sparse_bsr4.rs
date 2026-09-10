@@ -13,7 +13,7 @@
 //!   7. `bsr4_idempotency_partial`  — ||KSK-K||_F for an exact idempotent K
 //!   8. TC2 / McWeeny purification  — convergence from a perturbed K0
 //!
-//! Tests skip gracefully if no OpenCL device is available.
+//! OpenCL Err is a test failure. Skip only if the machine has zero platforms.
 
 use nalgebra::{DMatrix, SymmetricEigen};
 use rust_dftb::methods::sparse::bsr4::{
@@ -23,7 +23,7 @@ use rust_dftb::methods::sparse::bsr4::{
 };
 use rust_dftb::methods::sparse::gpu_sparse::{SparseBsr4Config, SparseBsr4Gpu, SparsePurifyWorkspace};
 use rust_dftb::methods::sparse::gpu_sparse;
-use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
+use rust_dftb::methods::sparse::harness::require_sparse_gpu;
 
 /// Deterministic LCG for reproducible random-ish data.
 struct Rng(u64);
@@ -40,30 +40,8 @@ impl Rng {
     }
 }
 
-/// Try to create a SparseBsr4Gpu; return None if no OpenCL device.
 fn try_gpu() -> Option<SparseBsr4Gpu> {
-    // ocl's Platform::default() panics when the ICD exposes zero platforms,
-    // instead of returning the Result used by SparseBsr4Gpu::new.  Preserve
-    // the test module's documented skip behavior for that one environment
-    // failure, while re-panicking on all unrelated constructor bugs.
-    match catch_unwind(AssertUnwindSafe(|| SparseBsr4Gpu::new(SparseBsr4Config::default()))) {
-        Ok(Ok(g)) => Some(g),
-        Ok(Err(e)) => {
-            eprintln!("Skipping GPU sparse test: no OpenCL device ({e})");
-            None
-        }
-        Err(payload) => {
-            let msg = payload.downcast_ref::<String>().map(String::as_str)
-                .or_else(|| payload.downcast_ref::<&str>().copied())
-                .unwrap_or("non-string panic");
-            if msg.contains("GetPlatformIdsPlatformListUnavailable") {
-                eprintln!("Skipping GPU sparse test: no OpenCL platform ({msg})");
-                None
-            } else {
-                resume_unwind(payload)
-            }
-        }
-    }
+    require_sparse_gpu()
 }
 
 /// Build a Bsr4Matrix from a dense (4N)x(4N) row-major f32 matrix using the
@@ -559,8 +537,8 @@ fn test_tc2_convergence() {
         k = gpu.symmetrize_mat(&knew).unwrap();
     }
     println!("TC2 final ||KSK-K||_F = {prev_idem:e}  Tr(KS)={last_tr:.5}");
-    assert!(prev_idem < 1e-3, "TC2 did not converge: {prev_idem:e}");
-    assert!((last_tr - nocc).abs() < 1e-2, "TC2 trace != Nocc: {last_tr} vs {nocc}");
+    assert!(prev_idem < 1e-5, "TC2 did not converge: {prev_idem:e} (measured ~4e-6; G2)");
+    assert!((last_tr - nocc).abs() < 1e-5, "TC2 trace != Nocc: {last_tr} vs {nocc} (G2)");
 }
 
 // =====================================================================
@@ -712,7 +690,7 @@ fn test_newton_schulz_inverse() {
     let err = dense_max_abs_diff(&z_dense, &s_inv_dense);
     println!("  ||Z - S⁻¹||_max = {err:e}");
     assert!(rz < 1e-3, "Newton-Schulz did not converge: R_Z = {rz:e}");
-    assert!(err < 1e-2, "Z != S⁻¹: max|dZ| = {err:e}");
+    assert!(err < 1e-4, "Z != S⁻¹: max|dZ| = {err:e} (host NS measured 1.1e-5; G2)");
 }
 
 // =====================================================================
@@ -754,9 +732,29 @@ fn test_newton_schulz_inverse_dev() {
 
     let z_dense = z.to_dense();
     let err = dense_max_abs_diff(&z_dense, &s_inv_dense);
-    println!("  ||Z_dev - S⁻¹||_max = {err:e}");
+    // Frozen-input residual of the *same* S the kernel used, in f64 (second review §3.6).
+    let mut zs_m_i = 0.0f64;
+    for i in 0..n {
+        for j in 0..n {
+            let mut acc = 0.0f64;
+            for k in 0..n {
+                acc += z_dense[i * n + k] as f64 * s_dense[k * n + j] as f64;
+            }
+            let t = if i == j { acc - 1.0 } else { acc };
+            zs_m_i += t * t;
+        }
+    }
+    let rz_f64 = zs_m_i.sqrt() / (n as f64).sqrt();
+    println!("  ||Z_dev - S⁻¹||_max = {err:e}  R_Z_kernel={rz:e}  ||ZS−I||_F/√N (f64)={rz_f64:e}");
     assert!(rz < 1e-3, "Newton-Schulz-dev did not converge: R_Z = {rz:e}");
-    assert!(err < 1e-2, "Z_dev != S⁻¹: max|dZ| = {err:e}");
+    // Residual must track the actual inverse error. Do not treat a historical
+    // 100× gap as proven on this tree until this print is inspected. Keep red
+    // if inverse error is large.
+    assert!(
+        err <= 20.0 * rz || err < 1e-4,
+        "NS-dev residual lies: R_Z={rz:e} but max|Z-S⁻¹|={err:e}  ||ZS−I||_F/√N={rz_f64:e} (N4)"
+    );
+    assert!(err < 1e-4, "Z_dev != S⁻¹: max|dZ| = {err:e} R_Z={rz:e} ||ZS−I||_F/√N={rz_f64:e} (keep red until N4)");
 }
 
 // =====================================================================
@@ -804,7 +802,8 @@ fn test_k0_and_tc2_vs_dense_projector() {
     let k0_dense = k0.to_dense();
     let k0_err = dense_max_abs_diff(&k0_dense, &k_ref_dense);
     println!("  ||K₀ - K_ref||_max = {k0_err:e} (before purification)");
-    // K₀ should be in the right ballpark but not exact.
+    // K₀ is not the projector; this is a sanity bound, not the regression test.
+    // The regression is K_final vs K_ref below (G1.10 / G2).
     assert!(k0_err < 1.0, "K₀ wildly off from K_ref: {k0_err:e}");
 
     // 4. TC2 purification from K₀.
@@ -819,12 +818,12 @@ fn test_k0_and_tc2_vs_dense_projector() {
     let k_final_dense = k_final.to_dense();
     let k_err = dense_max_abs_diff(&k_final_dense, &k_ref_dense);
     println!("  ||K_final - K_ref||_max = {k_err:e}");
-    assert!(r_i < 1e-3, "TC2 did not converge: R_I = {r_i:e}");
-    assert!((tr - nocc_f).abs() < 1e-2, "Tr(KS) != Nocc: {tr} vs {nocc_f}");
+    assert!(r_i < 1e-5, "TC2 did not converge: R_I = {r_i:e} (G2)");
+    assert!((tr - nocc_f).abs() < 1e-5, "Tr(KS) != Nocc: {tr} vs {nocc_f} (G2)");
     // The final K should match the dense projector much better than K₀.
     assert!(k_err < k0_err, "TC2 did not improve over K₀: {k_err:e} vs {k0_err:e}");
     // With full mask + well-conditioned S, expect good agreement.
-    assert!(k_err < 5e-2, "K_final != K_ref: {k_err:e}");
+    assert!(k_err < 1e-5, "K_final != K_ref: {k_err:e} (measured 7.7e-7; G2)");
 
     // 6. Hamiltonian commutator R_H = ||HKS - SKH||_F.
     let r_h = gpu.hamiltonian_residual(&h, &k_final, &s, &mask).unwrap();
@@ -940,29 +939,24 @@ fn test_tc2_dev_resident_convergence() {
     // Build the device-resident workspace.
     // T mask = K mask (full) for this small test.
     let t_mask = mask.clone();
-    let ws = SparsePurifyWorkspace::new(gpu, &k0, &s, &mask, &t_mask, nocc);
-    let mut ws = match ws {
-        Ok(w) => w,
-        Err(e) => { eprintln!("SparsePurifyWorkspace::new failed: {e}"); return; }
-    };
+    let mut ws = SparsePurifyWorkspace::new(gpu, &k0, &s, &mask, &t_mask, nocc)
+        .unwrap_or_else(|e| panic!("SparsePurifyWorkspace::new failed (no skip): {e}"));
 
     // Run device-resident TC2 purification.
-    let (k_final, r_i, tr, iters, _history) = match ws.tc2_purify_dev(30, 1e-3, 1) {
-        Ok(r) => r,
-        Err(e) => { eprintln!("tc2_purify_dev failed: {e}"); return; }
-    };
+    let (k_final, r_i, tr, iters, _history) = ws.tc2_purify_dev(30, 1e-5, 1)
+        .unwrap_or_else(|e| panic!("tc2_purify_dev failed (no skip): {e}"));
 
     println!("TC2-dev final: R_I={r_i:e}  Tr(KS)={tr:.5}  iters={iters}");
 
     // Same acceptance criteria as test_tc2_convergence.
-    assert!(r_i < 1e-3, "TC2-dev did not converge: R_I={r_i:e}");
-    assert!((tr - nocc).abs() < 1e-2, "TC2-dev trace != Nocc: {tr} vs {nocc}");
+    assert!(r_i < 1e-5, "TC2-dev did not converge: R_I={r_i:e} (G2)");
+    assert!((tr - nocc).abs() < 1e-5, "TC2-dev trace != Nocc: {tr} vs {nocc} (G2)");
 
     // Compare the device-resident result to the exact density kernel.
     let k_final_dense = k_final.to_dense();
     let max_diff = dense_max_abs_diff(&k_final_dense, &k_exact_dense);
     println!("  TC2-dev max|K_final - K_exact| = {max_diff:e}");
-    assert!(max_diff < 0.05, "TC2-dev result too far from exact: {max_diff:e}");
+    assert!(max_diff < 1e-5, "TC2-dev result too far from exact: {max_diff:e} (G2)");
 
     // The returned diagnostics must describe the returned K, not the K from
     // the preceding iteration.  This catches the old tc2_step_dev contract,
@@ -1206,6 +1200,7 @@ fn test_sparse_inf_norm_no_densify() {
 // =====================================================================
 
 #[test]
+#[ignore = "G1.9: dummy SparsePerfStats construction is not a performance contract. Instrument real counters on an NS+TC2 run."]
 fn test_sparse_perf_stats_audit() {
     let stats = rust_dftb::methods::sparse::SparsePerfStats {
         n_atom: 100,
@@ -1221,8 +1216,8 @@ fn test_sparse_perf_stats_audit() {
         ..Default::default()
     };
     stats.print_audit();
-    // No assertion needed — if it prints without panic, the struct works.
-    println!("SparsePerfStats audit printed successfully");
+    panic!("G1.9: SparsePerfStats dummy construction is not P0. Instrument real counters \
+        (kernel_launches, host_syncs, largest_dense) on an actual NS+TC2 run and assert them.");
 }
 
 // =====================================================================
@@ -1296,6 +1291,6 @@ fn test_k0_dev_vs_host() {
     let mut ws = SparsePurifyWorkspace::new(gpu, &k0_dev_host, &s, &mask, &t_mask, nocc as f32).unwrap();
     let (k_final, r_i, tr, iters, _) = ws.tc2_purify_dev(40, 1e-5, 1).unwrap();
     println!("TC2 from dev K0: {iters} iters, R_I={r_i:e}, Tr(KS)={tr:.6}");
-    assert!(r_i < 1e-3, "TC2 did not converge: R_I={r_i:e}");
-    assert!((tr - nocc as f32).abs() < 1e-2, "Tr(KS) mismatch: {tr} vs {nocc}");
+    assert!(r_i < 1e-5, "TC2 did not converge: R_I={r_i:e} (G2)");
+    assert!((tr - nocc as f32).abs() < 1e-5, "Tr(KS) mismatch: {tr} vs {nocc} (G2)");
 }

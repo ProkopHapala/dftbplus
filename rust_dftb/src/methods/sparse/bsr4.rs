@@ -162,6 +162,51 @@ impl Bsr4Matrix {
         Ok(())
     }
 
+    /// Pack a dense row-major `(4 N)×(4 N)` matrix onto a BSR4 mask.
+    pub fn from_dense(n_atom: usize, dense: &[f32], mask: &Bsr4Mask) -> Result<Self> {
+        let n = n_atom * BS;
+        if dense.len() != n * n {
+            return Err(DftbError::InvalidInput(format!(
+                "from_dense: dense len {} != (4*{n_atom})^2={}",
+                dense.len(), n * n
+            )));
+        }
+        let mut m = Self::from_structure(n_atom, mask.0.clone(), mask.1.clone())?;
+        for i in 0..n_atom {
+            let (a, b) = (mask.0[i] as usize, mask.0[i + 1] as usize);
+            for blk in a..b {
+                let j = mask.1[blk] as usize;
+                let mut v = [0.0f32; BS2];
+                for r in 0..BS {
+                    for c in 0..BS {
+                        v[r * BS + c] = dense[(i * BS + r) * n + (j * BS + c)];
+                    }
+                }
+                m.set_block(i, j, &v)?;
+            }
+        }
+        Ok(m)
+    }
+
+    /// Write this matrix into a preallocated dense `(4 N)×(4 N)` buffer (no alloc).
+    pub fn to_dense_into(&self, out: &mut [f32]) {
+        let n = self.n_atom * BS;
+        assert_eq!(out.len(), n * n, "to_dense_into: out len {} != (4*{})^2", out.len(), self.n_atom);
+        out.fill(0.0);
+        for i in 0..self.n_atom {
+            let (a, b) = (self.row_ptr[i] as usize, self.row_ptr[i + 1] as usize);
+            for blk in a..b {
+                let j = self.col_idx[blk] as usize;
+                let v = &self.values[blk * BS2..(blk + 1) * BS2];
+                for r in 0..BS {
+                    for c in 0..BS {
+                        out[(i * BS + r) * n + (j * BS + c)] = v[r * BS + c];
+                    }
+                }
+            }
+        }
+    }
+
     /// Get a block's 4×4 values by reference. Returns None if (i,j) not in mask.
     pub fn get_block(&self, i: usize, j: usize) -> Option<&[f32; BS2]> {
         self.find(i, j).map(|b| {
@@ -193,6 +238,151 @@ impl Bsr4Matrix {
 
 /// A CSR sparsity mask: just the structure without values.
 pub type Bsr4Mask = (Vec<u32>, Vec<u32>); // (row_ptr, col_idx)
+
+/// Pad a variable-orbital physical H0/S (row-major f64) to uniform 4-orbital
+/// BSR4 dense f32. Dummy orbitals: S_dd=1, H_dd=`e_dummy`, all couplings 0.
+///
+/// Returns `(h_pad, s_pad, dummy_orbital_indices)`.
+pub fn pad_physical_to_bsr4(
+    h0: &[f64],
+    s: &[f64],
+    atom_n_orb: &[u8],
+    e_dummy: f32,
+) -> (Vec<f32>, Vec<f32>, Vec<usize>) {
+    let n_atom = atom_n_orb.len();
+    let n_padded = n_atom * BS;
+    let n_phys: usize = atom_n_orb.iter().map(|&n| n as usize).sum();
+    assert_eq!(h0.len(), n_phys * n_phys, "pad: H0 len {} != n_phys² {}", h0.len(), n_phys * n_phys);
+    assert_eq!(s.len(), n_phys * n_phys, "pad: S len {} != n_phys² {}", s.len(), n_phys * n_phys);
+    let mut phys_off = Vec::with_capacity(n_atom);
+    let mut padded_off = Vec::with_capacity(n_atom);
+    let mut acc_phys = 0usize;
+    let mut acc_padded = 0usize;
+    for &n in atom_n_orb {
+        phys_off.push(acc_phys);
+        padded_off.push(acc_padded);
+        acc_phys += n as usize;
+        acc_padded += BS;
+    }
+    let mut dummy: Vec<usize> = Vec::new();
+    for (a, &n) in atom_n_orb.iter().enumerate() {
+        for d in (n as usize)..BS {
+            dummy.push(padded_off[a] + d);
+        }
+    }
+    let mut h_pad = vec![0.0f32; n_padded * n_padded];
+    let mut s_pad = vec![0.0f32; n_padded * n_padded];
+    for a in 0..n_atom {
+        for b in 0..n_atom {
+            let na = atom_n_orb[a] as usize;
+            let nb = atom_n_orb[b] as usize;
+            for i in 0..na {
+                for j in 0..nb {
+                    let pi = padded_off[a] + i;
+                    let pj = padded_off[b] + j;
+                    let phys_i = phys_off[a] + i;
+                    let phys_j = phys_off[b] + j;
+                    h_pad[pi * n_padded + pj] = h0[phys_i * n_phys + phys_j] as f32;
+                    s_pad[pi * n_padded + pj] = s[phys_i * n_phys + phys_j] as f32;
+                }
+            }
+        }
+    }
+    for (a, &n) in atom_n_orb.iter().enumerate() {
+        for d in (n as usize)..BS {
+            let pi = padded_off[a] + d;
+            s_pad[pi * n_padded + pi] = 1.0;
+            h_pad[pi * n_padded + pi] = e_dummy;
+        }
+    }
+    (h_pad, s_pad, dummy)
+}
+
+/// Same as `pad_physical_to_bsr4` but writes into preallocated `h_pad`/`s_pad`.
+pub fn pad_physical_to_bsr4_into(h0: &[f64], s: &[f64], atom_n_orb: &[u8], e_dummy: f32, h_pad: &mut [f32], s_pad: &mut [f32]) {
+    let n_atom = atom_n_orb.len();
+    let n_padded = n_atom * BS;
+    let n_phys: usize = atom_n_orb.iter().map(|&n| n as usize).sum();
+    assert_eq!(h0.len(), n_phys * n_phys, "pad_into: H0 len {} != n_phys² {}", h0.len(), n_phys * n_phys);
+    assert_eq!(s.len(), n_phys * n_phys, "pad_into: S len {} != n_phys² {}", s.len(), n_phys * n_phys);
+    assert_eq!(h_pad.len(), n_padded * n_padded, "pad_into: h_pad len {} != n_pad² {}", h_pad.len(), n_padded * n_padded);
+    assert_eq!(s_pad.len(), n_padded * n_padded, "pad_into: s_pad len {} != n_pad² {}", s_pad.len(), n_padded * n_padded);
+    h_pad.fill(0.0);
+    s_pad.fill(0.0);
+    let mut phys_off = Vec::with_capacity(n_atom);
+    let mut padded_off = Vec::with_capacity(n_atom);
+    let mut acc_phys = 0usize;
+    let mut acc_padded = 0usize;
+    for &n in atom_n_orb {
+        phys_off.push(acc_phys);
+        padded_off.push(acc_padded);
+        acc_phys += n as usize;
+        acc_padded += BS;
+    }
+    for a in 0..n_atom {
+        for b in 0..n_atom {
+            let na = atom_n_orb[a] as usize;
+            let nb = atom_n_orb[b] as usize;
+            for i in 0..na {
+                for j in 0..nb {
+                    let pi = padded_off[a] + i;
+                    let pj = padded_off[b] + j;
+                    let phys_i = phys_off[a] + i;
+                    let phys_j = phys_off[b] + j;
+                    h_pad[pi * n_padded + pj] = h0[phys_i * n_phys + phys_j] as f32;
+                    s_pad[pi * n_padded + pj] = s[phys_i * n_phys + phys_j] as f32;
+                }
+            }
+        }
+    }
+    for (a, &n) in atom_n_orb.iter().enumerate() {
+        for d in (n as usize)..BS {
+            let pi = padded_off[a] + d;
+            s_pad[pi * n_padded + pi] = 1.0;
+            h_pad[pi * n_padded + pi] = e_dummy;
+        }
+    }
+}
+
+/// Pack a dense `(4 N)×(4 N)` matrix onto an existing BSR value buffer (no alloc).
+pub fn fill_bsr_values_from_dense(n_atom: usize, dense: &[f32], row_ptr: &[u32], col_idx: &[u32], out: &mut [f32]) {
+    let n = n_atom * BS;
+    assert_eq!(dense.len(), n * n, "fill_bsr: dense len {} != (4*{n_atom})^2", dense.len());
+    assert_eq!(out.len(), col_idx.len() * BS2, "fill_bsr: out len {} != nblock*16 {}", out.len(), col_idx.len() * BS2);
+    assert_eq!(row_ptr.len(), n_atom + 1, "fill_bsr: row_ptr len {} != n_atom+1", row_ptr.len());
+    for i in 0..n_atom {
+        let (a, b) = (row_ptr[i] as usize, row_ptr[i + 1] as usize);
+        for blk in a..b {
+            let j = col_idx[blk] as usize;
+            let dst = &mut out[blk * BS2..(blk + 1) * BS2];
+            for r in 0..BS {
+                for c in 0..BS {
+                    dst[r * BS + c] = dense[(i * BS + r) * n + (j * BS + c)];
+                }
+            }
+        }
+    }
+}
+
+/// Expand BSR values into a preallocated dense `(4 N)×(4 N)` buffer.
+pub fn bsr_values_to_dense(n_atom: usize, row_ptr: &[u32], col_idx: &[u32], values: &[f32], out: &mut [f32]) {
+    let n = n_atom * BS;
+    assert_eq!(out.len(), n * n, "bsr_to_dense: out len {} != (4*{n_atom})^2", out.len());
+    assert_eq!(values.len(), col_idx.len() * BS2);
+    out.fill(0.0);
+    for i in 0..n_atom {
+        let (a, b) = (row_ptr[i] as usize, row_ptr[i + 1] as usize);
+        for blk in a..b {
+            let j = col_idx[blk] as usize;
+            let v = &values[blk * BS2..(blk + 1) * BS2];
+            for r in 0..BS {
+                for c in 0..BS {
+                    out[(i * BS + r) * n + (j * BS + c)] = v[r * BS + c];
+                }
+            }
+        }
+    }
+}
 
 /// Build a geometric BSR4 mask: block (i,j) exists iff `dist(i,j) <= cutoff`
 /// (always including the diagonal i==j). Returns sorted CSR structure.

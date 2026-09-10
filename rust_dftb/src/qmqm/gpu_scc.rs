@@ -276,7 +276,7 @@ pub fn gpu_solve_scc_batched(
         matmul_batched(rt, &x_buf, &cp, &c, n, batch)?;
 
         // 8. D = 2·Σ_{k∈occ} C[:,k]·C[:,k]^T
-        build_density_masked_batched(rt, &c, &occ_mask, &d, n, batch)?;
+        build_density_masked_batched(rt, &c, &occ_mask, &d, &eig_diag_buf, 0, n, batch)?;
 
         // 9. q_new = Mulliken(D, S)
         mulliken_charges_batched(rt, &d, s_buf, &q_new, orb_atom_buf, n, n_atoms, batch)?;
@@ -534,7 +534,7 @@ pub fn gpu_solve_scc_batched_diis_warmstart(
         timed!(tm, t_back_gemm, matmul_batched(rt, &x_buf, &cp, &c, n, batch)?);
 
         // 8. D = 2·Σ_{k∈occ} C[:,k]·C[:,k]^T
-        timed!(tm, t_density, build_density_masked_batched(rt, &c, &occ_mask, &d, n, batch)?);
+        timed!(tm, t_density, build_density_masked_batched(rt, &c, &occ_mask, &d, &eig_diag_buf, 0, n, batch)?);
 
         // 9. q_new = Mulliken(D, S) — device-resident
         timed!(tm, t_mulliken, mulliken_charges_batched(rt, &d, s_buf, &q_new, orb_atom_buf, n, n_atoms, batch)?);

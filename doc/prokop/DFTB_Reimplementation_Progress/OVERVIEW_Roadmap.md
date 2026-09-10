@@ -1,6 +1,6 @@
 # rust_dftb — Master Roadmap & Status Checklist
 
-**Last updated:** 2026-09-09
+**Last updated:** 2026-09-10
 **Maintained by:** prokop / Devin
 **Purpose:** Single source of truth for what is done (`[*]`) and what is not (`[ ]`)
 across the whole `rust_dftb` reimplementation (DFTB, xTB, QM/QM multi-system, OpenCL GPU).
@@ -185,6 +185,7 @@ file/function where the work should land.
 
 ### 5.4 Known optimization opportunities (from `OpenCL_DFTB_optimization.md`)
 - [ ] Replace `if (du<0) du=-du` with `fabs()`; pre-sort pairs by same-U — `methods/dftb/dftb_hamiltonian.cl::gamma_full` (L78-91); host sort in `gpu_prep.rs::build_pair_buckets`
+- [~] **f32 γ / γ' when Hubbard U's are close** (mio N–H ΔU≈0.011): `Ua≠Ub` is two large terms that cancel. Force kernel now does γ' in f64 (`gpu_forces.cl::gamma_prime_full_f32`); AT/GC gamma-force rel `4e-7`. On-device `dftb_hamiltonian.cl::gamma_full` VALUE is still f32 — same cancellation if γ is rebuilt on GPU.
 - [ ] Remove dead range-check branches in `cubic_interp_params` (host guarantees validity) — `methods/dftb/dftb_hamiltonian.cl::cubic_interp_params` (L111, L117-118); use `clamp()`
 - [ ] Remove dead `if (base < 0)` in `interp_sk_*_indexed` — `methods/dftb/dftb_hamiltonian.cl::interp_sk_*_indexed` (L128, L137, L152)
 - [ ] Precompute onsite diagonal on host (skip uncoalesced diagonal writes) — `methods/dftb/dftb_hamiltonian.cl::onsite_and_va` (L305-308); or separate kernel
@@ -218,7 +219,7 @@ file/function where the work should land.
 - [*] **H_scc_update kernel** (§4.4) — H = H0 + 0.5·S·(V_i+V_j), elementwise — `qmqm/gpu_matrix_ops.cl::h_scc_update_batched`; parity <3e-8
 - [*] **Mulliken charges kernel** — q = diag(D·S), batched — `qmqm/gpu_matrix_ops.cl::mulliken_charges_batched`; parity <4.8e-7
 - [*] **Residual + simple mixer kernel** — RMS = ||q_new - q_old||, q_mixed = α·q_new + (1-α)·q_old — `qmqm/gpu_matrix_ops.cl::residual_and_mix_batched`; parity <1.5e-8
-- [*] **Density build kernel** — D = 2·Σ_{k∈occ} C[:,k]·C[:,k]^T with occupation mask — `qmqm/gpu_matrix_ops.cl::build_density_masked_batched` (new, Wave 3)
+- [*] **Density / W kernel** — `2 Σ_k occ[k]·s_k·C_k C_kᵀ`; `s_k=1` → D, `s_k=ε_k` → W. Same kernel (`gpu_matrix_ops.cl::build_density_masked_batched`). `GpuSccPlan::build_edm`.
 - [*] **Frobenius trace + dot kernels** — for energy computation Tr(D·H0) and Σ Δq·V — `qmqm/gpu_matrix_ops.cl::frobenius_trace_batched`, `dot_batched` (new, Wave 3)
 - [ ] **Active mask** (§2.2) — active[system] flag, converged systems early-return — target: `qmqm/gpu_scc.rs` (TODO: all systems run all iterations currently)
 - [*] **SCC loop driver** — host enqueues kernel sequence per iteration, minimal readback (RMS + occ_mask only) — `qmqm/gpu_scc.rs::gpu_solve_scc_batched` (new, Wave 3)
@@ -231,15 +232,90 @@ file/function where the work should land.
 - [*] **Scan plotting** — `scripts/plot_formic_scan.py` + `tests/formic_scan_plots.rs` — 1D energy/charge/parity + 2D contour plots under `debug/formic_dimer_scan/`
 
 ### 6.3 Runtime refactoring (Stage 3.5, D14)
-- [ ] **Shared GpuRuntime** — context, device, queues, capabilities, program cache — target: `qmqm/gpu_runtime.rs` (new; refactor from `GpuMatrixContext` + `GpuDriver`)
-- [ ] **Cache Kernel objects** — create once, update args per call (current code creates new `ocl::Kernel` every call) — target: `qmqm/gpu_runtime.rs`
+- [*] **Shared GpuRuntime** — context, device, queues, capabilities, program cache — `qmqm/gpu_runtime.rs`
+- [*] **Cache Kernel objects** — `GpuSccPlan` + `GpuDftb`. W on device (same density kernel). `set_coords` refills pairs in place (no `GpuBatch` rebuild). `eval(want_forces)` is one finalize. Drive via `dftb_engine` + `scripts/test_gpu_dftb_molecules.rhai` (AT/GC/azaindole/replicas). `tests/gpu_dftb.rs` is H2O smoke only.
 - [ ] **Profiling-enabled queue** for benchmarks — target: `qmqm/gpu_runtime.rs`
 
-### 6.4 f32 precision monitoring (D10)
-- [ ] Monitor λ_min(S) per system — if ~1e-7, S ill-conditioned — target: `qmqm/gpu_driver.rs` (return from `build_inv_sqrt_from_eig`)
-- [ ] Monitor ||U^T·U - I|| (orthogonality) — target: `tests/gpu_eigenproblem.rs` (diagnostic)
-- [ ] Monitor ||H·C - S·C·ε|| (generalized residual) — target: `tests/gpu_eigenproblem.rs` (diagnostic)
-- [ ] Establish f32 vs f64 accuracy empirically for energies and forces — target: `tests/gpu_scc.rs::test_f32_f64_comparison`
+### 6.4 GPU f32 accuracy — strategy (Astra 2026-09-10), **not a verdict**
+
+> **Kickstart ≠ floor.** Package 1 made residuals and two cheap f64 islands honest. Package 2 then **measured**: AT `|dE|` is `δ_CH`, not frozen `δε_occ`. Löwdin Newton and f32 GEMM Kahan are in; Kahan does not cut `δ_CH`. Keep H/S/D/C/W **f32**. Do **not** all-f64 matrices. Do not re-enable f64 `batched_gemm`.
+>
+> Detail + dense task boxes: `tasts/HBond_Relaxed_Scan_GPU/HBond_Relaxed_Scan_GPU.manifest..md` §0.6.
+> Review: `reports/2026-09-10_gpu_accuracy_physics_performance_second_review.md` (§5 budget, §8 experiment order, §9 decision).
+> Old “floor” map (treat as hypothesis, not law): `topical_audit/f32_floor_dense_hbond.md`. Sparse: other agent, `f32_floor_sparse.md`.
+
+**What we are optimizing:** wall time to an **accepted physical accuracy** (meV barriers, consistent ΔE and F), not f32 FLOP/s and not a green smoke test.
+
+#### 6.4.0 Do-not (precision policy)
+- [*] Matrices stay f32 — do not convert H/S/D/C/W to f64
+- [*] γ' force stays an f64 island until a stable equal-U rewrite exists — `gpu_forces.cl::gamma_prime_full_f32`
+- [ ] f64 `batched_gemm` — tried, **reverted** (changed the nonlinear SCC, mixer blew up). Do not re-enable without **frozen-H** evidence that GEMM residual is the limiter
+- [ ] All-f64 Jacobi / all-f64 GEMM as production default
+- [ ] Treat AT `|dE|~2e-5` / charge rms `~1e-6` as a proven f32 law (that was SCC-then-compare-ε, stale `E_h0=q0·V`, and mixer L2 vs RMS mixed together)
+- [ ] Kahan on `Tr(D·H0)` as a first guess (F2: the 7e-5 was C/ε, not the Frobenius sum)
+- [ ] “Atomic Kahan” (independent atomics on sum+correction is not a coherent compensated update)
+
+#### 6.4.1 Package 1 — contracts + cheap f64 islands `[kickstart, 2026-09-10 NVIDIA 3090]`
+Honest numbers first. Cheap: energy is a few scalars; DIIS is ≤11×11. Drive `dftb_engine` + `scripts/test_gpu_dftb_molecules.rhai`.
+
+- [*] f64 energy total (band sum already f64; do not cast to f32 before E_rep) — `GpuSccPlan::energy_from_state`, `GpuDftbEval.energy: Vec<f64>`
+- [*] Finalize Mulliken `q_D`; print true RMS/`q_max` of `q_D−q_in` (do not call “converged” from mixer rms alone) — `GpuSccPlan::finalize`, `gpu_eval`
+- [*] DIIS: n<2 → α-mix (not 1-vector undamped); RMS=`√(Σres²/n_atoms)`; Gram+GE in f64, scale B before the 1-constraint; small pivot / non-finite / `|Σc−1|>tol` → α-mix + print, never silent `c_i=0` — `gpu_matrix_ops.cl::diis_step_batched`
+- [*] `set_coords` resets DIIS; `λ_min(S)≤1e-6` fails loud (no silent `rsqrt` clamp as success); missing Hubbard U fails; odd/charged `n_el` rejected
+- [*] H2O DIIS history cap `min(10,n_atoms)` at `GpuSccPlan::new` (specialize `DIIS_MAX_HIST`; local scratch = workgroup, not `n_atoms`). H2O: hist=3, **6 iters** (was 19), one pivot fallback at n=3, `|dE_GPU−CPU|=4.0e-7`. AT hist still 10 (`n_atoms=30`) — stall unchanged
+- [~] AT/GC still stall ~25 iters (mixer rms ~1.5e-6, finalize `q_rms` ~1e-6). Residual is now honest — **not solved**. Frozen-H shows this is **not** Jacobi arithmetic
+
+Measured kickstart (f64 Ha): H2O −4.076143626124 (`q_rms` 1.18e-6); AT −44.626055076718 stall; GC −44.921077474952 stall; azaindole −38.090388506651.
+
+#### 6.4.2 Package 2 — **measure** before arithmetic `[done 2026-09-10 NVIDIA 3090 --release]`
+Hold the electronic map fixed. Drive `dftb_engine` + `scripts/test_gpu_dftb_measure.rhai` (`GpuDftb::measure`, `scc_mix`). Frozen `max|δε_occ|` ≪ AT `|dE|`.
+
+- [*] **Frozen-H:** GPU-rounded `H_scc`/`S` on host Löwdin+GEVP vs GPU Jacobi — `GpuDftb::measure`
+  - H2O N=6: `||HC−SCε||_max=2.78e-7`, `||CᵀSC−I||_max=3.50e-7`, `max|δε_occ|=2.09e-7`, `||P_gpu−P_round||_F=6.91e-7`, `λ_min(S)=0.421` `λ_max=1.773` cond=4.21
+  - AT N=87: `||HC−SCε||_max` all=2.09e-6 occ=1.02e-6, `||CᵀSC−I||_max=5.04e-6`, `max|δε_occ|=1.35e-6`, `||P||_F=1.67e-5`, `λ_min=0.301` `λ_max=2.055` cond=6.82
+- [*] Representation vs CPU f64 assembly (same geometry): H2O `max|ΔH0|=4.43e-8` `max|ΔS|=3.21e-8`; AT `max|ΔH0|=2.87e-7` `max|ΔS|=4.78e-7`. AT `|dE_GPU−CPU|=3.25e-5` is **~20×** frozen `δε_occ` — not the Jacobi-vs-host-ε floor
+- [*] Mixer A/B on **unchanged** kernels (H2O, reset `q0` each time): mix=0 GPU DIIS **hist=3, 6 it** E=−4.076143193990 `q_rms=8.4e-7`; mix=1 simple 28 it `|ΔE|=2.8e-7`; mix=2 host f64 DIIS 17 it `|ΔE|=1.9e-7` `q_rms=3.53e-7`. AT mix=0 still stalls 25 it rms=1.68e-6 (hist=10)
+- [*] Energy identities from the **same** arrays: H2O `δ_eig=1.5e-7` (`δ_CH=1.8e-7`, `δ_D=−3e-8`, `||D−2CCᵀ||_F=9e-8`). AT `δ_eig=4.62e-5` = **`δ_CH=4.56e-5` + `δ_D=5.9e-7`** — band vs `CᵀHC`, not a noisy `Tr(DH)` / density kernel. AT `rms(q_D−q_cpu)=6.1e-6` `max=1.2e-5`
+- [*] H2O forces vs CPU on `GpuDftb` (full SCC→F): `max|F_gpu−F_cpu|=1.56e-6` at `max|F|=6.85e-2`. AT forces also match (`5.78e-6` at `8.49e-2`) despite energy `|dE|=3e-5`
+- [*] Relative `ΔE` formic dimer (translate atoms 5–9 by z=0,0.2,0.4,0.6,0.8 Å): `|E_gpu−E_cpu|` 2–8e-6 Ha; `|ΔE_gpu−ΔE_cpu|` vs z=0: **0, 1.54e-5, 9.60e-6, 1.05e-5, 2.27e-6 Ha** before Newton. After Newton: max `|ΔΔE|=4.6e-6 Ha`
+- [ ] Translation / origin: recenter replica in host f64 before f32 upload (absolute coords vs pair `r` can disagree far from origin)
+
+**Verdict:** AT `δ_eig` is `E_band − 2Σ CᵀHC`, not `Tr(DH)` (`δ_D=6e-7`). GPU DIIS hist cap is in for H2O. Löwdin Newton and f32 GEMM Kahan are in (6.4.3). Next: AT stall, Jacobi `C'` residual, origin recenter. Forces stay ~1e-6 Ha/Å vs CPU. Do not require AT `|dE|<1e-5`.
+
+#### 6.4.3 Package 3 — arithmetic, **only where 6.4.2 shows accumulation**
+Candidate order (cheap → expensive). Benchmark occupancy/spills, not FLOP counts. One kernel at a time.
+
+- [ ] f32 FMA + several independent accumulators, then a balanced combine (GEMM / SpGEMM / density)
+- [*] Compensated combine of **tile/block partial sums** — f32 Kahan across K in `batched_gemm` (`gpu_matrix_ops.cl`). H2O/formic bit-identical vs Newton-only. AT `δ_CH` 4.71e-5→5.03e-5 (**not** the limiter). `|dE|` 3.36e-5→2.79e-5 is cancellation. No DIIS blowup. **Not** f64 GEMM (still reverted)
+- [ ] Full compensated dots (Kahan / Ogita–Rump–Oishi) **only** in kernels/rows the frozen residual still flags — leftover is Jacobi `C'`, not GEMM
+- [ ] f64 accumulation as a **reference** and a selective production option — not the global default
+- [*] Metric repair **once per geometry** — `repair_lowdin_x`: `M=I+E` → `X←X(I−E/2)`, skip writeback if `e1≥e0` or `e0<1e-8`. AT `||XᵀSX−I||` 2.9e-6→2.0e-7; after SCC leftover metric is `||C'ᵀC'−I||~2e-6`. Formic `|ΔΔE|` 1.54e-5→4.6e-6
+- [ ] Occupied-subspace repair (S-orthonormalize + tiny projected eigen) — **this is the remaining `δ_CH` candidate**; D/W must stay consistent with the repaired C
+- [ ] γ **value** (`dftb_hamiltonian.cl::gamma_full`): stable equal-U expansion + cached species-pair coeffs. Do not just widen the equal-U threshold. Dense SCC currently uploads host G — that does not certify on-device γ
+- [ ] Force scatter: pair-owned contributions + atom-owned gather (or fused non-SCC+shift), not atomic Kahan
+
+#### 6.4.4 Jacobi / overlap (already a large f64 island — profile first)
+Tiled Jacobi (`gpu_tiled_jacobi.cl`) already does f64 inner sweeps, compound 2×2 updates, and strip products. Treating it as “f32 plus a scalar island” understates the cost (thousands of inner barriers at N=87).
+
+- [ ] Surface Jacobi residual + stop reason (rel off-diag / stagnation / exhaustion). Do not treat a **zeroed** off-diagonal as a solved eigenproblem
+- [ ] Profile kernel time, outer sweeps, local/private, spills, batch util **before** cutting inner sweeps or demoting f64 strips
+- [ ] Then: adaptive inner work vs current f64 reference; f32/FMA or compensated strips only with independent `||HC−SCε||`
+- [ ] `||UᵀU−I||` and `||HC−SCε||` as standing diagnostics (old D10) — `gpu_eigen.rs` / script prints, not a new cargo test crate
+- [~] `λ_min(S)` fail-loud on `GpuSccPlan::set_geometry` / `new` (≤1e-6). Still want the number printed, not only a crash
+
+#### 6.4.5 Engine honesty (not an f32 problem)
+- [ ] FIRE: Bitzek mix uses `|v|`, not `|F|`; per-replica `dt/α`
+- [ ] `md_step` is not velocity-Verlet (missing half-kick) — rename or fix
+- [ ] `relax` returns **final** rms; do not ignore `stalled`
+- [*] W on GPU (same density kernel as D); `eval(want_forces)` one finalize; `set_coords` in-place pairs
+- [ ] Optional: fuse neighbor+G in one GPU kernel (same O(n²) distances; SK stays)
+
+#### 6.4.6 Sparse (other agent — do not “fix f32” here by accident)
+- [ ] `run_scc` is not an SCC loop; `purify_h` rebuilds Z every iter (geometry-independent work inside SCC)
+- [ ] Host dense W from K; TC2 idempotency without trace
+- [ ] Device NS: re-verify `||ZS−I||` on the exact `dftb_engine` path before raising precision
+- [ ] Gate G / Hessian: stopping error vs arithmetic; G3 fixture is **not** tetrahedral
+- [ ] SpGEMM compensation: many-block row accumulation first, not the 4-term 4×4 product
 
 ---
 
@@ -368,21 +444,31 @@ actually wired into the production numerical path. See manifest §13 for the
 full 22-issue checklist and `tasks.md` for the phased master task breakdown.
 
 - [*] **P0** — Sparse perf stats + `sparse_firewall` feature — correct
-- [~] **P1** — C² B-spline evaluator built but **not canonical** in production force path; `SkTableSp` still uses C¹ Hermite + numerical FD tail derivative
-- [~] **P2** — Angular derivatives correct; but radial V,V' still from Hermite, not C²
-- [~] **P3** — D/W formula correct; but allocation-heavy and attached to dense SCC (not self-consistent sparse)
-- [~] **P4** — Plan infrastructure built; **not integrated** into TC2/NS/K0/W
+- [~] **P1** — C² B-spline **evaluation** is production (`eval_into` / force V'). Remaining interpolator work is the **extra-control fitter** (blunt zero-sample pad), not Hermite. Spec: `topical_audit/sk_interpolation.md`. Not f32.
+- [~] **P2** — Angular + radial V' from the same B-spline. Fitter still open (same as P1).
+- [~] **P3** — D/W formula used in G3.3 (`D=2K`, `W=2KHK` → CPU forces). Still allocation-heavy; not GPU-resident.
+- [~] **P4** — Plan infrastructure built; **not** the G3/F/G path (those use host-roundtrip NS/TC2).
 - [ ] **Gate C** — False positive — 5-atom toy system, +2I doesn't create gap
 - [*] **Gate D** — Nonsingular padded Si/H basis — correct
+- [~] **G3.1 / G3.2 / G3.3** — investigating. **SparseDftb** NVIDIA 2026-09-10: G3.2 \|dE_el\|=3.5e-7; G3.3 max\|dF\|=5.3e-6; G3.4 rel **4.4e-3** at h=1e-3 (abs 6e-5, passes abs). Distorted SiH4. Not an f32 law. Awaiting USER confirmation.
 - [ ] **Gate E** — False positive — FD-of-energy forces, symmetrized Hessian tautology
+- [~] **Gate F / G** — investigating. **SparseDftb** FIRE 72 steps, E=−2.826054, Si–H 1.477 Å, \|F\|=9.3e-4. Gate G Hessian rel **0.116%**, η_asym 3.2e-4. Lab: manifest §0.7. Awaiting USER confirmation.
+
+**Read first for the next LLM:** manifest **§0** + §0.7 lab numbers + `topical_audit/f32_floor_sparse.md`. CLI: `userguide/sparse_dftb.md`. Do not mix with dense `f32_floor_dense_hbond.md`.
 
 ### 7.6.2 Current plan (Phases A–E, see `tasks.md`)
 
+**Next (2026-09-10):** `SparseDftb` + CLI exist (SiH4 numbers in manifest §0.7).
+Unify G3/F/G onto that solver. Then a nanocrystal `.rhai` (geometric mask).
+Device NS stays red. Do not chase G3.4 rel 1e-3 at h=1e-3 Å. Do not time
+`cargo test`.
+
 - **Phase A** — Foundation: canonical C² spline (A1), TC2 fix 2 SpGEMMs/iter (A2), plan integration (A3)
-- **Phase B** — Sparse SCC solver, GPU-resident, self-consistent — **current focus**
+- **Phase B** — Sparse SCC solver, GPU-resident, self-consistent — **G3.1/G3.2 SiH4 numbers on NVIDIA (not marked done)**
   - B1: `SparseSystemWorkspace`, B2: GPU H0/S assembly, B3: GPU gamma, B4: GPU Hscc, B5: GPU K0+bounds, B6: SCC loop, B7: Mulliken
-- **Phase C** — GPU-resident sparse analytic forces (pair-force + atom-gather kernel, after dense agent finishes)
-- **Phase D** — Correctness gates: redo C (D1), E (D2), then F (D3), G (D4), H (D5)
+- **Phase C** — Sparse analytic forces: G3.3/G3.4 in progress (`D=2K`, `W=2KHK` + CPU contraction). H-bond `gpu_forces.cl` is read-only; a shared GPU pair-force kernel waits until both paths are tested. Later: BSR pair-force + atom-gather (after dense H-bond agent finishes).
+- **Phase D** — Correctness gates: C/E still false (D1/D2); F/G investigating; H after USER confirm
+- **Must-build (overrides Gate I):** `SparseDftb` — **coded** (`sparse_dftb.rs`). Drive via `dftb_engine` + `scripts/test_sparse_dftb_sih4.rhai` (`userguide/sparse_dftb.md`). `tests/sparse_dftb.rs` is SiH4 smoke only. NVIDIA SiH4 2026-09-10: NS `R_Z=6e-8`, E=−2.764, reuse SCC 17→4 iters. Not USER-confirmed. Do not time `cargo test`.
 - **Phase E** — Performance: real counters (E1), cell-list masks (E2), degree buckets (E3), packed plans (E4), lane benchmark (E5), symmetrization policy (E6), scaling Gate I (E7), production Gate J (E8)
 
 ---
@@ -430,7 +516,7 @@ full 22-issue checklist and `tasks.md` for the phased master task breakdown.
 | GPU H-assembly | ⚠️ | 4/4 tests pass (H2, N2); **s-p rotation sign bug** for H-O/H-C pairs (formic dimer |dH0|=0.66) — `qmqm/gpu_driver.rs`, `tests/gpu_hamiltonian.rs` |
 | GPU generalized eigensolver | ✅ | 10/10 tests pass — Brent-Luk Jacobi + S^{-1/2} — `qmqm/gpu_eigen.rs`, `tests/gpu_eigenproblem.rs` |
 | GPU SCC component kernels | ✅ | 10/10 tests pass — GEMM, gamma, H_scc, Mulliken, mixer — `qmqm/gpu_matrix.rs`, `tests/gpu_scc_kernels.rs` |
-| GPU SCC cycle | ✅ | Device-resident SCC loop with DIIS — H2O/N2/10×H2O parity <1e-6; formic dimer 1D scan (41 pts, 28 orbs) |dE|<3.6e-6, |dq|<1e-5; 2D scan 147/441 converged (CPU also fails) — `qmqm/gpu_scc.rs`, `tests/gpu_scc.rs`, `tests/hbond_gpu_scc.rs`, `tests/formic_scan_plots.rs` |
+| GPU SCC cycle | ✅ | Device-resident SCC + DIIS. Production object `GpuDftb` (`eval`, W on GPU). Package 2: AT `|dE|` is `δ_CH` not frozen `δε`. Newton + f32 GEMM Kahan in. AT/GC stall ~25 iters. Not `|dE|<1e-5`. |
 | GPU multi-system (independent) | ✅ | Batched SCC for N≤64, homogeneous templates, warm-start, best-effort — `qmqm/gpu_scc.rs::gpu_solve_scc_batched_diis_warmstart` |
 | GPU multi-system (QM/QM coupling) | ❌ | Not started — Stage 8 of revised plan |
 | Scan / NEB driver | ✅ | CPU scan: 2/2 tests pass; GPU scan: 1D+2D formic dimer with plots — `examples/scan.rs`, `tests/scan.rs`, `tests/formic_scan_plots.rs`, `scripts/plot_formic_scan.py` |
@@ -451,34 +537,36 @@ Full plan: `GPU_MultiSystem_Design.md`.
 
 ## 11. Recommended Next Steps (priority order)
 
+> **GPU accuracy (2026-09-10):** Package 1 kickstart `[*]`. Package 2 **measure** `[*]`.
+> Löwdin Newton `[*]`. f32 GEMM Kahan `[*]` (does not cut AT `δ_CH`). Frozen-H Jacobi
+> is not the AT `|dE|` limiter (`max|δε_occ|~1e-6` vs `|dE|~3e-5`). Next: AT stall;
+> Jacobi `C'` / occupied-subspace; origin recenter. Dense boxes:
+> `tasts/HBond_Relaxed_Scan_GPU/HBond_Relaxed_Scan_GPU.manifest..md` §0.6.
+> Interpolator fitter is a **method** problem (`sk_interpolation.md`), not f32.
+> Analytic force kernels exist; production loop is `GpuDftb` + `dftb_engine`.
+
 > **Architecture revised (2026-09-06):** host-orchestrated device-resident SCC,
 > Brent-Luk Jacobi, S^{-1/2} on GPU, f32 only, homogeneous templates.
 > See `GPU_MultiSystem_Design.md` for the full revised staged plan (D1–D17).
 
-1. **SK extra-control BC fitter** — replace blunt zero-sample pad. Extra
+1. **GPU accuracy after Package 2** — AT `δ_eig` is `δ_CH` (band vs `CᵀHC`); density and `X` are fine after Newton. f32 GEMM Kahan does not cut `δ_CH`. Left: AT stall, Jacobi `C'` / occupied-subspace, origin recenter `[ ]`. Interpolator-fitter and FIRE formula are separate.
+2. **SK extra-control BC fitter** — replace blunt zero-sample pad. Extra
    controls before/after the table must be *solved* (valid-domain accuracy +
    V,V'→0 at cutoff), not hardcoded zeros. Do not restore Neville/`DIST_FUDGE`.
    — `doc/prokop/topical_audit/sk_interpolation.md`, `interpolation.rs`,
    `spline_resample.rs`
    (Old “64-point resample H/S ~1e-2” is **not** the current mio H-bond path;
    AT max|dH| is `8.6e-8`. Resample branch only if `n_grid+1+N_PAD_END > SK_GRID_MAX`.)
-2. ~~**Brent-Luk parallel cyclic Jacobi kernel** (D8)~~ — ✅ DONE — `qmqm/gpu_eigen.rs::jacobi_cyclic_local_batched`
-3. ~~**S^{-1/2} on GPU** (D9)~~ — ✅ DONE — `qmqm/gpu_eigen.rs::build_inv_sqrt`
-4. ~~**Full-local batched GEMM** for N≤64~~ — ✅ DONE — `qmqm/gpu_matrix.rs::matmul_full_local_batched`
-5. ~~**Device-resident SCC** (D11)~~ — ✅ DONE — `qmqm/gpu_scc.rs::gpu_solve_scc_batched_diis`
-6. ~~**Dispatch Wave 2**~~ — ✅ DONE — Agent_4 (GPU SCC) + Agent_5 (scan)
-7. **Runtime refactoring** (D14) — shared GpuRuntime, cached kernels.
+3. ~~Brent-Luk / S⁻¹ᐟ² / full-local GEMM / device-resident SCC / Wave 2~~ — done. Do not re-open.
+4. **Runtime refactoring leftovers** (D14) — profiling queue, active mask. Kernels/buffers already cached on `GpuDftb`.
    — `qmqm/gpu_runtime.rs`
-8. **Scheduling benchmark** (Stage 5) — giant batch vs microbatch vs multi-queue.
+5. **Scheduling benchmark** (Stage 5) — giant batch vs microbatch vs multi-queue.
    — `tests/gpu_sched.rs`
-9. **GPU QM/QM inter-fragment coupling** (D6, D12) — `inter_fragment_vext` kernel.
+6. **GPU QM/QM inter-fragment coupling** (D6, D12) — `inter_fragment_vext` kernel.
    — Stage 8 of `GPU_MultiSystem_Design.md`
-10. **CI + justfile** — stop relying on manual env-var setup.
-11. **GFN2 residual debug** — deep, uncertain; defer unless xTB needed.
-12. **2D scan convergence** — 67% of 2D points don't converge (CPU also fails).
+7. **CI + justfile** — stop relying on manual env-var setup.
+8. **GFN2 residual debug** — deep, uncertain; defer unless xTB needed.
+9. **2D scan convergence** — 67% of 2D points don't converge (CPU also fails).
     Try: Broyden mixing, level shifting, smaller alpha, strip propagation.
     — `qmqm/gpu_scc.rs`, `tests/formic_scan_plots.rs`
-13. **Performance optimization** — cache Kernel objects, active mask, diagonal-extract
-    kernel. See `doc/prokop/reports/2025-09-06_gpu_scc_benchmarks.md`.
-    **Baseline measured:** Jacobi = 50-65% of per-iter time, GEMM = 5%, DIIS = 16%.
-    Throughput: 1194 systems/s at batch=100 (formic dimer, N=28). 60-120× vs CPU.
+10. **Performance** — Jacobi is already the dominant kernel (50–65% in the old formic bench). Profile **tiled** Jacobi f64 inner work before more GEMM tricks. Throughput claims must be `--release` NVIDIA through `GpuDftb`, not `cargo test`.

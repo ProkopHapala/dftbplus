@@ -26,8 +26,9 @@ use rust_dftb::methods::sparse::bsr4::{
     build_geometric_mask, build_full_mask, build_identity, build_product_mask,
     diag_block_map, inf_norm, Bsr4Matrix, BS,
 };
-use rust_dftb::methods::sparse::gpu_sparse::{SparseBsr4Config, SparseBsr4Gpu};
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use rust_dftb::methods::sparse::gpu_sparse::SparseBsr4Gpu;
+use rust_dftb::methods::sparse::harness::require_sparse_gpu;
+use std::collections::HashSet;
 use std::time::Instant;
 
 // ---------------------------------------------------------------------
@@ -179,15 +180,8 @@ fn cpu_mulliken_charges(k_dense: &[f32], s_dense: &[f32], n_atom: usize) -> Vec<
     q
 }
 
-/// Try to create a GPU; return None if no OpenCL device.
 fn try_gpu() -> Option<SparseBsr4Gpu> {
-    match catch_unwind(AssertUnwindSafe(|| {
-        SparseBsr4Gpu::new(SparseBsr4Config::default())
-    })) {
-        Ok(Ok(gpu)) => Some(gpu),
-        Ok(Err(e)) => { eprintln!("Skipping locality sweep: no OpenCL ({e})"); None }
-        Err(_) => { eprintln!("Skipping locality sweep: OpenCL panic"); None }
-    }
+    require_sparse_gpu()
 }
 
 // ---------------------------------------------------------------------
@@ -208,6 +202,18 @@ struct SweepRow {
     z_iters: usize,
     elapsed_ms: f64,
     converged: bool,
+}
+
+impl SweepRow {
+    fn unconverged(r_k: f64, r_z: f64, why: &str) -> Self {
+        eprintln!("  {r_k:5.1}  {r_z:5.1}  UNCONVERGED (recorded as data, not a skip): {why}");
+        Self {
+            r_k, r_z,
+            energy_err: f64::INFINITY, charge_err: f64::INFINITY, tr_err: f64::INFINITY,
+            r_in: f32::INFINITY, r_leak: f32::NAN, r_h: f32::NAN,
+            tc2_iters: 0, z_iters: 0, elapsed_ms: 0.0, converged: false,
+        }
+    }
 }
 
 /// Run the full sparse pipeline for one (R_K, R_Z) pair and return metrics.
@@ -234,8 +240,6 @@ fn run_one(
     let m_val = build_geometric_mask(&(0..n_atom).map(|i| [1.5 * i as f64, 0.0, 0.0]).collect::<Vec<_>>(), r_val);
     // T mask for Z·S (Z on M_Z, S on M_HS)
     let m_t_zs = build_product_mask(n_atom, &m_z, &m_hs);
-    // T mask for Z·H (Z on M_K after projection, H on M_HS)
-    let m_t_kh = build_product_mask(n_atom, &m_k, &m_hs);
     // T mask for K·S (K on M_K, S on M_HS)
     let m_t_ks = build_product_mask(n_atom, &m_k, &m_hs);
 
@@ -243,25 +247,25 @@ fn run_one(
     let h = bsr4_from_dense(n_atom, h_dense, &m_hs);
     let s = bsr4_from_dense(n_atom, s_dense, &m_hs);
 
-    // 1. Z ≈ S⁻¹ on M_Z
-    let (z_on_mz, rz, z_iters) = match gpu.newton_schulz_inverse(&s, &m_z, &m_t_zs, 50, 1e-5, 5) {
+    // 1. Z ≈ S⁻¹ on M_Z. Keep Z on M_Z for ZHZ (G1.3); project only K0 to M_K.
+    let (z_on_mz, _rz, z_iters) = match gpu.newton_schulz_inverse(&s, &m_z, &m_t_zs, 50, 1e-5, 5) {
         Ok(r) => r,
         Err(e) => return Err(format!("Z failed: {e}")),
     };
-    // Project Z from M_Z to M_K (truncate blocks not in M_K, zero missing)
-    let z = z_on_mz.project_to_mask(&m_k).map_err(|e| format!("Z projection failed: {e}"))?;
+    let m_t_zh = build_product_mask(n_atom, &m_z, &m_hs);
 
-    // 2. Spectral bounds (B = Z·H, Z on M_K, H on M_HS)
-    let (emin, emax) = match gpu.spectral_bounds(&h, &z, &m_t_kh, 0.1) {
+    // 2. Spectral bounds of B = Z·H with Z on M_Z
+    let (emin, emax) = match gpu.spectral_bounds(&h, &z_on_mz, &m_t_zh, 0.1) {
         Ok(r) => r,
         Err(e) => return Err(format!("spectral_bounds failed: {e}")),
     };
 
-    // 3. K₀ on M_K (Z·H on m_t_kh, B·Z on M_K)
-    let k0 = match gpu.build_k0(&h, &s, &z, &m_k, &m_t_kh, emin, emax) {
+    // 3. K₀ on M_Z via ZHZ, then project onto M_K
+    let k0_on_mz = match gpu.build_k0(&h, &s, &z_on_mz, &m_z, &m_t_zh, emin, emax) {
         Ok(k) => k,
         Err(e) => return Err(format!("build_k0 failed: {e}")),
     };
+    let k0 = k0_on_mz.project_to_mask(&m_k).map_err(|e| format!("K0 projection failed: {e}"))?;
 
     // 4. TC2 purification (K·S on m_t_ks). f32 TC2 typically converges to
     // ~1e-3..1e-4; use 1e-4 as the tolerance and 80 max iters.
@@ -284,16 +288,12 @@ fn run_one(
     let tr_err = (tr as f64 - nocc as f64).abs();
 
     // 8. R_H = ||HKS - SKH||_F (on validation mask)
-    let r_h = gpu.hamiltonian_residual(&h, &k_final, &s, &m_val).unwrap_or(f32::NAN);
+    let r_h = gpu.hamiltonian_residual(&h, &k_final, &s, &m_val)
+        .map_err(|e| format!("R_H failed: {e}"))?;
     let r_h_norm = r_h / (n as f32).sqrt();
 
-    // 9. R_leak = || P_(Mval \ MK)(KSK) ||_F
-    //    Compute KSK on M_val, then subtract the part on M_K.
-    //    For simplicity, compute KSK on M_val and on M_K, take the difference.
-    //    This is an approximation — the exact R_leak needs the complement mask.
-    //    Here we use a simpler proxy: ||KSK on M_val|| - ||KSK on M_K||.
-    //    A proper implementation would build a complement mask.
-    let r_leak = compute_r_leak(gpu, &k_final, &s, &m_k, &m_val, &m_t_ks);
+    // 9. Exact R_leak = || P_(Mval \ MK)(KSK) ||_F (G1.2)
+    let r_leak = compute_r_leak(gpu, &k_final, &s, &m_k, &m_val)?;
 
     let elapsed_ms = t0.elapsed().as_secs_f64() * 1e3;
     let converged = r_in < 1e-3 && tr_err < 5e-2;
@@ -304,43 +304,39 @@ fn run_one(
     })
 }
 
-/// Compute R_leak = || P_(Mval \ MK)(KSK) ||_F.
-///
-/// KSK is computed on M_val (generous mask). The part that falls on M_K
-/// is the "inside" contribution. The part that falls on M_val \ M_K is
-/// the "leak". We compute this by:
-/// 1. KSK on M_val → Q_val
-/// 2. KSK on M_K → Q_K
-/// 3. R_leak ≈ ||Q_val - P_MK(Q_val)||_F
-///
-/// Since Q_val and Q_K have different structures, we approximate by
-/// computing ||Q_val||_F - ||Q_K||_F (a lower bound on the leak).
-/// A proper implementation would project block-by-block.
+/// Exact R_leak = || P_(Mval \ MK)(KSK) ||_F (review G1.2 / GPT-5.6 #11).
 fn compute_r_leak(
     gpu: &SparseBsr4Gpu,
     k: &Bsr4Matrix,
     s: &Bsr4Matrix,
     m_k: &(Vec<u32>, Vec<u32>),
     m_val: &(Vec<u32>, Vec<u32>),
-    m_t_ks: &(Vec<u32>, Vec<u32>),
-) -> f32 {
-    // KSK on M_val
+) -> Result<f32, String> {
     let m_t_val = build_product_mask(k.n_atom, m_val, m_val);
-    let (_t_val, q_val) = match gpu.ksk(k, s, m_val, &m_t_val) {
-        Ok(r) => r,
-        Err(_) => return f32::NAN,
-    };
-    let norm_val = gpu.frobenius_norm(&q_val).unwrap_or(f32::NAN);
-
-    // KSK on M_K
-    let (_t_k, q_k) = match gpu.ksk(k, s, m_k, m_t_ks) {
-        Ok(r) => r,
-        Err(_) => return f32::NAN,
-    };
-    let norm_k = gpu.frobenius_norm(&q_k).unwrap_or(f32::NAN);
-
-    // R_leak ≈ ||Q_val|| - ||Q_K||  (lower bound; proper needs block projection)
-    (norm_val - norm_k).max(0.0)
+    let (_t_val, q_val) = gpu.ksk(k, s, m_val, &m_t_val)
+        .map_err(|e| format!("R_leak KSK(M_val) failed: {e}"))?;
+    let mut in_mk = HashSet::new();
+    for i in 0..k.n_atom {
+        let (a, b) = (m_k.0[i] as usize, m_k.0[i + 1] as usize);
+        for blk in a..b {
+            in_mk.insert((i, m_k.1[blk] as usize));
+        }
+    }
+    let mut sum_sq = 0.0f32;
+    for i in 0..q_val.n_atom {
+        let (a, b) = (q_val.row_ptr[i] as usize, q_val.row_ptr[i + 1] as usize);
+        for blk in a..b {
+            let j = q_val.col_idx[blk] as usize;
+            if in_mk.contains(&(i, j)) {
+                continue;
+            }
+            let off = blk * BS * BS;
+            for x in &q_val.values[off..off + BS * BS] {
+                sum_sq += x * x;
+            }
+        }
+    }
+    Ok(sum_sq.sqrt())
 }
 
 // ---------------------------------------------------------------------
@@ -351,15 +347,13 @@ fn compute_r_leak(
 fn test_locality_sweep_rk_rz() {
     let Some(gpu) = try_gpu() else { return };
 
-    // Small insulating system: 5 atoms on a line, spacing 1.5 Å.
-    // H has a clear gap (diagonal shifted by +2.0).
+    // 5-atom line. A diagonal +2I shift is NOT a HOMO–LUMO gap (G1.1).
     let n_atom = 5;
     let n = n_atom * BS;
     let nocc = 3;  // 3 occupied orbitals (out of 20)
     let mut rng = Rng(0x1234_abcd_5678_ef90);
 
-    let mut h_full = random_symmetric_dense(n_atom, &mut rng, 0.4);
-    for i in 0..n { h_full[i * n + i] += 2.0; }
+    let h_full = random_symmetric_dense(n_atom, &mut rng, 0.4);
     let s_full = make_overlap_dense(n_atom, &mut rng, 0.2);
 
     // Truncate H and S to M_HS (the physical Hamiltonian/overlap locality).
@@ -393,16 +387,20 @@ fn test_locality_sweep_rk_rz() {
                     row.tc2_iters, row.z_iters, row.elapsed_ms, row.converged);
                 phase1_rows.push(row);
             }
-            Err(e) => eprintln!("  {r_k:5.1}  {r_z_fixed:5.1}  FAILED: {e}"),
+            Err(e) => phase1_rows.push(SweepRow::unconverged(r_k, r_z_fixed, &e)),
         }
     }
 
-    // Find converged R_K (smallest R_K where energy_err < 1e-3 and converged)
+    // Plateau only from rows that actually returned metrics (G0.5). No invented R=5.
     let converged_rk = phase1_rows.iter()
         .filter(|r| r.energy_err < 1e-3 && r.converged)
         .map(|r| r.r_k)
         .min_by(|a, b| a.partial_cmp(b).unwrap())
-        .unwrap_or(5.0);
+        .unwrap_or_else(|| panic!(
+            "Gate C: no R_K plateau (no converged row with energy_err<1e-3). \
+             Truncated-R solver failure is data; inventing R_K=5.0 is not. \
+             This 5-atom line is not a locality test of a gapped insulator (review A.2 / G1.1)."
+        ));
     eprintln!("\n  → Converged R_K = {converged_rk}");
 
     // Phase 2: fix R_K, sweep R_Z
@@ -418,16 +416,18 @@ fn test_locality_sweep_rk_rz() {
                     row.tc2_iters, row.z_iters, row.elapsed_ms, row.converged);
                 phase2_rows.push(row);
             }
-            Err(e) => eprintln!("  {converged_rk:5.1}  {r_z:5.1}  FAILED: {e}"),
+            Err(e) => phase2_rows.push(SweepRow::unconverged(converged_rk, r_z, &e)),
         }
     }
 
-    // Find converged R_Z
     let converged_rz = phase2_rows.iter()
         .filter(|r| r.energy_err < 1e-3 && r.converged)
         .map(|r| r.r_z)
         .min_by(|a, b| a.partial_cmp(b).unwrap())
-        .unwrap_or(5.0);
+        .unwrap_or_else(|| panic!(
+            "Gate C: no R_Z plateau (no converged row with energy_err<1e-3). \
+             Inventing R_Z=5.0 is forbidden (G0.5)."
+        ));
     eprintln!("\n  → Converged R_Z = {converged_rz}");
 
     // Phase 3: verify the crossed combination
@@ -448,10 +448,17 @@ fn test_locality_sweep_rk_rz() {
             assert!(row.charge_err < 1e-2,
                 "Gate C: charge error {:.3e} too large at plateau",
                 row.charge_err);
-            assert!(row.tr_err < 1e-2,
-                "Gate C: trace error {:.3e} too large at plateau",
+            assert!(row.tr_err < 1e-5,
+                "Gate C: trace error {:.3e} too large at plateau (G2: Tr(KS)=Nocc)",
                 row.tr_err);
-            eprintln!("\n  Gate C: PASS — plateau achieves physical accuracy.");
+            eprintln!("\n  Gate C: plateau numbers printed. A 5-atom line with R≥7 covering the whole system is not a locality proof.");
+            let system_span = 1.5 * (n_atom - 1) as f64;
+            assert!(
+                converged_rk < system_span && converged_rz < system_span,
+                "Gate C: plateau (R_K={converged_rk}, R_Z={converged_rz}) Å covers the entire {system_span} Å toy. \
+                 That is dense algebra on a small matrix, not a locality test (review A.2 / G1.1). \
+                 Redo on a gapped passivated Si/H cluster where a sub-span radius still converges."
+            );
         }
         Err(e) => panic!("Gate C cross-check failed: {e}"),
     }

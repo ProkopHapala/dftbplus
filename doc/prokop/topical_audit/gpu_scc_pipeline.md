@@ -29,7 +29,9 @@ Per SCC iteration (all on device):
 9. q_new = Mulliken(D, S) (device-resident)
 10. CPU DIIS mixing → upload mixed charges
 
-After convergence: E = Tr(D·H0) + 0.5·Σ Δq·V
+After convergence: `E = 2 Σ_{occ} ε − ½ Δq·V − q0·V` (algebraically the same as
+`Tr(D·H0)+½Δq·V`; band form avoids the noisy f32 projector). See
+`f32_floor_dense_hbond.md`.
 
 ## Implementations
 
@@ -50,8 +52,9 @@ After convergence: E = Tr(D·H0) + 0.5·Σ Δq·V
 
 ## Key Design Decisions
 
-- **f32 only on GPU** — controlled accuracy compromise; parity vs CPU f64 is
-  ~1e-6 for energies, ~1e-5 for charges.
+- **f32 on GPU, with documented f64 islands** — N≤64 energies ~1e-6 vs CPU f64.
+  N~90 (tiled Jacobi) hits an occupied-ε floor `|dE|~2.6e-5`. γ' forces already
+  use f64. Map: `f32_floor_dense_hbond.md`.
 - **Brent-Luk parallel cyclic Jacobi** — N/2 independent rotations per round,
   one barrier per round, A+V in `__local` for N ≤ 64. Workgroup size derived
   from N (power of 2, 32–1024).
@@ -84,6 +87,8 @@ After convergence: E = Tr(D·H0) + 0.5·Σ Δq·V
 | Formic dimer 1D (21 pts) | 28 | 21 | <1.5e-5 | <6.2e-6 | 46 total | `hbond_gpu_scc.rs` |
 | Formic dimer 1D (41 pts) | 28 | 41 | <3.6e-6 | <1e-5 | 13 | `formic_scan_plots.rs` |
 | Formic dimer 2D (441 pts) | 28 | 21×21 | — | — | 147/441 conv | `formic_scan_plots.rs` |
+| H2O full-chain (GPU H/S) | 6 | 1 | **3e-7** | 4e-7 | ~20 | `gpu_hbond_physics.rs` G3.4 |
+| AT full-chain (GPU H/S) | 87 | 1 | **2.6e-5** (eigen floor) | 1.2e-5 | plateau rms~7e-6 | `gpu_hbond_physics.rs` G3.4 |
 
 **2D nonconvergence:** 294/441 points unconverged. CPU also fails on these
 highly asymmetric geometries (|t1−t2| > ~0.5). Root cause: SCC fixed-point
@@ -94,7 +99,10 @@ oscillation between competing charge transfer states. Not a GPU bug.
 - **SK interpolator stopgap (2026-09-09)** — blunt extra zero *samples* on
   the right + left phantom knot. Kills Neville-tail explosion. **Not** the
   intended BC: extra controls must be *fitted*. See `sk_interpolation.md`.
-- **AT/GC GPU SCC rms `~1e-5`** — H/S matches CPU (`max|dH|~1e-7`). Charge rms plateaus `~1e-5` (CPU f64 on the same H/S goes to `~1e-9`). **Hypothesis: f32 floor, not a broken mixer.** Relative f32 error `~1e-8` times values `~100` (e.g. ~100 eV `H_ij` near r=0) gives absolute `~1e-6`–`1e-5`. Do not chase rms `<1e-6` on f32 N~90 until `max|H|` / energy scale is printed. Spec: H-bond manifest §3.0.1.
+- **AT/GC GPU SCC leftover is `δ_CH`, not a mixer bug and not occupied-ε 2.5e-5** —
+  Package 2 frozen-H: `max|δε_occ|~1e-6`; `|dE|~3e-5` tracks `E_band−2ΣCᵀHC`.
+  Löwdin Newton + f32 GEMM Kahan in; Kahan does not cut `δ_CH`. Honest contract:
+  N~90 `|dE|<1e-4` (regression), not `<1e-5`. SSOT: `f32_floor_dense_hbond.md` §3.1.
 - **Kernel objects rebuilt each call** — `Kernel::builder().build()` per
   iteration. Program cache hits, but Kernel handle creation is a performance
   TODO. Target: cache Kernel objects in `GpuRuntime`.
@@ -117,4 +125,5 @@ oscillation between competing charge transfer states. Not a GPU bug.
 - `/doc/prokop/reports/2025-09-06_scan_plots_and_gamma_fix.md` — scan validation, gamma fix
 - `/doc/prokop/reports/2025-09-06_gpu_scc_benchmarks.md` — timing benchmarks
 - `/doc/prokop/topical_audit/sk_interpolation.md` — SK B-spline BCs (stopgap vs intended fitter)
+- `/doc/prokop/topical_audit/f32_floor_dense_hbond.md` — bugs vs measured f32 arithmetic floor
 - `/doc/prokop/DFTB_Reimplementation_Progress/GPU_MultiSystem_Design.md` — design doc

@@ -72,8 +72,10 @@ Tr(K·H0)  called "energy"
 
 Evidence:
 
-- Production entry `rhai_run_sparse_purify` / `_geom` (`src/bin/dftb_engine.rs`)
-  still starts from a stored dense `SccResult` (`scc.h_scc`, `scc.s`).
+- Production leftover `rhai_run_sparse_purify` / `_geom` still starts from a
+  stored dense `SccResult`. **Do not use for new jobs.** Production sparse is
+  `sparse_new` / `sparse_scc` / `sparse_eval` (`SparseDftb`). Lab numbers:
+  manifest §0.7.
 - `SparseSystemWorkspace::run_scc` (`sparse_system.rs:454`) is named SCC and
   documents `γ·Δq → Hscc → repeat`. The body is `compute_z; compute_k0;
   tc2_purify; mulliken_charges`. **No gamma, no Hscc update, no charge mix,
@@ -434,9 +436,18 @@ C² spline, plus F_rep and SCC γ' terms. Newton's third law, ΣF ≈ 0,
 translation invariance. FD of energy is a **check**, not the production
 force. Relative analytic-vs-FD < 1e-3 on SiH4 at equilibrium.
 
+Implementation: `sparse_forces.rs::sparse_analytic_forces` builds D/W
+from K and calls CPU `forces.rs::compute_forces_from_dw` (same four
+components as dense). The H-bond GPU kernels (`qmqm/gpu_forces.cl`) are
+a **separate in-progress path** — treat them read-only from this work.
+Do **not** merge sparse BSR4 forces with the H-bond GPU kernel until
+**both** codepaths are developed and tested; the end goal is one shared
+pair-force kernel, but joining now would mix two unfinished bug lists.
+
 **G3.4 — Energy-gradient consistency.** Central-difference dE/dR of the
 pipeline's own E_tot vs its own analytic F. This is the only test that
 catches "E and F evaluated at different charge states" and "forgot E_rep".
+Test: `tests/gate_g3_energy.rs::test_g3_3_analytic_force_and_g3_4_energy_gradient`.
 
 Do not begin Gate F/G/H before G3.4 is green **and** Si–H is near 1.48 Å.
 

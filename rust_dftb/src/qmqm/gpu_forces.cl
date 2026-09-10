@@ -589,46 +589,74 @@ __kernel void force_pairs_scc_shift(
 #define MIN_HUB_DIFF_F 1e-4f
 #define TOL_SAME_DIST_F 1e-10f
 
-// gamma_full'(R) = -1/R^2 - S'(R)
+// The Ua≠Ub branch of S' is s_a+s_b of two O(10³) terms that cancel to O(0.06)
+// when Hubbard U's are close. mio N–H is ΔU≈0.011 (threshold is 1e-4, so we
+// still take this branch). OpenCL f32 pown/exp on that pair was 3% off f64
+// (AT atoms 9–10, r=1.02 Å, 2-atom kernel |dF|=2.9e-4). Jacobi already uses
+// double for the same cancellation class. Evaluate γ' in f64, return f32.
+#pragma OPENCL EXTENSION cl_khr_fp64 : enable
+
+inline double gamma_sub_prime_f64(double r, double tau1, double tau2) {
+    double dt2 = tau1*tau1 - tau2*tau2;
+    double t2_2 = tau2*tau2;
+    double t2_4 = t2_2*t2_2;
+    double t2_6 = t2_4*t2_2;
+    double dt2_sq = dt2*dt2;
+    double dt2_cu = dt2_sq*dt2;
+    double term_a = 0.5 * t2_4 * tau1 / dt2_sq;
+    double term_b = (t2_6 - 3.0*t2_4*tau1*tau1) / (r * dt2_cu);
+    double e = exp(-tau1 * r);
+    return -tau1*e*(term_a - term_b) + e*(term_b/r);
+}
+
 inline float gamma_prime_full_f32(float r, float u1, float u2) {
     if (r < TOL_SAME_DIST_F) return 0.0f;
-    float short_prime;
-    if (fabs(u1 - u2) < MIN_HUB_DIFF_F) {
-        float tau = TAU_FACTOR_F * 0.5f * (u1 + u2);
-        float e = exp(-tau * r);
-        float poly = 1.0f/r + SAME_U_C0_F*tau + SAME_U_C1_F*r*tau*tau
-                   + SAME_U_C2_F*r*r*tau*tau*tau;
-        float poly_prime = -1.0f/(r*r) + SAME_U_C1_F*tau*tau
-                        + 2.0f*SAME_U_C2_F*r*tau*tau*tau;
+    double rd = (double)r, u1d = (double)u1, u2d = (double)u2;
+    double short_prime;
+    if (fabs(u1d - u2d) < (double)MIN_HUB_DIFF_F) {
+        double tau = 3.2 * 0.5 * (u1d + u2d);
+        double e = exp(-tau * rd);
+        double poly = 1.0/rd + 0.6875*tau + 0.1875*rd*tau*tau
+                    + 0.020833333333333333*rd*rd*tau*tau*tau;
+        double poly_prime = -1.0/(rd*rd) + 0.1875*tau*tau
+                          + 2.0*0.020833333333333333*rd*tau*tau*tau;
         short_prime = -tau*e*poly + e*poly_prime;
     } else {
-        float tau1 = TAU_FACTOR_F * u1;
-        float tau2 = TAU_FACTOR_F * u2;
-        float dt2_a = tau1*tau1 - tau2*tau2;
-        float dt2_b = tau2*tau2 - tau1*tau1;
-        float s_a, s_b;
-        {
-            float dt2 = dt2_a;
-            float dt2_sq = dt2*dt2;
-            float dt2_cu = dt2_sq*dt2;
-            float term_a = 0.5f * pown(tau2,4) * tau1 / dt2_sq;
-            float term_b = (pown(tau2,6) - 3.0f*pown(tau2,4)*tau1*tau1) / (r * dt2_cu);
-            float e = exp(-tau1 * r);
-            s_a = -tau1*e*(term_a - term_b) + e*(term_b/r);
-        }
-        {
-            float dt2 = dt2_b;
-            float dt2_sq = dt2*dt2;
-            float dt2_cu = dt2_sq*dt2;
-            float term_a = 0.5f * pown(tau1,4) * tau2 / dt2_sq;
-            float term_b = (pown(tau1,6) - 3.0f*pown(tau1,4)*tau2*tau2) / (r * dt2_cu);
-            float e = exp(-tau2 * r);
-            s_b = -tau2*e*(term_a - term_b) + e*(term_b/r);
-        }
-        short_prime = s_a + s_b;
+        double tau1 = 3.2 * u1d;
+        double tau2 = 3.2 * u2d;
+        short_prime = gamma_sub_prime_f64(rd, tau1, tau2) + gamma_sub_prime_f64(rd, tau2, tau1);
     }
-    return -1.0f/(r*r) - short_prime;
+    return (float)(-1.0/(rd*rd) - short_prime);
 }
+
+// DEBUG old f32 body (3% error on N–H): pown + s_a+s_b cancellation in f32.
+// inline float gamma_prime_full_f32_old(float r, float u1, float u2) {
+//     if (r < TOL_SAME_DIST_F) return 0.0f;
+//     float short_prime;
+//     if (fabs(u1 - u2) < MIN_HUB_DIFF_F) {
+//         float tau = TAU_FACTOR_F * 0.5f * (u1 + u2);
+//         float e = exp(-tau * r);
+//         float poly = 1.0f/r + SAME_U_C0_F*tau + SAME_U_C1_F*r*tau*tau + SAME_U_C2_F*r*r*tau*tau*tau;
+//         float poly_prime = -1.0f/(r*r) + SAME_U_C1_F*tau*tau + 2.0f*SAME_U_C2_F*r*tau*tau*tau;
+//         short_prime = -tau*e*poly + e*poly_prime;
+//     } else {
+//         float tau1 = TAU_FACTOR_F * u1, tau2 = TAU_FACTOR_F * u2;
+//         float dt2_a = tau1*tau1 - tau2*tau2, dt2_b = -dt2_a;
+//         float s_a, s_b;
+//         { float dt2 = dt2_a; float dt2_cu = dt2*dt2*dt2;
+//           float term_a = 0.5f * pown(tau2,4) * tau1 / (dt2*dt2);
+//           float term_b = (pown(tau2,6) - 3.0f*pown(tau2,4)*tau1*tau1) / (r * dt2_cu);
+//           float e = exp(-tau1 * r);
+//           s_a = -tau1*e*(term_a - term_b) + e*(term_b/r); }
+//         { float dt2 = dt2_b; float dt2_cu = dt2*dt2*dt2;
+//           float term_a = 0.5f * pown(tau1,4) * tau2 / (dt2*dt2);
+//           float term_b = (pown(tau1,6) - 3.0f*pown(tau1,4)*tau2*tau2) / (r * dt2_cu);
+//           float e = exp(-tau2 * r);
+//           s_b = -tau2*e*(term_a - term_b) + e*(term_b/r); }
+//         short_prime = s_a + s_b;
+//     }
+//     return -1.0f/(r*r) - short_prime;
+// }
 
 __kernel void force_gamma_deriv_batched(
     const int n_atoms,

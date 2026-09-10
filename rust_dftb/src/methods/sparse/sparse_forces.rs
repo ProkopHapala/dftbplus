@@ -5,6 +5,24 @@
 //! comes from TC2 purification; `H_scc` is the SCC Hamiltonian on the H/S
 //! mask. The products are masked SpGEMM operations on the GPU.
 //!
+//! G3.3 contracts those `D`/`W` with the **same CPU force components** as
+//! dense DFTB (`methods/dftb/forces.rs`: `dH0`/`dS` Pulay, SCC shift, γ′,
+//! F_rep). That CPU module is the formula SSOT for this path.
+//!
+//! ## Two force codepaths — do not merge yet
+//!
+//! The dense multi-system H-bond GPU kernels (`qmqm/gpu_forces.cl`,
+//! `qmqm/gpu_forces.rs`) implement the same pair-force physics for the
+//! fragment QM/QM solver. That work is **in progress and not fully verified**.
+//! Treat it as **read-only** from this sparse nanocrystal path.
+//!
+//! Eventual goal: one GPU pair-force + atom-gather kernel (shared SK
+//! interpolation, `D`/`W` layout) used by both H-bond batches and sparse
+//! BSR4. **Wait until both codepaths are developed and well tested** so the
+//! caveats of each (f32 vs f64, padded dummy orbitals, fragment vs BSR
+//! indexing, SCC split) are known. Merging earlier would mix two unfinished
+//! bugs.
+//!
 //! ## Algorithm (manifest v3 §4.4)
 //!
 //! ```text
@@ -13,24 +31,29 @@
 //! W    = 2 * project_MHS(T * K)       // final short-range support
 //! symmetrize(W)
 //! D    = 2 * K                        // same mask as K
+//! F    = 2 (D:dH0 − W:dS) + F_shift + F_γ′ + F_rep
 //! ```
 //!
 //! `W` is built only on `M_HS` (the H/S support mask), never as a dense
 //! matrix. This is the diagonalization-free route: no eigenvalues, no
-//! eigenvectors, no dense EDM.
+//! eigenvectors, no dense EDM from an eigenproblem.
 //!
-//! ## Parity gate (manifest v3 §4.4)
+//! ## Parity gate (manifest v3 §4.4 / review G3.3–G3.4)
 //!
 //! At the same geometry and same Hamiltonian, compare:
 //!   - `D_sparse = 2K`  vs dense occupied-orbital D
 //!   - `W_sparse = 2KHK` vs dense eigenvalue/eigenvector W
 //!   - `F_sparse` vs dense analytic force
+//!   - own `E_tot` finite-difference vs own analytic F (G3.4)
 //!
 //! Hessian implementation is blocked until this passes.
 
-use crate::core::error::Result;
+use crate::core::error::{DftbError, Result};
+use crate::methods::dftb::forces::{compute_forces_from_dw, Forces};
+use crate::methods::dftb::sk_data::SkData;
 use crate::methods::sparse::bsr4::{build_product_mask, build_spgemm_plan_bsym, Bsr4Matrix, SpgemmPlan, BS, BS2};
 use crate::methods::sparse::gpu_sparse::{GpuBsrMatrix, GpuBsrStructure, SparseBsr4Gpu, SpgemmPlanGpu};
+use nalgebra::DMatrix;
 use std::sync::Arc;
 
 /// Output of `build_dw_sparse`: device-resident `D` and `W` matrices.
@@ -229,6 +252,129 @@ pub fn build_dw_sparse(
     Ok(SparseDW { d, w })
 }
 
+/// Host `D = 2K`, `W = 2 K H_scc K` on the padded BSR4 dense layout.
+///
+/// G3.3 uses this (not the device NS inverse). Device SpGEMM `build_dw_sparse`
+/// is the production-scale path once N4 is fixed.
+pub fn dw_from_k_padded(k_pad: &[f32], h_scc_pad: &[f32], n_atom: usize) -> (Vec<f64>, Vec<f64>) {
+    let n = n_atom * BS;
+    assert_eq!(k_pad.len(), n * n, "dw_from_k_padded: K len {} != (n_atom*4)² {}", k_pad.len(), n * n);
+    assert_eq!(h_scc_pad.len(), n * n, "dw_from_k_padded: H len {} != (n_atom*4)² {}", h_scc_pad.len(), n * n);
+    let k: Vec<f64> = k_pad.iter().map(|&x| x as f64).collect();
+    let h: Vec<f64> = h_scc_pad.iter().map(|&x| x as f64).collect();
+    let d: Vec<f64> = k.iter().map(|x| 2.0 * x).collect();
+    let mut t = vec![0.0f64; n * n];
+    for i in 0..n {
+        for j in 0..n {
+            let mut s = 0.0f64;
+            for p in 0..n {
+                s += k[i * n + p] * h[p * n + j];
+            }
+            t[i * n + j] = s;
+        }
+    }
+    let mut w = vec![0.0f64; n * n];
+    for i in 0..n {
+        for j in 0..n {
+            let mut s = 0.0f64;
+            for p in 0..n {
+                s += t[i * n + p] * k[p * n + j];
+            }
+            w[i * n + j] = 2.0 * s;
+        }
+    }
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let avg = 0.5 * (w[i * n + j] + w[j * n + i]);
+            w[i * n + j] = avg;
+            w[j * n + i] = avg;
+        }
+    }
+    (d, w)
+}
+
+/// Copy physical orbital blocks out of a padded BSR4 dense matrix.
+pub fn unpad_to_physical(padded: &[f64], atom_n_orb: &[u8]) -> DMatrix<f64> {
+    let n_atom = atom_n_orb.len();
+    let n_pad = n_atom * BS;
+    let n_phys: usize = atom_n_orb.iter().map(|&n| n as usize).sum();
+    assert_eq!(padded.len(), n_pad * n_pad, "unpad_to_physical: len {} != n_pad² {}", padded.len(), n_pad * n_pad);
+    let mut phys_off = vec![0usize; n_atom];
+    let mut acc = 0usize;
+    for a in 0..n_atom {
+        phys_off[a] = acc;
+        acc += atom_n_orb[a] as usize;
+    }
+    let mut m = DMatrix::<f64>::zeros(n_phys, n_phys);
+    for a in 0..n_atom {
+        let na = atom_n_orb[a] as usize;
+        for b in 0..n_atom {
+            let nb = atom_n_orb[b] as usize;
+            for i in 0..na {
+                for j in 0..nb {
+                    let pi = a * BS + i;
+                    let pj = b * BS + j;
+                    m[(phys_off[a] + i, phys_off[b] + j)] = padded[pi * n_pad + pj];
+                }
+            }
+        }
+    }
+    m
+}
+
+/// Analytic force of the sparse SCC energy: `D = 2K`, `W = 2 K H_scc K`.
+///
+/// Contracts with CPU `compute_forces_from_dw` (read-only use of the dense
+/// force formulas). Does not call `qmqm/gpu_forces`.
+pub fn sparse_analytic_forces(
+    sk: &SkData,
+    species: &[String],
+    coords: &[[f64; 3]],
+    atom_n_orb: &[u8],
+    k_pad: &[f32],
+    h_scc_pad: &[f32],
+    q: &[f64],
+    q0: &[f64],
+    sk_dir: &str,
+) -> Result<Forces> {
+    let n_atom = atom_n_orb.len();
+    if k_pad.is_empty() || h_scc_pad.is_empty() {
+        return Err(DftbError::InvalidInput(
+            "sparse_analytic_forces: empty K or H_scc — run_sparse_scc must store k_pad/h_scc_pad".into(),
+        ));
+    }
+    let n_pad = n_atom * BS;
+    let (d_pad, w_pad) = dw_from_k_padded(k_pad, h_scc_pad, n_atom);
+    let mut dummy_d = 0.0f64;
+    for (a, &nphys) in atom_n_orb.iter().enumerate() {
+        for d in (nphys as usize)..BS {
+            let idx = a * BS + d;
+            dummy_d += d_pad[idx * n_pad + idx].abs();
+        }
+    }
+    if dummy_d > 1e-6 {
+        return Err(DftbError::InvalidInput(format!(
+            "sparse_analytic_forces: dummy |D_ii| sum={dummy_d:.3e} > 1e-6 (dummy orbitals occupied)"
+        )));
+    }
+    let dm = unpad_to_physical(&d_pad, atom_n_orb);
+    let edm = unpad_to_physical(&w_pad, atom_n_orb);
+    let forces = compute_forces_from_dw(sk, species, coords, &dm, &edm, q, q0, sk_dir)?;
+    let mut sum = [0.0f64; 3];
+    for f in &forces.forces {
+        sum[0] += f[0];
+        sum[1] += f[1];
+        sum[2] += f[2];
+    }
+    let newton = sum.iter().map(|x| x.abs()).fold(0.0_f64, f64::max);
+    if newton > 1e-5 {
+        panic!(
+            "sparse_analytic_forces: Newton's third law |ΣF|={newton:.3e} (sum={sum:?}) n_atom={n_atom}"
+        );
+    }
+    Ok(forces)
+}
+
 /// Host-side reference: build `D = 2K` and `W = 2 K H_scc K` using dense
 /// arithmetic for parity validation. This is **test/reference only** —
 /// production uses `build_dw_sparse` (device-resident, masked).
@@ -299,24 +445,10 @@ pub fn bsr4_max_abs_diff(a: &Bsr4Matrix, b: &Bsr4Matrix) -> f32 {
 mod tests {
     use super::*;
     use crate::methods::sparse::bsr4::build_geometric_mask;
-    use crate::methods::sparse::gpu_sparse::SparseBsr4Config;
-    use std::panic::{catch_unwind, AssertUnwindSafe};
+    use crate::methods::sparse::harness::require_sparse_gpu;
 
-    /// Try to create a GPU; return None if no OpenCL device.
     fn try_gpu() -> Option<SparseBsr4Gpu> {
-        match catch_unwind(AssertUnwindSafe(|| {
-            SparseBsr4Gpu::new(SparseBsr4Config::default())
-        })) {
-            Ok(Ok(gpu)) => Some(gpu),
-            Ok(Err(e)) => {
-                eprintln!("Skipping P3 test: no OpenCL device ({e})");
-                None
-            }
-            Err(_) => {
-                eprintln!("Skipping P3 test: OpenCL panic");
-                None
-            }
-        }
+        require_sparse_gpu()
     }
 
     /// Build a random symmetric Bsr4Matrix on a given mask with values in [-1, 1].

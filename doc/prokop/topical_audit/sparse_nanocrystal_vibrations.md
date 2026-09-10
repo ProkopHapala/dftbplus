@@ -8,14 +8,16 @@ tags: [topic, sparse, bsr4, vibrations, hessian, forces, gpu, nanocrystal, si, h
 
 ## Summary
 
-Sparse GPU DFTB implementation for vibrational calculations on large silicon
-and diamond nanocrystals (300–1000 atoms). Uses BSR4 sparse matrices (4×4 atom
-blocks), f32 GPU arithmetic, TC2 density-matrix purification, analytic
-Hellmann-Feynman forces, and finite-difference Hessians. **Everything
-GPU-resident** — no CPU bridges, no hybrid paths.
+Sparse GPU DFTB for Si/H nanocrystal vibrations (300–1000 atoms): BSR4,
+f32 TC2, analytic forces, FD Hessians. **Physics gates G3/F/G run on NVIDIA
+with a CPU H0/S + host-NS + CPU force bridge.** Production owner `SparseDftb`
+is coded; drive it with `dftb_engine` + `scripts/test_sparse_dftb_sih4.rhai`
+(userguide `sparse_dftb.md`). Floor vs bugs: `f32_floor_sparse.md`.
 
 **Manifest (source of truth):**
-`tasts/Sparse_Nanocrystal_Vibrations/Sparse_Nanocrystal_Vibrations.manifest.md`
+`tasts/Sparse_Nanocrystal_Vibrations/Sparse_Nanocrystal_Vibrations.manifest.md` **§0**
+**Bugs vs floor vs pipeline:** `topical_audit/f32_floor_sparse.md`
+**Interpolator fitter:** `topical_audit/sk_interpolation.md`
 **Master task:**
 `tasts/Sparse_Nanocrystal_Vibrations/Sparse_Nanocrystal_Vibrations.tasks.md`
 **Implementation report:**
@@ -23,57 +25,47 @@ GPU-resident** — no CPU bridges, no hybrid paths.
 **GPT-5.6 review:**
 `tasts/Sparse_Nanocrystal_Vibrations/Sparse_Nanocrystal_Vibrations.chat.md` line 2064+
 
-## Status (revised after GPT-5.6 review, 2026-09-09)
+## Status (revised 2026-09-10 — read `f32_floor_sparse.md` + manifest §0)
 
-GPT-5.6 reviewed commit `b269ab6` and found 22 issues (7 critical blockers).
-Several "completed" items are not actually wired into the production numerical
-path. See manifest §13 for the full checklist and `tasks.md` for the phased
-master task breakdown.
+Physics gates G3/F/G exist and were run on NVIDIA. They are **investigating**,
+not done. Device NS (N4) stays **red**. There is **no** persistent `SparseDftb`
+production loop — `cargo test` is not the product.
+
+GPT-5.6 (commit `b269ab6`) found 22 issues; several are now stale (B-spline
+eval is production; sparse SCC exists in `scc.rs`). The remaining split is
+bugs / fitter / floor / missing pipeline — do not mix them.
 
 ## Implementations
 
 | Component | Location | Status | Notes |
 |-----------|----------|--------|-------|
 | Sparse firewall | `methods/sparse/bsr4.rs`, `gpu_sparse.rs` | [*] P0 PASS | `sparse_firewall` feature |
-| CPU/GPU B-spline | `methods/dftb/spline_resample.rs`, `dftb_hamiltonian.cl` | [~] P1 | Evaluator built, **not canonical** in production force path |
-| Analytic SK derivatives | `methods/dftb/forces.rs`, `rotation.rs` | [~] P2 | Angular correct; radial V,V' still from Hermite, not C² |
-| Sparse D=2K, W=2KHK | `methods/sparse/sparse_forces.rs` | [~] P3 | Formula correct; allocation-heavy, attached to dense SCC |
-| Symbolic SpGEMM plan | `methods/sparse/bsr4.rs`, `gpu_sparse.rs`, `sparse_bsr4_purification.cl` | [~] P4 | Plan built, **not integrated** into TC2/NS/K0/W |
-| BSR4 padded Si/H basis | `tests/sih_padded_basis.rs` | [*] Gate D PASS | H dummy orbitals: S_dd=1, H_dd=E_dummy=2.0 |
-| Locality sweep R_K×R_Z | `tests/locality_sweep.rs` | [ ] Gate C | False positive — 5-atom toy, +2I doesn't create gap |
-| Determinism + Hessian h | `tests/gate_e_determinism.rs` | [ ] Gate E | False positive — FD-of-energy forces, symmetrized Hessian |
-| Geometry optimization | `tests/gate_f_geom_opt.rs` | [ ] Gate F | Broken — FD-of-energy forces, do not use |
-| Hessian parity | — | NOT STARTED | Gate G |
+| CPU/GPU B-spline eval | `interpolation.rs`, force V' | [*] eval | Extra-control **fitter** still stopgap zeros |
+| Sparse D=2K, W=2KHK | `sparse_forces.rs` + CPU `compute_forces_from_dw` | [~] G3.3 | Allocation-heavy; not GPU-resident |
+| Sparse SCC (real mix loop) | `scc.rs::run_sparse_scc` + `SparseDftb::scc` | [~] G3.2 / production owner | G3 still allocating. `SparseDftb` is the persistent loop |
+| Geometry optimization | `tests/gate_f_geom_opt.rs` | [~] | FIRE 1.477 Å on NVIDIA; not marked done |
+| Hessian parity | `tests/gate_g_hessian.rs` | [~] | Unsymmetrized FD-of-F; 0.11% vs dense; not marked done |
 | Vibrational spectra | — | NOT STARTED | Gate H |
+| Production `SparseDftb` lifetime | `sparse_dftb.rs` | **coded, not confirmed** | NVIDIA SiH4 reuse+FIRE; see `f32_floor_sparse.md` |
 
 ## Gate Status
 
 | Gate | Description | Status |
 |------|-------------|--------|
-| B | Analytic force vs finite difference | [~] PASS (9 tests) — but radial V,V' from Hermite, not C² |
+| B | Analytic force vs finite difference | [~] G3.3/G3.4 — analytic F vs dense 3.7e-6; energy-FD rel 4e-3 at h=1e-3 is floor |
 | C | Locality sweep R_K × R_Z | [ ] false positive — redo on real Si/H (task D1) |
 | D | Nonsingular padded Si/H basis | [*] PASS |
 | E | Determinism, arithmetic sensitivity, Hessian h plateau | [ ] false positive — redo with analytic forces (task D2) |
-| F | Geometry optimization | [ ] broken — needs GPU sparse force kernel (Phase C) |
-| G | Same-geometry Hessian parity | NOT STARTED |
+| F | Geometry optimization | [~] investigating — FIRE 1.477 Å; not done |
+| G | Same-geometry Hessian parity | [~] investigating — 0.11% vs dense; not done |
 | H | Spectra at each method's own minimum | NOT STARTED |
-| I | Scaling and whole-program profile | NOT STARTED |
+| I | Scaling and whole-program profile | NOT STARTED — illegal until `SparseDftb` exists |
 
-## Blockers (GPT-5.6 review, 7 critical issues)
+## Remaining split (do not treat GPT-5.6 2026-09-09 list as current)
 
-1. **#1 — C² spline not canonical in production force path.** `SkTableSp`
-   still uses `EqGridTable` (C¹ Hermite + numerical FD tail derivative).
-2. **#2 — No sparse SCC solver.** Sparse purification attached to dense
-   `SccResult`. K from dense charges, not self-consistent sparse.
-3. **#3 — TC2 does ~4 SpGEMMs/iter instead of 2.** Convergence check
-   recomputes KS+KSK after update. Trace read to host every iteration.
-4. **#4 — P4 plans not integrated.** Plan kernel exists but TC2/build_dw_sparse
-   still use intersection kernel.
-5. **#8 — `build_dw_sparse()` allocation-heavy.** No persistent workspace,
-   separate D allocation, scale kernels.
-6. **#10 — Gate C false positive.** 5-atom toy system, +2I doesn't create gap.
-7. **#13 — Gate E false positive.** FD-of-energy forces, symmetrized Hessian
-   tautology, h_ref in candidate list.
+Stale: Hermite-as-production, “no sparse SCC”, Gate F 0.93 Å as the only F.
+Current: `f32_floor_sparse.md` ID table. Still true from that review: Gate C/E
+false positives; device NS N4; no persistent production owner; D/W not GPU-resident.
 
 ## Current plan (Phases A–E, see `tasks.md`)
 
@@ -92,7 +84,8 @@ master task breakdown.
 ## Cross-References
 
 - **Sparse TC2 purification:** `topical_audit/sparse_tc2_purification.md`
-- **SK interpolation:** `topical_audit/sk_interpolation.md`
+- **SK interpolation:** `topical_audit/sk_interpolation.md` (extra-control fitter)
+- **Sparse floor vs bugs vs pipeline:** `topical_audit/f32_floor_sparse.md`
 - **GPU SCC pipeline:** `topical_audit/gpu_scc_pipeline.md`
 - **SCC Mulliken charges:** `topical_audit/scc_mulliken_charges.md`
 - **Roadmap:** `DFTB_Reimplementation_Progress/OVERVIEW_Roadmap.md` §7.6

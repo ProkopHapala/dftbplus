@@ -298,7 +298,7 @@ pub fn load_sk_for_species(sk_dir: &str, species: &[String]) -> Result<SkData> {
 pub fn capitalize(s: &str) -> String {
     let mut chars = s.chars();
     match chars.next() {
-        Some(c) => c.to_uppercase().collect::<String>() + &chars.as_str().to_lowercase(),
+        Some(c) => c.to_uppercase().collect::<String>() + chars.as_str().to_lowercase().as_str(),
         None => String::new(),
     }
 }
