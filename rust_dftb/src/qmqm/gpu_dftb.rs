@@ -20,7 +20,7 @@
 
 use crate::core::error::{DftbError, Result};
 use crate::methods::dftb::forces::{pack_repulsive_gpu, parse_all_repulsive};
-use crate::methods::dftb::gamma::{gamma_full, GammaTable};
+use crate::methods::dftb::gamma::GammaTable;
 use crate::methods::dftb::sk_data::SkData;
 use crate::qmqm::fragment::{Fragment, FragmentTemplate};
 use crate::qmqm::gpu_driver::{build_n_orb_per_atom, build_s_identity_init};
@@ -36,12 +36,28 @@ const FORCE_SOURCE: &str = include_str!("gpu_forces.cl");
 const PAIR_WG: usize = 64;
 const SCC_MAX_ITER: usize = 100;
 
+/// §12 D11: per-system convergence status — never conflate a numerical
+/// plateau with convergence, and never treat "did not meet tolerance" as
+/// converged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SccStatus {
+    /// rms < tol at loop exit.
+    Converged,
+    /// rms ≥ tol but the iterate stopped moving (numerical plateau) —
+    /// energy is still valid; charge residual did not certify.
+    Plateau,
+    /// Hit max_iter without convergence/plateau, or non-finite residual.
+    Failed,
+}
+
 /// Result of one `scc` call.
 #[derive(Debug, Clone)]
 pub struct GpuDftbScc {
     pub n_iters: usize,
     pub rms: f32,
     pub stalled: bool,
+    /// Per-system status (len = batch). For batch=1 this is the system status.
+    pub statuses: Vec<SccStatus>,
 }
 
 /// One electronic finalize: energy always (f64), forces if `want_forces`.
@@ -68,7 +84,6 @@ pub struct GpuDftb {
     n_atoms: usize,
     n_occ: usize,
     batch: usize,
-    pair_cap: usize,
 
     buf_h0: Buffer<f32>,
     buf_s: Buffer<f32>,
@@ -91,25 +106,39 @@ pub struct GpuDftb {
     buf_u_hub: Buffer<f32>,
     buf_rep_off: Buffer<i32>,
     buf_rep_data: Buffer<f32>,
+    /// §12 D8: species-pair γ/γ′ Hermite table (host f64 → f32 upload).
+    /// Energy γ and force γ′ come from the same table — energy–force
+    /// consistent, and the force kernel's f64 analytic island is gone.
+    gamma_spl: crate::methods::dftb::gamma_spline::GammaSpline,
+    buf_gamma_spl: Buffer<f32>,
 
     k_onsite: Kernel,
     k_gamma_f: Kernel,
+    k_gamma_build: Kernel,
     k_rep_force: Kernel,
     buckets: Vec<PairBucket>,
 
-    s_ident: Vec<f32>,
     q0: Vec<f32>,
+    #[allow(dead_code)]
     u_per_atom: Vec<f64>,
     coords: Vec<[f64; 3]>,
     fire_v: Vec<[f64; 3]>,
-    fire_dt: f64,
-    fire_alpha: f64,
-    fire_n_pos: usize,
+    // D12: per-replica FIRE state — batched systems adapt independently.
+    fire_dt: Vec<f64>,
+    fire_alpha: Vec<f64>,
+    fire_n_pos: Vec<usize>,
+    /// Replicas whose last SCC Failed — `fire_step` parks them (zero v, no
+    /// integrate) rather than stepping on garbage forces. All-true until
+    /// first scc.
+    scc_ok: Vec<bool>,
+    /// Per-template-atom freeze mask (same for all replicas) — constrained
+    /// relaxed scans pin e.g. the transferring proton. Frozen atoms get
+    /// zero force, zero velocity, zero displacement, and are EXCLUDED from
+    /// the replica's max|F| convergence test (their force is the constraint
+    /// reaction force, not an optimizable one).
+    frozen: Vec<bool>,
 
     // Host scratch (per-geometry / per-force; never reallocated)
-    scratch_h0: Vec<f32>,
-    scratch_v: Vec<f32>,
-    scratch_g: Vec<f32>,
     scratch_ang: Vec<f32>,
     scratch_bohr: Vec<f32>,
     scratch_f: Vec<f32>,
@@ -120,8 +149,11 @@ pub struct GpuDftb {
     atom_sp: Vec<i32>,
     atom_n_orb: Vec<u8>,
     atom_orb_off: Vec<u16>,
+    #[allow(dead_code)]
     pair_cut_sq: Vec<f64>,
+    #[allow(dead_code)]
     sk_cut_sq: f64,
+    #[allow(dead_code)]
     bucket_lut: Vec<i32>,
     nsp: usize,
 
@@ -138,6 +170,7 @@ struct PairBucket {
     buf_sk_h: Buffer<f32>,
     #[allow(dead_code)]
     buf_sk_s: Buffer<f32>,
+    k_refresh: Kernel,   // D7: in-place r,l,m,n from device coords
     k_assemble: Kernel,
     k_force: Kernel,
     k_shift: Kernel,
@@ -147,8 +180,9 @@ struct PairBucket {
     block_type: i32,
     sp_i: i32,
     sp_j: i32,
+    /// Frozen pair count (all i<j for this block/species bucket × batch) —
+    /// fixed at `new`; never grows (no cutoff membership changes).
     n_live: usize,
-    pair_staging: Vec<GpuPairEntry>,
 }
 
 impl GpuDftb {
@@ -201,16 +235,24 @@ impl GpuDftb {
             )));
         }
 
-        let pair_cap = (batch * n_atoms * n_atoms).max(PAIR_WG);
         let ham = rt.build_program(HAM_SOURCE)?;
         let force = rt.build_program(&force_src)?;
 
         let buf_h0 = rt.zero_buffer::<f32>(batch * n * n)?;
         let s_ident = build_s_identity_init(&gpu_batch.fragments, gpu_batch.total_h_elements);
         let buf_s = rt.buffer_from_slice(&s_ident)?;
-        let mut g_host = vec![0.0f32; batch * n_atoms * n_atoms];
-        fill_gamma(&coords, &per_atom_u(&sk, &species)?, n_atoms, batch, &mut g_host);
-        let buf_g = rt.buffer_from_slice(&g_host)?;
+        // D8: γ/γ′ spline table indexed by the SAME global species index the
+        // kernels see (`atom_species` ↔ gpu_batch.hubbard_u ordering).
+        let u_global: Vec<f64> = gpu_batch.hubbard_u.iter().map(|&u| u as f64).collect();
+        let gamma_spl = crate::methods::dftb::gamma_spline::GammaSpline::new(
+            &u_global,
+            crate::methods::dftb::gamma_spline::GAMMA_SPLINE_NK,
+            crate::methods::dftb::gamma_spline::GAMMA_SPLINE_RMAX,
+        )?;
+        let buf_gamma_spl = rt.buffer_from_slice(&gamma_spl.knots)?;
+        // D7: G is built on-device by build_gamma_batched each geometry —
+        // buf_g starts uninitialized, first assemble() fills it.
+        let buf_g = rt.zero_buffer::<f32>(batch * n_atoms * n_atoms)?;
         let q0: Vec<f32> = tmpl.q0.iter().map(|&q| q as f32).collect::<Vec<_>>().repeat(batch);
         let buf_q0 = rt.buffer_from_slice(&q0)?;
         // h_scc / Mulliken index orb_atom as [batch][N] (`oa + sid*n`). One copy is OOB for replica>0.
@@ -260,7 +302,23 @@ impl GpuDftb {
             .global_work_size(batch * 256).local_work_size(256)
             .arg(n_atoms as i32).arg(batch as i32)
             .arg(&buf_coords_ang).arg(&buf_atom_species).arg(&buf_v_asm).arg(&buf_u_hub)
-            .arg(n_species).arg(&buf_forces)
+            .arg(n_species)
+            .arg(&buf_gamma_spl).arg(gamma_spl.nk as i32)
+            .arg(gamma_spl.dr as f32).arg(gamma_spl.r_max as f32)
+            .arg(&buf_forces)
+            .build().map_err(map_ocl_err)?;
+        // D7: device-resident G build — one thread per (system, upper-tri atom pair).
+        let ntri = n_atoms * (n_atoms + 1) / 2;
+        let g_gamma = ((batch * ntri + 255) / 256) * 256;
+        let k_gamma_build = Kernel::builder()
+            .program(&force).name("build_gamma_batched").queue(rt.queue().clone())
+            .global_work_size(g_gamma).local_work_size(256)
+            .arg(n_atoms as i32).arg(batch as i32)
+            .arg(&buf_coords_bohr).arg(&buf_atom_species).arg(&buf_u_hub)
+            .arg(n_species)
+            .arg(&buf_gamma_spl).arg(gamma_spl.nk as i32)
+            .arg(gamma_spl.dr as f32).arg(gamma_spl.r_max as f32)
+            .arg(&buf_g)
             .build().map_err(map_ocl_err)?;
         let k_rep_force = Kernel::builder()
             .program(&force).name("force_repulsive_batched").queue(rt.queue().clone())
@@ -275,27 +333,77 @@ impl GpuDftb {
         ensure_template_pair_buckets(&mut pair_buckets, &tmpl, &atom_sp, &gpu_batch.sk_tables, unique.len())?;
         let (pair_cut_sq, sk_cut_sq) = pair_cutoffs(&sk, unique.len(), &unique)?;
 
-        let mut buckets = Vec::with_capacity(pair_buckets.len());
-        for bkt in &pair_buckets {
+        // ── D7: frozen per-template pair lists ──────────────────────────
+        // Static fields (replica, atoms, orb offsets, species, block type)
+        // are built ONCE here for ALL i<j pairs — no cutoff membership
+        // filtering (pairs beyond the SK cutoff evaluate to ~0 anyway via
+        // the clamped table tail; they cost a few flops, not correctness).
+        // r/l/m/n are refreshed on-device by `refresh_pair_geom` each
+        // geometry — no per-set_coords host pair rebuild or upload.
+        let nsp = unique.len();
+        let mut bucket_lut = vec![-1i32; 3 * nsp * nsp];
+        for (i, bkt) in pair_buckets.iter().enumerate() {
             let skt = &gpu_batch.sk_tables[bkt.sk_table_idx];
-            if bkt.n_pairs > pair_cap {
-                return Err(DftbError::InvalidInput(format!(
-                    "GpuDftb::new: n_pairs={} > pair_cap={} (batch={} n_atoms={}) — increase cap / shrink batch",
-                    bkt.n_pairs, pair_cap, batch, n_atoms
-                )));
+            let k = bkt.block_type as usize * nsp * nsp
+                + skt.species_i as usize * nsp + skt.species_j as usize;
+            if k >= bucket_lut.len() {
+                return Err(DftbError::InvalidInput(format!("GpuDftb: bucket lut index {k} >= {}", bucket_lut.len())));
             }
-            let mut staging = vec![GpuPairEntry::default(); pair_cap];
-            staging[..bkt.n_pairs].copy_from_slice(&bkt.pairs);
+            bucket_lut[k] = i as i32;
+        }
+        let atom_n_orb = tmpl.atom_n_orb.clone();
+        let atom_orb_off = tmpl.atom_orb_off.clone();
+        // template pair → per-bucket static list
+        let mut lists: Vec<Vec<GpuPairEntry>> = vec![Vec::new(); pair_buckets.len()];
+        for i in 0..n_atoms {
+            for j in (i + 1)..n_atoms {
+                let n_orb_i = atom_n_orb[i] as usize;
+                let n_orb_j = atom_n_orb[j] as usize;
+                let Some((bt, ai, aj, oi, oj, l, m, nv, si, sj)) = orient_pair(
+                    i, j, n_orb_i, n_orb_j, atom_orb_off[i], atom_orb_off[j],
+                    atom_sp[i], atom_sp[j], 1.0, 0.0, 0.0, 1.0,
+                ) else {
+                    return Err(DftbError::InvalidInput(format!(
+                        "GpuDftb::new: unsupported block type for pair {i}-{j} (n_orb {n_orb_i}x{n_orb_j})"
+                    )));
+                };
+                let key = bt as usize * nsp * nsp + si as usize * nsp + sj as usize;
+                let bi = bucket_lut[key];
+                if bi < 0 {
+                    return Err(DftbError::InvalidInput(format!(
+                        "GpuDftb::new: pair {i}-{j} block={bt} species {si}-{sj} has no SK bucket — missing SK table"
+                    )));
+                }
+                for b in 0..batch {
+                    lists[bi as usize].push(GpuPairEntry {
+                        replica: b as u32, atom_i: ai, atom_j: aj, orb_i: oi, orb_j: oj,
+                        r: 1.0, l, m, n: nv,
+                    });
+                }
+            }
+        }
+
+        let mut buckets = Vec::with_capacity(pair_buckets.len());
+        for (bi, bkt) in pair_buckets.iter().enumerate() {
+            let skt = &gpu_batch.sk_tables[bkt.sk_table_idx];
+            let staging = std::mem::take(&mut lists[bi]);
+            let n_pairs = staging.len();
             let buf_pairs = rt.buffer_from_slice(&staging)?;
             let buf_sk_h = rt.buffer_from_slice(&skt.sk_h)?;
             let buf_sk_s = rt.buffer_from_slice(&skt.sk_s)?;
-            let gws = ((pair_cap + PAIR_WG - 1) / PAIR_WG) * PAIR_WG;
+            let gws = ((n_pairs.max(1) + PAIR_WG - 1) / PAIR_WG) * PAIR_WG;
+            let k_refresh = Kernel::builder()
+                .program(&force).name("refresh_pair_geom").queue(rt.queue().clone())
+                .global_work_size(gws).local_work_size(PAIR_WG)
+                .arg(&buf_pairs).arg(&buf_coords_bohr)
+                .arg(n_pairs as i32).arg(n_atoms as i32)
+                .build().map_err(map_ocl_err)?;
             let k_assemble = Kernel::builder()
                 .program(&ham).name("assemble_pairs").queue(rt.queue().clone())
                 .global_work_size(gws).local_work_size(PAIR_WG)
                 .arg(&buf_pairs).arg(&buf_fragments).arg(&buf_sk_h).arg(&buf_sk_s)
                 .arg(&buf_v_asm).arg(&buf_h0).arg(&buf_s)
-                .arg(skt.dr).arg(skt.n_grid as i32).arg(bkt.n_pairs as i32)
+                .arg(skt.dr).arg(skt.n_grid as i32).arg(n_pairs as i32)
                 .arg(n_frags).arg(bkt.block_type as i32).arg(skt.n_sk_cols as i32)
                 .build().map_err(map_ocl_err)?;
             let k_force = Kernel::builder()
@@ -303,7 +411,7 @@ impl GpuDftb {
                 .global_work_size(gws).local_work_size(PAIR_WG)
                 .arg(&buf_pairs).arg(&buf_fragments).arg(&buf_sk_h).arg(&buf_sk_s)
                 .arg(&buf_h0).arg(&buf_edm).arg(&buf_forces)
-                .arg(skt.dr).arg(skt.n_grid as i32).arg(bkt.n_pairs as i32)
+                .arg(skt.dr).arg(skt.n_grid as i32).arg(n_pairs as i32)
                 .arg(n_frags).arg(bkt.block_type as i32).arg(skt.n_sk_cols as i32)
                 .build().map_err(map_ocl_err)?;
             let k_shift = Kernel::builder()
@@ -311,44 +419,31 @@ impl GpuDftb {
                 .global_work_size(gws).local_work_size(PAIR_WG)
                 .arg(&buf_pairs).arg(&buf_fragments).arg(&buf_sk_s)
                 .arg(&buf_h0).arg(&buf_v_asm).arg(&buf_forces)
-                .arg(skt.dr).arg(skt.n_grid as i32).arg(bkt.n_pairs as i32)
+                .arg(skt.dr).arg(skt.n_grid as i32).arg(n_pairs as i32)
                 .arg(n_frags).arg(bkt.block_type as i32).arg(skt.n_sk_cols as i32)
                 .build().map_err(map_ocl_err)?;
             buckets.push(PairBucket {
-                buf_pairs, buf_sk_h, buf_sk_s, k_assemble, k_force, k_shift,
+                buf_pairs, buf_sk_h, buf_sk_s, k_refresh, k_assemble, k_force, k_shift,
                 dr: skt.dr, n_grid: skt.n_grid as i32, n_sk_cols: skt.n_sk_cols as i32,
                 block_type: bkt.block_type as i32,
                 sp_i: skt.species_i as i32, sp_j: skt.species_j as i32,
-                n_live: bkt.n_pairs, pair_staging: staging,
+                n_live: n_pairs,
             });
         }
-        let nsp = unique.len();
-        let mut bucket_lut = vec![-1i32; 3 * nsp * nsp];
-        for (i, slot) in buckets.iter().enumerate() {
-            let k = slot.block_type as usize * nsp * nsp + slot.sp_i as usize * nsp + slot.sp_j as usize;
-            if k >= bucket_lut.len() {
-                return Err(DftbError::InvalidInput(format!("GpuDftb: bucket lut index {k} >= {}", bucket_lut.len())));
-            }
-            bucket_lut[k] = i as i32;
-        }
-
-        let atom_n_orb = tmpl.atom_n_orb.clone();
-        let atom_orb_off = tmpl.atom_orb_off.clone();
         let plan = GpuSccPlan::new(&mut rt, &buf_s, n, n_atoms, batch)
             .map_err(|e| DftbError::InvalidInput(format!("GpuSccPlan::new (Lowdin X from S): {e}")))?;
-        let nn = n * n;
         let mut eng = Self {
-            rt, sk, sk_dir: sk_dir.to_string(), species, tmpl, gamma_tbl, n, n_atoms, n_occ, batch, pair_cap,
+            rt, sk, sk_dir: sk_dir.to_string(), species, tmpl, gamma_tbl, n, n_atoms, n_occ, batch,
             buf_h0, buf_s, buf_g, buf_q0, buf_oa, buf_fragments, buf_atom_species,
             buf_orb_off, buf_n_orb, buf_onsite, buf_hubbard, buf_v_asm, buf_charges_zero,
             buf_forces, buf_edm, buf_coords_ang, buf_coords_bohr, buf_u_hub, buf_rep_off, buf_rep_data,
-            k_onsite, k_gamma_f, k_rep_force, buckets, s_ident, q0,
+            gamma_spl, buf_gamma_spl,
+            k_onsite, k_gamma_f, k_gamma_build, k_rep_force, buckets, q0,
             u_per_atom, coords,
             fire_v: vec![[0.0; 3]; batch * n_atoms],
-            fire_dt: 1.0, fire_alpha: 0.1, fire_n_pos: 0,
-            scratch_h0: vec![0.0; batch * nn],
-            scratch_v: vec![0.0; batch * n_atoms],
-            scratch_g: vec![0.0; batch * n_atoms * n_atoms],
+            fire_dt: vec![1.0; batch], fire_alpha: vec![0.1; batch], fire_n_pos: vec![0; batch],
+            scc_ok: vec![true; batch],
+            frozen: vec![false; n_atoms],
             scratch_ang: coords_ang,
             scratch_bohr: coords_bohr.clone(),
             scratch_f: vec![0.0; 3 * batch * n_atoms],
@@ -381,8 +476,10 @@ impl GpuDftb {
     pub fn batch(&self) -> usize { self.batch }
     pub fn coords(&self) -> &[[f64; 3]] { &self.coords }
 
-    /// Per-geometry update. Refills pair r,l,m,n into existing staging; GPU kernels/buffers stay.
-    /// Fails loud if a pair's (block, species) slot was not allocated at `new`, or `n_pairs > pair_cap`.
+    /// Per-geometry update (D7): uploads coords, then everything else is
+    /// device-side — pair r,l,m,n refresh, G build, H0/S assembly. The pair
+    /// SET is frozen at `new` (all i<j, per template); the SK tail is ~0 for
+    /// pairs beyond cutoff, so far pairs contribute exactly zero.
     pub fn set_coords(&mut self, coords: &[[f64; 3]]) -> Result<()> {
         if coords.len() != self.batch * self.n_atoms {
             return Err(DftbError::InvalidInput(format!(
@@ -390,111 +487,84 @@ impl GpuDftb {
             )));
         }
         self.coords.copy_from_slice(coords);
-        self.refill_pairs()?;
         self.assemble()?;
         self.plan.set_geometry(&mut self.rt, &self.buf_s)?;
         self.plan.reset_diis(&self.rt)?;
         Ok(())
     }
 
-    fn refill_pairs(&mut self) -> Result<()> {
-        for slot in &mut self.buckets { slot.n_live = 0; }
-        let n_atoms = self.n_atoms;
-        let nsp = self.nsp;
-        let pair_cap = self.pair_cap;
-        let sk_cut_sq = self.sk_cut_sq;
-        let batch = self.batch;
-        {
-            let coords = &self.coords;
-            let atom_sp = &self.atom_sp;
-            let atom_n_orb = &self.atom_n_orb;
-            let atom_orb_off = &self.atom_orb_off;
-            let pair_cut_sq = &self.pair_cut_sq;
-            let lut = &self.bucket_lut;
-            let buckets = &mut self.buckets;
-            for b in 0..batch {
-                let base = b * n_atoms;
-                for i in 0..n_atoms {
-                    let pi = coords[base + i];
-                    let n_orb_i = atom_n_orb[i] as usize;
-                    for j in (i + 1)..n_atoms {
-                        let pj = coords[base + j];
-                        let dx = (pj[0] - pi[0]) * ANG2BOHR;
-                        let dy = (pj[1] - pi[1]) * ANG2BOHR;
-                        let dz = (pj[2] - pi[2]) * ANG2BOHR;
-                        let r2 = dx * dx + dy * dy + dz * dz;
-                        if r2 > sk_cut_sq { continue; }
-                        let spi = atom_sp[i] as usize;
-                        let spj = atom_sp[j] as usize;
-                        let cut = pair_cut_sq[spi * nsp + spj];
-                        if cut == 0.0 || r2 > cut { continue; }
-                        let n_orb_j = atom_n_orb[j] as usize;
-                        let Some((bt, atom_i, atom_j, orb_i, orb_j, l, m, n_val, s_i, s_j)) =
-                            orient_pair(i, j, n_orb_i, n_orb_j, atom_orb_off[i], atom_orb_off[j],
-                                atom_sp[i], atom_sp[j], dx, dy, dz, r2.sqrt())
-                        else { continue };
-                        let key = bt as usize * nsp * nsp + s_i as usize * nsp + s_j as usize;
-                        let bi = lut[key];
-                        if bi < 0 {
-                            return Err(DftbError::InvalidInput(format!(
-                                "set_coords: pair atom {i}-{j} replica {b} block={bt} species {s_i}-{s_j} has no bucket (not allocated at GpuDftb::new). Rebuild new."
-                            )));
-                        }
-                        let slot = &mut buckets[bi as usize];
-                        if slot.n_live >= pair_cap {
-                            return Err(DftbError::InvalidInput(format!(
-                                "set_coords: n_pairs > pair_cap={pair_cap} at bucket {bi} replica {b}. Rebuild GpuDftb."
-                            )));
-                        }
-                        slot.pair_staging[slot.n_live] = GpuPairEntry {
-                            replica: b as u32, atom_i, atom_j, orb_i, orb_j,
-                            r: r2.sqrt() as f32, l, m, n: n_val,
-                        };
-                        slot.n_live += 1;
-                    }
-                }
-            }
-        }
-        for (i, slot) in self.buckets.iter_mut().enumerate() {
-            if slot.n_live == 0 { continue; }
-            self.rt.write_buffer(&slot.buf_pairs, &slot.pair_staging)
-                .map_err(|e| DftbError::InvalidInput(format!("write pairs bucket {i} n_live={}: {e}", slot.n_live)))?;
-            slot.k_assemble.set_arg(9u32, slot.n_live as i32).map_err(map_ocl_err)?;
-            slot.k_force.set_arg(9u32, slot.n_live as i32).map_err(map_ocl_err)?;
-            slot.k_shift.set_arg(8u32, slot.n_live as i32).map_err(map_ocl_err)?;
-        }
-        Ok(())
-    }
+    // DEPRECATED by D7 — kept for reference. Host pair rebuild + upload per
+    // geometry; replaced by frozen pair lists + refresh_pair_geom kernel.
+    // fn refill_pairs(&mut self) -> Result<()> { ... }
 
+    /// Device-resident geometry assembly (D7). No host pair loops, no G
+    /// upload, no finish() — the in-order queue orders the kernels.
+    /// H0/S need no zeroing: every off-diagonal element is written by a
+    /// pair block (frozen list covers all i<j), the diagonal by
+    /// onsite_diagonal / the persistent S=I. V_asm stays zero (zeroed at
+    /// `new`; the SCC shift path uses plan buffers, not this one).
     fn assemble(&mut self) -> Result<()> {
-        fill_gamma(&self.coords, &self.u_per_atom, self.n_atoms, self.batch, &mut self.scratch_g);
-        self.rt.write_buffer(&self.buf_g, &self.scratch_g)
-            .map_err(|e| DftbError::InvalidInput(format!("write G: {e}")))?;
-        self.scratch_h0.fill(0.0);
-        self.rt.write_buffer(&self.buf_h0, &self.scratch_h0)
-            .map_err(|e| DftbError::InvalidInput(format!("zero H0: {e}")))?;
-        self.rt.write_buffer(&self.buf_s, &self.s_ident)
-            .map_err(|e| DftbError::InvalidInput(format!("write S=I: {e}")))?;
-        self.scratch_v.fill(0.0);
-        self.rt.write_buffer(&self.buf_v_asm, &self.scratch_v)
-            .map_err(|e| DftbError::InvalidInput(format!("zero V_asm: {e}")))?;
+        fill_coord_scratch(&self.coords, &mut self.scratch_ang, &mut self.scratch_bohr);
+        self.rt.write_buffer(&self.buf_coords_ang, &self.scratch_ang)
+            .map_err(|e| DftbError::InvalidInput(format!("write coords_ang: {e}")))?;
+        self.rt.write_buffer(&self.buf_coords_bohr, &self.scratch_bohr)
+            .map_err(|e| DftbError::InvalidInput(format!("write coords_bohr: {e}")))?;
+        unsafe { self.k_gamma_build.enq().map_err(|e| DftbError::InvalidInput(format!("build_gamma: {e}")))?; }
+        for (i, slot) in self.buckets.iter().enumerate() {
+            if slot.n_live == 0 { continue; }
+            unsafe { slot.k_refresh.enq().map_err(|e| DftbError::InvalidInput(format!("refresh_pairs bucket {i}: {e}")))?; }
+        }
         unsafe { self.k_onsite.enq().map_err(|e| DftbError::InvalidInput(format!("onsite_diagonal: {e}")))?; }
-        self.rt.finish()?;
         for (i, slot) in self.buckets.iter().enumerate() {
             if slot.n_live == 0 { continue; }
             unsafe { slot.k_assemble.enq().map_err(|e| DftbError::InvalidInput(format!("assemble_pairs bucket {i}: {e}")))?; }
         }
-        self.rt.finish()?;
-        fill_coord_scratch(&self.coords, &mut self.scratch_ang, &mut self.scratch_bohr);
-        self.rt.write_buffer(&self.buf_coords_ang, &self.scratch_ang)?;
-        self.rt.write_buffer(&self.buf_coords_bohr, &self.scratch_bohr)?;
         self.plan.set_repulsive_coords(&self.rt, &self.scratch_bohr)?;
         Ok(())
     }
 
     /// SCC mixer for Package 2 A/B: 0 = GPU DIIS (production), 1 = GPU simple mix, 2 = host f64 DIIS (same electronic kernels).
+    /// Production SCC: GPU DIIS, and on any Failed replica ONE retry where
+    /// the failed replicas are warm-started from the NEAREST converged
+    /// replica's charges (adiabatic continuation — at scan geometries like
+    /// mid proton transfer, bare-q0 DIIS oscillates between near-degenerate
+    /// charge states; a converged neighbor's q usually lands it in the right
+    /// basin on the first iteration).
     pub fn scc(&mut self, max_iter: usize, rms_tol: f32) -> Result<GpuDftbScc> {
-        self.scc_mix(max_iter, rms_tol, 0)
+        let s = self.scc_mix(max_iter, rms_tol, 0)?;
+        let n_fail = s.statuses.iter().filter(|st| **st == SccStatus::Failed).count();
+        if n_fail == 0 { return Ok(s); }
+        // snapshot converged charges (q_gpu = last iterate per replica)
+        let na = self.n_atoms;
+        let mut q = vec![0.0f32; self.batch * na];
+        self.rt.read_buffer(&self.plan.q_gpu, &mut q)?;
+        let ok: Vec<usize> = (0..self.batch).filter(|&b| s.statuses[b] != SccStatus::Failed).collect();
+        if ok.is_empty() { return Ok(s); }   // nothing to seed from — keep the honest failures
+        for b in 0..self.batch {
+            if s.statuses[b] != SccStatus::Failed { continue; }
+            let src = *ok.iter().min_by_key(|&&c| c.abs_diff(b)).unwrap();
+            let (dst_lo, src_lo) = (b * na, src * na);
+            q.copy_within(src_lo..src_lo + na, dst_lo);
+            eprintln!("[GpuDftb] SCC warm-start replica {b} ← replica {src} (q copied, DIIS reset)");
+        }
+        self.plan.reset_diis(&self.rt)?;
+        self.plan.set_initial_charges(&self.rt, &q)?;
+        let s2 = self.scc_mix(max_iter, rms_tol, 0)?;
+        // per-replica merge: keep the BETTER outcome — a converged replica
+        // re-seeded from its own q can re-evaluate a hair above tol near the
+        // floor and must not be demoted to Failed by the retry.
+        let rank = |st: &SccStatus| match st { SccStatus::Converged => 0, SccStatus::Plateau => 1, SccStatus::Failed => 2 };
+        let mut merged = s2;
+        for b in 0..self.batch {
+            if rank(&s.statuses[b]) < rank(&merged.statuses[b]) {
+                merged.statuses[b] = s.statuses[b].clone();
+            }
+        }
+        merged.stalled = merged.statuses.iter().any(|st| *st != SccStatus::Converged);
+        let still = merged.statuses.iter().filter(|st| **st == SccStatus::Failed).count();
+        eprintln!("[GpuDftb] SCC warm-start retry: {n_fail} failed → {still} still failed");
+        self.scc_ok = merged.statuses.iter().map(|st| *st != SccStatus::Failed).collect();
+        Ok(merged)
     }
 
     pub fn reset_q0(&mut self) -> Result<()> {
@@ -507,10 +577,19 @@ impl GpuDftb {
         if mix == 2 && self.batch != 1 {
             return Err(DftbError::InvalidInput(format!("scc_mix host DIIS: batch={} — measurement path is replica-0 only", self.batch)));
         }
+        // D11-fix: PER-REPLICA convergence tracking. The old detector tested
+        // the batch-MAX rms — one stagnating replica broke the loop for
+        // everyone, and "plateau" was declared for ANY stagnant residual
+        // (rms=0.2 counted as plateau — that's divergence, not a floor).
+        // Plateau = iterate stopped moving AND residual near the f32 floor.
+        const PLATEAU_FLOOR: f32 = 5e-4;   // measured floor ~1e-6..1e-5; above this, stagnant = failed
         let mut rms = f32::INFINITY;
         let mut n_iters = 0;
-        let mut hist = [f32::INFINITY; 10];
-        let mut stalled = false;
+        // per-replica ring of last-10 rms + done flags
+        let mut hist = vec![[f32::INFINITY; 10]; self.batch];
+        let mut stagnant = vec![false; self.batch];
+        let mut done = vec![false; self.batch];
+        let mut n_active = self.batch;
         let mut host = if mix == 2 {
             let mut m = crate::qmqm::mixer::DiisMixer::new(self.n_atoms.min(10), self.n_atoms);
             m.alpha = 0.3;
@@ -564,19 +643,71 @@ impl GpuDftb {
                 }
                 other => return Err(DftbError::InvalidInput(format!("scc_mix: mix={other} not 0/1/2"))),
             };
-            hist[n_iters % 10] = rms;
-            if rms < rms_tol { break; }
-            if n_iters >= 25 {
-                let (mut rmin, mut rmax) = (f32::INFINITY, 0.0f32);
-                for &r in &hist { rmin = rmin.min(r); rmax = rmax.max(r); }
-                if rmin > rms_tol && rmax < 4.0 * rmin {
-                    stalled = true;
-                    break;
+            // per-replica convergence: done when r<tol, stagnant when the
+            // last-10 window stops moving (status decided by floor at end)
+            for b in 0..self.batch {
+                if done[b] { continue; }
+                let r_b = if mix == 2 { rms } else { self.plan.rms_host.get(b).copied().unwrap_or(rms) };
+                hist[b][n_iters % 10] = r_b;
+                if r_b < rms_tol { done[b] = true; n_active -= 1; continue; }
+                if !r_b.is_finite() { done[b] = true; n_active -= 1; continue; }  // Failed — stop iterating it
+                if n_iters >= 25 {
+                    let (mut rmin, mut rmax) = (f32::INFINITY, 0.0f32);
+                    for &r in &hist[b] { rmin = rmin.min(r); rmax = rmax.max(r); }
+                    if rmax < 4.0 * rmin { done[b] = true; stagnant[b] = true; n_active -= 1; }
                 }
             }
+            if n_active == 0 { break; }
         }
-        if n_iters == cap && rms >= rms_tol { stalled = true; }
-        Ok(GpuDftbScc { n_iters, rms, stalled })
+        let mut stalled = false;
+        let mut plateau = false;
+        for b in 0..self.batch {
+            let r_b = if mix == 2 { rms } else { self.plan.rms_host.get(b).copied().unwrap_or(f32::NAN) };
+            if r_b < rms_tol { continue; }
+            stalled = true;
+            if stagnant[b] && r_b < PLATEAU_FLOOR { plateau = true; }
+        }
+        // D9: report device-side DIIS fallbacks (replaces kernel printf).
+        if mix == 0 {
+            let mut flag = vec![0i32; self.batch];
+            let mut reason = vec![0i32; self.batch];
+            self.plan.diis_status(&self.rt, &mut flag, &mut reason)?;
+            let mut n_fb = 0i32;
+            let mut worst = 0i32;
+            let mut worst_sid = 0usize;
+            for (sid, &f) in flag.iter().enumerate() {
+                if f > 0 { n_fb += f; if reason[sid] > worst { worst = reason[sid]; worst_sid = sid; } }
+            }
+            if n_fb > 0 {
+                eprintln!("[GpuDftb] DIIS fallbacks: {n_fb} total, last reason={worst} at sid={worst_sid} (1=pivot/scale 2=nonfinite 3=sum(c)!=1)");
+            }
+        }
+        // D11: per-system status — Converged only when the final residual is
+        // below tol; Plateau when the iterate stopped moving; else Failed.
+        // mix=2 (host DIIS) fills only the scalar rms (batch=1 path).
+        let statuses: Vec<SccStatus> = (0..self.batch).map(|sid| {
+            let r = if mix == 2 { rms } else { self.plan.rms_host.get(sid).copied().unwrap_or(f32::NAN) };
+            if !r.is_finite() { SccStatus::Failed }
+            else if r < rms_tol { SccStatus::Converged }
+            else if stagnant[sid] && r < PLATEAU_FLOOR { SccStatus::Plateau }
+            else { SccStatus::Failed }
+        }).collect();
+        if self.batch > 1 || statuses.first() != Some(&SccStatus::Converged) {
+            // per-replica rms — the diagnostic that shows WHO failed/plateaued
+            let rms_str: Vec<String> = (0..self.batch).map(|sid| {
+                let r = if mix == 2 { rms } else { self.plan.rms_host.get(sid).copied().unwrap_or(f32::NAN) };
+                format!("{r:.1e}")
+            }).collect();
+            eprintln!("[GpuDftb] SCC status: {}", statuses.iter().map(|s| match s {
+                SccStatus::Converged => "converged",
+                SccStatus::Plateau => "plateau",
+                SccStatus::Failed => "FAILED",
+            }).collect::<Vec<_>>().join(","));
+            eprintln!("[GpuDftb] SCC rms per replica: {}", rms_str.join(","));
+        }
+        // failed replicas must not be stepped on garbage forces (relax parks them)
+        self.scc_ok = statuses.iter().map(|s| *s != SccStatus::Failed).collect();
+        Ok(GpuDftbScc { n_iters, rms, stalled, statuses })
     }
 
     /// One finalize: energy always; forces if `want_forces`. Do not call energy() then forces().
@@ -625,7 +756,7 @@ impl GpuDftb {
 
     /// Force kernels from the current finalized D/C/ε. Caller must have `finalize`d.
     fn forces_from_state(&mut self) -> Result<Vec<f32>> {
-        self.plan.build_edm(&self.buf_edm)?;
+        self.plan.build_edm(&self.buf_edm, self.n_occ)?;
         self.scratch_f0.fill(0.0);
         self.rt.write_buffer(&self.buf_forces, &self.scratch_f0)?;
         for slot in &self.buckets {
@@ -646,46 +777,115 @@ impl GpuDftb {
         Ok(self.scratch_f.clone())
     }
 
-    /// One FIRE step on all replicas (Bitzek 2006). Call `scc` first. Returns max |F|.
-    pub fn fire_step(&mut self, f_tol: f64) -> Result<f64> {
-        let ev = self.eval(true)?;
-        let f = ev.forces.as_ref().expect("eval(true) returns forces");
-        let ntot = self.batch * self.n_atoms;
-        let mut max_f = 0.0f64;
-        let mut p = 0.0f64;
-        for i in 0..ntot {
-            for c in 0..3 {
-                let fi = f[3 * i + c] as f64;
-                max_f = max_f.max(fi.abs());
-                p += fi * self.fire_v[i][c];
+    /// Fermi smearing kT in Hartree (0 = integer occupation). Stabilizes SCC
+    /// at near-degenerate HOMO/LUMO geometries (e.g. mid proton transfer:
+    /// gap ~0.5 mHa makes integer occ flip → O(1) Δq oscillation).
+    /// Suggested ~0.002 (≈630 K). Costs a tiny eig readback + μ bisection
+    /// per SCC iter; energy becomes 2Σf_k ε_k, forces use W=2Σf_k ε_k CCᵀ.
+    pub fn set_smearing(&mut self, kt: f32) {
+        if !kt.is_finite() || kt < 0.0 { panic!("set_smearing: kT={kt}"); }
+        self.plan.kT = kt;
+        eprintln!("[GpuDftb] Fermi smearing kT={kt} Ha{}", if kt > 0.0 { "" } else { " (integer occ)" });
+    }
+
+    /// Pin atoms (template indices, applied to every replica) for
+    /// constrained relaxed scans — e.g. the transferred proton fixed at a
+    /// scan-point position. Forces/velocities on frozen atoms are ignored
+    /// and excluded from that replica's convergence test.
+    pub fn set_frozen_atoms(&mut self, idx: &[usize]) -> Result<()> {
+        self.frozen.fill(false);
+        for &i in idx {
+            if i >= self.n_atoms {
+                return Err(DftbError::InvalidInput(format!(
+                    "set_frozen_atoms: index {i} >= n_atoms {}", self.n_atoms
+                )));
             }
+            self.frozen[i] = true;
         }
-        if p > 0.0 {
-            self.fire_n_pos += 1;
-            if self.fire_n_pos > 10 {
-                self.fire_dt = (self.fire_dt * 1.1).min(5.0);
-                self.fire_alpha *= 0.95;
+        Ok(())
+    }
+
+    /// One FIRE step on all replicas (Bitzek 2006, D12-fixed).
+    /// Correct physics: mixing is `v ← (1−α)v + α·F̂·‖v‖` with ‖v‖,‖F‖ the
+    /// GLOBAL per-replica norms (NOT per-atom α‖F_i‖F̂_i — that would pin
+    /// each atom's speed to its force). dt/α/n_pos are per-replica state —
+    /// batched systems adapt independently; a replica whose max|F| (over
+    /// UNfrozen atoms) < f_tol is parked with zero velocity.
+    /// Ordering (matches `FireOptimizer` in examples/hbond_ref.rs):
+    ///   P=F·v → adapt → mix → v+=F·dt (vmax cap) → x+=v·dt (disp cap).
+    /// Call `scc` first. Returns global max |F|.
+    pub fn fire_step(&mut self, f_tol: f64) -> Result<f64> {
+        const N_MIN: usize = 10;
+        const F_INC: f64 = 1.1;
+        const F_DEC: f64 = 0.7;
+        const ALPHA_START: f64 = 0.1;
+        const F_ALPHA: f64 = 0.95;
+        const VMAX: f64 = 2.0;
+        let ev = self.eval(true)?;
+        let f = ev.forces.as_ref().expect("eval(true) returns forces").clone();
+        let n_atoms = self.n_atoms;
+        let mut max_f = 0.0f64;
+        for b in 0..self.batch {
+            let lo = b * n_atoms;
+            let hi = lo + n_atoms;
+            // per-replica convergence over UNfrozen atoms only
+            let mut max_fb = 0.0f64;
+            for i in lo..hi {
+                if self.frozen[i - lo] { continue; }
+                for c in 0..3 { max_fb = max_fb.max(f[3 * i + c].abs() as f64); }
             }
-        } else {
-            self.fire_n_pos = 0;
-            self.fire_dt *= 0.7;
-            self.fire_alpha = 0.1;
-            for v in &mut self.fire_v { *v = [0.0; 3]; }
+            max_f = max_f.max(max_fb);
+            if max_fb < f_tol || !self.scc_ok[b] {
+                for v in &mut self.fire_v[lo..hi] { *v = [0.0; 3]; }
+                continue;   // replica parked — converged or SCC failed
+            }
+            // P = F·v over this replica's degrees of freedom
+            let mut p = 0.0f64;
+            for i in lo..hi {
+                for c in 0..3 { p += f[3 * i + c] as f64 * self.fire_v[i][c]; }
+            }
+            if p > 0.0 {
+                self.fire_n_pos[b] += 1;
+                if self.fire_n_pos[b] > N_MIN {
+                    self.fire_dt[b] = (self.fire_dt[b] * F_INC).min(5.0);
+                    self.fire_alpha[b] *= F_ALPHA;
+                }
+            } else {
+                self.fire_n_pos[b] = 0;
+                self.fire_dt[b] *= F_DEC;
+                self.fire_alpha[b] = ALPHA_START;
+                for v in &mut self.fire_v[lo..hi] { *v = [0.0; 3]; }
+            }
+            // Global per-replica norms for the mix
+            let mut v2 = 0.0f64;
+            let mut f2 = 0.0f64;
+            for i in lo..hi {
+                for c in 0..3 {
+                    v2 += self.fire_v[i][c] * self.fire_v[i][c];
+                    f2 += f[3 * i + c] as f64 * f[3 * i + c] as f64;
+                }
+            }
+            let vnorm = v2.sqrt();
+            let fnorm = f2.sqrt();
+            let alpha = self.fire_alpha[b];
+            let dt = self.fire_dt[b];
+            let scale = if fnorm > 1e-12 { alpha * vnorm / fnorm } else { 0.0 };
+            for i in lo..hi {
+                if self.frozen[i - lo] {
+                    self.fire_v[i] = [0.0; 3];    // constraint: F and v dead
+                    continue;
+                }
+                for c in 0..3 {
+                    let mut v = (1.0 - alpha) * self.fire_v[i][c] + scale * f[3 * i + c] as f64;
+                    v += f[3 * i + c] as f64 * dt;           // v += F·dt
+                    if v.abs() > VMAX { v = v.signum() * VMAX; }
+                    self.fire_v[i][c] = v;
+                }
+                let v = self.fire_v[i];
+                apply_disp(&mut self.coords[i], &v, 0.0, 0.0, 0.0, dt); // x += v·dt (disp-capped)
+            }
         }
         if max_f < f_tol { return Ok(max_f); }
-        for i in 0..ntot {
-            let fx = f[3 * i] as f64; let fy = f[3 * i + 1] as f64; let fz = f[3 * i + 2] as f64;
-            let fnorm = (fx * fx + fy * fy + fz * fz).sqrt();
-            let (hx, hy, hz) = if fnorm > 1e-12 { (fx / fnorm, fy / fnorm, fz / fnorm) } else { (0.0, 0.0, 0.0) };
-            for (c, h) in [hx, hy, hz].iter().enumerate() {
-                self.fire_v[i][c] = (1.0 - self.fire_alpha) * self.fire_v[i][c] + self.fire_alpha * fnorm * h;
-            }
-            let dt = self.fire_dt;
-            apply_disp(&mut self.coords[i], &self.fire_v[i], fx, fy, fz, dt);
-            self.fire_v[i][0] += fx * dt;
-            self.fire_v[i][1] += fy * dt;
-            self.fire_v[i][2] += fz * dt;
-        }
         let c = self.coords.clone();
         self.set_coords(&c)?;
         Ok(max_f)
@@ -777,6 +977,9 @@ impl GpuDftb {
         let ctsc = residual_ctsc(&s, &c, n);
         let xtsx = residual_ctsc(&s, &xlow, n);
         let ctcp = residual_eye(&cp, n);
+        // D1: decompose δ_CH into normalization vs residual parts; per-column
+        // metric defects for C (S-metric) and C' (plain orthonormality).
+        let d1 = decompose_occ(&hscc, &s, &c, &cp, eig, mask, n);
 
         let (lam_r, c_r) = gevp_lowdin_f32(&hscc, &s, n)?;
         let mut eps_gpu_occ: Vec<f64> = (0..n).filter(|&k| mask[k] != 0).map(|k| eig[k] as f64).collect();
@@ -821,6 +1024,8 @@ impl GpuDftb {
         eprintln!("[measure] frozen rounded GEVP vs GPU Jacobi: max|δε_occ|={de_occ:.3e}  ||P_gpu−P_round||_F={p_diff:.3e}");
         eprintln!("[measure] E_band={e_band:.12} E_bandform_el={e_bandform_el:.12} E_dens={e_dens:.12} E_rep={e_rep:.12} E_tot={:.12}", ev.energy[0]);
         eprintln!("[measure] δ_eig={delta_eig:.3e} = δ_CH(E_band−2ΣCᵀHC)={delta_ch:.3e} + δ_D(2ΣCᵀHC−Tr(DH))={delta_d:.3e}  ||D−2CCᵀ||_F={d_vs_cc:.3e}");
+        eprintln!("[measure] D1 δ_CH split: δ_norm(2Σρ(1−n_k))={:.3e} + δ_res(2Σ(ε−ρ))={:.3e} = {:.3e} (should equal δ_CH)", d1.delta_norm, d1.delta_res, d1.delta_norm + d1.delta_res);
+        eprintln!("[measure] D1 occ cols: max|cᵀSc−1|={:.3e} max_offdiag|cᵀSc|={:.3e} max|ε−ρ|={:.3e} max r_k={:.3e} || C' occ: max|c'ᵀc'−1|={:.3e} max_offdiag|c'ᵀc'|={:.3e}", d1.max_diag_ctsc, d1.max_offdiag_ctsc, d1.max_eps_rho, d1.max_resid, d1.max_diag_ctcp, d1.max_offdiag_ctcp);
         eprintln!("[measure] r·V={rdotv:.3e} ½rᵀGr={half_rgr:.3e}  bandform−dens={ident:.3e}  predicted(δ_eig−½rGr)={pred:.3e}");
         eprintln!("[measure] q_rms={:.3e} q_max={:.3e}", ev.q_rms, ev.q_max);
 
@@ -915,7 +1120,19 @@ fn apply_disp(xyz: &mut [f64; 3], v: &[f64; 3], fx: f64, fy: f64, fz: f64, dt: f
     xyz[0] += dx; xyz[1] += dy; xyz[2] += dz;
 }
 
-fn fill_gamma(coords: &[[f64; 3]], u: &[f64], n_atoms: usize, batch: usize, g: &mut [f32]) {
+/// DEPRECATED by D7 — kept as the host-side reference for device G parity.
+/// G matrix via the D8 species-pair spline — the SAME numerical γ the
+/// force kernel's γ′ comes from (energy–force consistent). `atom_sp` is the
+/// global species index per atom (replica-0 ordering; batch is homogeneous).
+#[allow(dead_code)]
+fn fill_gamma(
+    coords: &[[f64; 3]],
+    spl: &crate::methods::dftb::gamma_spline::GammaSpline,
+    atom_sp: &[i32],
+    n_atoms: usize,
+    batch: usize,
+    g: &mut [f32],
+) {
     for b in 0..batch {
         let xyz = &coords[b * n_atoms..(b + 1) * n_atoms];
         let base = b * n_atoms * n_atoms;
@@ -925,7 +1142,8 @@ fn fill_gamma(coords: &[[f64; 3]], u: &[f64], n_atoms: usize, batch: usize, g: &
                 let dy = xyz[a][1] - xyz[c][1];
                 let dz = xyz[a][2] - xyz[c][2];
                 let r = (dx * dx + dy * dy + dz * dz).sqrt() * ANG2BOHR;
-                g[base + a * n_atoms + c] = gamma_full(r, u[a], u[c]) as f32;
+                let (gv, _) = spl.eval(r, atom_sp[a] as usize, atom_sp[c] as usize);
+                g[base + a * n_atoms + c] = gv as f32;
             }
         }
     }
@@ -1188,4 +1406,85 @@ fn density_vs_cc(d: &[f32], c: &[f32], mask: &[i32], n: usize) -> f64 {
         }
     }
     s2.sqrt()
+}
+
+/// D1 decomposition of δ_CH for occupied states (GPT 5.6 review, manifest §12).
+///
+/// δ_CH = 2Σε_k − 2Σc_kᵀHc_k. With n_k=c_kᵀSc_k and ρ_k=(c_kᵀHc_k)/n_k this
+/// splits *exactly* as δ_CH = δ_res + δ_norm:
+///   δ_res  = 2Σ(ε_k − ρ_k)      — true eigen-equation error (Rayleigh quotient)
+///   δ_norm = 2Σρ_k(1 − n_k)     — pure S-normalization defect of the columns
+/// Also reports the plain-orthonormality defect of the orthogonal-basis C′
+/// columns, and the per-state residual ||Hc_k − ε_kSc_k||/||H||_F.
+struct OccDecomp {
+    delta_norm: f64,
+    delta_res: f64,
+    max_diag_ctsc: f64,
+    max_offdiag_ctsc: f64,
+    max_eps_rho: f64,
+    max_resid: f64,
+    max_diag_ctcp: f64,
+    max_offdiag_ctcp: f64,
+}
+
+fn decompose_occ(h: &[f32], s: &[f32], c: &[f32], cp: &[f32], eig: &[f32], mask: &[i32], n: usize) -> OccDecomp {
+    // sc = S·C, hc = H·C (f64 diagnostics, O(n³) once per measure call)
+    let mut sc = vec![0.0f64; n * n];
+    let mut hc = vec![0.0f64; n * n];
+    let mut hnf = 0.0f64;
+    for i in 0..n {
+        for j in 0..n { hnf += (h[i * n + j] as f64).powi(2); }
+    }
+    hnf = hnf.sqrt().max(1e-30);
+    for i in 0..n {
+        for k in 0..n {
+            let mut sa = 0.0f64;
+            let mut ha = 0.0f64;
+            for nu in 0..n {
+                sa += s[i * n + nu] as f64 * c[nu * n + k] as f64;
+                ha += h[i * n + nu] as f64 * c[nu * n + k] as f64;
+            }
+            sc[i * n + k] = sa;
+            hc[i * n + k] = ha;
+        }
+    }
+    let mut occ: Vec<usize> = (0..n).filter(|&k| mask[k] != 0).collect();
+    occ.sort_unstable();
+    let mut d = OccDecomp {
+        delta_norm: 0.0, delta_res: 0.0,
+        max_diag_ctsc: 0.0, max_offdiag_ctsc: 0.0,
+        max_eps_rho: 0.0, max_resid: 0.0,
+        max_diag_ctcp: 0.0, max_offdiag_ctcp: 0.0,
+    };
+    for (ii, &k) in occ.iter().enumerate() {
+        let mut n_k = 0.0f64;
+        let mut q_k = 0.0f64;
+        let mut n2_cp = 0.0f64;
+        for mu in 0..n {
+            n_k += c[mu * n + k] as f64 * sc[mu * n + k];
+            q_k += c[mu * n + k] as f64 * hc[mu * n + k];
+            n2_cp += (cp[mu * n + k] as f64).powi(2);
+        }
+        let rho = q_k / n_k;
+        let eps = eig[k] as f64;
+        d.delta_res += 2.0 * (eps - rho);
+        d.delta_norm += 2.0 * rho * (1.0 - n_k);
+        d.max_diag_ctsc = d.max_diag_ctsc.max((n_k - 1.0).abs());
+        d.max_diag_ctcp = d.max_diag_ctcp.max((n2_cp - 1.0).abs());
+        d.max_eps_rho = d.max_eps_rho.max((eps - rho).abs());
+        let mut r2 = 0.0f64;
+        for mu in 0..n { r2 += (hc[mu * n + k] - eps * sc[mu * n + k]).powi(2); }
+        d.max_resid = d.max_resid.max(r2.sqrt() / hnf);
+        for &l in occ.iter().skip(ii + 1) {
+            let mut kl = 0.0f64;
+            let mut kl_cp = 0.0f64;
+            for mu in 0..n {
+                kl += c[mu * n + k] as f64 * sc[mu * n + l];
+                kl_cp += cp[mu * n + k] as f64 * cp[mu * n + l] as f64;
+            }
+            d.max_offdiag_ctsc = d.max_offdiag_ctsc.max(kl.abs());
+            d.max_offdiag_ctcp = d.max_offdiag_ctcp.max(kl_cp.abs());
+        }
+    }
+    d
 }

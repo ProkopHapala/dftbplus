@@ -430,10 +430,10 @@ fn build_density_matrices(
 /// row-major (rows = orbitals of j, cols = orbitals of i) — matching the
 /// convention used by `Rotation::rotate_diatomic_block_into`.
 ///
-/// **P2:** Now test/reference-only — production force code uses
-/// `build_pair_block_with_derivs` (analytic derivatives) instead.
-#[cfg(test)]
-fn build_pair_block(
+/// **P2:** production use is the sparse BSR4 assembler (F2,
+/// `assemble_hs_bsr` in `methods/sparse/sparse_dftb.rs`); dense force code
+/// uses `build_pair_block_with_derivs` (analytic derivatives) instead.
+pub(crate) fn build_pair_block(
     ctx: &SystemContext<'_>,
     coords_i: [f64; 3],
     coords_j_disp: [f64; 3],
@@ -486,7 +486,7 @@ fn build_pair_block(
 /// derivatives are in Hartree/Bohr, so the Cartesian derivatives are in
 /// Hartree/Bohr (matching the SK convention). The force functions convert
 /// to Hartree/Å using ANG2BOHR.
-fn build_pair_block_with_derivs(
+pub(crate) fn build_pair_block_with_derivs(
     ctx: &SystemContext<'_>,
     coords: &[[f64; 3]],
     i: usize,
@@ -1091,6 +1091,50 @@ pub fn repulsive_energy(
             let (e, _) = spline.eval(r2.sqrt() * ANG2BOHR);
             if !e.is_finite() {
                 panic!("repulsive_energy: non-finite E_rep for {}-{} at r={:.4} Å: {e}", species[i], species[j], r2.sqrt());
+            }
+            e_rep += e;
+        }
+    }
+    Ok(e_rep)
+}
+
+/// Repulsive pair energy using pre-parsed spline tables (no file I/O).
+///
+/// Same physics as `repulsive_energy` but reads `repulsive` from
+/// `parse_all_repulsive` (parsed once at init). `species_code` indexes the
+/// `species_names` order used at parse time. Fails loud on a missing spline.
+pub fn repulsive_energy_cached(
+    coords: &[[f64; 3]],
+    species_code: &[u8],
+    species_names: &[String],
+    repulsive: &[Option<RepulsiveSpline>],
+    n_species: usize,
+) -> Result<f64> {
+    let n = coords.len();
+    assert_eq!(species_code.len(), n, "repulsive_energy_cached: len mismatch");
+    let mut e_rep = 0.0f64;
+    for i in 0..n {
+        let si = species_code[i] as usize;
+        for j in (i + 1)..n {
+            let sj = species_code[j] as usize;
+            let spline = repulsive[si * n_species + sj].as_ref()
+                .or(repulsive[sj * n_species + si].as_ref())
+                .ok_or_else(|| DftbError::InvalidInput(format!(
+                    "repulsive_energy_cached: no repulsive Spline for {}-{}",
+                    species_names[si], species_names[sj]
+                )))?;
+            let dx = coords[j][0] - coords[i][0];
+            let dy = coords[j][1] - coords[i][1];
+            let dz = coords[j][2] - coords[i][2];
+            let r2 = dx * dx + dy * dy + dz * dz;
+            if r2 < MIN_NEIGH_DIST * MIN_NEIGH_DIST {
+                return Err(DftbError::InvalidInput(format!(
+                    "repulsive_energy_cached: atoms {i}-{j} on top of each other, |r|={:.3e} Å", r2.sqrt()
+                )));
+            }
+            let (e, _) = spline.eval(r2.sqrt() * ANG2BOHR);
+            if !e.is_finite() {
+                panic!("repulsive_energy_cached: non-finite E_rep for {}-{} at r={:.4} Å: {e}", species_names[si], species_names[sj], r2.sqrt());
             }
             e_rep += e;
         }

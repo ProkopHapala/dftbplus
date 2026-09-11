@@ -49,12 +49,19 @@
 //! Hessian implementation is blocked until this passes.
 
 use crate::core::error::{DftbError, Result};
-use crate::methods::dftb::forces::{compute_forces_from_dw, Forces};
+use crate::methods::dftb::forces::{
+    build_pair_block_with_derivs, check_finite, check_newton, compute_forces_from_dw,
+    repulsive_force_cached, scc_double_counting_force, Forces, RepulsiveSpline,
+};
+use crate::methods::dftb::gamma::GammaTable;
+use crate::methods::dftb::hamiltonian::SystemContext;
 use crate::methods::dftb::sk_data::SkData;
-use crate::methods::sparse::bsr4::{build_product_mask, build_spgemm_plan_bsym, Bsr4Matrix, SpgemmPlan, BS, BS2};
+use crate::methods::sparse::bsr4::{build_product_mask, build_spgemm_plan_bsym, Bsr4Matrix, BS, BS2};
 use crate::methods::sparse::gpu_sparse::{GpuBsrMatrix, GpuBsrStructure, SparseBsr4Gpu, SpgemmPlanGpu};
 use nalgebra::DMatrix;
 use std::sync::Arc;
+
+const ANG2BOHR: f64 = 1.889_726_133;
 
 /// Output of `build_dw_sparse`: device-resident `D` and `W` matrices.
 ///
@@ -75,15 +82,12 @@ pub struct SparseDW {
 /// and swaps `set_arg`s.
 ///
 /// The workspace owns:
-/// - `tw_struct`: GPU structure for T = K·H_scc (on M_TW = M_K ∘ M_HS)
-/// - `t`: scratch GPU matrix on M_TW
+/// - `t`: scratch GPU matrix on M_TW = M_K ∘ M_HS
 /// - `w`: GPU matrix on M_HS (the output W)
 /// - `d`: GPU matrix on M_K (the output D)
 /// - `plan_kh`: symbolic plan for T = K·H_scc (A=K, B=H_scc sym, C=T)
 /// - `plan_tk`: symbolic plan for W = T·K (A=T, B=K sym, C=W on M_HS)
 pub struct SparseDWWorkspace {
-    /// GPU structure for T = K·H_scc on M_TW.
-    tw_struct: Arc<GpuBsrStructure>,
     /// Scratch T = K·H_scc (on M_TW).
     t: GpuBsrMatrix,
     /// Output W = 2·T·K (on M_HS, reuses h_scc structure).
@@ -114,10 +118,17 @@ impl SparseDWWorkspace {
         let n_atom = k_struct.n_atom;
         assert_eq!(h_struct.n_atom, n_atom, "K and H_scc must have same n_atom");
 
-        // M_TW = boolean_product(M_K, M_HS) — host-side, one-time.
+        // T = K·H_scc is multiply-TRUNCATED to M_K, not stored on the
+        // symbolic product mask: product(M_K,M_HS) reaches r_k+r_hs (~19 Å →
+        // 1298 blocks/row on a 1648-atom sphere, far past the SpGEMM
+        // local-mem cap). Same truncation choice as T=K·S in sparse_system.
+        // NOTE (f32/accuracy): truncating an INTERMEDIATE deletes real
+        // contributions to in-mask W blocks; its error is the same controlled
+        // quantity as the M_K truncation itself and must be measured (see
+        // report: K/Z truncation costs ~6 mHa at r_k=8 Å vs 0.04 mHa for H/S).
         let k_mask = (k_struct.row_ptr_host(gpu)?, k_struct.col_idx_host(gpu)?);
         let hs_mask = (h_struct.row_ptr_host(gpu)?, h_struct.col_idx_host(gpu)?);
-        let m_tw = build_product_mask(n_atom, &k_mask, &hs_mask);
+        let m_tw = k_mask.clone();
 
         // Allocate device structures and buffers once.
         let tw_struct = Arc::new(GpuBsrStructure::new(gpu, n_atom, &m_tw)?);
@@ -151,7 +162,7 @@ impl SparseDWWorkspace {
             }
         };
 
-        Ok(Self { tw_struct, t, w, d, plan_kh, plan_tk })
+        Ok(Self { t, w, d, plan_kh, plan_tk })
     }
 
     /// Build `D = 2K` and `W = 2 K H_scc K` into the workspace's persistent
@@ -441,6 +452,243 @@ pub fn bsr4_max_abs_diff(a: &Bsr4Matrix, b: &Bsr4Matrix) -> f32 {
     max
 }
 
+// ============================================================================
+// F5 — sparse force contraction (second review G3.3): D=2K on M_K,
+// W=2KHK on M_HS, contracted over physical atom pairs — NO dense matrices.
+// ============================================================================
+
+/// One off-diagonal atom pair of the frozen `M_HS` topology with its BSR
+/// block indices into the H/S and K value arrays.
+#[derive(Debug, Clone, Copy)]
+pub struct HsPair {
+    pub i: u32,
+    pub j: u32,
+    /// Block index of (i,j) in the M_HS value array (H0/S/W/Hscc).
+    pub b_ij: i32,
+    /// Block index of (j,i) in the M_HS value array (transpose copy).
+    pub b_ji: i32,
+    /// Block index of (i,j) in the M_K value array, or −1 if the pair is
+    /// outside the density-kernel support (D contributes exactly 0 there).
+    pub b_ij_k: i32,
+}
+
+/// Extract the unique-pair list (i<j) from a symmetric mask, with block
+/// indices into `mask` (both orientations) and `k_mask` (same orientation).
+pub fn hs_pairs_from_mask(
+    mask: &(Vec<u32>, Vec<u32>),
+    k_mask: &(Vec<u32>, Vec<u32>),
+    n_atom: usize,
+) -> Vec<HsPair> {
+    let mut pairs = Vec::new();
+    let find_in = |m: &(Vec<u32>, Vec<u32>), i: usize, j: usize| -> i32 {
+        let (lo, hi) = (m.0[i] as usize, m.0[i + 1] as usize);
+        for b in lo..hi {
+            if m.1[b] as usize == j {
+                return b as i32;
+            }
+        }
+        -1
+    };
+    for i in 0..n_atom {
+        for b in (mask.0[i] as usize)..(mask.0[i + 1] as usize) {
+            let j = mask.1[b] as usize;
+            if j <= i {
+                continue;
+            }
+            pairs.push(HsPair {
+                i: i as u32,
+                j: j as u32,
+                b_ij: b as i32,
+                b_ji: find_in(mask, j, i),
+                b_ij_k: find_in(k_mask, i, j),
+            });
+        }
+    }
+    pairs
+}
+
+/// Cosine taper for physical H/S truncation: w=1 for r ≤ r0, decays
+/// smoothly to 0 at r0+w, C¹ (w'=0 at both ends). `t` = (r0_ang, w_ang);
+/// None = untruncated. Returns (w, dw/dr) with r in Å.
+///
+/// A scalar radial taper commutes with the rotation: tapered blocks are
+/// just w·H, w·S. For derivatives (needed by forces) the chain term is
+/// d(wV)/dx_a = w·dV/dx_a + w'·u_a·V with u_a = R_a/R.
+#[inline]
+pub(crate) fn hs_taper(t: Option<(f64, f64)>, r_ang: f64) -> (f64, f64) {
+    match t {
+        None => (1.0, 0.0),
+        Some((r0, w)) => {
+            if r_ang <= r0 { (1.0, 0.0) }
+            else if r_ang >= r0 + w { (0.0, 0.0) }
+            else {
+                let x = std::f64::consts::PI * (r_ang - r0) / w;
+                (0.5 * (1.0 + x.cos()), -0.5 * x.sin() * std::f64::consts::PI / w)
+            }
+        }
+    }
+}
+
+/// Sparse analytic forces of the sparse SCC energy — F5.
+///
+/// Contracts `D = 2K` (on M_K, `k_vals`) and `W = 2 K H_scc K` (on M_HS,
+/// `w_vals`, symmetrized) over the `pairs` list using the same analytic SK
+/// pair derivatives as `non_scc_electronic_force`/`scc_shift_force`, plus
+/// `scc_double_counting_force` and the cached repulsive force. No dense
+/// orbital matrices anywhere.
+///
+/// Parity contract with `compute_forces_from_dw`:
+///   `sqr_dm[a*ni+b]  = D_{ib,ja} = 2·K_{ib,ja}`  → `k_vals[b_ij_k*16 + b*4+a]`
+///   `sqr_edm[a*ni+b] = W_{ib,ja}`                → `w_vals[b_ij*16 + b*4+a]`
+/// Blocks outside M_K (`b_ij_k < 0`) contribute exactly 0 (truncated D).
+pub fn sparse_forces_bsr(
+    ctx: &SystemContext<'_>,
+    coords: &[[f64; 3]],
+    pairs: &[HsPair],
+    k_diag: &[u32],          // m_k block index of (i,i) per atom (dummy check)
+    k_vals: &[f32],          // K values on M_K
+    w_vals: &[f32],          // symmetrized W = 2KHK values on M_HS
+    v_shift: &[f64],         // atom SCC shifts V_i (the state that produced K)
+    q: &[f64],
+    q0: &[f64],
+    gamma_tbl: &GammaTable,
+    repulsive: &[Option<RepulsiveSpline>],
+    taper: Option<(f64, f64)>,   // (r_start_ang, width_ang) — see hs_taper
+) -> Result<Forces> {
+    let n_atom = ctx.n_atoms;
+    let max_n = ctx.species_n_orb.iter().copied().map(|n| n as usize).max().unwrap_or(0);
+    let max_block = max_n * max_n;
+    let mut out = Forces::zeros(n_atom);
+
+    // Dummy-orbital occupation guard on the diagonal K blocks (same check as
+    // sparse_analytic_forces, but on BSR values — no dense D).
+    let mut dummy_d = 0.0f64;
+    for (i, &nphys) in ctx.atom_n_orb.iter().enumerate() {
+        let b = k_diag[i] as usize;
+        for d in (nphys as usize)..BS {
+            dummy_d += (2.0 * k_vals[b * BS2 + d * BS + d] as f64).abs();
+        }
+    }
+    if dummy_d > 1e-6 {
+        return Err(DftbError::InvalidInput(format!(
+            "sparse_forces_bsr: dummy |D_ii| sum={dummy_d:.3e} > 1e-6 (dummy orbitals occupied)"
+        )));
+    }
+
+    // Scratch pair buffers — fixed 4×4 max, no heap alloc in the loop.
+    let mut h = vec![0.0f64; max_block];
+    let mut s = vec![0.0f64; max_block];
+    let mut dh_dx = vec![0.0f64; max_block];
+    let mut dh_dy = vec![0.0f64; max_block];
+    let mut dh_dz = vec![0.0f64; max_block];
+    let mut ds_dx = vec![0.0f64; max_block];
+    let mut ds_dy = vec![0.0f64; max_block];
+    let mut ds_dz = vec![0.0f64; max_block];
+
+    for p in pairs {
+        let i = p.i as usize;
+        let j = p.j as usize;
+        let ni = ctx.atom_n_orb[i] as usize;
+        let nj = ctx.atom_n_orb[j] as usize;
+        let block_size = ni * nj;
+
+        // Skip pairs outside the SK table range — derivatives vanish there
+        // (Verlet-skin blocks inside M_HS contribute exactly 0 force).
+        let dx = coords[j][0] - coords[i][0];
+        let dy = coords[j][1] - coords[i][1];
+        let dz = coords[j][2] - coords[i][2];
+        let r_bohr = (dx * dx + dy * dy + dz * dz).sqrt() * ANG2BOHR;
+        let si = ctx.atom_species[i];
+        let sj = ctx.atom_species[j];
+        let cut = ctx
+            .pair_table(si, sj)
+            .map(|t| t.cutoff())
+            .unwrap_or(f64::INFINITY)
+            .min(ctx.pair_table(sj, si).map(|t| t.cutoff()).unwrap_or(f64::INFINITY));
+        if r_bohr >= cut {
+            continue;
+        }
+
+        let r_ang = r_bohr / ANG2BOHR;
+        let (w, wp_ang) = hs_taper(taper, r_ang);
+        if w == 0.0 { continue; }   // beyond taper: exactly zero
+
+        build_pair_block_with_derivs(
+            ctx, coords, i, j,
+            &mut h[..block_size], &mut s[..block_size],
+            &mut dh_dx[..block_size], &mut dh_dy[..block_size], &mut dh_dz[..block_size],
+            &mut ds_dx[..block_size], &mut ds_dy[..block_size], &mut ds_dz[..block_size],
+        )?;
+
+        if w != 1.0 {
+            // d(w·V)/dx_a = w·dV_a + w'·u_a·V — the chain term keeps the
+            // force the exact gradient of the tapered energy (derivs are
+            // stored per-Bohr·u_a; wp converted accordingly).
+            let wp_b = wp_ang / ANG2BOHR;
+            let inv_r = 1.0 / r_ang;
+            let (ux, uy, uz) = (dx * inv_r, dy * inv_r, dz * inv_r);
+            for k in 0..block_size {
+                let (hv, sv) = (h[k], s[k]);
+                dh_dx[k] = w * dh_dx[k] + wp_b * ux * hv;
+                dh_dy[k] = w * dh_dy[k] + wp_b * uy * hv;
+                dh_dz[k] = w * dh_dz[k] + wp_b * uz * hv;
+                ds_dx[k] = w * ds_dx[k] + wp_b * ux * sv;
+                ds_dy[k] = w * ds_dy[k] + wp_b * uy * sv;
+                ds_dz[k] = w * ds_dz[k] + wp_b * uz * sv;
+                h[k] = w * hv;
+                s[k] = w * sv;
+            }
+        }
+
+        // sqr_dm[a*ni+b] = D_{ib,ja} = 2 K_{ib,ja} (0 when (i,j) ∉ M_K);
+        // sqr_edm[a*ni+b] = W_{ib,ja} at hs block (i,j) lane [b*4+a].
+        let bk = p.b_ij_k;
+        let bw = p.b_ij as usize;
+        let avg_shift = 0.5 * (v_shift[i] + v_shift[j]);
+        let mut cx = 0.0f64;
+        let mut cy = 0.0f64;
+        let mut cz = 0.0f64;
+        let mut sx = 0.0f64;
+        let mut sy = 0.0f64;
+        let mut sz = 0.0f64;
+        for a in 0..nj {
+            for b in 0..ni {
+                let idx = a * ni + b;
+                let dm = if bk >= 0 {
+                    2.0 * k_vals[bk as usize * BS2 + b * BS + a] as f64
+                } else {
+                    0.0
+                };
+                let edm = w_vals[bw * BS2 + b * BS + a] as f64;
+                // non_scc part: 2·(D:dH − W:dS);  scc_shift part: 2·avg·dS·D
+                cx += dm * dh_dx[idx] - edm * ds_dx[idx];
+                cy += dm * dh_dy[idx] - edm * ds_dy[idx];
+                cz += dm * dh_dz[idx] - edm * ds_dz[idx];
+                sx += avg_shift * ds_dx[idx] * dm;
+                sy += avg_shift * ds_dy[idx] * dm;
+                sz += avg_shift * ds_dz[idx] * dm;
+            }
+        }
+        let f = 2.0 * ANG2BOHR;
+        out.non_scc[i][0] += f * cx; out.non_scc[i][1] += f * cy; out.non_scc[i][2] += f * cz;
+        out.non_scc[j][0] -= f * cx; out.non_scc[j][1] -= f * cy; out.non_scc[j][2] -= f * cz;
+        out.scc_shift[i][0] += f * sx; out.scc_shift[i][1] += f * sy; out.scc_shift[i][2] += f * sz;
+        out.scc_shift[j][0] -= f * sx; out.scc_shift[j][1] -= f * sy; out.scc_shift[j][2] -= f * sz;
+    }
+
+    let delta_q: Vec<f64> = q.iter().zip(q0.iter()).map(|(a, b)| a - b).collect();
+    scc_double_counting_force(coords, &ctx.atom_species, &delta_q, gamma_tbl, &mut out.scc_dc);
+    repulsive_force_cached(coords, ctx, repulsive, &mut out.repulsive)?;
+    for i in 0..n_atom {
+        for c in 0..3 {
+            out.forces[i][c] = out.non_scc[i][c] + out.scc_shift[i][c] + out.scc_dc[i][c] + out.repulsive[i][c];
+        }
+    }
+    check_finite(&out.forces, "sparse_forces_bsr total");
+    check_newton(&out.forces, "sparse_forces_bsr total", 1e-6);
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -658,13 +906,16 @@ mod tests {
         let d_ws = d_ws_ref.to_host(&gpu).unwrap();
         let w_ws = w_ws_ref.to_host(&gpu).unwrap();
 
-        // Compare: should be identical (same kernels, same order, just
-        // different buffer ownership).
+        // Compare: same math, different kernels — one-shot uses the
+        // intersection SpGEMM, the workspace the symbolic-plan kernel.
+        // Different summation order → f32 reorder noise; W entries are
+        // O(100) here (T·K of random ~O(1) blocks), so compare relative.
         let d_diff = bsr4_max_abs_diff(&d_oneshot, &d_ws);
         let w_diff = bsr4_max_abs_diff(&w_oneshot, &w_ws);
-        eprintln!("DW workspace vs oneshot: D max|diff|={d_diff:e}, W max|diff|={w_diff:e}");
+        let w_scale = w_oneshot.values.iter().map(|x| x.abs()).fold(0.0f32, f32::max).max(1.0);
+        eprintln!("DW workspace vs oneshot: D max|diff|={d_diff:e}, W max|diff|={w_diff:e} (|W|max={w_scale:e})");
         assert!(d_diff < 1e-6, "D mismatch: {d_diff:e}");
-        assert!(w_diff < 1e-6, "W mismatch: {w_diff:e}");
+        assert!(w_diff < 1e-6 * w_scale, "W mismatch: {w_diff:e} (rel {})", w_diff / w_scale);
 
         // Verify workspace is reusable: second call should give same result.
         let (d2_ref, w2_ref) = ws.build_dw_into(&gpu, &k_dev, &h_scc_dev).unwrap();
@@ -674,6 +925,6 @@ mod tests {
         let w2_diff = bsr4_max_abs_diff(&w_oneshot, &w2);
         eprintln!("DW workspace reuse: D max|diff|={d2_diff:e}, W max|diff|={w2_diff:e}");
         assert!(d2_diff < 1e-6, "D reuse mismatch: {d2_diff:e}");
-        assert!(w2_diff < 1e-6, "W reuse mismatch: {w2_diff:e}");
+        assert!(w2_diff < 1e-6 * w_scale, "W reuse mismatch: {w2_diff:e} (rel {})", w2_diff / w_scale);
     }
 }

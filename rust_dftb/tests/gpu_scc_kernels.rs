@@ -373,6 +373,8 @@ fn test_residual_and_mix() {
     let q_mixed_cpu: Vec<f32> = (0..batch * n_atoms)
         .map(|i| alpha * q_new[i] + (1.0 - alpha) * q_old[i])
         .collect();
+    // Kernel contract is RMS (sqrt(Σd²/n_atoms)), matching the CPU SCC
+    // tolerance convention — NOT the L2 norm.
     let rms_cpu: Vec<f32> = (0..batch)
         .map(|b| {
             let mut s = 0.0f64;
@@ -380,7 +382,7 @@ fn test_residual_and_mix() {
                 let d = q_new[b * n_atoms + a] as f64 - q_old[b * n_atoms + a] as f64;
                 s += d * d;
             }
-            s.sqrt() as f32
+            (s / n_atoms as f64).sqrt() as f32
         })
         .collect();
 
@@ -563,6 +565,8 @@ fn test_batched_scc_kernels() {
     let qm_cpu: Vec<f32> = (0..batch * n_atoms)
         .map(|i| 0.3 * q_new[i] + 0.7 * q_old[i])
         .collect();
+    // Kernel contract is RMS (sqrt(Σd²/n_atoms)), matching the CPU SCC
+    // tolerance convention — NOT the L2 norm.
     let rms_cpu: Vec<f32> = (0..batch)
         .map(|b| {
             let mut s = 0.0f64;
@@ -570,7 +574,7 @@ fn test_batched_scc_kernels() {
                 let d = q_new[b * n_atoms + a] as f64 - q_old[b * n_atoms + a] as f64;
                 s += d * d;
             }
-            s.sqrt() as f32
+            (s / n_atoms as f64).sqrt() as f32
         })
         .collect();
     let dm = max_abs_diff_slice(&qm_gpu, &qm_cpu);

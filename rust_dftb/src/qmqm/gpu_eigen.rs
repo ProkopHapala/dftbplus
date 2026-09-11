@@ -142,7 +142,9 @@ const GPU_TILED_JACOBI_TEMPLATE: &str = include_str!("gpu_tiled_jacobi.cl");
 const TILED_MAX_SWEEPS: usize = 100;
 
 /// Render the tiled Jacobi OpenCL template with block-size specialization.
-fn render_tiled_source(b: usize, wg: usize) -> String {
+/// `prec` = JACOBI_PREC (0=FP32-FMA, 1=FP64 c/s only, 2=broad FP64 reference).
+/// Public for the event-timed 3-mode benchmark in tests/gpu_tiled_jacobi.rs.
+pub fn render_tiled_source(b: usize, wg: usize, prec: u32) -> String {
     let pb = 2 * b;
     let pld = pb + 1;
     GPU_TILED_JACOBI_TEMPLATE
@@ -152,6 +154,7 @@ fn render_tiled_source(b: usize, wg: usize) -> String {
         .replace("#define WG 256", &format!("#define WG {}", wg))
         .replace("#define STRIP_R 32", &format!("#define STRIP_R {}", b))
         .replace("#define MAX_SWEEPS 50", &format!("#define MAX_SWEEPS {}", TILED_MAX_SWEEPS))
+        .replace("#define JACOBI_PREC 2", &format!("#define JACOBI_PREC {}", prec))
 }
 
 /// Tiled block Jacobi eigensolver for N > 64.
@@ -176,6 +179,19 @@ pub fn tiled_jacobi_batched(
     n: usize,
     batch: usize,
 ) -> Result<()> {
+    tiled_jacobi_batched_prec(rt, a_buf, v_buf, n, batch, 2)
+}
+
+/// `prec` = JACOBI_PREC: 0 pure FP32-FMA, 1 FP64 rotation params only,
+/// 2 broad FP64 (accuracy reference).
+pub fn tiled_jacobi_batched_prec(
+    rt: &mut GpuRuntime,
+    a_buf: &Buffer<f32>,
+    v_buf: &Buffer<f32>,
+    n: usize,
+    batch: usize,
+    prec: u32,
+) -> Result<()> {
     if n == 0 || batch == 0 {
         return Ok(());
     }
@@ -186,7 +202,7 @@ pub fn tiled_jacobi_batched(
     }
     let b = 32usize;  // block size
     let wg = 256usize; // workgroup size
-    let source = render_tiled_source(b, wg);
+    let source = render_tiled_source(b, wg, prec);
     let program = rt.build_program(&source)?;
     let kernel = Kernel::builder()
         .program(&program)

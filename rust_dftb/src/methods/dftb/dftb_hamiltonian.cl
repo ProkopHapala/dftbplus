@@ -499,6 +499,27 @@ __kernel void assemble_pairs(
     int atom_off = frag.atom_off;
     int base = frag.H_base;
 
+    // D7: the frozen pair list contains ALL i<j pairs — those beyond the
+    // SK table range must write ZERO (H0/S are no longer pre-zeroed), never
+    // extrapolate the last stencil (cubic_interp_params clamps i but t keeps
+    // growing → garbage). Same in the force kernels.
+    const float r_tab = ((float)n_grid - 1.0f) * dr;
+    if (p.r >= r_tab || p.r < 1e-6f) {
+        if (block_type == 0) {
+            write_symmetric_1x1(H_out, n_orbs, base, p.orb_i, p.orb_j, 0.0f);
+            write_symmetric_1x1(S_out, n_orbs, base, p.orb_i, p.orb_j, 0.0f);
+        } else if (block_type == 1) {
+            float4 blk = (float4)(0.0f);
+            write_symmetric_1x4(S_out, n_orbs, base, p.orb_i, p.orb_j, &blk);
+            write_symmetric_1x4(H_out, n_orbs, base, p.orb_i, p.orb_j, &blk);
+        } else {
+            float4 blk[4] = {(float4)(0.0f), (float4)(0.0f), (float4)(0.0f), (float4)(0.0f)};
+            write_symmetric_4x4(S_out, n_orbs, base, p.orb_i, p.orb_j, blk);
+            write_symmetric_4x4(H_out, n_orbs, base, p.orb_i, p.orb_j, blk);
+        }
+        return;
+    }
+
     float va = V_a[atom_off + p.atom_i];
     float vb = V_a[atom_off + p.atom_j];
     float h1_factor = 0.5f * (va + vb);

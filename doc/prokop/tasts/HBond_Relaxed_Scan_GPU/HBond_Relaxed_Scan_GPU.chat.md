@@ -2319,3 +2319,237 @@ Only after that re-profile.
 One important positive conclusion is that **the analytic SK derivative mathematics itself now looks much healthier than the infrastructure around it**. The H2O/formic parity achieved after fixing orientation, grid origin, and p–s radial units is strong evidence that those derivative formulas are basically correct.  The biggest current risks are now the tiled eigensolver's mathematical shortcut, the deliberately weakened tests, incomplete SCC/repulsive force physics, and a host harness that still moves/allocates far too much data.
 
 I also would make the next validation system **actual 7-azaindole/AT at N≈84–87**, not the artificial 72-orbital 12-water cluster. The water cluster is a useful N>64 smoke test, but it does not probe the spectrum, overlap conditioning, charge redistribution, or near-zwitterionic SCC behavior that motivated this solver in the first place.
+
+
+
+
+
+
+
+---
+
+# USER
+
+OK, we updated it, based on comments in doc/prokop/reports/2026-09-10_gpu_accuracy_physics_performance_second_review.md
+and added CLI unified engine using rhai script to avoid ad hoc test.
+plese review it again now, both scientific rigor, performance, and f32 numerical acuracy issue, suggest imporvemnt which does not hamper speed while overcoming f32 limits. as wel as perforamnce improvement. Focus on the sparse large systems
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+---
+
+# Chat GPT 5.6 sol
+
+I reviewed the current dense path at `e965ae00...`, together with the September 10 report/topical audit and the new Rhai `dftb_engine` workflow. This is **substantially better than the previous version**. Most of the earlier outright correctness failures have really been fixed: the tiled Jacobi now preserves the local similarity transform, the missing global fences are present, the strict Jacobi residual tests are restored, `GpuSccPlan` genuinely owns persistent kernels/buffers, occupation and DIIS are GPU-side, the final unmixed solve makes \(q,H,C,D\) mutually consistent, W is built on GPU, and total energy/forces now include repulsion and all SCC force terms.
+
+I would **not**, however, call the current \(3\times10^{-5}\) Ha AT error a fundamental FP32 floor yet. The evidence points to a much narrower problem: accumulated loss of orthonormality in the tiled Jacobi eigenvectors. That is exactly the sort of error that can often be repaired cheaply in FP32 without converting the O(\(N^3\)) hot path to FP64. The current implementation has actually overreacted somewhat by putting FP64 into large parts of tiled Jacobi. The audit itself finds \(||C'^TC'-I||\sim2\times10^{-6}\), while frozen occupied eigenvalue errors are only \(\sim10^{-6}\) Ha and assembly is around \(10^{-7}\).
+
+I would give the coding agent these next instructions, in this order:
+
+* [ ] **1. Stop calling `δ_CH` a pure eigensolver/f32 floor. Diagnose normalization separately.** Right now you compare something equivalent to \(2\sum_k c_k^T Hc_k\) against \(2\sum_k\epsilon_k\). But that equality assumes \(c_k^TSc_k=1\). Since you already measure \(C^TSC-I\neq0\), part of `δ_CH` is simply normalization error. For each occupied state compute instead
+
+  $$
+  \rho_k=\frac{c_k^T Hc_k}{c_k^TSc_k},
+  \qquad
+  r_k=\frac{\|Hc_k-\epsilon_kSc_k\|}{\|H\|}.
+  $$
+
+  Separately print `max|c_k^T S c_k-1|` and `max_{k≠l}|c_k^TSc_l|`. Your existing diagnostic machinery already computes the relevant generalized residuals.  This will tell us whether the current ~\(5\times10^{-5}\) Ha `δ_CH` comes mostly from column normalization, mutual nonorthogonality, or a genuine eigen-equation error.
+
+* [ ] **2. Remove FP64 from the O(\(N^3\)) parts of tiled Jacobi.** Keeping `tau,c,s` in double is defensible as a small experiment; doing every 2×2 block update, every `lU` update and every length-64 strip dot product in double is not. The current inner pivot does \(1024\times63\times20\approx1.29\) million 2×2 block updates **per pivot**, before strip/V updates, and those are presently double arithmetic cast back to float after every store.   On a 3090 this can destroy throughput while the persistent state is still only FP32.
+
+  Use FP32 FMA for matrix updates. For length-64 dot products, replace both FP64 accumulation and serial Kahan with 4 independent FP32 accumulators:
+
+  ```c
+  float s0=0, s1=0, s2=0, s3=0;
+  for(int k=0; k<m; k+=4){
+      s0 = fma(a[k  ], b[k  ], s0);
+      s1 = fma(a[k+1], b[k+1], s1);
+      s2 = fma(a[k+2], b[k+2], s2);
+      s3 = fma(a[k+3], b[k+3], s3);
+  }
+  float sum = (s0+s1) + (s2+s3);
+  ```
+
+  This shortens the dependency chain, preserves FMA, improves numerical summation, and is much cheaper than either Kahan or FP64. Do the same A/B experiment for `batched_gemm`: the current Kahan implementation has already been measured not to improve `δ_CH`, while adding serial dependencies to every product.
+
+  Benchmark exactly three Jacobi modes: pure FP32-FMA; FP64 only for scalar rotation construction \(c,s\) but FP32-FMA updates; current broad-FP64 version as an accuracy reference. Measure **event time + residual + orthogonality + AT ΔE**, not just whether tests pass.
+
+* [ ] **3. The cheapest likely accuracy fix is occupied-column renormalization. Try this before anything complicated.** After Jacobi and occupation selection, compute
+
+  $$
+  n_k^2=C_k'^TC_k',\qquad C_k'\leftarrow C_k'/\sqrt{n_k^2}
+  $$
+
+  for occupied columns. This costs only \(O(NN_{\rm occ})\), essentially nothing compared with Jacobi. If the diagonal part of the measured \(C'^TC'-I\) dominates, this alone could eliminate a large part of `δ_CH` and may even lower the SCC charge plateau. It also preserves each eigenvector direction, so existing \(\epsilon_k\) and W construction remain conceptually valid.
+
+  If off-diagonal orthogonality remains dominant, then do **one occupied-subspace polar/Newton correction**
+
+  $$
+  G=C_o'^TC_o',\qquad
+  C_o'\leftarrow C_o'\frac{3I-G}{2}.
+  $$
+
+  Since \(G=I+E\), the new metric error is \(O(E^2)\). This is exactly the sort of algorithmic compensation FP32 is good at. Do it first only in `finalize()`; if it materially improves final E/F at small cost, then test whether using it during SCC also lowers the charge floor.
+
+* [ ] **4. Make energy and W consistent with any occupied-subspace correction.** If you only rescale columns, old \(\epsilon_k\) are fine. If you mix occupied columns through a polar correction, do **not** blindly pair the corrected columns with the old diagonal eigenvalues. The rigorous quantity is the small occupied projected Hamiltonian
+
+  $$
+  H_o=C_o^T H_{\rm SCC} C_o .
+  $$
+
+  Then
+
+  $$
+  E_{\rm band}=2\,{\rm Tr}(H_o),
+  \qquad
+  W=2\,C_o H_o C_o^T .
+  $$
+
+  This is invariant to rotations inside the occupied subspace and makes P, W and energy refer to exactly the same approximate occupied projector. It also attacks the current uncomfortable situation where band-form energy is numerically better than `Tr(PH0)` but is not quite consistent with the C used for forces.
+
+* [ ] **5. Move the Löwdin/metric repair off the CPU immediately.** This is currently a serious production anti-pattern. `repair_lowdin_x()` downloads full X and S, converts them to f64, and performs several naïve serial \(N^3\) CPU GEMMs **for every replica** before uploading X again.  For batch=100–1000 this will overwhelm the very GPU parallelism we are building.
+
+  The repair itself is mathematically nice; keep the idea but run it on GPU:
+
+  $$
+  M=X^TSX,\qquad Q=\frac{3I-M}{2},\qquad X\leftarrow XQ.
+  $$
+
+  For \(M=I+E\),
+
+  $$
+  Q^TMQ=I-\frac34E^2+\frac14E^3,
+  $$
+
+  so one step quadratically reduces a small metric defect. This needs only three ordinary FP32 GEMMs once per geometry.
+
+  **Do not symmetrize X afterward.** It is unnecessary. Once corrected, regard X as a general orthogonalizer satisfying \(X^TSX\simeq I\), not specifically symmetric \(S^{-1/2}\). Then use
+
+  $$
+  H'=X^T H X,
+  \qquad C=XC'.
+  $$
+
+  Your tiled GEMM already supports transpose flags.
+
+* [ ] **6. Exploit that same metric correction to avoid diagonalizing S on every relaxation step.** This is a particularly attractive optimization. First geometry: construct X by the full S eigensolve. On the next small FIRE displacement, reuse the previous X and compute
+
+  $$
+  M=X_{\rm old}^TS_{\rm new}X_{\rm old}.
+  $$
+
+  If M is close enough to I, one or two \(X\leftarrow X(3I-M)/2\) corrections should restore orthogonality. Verify that the metric residual decreases; otherwise fall back to the full S eigensolve.
+
+  Unlike the earlier unsafe-looking `X(3I-SX²)/2` idea, this formulation is a well-defined **metric orthogonalization iteration**. It also preserves parallelism: each relaxing scan point reuses only its own previous X; different scan points remain independent.
+
+* [ ] **7. `GpuDftb` is persistent now, but geometry preparation is still mostly CPU-driven. Fix that next.** `fill_gamma()` still loops over every replica/atom pair on CPU in f64, and coordinate/pair information is reconstructed on the host.  More seriously, the current bucket implementation allocates a capacity proportional to `batch*n_atoms²` **for every bucket**, then refills/uploads pair records containing \(r,l,m,n\) after geometry changes. For AT, batch=1000 means ~900,000 pair slots per bucket; that can become hundreds of MB across buckets and huge per-step PCIe traffic.
+
+  Species, atom indices, block type and orbital offsets **never change during relaxation**. Build the per-template pair lists exactly once. For a homogeneous batch, a bucket only needs the pair list for **one molecule**. Launch over `(replica,pair)` and have the kernel read GPU coordinates and compute \(\Delta R,r,\hat R\) itself. Check cutoff on GPU. Then geometry change means essentially one coordinate-buffer update, not reconstructing and re-uploading pair tables.
+
+  Likewise remove the intermediate `finish()` calls from assembly; an in-order queue already orders the kernels. Zero H/S/force buffers with device fills or initialize them in their producer kernels, not by filling host vectors and uploading them.
+
+* [ ] **8. Replace the ill-conditioned analytic gamma formula by a tiny pretabulated species-pair spline.** The current f64 `gamma_prime_full_f32` fixes the close-Hubbard-U cancellation very accurately, but runtime FP64 exp/rational arithmetic is a poor long-term solution.  There are only a handful of H/C/N/O species pairs. At initialization, evaluate \(\gamma_{AB}(r)\) accurately in CPU f64, fit/upload a compact cubic spline, and evaluate **both γ and γ′ from the same spline** on GPU in FP32.
+
+  This simultaneously solves three problems: it removes the catastrophic close-\(U\) cancellation, removes runtime FP64 from γ′, and lets the full G matrix be constructed on-device from coordinates instead of host `fill_gamma()`. Most importantly, γ′ becomes analytically the derivative of the **same numerical γ used in SCC energy**, improving energy-force consistency.
+
+* [ ] **9. Keep the tiny DIIS f64 island; improve its formulation rather than optimizing it away.** The current GPU DIIS correctly fixed RMS and the one-vector DIIS bug and uses scaled f64 Gram/solve, which is exactly where FP64 makes sense.  A 10×10 solve is negligible compared with N=87 Jacobi.
+
+  But change the final affine combination so coefficient-rounding cannot inject the large neutral population \(q_0\). Mix \(\Delta q=q-q_0\), or use an anchored form such as
+
+  $$
+  q=q_{\rm ref}+\sum_{i<n-1}c_i(q_i-q_{\rm ref}).
+  $$
+
+  Then \(\sum c_i=1\) is algebraically exact instead of relying on f32-rounded coefficients. On rank failure, first drop the oldest/most-dependent history vector and retry with \(n-1\), rather than immediately falling back to α-mixing. Also remove `printf` from the production kernel; record a per-system DIIS status/counter instead. And delete `b_mat`/`rhs` device buffers if, as the current code says, they are unused.
+
+* [ ] **10. Reduce work in density/W and SCC orchestration.** `build_density_masked_batched` currently loops over all N orbitals and multiplies by a 0/1 occupation mask.  Have the occupation kernel output `occ_idx[Nocc]` and loop only over occupied states—49 instead of 87 for AT. Since P and W are symmetric, compute only one triangle and mirror it. Use several FP32 FMA accumulators rather than a serial sum.
+
+  Also fuse the tiny
+
+  $$
+  q-q_0\rightarrow V=\gamma\Delta q\rightarrow H_{\rm SCC}
+  $$
+
+  stages into one one-WG-per-system kernel. The data all fit comfortably in local memory. This removes two launches and intermediate global traffic. It matters especially for N=28 where Jacobi is much cheaper.
+
+* [ ] **11. Add per-system active masks before compaction.** The current host reads the entire RMS vector each SCC iteration and waits for the slowest system.  For a 2D proton scan, different configurations will need very different SCC iteration counts. Add one `active[sid]` flag; all kernels—including tiled GEMM workgroups—immediately return for inactive systems. No physical compaction is needed initially. Track convergence/stall per system, not only through the global max.
+
+  Also distinguish `Converged`, `AcceptedAtNumericalPlateau`, and `Failed`. The Rhai scripts currently request `1e-6` for AT, permit the engine to declare `stalled`, and then continue evaluating it.  That is acceptable for a diagnostic script, but production chemistry must not silently conflate “did not meet requested tolerance” with “converged”.
+
+* [ ] **12. Fix FIRE before doing any relaxed PES.** The current implementation computes
+
+  $$
+  v\leftarrow(1-\alpha)v+\alpha |F|\hat F
+       =(1-\alpha)v+\alpha F,
+  $$
+
+  whereas FIRE requires
+
+  $$
+  v\leftarrow(1-\alpha)v+\alpha |v|\hat F.
+  $$
+
+  The present expression literally adds a force to a velocity. It also computes a single P, dt and α over **all replicas**, so one scan point changes the optimizer parameters of every other independent scan point.
+
+  FIRE state must be `[batch]` for `dt,alpha,n_pos` and `[batch,natom,3]` for velocity. Once corrected, move the whole trivial FIRE step to GPU. At present every `fire_step()` downloads forces, updates host coordinates, then sends geometry through the CPU `set_coords()` path. That will be disastrous for the intended large batch. `apply_disp()` also contains its own Verlet-like \(v\,dt+\frac12Fdt^2\) displacement before the later velocity update, so choose one standard FIRE integration ordering and test it against the CPU optimizer instead of mixing schemes.
+
+### The FP32 policy I would use
+
+| Operation                               | Recommended precision                  |
+| --------------------------------------- | -------------------------------------- |
+| H/S/SCC matrices, C, P, W storage       | FP32                                   |
+| Dense GEMM / Jacobi block+strip updates | FP32 FMA, 4-way accumulators           |
+| Jacobi \(c,s\) construction             | benchmark FP32 vs **scalar-only FP64** |
+| Column normalization / polar correction | FP32                                   |
+| Löwdin metric correction                | FP32 GPU GEMMs                         |
+| DIIS Gram + tiny solve                  | FP64                                   |
+| γ/γ′                                    | f64-generated spline → FP32 evaluation |
+| final \(\Delta q\cdot V,\;q_0\cdot V\)  | FP64 accumulation is cheap             |
+| final repulsive-energy reduction        | FP64 accumulation is cheap             |
+| final occupied-energy sum / total E     | FP64                                   |
+| coordinates on CPU/API                  | f64 is fine; device coordinates FP32   |
+
+The important distinction is that the **final scalar reductions contain only tens/hundreds of operations once per geometry**. Using double there costs essentially nothing relative to an N=87 eigensolve. Putting double into millions of operations inside every Jacobi pivot is the opposite tradeoff.
+
+There is one especially promising sequence I would test before anything more elaborate:
+
+$$
+\boxed{\text{FP32-FMA Jacobi}
+\rightarrow
+\text{normalize occupied }C'
+\rightarrow
+\text{measure}}
+$$
+
+If that already cuts `δ_CH` substantially, stop there. If not:
+
+$$
+\boxed{C_o'\rightarrow C_o'(3I-C_o'^TC_o')/2}
+$$
+
+once after `finalize()`. The present data strongly suggest this is where the remaining accuracy lives. I would explicitly change the audit wording from **“f32 floor”** to **“measured floor of the current FP32 Jacobi representation”** until those two cheap corrections have been tried. The restored standalone Jacobi tests already show that FP32 can satisfy residual/orthogonality \(<10^{-5}\), so there is no evidence yet for a fundamental N≈90 precision wall.
+
+### About the Rhai engine
+
+I like this change. `gpu_new → gpu_scc → gpu_eval/gpu_set_coords` is the right abstraction: one persistent native object and coarse script calls, rather than a new Rust executable/test for each experiment.  The measurement scripts are also much easier to audit scientifically than dozens of ad-hoc tests.
+
+Two corrections are important. First, **do not replace mathematical unit tests with Rhai**—Jacobi residuals, derivative parity and kernel invariants belong in Rust tests; scans, A/B experiments and production workflows belong in Rhai. Second, your current `gpu_scc_bench.rs` still benchmarks the **old `GpuDriver`/legacy SCC driver**, including the old host-style setup and 500-iteration runs, rather than `GpuDftb`.  I would delete or rewrite that benchmark now. Otherwise future agents will “optimize” based on measurements of code that production no longer uses.
+
+I would add a native coarse `gpu_bench()` operation to `dftb_engine` which times, with OpenCL events, `set_coords`, S orthogonalization, one SCC iteration, Jacobi, GEMMs, finalize, P/W, forces and total wall time for **N=28 and N=87 at batch=1, 100, 500**. That is the benchmark that should drive all further optimization.
+
+The largest immediate wins, in my view, are therefore **(1) remove broad FP64 Jacobi arithmetic, (2) cheap C′ normalization/orthogonality repair, (3) kill the CPU Löwdin repair, (4) stop rebuilding/uploading geometric pair records, and (5) correct/move FIRE to GPU**. Those five changes improve accuracy *and* throughput rather than trading one for the other.

@@ -1,9 +1,15 @@
 # Sparse Nanocrystal Vibrations — Master Task Breakdown
 
 **Created:** 2026-09-09
-**Source of truth:** `Sparse_Nanocrystal_Vibrations.manifest.md` (§13 checklist)
-**GPT-5.6 review:** `Sparse_Nanocrystal_Vibrations.chat.md` from line 2064
+**Source of truth:** `Sparse_Nanocrystal_Vibrations.manifest.md` (§13 + §14 checklists)
+**GPT-5.6 reviews:** `Sparse_Nanocrystal_Vibrations.chat.md` line 2064 (review 1, commit `b269ab6`) and line 3276 (review 2, commit `e965ae0`)
 **Status report:** `Sparse_Nanocrystal_Vibrations.report.md`
+
+> **2026-09-11 — second review.** Review 2 found three remaining blockers and
+> the root cause of the N4 mystery (a missing `sqrt` contract bug, not an f32
+> floor). **Phase F below is now the active work** — it precedes all remaining
+> Phase-E tuning. See manifest §14 for the verified findings (file:line) and
+> §14.8 for the stricter "done" criteria this phase enforces.
 
 ---
 
@@ -588,6 +594,10 @@ kernel, not a CPU bridge.
 
 **Manifest ref:** §5 Gate G
 **Depends on:** D3 (Gate F)
+**Status (2026-09-12):** prototype driver `sparse_vibrations` (FD Hessian →
+mass-weighted eigen → freqs) exists in `dftb_engine`; first end-to-end
+Si10H16 spectrum produced (see report 2026-09-12). Gate NOT satisfied —
+no dense-f64 Hessian parity comparison yet.
 
 **Spec:**
 - At identical frozen coordinates: sparse f32 Hessian vs dense f64 Hessian.
@@ -754,6 +764,239 @@ kernel, not a CPU bridge.
 
 ---
 
+## Phase F — Second-review corrections (GPT-5.6 review 2, commit `e965ae0`)
+
+**Manifest ref:** §14 (each item verified against code with file:line).
+**Priority: before all remaining Phase-E tuning.** These are correctness
+contracts and architecture, not optimizations. Ordering follows review §"What
+I would implement next" = manifest §14.7.
+
+### Phase F status — 2026-09-11 (measured, see report labbook)
+
+| Task | Status | Evidence |
+|------|--------|----------|
+| F1 | **DONE** | `compute_z` device-resident, full-write identity, plan_zs/plan_tz, warm-Z + cold fallback; 4 `sparse_system` tests pass |
+| F2 | **DONE** | direct BSR H/S assembly, independent M_HS/M_K/M_Z + plans, Verlet skin guard fails loud; `test_f2_direct_bsr_hs_parity` max\|dH\|,\|dS\|<5e-7 vs dense |
+| F3 | **DONE** | `trace_kh0_dev` masked energy (no dense K/trace); `n_buf_allocs` counter; `test_f3_no_device_allocs_in_scc` = 0 growth across scc/forces/geom2 |
+| F4 | **DONE** | `finalize_scc` consistent (q_in,K,H_scc,V) + `rh_stationarity` one-SpGEMM R_H; G3.2 passes |
+| F5 | **DONE (stage 1)** | `SparseDWWorkspace` device T/W + `sparse_forces_bsr` pair contraction; G3.3 D/W parity + G3.4 E-Fd agreement |
+| F6 | **DONE** | repulsive splines + γ matrix + pair lists cached in `new()`; `SystemContext` per-call (can't store — `&'a SkData` borrow) |
+| F7 | **PARTIAL** | normalized R_I=‖KSK−K‖/‖K‖ (R12) + masked trace/Mulliken/Hscc + dummy-lane checks done; packed Mulliken read done (2N buffer, 1 read); multi-acc SpGEMM done (1.06× on 8-atom toy — latency-bound); remaining: packed residual reads |
+| F8 | **PENDING** | = Phase E items, after D-gates revalidated |
+
+Known designed-red tests (diagnostic, not regressions): `gate_e_determinism`
+E-B (its own panic says it stays red until the analytic sparse force exists —
+it now does, test upgrade is a Gate-D item), `locality_sweep` Gate C
+(5-atom toy is not a locality test — needs real gapped Si/H cluster),
+`spline_resample` sin test (pre-existing, untouched file).
+
+### F1 — Newton–Schulz contract bugs (manifest R5+R6, solves N4)
+
+**Problem:** `identity_residual_scalar_dev` returns ‖I−T‖² (missing `sqrt`) —
+the "R_Z=1.9e-5 vs max|Z−S⁻¹|=2.18e-3" gap was a squared norm, not an f32
+failure. Separately, `bsr4_build_identity_dev` writes only diagonal blocks and
+`scale_dev` then scales **all** blocks → geometry ≥2 starts from stale
+off-diagonals (neither αI nor a valid warm start).
+
+**Spec:**
+- Make the contract explicit: rename to `identity_residual_sq` or add `.sqrt()`.
+- Cold start: one kernel writes every structural entry (physical diag→1,
+  else 0); OR warm start: keep previous/central Z and NS-correct against new
+  S (first-order correction Z−Z·δS·Z, few iters for ±h). Same central Z for
+  +h and −h independently — no history asymmetry.
+- After fix: remove the per-iteration full-T download in
+  `SparseSystemWorkspace::compute_z`; validate device reduction vs host f64
+  reduction of the identical T; route Z·S / T·Z through `plan_zs`/`plan_tz`.
+
+**Acceptance criteria:**
+- [ ] `test_newton_schulz_inverse_dev` green with the **correct** norm, and a
+      cross-check test (device residual vs host f64 ‖I−T‖ of the same
+      downloaded T) agrees to f32 reduction accuracy.
+- [ ] One scalar diagnostic read per NS iteration (no matrix transfer).
+- [ ] Two-consecutive-geometry regression test: second geometry's Z is
+      correct (no stale off-diagonals / valid warm start).
+
+**Files:** `gpu_sparse.rs`, `sparse_system.rs`, `sparse_bsr4_purification.cl`, `bsr4.rs`
+
+---
+
+### F2 — Remove dense storage from `SparseDftb`; independent masks; real skin (manifest R1, R4, R15)
+
+**Problem:** `SparseDftb` still holds `h0_phys`/`s_phys` f64[N²] + four padded
+f32[(4N)²] arrays (~512 MB at N=1000); `set_coords` builds dense `DMatrix`
+then re-sparsifies. One mask serves H/S, K and Z. The skin is paid for but
+`set_coords` rebuilds the O(N²) mask every geometry and demands exact
+equality — so it is never used.
+
+**Spec:**
+- Direct sparse H/S assembly into BSR values over the frozen physical pair
+  list (SK eval + rotation per pair → block b(i,j); onsite diag; dummy S=1,
+  H=E_dummy). CPU first. No `DMatrix`, no `*_pad`, no
+  `fill_bsr_values_from_dense` in production.
+- Independent `R_HS`/`R_K`/`R_Z` masks + their product plans. ZHZ uses full
+  M_Z; only K0 is projected to M_K.
+- Verlet skin: structural support at R_phys+R_skin built once, build coords
+  stored, rebuild only when 2·max|ΔR_i| > R_skin; in-support pairs beyond the
+  physical cutoff carry exactly-zero H/S. Hessian: skin covers all ±h → zero
+  rebuilds, zero mask jitter.
+- Cell list for `build_geometric_mask` (E2) can land here since the mask
+  builder is being touched anyway.
+
+**Acceptance criteria:**
+- [ ] Zero dense Norb×Norb host allocation inside `SparseDftb` (firewall
+      counter proves it).
+- [ ] R_K/R_Z sweepable independently (Gate-C prerequisite).
+- [ ] `set_coords` with |ΔR| < skin/2 does not rebuild the mask; exhausted
+      skin aborts loudly, never silently mutates topology.
+- [ ] Hessian-displacement H/S update touches only blocks of the moved atom.
+
+**Files:** `sparse_dftb.rs`, `bsr4.rs`, `masks.rs`/`bsr4.rs` mask builders,
+new direct-assembly routine (extend `sparse_hs_assembly` if present, else
+minimal new module per §9)
+
+---
+
+### F3 — Sparse energy; kill per-iteration K densification and spare products (manifest R7, R8, R10)
+
+**Problem:** `k_to_dense_into` + `trace_ab` over the padded N² run every SCC
+iteration; `mulliken_charges` recomputes K·S although `t_ks` holds it;
+`compute_k0_from_hscc` computes ZH twice; `plan_zh`/`plan_bz` are built but
+unused; `mulliken_dev`/`gershgorin_bounds_dev`/`identity_residual_scalar_dev`/
+reduction helpers allocate GPU buffers per call.
+
+**Spec:**
+- E_H0 = 2·Tr(K·H0) over M_HS blocks only: precomputed HS-block→K-block map,
+  f32 FMA block dot products on GPU → one partial per atom → host f64 sum
+  (~4 kB transfer). Per-iteration energy becomes a configurable diagnostic.
+- Reuse final `t_ks` for Mulliken — delete the extra K·S.
+- Single ZH product feeding both Gershgorin bounds and ZH·Z; both through
+  `plan_zh`/`plan_bz`.
+- Move q_atom buffer, gershgorin partials, reduction scratch, and a packed
+  diagnostic buffer into `SparseSystemWorkspace`.
+
+**Acceptance criteria:**
+- [ ] No `k_pad`, no `trace_ab` over padded N², no matrix download inside SCC.
+- [ ] ≥2 fewer SpGEMMs per SCC iteration (measured by launch counter).
+- [ ] Allocation counter: zero `Buffer::builder` between `scc()` entry/exit.
+- [ ] E_H0 parity vs dense `2·Tr(K·H0)` at the same K.
+
+**Files:** `sparse_dftb.rs`, `sparse_system.rs`, `gpu_sparse.rs`
+
+---
+
+### F4 — Stationary SCC finalization + final R_H (manifest R3, R11)
+
+**Problem:** `finalize_scc` stores `q_fin` but keeps `V`/`H_scc` of `q_new` —
+energy, force, and stored state are not one stationary electronic state at
+finite tolerance. `r_h` is NaN in production.
+
+**Spec:**
+- Explicit contract: q_in → H[q_in] → K → q_out. Iterate the finalization
+  until R_SCC = rms(q_out−q_in) < final force tolerance; store q_in and q_out
+  for diagnostics; V, H_scc, K, W, F all belong to the identified state.
+- After final convergence only: A = H·(KS) with the existing T=KS →
+  R_H = ‖A−Aᵀ‖_F/(2‖A‖_F+ε). One extra SpGEMM at finalization, none in-loop.
+
+**Acceptance criteria:**
+- [ ] Energy/force/diagnostics demonstrably use one consistent state (test:
+      force evaluated with stored q and stored H_scc agree to the SCC
+      residual, not mixed-state).
+- [ ] `r_h` populated at every converged SCC; reported in SparseDftbScc.
+
+**Files:** `sparse_dftb.rs`, `sparse_system.rs`, `gpu_sparse.rs`
+
+---
+
+### F5 — Sparse force via `SparseDWWorkspace`, then GPU contraction (manifest R2)
+
+**Problem:** `sparse_analytic_forces` → `dw_from_k_padded` runs two dense f64
+triple-loop matmuls O((4N)³) — catastrophic at N≥300.
+
+**Spec:**
+- Stage 1 (immediate): GPU T = K·Hscc (planned), W = P_{M_HS}(T·K) via
+  `SparseDWWorkspace`; download only W[M_HS] and K[M_HS]; existing tested CPU
+  pair contraction. No D=2K materialization (factor 2 inside contraction);
+  η_W = ‖W−Wᵀ‖/‖W‖ measured as diagnostic before any symmetrize pass.
+- Stage 2 (after Stage-1 parity): GPU pair-force + atom-gather kernels
+  (C1/C2), no atomics, precomputed pair→block maps.
+
+**Acceptance criteria:**
+- [ ] No O(N³) host work anywhere in `forces()`.
+- [ ] Stage-1 force parity vs dense f64 at same geometry/state (Gate B
+      standard) before Stage 2 starts.
+- [ ] Downloaded bytes per force call = O(nnz(M_HS)), not O(N²).
+
+**Files:** `sparse_forces.rs`, `sparse_dftb.rs`, `gpu_sparse.rs`,
+`sparse_bsr4_purification.cl` (stage 2)
+
+---
+
+### F6 — Per-geometry / static precomputation (manifest R9, R16)
+
+**Problem:** `compute_intra_shifts` recomputes every R_ij and γ(R_ij) (incl.
+exponentials) every SCC iteration; `compute_forces_from_dw` rebuilds
+SystemContext/GammaTable/neighbors and re-parses repulsive splines per call;
+`repulsive_energy` re-parses SK files every `set_coords`. Also SK `cutoff()`
+(Bohr) is passed raw to `NeighborBuilder` on Å coords → ~1.89× oversized
+neighbor radius.
+
+**Spec:**
+- Dense f64 G[N²] built once per geometry (8 MB @ N=1000); V = G·Δq in CPU
+  f64 per iteration (~10⁶ FMA — cheaper than the GPU sync it replaces);
+  Hessian patches only the moved atom's row/column, O(N).
+- `SparseDftb::new` owns SystemContext, repulsive tables (one
+  `parse_all_repulsive`), species-pair indices, physical pair list, gamma
+  coefficients — never reconstructed.
+- Convert SK cutoff Bohr→Å before `NeighborBuilder` (and audit the same
+  pattern wherever SK cutoffs feed distance comparisons).
+
+**Acceptance criteria:**
+- [ ] Zero SK file I/O inside SCC / force / Hessian-displacement loops.
+- [ ] γ evaluated O(N²) once per geometry, O(N) per Hessian displacement.
+- [ ] Neighbor count consistent with the physical cutoff (log nnz/pair count).
+
+**Files:** `sparse_dftb.rs`, `scc.rs`/`shifts.rs` call sites, `forces.rs`
+
+---
+
+### F7 — f32 tolerance + selective-precision pass (manifest R12–R14, §14.5)
+
+**Depends on:** F1–F6. **Problem:** raw ‖KSK−K‖_F < 1e-4 demands ~10⁻⁷
+RMS/scalar at N=1000 (f32 machine epsilon) — mislabels normal f32 saturation
+as failure and wastes iterations. Hscc/Mulliken apply to dummy lanes.
+
+**Spec:**
+- Normalized convergence: r_I = ‖KSK−K‖/max(‖K‖,ε), r_N = |Tr(KS)−Nocc|/Nocc;
+  raw norms remain printed diagnostics.
+- Hscc on GPU: upload only V[N] per iteration; `bsr4_build_Hscc` respects the
+  active-orbital mask so the dummy diagonal stays E_dummy exactly.
+- Mulliken with per-atom orbital mask (Si lanes 0,5,10,15; H lane 0); dummy
+  occupation reported separately; charge check = Σq_A vs 2·Tr(KS) (tight),
+  not |Σq−N_e|<0.5.
+- One packed diagnostic read (trace + R_I² + flags); benchmark check_every
+  2–3.
+- Multi-accumulator SpGEMM (2–4 partials over successive plan terms)
+  benchmarked **before** any Kahan-in-SpGEMM; compensated f32 only for the
+  long signed reductions (gamma matvec, force gather, trace).
+
+**Acceptance criteria:**
+- [ ] Convergence no longer demands ~10⁻⁷ RMS/scalar at N=1000.
+- [ ] Dummy occupation exactly zero-structure (reported, asserted).
+- [ ] Multi-accumulator SpGEMM benchmark recorded (speed + residual depth).
+
+**Files:** `gpu_sparse.rs`, `sparse_system.rs`, `sparse_bsr4_purification.cl`,
+`sparse_dftb.rs`
+
+---
+
+### F8 — Kernel micro-opts last (manifest §14.5/§18)
+
+Packed plan indices (8+24 bit), degree buckets, fused W→force, lane-mapping
+benchmark — the existing Phase-E items (E3–E6). Only after F1–F7 are verified
+by USER.
+
+---
+
 ## Dependency graph
 
 ```
@@ -771,24 +1014,32 @@ B6 (SCC loop) ───────────> C1 (force) ──> D1 (Gate C)
                                            ├──> D3 (Gate F)
                                            ├──> D4 (Gate G)
                                            └──> D5 (Gate H) ──> E7 (Gate I) ──> E8 (Gate J)
+
+── 2026-09-11: Phase F (second-review corrections) gates everything below ──
+F1 (NS contracts) ──> F2 (de-densify + masks/skin) ──> F3 (sparse energy, no spare SpGEMMs)
+F3 ──> F4 (stationary SCC + R_H) ──> F5 (sparse W/force) ──> D-gates
+F2 ──> F5 ; F6 (per-geometry precompute) ──> F7 (f32 tolerances/precision) ──> F8 = E3–E6
 E2-E6 (perf tuning) ───────────────────────────────────────────> after D5
 ```
 
 ## Current focus
 
-**Phase B (sparse SCC)** is the current focus, since the dense agent handles
-analytic forces in parallel. Within Phase B, the order is:
+**Phase F (second-review corrections)** is the current focus — it fixes the
+physics/architecture contracts that the partially-complete A/B phases left
+behind. Order (manifest §14.7):
 
-1. B1 — SparseSystemWorkspace (foundation for everything)
-2. A1 — Canonical C² spline (can proceed in parallel with B1)
-3. A2 — TC2 fix (can proceed in parallel with B1)
-4. A3 — Plan integration (depends on A2)
-5. B2 — Sparse H0/S assembly (depends on A1, B1)
-6. B3 — Sparse gamma (depends on B1)
-7. B4 — Sparse Hscc (depends on A1, B2, B3)
-8. B5 — Sparse K0 + bounds (depends on A3, B1, B4)
-9. B6 — Sparse SCC loop (depends on A2, A3, B1-B5)
-10. B7 — Sparse Mulliken (depends on B6)
+1. F1 — NS contract bugs (missing sqrt + stale identity) → revalidate
+2. F2 — remove dense storage from `SparseDftb`, independent R_HS/R_K/R_Z, Verlet skin
+3. F3 — sparse energy, no per-iteration K densification, no spare SpGEMMs, no in-loop allocs
+4. F4 — stationary SCC finalization + final R_H
+5. F5 — sparse force via `SparseDWWorkspace` (staged → GPU kernels)
+6. F6 — per-geometry precomputation (gamma, repulsive, context) + Bohr/Å fix
+7. F7 — normalized tolerances + selective precision
+8. F8 — kernel micro-opts (= Phase E items, last)
 
-Phase C (GPU forces) starts after B6 is done and the dense agent's analytic
-force work is available for reference.
+Only then resume gates D1–D5 → E7–E8. Phase-B items not yet absorbed by F
+(B2's GPU assembly, B3's GPU gamma option) remain as *later* GPU-side upgrades
+— F2/F6 make the CPU versions correct and cheap first.
+
+Phase C (GPU forces) starts after F5 stage-1 parity is demonstrated and the
+dense agent's analytic force work is available for reference.

@@ -278,7 +278,8 @@ fn test_trace_ks_vs_cpu() {
     let diag = diag_block_map(&t).unwrap();
     let diag_buf = gpu.buf_u32(&diag).unwrap();
     let t_buf = gpu.buf_f32(&t.values).unwrap();
-    let tr_gpu = gpu.trace_ks(n_atom, &diag_buf, &t_buf).unwrap();
+    let n_orb_buf = gpu.buf_u32(&vec![4u32; n_atom]).unwrap();
+    let tr_gpu = gpu.trace_ks(n_atom, &diag_buf, &t_buf, &n_orb_buf).unwrap();
 
     let t_ref = dense_matmul(n, &k_dense, &s_dense);
     let tr_cpu = dense_trace(&t_ref, n);
@@ -344,7 +345,7 @@ fn test_mulliken_vs_cpu() {
     let s = bsr4_from_dense(n_atom, &s_dense, &mask);
 
     let ks = gpu.matmul_masked_bsym(&k, &s, &mask).unwrap();
-    let q_gpu = gpu.mulliken(&ks).unwrap();
+    let (q_gpu, _q_dum) = gpu.mulliken(&ks, &vec![4u8; n_atom]).unwrap();
 
     // CPU: q_A = 2 * sum_{mu in A} (KS)[mu,mu]
     let ks_ref = dense_matmul(n, &k_dense, &s_dense);
@@ -414,7 +415,8 @@ fn test_idempotency_exact_kernel() {
     let diag = diag_block_map(&t).unwrap();
     let diag_buf = gpu.buf_u32(&diag).unwrap();
     let t_buf = gpu.buf_f32(&t.values).unwrap();
-    let tr = gpu.trace_ks(n_atom, &diag_buf, &t_buf).unwrap();
+    let n_orb_buf = gpu.buf_u32(&vec![4u32; n_atom]).unwrap();
+    let tr = gpu.trace_ks(n_atom, &diag_buf, &t_buf, &n_orb_buf).unwrap();
     println!("Tr(KS) = {tr:.6} (expected Nocc = {nocc})");
     assert!((tr - nocc as f32).abs() < 1e-3, "Tr(KS) != Nocc: {tr} vs {nocc}");
 }
@@ -524,7 +526,8 @@ fn test_tc2_convergence() {
         // trace of KS via T = K·S
         let t = gpu.matmul_masked_bsym(&k, &s, &mask).unwrap();
         let t_buf = gpu.buf_f32(&t.values).unwrap();
-        let tr = gpu.trace_ks(n_atom, &diag_buf, &t_buf).unwrap();
+        let n_orb_buf = gpu.buf_u32(&vec![4u32; n_atom]).unwrap();
+        let tr = gpu.trace_ks(n_atom, &diag_buf, &t_buf, &n_orb_buf).unwrap();
         println!("TC2 step {step}: ||KSK-K||_F={idem:e}  Tr(KS)={tr:.5} (Nocc={nocc})");
         // Trace must stay bounded and in [0, 2*Nocc].
         assert!(tr >= -1.0 && tr <= 2.0 * nocc, "TC2 trace out of bounds at step {step}: {tr}");
@@ -533,7 +536,7 @@ fn test_tc2_convergence() {
         if idem < 1e-5 {
             break;
         }
-        let (knew, _n) = gpu.tc2_step(&k, &s, nocc, &mask, &mask, &diag_buf).unwrap();
+        let (knew, _n) = gpu.tc2_step(&k, &s, nocc, &mask, &mask, &diag_buf, &n_orb_buf).unwrap();
         k = gpu.symmetrize_mat(&knew).unwrap();
     }
     println!("TC2 final ||KSK-K||_F = {prev_idem:e}  Tr(KS)={last_tr:.5}");
@@ -810,7 +813,7 @@ fn test_k0_and_tc2_vs_dense_projector() {
     let nocc_f = nocc as f32;
     println!("TC2 purification from K₀ ...");
     let (k_final, r_i, tr, iters, _history) = gpu
-        .tc2_purify(&k0, &s, nocc_f, &mask, &mask, 40, 1e-5)
+        .tc2_purify(&k0, &s, nocc_f, &mask, &mask, &vec![4u8; n_atom], 40, 1e-5)
         .unwrap();
     println!("  TC2: {iters} iters, R_I={r_i:e}, Tr(KS)={tr:.6}");
 
@@ -939,7 +942,8 @@ fn test_tc2_dev_resident_convergence() {
     // Build the device-resident workspace.
     // T mask = K mask (full) for this small test.
     let t_mask = mask.clone();
-    let mut ws = SparsePurifyWorkspace::new(gpu, &k0, &s, &mask, &t_mask, nocc)
+    let all4 = vec![4u8; n_atom];
+    let mut ws = SparsePurifyWorkspace::new(gpu, &k0, &s, &mask, &t_mask, &all4, nocc)
         .unwrap_or_else(|e| panic!("SparsePurifyWorkspace::new failed (no skip): {e}"));
 
     // Run device-resident TC2 purification.
@@ -986,7 +990,7 @@ fn test_tc2_nonconvergence_is_error() {
     k0_dense[n + 1] = 0.8;
     let k0 = bsr4_from_dense(n_atom, &k0_dense, &mask);
     let s = build_identity(n_atom, &mask).unwrap();
-    let result = gpu.tc2_purify(&k0, &s, 2.0, &mask, &mask, 1, 1e-12);
+    let result = gpu.tc2_purify(&k0, &s, 2.0, &mask, &mask, &vec![4u8; n_atom], 1, 1e-12);
     match result {
         Err(e) => {
             let msg = format!("{e}");
@@ -1060,15 +1064,17 @@ fn test_tc2_dev_vs_host_parity() {
     let diag = diag_block_map(&diag_dummy).unwrap();
     let diag_buf = gpu.buf_u32(&diag).unwrap();
     let mut k_host = k0.clone();
+    let n_orb_buf = gpu.buf_u32(&vec![4u32; n_atom]).unwrap();
     for step in 0..5 {
-        let (knew, _n) = gpu.tc2_step(&k_host, &s, nocc, &mask, &mask, &diag_buf).unwrap();
+        let (knew, _n) = gpu.tc2_step(&k_host, &s, nocc, &mask, &mask, &diag_buf, &n_orb_buf).unwrap();
         k_host = gpu.symmetrize_mat(&knew).unwrap();
     }
 
     // --- New device-resident path: run 5 TC2 steps ---
     let t_mask = mask.clone();
     let gpu2 = SparseBsr4Gpu::new(SparseBsr4Config::default()).unwrap();
-    let mut ws = SparsePurifyWorkspace::new(gpu2, &k0, &s, &mask, &t_mask, nocc).unwrap();
+    let all4 = vec![4u8; n_atom];
+    let mut ws = SparsePurifyWorkspace::new(gpu2, &k0, &s, &mask, &t_mask, &all4, nocc).unwrap();
     for step in 0..5 {
         let _tr = ws.tc2_step_dev().unwrap();
     }
@@ -1288,7 +1294,8 @@ fn test_k0_dev_vs_host() {
 
     // 7. Verify K0 leads to correct TC2 convergence.
     let t_mask = mask.clone();
-    let mut ws = SparsePurifyWorkspace::new(gpu, &k0_dev_host, &s, &mask, &t_mask, nocc as f32).unwrap();
+    let all4 = vec![4u8; n_atom];
+    let mut ws = SparsePurifyWorkspace::new(gpu, &k0_dev_host, &s, &mask, &t_mask, &all4, nocc as f32).unwrap();
     let (k_final, r_i, tr, iters, _) = ws.tc2_purify_dev(40, 1e-5, 1).unwrap();
     println!("TC2 from dev K0: {iters} iters, R_I={r_i:e}, Tr(KS)={tr:.6}");
     assert!(r_i < 1e-5, "TC2 did not converge: R_I={r_i:e} (G2)");

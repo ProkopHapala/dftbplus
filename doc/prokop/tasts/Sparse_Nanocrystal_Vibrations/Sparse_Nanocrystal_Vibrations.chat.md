@@ -3258,3 +3258,765 @@ In this order:
 
 The commit has moved the project in the right direction, especially the analytic SK angular derivatives, the \(D/W\) formulation, and the symbolic-plan concept. But right now the largest gains are **not another clever OpenCL micro-optimization**. They are removing whole unnecessary matrix products, eliminating synchronization/allocation from the harness, and ensuring the force is genuinely the derivative of the same smooth self-consistent sparse model whose Hessian you intend to diagonalize.
 
+
+
+
+---
+
+# USER
+
+OK, we updated it, based on comments in doc/prokop/reports/2026-09-10_gpu_accuracy_physics_performance_second_review.md
+and added CLI unified engine using rhai script to avoid ad hoc test.
+plese review it again now, both scientific rigor, performance, and f32 numerical acuracy issue, suggest imporvemnt which does not hamper speed while overcoming f32 limits. as wel as perforamnce improvement. Focus on the sparse large systems
+
+
+---
+
+
+# Chat GPT 5.6 sol
+
+I reviewed the current sparse path at `e965ae00b7deff7ef4b0928f54a42cf35fd79039`, including the second-review document and the new Rhai-driven `SparseDftb` engine. This is a **substantial improvement** over the previous version. The architecture is finally beginning to look like a persistent solver rather than a collection of tests: `sparse_new()` constructs one `SparseDftb`, subsequent `sparse_scc`/`sparse_eval` calls reuse it, the TC2 loop now uses the precomputed symbolic plans for the dominant KS/KSK products, and the production SK evaluator really is the same C² B-spline for values and derivatives.
+
+But I still would **not yet call it a large-system sparse DFTB solver**. There are three blockers more important than any further OpenCL micro-optimization: the persistent engine still carries dense \(N^2\) host matrices, the force path still contains an \(N^3\) dense host calculation, and the returned SCC state is not quite internally self-consistent. I also found what I think is the exact cause of the mysterious Newton–Schulz “N4” residual problem.
+
+### Current status
+
+| Priority    | Finding                                                                            | Consequence                                                      |
+| ----------- | ---------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
+| **BLOCKER** | `SparseDftb` still builds/stores dense H/S/K arrays                                | memory/time cease to be linear before GPU sparse algebra matters |
+| **BLOCKER** | sparse force builds \(W=2KHK\) by two dense CPU matmuls                            | \(O((4N)^3)\); impossible for 1000-atom Hessians                 |
+| **BLOCKER** | final SCC repair stores \(q_\mathrm{fin}\) but retains \(H,V\) from previous \(q\) | energy/force are not exactly one stationary electronic state     |
+| **HIGH**    | only one structural mask is used for H/S, K and Z                                  | destroys the intended independent \(R_K,R_Z\) locality control   |
+| **HIGH**    | NS device residual misses a square root                                            | apparent “f32 NS failure” is probably just a contract bug        |
+| **HIGH**    | persistent Z “identity reset” leaves stale off-diagonal entries                    | subsequent geometries do not actually start from \(\alpha I\)    |
+| **HIGH**    | K is downloaded/densified every SCC iteration just to evaluate energy              | major synchronization + \(N^2\) CPU overhead                     |
+| **MEDIUM**  | one unnecessary KS after every converged TC2 + duplicated ZH in K0                 | several avoidable SpGEMMs per SCC iteration                      |
+| **MEDIUM**  | gamma functions are reevaluated \(O(N^2)\) every SCC iteration                     | expensive exponentials repeated although geometry is unchanged   |
+| **MEDIUM**  | several supposedly persistent helpers still allocate GPU buffers                   | hidden `Buffer::builder()` remains inside SCC                    |
+| **LATER**   | plan packing, degree buckets, multi-accumulator SpGEMM                             | worthwhile after the above is removed                            |
+
+## 1. The biggest remaining architectural problem is still dense host storage
+
+`SparseDftb` itself now persists correctly, but it stores
+
+```text
+h0_phys : f64[Norb²]
+s_phys  : f64[Norb²]
+
+h0_pad  : f32[(4N)²]
+s_pad   : f32[(4N)²]
+h_scc_pad : f32[(4N)²]
+k_pad     : f32[(4N)²]
+```
+
+and `set_coords()` calls dense `HamiltonianBuilder::build_non_scc()`, copies the entire dense matrices, pads them to another dense representation, then finally extracts only the BSR blocks that the GPU actually needs.
+
+For 1000 Si atoms, \(N_\mathrm{orb}=4000\). Those persistent arrays alone are approximately
+
+$$
+2(4000^2)(8)+4(4000^2)(4)
+\simeq512\ {\rm MB},
+$$
+
+before counting the temporary dense `DMatrix` H and S. The sparse GPU matrix may be small while the host silently consumes close to a gigabyte.
+
+I would fix this **before optimizing the SpGEMM further**. Implement direct sparse H/S assembly into BSR values. CPU first is completely sufficient:
+
+```text
+for physical pair (i,j) in frozen HS pair list:
+    evaluate SK(rij)
+    rotate 4x4 / 4x1 / 1x1
+    write directly to BSR block b(i,j)
+
+for atom i:
+    write onsite diagonal block
+    write dummy diagonal S=1, H=E_dummy
+```
+
+No dense `DMatrix`, no `h0_phys`, no `h0_pad`, no `fill_bsr_values_from_dense()`.
+
+Then GPU assembly can replace the CPU pair loop later without changing the data architecture.
+
+This is especially important for Hessians because only one atom moves. Once the central H/S is stored, displacement of atom \(a\) requires updating only blocks involving \(a\), i.e. \(O(n_\mathrm{neigh})\), rather than rebuilding the entire Hamiltonian.
+
+## 2. The current “sparse analytic force” is still catastrophically dense
+
+This is now probably the single worst runtime operation.
+
+`SparseDftb::forces()` calls `sparse_analytic_forces()`. That calls `dw_from_k_padded()`, converts full padded K and H to f64, and explicitly performs
+
+$$
+T=KH,
+\qquad
+W=2TK
+$$
+
+with two dense three-loop CPU matrix multiplies.
+
+For \(4N=4000\), one naive matrix multiplication has roughly
+
+$$
+4000^3=6.4\times10^{10}
+$$
+
+scalar multiply-add terms. You perform two. That completely overwhelms the sparse solver.
+
+Ironically, you already implemented most of the correct replacement: `SparseDWWorkspace` has persistent T/W buffers and symbolic plans for sparse \(KH\) and \(TK\).
+
+So the immediate solution is straightforward:
+
+$$
+T=P_{M_{KH}}(K H_\mathrm{SCC}),
+$$
+
+$$
+W=P_{M_{HS}}(TK).
+$$
+
+Then contract only the physical H/S pair blocks.
+
+I would not even construct `D=2K`. The force kernel knows that \(D=2K\); just multiply the K contribution by 2. Likewise W does not need a separate scaling kernel if the contraction knows its spin factor.
+
+A good transitional architecture is:
+
+```text
+GPU:
+    T = K Hscc
+    W = T K             only M_HS output
+
+download only W[M_HS] and K[M_HS]
+CPU:
+    analytic pair-force contraction
+```
+
+That already turns the catastrophic \(N^3\) force into sparse algebra while retaining your well-tested CPU force formula.
+
+Production should then become:
+
+```text
+GPU T
+GPU W
+GPU pair force -> pair_force[p]
+GPU atom gather -> F[i]
+```
+
+with no atomics.
+
+Eventually you can fuse the second \(TK\) product and force contraction for H/S blocks so W never reaches global memory at all, but I would not do that until the simpler sparse force is validated.
+
+## 3. There is still a real finite-SCC consistency bug
+
+The finalization is better conceptually but not quite correct.
+
+Currently `finalize_scc()` takes `q_new`, constructs
+
+$$
+V[q_\mathrm{new}],
+\qquad
+H[q_\mathrm{new}],
+$$
+
+purifies that Hamiltonian to K, and then obtains
+
+$$
+q_\mathrm{fin}=q[K].
+$$
+
+But after that it sets `self.q = q_fin` while `self.v` and `h_scc_pad` still correspond to `q_new`. `store_energy(q_fin)` then evaluates the SCC double-counting term using \(dq_\mathrm{fin}\) multiplied by \(V[q_\mathrm{new}]\). The force similarly receives `q_fin` together with \(H_\mathrm{SCC}[q_\mathrm{new}]\).
+
+At exact convergence these are identical. At finite tolerance they are not.
+
+For geometry optimization and especially a Hessian, I would make the state contract explicit:
+
+$$
+q_\mathrm{in}
+\stackrel{H[q]}{\longrightarrow}
+K
+\stackrel{\rm Mulliken}{\longrightarrow}
+q_\mathrm{out}.
+$$
+
+Finalization should continue until
+
+$$
+R_\mathrm{SCC}
+=
+\sqrt{\frac1N\sum_A(q_A^\mathrm{out}-q_A^\mathrm{in})^2}
+$$
+
+is below the final force tolerance.
+
+Then store both `q_in` and `q_out` for diagnostics rather than silently replacing one with the other. The state used for H, K, W, V and force must be clearly identified.
+
+This matters because
+
+$$
+W=2K H K
+$$
+
+has the desired EDM interpretation when K is the occupied projector of the **same H**. TC2 idempotency alone does not guarantee that.
+
+## 4. Add a final Hamiltonian compatibility residual—but cheaply
+
+The production `SparseDftb` still leaves `r_h = NaN`.
+
+I would calculate \(R_H\) only after final SCC convergence, not in the inner TC2 loop:
+
+$$
+R_H=
+\frac{\|HKS-SKH\|_F}
+{\|HKS\|_F+\|SKH\|_F+\epsilon}.
+$$
+
+There is a useful simplification because H, K and S are symmetric:
+
+$$
+SKH=(HKS)^T.
+$$
+
+And you already have
+
+$$
+T=KS
+$$
+
+at the end of TC2.
+
+Therefore compute only
+
+$$
+A=HT
+$$
+
+and measure
+
+$$
+\|A-A^T\|.
+$$
+
+That reduces a naive four-product commutator diagnostic to **one additional sparse multiplication** at final SCC only.
+
+This is exactly the sort of numerical rigor we want: cheap enough to keep, strong enough to catch a beautifully idempotent projector onto the wrong subspace.
+
+## 5. The single-mask design needs to be undone
+
+`SparseDftb` currently builds one mask using approximately maximum SK cutoff + skin, then gives that same mask to H/S and K; workspace Z consequently also lives on that K mask.
+
+Scientifically these are different locality problems:
+
+$$
+M_{HS}: \text{physical two-centre interaction support},
+$$
+
+$$
+M_K: \text{density-matrix locality},
+$$
+
+$$
+M_Z: \text{inverse-overlap locality}.
+$$
+
+There is no reason \(R_K\) or \(R_Z\) should equal the SK cutoff.
+
+For passivated Si I expect K to be local because of the gap, but the whole point of Gate C is to **demonstrate** that. Production should therefore have independent:
+
+```text
+R_HS
+R_K
+R_Z
+```
+
+and corresponding product masks/plans.
+
+Also, don't project Z down to \(M_K\) before evaluating \(ZHZ\). Use all available \(M_Z\) information and project only the resulting K0 onto \(M_K\).
+
+Until this exists and is tested on actual Si/H clusters of increasing size, I would avoid claiming genuine linear-scaling locality.
+
+## 6. I think the NS “N4” problem is now understood
+
+This is an important finding.
+
+`identity_residual_to_dev()` is documented and implemented as
+
+$$
+\|A-I\|_F^2.
+$$
+
+But `identity_residual_scalar_dev()` returns the resulting scalar directly without `sqrt()`. Then `newton_schulz_inverse_dev()` treats it as the norm and divides only by \(\sqrt{N}\).
+
+So change the contract either to
+
+```rust
+Ok(host[0].sqrt())
+```
+
+or, better, rename the lower-level quantity explicitly to `identity_residual_sq`.
+
+Then validate:
+
+```text
+same GPU T=ZS
+device reduction
+host f64 reduction of downloaded identical T
+```
+
+They should agree to ordinary f32 reduction accuracy.
+
+Once this is fixed, **remove the current full T download every NS iteration**. `SparseSystemWorkspace::compute_z()` currently does exactly that as an N4 workaround.
+
+This should leave one scalar diagnostic read rather than an entire sparse matrix transfer.
+
+### There is a second NS bug nearby
+
+`bsr4_build_identity_dev()` only writes the diagonal blocks. It does not zero off-diagonal blocks.
+
+But Z is persistent. Therefore on the second geometry:
+
+```text
+Z contains previous inverse
+build_identity_dev(Z)
+```
+
+overwrites only diagonal blocks; old off-diagonal Z values survive. Then `scale_dev()` scales **all blocks**.
+
+So the resulting initial Z is neither \(\alpha I\) nor a sensible previous-Z warm start.
+
+Do one of two things deliberately:
+
+```text
+cold start:
+    one kernel writes every structural entry:
+    diag physical -> 1
+    everything else -> 0
+```
+
+or
+
+```text
+warm start:
+    retain previous/central Z exactly
+    Newton-Schulz correct it against new S
+```
+
+For Hessians the second option is much better. If \(Z\simeq S^{-1}\) and
+
+$$
+S'=S+\delta S,
+$$
+
+one NS step starting from the old Z gives approximately
+
+$$
+2Z-ZS'Z
+\simeq
+Z-Z\,\delta S\,Z,
+$$
+
+which is precisely the first-order inverse correction. For small ±h displacements I would expect only a few NS iterations.
+
+Use the **same central Z** independently for +h and −h; don't warm-start −h from +h, which would introduce history asymmetry.
+
+## 7. There are still several hidden buffer allocations in the “persistent” loop
+
+The central TC2 part is genuinely much better. But two helpers violate the stated no-allocation contract.
+
+`mulliken_dev()` creates a new GPU q buffer every call. `gershgorin_bounds_dev()` allocates `emin_partial`, `emax_partial` and further reduction buffers every call. Since spectral bounds are evaluated for every SCC H, these allocations are in the SCC outer loop.
+
+Move these into `SparseSystemWorkspace`:
+
+```text
+q_atom
+gersh_min
+gersh_max
+reduction scratch
+two-scalar diagnostic buffer
+```
+
+Then absolutely no `Buffer::builder()` should occur between `SparseDftb::scc()` entry and exit.
+
+This is easy to enforce with a runtime allocation counter.
+
+## 8. There are three completely unnecessary sparse products/synchronizations
+
+The TC2 redesign itself is now good: KS and KSK are computed once for the current K, and the residual is evaluated before the update. That fixes the previous factor-of-two SpGEMM waste.
+
+But three opportunities remain.
+
+First, when TC2 accepts K, `t_ks` already contains \(KS\). `mulliken_charges()` immediately calculates KS again. Reuse the existing final `t_ks`; that saves **one SpGEMM per SCC iteration**.
+
+Second, `compute_k0_from_hscc()` calls `spectral_bounds_dev()`, which computes
+
+$$
+B=ZH,
+$$
+
+and then calls `build_k0_dev()`, which computes **the same \(B=ZH\) again** before \(BZ\).
+
+Compute ZH once:
+
+```text
+ZH
+├── Gershgorin bounds
+└── ZH * Z -> ZHZ
+```
+
+Third, you already construct `plan_zh` and `plan_bz`, but the actual K0 route does not use them.
+
+And the comment saying ZH requires the generic kernel because “ZH is not symmetric” repeats the earlier conceptual confusion: the Bsym kernel requires **the right operand H to be symmetric**, not the result ZH.
+
+So `Z*H` is perfectly suitable for the planned Bsym kernel.
+
+Those changes are likely more valuable than another 10% inside one SpGEMM kernel.
+
+## 9. The energy calculation should become a very cheap high-precision island
+
+Right now every SCC iteration downloads K, expands it to dense `k_pad`, and then `trace_ab()` performs the energy contraction over the full padded \(N^2\) array.
+
+That is unnecessary because
+
+$$
+E_{H0}=2\operatorname{Tr}(K H_0),
+$$
+
+and \(H_0\) exists only on \(M_{HS}\).
+
+Precompute a mapping
+
+```text
+HS block -> corresponding K transpose block
+```
+
+and reduce only those blocks.
+
+This is also where I would use selective precision:
+
+```text
+GPU:
+    each atom/row computes f32 block dot products using FMA
+    -> one f32 partial per atom
+
+CPU:
+    sum ~1000 partials in f64
+```
+
+Only ~4 kB comes back for N=1000, and there is no expensive GPU fp64. You get essentially perfect final scalar accumulation of the already-f32 matrix data.
+
+You don't even need energy every SCC iteration. Make it diagnostic/configurable; final energy is enough for production geometry work.
+
+## 10. How I would handle f32—not by making SpGEMM f64
+
+I agree with the current report that blanket f64 is the wrong response.
+
+For your sparse workload, I would use the following arithmetic split:
+
+**Keep pure f32 + FMA** for K/S/H/Z/W matrix storage, all main SpGEMMs, SK GPU evaluation, Hscc construction, and ordinary pair contractions. That's where consumer-GPU fp64 would be ruinous.
+
+**Use compensated f32 selectively** for long signed reductions: most notably gamma matvec and perhaps the final force gather. Kahan/Neumaier there costs little because these kernels are tiny compared with TC2.
+
+**Use host/tiny-device f64** for scalar energies, SCC mixing/DIIS algebra, Hessian assembly, frequencies, and final diagnostic reductions.
+
+I would *not* introduce compensated SpGEMM everywhere yet.
+
+There is a particularly attractive modification to the existing planned SpGEMM that can improve **both speed and accuracy**. Each output scalar currently has one long serial accumulator over all plan contributions:
+
+```c
+float sum = 0;
+for(t=t0; t<t1; t++){
+    sum = fma(..., sum);
+    ...
+}
+```
+
+Use 2 or 4 independent accumulators over successive plan entries:
+
+```c
+float s0=0, s1=0;
+
+for(t=t0; t+1<t1; t+=2){
+    s0 = dot4_fma(block(t  ), s0);
+    s1 = dot4_fma(block(t+1), s1);
+}
+float sum = s0 + s1;
+```
+
+This shortens the dependency chain, exposes ILP to the GPU, and reduces serial roundoff depth. Four accumulators may be even better if register pressure remains modest.
+
+I would benchmark that **before Kahan SpGEMM**.
+
+For rows where real cancellation is demonstrated, a compensated final combination of the 2–4 accumulators is cheap.
+
+## 11. Your absolute TC2 tolerance is problematic for large N
+
+This is an important large-system/f32 point.
+
+Current TC2 uses the raw Frobenius quantity
+
+$$
+R_I=\|KSK-K\|_F
+$$
+
+against approximately \(10^{-4}\).
+
+Imagine N=1000 with about 50 BSR neighbors. You have roughly
+
+$$
+1000\times50\times16\approx8\times10^5
+$$
+
+stored scalars.
+
+Demanding total Frobenius residual \(10^{-4}\) corresponds to an RMS error of order
+
+$$
+10^{-4}/\sqrt{8\times10^5}
+\sim10^{-7}
+$$
+
+per stored scalar—already around binary32 machine precision.
+
+Thus a tolerance perfectly reasonable on SiH4 becomes absurdly demanding simply because the system got larger.
+
+Use a size-independent residual, for example
+
+$$
+r_I=
+\frac{\|KSK-K\|_F}
+{\max(\|K\|_F,\epsilon)}
+$$
+
+or at minimum normalize by \(\sqrt{N_\mathrm{occ}}\).
+
+Likewise record
+
+$$
+r_N=
+\frac{|\operatorname{Tr}(KS)-N_\mathrm{occ}|}
+{\max(N_\mathrm{occ},1)}.
+$$
+
+Keep the raw values for debugging, but **convergence should use normalized quantities**.
+
+This alone may save many useless late TC2 iterations and prevent misidentifying normal f32 saturation as “failure.”
+
+NS already uses the correct idea by dividing its Frobenius residual by \(\sqrt{N_\mathrm{orb}}\).
+
+## 12. I would not worry much about f32 trace reduction yet
+
+At \(N_\mathrm{occ}\sim2000\), one f32 ULP is only about \(1.2\times10^{-4}\) electrons. Your current occupation acceptance width of 0.05 electrons is hundreds of ULPs.
+
+So merely storing the final trace in f32 is **not currently the limiting factor**.
+
+If branch jitter is actually observed, make the trace reduction compensated because it is cheap: only diagonal KS blocks are touched. A `float2 (hi,lo)` accumulator or Neumaier reduction would cost virtually nothing relative to the two SpGEMMs.
+
+But first normalize the convergence criterion and determine whether the error originates in the KS matrix itself.
+
+Also combine `trace` and `R_I²` into one tiny device result and do **one blocking read**, rather than two separate scalar reads at every diagnostic iteration.
+
+And I would no longer default to `check_every=1` blindly. Test 2 or 3. Since TC2 itself is expensive, there is a balance between saved synchronization and overshooting convergence.
+
+## 13. Gamma is an unusually good place to buy both speed and precision
+
+Current sparse SCC calls `compute_intra_shifts()` every SCC iteration. That nested loop recomputes every \(R_{ij}\), every \(\gamma(R_{ij})\), including exponentials, every time even though geometry is fixed during SCC.
+
+For N=1000, simply precompute
+
+$$
+G_{ij}=\gamma_{ij}(R)
+$$
+
+once per geometry.
+
+A dense f64 \(1000\times1000\) gamma matrix is only **8 MB**. That's tiny compared with what the code currently allocates.
+
+Then every SCC iteration becomes merely
+
+$$
+V=G\,\Delta q.
+$$
+
+Since q is already on the CPU as f64, I would initially do this matvec in **CPU f64**. A million multiply-adds per SCC iteration is cheap, requires no extra GPU synchronization, and completely sidesteps f32 cancellation issues in gamma.
+
+This is one of the rare places where f64 can actually be *faster overall* because you're eliminating repeated transcendental functions.
+
+For Hessian ±h it gets even better: only one atom moves, so relative to the central gamma matrix only one row/column changes. Update that row/column in \(O(N)\), rather than rebuilding \(O(N^2)\).
+
+Only move gamma matvec to GPU if profiling later says the f64 CPU matvec matters.
+
+## 14. Hscc should then be built on GPU from N atom potentials
+
+Once V is known, don't rebuild a dense `h_scc_pad` on the CPU and upload all H blocks.
+
+You already have `bsr4_build_Hscc`.
+
+Modify it to respect the physical orbital count:
+
+```c
+bool active = (r < n_orb[i]) && (c < n_orb[j]);
+
+H[p] = active
+     ? fma(S[p], 0.5f*(Vi+Vj), H0[p])
+     : H0[p];
+```
+
+Then dummy H orbitals retain exactly `E_dummy`, and per SCC iteration you upload only N atom potentials rather than Hscc.
+
+That eliminates another \(N^2\) CPU operation and a large host→GPU transfer.
+
+## 15. Mulliken should explicitly ignore dummy H orbitals
+
+Current OpenCL Mulliken always sums all four diagonal elements of an atom block.
+
+Today you rely on dummy occupations being almost zero. Better make the mathematics exact:
+
+```text
+Si: lanes 0,5,10,15
+H : lane 0 only
+```
+
+Pass `n_orb_atom` or a 4-bit active mask.
+
+Then separately monitor dummy occupation as a diagnostic.
+
+Also tighten the charge-conservation test. Current acceptance allows
+
+```text
+|sum(q)-N_elec| < 0.5 electron
+```
+
+which is much too loose for detecting implementation errors.
+
+A much stronger internal identity is
+
+$$
+\sum_A q_A \approx 2\,\mathrm{Tr}(KS).
+$$
+
+Those are computed from the same K and S and should agree very closely. Separately compare \(2\,\mathrm{Tr}(KS)\) with the requested electron number using the TC2 rank tolerance.
+
+## 16. The mask “skin” implementation currently defeats the purpose of a skin
+
+`set_coords()` rebuilds the geometric mask from scratch at every geometry and demands exact equality with the frozen mask.
+
+`build_geometric_mask()` itself is \(O(N^2)\).
+
+A Verlet-style skin should do the opposite.
+
+Build structural support out to
+
+$$
+R_\mathrm{struct}=R_\mathrm{physical}+R_\mathrm{skin}.
+$$
+
+Store the coordinates at which that support was built. Rebuild only if
+
+$$
+2\max_i|\mathbf R_i-\mathbf R_i^\mathrm{build}|
+>R_\mathrm{skin}.
+$$
+
+Inside the structural mask, H/S are simply zero whenever the present distance exceeds the physical cutoff.
+
+For a Hessian, choose the skin to cover all ±h displacements and **never rebuild at all**.
+
+That removes another \(O(N^2)\) operation from every geometry update and eliminates mask jitter by construction.
+
+The new stamping implementation in `build_product_mask()` is a good fix, incidentally; the previous `Vec::contains` problem is gone.
+
+## 17. Some CPU force infrastructure is also doing surprisingly expensive repeated setup
+
+Until the force is moved fully to GPU, cache the CPU-side static objects.
+
+`compute_forces_from_dw()` currently reconstructs `SystemContext`, `GammaTable`, neighbor list, parses all repulsive splines, and computes gamma shifts again.
+
+You already have `repulsive_force_cached()` and `parse_all_repulsive()` specifically intended for initialization-time caching.
+
+Yet `repulsive_energy()` reparses the SK repulsive sections every time `set_coords()` is called.
+
+For a 6000-force-evaluation Hessian that sort of filesystem/string parsing is absurd overhead.
+
+`SparseDftb::new()` should own:
+
+```text
+SystemContext/static atom metadata
+repulsive spline tables
+species pair indices
+physical pair list
+gamma species coefficients
+```
+
+and never reconstruct them.
+
+There is also a unit/performance wart in the current CPU force neighbor construction: SK cutoff is in Bohr, coordinates in Å, but the raw SK cutoff is passed directly to `NeighborBuilder`, whose distance comparison uses coordinate units.
+
+That makes the electronic neighbor sphere roughly 1.89× too large in radius. SK evaluation subsequently returns zero for the excess pairs, so it is mostly a performance rather than energy error, but in 3D it can mean several times too many neighbor pairs.
+
+## 18. After the structural fixes, there are worthwhile SpGEMM optimizations
+
+The planned kernel cleanup is correct: unused `A_col`, `C_col` and local `lcol` are gone.
+
+After profiling N=300–1000 actual Si/H masks, I would test three things.
+
+Pack
+
+```text
+plan_a_idx : 8 bits
+plan_b_idx : 24 bits
+```
+
+into one `uint`. That halves per-plan-term index traffic.
+
+Compile degree-specialized kernels around roughly 32/64/128/256 blocks so rows of degree 40 don't reserve local memory for 256 blocks.
+
+And benchmark the two/four-accumulator scheme discussed above. I actually expect that one to be particularly attractive on the 3090 because it simultaneously shortens FMA dependency chains and improves numerical accumulation.
+
+I would **not implement full Kahan inside every SpGEMM output scalar unless a frozen-input experiment shows it is needed**.
+
+## 19. The remaining spline issue is now a boundary-condition problem, not an f32 problem
+
+This part is much improved. Production value and derivative now really come from the same C² B-spline.
+
+The remaining right-tail treatment—append several exact zero samples and refit—is explicitly documented as a stopgap. That's a reasonable temporary solution, but before final vibration work I would replace it with a constrained f64 preprocessing fit satisfying something like
+
+$$
+V(r_c)=0,\qquad
+V'(r_c)=0,\qquad
+V''(r_c)=0,
+$$
+
+while preserving the tabulated region.
+
+That costs exactly zero additional runtime on GPU. So this is another case where we can improve Hessian smoothness without sacrificing performance.
+
+## 20. The CLI itself is the right direction, but its current SiH4 script proves persistence, not sparsity
+
+I like the Rhai design. The script does `sparse_new` once, SCC, repeats SCC to test warm reuse, then runs movement operations on the same object.
+
+Keep this as the single user-facing path.
+
+But SiH4 defaults to a full mask, so it tests persistence and physics plumbing, **not sparse scaling**.
+
+After the blockers above, the benchmark should be the same CLI with real approximately
+
+```text
+Si~100H...
+Si~300H...
+Si~600H...
+Si~1000H...
+```
+
+systems, and it should print actual stage timings, nnz/row-degree distributions, allocations, bytes transferred, TC2/SCC iteration counts and normalized residuals.
+
+### What I would implement next
+
+The implementation order I would give the coding agent is:
+
+1. **Fix the NS squared-norm bug and stale-identity bug immediately.** Revalidate device NS, then remove the per-iteration T download and use the already-created NS plans.
+2. **Remove dense matrices from `SparseDftb`.** Direct BSR H/S assembly; separate \(M_{HS},M_K,M_Z\); correct Verlet-skin semantics.
+3. **Eliminate `k_to_dense_into()` from SCC.** Sparse energy reduction; reuse final KS for Mulliken; remove duplicate ZH and use `plan_zh/plan_bz`.
+4. **Make SCC finalization genuinely stationary** and add final normalized \(R_H\).
+5. **Replace dense CPU \(KHK\) force construction with `SparseDWWorkspace`**, then direct pair-force/gather GPU contraction.
+6. **Precompute gamma and repulsive data per geometry/static lifetime.** For N≈1000 I would happily keep gamma matvec in CPU f64 initially because it is only ~\(10^6\) FMAs and q is already on the host.
+7. Only then tune **f32 arithmetic**: normalized tolerances, multi-accumulator SpGEMM, compensated trace/gamma/force gather, f64 scalar energy and small SCC mixing algebra.
+8. Finally benchmark packed plan indices, degree buckets and fused W→force kernels.
+
+The encouraging part is that I don't currently see a reason to abandon the basic **f32 BSR4 + TC2 architecture**. Most of the apparent accuracy/performance limitations are still attributable to correctable contracts, unnecessary dense operations, convergence definitions, or long reductions—not to an inherent inability of f32 to solve this problem. The newly discovered NS square-root bug is a particularly clear example: a result that looked like a 100×–200× numerical-precision failure appears to be mostly a one-line norm-vs-norm-squared mistake.

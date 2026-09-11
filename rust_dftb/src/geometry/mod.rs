@@ -79,6 +79,22 @@ impl Element {
             Element::Cl => 0.99,
         }
     }
+    /// Standard atomic weight (amu) — for mass-weighted Hessians / vibrational
+    /// frequencies.
+    pub fn mass(&self) -> f64 {
+        match self {
+            Element::H => 1.008,
+            Element::B => 10.81,
+            Element::C => 12.011,
+            Element::N => 14.007,
+            Element::O => 15.999,
+            Element::F => 18.998,
+            Element::Si => 28.085,
+            Element::P => 30.974,
+            Element::S => 32.06,
+            Element::Cl => 35.45,
+        }
+    }
     /// s/p DFTB valence electrons. Not SK onsite `q0` (parser reads trailing fields).
     pub fn valence_electrons(&self) -> f64 {
         match self {

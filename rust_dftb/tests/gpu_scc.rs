@@ -509,8 +509,10 @@ fn test_gpu_scc_parity_n64_h2o_cluster() {
     eprintln!("  E_cpu={:.8}, E_gpu={:.8}, |dE|={de:.2e}", cpu.energy, gpu.energies[0]);
     eprintln!("  |dq|={dq:.2e}, |d_eig|={d_eig:.2e}, n_iters={}", gpu.n_iters);
 
-    // N>64 tolerances (manifest §4.3): relaxed from N≤64 due to f32 block Jacobi
-    assert!(de < 1e-2, "N>64 energy parity failed: |dE|={de:.2e} > 1e-2");
-    assert!(dq < 1e-2, "N>64 charges parity failed: |dq|={dq:.2e} > 1e-2");
-    assert!(d_eig < 1e-2, "N>64 eigenvalues parity failed: |d_eig|={d_eig:.2e} > 1e-2");
+    // N>64 contract (manifest §12 D11): measured |dE|=4.4e-5, |dq|=9.1e-6,
+    // |d_eig|=1.1e-5 on RTX 3090 after D1–D4 — tighten from the old 1e-2
+    // placeholder to 1e-4 (2×+ headroom over measurement).
+    assert!(de < 1e-4, "N>64 energy parity failed: |dE|={de:.2e} > 1e-4");
+    assert!(dq < 1e-4, "N>64 charges parity failed: |dq|={dq:.2e} > 1e-4");
+    assert!(d_eig < 1e-4, "N>64 eigenvalues parity failed: |d_eig|={d_eig:.2e} > 1e-4");
 }

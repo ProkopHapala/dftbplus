@@ -320,3 +320,123 @@ fn test_g3_3_analytic_force_and_g3_4_energy_gradient() {
         "G3.4 |F_ana - F_fd|={abs_eg:.3e} rel={rel_eg:.3e} (target 1e-4 abs or 1e-3 rel). F_ana={f_ana:.6e} F_fd={f_fd:.6e}"
     );
 }
+
+// ============================================================================
+// F2: direct atom-pair→BSR assembly parity vs the dense HamiltonianBuilder.
+// ============================================================================
+
+/// Expand BSR4 padded values (n_pad = 4·n_atom row-major) into a f64 dense.
+fn bsr_to_dense_pad(b: &rust_dftb::methods::sparse::bsr4::Bsr4Matrix) -> Vec<f64> {
+    let d = b.to_dense();
+    d.iter().map(|&x| x as f64).collect()
+}
+
+#[test]
+fn test_f2_direct_bsr_hs_parity() {
+    let Some(_gpu) = require_sparse_gpu() else { return };
+    let sk_dir = require_sih_sk_dir();
+    let (species, coords, atom_n_orb, _, _) = sih4_geom();
+    let sk = load_sk_for_species(&sk_dir, &species).unwrap();
+
+    // Dense reference H0/S (8×8 physical) from the production dense path.
+    let dense = HamiltonianBuilder::new(sk.clone())
+        .build_non_scc(&species, &coords)
+        .unwrap_or_else(|e| panic!("F2 dense build_non_scc: {e}"));
+
+    // Sparse engine: geometric mask (not full) — all SiH4 pairs are inside
+    // the SK cutoff + 1 Å skin, so M_HS covers every pair.
+    let cfg = rust_dftb::methods::sparse::SparseDftbConfig {
+        full_mask: Some(false),
+        ..Default::default()
+    };
+    let eng = rust_dftb::methods::sparse::SparseDftb::with_config(
+        sk, &sk_dir, species.clone(), coords.clone(), cfg.clone(),
+    ).unwrap_or_else(|e| panic!("F2 SparseDftb::new: {e}"));
+
+    // Compare on physical orbital indices: padded BSR [i*4+r, j*4+c] ↔
+    // dense [off_i+r, off_j+c].
+    let h_pad = bsr_to_dense_pad(eng.h_bsr());
+    let s_pad = bsr_to_dense_pad(eng.s_bsr());
+    let n_pad = species.len() * 4;
+    let mut off = vec![0usize; species.len()];
+    let mut acc = 0usize;
+    for (a, &n) in atom_n_orb.iter().enumerate() { off[a] = acc; acc += n as usize; }
+    let (mut max_h, mut max_s) = (0.0f64, 0.0f64);
+    for a in 0..species.len() {
+        let na = atom_n_orb[a] as usize;
+        for b in 0..species.len() {
+            let nb = atom_n_orb[b] as usize;
+            for r in 0..na {
+                for c in 0..nb {
+                    let idx = (a * 4 + r) * n_pad + (b * 4 + c);
+                    let dh = (h_pad[idx] - dense.h0[(off[a] + r, off[b] + c)]).abs();
+                    let ds = (s_pad[idx] - dense.s[(off[a] + r, off[b] + c)]).abs();
+                    if dh > max_h { max_h = dh; eprintln!("  F2 max dH @ ({a},{b},{r},{c}): sparse={:.8} dense={:.8}", h_pad[idx], dense.h0[(off[a] + r, off[b] + c)]); }
+                    max_s = max_s.max(ds);
+                }
+            }
+        }
+    }
+    eprintln!("F2 parity: max|dH|={max_h:.3e}  max|dS|={max_s:.3e}  (f32 rounding of dense f64)");
+    assert!(max_h < 5e-7, "F2 H parity failed: max|dH|={max_h:.3e}");
+    assert!(max_s < 5e-7, "F2 S parity failed: max|dS|={max_s:.3e}");
+
+    // Dummy lanes: H0 dummy diag = E_DUMMY, S dummy diag = 1, couplings 0.
+    for a in 0..species.len() {
+        let na = atom_n_orb[a] as usize;
+        for d in na..4 {
+            let idx = (a * 4 + d) * n_pad + (a * 4 + d);
+            assert!((h_pad[idx] - 2.0).abs() < 1e-7, "F2 dummy H diag atom {a} lane {d}: {}", h_pad[idx]);
+            assert!((s_pad[idx] - 1.0).abs() < 1e-7, "F2 dummy S diag atom {a} lane {d}: {}", s_pad[idx]);
+            for b in 0..species.len() {
+                for c in 0..4 {
+                    let x = (a * 4 + d) * n_pad + (b * 4 + c);
+                    if b != a || c != d {
+                        assert!(h_pad[x].abs() < 1e-7, "F2 dummy row atom {a} lane {d} col ({b},{c}): {}", h_pad[x]);
+                    }
+                }
+            }
+        }
+    }
+
+    // Verlet skin: move an atom beyond skin/2 → set_coords must fail loud.
+    let mut moved = coords.clone();
+    moved[1][0] += 0.6; // > skin/2 = 0.5 Å (default skin 1.0)
+    let mut eng2 = rust_dftb::methods::sparse::SparseDftb::with_config(
+        load_sk_for_species(&sk_dir, &species).unwrap(), &sk_dir, species, coords, cfg.clone(),
+    ).unwrap_or_else(|e| panic!("F2 second engine: {e}"));
+    match eng2.set_coords(&moved) {
+        Err(e) => eprintln!("F2 skin guard (expected): {e}"),
+        Ok(()) => panic!("F2 skin guard failed: set_coords accepted a >skin/2 displacement"),
+    }
+}
+
+// ============================================================================
+// F3: zero device-buffer allocations across the SCC/force hot path — the
+// workspace contract. n_buf_allocs counts every buf_*/zero_* device alloc.
+// ============================================================================
+
+#[test]
+fn test_f3_no_device_allocs_in_scc() {
+    let Some(_gpu) = require_sparse_gpu() else { return };
+    let sk_dir = require_sih_sk_dir();
+    let (species, coords, _n, _, _) = sih4_geom();
+    let sk = load_sk_for_species(&sk_dir, &species).unwrap();
+    let mut eng = SparseDftb::new(sk, &sk_dir, species.clone(), coords.clone()).unwrap();
+
+    let a0 = eng.gpu().n_buf_allocs.get();
+    eng.scc(80, 1e-5).unwrap_or_else(|e| panic!("F3 SCC: {e}"));
+    let a1 = eng.gpu().n_buf_allocs.get();
+    let _f = eng.forces().unwrap_or_else(|e| panic!("F3 forces: {e}"));
+    let a2 = eng.gpu().n_buf_allocs.get();
+    // Second geometry: skin-legal nudge → set_coords + warm-Z + full SCC.
+    let mut c2 = coords.clone();
+    c2[0][0] += 0.05;
+    eng.set_coords(&c2).unwrap_or_else(|e| panic!("F3 set_coords: {e}"));
+    eng.scc(80, 1e-5).unwrap_or_else(|e| panic!("F3 SCC geom2: {e}"));
+    let a3 = eng.gpu().n_buf_allocs.get();
+    eprintln!("F3 device allocs: init={a0} after_scc={a1} after_forces={a2} after_geom2_scc={a3}");
+    assert_eq!(a1, a0, "F3: {a1}-{a0}={} device buffers allocated inside scc()", a1 - a0);
+    assert_eq!(a2, a1, "F3: {} device buffers allocated inside forces()", a2 - a1);
+    assert_eq!(a3, a2, "F3: {} device buffers allocated in geometry-2 scc (warm-Z path)", a3 - a2);
+}

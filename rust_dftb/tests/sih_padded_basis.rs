@@ -314,7 +314,7 @@ fn test_sih_padded_basis_gate_d() {
     let k0 = gpu.build_k0(&h_bsr, &s_bsr, &z, &mask, &mask, emin, emax).unwrap();
     let nocc_f = n_occ_phys as f32;
     let (k_final, r_in, tr, tc2_iters, _hist) = gpu
-        .tc2_purify(&k0, &s_bsr, nocc_f, &mask, &mask, 80, 1e-4)
+        .tc2_purify(&k0, &s_bsr, nocc_f, &mask, &mask, &atom_n_orb, 80, 1e-4)
         .expect("TC2 must converge");
     eprintln!("  TC2: {tc2_iters} iters, R_I={r_in:.3e}, Tr(KS)={tr:.6} (Nocc={nocc_f})");
 

@@ -125,6 +125,7 @@ pub fn purify_h(
     s_pad: &[f32],
     n_atom: usize,
     nocc: f32,
+    atom_n_orb: &[u8],
 ) -> Result<(Bsr4Matrix, f32, f32, usize)> {
     let mask = build_full_mask(n_atom);
     let s = Bsr4Matrix::from_dense(n_atom, s_pad, &mask)?;
@@ -133,7 +134,7 @@ pub fn purify_h(
     if verbose {
         eprintln!("  NS: {z_iters} iters, R_Z={rz:.3e}");
     }
-    purify_h_with_z(gpu, h_pad, &s, &z, nocc, &mask)
+    purify_h_with_z(gpu, h_pad, &s, &z, nocc, &mask, atom_n_orb)
 }
 
 /// K0+TC2 of `h_pad` using a **precomputed** Z. S does not change during SCC.
@@ -144,6 +145,7 @@ pub fn purify_h_with_z(
     z: &Bsr4Matrix,
     nocc: f32,
     mask: &(Vec<u32>, Vec<u32>),
+    atom_n_orb: &[u8],
 ) -> Result<(Bsr4Matrix, f32, f32, usize)> {
     let n_atom = s.n_atom;
     let h = Bsr4Matrix::from_dense(n_atom, h_pad, mask)?;
@@ -158,7 +160,7 @@ pub fn purify_h_with_z(
         eprintln!("  bounds (ZH Gershgorin): emin={emin:.4} emax={emax:.4}");
     }
     let k0 = gpu.build_k0(&h, s, z, mask, mask, emin, emax)?;
-    let (k, r_i, tr, iters, _) = gpu.tc2_purify(&k0, s, nocc, mask, mask, 80, 1e-4)?;
+    let (k, r_i, tr, iters, _) = gpu.tc2_purify(&k0, s, nocc, mask, mask, atom_n_orb, 80, 1e-4)?;
     if verbose {
         eprintln!("  TC2: {iters} iters, R_I={r_i:.3e}, Tr(KS)={tr:.6} (Nocc={nocc})");
     }
@@ -184,7 +186,7 @@ pub fn energy_non_scc(
     let n_atom = atom_n_orb.len();
     let (h_pad, s_pad, _) = pad_physical_to_bsr4(h0_phys, s_phys, atom_n_orb, E_DUMMY);
     let n = n_atom * BS;
-    let (k, r_i, tr, tc2_iters) = purify_h(gpu, &h_pad, &s_pad, n_atom, nocc)?;
+    let (k, r_i, tr, tc2_iters) = purify_h(gpu, &h_pad, &s_pad, n_atom, nocc, atom_n_orb)?;
     let k_dense = k.to_dense();
     let e_h0 = 2.0 * trace_ab(&k_dense, &h_pad, n);
     let e_rep = repulsive_energy(sk_dir, species, coords)?;
@@ -231,9 +233,15 @@ fn energy_from_k(
     }
 }
 
-fn mulliken_q(gpu: &SparseBsr4Gpu, k: &Bsr4Matrix, s: &Bsr4Matrix, mask: &(Vec<u32>, Vec<u32>), n_atom: usize, nocc: f32, tr: f32, it: usize) -> Result<Vec<f64>> {
+fn mulliken_q(gpu: &SparseBsr4Gpu, k: &Bsr4Matrix, s: &Bsr4Matrix, mask: &(Vec<u32>, Vec<u32>), n_atom: usize, nocc: f32, tr: f32, it: usize, atom_n_orb: &[u8]) -> Result<Vec<f64>> {
     let t_ks = gpu.matmul_masked_bsym(k, s, mask)?;
-    let q_f32 = gpu.mulliken(&t_ks)?;
+    let (q_f32, q_dum) = gpu.mulliken(&t_ks, atom_n_orb)?;
+    let qd_max: f32 = q_dum.iter().map(|x| x.abs()).fold(0.0, f32::max);
+    if qd_max > 1e-4 {
+        return Err(DftbError::InvalidInput(format!(
+            "SCC iter {it}: dummy-orbital occupation {qd_max:.3e} > 1e-4 — K leaked into padded lanes (R14)"
+        )));
+    }
     if q_f32.len() != n_atom {
         return Err(DftbError::InvalidInput(format!(
             "Mulliken len {} != n_atom {n_atom}", q_f32.len()
@@ -308,8 +316,8 @@ pub fn run_sparse_scc(
         let dq: Vec<f64> = q.iter().zip(q0).map(|(a, b)| a - b).collect();
         compute_intra_shifts(coords, species_code, &dq, gamma, &mut v);
         let h_scc = apply_shift_padded(&h0_pad, &s_pad, &v, atom_n_orb);
-        let (k, r_i, tr, tc2_iters) = purify_h_with_z(gpu, &h_scc, &s_bsr, &z, nocc, &mask)?;
-        let q_new = mulliken_q(gpu, &k, &s_bsr, &mask, n_atom, nocc, tr, it)?;
+        let (k, r_i, tr, tc2_iters) = purify_h_with_z(gpu, &h_scc, &s_bsr, &z, nocc, &mask, atom_n_orb)?;
+        let q_new = mulliken_q(gpu, &k, &s_bsr, &mask, n_atom, nocc, tr, it, atom_n_orb)?;
         let k_dense = k.to_dense();
         let t_dense = gpu.matmul_masked_bsym(&k, &s_bsr, &mask)?.to_dense();
         let mut dummy_occ = 0.0f64;
@@ -343,8 +351,8 @@ pub fn run_sparse_scc(
             let dq_out: Vec<f64> = q_new.iter().zip(q0).map(|(a, b)| a - b).collect();
             compute_intra_shifts(coords, species_code, &dq_out, gamma, &mut v);
             let h_fin = apply_shift_padded(&h0_pad, &s_pad, &v, atom_n_orb);
-            let (k_fin, r_i_f, tr_f, tc2_f) = purify_h_with_z(gpu, &h_fin, &s_bsr, &z, nocc, &mask)?;
-            let q_fin = mulliken_q(gpu, &k_fin, &s_bsr, &mask, n_atom, nocc, tr_f, it)?;
+            let (k_fin, r_i_f, tr_f, tc2_f) = purify_h_with_z(gpu, &h_fin, &s_bsr, &z, nocc, &mask, atom_n_orb)?;
+            let q_fin = mulliken_q(gpu, &k_fin, &s_bsr, &mask, n_atom, nocc, tr_f, it, atom_n_orb)?;
             let mut r_fin = 0.0f64;
             for a in 0..n_atom {
                 let d = q_fin[a] - q_new[a];

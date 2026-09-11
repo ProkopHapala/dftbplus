@@ -240,6 +240,7 @@ file/function where the work should land.
 
 > **Kickstart ≠ floor.** Package 1 made residuals and two cheap f64 islands honest. Package 2 then **measured**: AT `|dE|` is `δ_CH`, not frozen `δε_occ`. Löwdin Newton and f32 GEMM Kahan are in; Kahan does not cut `δ_CH`. Keep H/S/D/C/W **f32**. Do **not** all-f64 matrices. Do not re-enable f64 `batched_gemm`.
 >
+> **2026-09-11 GPT 5.6 dense review (`e965ae00`) — active order:** `δ_CH` is probably **Jacobi C′ orthonormality loss** (`||C'ᵀC'−I||~2e-6`), not a precision wall — decompose per-column before accepting any floor. Strip the broad FP64 out of O(N³) Jacobi (FP32-FMA + 4 accumulators); move `repair_lowdin_x` to GPU GEMMs; device-resident geometry; fix FIRE then GPU. Full work order + FP32 policy table: `tasts/HBond_Relaxed_Scan_GPU/HBond_Relaxed_Scan_GPU.manifest..md` **§0.7 + §12**.
 > Detail + dense task boxes: `tasts/HBond_Relaxed_Scan_GPU/HBond_Relaxed_Scan_GPU.manifest..md` §0.6.
 > Review: `reports/2026-09-10_gpu_accuracy_physics_performance_second_review.md` (§5 budget, §8 experiment order, §9 decision).
 > Old “floor” map (treat as hypothesis, not law): `topical_audit/f32_floor_dense_hbond.md`. Sparse: other agent, `f32_floor_sparse.md`.
@@ -290,25 +291,29 @@ Candidate order (cheap → expensive). Benchmark occupancy/spills, not FLOP coun
 - [ ] Full compensated dots (Kahan / Ogita–Rump–Oishi) **only** in kernels/rows the frozen residual still flags — leftover is Jacobi `C'`, not GEMM
 - [ ] f64 accumulation as a **reference** and a selective production option — not the global default
 - [*] Metric repair **once per geometry** — `repair_lowdin_x`: `M=I+E` → `X←X(I−E/2)`, skip writeback if `e1≥e0` or `e0<1e-8`. AT `||XᵀSX−I||` 2.9e-6→2.0e-7; after SCC leftover metric is `||C'ᵀC'−I||~2e-6`. Formic `|ΔΔE|` 1.54e-5→4.6e-6
-- [ ] Occupied-subspace repair (S-orthonormalize + tiny projected eigen) — **this is the remaining `δ_CH` candidate**; D/W must stay consistent with the repaired C
+- [ ] Occupied-subspace repair (S-orthonormalize + tiny projected eigen) — **this is the remaining `δ_CH` candidate**; D/W must stay consistent with the repaired C. **Concrete spec: manifest §12 D1–D4** — decompose `δ_CH` first (per-column `cᵀSc`, `ρ_k=cᵀHc/cᵀSc`), then occupied-column renorm `C'←C'/‖C'‖`, then one polar step `C_o'←C_o'(3I−C_o'ᵀC_o')/2`; E/W via `H_o=C_oᵀH_sccC_o` if columns are mixed
 - [ ] γ **value** (`dftb_hamiltonian.cl::gamma_full`): stable equal-U expansion + cached species-pair coeffs. Do not just widen the equal-U threshold. Dense SCC currently uploads host G — that does not certify on-device γ
 - [ ] Force scatter: pair-owned contributions + atom-owned gather (or fused non-SCC+shift), not atomic Kahan
 
 #### 6.4.4 Jacobi / overlap (already a large f64 island — profile first)
 Tiled Jacobi (`gpu_tiled_jacobi.cl`) already does f64 inner sweeps, compound 2×2 updates, and strip products. Treating it as “f32 plus a scalar island” understates the cost (thousands of inner barriers at N=87).
 
+**2026-09-11 review (manifest §12 D2):** the broad f64 is a throughput bug, not a safety net — ~1.29M double block-updates per pivot. Benchmark exactly 3 modes (pure FP32-FMA / FP64 scalar `c,s` only / current broad-FP64 reference) reporting event time + residual + orthogonality + AT ΔE. Strip dots → 4 independent FP32 FMA accumulators (not Kahan, not f64).
+
 - [ ] Surface Jacobi residual + stop reason (rel off-diag / stagnation / exhaustion). Do not treat a **zeroed** off-diagonal as a solved eigenproblem
 - [ ] Profile kernel time, outer sweeps, local/private, spills, batch util **before** cutting inner sweeps or demoting f64 strips
 - [ ] Then: adaptive inner work vs current f64 reference; f32/FMA or compensated strips only with independent `||HC−SCε||`
 - [ ] `||UᵀU−I||` and `||HC−SCε||` as standing diagnostics (old D10) — `gpu_eigen.rs` / script prints, not a new cargo test crate
 - [~] `λ_min(S)` fail-loud on `GpuSccPlan::set_geometry` / `new` (≤1e-6). Still want the number printed, not only a crash
+- [ ] `repair_lowdin_x` CPU f64 serial GEMMs per replica → 3 GPU f32 GEMMs (`M=XᵀSX`, `X←X(3I−M)/2`, no re-symmetrization); then X reuse across FIRE steps — manifest §12 D5–D6
 
 #### 6.4.5 Engine honesty (not an f32 problem)
-- [ ] FIRE: Bitzek mix uses `|v|`, not `|F|`; per-replica `dt/α`
+- [ ] FIRE: Bitzek mix uses `|v|`, not `|F|`; per-replica `dt/α`; `apply_disp` mixes Verlet-like displacement with the velocity update — one standard ordering, then move FIRE on GPU — manifest §12 D12
 - [ ] `md_step` is not velocity-Verlet (missing half-kick) — rename or fix
 - [ ] `relax` returns **final** rms; do not ignore `stalled`
+- [ ] Per-system `Converged`/`AcceptedAtNumericalPlateau`/`Failed` status + `active[sid]` mask — manifest §12 D11
 - [*] W on GPU (same density kernel as D); `eval(want_forces)` one finalize; `set_coords` in-place pairs
-- [ ] Optional: fuse neighbor+G in one GPU kernel (same O(n²) distances; SK stays)
+- [ ] Optional: fuse neighbor+G in one GPU kernel (same O(n²) distances; SK stays) — superseded by §12 D7 (device-resident geometry)
 
 #### 6.4.6 Sparse (other agent — do not “fix f32” here by accident)
 - [ ] `run_scc` is not an SCC loop; `purify_h` rebuilds Z every iter (geometry-independent work inside SCC)

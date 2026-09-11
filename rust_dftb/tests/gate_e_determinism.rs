@@ -230,7 +230,7 @@ fn sparse_energy(
     let (emin, emax) = gpu.spectral_bounds(&h_bsr, &z, &mask, 0.1).unwrap();
     let k0 = gpu.build_k0(&h_bsr, &s_bsr, &z, &mask, &mask, emin, emax).unwrap();
     let (k_final, _r_i, _tr, _iters, _hist) = gpu
-        .tc2_purify(&k0, &s_bsr, n_occ as f32, &mask, &mask, 80, 1e-4).unwrap();
+        .tc2_purify(&k0, &s_bsr, n_occ as f32, &mask, &mask, atom_n_orb, 80, 1e-4).unwrap();
 
     let k_dense = k_final.to_dense();
     cpu_energy(&k_dense, &h_pad, n_padded)
@@ -302,7 +302,7 @@ fn test_gate_e_determinism_and_h_plateau() {
         let (z, _, _) = gpu.newton_schulz_inverse(&sb, &mask, &mask, 50, 1e-5, 5).unwrap();
         let (emin, emax) = gpu.spectral_bounds(&hb, &z, &mask, 0.1).unwrap();
         let k0 = gpu.build_k0(&hb, &sb, &z, &mask, &mask, emin, emax).unwrap();
-        let (kf, _, _, _, _) = gpu.tc2_purify(&k0, &sb, n_occ as f32, &mask, &mask, 80, tol).unwrap();
+        let (kf, _, _, _, _) = gpu.tc2_purify(&k0, &sb, n_occ as f32, &mask, &mask, &atom_n_orb, 80, tol).unwrap();
         let kd = kf.to_dense();
         let e = cpu_energy(&kd, &hp, np);
         e_by_tol.push(e);

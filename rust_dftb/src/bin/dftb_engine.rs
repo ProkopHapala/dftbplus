@@ -21,7 +21,7 @@
 
 use rust_dftb::geometry::{self, A_CC, Element, FlakeShape, NanoStructure};
 use rust_dftb::methods::sparse::{
-    Bsr4Matrix, SparseBsr4Config, SparseBsr4Gpu, SparseDftb, SparsePerfStats,
+    Bsr4Matrix, SparseBsr4Config, SparseBsr4Gpu, SparseDftb, SparseDftbConfig, SparsePerfStats,
     build_full_mask, build_geometric_mask,
 };
 use rust_dftb::methods::sparse::gpu_sparse::{GpuBsrMatrix, GpuBsrStructure, SparsePurifyWorkspace};
@@ -355,7 +355,8 @@ fn rhai_run_sparse_purify(name: &str, max_iter: INT, tol: f64) -> Dynamic {
 
     // 4. TC2 purification
     eprintln!("  TC2 purification (max_iter={max_iter}, tol={tol}) ...");
-    let mut workspace = match SparsePurifyWorkspace::new(gpu, &k0, &s_bsr, &mask, &mask, n_occ) {
+    let n_orb_atom: Vec<u8> = st.elements.iter().map(|e| if e.symbol() == "H" { 1 } else { 4 }).collect();
+    let mut workspace = match SparsePurifyWorkspace::new(gpu, &k0, &s_bsr, &mask, &mask, &n_orb_atom, n_occ) {
         Ok(ws) => ws,
         Err(e) => panic!("ERROR creating resident TC2 workspace: {e}"),
     };
@@ -379,12 +380,13 @@ fn rhai_run_sparse_purify(name: &str, max_iter: INT, tol: f64) -> Dynamic {
         panic!("Hamiltonian residual is non-finite: R_H={r_h:e}, normalized={r_h_norm:e}");
     }
 
-    // 6. Mulliken charges from sparse K
-    let mulliken = match workspace.mulliken_dev() {
+    // 6. Mulliken charges from sparse K (physical lanes only, R14)
+    let (mulliken, q_dum) = match workspace.mulliken_dev() {
         Ok(m) => m,
         Err(e) => panic!("ERROR Mulliken: {e}"),
     };
-    eprintln!("    sparse Mulliken: {:?}", mulliken.iter()
+    let qd_max: f32 = q_dum.iter().map(|x| x.abs()).fold(0.0, f32::max);
+    eprintln!("    sparse Mulliken: {:?}  (dummy occ max={qd_max:.3e})", mulliken.iter()
         .map(|q| format!("{q:.4}")).collect::<Vec<_>>());
 
     let k_dense = k_final.to_dense();
@@ -505,7 +507,8 @@ fn rhai_run_sparse_purify_geom(name: &str, r_max: f64, max_iter: INT, tol: f64) 
 
     eprintln!("  TC2 purification (max_iter={max_iter}, tol={tol}) ...");
     let t0 = Instant::now();
-    let mut workspace = match SparsePurifyWorkspace::new(gpu, &k0, &s_bsr, &mask, &mask, n_occ) {
+    let n_orb_atom: Vec<u8> = st.elements.iter().map(|e| if e.symbol() == "H" { 1 } else { 4 }).collect();
+    let mut workspace = match SparsePurifyWorkspace::new(gpu, &k0, &s_bsr, &mask, &mask, &n_orb_atom, n_occ) {
         Ok(ws) => ws,
         Err(e) => panic!("ERROR creating resident TC2 workspace: {e}"),
     };
@@ -529,11 +532,12 @@ fn rhai_run_sparse_purify_geom(name: &str, r_max: f64, max_iter: INT, tol: f64) 
         panic!("Hamiltonian residual is non-finite: R_H={r_h:e}, normalized={r_h_norm:e}");
     }
 
-    let mulliken = match workspace.mulliken_dev() {
+    let (mulliken, q_dum) = match workspace.mulliken_dev() {
         Ok(m) => m,
         Err(e) => panic!("ERROR Mulliken: {e}"),
     };
-    eprintln!("    sparse Mulliken: {:?}", mulliken.iter()
+    let qd_max: f32 = q_dum.iter().map(|x| x.abs()).fold(0.0, f32::max);
+    eprintln!("    sparse Mulliken: {:?}  (dummy occ max={qd_max:.3e})", mulliken.iter()
         .map(|q| format!("{q:.4}")).collect::<Vec<_>>());
 
     let t_total = t_total_start.elapsed();
@@ -651,6 +655,12 @@ fn rhai_get_n_atoms(name: &str) -> INT {
 }
 
 /// Convert a float to string for printing.
+/// clock() -> seconds since first call — for timing scan/bench scripts.
+fn rhai_clock() -> f64 {
+    static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    T0.get_or_init(std::time::Instant::now).elapsed().as_secs_f64()
+}
+
 fn rhai_ftos(x: f64) -> String {
     format!("{x}")
 }
@@ -1005,6 +1015,8 @@ struct GpuHandle {
     last_q_max: f64,
     last_iters: i64,
     last_stalled: bool,
+    /// §12 D11: per-system SCC status words ("converged"/"plateau"/"failed").
+    last_status: Vec<String>,
 }
 
 thread_local! {
@@ -1054,13 +1066,32 @@ fn sync_geom_coords(name: &str, coords: &[[f64; 3]]) {
 }
 
 /// Compile/allocate SparseDftb once for a stored geometry. Not a replica batch (one system).
+/// 4-arg form: sparse_new(name, sk_dir, r_trunc_ang, taper_w_ang) — r_trunc <= 0
+/// = untruncated (full SK table range); otherwise H/S pairs are cosine-tapered
+/// to zero over [r_trunc − taper_w, r_trunc] and the mask shrinks to
+/// r_trunc + skin.
 fn rhai_sparse_new(name: &str, sk_dir: &str) -> INT {
+    rhai_sparse_new_full(name, sk_dir, 0.0, 0.0, 0.0, 0.0)
+}
+
+fn rhai_sparse_new_cut(name: &str, sk_dir: &str, r_trunc_ang: f64, taper_w_ang: f64) -> INT {
+    rhai_sparse_new_full(name, sk_dir, r_trunc_ang, taper_w_ang, 0.0, 0.0)
+}
+
+/// sparse_new(name, sk_dir, r_trunc, taper_w, r_k, r_z) — r_k/r_z <= 0 = default
+/// (full SK radius + skin). K/Z decay is set by the gap, not the H/S range.
+fn rhai_sparse_new_full(name: &str, sk_dir: &str, r_trunc_ang: f64, taper_w_ang: f64, r_k_ang: f64, r_z_ang: f64) -> INT {
     let (species, coords) = geom_species_coords(name, "sparse_new");
     let n_atom = species.len();
-    eprintln!("[sparse] sparse_new '{name}' n_atom={n_atom} sk={sk_dir}");
+    eprintln!("[sparse] sparse_new '{name}' n_atom={n_atom} sk={sk_dir} r_trunc={r_trunc_ang} taper_w={taper_w_ang} r_k={r_k_ang} r_z={r_z_ang}");
     let sk = load_sk_for_species(sk_dir, &species).unwrap_or_else(|e| panic!("sparse_new '{name}' load SK from {sk_dir}: {e}"));
-    let eng = SparseDftb::new(sk, sk_dir, species, coords)
-        .unwrap_or_else(|e| panic!("sparse_new '{name}' SparseDftb::new: {e}"));
+    let mut cfg = SparseDftbConfig::default();
+    if r_trunc_ang > 0.0 { cfg.r_trunc_ang = Some(r_trunc_ang); }
+    if taper_w_ang > 0.0 { cfg.taper_w_ang = taper_w_ang; }
+    if r_k_ang > 0.0 { cfg.r_k_ang = Some(r_k_ang); }
+    if r_z_ang > 0.0 { cfg.r_z_ang = Some(r_z_ang); }
+    let eng = SparseDftb::with_config(sk, sk_dir, species, coords, cfg)
+        .unwrap_or_else(|e| panic!("sparse_new '{name}' SparseDftb::with_config: {e}"));
     let n_orbs = eng.n_orbs() as INT;
     eprintln!("[sparse] sparse_new '{name}' n_orbs={n_orbs}");
     with_sparse(|g| {
@@ -1115,6 +1146,20 @@ fn rhai_sparse_max_force(name: &str) -> f64 {
         let h = g.get(name).unwrap_or_else(|| panic!("sparse_max_force '{name}': no engine"));
         if !h.have_forces { panic!("sparse_max_force '{name}': last sparse_eval had want_forces=false"); }
         h.last_fmax
+    })
+}
+
+/// sparse_force_at(name, atom_i, comp) -> force component (Ha/Å). Runs the
+/// analytic sparse force path (requires a prior sparse_scc at this geometry).
+fn rhai_sparse_force_at(name: &str, i: INT, c: INT) -> f64 {
+    with_sparse(|g| {
+        let h = g.get_mut(name).unwrap_or_else(|| panic!("sparse_force_at '{name}': no engine"));
+        let f = h.eng.forces().unwrap_or_else(|e| panic!("sparse_force_at '{name}': {e}"));
+        let (i, c) = (i as usize, c as usize);
+        if i >= h.eng.n_atom() || c > 2 {
+            panic!("sparse_force_at '{name}': bad index i={i} c={c} (n_atom={})", h.eng.n_atom());
+        }
+        f.forces[i][c]
     })
 }
 
@@ -1199,10 +1244,162 @@ fn rhai_sparse_tr_ks(name: &str) -> f64 {
     with_sparse(|g| g.get(name).unwrap_or_else(|| panic!("sparse_tr_ks '{name}': no engine")).eng.last_energy().tr_ks as f64)
 }
 
+/// Relative TC2 tolerance ‖KSK−K‖/‖K‖ for subsequent scc calls.
+fn rhai_sparse_tc2_tol(name: &str, tol: f64) {
+    with_sparse(|g| {
+        let h = g.get_mut(name).unwrap_or_else(|| panic!("sparse_tc2_tol '{name}': no engine"));
+        h.eng.set_tc2_tol(tol as f32);
+        eprintln!("[sparse] sparse_tc2_tol '{name}' tol={tol:e}");
+    });
+}
+
+fn rhai_sparse_ns_tol(name: &str, tol: f64) {
+    with_sparse(|g| {
+        let h = g.get_mut(name).unwrap_or_else(|| panic!("sparse_ns_tol '{name}': no engine"));
+        h.eng.set_ns_tol(tol as f32);
+        eprintln!("[sparse] sparse_ns_tol '{name}' tol={tol:e}");
+    });
+}
+
 fn rhai_sparse_charges(name: &str) -> String {
     with_sparse(|g| {
         let h = g.get(name).unwrap_or_else(|| panic!("sparse_charges '{name}': no engine"));
         h.eng.last_energy().q.iter().map(|q| format!("{q:.8}")).collect::<Vec<_>>().join(",")
+    })
+}
+
+/// Vibrational frequencies from a central-difference Hessian of the sparse
+/// analytic forces (manifest Gate G/H machinery — user-level entry point).
+///
+/// `h` is the displacement step in Å (must be ≪ skin/2 — the Verlet skin
+/// guard in `set_coords` enforces this; h = 0.02 Å is the Gate-E plateau).
+/// Each column is warm-started: SCC reuses the previous converged charges.
+/// The engine is restored to the input geometry and re-converged at the end.
+///
+/// H[iα,jβ] = −(F_jβ(+h) − F_jβ(−h)) / 2h, symmetrized, mass-weighted with
+/// standard atomic weights, diagonalized by dense f64 Jacobi-free symmetric
+/// eigensolver (3N ≤ few thousand — dense eig is fine at this scale).
+/// ω[cm⁻¹] = sign(λ)·√|λ|·5140.487143 (E_h/Bohr²·amu → cm⁻¹).
+///
+/// Writes `path` (plain text: one line per mode, "freq_cm1" then mode
+/// vector block). Returns a one-line summary (n_imag, lowest/highest freq).
+fn rhai_sparse_vibrations(name: &str, h: f64, scc_tol: f64, path: &str) -> String {
+    // H is in E_h/Å² (forces are E_h/Å, h in Å). The cm⁻¹ convention
+    // ν = √λ·5140.487 assumes λ in E_h/(Bohr²·amu): convert with
+    // 1/(ANG2BOHR·√m_amu) per index (m in amu, NOT electron masses).
+    const AU_TO_CM: f64 = 5140.487_143;
+    let (species, _coords) = geom_species_coords(name, "sparse_vibrations");
+    let masses: Vec<f64> = species.iter()
+        .map(|s| Element::from_symbol(s).unwrap_or_else(|| panic!("sparse_vibrations '{name}': unknown element {s}")).mass())
+        .collect();
+
+    with_sparse(|g| {
+        let hnd = g.get_mut(name).unwrap_or_else(|| panic!("sparse_vibrations '{name}': no engine — sparse_new first"));
+        let eng = &mut hnd.eng;
+        let n_atom = eng.n_atom();
+        let n3 = 3 * n_atom;
+        let x0 = eng.coords().to_vec();
+        if !(h > 0.0) || h > 0.5 {
+            panic!("sparse_vibrations '{name}': h={h} Å must be in (0, 0.5] — skin/2 guard needs h < skin/2");
+        }
+
+        let mut hess = vec![0.0f64; n3 * n3];
+        let mut work = x0.clone();
+        eprintln!("[sparse] vibrations '{name}': {n3} columns, h={h} Å, scc_tol={scc_tol:e}");
+        for i in 0..n_atom {
+            for a in 0..3 {
+                let col = 3 * i + a;
+                let (f_plus, f_minus);
+                work[i][a] = x0[i][a] + h;
+                eng.set_coords(&work).unwrap_or_else(|e| panic!("vibrations '{name}' col {col} +h set_coords: {e}"));
+                eng.scc(80, scc_tol).unwrap_or_else(|e| panic!("vibrations '{name}' col {col} +h scc: {e}"));
+                f_plus = eng.forces().unwrap_or_else(|e| panic!("vibrations '{name}' col {col} +h forces: {e}")).forces;
+                work[i][a] = x0[i][a] - h;
+                eng.set_coords(&work).unwrap_or_else(|e| panic!("vibrations '{name}' col {col} -h set_coords: {e}"));
+                eng.scc(80, scc_tol).unwrap_or_else(|e| panic!("vibrations '{name}' col {col} -h scc: {e}"));
+                f_minus = eng.forces().unwrap_or_else(|e| panic!("vibrations '{name}' col {col} -h forces: {e}")).forces;
+                work[i][a] = x0[i][a];
+                for j in 0..n_atom {
+                    for b in 0..3 {
+                        hess[(3 * j + b) * n3 + col] = -(f_plus[j][b] - f_minus[j][b]) / (2.0 * h);
+                    }
+                }
+                if col % 6 == 0 { eprintln!("[sparse] vibrations '{name}': col {col}/{n3}"); }
+            }
+        }
+        // Restore input geometry + reconverge so the engine's state is consistent.
+        eng.set_coords(&x0).unwrap_or_else(|e| panic!("vibrations '{name}' restore set_coords: {e}"));
+        eng.scc(80, scc_tol).unwrap_or_else(|e| panic!("vibrations '{name}' restore scc: {e}"));
+        sync_geom_coords(name, &x0);
+
+        // Symmetrize (FD noise + truncation asymmetry — report, don't hide).
+        let mut max_asym = 0.0f64;
+        for r in 0..n3 {
+            for c in (r + 1)..n3 {
+                let a = hess[r * n3 + c];
+                let b = hess[c * n3 + r];
+                max_asym = max_asym.max((a - b).abs());
+                let m = 0.5 * (a + b);
+                hess[r * n3 + c] = m;
+                hess[c * n3 + r] = m;
+            }
+        }
+        eprintln!("[sparse] vibrations '{name}': Hessian max asymmetry = {max_asym:.3e}");
+
+        // Mass-weight: M_ij = H_ij[E_h/Bohr²] / sqrt(m_i m_j), masses in amu.
+        let inv: Vec<f64> = (0..n_atom)
+            .flat_map(|i| std::iter::repeat(1.0 / (ANG2BOHR * masses[i].sqrt())).take(3))
+            .collect();
+        let mut mw = vec![0.0f64; n3 * n3];
+        for r in 0..n3 {
+            for c in 0..n3 {
+                mw[r * n3 + c] = hess[r * n3 + c] * inv[r] * inv[c];
+            }
+        }
+        let dm = nalgebra::DMatrix::from_row_slice(n3, n3, &mw);
+        let eig = nalgebra::SymmetricEigen::new(dm);
+        let mut vals: Vec<f64> = eig.eigenvalues.iter().copied().collect();
+        vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let mut freqs: Vec<f64> = Vec::with_capacity(n3);
+        let mut n_imag = 0usize;
+        for &lam in &vals {
+            if lam < 0.0 {
+                n_imag += 1;
+                freqs.push(-(-lam).sqrt() * AU_TO_CM);
+            } else {
+                freqs.push(lam.sqrt() * AU_TO_CM);
+            }
+        }
+
+        // Write: freqs then mass-weighted eigenmodes (columns of eigvecs).
+        let mut out = String::new();
+        out.push_str(&format!("# sparse vibrations '{name}' n_atom={n_atom} h={h} scc_tol={scc_tol:e} max_asym={max_asym:.3e}\n"));
+        for (k, &f) in freqs.iter().enumerate() {
+            out.push_str(&format!("{k} {f:.4}\n"));
+        }
+        let mut order: Vec<usize> = (0..n3).collect();
+        order.sort_by(|&a, &b| eig.eigenvalues[a].partial_cmp(&eig.eigenvalues[b]).unwrap());
+        for (k, &col) in order.iter().enumerate() {
+            out.push_str(&format!("mode {k} freq {:.4}\n", freqs[k]));
+            // Mass-weighted eigenvector → real-space displacement, unit-normed.
+            let mut un = 0.0f64;
+            let mut u = vec![0.0f64; n3];
+            for c in 0..n3 {
+                u[c] = eig.eigenvectors[(c, col)] * inv[c] * ANG2BOHR;
+                un += u[c] * u[c];
+            }
+            let un = un.sqrt().max(1e-30);
+            for i in 0..n_atom {
+                out.push_str(&format!("  {:.8} {:.8} {:.8}\n", u[3 * i] / un, u[3 * i + 1] / un, u[3 * i + 2] / un));
+            }
+        }
+        std::fs::write(path, &out).unwrap_or_else(|e| panic!("sparse_vibrations '{name}' write {path}: {e}"));
+
+        let lo = freqs.first().copied().unwrap_or(f64::NAN);
+        let hi = freqs.last().copied().unwrap_or(f64::NAN);
+        let summary = format!("n3={n3} n_imag={n_imag} freq_min={lo:.2} freq_max={hi:.2} cm-1 (written {path})");
+        eprintln!("[sparse] vibrations '{name}': {summary}");
+        summary
     })
 }
 
@@ -1278,7 +1475,7 @@ fn rhai_gpu_new(name: &str, sk_dir: &str, batch: INT) -> INT {
     eprintln!("[gpu] gpu_new '{name}' N={n_orbs} device={}", eng.rt.caps().name);
     with_gpu(|g| {
         g.insert(name.to_string(), GpuHandle {
-            eng, last_e: Vec::new(), last_f: None, last_rms: f32::NAN, last_q_rms: f64::NAN, last_q_max: f64::NAN, last_iters: 0, last_stalled: false,
+            eng, last_e: Vec::new(), last_f: None, last_rms: f32::NAN, last_q_rms: f64::NAN, last_q_max: f64::NAN, last_iters: 0, last_stalled: false, last_status: Vec::new(),
         });
     });
     n_orbs
@@ -1292,6 +1489,7 @@ fn rhai_gpu_scc(name: &str, max_iter: INT, tol: f64) -> f64 {
         h.last_rms = scc.rms;
         h.last_iters = scc.n_iters as i64;
         h.last_stalled = scc.stalled;
+        h.last_status = scc.statuses.iter().map(|s| format!("{s:?}").to_lowercase()).collect();
         eprintln!("[gpu] gpu_scc '{name}' rms={:.3e} iters={} stalled={}", scc.rms, scc.n_iters, scc.stalled);
         scc.rms as f64
     })
@@ -1336,6 +1534,75 @@ fn rhai_gpu_energy_i(name: &str, i: INT) -> f64 {
     })
 }
 
+/// gpu_fire_step(name, f_tol) -> max|F| — one FIRE step on all replicas;
+/// the engine's SCC state is consumed internally (call after gpu_scc or
+/// standalone — it runs its own eval).
+fn rhai_gpu_fire_step(name: &str, f_tol: f64) -> f64 {
+    with_gpu(|g| {
+        let h = g.get_mut(name).unwrap_or_else(|| panic!("gpu_fire_step '{name}': no engine — gpu_new first"));
+        h.eng.fire_step(f_tol).unwrap_or_else(|e| panic!("gpu_fire_step '{name}': {e}"))
+    })
+}
+
+/// gpu_relax(name, max_steps, f_tol, scc_tol) -> max|F| — FIRE loop until
+/// converged or max_steps; prints unbuffered progress.
+fn rhai_gpu_relax(name: &str, max_steps: INT, f_tol: f64, scc_tol: f64) -> f64 {
+    with_gpu(|g| {
+        let h = g.get_mut(name).unwrap_or_else(|| panic!("gpu_relax '{name}': no engine"));
+        let (n, max_f, rms0) = h.eng.relax(max_steps as usize, f_tol, scc_tol as f32)
+            .unwrap_or_else(|e| panic!("gpu_relax '{name}': {e}"));
+        eprintln!("[gpu] gpu_relax '{name}' steps={n} max|F|={max_f:.4e} rms0={rms0:.3e}");
+        max_f
+    })
+}
+
+/// gpu_bench(name, n_runs, max_iter, rms_tol) -> avg ms per SCC call.
+/// Times the production GpuDftb path end-to-end (reset_q + scc per run,
+/// wall clock — includes queue sync). Replaces the legacy
+/// tests/gpu_scc_bench.rs GpuDriver benchmark.
+fn rhai_gpu_bench(name: &str, n_runs: INT, max_iter: INT, rms_tol: f64) -> f64 {
+    with_gpu(|g| {
+        let h = g.get_mut(name).unwrap_or_else(|| panic!("gpu_bench '{name}': no engine — gpu_new first"));
+        let mut total_ms = 0.0;
+        for r in 0..n_runs {
+            h.eng.reset_q0().unwrap_or_else(|e| panic!("gpu_bench '{name}' reset_q0: {e}"));
+            let t0 = std::time::Instant::now();
+            let scc = h.eng.scc(max_iter as usize, rms_tol as f32)
+                .unwrap_or_else(|e| panic!("gpu_bench '{name}' scc run {r}: {e}"));
+            let dt = t0.elapsed().as_secs_f64() * 1e3;
+            total_ms += dt;
+            eprintln!("[gpu_bench] {name} run {r}: {dt:.2} ms ({} iters, rms={:.3e})", scc.n_iters, scc.rms);
+        }
+        let avg = total_ms / n_runs as f64;
+        eprintln!("[gpu_bench] {name} avg={avg:.3} ms/scc over {n_runs} runs");
+        avg
+    })
+}
+
+/// gpu_smearing(name, kT_ha) — Fermi smearing in Hartree (0 = integer occ).
+/// Stabilizes SCC at near-degenerate HOMO/LUMO (mid proton transfer):
+/// fractional occupation removes the O(1) Δq oscillation.
+fn rhai_gpu_smearing(name: &str, kT: f64) {
+    with_gpu(|g| {
+        let h = g.get_mut(name).unwrap_or_else(|| panic!("gpu_smearing '{name}': no engine"));
+        h.eng.set_smearing(kT as f32);
+    });
+}
+
+/// gpu_freeze_atoms(name, [i0,i1,...]) — pin template atoms for ALL
+/// replicas (constrained scans: the transferred proton etc.). Forces,
+/// velocities, and the per-replica convergence test ignore them.
+fn rhai_gpu_freeze_atoms(name: &str, idx: Array) {
+    let ids: Vec<usize> = idx.iter()
+        .map(|d| dyn_f64(d, &format!("gpu_freeze_atoms '{name}' idx")) as usize)
+        .collect();
+    with_gpu(|g| {
+        let h = g.get_mut(name).unwrap_or_else(|| panic!("gpu_freeze_atoms '{name}': no engine"));
+        h.eng.set_frozen_atoms(&ids).unwrap_or_else(|e| panic!("gpu_freeze_atoms '{name}': {e}"));
+    });
+    eprintln!("[gpu] gpu_freeze_atoms '{name}' frozen={ids:?}");
+}
+
 fn rhai_gpu_max_force(name: &str) -> f64 {
     with_gpu(|g| {
         let h = g.get(name).unwrap_or_else(|| panic!("gpu_max_force '{name}': no engine"));
@@ -1371,6 +1638,16 @@ fn rhai_gpu_scc_stalled(name: &str) -> INT {
     with_gpu(|g| {
         let h = g.get(name).unwrap_or_else(|| panic!("gpu_scc_stalled '{name}': no engine"));
         if h.last_stalled { 1 } else { 0 }
+    })
+}
+
+/// §12 D11: per-system convergence status of the last gpu_scc_mixer call.
+/// Returns "converged" | "plateau" | "failed" (batch=1) or joined list.
+fn rhai_gpu_scc_status(name: &str) -> String {
+    with_gpu(|g| {
+        let h = g.get(name).unwrap_or_else(|| panic!("gpu_scc_status '{name}': no engine"));
+        if h.last_status.is_empty() { panic!("gpu_scc_status '{name}': no scc_mixer call yet"); }
+        h.last_status.join(",")
     })
 }
 
@@ -1421,9 +1698,37 @@ fn rhai_gpu_scc_mixer(name: &str, max_iter: INT, tol: f64, mix: INT) -> f64 {
         h.last_rms = scc.rms;
         h.last_iters = scc.n_iters as i64;
         h.last_stalled = scc.stalled;
-        eprintln!("[gpu] gpu_scc_mixer '{name}' mix={mix} rms={:.3e} iters={} stalled={}", scc.rms, scc.n_iters, scc.stalled);
+        h.last_status = scc.statuses.iter().map(|s| format!("{s:?}").to_lowercase()).collect();
+        eprintln!("[gpu] gpu_scc_mixer '{name}' mix={mix} rms={:.3e} iters={} stalled={} status={}", scc.rms, scc.n_iters, scc.stalled, h.last_status.join(","));
         scc.rms as f64
     })
+}
+
+/// §12 D2 A/B: set JACOBI_PREC for engines created AFTER this call.
+/// 0 = pure FP32-FMA, 1 = FP64 rotation construction only, 2 = broad FP64.
+fn rhai_gpu_jacobi_prec(mode: INT) {
+    rust_dftb::qmqm::gpu_scc_plan::set_jacobi_prec(mode as u32);
+    eprintln!("[gpu] gpu_jacobi_prec mode={mode} (0=f32-fma 1=f64-rot 2=f64-all) — affects subsequent gpu_new");
+}
+
+/// §12 D3/D4 A/B: mode bit0 = finalize repair (C′ renorm + ρ weights),
+/// bit1 = in-SCC occupied-column renormalization. Default production = 1.
+fn rhai_gpu_occ_repair(name: &str, mode: INT) {
+    with_gpu(|g| {
+        let h = g.get_mut(name).unwrap_or_else(|| panic!("gpu_occ_repair '{name}': no engine — gpu_new first"));
+        h.eng.plan.occ_repair = (mode & 1) != 0;
+        h.eng.plan.occ_repair_scc = (mode & 2) != 0;
+        eprintln!("[gpu] gpu_occ_repair '{name}' mode={mode} (finalize={} scc={})", h.eng.plan.occ_repair, h.eng.plan.occ_repair_scc);
+    });
+}
+
+/// §12 D6 A/B: enable/disable Löwdin-X reuse across geometry changes.
+fn rhai_gpu_x_reuse(name: &str, on: bool) {
+    with_gpu(|g| {
+        let h = g.get_mut(name).unwrap_or_else(|| panic!("gpu_x_reuse '{name}': no engine — gpu_new first"));
+        h.eng.plan.x_reuse = on;
+        eprintln!("[gpu] gpu_x_reuse '{name}' on={on}");
+    });
 }
 
 fn rhai_gpu_measure(name: &str, want_cpu: bool) -> f64 {
@@ -1485,6 +1790,13 @@ fn rhai_get_xyz(name: &str) -> Array {
             a.push(Dynamic::from_float(p[2]));
         }
         a
+    })
+}
+
+fn rhai_get_species(name: &str) -> Array {
+    with_state(|s| {
+        let st = s.geometries.get(name).unwrap_or_else(|| panic!("get_species '{name}': no geometry — load_xyz/make_geom first"));
+        st.elements.iter().map(|e| Dynamic::from(e.symbol().to_string())).collect()
     })
 }
 
@@ -1614,6 +1926,8 @@ fn main() {
     engine.register_fn("gpu_new", rhai_gpu_new);
     engine.register_fn("gpu_scc", rhai_gpu_scc);
     engine.register_fn("gpu_scc_mixer", rhai_gpu_scc_mixer);
+    engine.register_fn("gpu_occ_repair", rhai_gpu_occ_repair);
+    engine.register_fn("gpu_jacobi_prec", rhai_gpu_jacobi_prec);
     engine.register_fn("gpu_reset_q", rhai_gpu_reset_q);
     engine.register_fn("gpu_set_coords", rhai_gpu_set_coords);
     engine.register_fn("gpu_eval", rhai_gpu_eval);
@@ -1621,17 +1935,28 @@ fn main() {
     engine.register_fn("gpu_cpu_energy", rhai_gpu_cpu_energy);
     engine.register_fn("gpu_energy_i", rhai_gpu_energy_i);
     engine.register_fn("gpu_max_force", rhai_gpu_max_force);
+    engine.register_fn("gpu_bench", rhai_gpu_bench);
+    engine.register_fn("gpu_fire_step", rhai_gpu_fire_step);
+    engine.register_fn("gpu_relax", rhai_gpu_relax);
+    engine.register_fn("gpu_freeze_atoms", rhai_gpu_freeze_atoms);
+    engine.register_fn("gpu_smearing", rhai_gpu_smearing);
     engine.register_fn("gpu_n_batch", rhai_gpu_n_batch);
     engine.register_fn("gpu_n_orbs", rhai_gpu_n_orbs);
     engine.register_fn("gpu_n_atoms", rhai_gpu_n_atoms);
     engine.register_fn("gpu_scc_iters", rhai_gpu_scc_iters);
     engine.register_fn("gpu_scc_stalled", rhai_gpu_scc_stalled);
+    engine.register_fn("gpu_scc_status", rhai_gpu_scc_status);
+    engine.register_fn("gpu_x_reuse", rhai_gpu_x_reuse);
     engine.register_fn("gpu_q_rms", rhai_gpu_q_rms);
     engine.register_fn("get_xyz", rhai_get_xyz);
+    engine.register_fn("get_species", rhai_get_species);
     engine.register_fn("sparse_new", rhai_sparse_new);
+    engine.register_fn("sparse_new", rhai_sparse_new_cut);
+    engine.register_fn("sparse_new", rhai_sparse_new_full);
     engine.register_fn("sparse_scc", rhai_sparse_scc);
     engine.register_fn("sparse_eval", rhai_sparse_eval);
     engine.register_fn("sparse_max_force", rhai_sparse_max_force);
+    engine.register_fn("sparse_force_at", rhai_sparse_force_at);
     engine.register_fn("sparse_fire_step", rhai_sparse_fire_step);
     engine.register_fn("sparse_md_step", rhai_sparse_md_step);
     engine.register_fn("sparse_relax", rhai_sparse_relax);
@@ -1641,6 +1966,9 @@ fn main() {
     engine.register_fn("sparse_scc_iters", rhai_sparse_scc_iters);
     engine.register_fn("sparse_tr_ks", rhai_sparse_tr_ks);
     engine.register_fn("sparse_charges", rhai_sparse_charges);
+    engine.register_fn("sparse_vibrations", rhai_sparse_vibrations);
+    engine.register_fn("sparse_tc2_tol", rhai_sparse_tc2_tol);
+    engine.register_fn("sparse_ns_tol", rhai_sparse_ns_tol);
     engine.register_fn("assert_finite", rhai_assert_finite);
     engine.register_fn("assert_close", rhai_assert_close);
     engine.register_fn("die", rhai_die);
@@ -1653,6 +1981,7 @@ fn main() {
     engine.register_fn("get_energy", rhai_get_energy);
     engine.register_fn("get_n_atoms", rhai_get_n_atoms);
     engine.register_fn("ftos", rhai_ftos);
+    engine.register_fn("clock", rhai_clock);
     engine.register_fn("itos", rhai_itos);
     engine.register_fn("save_convergence", rhai_save_convergence);
     engine.register_fn("get_charges", rhai_get_charges);

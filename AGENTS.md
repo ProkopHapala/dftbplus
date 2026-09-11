@@ -24,6 +24,17 @@ DFTB+ fork: upstream Fortran reference (`src/dftbp/`) + from-scratch Rust reimpl
 - **Never cheat a test green** by violating physics, suppressing errors, loosening tolerances, or picking cautious parameters.
 - When a test fails, the response is to **investigate the physics**, not to silence the test. If the test itself is wrong, fix the test — but say so explicitly and justify it.
 
+## ⚑ f32 Is The Architecture, Not An Inconvenience (second-most-violated rule)
+
+GPU kernels are **single precision**. Agents repeatedly write iterative schemes that are only stable in exact arithmetic, then "fix" the resulting blowup by iterating harder or tightening tolerances. That is backwards and has cost days of debugging. Mandatory discipline:
+
+- **No open-loop iterations.** Any iterative scheme (purification/TC2/SP2, Newton–Schulz, DIIS, FIRE, Jacobi) must have an **enforced restoring invariant** — trace normalization, renormalization, projection back into the admissible set. "The math says the spectrum stays in [0,1]" is not enforcement: f32 noise (~1e-5 relative per SpGEMM) accumulates and violates the precondition, after which divergent polynomial maps amplify it exponentially. State each solver's invariant and *how it is enforced*.
+- **Tolerances must be set to the MEASURED floor, then the loop must STOP.** Iterating against a noise floor is a bug, not diligence. Report the floor honestly (a plateau is a legitimate answer); hard-fail only on genuine blowup. Never silently continue past a floor and never tighten a tolerance below the measured floor to "look better".
+- **Discrete decisions in f64, on the host.** Branch selects, occupancy/trace counts, convergence tests, bracket/bisection logic: if the decision quantity costs O(N) (not O(N²)) to reduce, compute it in f64. A wrong branch caused by 1e-5 noise is catastrophic; a 1e-5 error inside a matrix element is harmless. Budget precision where decisions are made, not uniformly.
+- **Truncating an INTERMEDIATE is a different error class than truncating a RESULT.** Dropping blocks of an intermediate deletes real contributions to in-mask outputs (`C_ij = Σ_k A_ik B_kj`). Use magnitude/τ-based dropping with an error bound, never an ad-hoc radius, for intermediates.
+- **Approximate inputs invalidate rigorous bounds.** Gershgorin/norm bounds computed from a truncated or non-symmetric operand are no longer bounds. If a solver's stability depends on a bound, it must be computed from something that still guarantees it, or be made generous by a measured margin.
+- **Every new numerical scheme must document:** stability invariant · enforcement mechanism · measured f32 floor · behaviour at the floor. Missing any of these = the change is unfinished.
+
 ## Never Do This
 
 - **NEVER use `rm`, `sed -i`, `cat >`, `echo >>`, heredocs, or shell redirects to delete/modify files.** Use the Devin `edit`/`write`/`read` tools so changes appear in the diff viewer. If an edit tool fails, do smaller targeted edits — never fall back to shell.

@@ -189,6 +189,9 @@ impl Mixer for DiisMixer {
         // Phase 0e safeguard (manifest §4.9): reject non-finite or catastrophic
         // DIIS extrapolation, fall back to damped simple mixing.
         let prev_norm: f64 = residual.iter().map(|r| r * r).sum::<f64>().sqrt();
+        // Index of the buffer slot that just received the CURRENT q_in
+        // (buf_idx was already advanced) — needed for the step-norm check.
+        let cur = (self.buf_idx + self.max_history - 1) % self.max_history;
         q_inout.fill(0.0);
         for i in 0..n_hist {
             let c = self.work[i];
@@ -198,15 +201,21 @@ impl Mixer for DiisMixer {
                 *q += c * (q_in_val + res_val);
             }
         }
-        // Safeguard: if DIIS produced non-finite values or the extrapolated
-        // charge vector is wildly larger than the input, reject and fall back.
-        let new_norm: f64 = q_inout.iter().map(|q| q * q).sum::<f64>().sqrt();
+        // Safeguard: reject non-finite, unphysical charges, or an ill-
+        // conditioned extrapolation. The correct scale is the STEP
+        // ‖q_next − q_in‖ vs ‖r‖ — a DIIS step ≫ residual signals bad
+        // coefficients. (Bug fix 2026-09-12: the old check compared
+        // ‖q_next‖ to ‖r‖ — ‖q‖ is O(√N·valence) ≈ 13 for Si10H16, so DIIS
+        // was silently rejected whenever ‖r‖ < ‖q‖/100, i.e. exactly when
+        // the iterate was close enough that only DIIS could finish.)
+        let step_norm: f64 = q_inout.iter().zip(self.q_in_bufs[cur].iter())
+            .map(|(a, b)| (a - b) * (a - b)).sum::<f64>().sqrt();
         let max_q: f64 = q_inout.iter().fold(0.0f64, |m, &q| m.max(q.abs()));
-        if !q_inout.iter().all(|q| q.is_finite()) || max_q > 10.0 || new_norm > 100.0 * prev_norm.max(1e-10) {
+        if !q_inout.iter().all(|q| q.is_finite()) || max_q > 10.0
+            || step_norm > 50.0 * prev_norm.max(1e-10) {
             // Reject DIIS, take damped simple mixing step instead.
             // Restore q_inout to the pre-DIIS state (q_in before overwrite).
-            let idx = (self.buf_idx + self.max_history - 1) % self.max_history;
-            q_inout.copy_from_slice(&self.q_in_bufs[idx]);
+            q_inout.copy_from_slice(&self.q_in_bufs[cur]);
             for (q, &r) in q_inout.iter_mut().zip(residual.iter()) {
                 *q += self.alpha * r;
             }

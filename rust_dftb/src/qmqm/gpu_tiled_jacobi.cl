@@ -46,6 +46,25 @@
 #define PAIR_SKIP_TOL 1.0e-12f
 #endif
 
+// ---- Arithmetic precision modes (manifest §12 D2) ----
+// JACOBI_PREC=0: pure FP32-FMA (rotation params, block/strip updates)
+// JACOBI_PREC=1: FP64 only for scalar rotation construction c,s — FP32-FMA updates
+// JACOBI_PREC=2: broad FP64 everywhere (accuracy reference; ~1.29M double
+//                block-updates per pivot — a throughput disaster on a 3090)
+#ifndef JACOBI_PREC
+#define JACOBI_PREC 2
+#endif
+#if JACOBI_PREC >= 1
+typedef double jrot_t;   // rotation-parameter precision
+#else
+typedef float jrot_t;
+#endif
+#if JACOBI_PREC >= 2
+typedef double jupd_t;   // block/strip update accumulation precision
+#else
+typedef float jupd_t;
+#endif
+
 // ---- Inner pivot Brent–Luk parallel Jacobi parameters ----
 // PB=64 → JPAIR_INNER=32 independent pairs/round, PPG_INNER=8 threads/pair,
 // JROUND_INNER=63 rounds/sweep. 32×8=256=WG threads all active.
@@ -100,8 +119,8 @@ __kernel void tiled_jacobi_batched(
     __local float strip[STRIP_R * PB]; // strip workspace (32×64)
     __local float reduce[WG];        // reduction buffer
     // Brent–Luk parallel Jacobi rotation params (32 pairs)
-    __local double rot_c[JPAIR_INNER];
-    __local double rot_s[JPAIR_INNER];
+    __local jrot_t rot_c[JPAIR_INNER];
+    __local jrot_t rot_s[JPAIR_INNER];
     __local int   rot_p[JPAIR_INNER];
     __local int   rot_q[JPAIR_INNER];
 
@@ -197,9 +216,9 @@ __kernel void tiled_jacobi_batched(
                     for (int round = 0; round < JROUND_INNER; ++round) {
 
                         // Phase 1: compute rotation params for each pair
-                        // f64 for rotation computation: the rotation parameters
-                        // propagate through all strip updates across all sweeps,
-                        // so f32 rounding here accumulates to ~N*eps*||A||.
+                        // JACOBI_PREC>=1 keeps the scalar c,s construction in
+                        // f64 (cheap: 32 scalars/round); the expensive part was
+                        // the millions of block/strip updates, not these.
                         int ipair = lid / PPG_INNER;
                         int sub   = lid % PPG_INNER;
                         if (sub == 0 && ipair < JPAIR_INNER) {
@@ -207,19 +226,19 @@ __kernel void tiled_jacobi_batched(
                             int p = pr.x;
                             int q = pr.y;
                             if (p > q) { int tmp = p; p = q; q = tmp; }
-                            double apq = (double)lA[p * PLD + q];
-                            if (fabs(apq) < (double)PAIR_SKIP_TOL) {
-                                rot_c[ipair] = 1.0;
-                                rot_s[ipair] = 0.0;
+                            jrot_t apq = (jrot_t)lA[p * PLD + q];
+                            if (fabs(apq) < (jrot_t)PAIR_SKIP_TOL) {
+                                rot_c[ipair] = (jrot_t)1.0;
+                                rot_s[ipair] = (jrot_t)0.0;
                             } else {
-                                double app = (double)lA[p * PLD + p];
-                                double aqq = (double)lA[q * PLD + q];
-                                double tau = (aqq - app) / (2.0 * apq);
-                                double t = (tau >= 0.0)
-                                    ? 1.0 / (tau + sqrt(1.0 + tau * tau))
-                                    : -1.0 / (-tau + sqrt(1.0 + tau * tau));
-                                double c = 1.0 / sqrt(1.0 + t * t);
-                                double s = t * c;
+                                jrot_t app = (jrot_t)lA[p * PLD + p];
+                                jrot_t aqq = (jrot_t)lA[q * PLD + q];
+                                jrot_t tau = (aqq - app) / ((jrot_t)2.0 * apq);
+                                jrot_t t = (tau >= (jrot_t)0.0)
+                                    ? (jrot_t)1.0 / (tau + sqrt((jrot_t)1.0 + tau * tau))
+                                    : -(jrot_t)1.0 / (-tau + sqrt((jrot_t)1.0 + tau * tau));
+                                jrot_t c = (jrot_t)1.0 / sqrt((jrot_t)1.0 + t * t);
+                                jrot_t s = t * c;
                                 rot_c[ipair] = c;
                                 rot_s[ipair] = s;
                             }
@@ -230,24 +249,25 @@ __kernel void tiled_jacobi_batched(
 
                         // Phase 2: block update of lA (J^T · lA · J)
                         // Process all JPAIR² 2×2 blocks; 1024 blocks / 256 threads = 4 per thread.
-                        // f64 for rotation params (ca,sa,cb,sb) to preserve precision.
+                        // JACOBI_PREC<2 → FP32 FMA (D2: the f64 here was ~1.29M
+                        // double ops per pivot, a 3090 throughput disaster).
                         for (int blk = lid; blk < JPAIR_INNER * JPAIR_INNER; blk += lsz) {
                             int a = blk / JPAIR_INNER;
                             int b = blk % JPAIR_INNER;
                             int p = rot_p[a], q = rot_q[a];
                             int r = rot_p[b], sc = rot_q[b];
-                            double ca = rot_c[a], sa = rot_s[a];
-                            double cb = rot_c[b], sb = rot_s[b];
-                            double apr = (double)lA[p * PLD + r], aps = (double)lA[p * PLD + sc];
-                            double aqr = (double)lA[q * PLD + r], aqs = (double)lA[q * PLD + sc];
-                            double tpr = cb * apr - sb * aps;
-                            double tps = sb * apr + cb * aps;
-                            double tqr = cb * aqr - sb * aqs;
-                            double tqs = sb * aqr + cb * aqs;
-                            lA[p * PLD + r] = (float)(ca * tpr - sa * tqr);
-                            lA[p * PLD + sc] = (float)(ca * tps - sa * tqs);
-                            lA[q * PLD + r] = (float)(sa * tpr + ca * tqr);
-                            lA[q * PLD + sc] = (float)(sa * tps + ca * tqs);
+                            jupd_t ca = (jupd_t)rot_c[a], sa = (jupd_t)rot_s[a];
+                            jupd_t cb = (jupd_t)rot_c[b], sb = (jupd_t)rot_s[b];
+                            jupd_t apr = (jupd_t)lA[p * PLD + r], aps = (jupd_t)lA[p * PLD + sc];
+                            jupd_t aqr = (jupd_t)lA[q * PLD + r], aqs = (jupd_t)lA[q * PLD + sc];
+                            jupd_t tpr = fma(cb, apr, -sb * aps);
+                            jupd_t tps = fma(sb, apr, cb * aps);
+                            jupd_t tqr = fma(cb, aqr, -sb * aqs);
+                            jupd_t tqs = fma(sb, aqr, cb * aqs);
+                            lA[p * PLD + r] = (float)fma(ca, tpr, -sa * tqr);
+                            lA[p * PLD + sc] = (float)fma(ca, tps, -sa * tqs);
+                            lA[q * PLD + r] = (float)fma(sa, tpr, ca * tqr);
+                            lA[q * PLD + sc] = (float)fma(sa, tps, ca * tqs);
                         }
                         barrier(CLK_LOCAL_MEM_FENCE);
 
@@ -255,15 +275,15 @@ __kernel void tiled_jacobi_batched(
                         ipair = lid / PPG_INNER;
                         sub   = lid % PPG_INNER;
                         if (ipair < JPAIR_INNER) {
-                            double c = rot_c[ipair];
-                            double s = rot_s[ipair];
+                            jupd_t c = (jupd_t)rot_c[ipair];
+                            jupd_t s = (jupd_t)rot_s[ipair];
                             int p = rot_p[ipair];
                             int q = rot_q[ipair];
                             for (int k = sub; k < PB; k += PPG_INNER) {
-                                double vkp = (double)lU[k * PLD + p];
-                                double vkq = (double)lU[k * PLD + q];
-                                lU[k * PLD + p] = (float)(c * vkp - s * vkq);
-                                lU[k * PLD + q] = (float)(s * vkp + c * vkq);
+                                jupd_t vkp = (jupd_t)lU[k * PLD + p];
+                                jupd_t vkq = (jupd_t)lU[k * PLD + q];
+                                lU[k * PLD + p] = (float)fma(c, vkp, -s * vkq);
+                                lU[k * PLD + q] = (float)fma(s, vkp, c * vkq);
                             }
                         }
                         barrier(CLK_LOCAL_MEM_FENCE);
@@ -318,16 +338,31 @@ __kernel void tiled_jacobi_batched(
                         barrier(CLK_LOCAL_MEM_FENCE);
 
                         // Y = strip × lU (nrows × m) × (m × m) → (nrows × m)
-                        // f64 accumulation: strip updates are the dominant source
-                        // of f32 accumulation error (m≤64 terms × many sweeps).
+                        // JACOBI_PREC>=2: f64 accumulation (reference).
+                        // JACOBI_PREC<2:  FP32 FMA, 4 independent accumulators —
+                        // shorter dependency chain + better summation than one
+                        // serial accumulator; cheaper than Kahan or f64 (§12 D2).
                         for (int i = lid; i < nrows * m; i += lsz) {
                             int r = i / m;
                             int c = i - r * m;
+#if JACOBI_PREC >= 2
                             double sum = 0.0;
                             for (int k = 0; k < m; ++k) {
                                 sum += (double)strip[r * PB + k] * (double)lU[k * PLD + c];
                             }
                             float sumf = (float)sum;
+#else
+                            float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+                            int k = 0;
+                            for (; k + 4 <= m; k += 4) {
+                                s0 = fma(strip[r * PB + k    ], lU[(k    ) * PLD + c], s0);
+                                s1 = fma(strip[r * PB + k + 1], lU[(k + 1) * PLD + c], s1);
+                                s2 = fma(strip[r * PB + k + 2], lU[(k + 2) * PLD + c], s2);
+                                s3 = fma(strip[r * PB + k + 3], lU[(k + 3) * PLD + c], s3);
+                            }
+                            for (; k < m; ++k) s0 = fma(strip[r * PB + k], lU[k * PLD + c], s0);
+                            float sumf = (s0 + s1) + (s2 + s3);
+#endif
                             // Store Y → [A_kp | A_kq]
                             int gr = kt*B + koff + r;
                             int gc;
@@ -359,19 +394,33 @@ __kernel void tiled_jacobi_batched(
                         }
                         barrier(CLK_LOCAL_MEM_FENCE);
 
-                        // Y = strip × lU (f64 accumulation for precision)
+                        // Y = strip × lU — same JACOBI_PREC split as A strips
                         for (int i = lid; i < nrows * m; i += lsz) {
                             int r = i / m;
                             int c = i - r * m;
+#if JACOBI_PREC >= 2
                             double sum = 0.0;
                             for (int k = 0; k < m; ++k) {
                                 sum += (double)strip[r * PB + k] * (double)lU[k * PLD + c];
                             }
+                            float sumf = (float)sum;
+#else
+                            float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+                            int k = 0;
+                            for (; k + 4 <= m; k += 4) {
+                                s0 = fma(strip[r * PB + k    ], lU[(k    ) * PLD + c], s0);
+                                s1 = fma(strip[r * PB + k + 1], lU[(k + 1) * PLD + c], s1);
+                                s2 = fma(strip[r * PB + k + 2], lU[(k + 2) * PLD + c], s2);
+                                s3 = fma(strip[r * PB + k + 3], lU[(k + 3) * PLD + c], s3);
+                            }
+                            for (; k < m; ++k) s0 = fma(strip[r * PB + k], lU[k * PLD + c], s0);
+                            float sumf = (s0 + s1) + (s2 + s3);
+#endif
                             int gr = kt*B + koff + r;
                             int gc;
                             if (c < Bp) gc = bp*B + c;
                             else gc = bq*B + (c - Bp);
-                            gV[gr * n + gc] = (float)sum;
+                            gV[gr * n + gc] = sumf;
                         }
                         barrier(CLK_LOCAL_MEM_FENCE);
                     }

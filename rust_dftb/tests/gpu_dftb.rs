@@ -42,7 +42,7 @@ fn test_gpu_dftb_h2o_reuse_scc_and_fire() {
     eprintln!("H2O GpuDftb SCC2 (reuse): E={e2:.8} rms={:.3e} iters={}", s2.rms, s2.n_iters);
     assert!((e2 - e1).abs() < 1e-5, "reuse SCC |dE|={:.3e} — pipeline is not persistent/warm", (e2 - e1).abs());
     let mut max_f = 0.0f32;
-    for &x in &f { max_f = max_f.max(x.abs()); }
+    for &x in f.iter() { max_f = max_f.max(x.abs()); }
     eprintln!("H2O GpuDftb |F|_max={max_f:.4e}");
     assert!(max_f.is_finite(), "forces non-finite");
     // One FIRE step on the same engine (set_coords + scc, no compile). 0.1 Å cap.

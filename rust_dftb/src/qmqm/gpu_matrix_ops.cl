@@ -848,6 +848,95 @@ __kernel void residual_and_mix_batched(
 }
 
 // ------------------------------------------------------------------
+// fused_dq_v_hscc_batched   (manifest §12 D10 / R18)
+//
+// Fuses Δq = q−q0 → V = γ·Δq → H_scc = H0 + ½S·(V_A+V_B) into one
+// WG/system launch. Δq/V live in local memory and are also written to
+// global (the energy dot ½Δq·V reads them). Replaces 3 launches and the
+// intermediate dq/v global round-trip. γ rows stream from global;
+// orb_atom is read per element (L2-cached, small).
+// ------------------------------------------------------------------
+__kernel void fused_dq_v_hscc_batched(
+    const int n,
+    const int n_atoms,
+    const int batch,
+    __global const float* q,        // [batch*n_atoms]
+    __global const float* q0,       // [batch*n_atoms]
+    __global const float* G,        // [batch*n_atoms*n_atoms]
+    __global const float* H0,       // [batch*n*n]
+    __global const float* S,        // [batch*n*n]
+    __global const int* orb_atom,   // [batch*n]
+    __global float* dq,             // [batch*n_atoms] out (energy dot)
+    __global float* V,              // [batch*n_atoms] out
+    __global float* H,              // [batch*n*n] out
+    __local float* ldq,             // [n_atoms] local Δq
+    __local float* lv               // [n_atoms] local V
+) {
+    const int sid = get_group_id(0);
+    const int lid = get_local_id(0);
+    const int lsz = get_local_size(0);
+    if (sid >= batch) return;
+    __global const float* qb  = q  + (size_t)sid * n_atoms;
+    __global const float* q0b = q0 + (size_t)sid * n_atoms;
+    __global const float* Gb  = G  + (size_t)sid * n_atoms * n_atoms;
+    __global const float* H0b = H0 + (size_t)sid * n * n;
+    __global const float* Sb  = S  + (size_t)sid * n * n;
+    __global const int* oa    = orb_atom + (size_t)sid * n;
+    __global float* dqb       = dq + (size_t)sid * n_atoms;
+    __global float* Vb        = V  + (size_t)sid * n_atoms;
+    __global float* Hb        = H  + (size_t)sid * n * n;
+
+    for (int a = lid; a < n_atoms; a += lsz) {
+        const float d = qb[a] - q0b[a];
+        ldq[a] = d;
+        dqb[a] = d;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    for (int a = lid; a < n_atoms; a += lsz) {
+        __global const float* row = Gb + (size_t)a * n_atoms;
+        float sum = 0.0f;
+        for (int b = 0; b < n_atoms; ++b) sum = fma(row[b], ldq[b], sum);
+        lv[a] = sum;
+        Vb[a] = sum;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    const int nn = n * n;
+    for (int idx = lid; idx < nn; idx += lsz) {
+        const int i = idx / n;
+        const int j = idx - i * n;
+        Hb[idx] = H0b[idx] + 0.5f * Sb[idx] * (lv[oa[i]] + lv[oa[j]]);
+    }
+}
+
+// ------------------------------------------------------------------
+// transpose_batched   (D6)
+//
+// at[b][j][i] = a[b][i][j] — maintain Xᵀ so H' = Xᵀ·H·X stays correct
+// for ANY orthonormalizer gauge (Newton-reused X is S^{-1/2}·U, not
+// symmetric). One workgroup per system.
+// ------------------------------------------------------------------
+__kernel void transpose_batched(
+    const int n,
+    const int batch,
+    __global const float* a,
+    __global float* at
+) {
+    const int sid = get_group_id(0);
+    const int lid = get_local_id(0);
+    const int lsz = get_local_size(0);
+    if (sid >= batch) return;
+    __global const float* ab = a + (size_t)sid * n * n;
+    __global float* atb = at + (size_t)sid * n * n;
+    for (int idx = lid; idx < n * n; idx += lsz) {
+        const int i = idx / n;
+        const int j = idx - i * n;
+        atb[j * n + i] = ab[i * n + j];
+    }
+}
+
+// ------------------------------------------------------------------
 // delta_q_batched
 //
 // dq[a] = q[a] - q0[a]  per atom, per system.
@@ -907,6 +996,71 @@ __kernel void build_density_masked_batched(
             s += (float)mb[k] * sk * Cb[i * n + k] * Cb[j * n + k];
         }
         Db[idx] = 2.0f * s;
+    }
+}
+
+// ------------------------------------------------------------------
+// build_density_occ_batched   (manifest §12 D10)
+//
+// D = 2 * Σ_{t<n_occ} s_t · C[:,k_t] · C[:,k_t]^T
+//   s_t = 1 → density D (use_eig=0);  s_t = eig[k_t] → W (use_eig=1).
+// Occupied-index list instead of an all-N×mask scan (49 vs 87 columns for
+// AT), lower triangle only (i ≥ j) mirrored, occupied weights/indices staged
+// in local memory, inner loop = 4 independent FP32 FMA accumulators.
+// One workgroup per system.
+// ------------------------------------------------------------------
+__kernel void build_density_occ_batched(
+    const int n,
+    const int batch,
+    const int n_occ,
+    __global const float* C,
+    __global const int* occ_idx,
+    __global float* D,
+    const int use_eig,
+    __global const float* eig,
+    const int use_w,             // 1 → multiply by occ_w[k] (Fermi smearing)
+    __global const float* occ_w, // [batch*n] per-orbital weights f_k
+    __local float* lw,      // [n_occ] occupied weights
+    __local int*   loi      // [n_occ] occupied column indices
+) {
+    const int sid = get_group_id(0);
+    const int lid = get_local_id(0);
+    const int lsz = get_local_size(0);
+    if (sid >= batch) return;
+    __global const float* Cb = C + (size_t)sid * n * n;
+    __global float* Db = D + (size_t)sid * n * n;
+    __global const float* eb = eig + (size_t)sid * n;
+    __global const int* oib = occ_idx + (size_t)sid * n;
+    __global const float* owb = occ_w + (size_t)sid * n;
+
+    for (int t = lid; t < n_occ; t += lsz) {
+        const int k = use_w ? t : oib[t];   // smearing: all orbitals, weighted
+        loi[t] = k;
+        lw[t] = (use_eig ? eb[k] : 1.0f) * (use_w ? owb[k] : 1.0f);
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    const int nt = n * (n + 1) / 2;
+    for (int idx = lid; idx < nt; idx += lsz) {
+        // triangle index → (i,j), i≥j; float sqrt estimate + exact adjust
+        int i = (int)(0.5f * (sqrt(8.0f * (float)idx + 1.0f) - 1.0f));
+        while ((i + 1) * (i + 2) / 2 <= idx) i++;
+        while (i * (i + 1) / 2 > idx) i--;
+        const int j = idx - i * (i + 1) / 2;
+        const int in = i * n;
+        const int jn = j * n;
+        float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+        int t = 0;
+        for (; t + 4 <= n_occ; t += 4) {
+            s0 = fma(lw[t    ] * Cb[in + loi[t    ]], Cb[jn + loi[t    ]], s0);
+            s1 = fma(lw[t + 1] * Cb[in + loi[t + 1]], Cb[jn + loi[t + 1]], s1);
+            s2 = fma(lw[t + 2] * Cb[in + loi[t + 2]], Cb[jn + loi[t + 2]], s2);
+            s3 = fma(lw[t + 3] * Cb[in + loi[t + 3]], Cb[jn + loi[t + 3]], s3);
+        }
+        for (; t < n_occ; ++t) s0 = fma(lw[t] * Cb[in + loi[t]], Cb[jn + loi[t]], s0);
+        const float s = (s0 + s1) + (s2 + s3);
+        Db[in + j] = 2.0f * s;
+        Db[jn + i] = 2.0f * s;
     }
 }
 
@@ -1015,6 +1169,8 @@ __kernel void extract_diagonal_batched(
 //   batch    — number of systems
 //   eig_diag — [batch][N] eigenvalues (from extract_diagonal_batched)
 //   occ_mask — [batch][N] output: 1=occupied, 0=virtual
+//   occ_idx  — [batch][N] output: occ_idx[t] = sorted occupied column index
+//              for t < n_occ (ascending eigenvalue order); D10 density path
 //
 // Specialization: OCC_MAX_N must be the next power of 2 ≥ max N.
 // ------------------------------------------------------------------
@@ -1027,7 +1183,8 @@ __kernel void select_occupation_batched(
     const int n_occ,
     const int batch,
     __global const float* eig_diag,
-    __global int* occ_mask
+    __global int* occ_mask,
+    __global int* occ_idx
 ) {
     const int sid = get_group_id(0);
     const int lid = get_local_id(0);
@@ -1071,11 +1228,13 @@ __kernel void select_occupation_batched(
     }
 
     // After sort, lval[0..n] are the n smallest eigenvalues in ascending order.
-    // Mark the first n_occ original indices as occupied.
+    // Mark the first n_occ original indices as occupied; also write the
+    // occupied index list for the D10 density kernel.
     for (int i = lid; i < n; i += lsz) {
         int orig_idx = lidx[i];
         if (orig_idx >= 0) {
             occ_mask[(size_t)sid * n + orig_idx] = (i < n_occ) ? 1 : 0;
+            if (i < n_occ) occ_idx[(size_t)sid * n + i] = orig_idx;
         }
     }
 }
@@ -1222,22 +1381,28 @@ __kernel void repulsive_energy_batched(
 //
 // GPU-resident DIIS mixing. One workgroup per system.
 //
-//   1. residual = q_new - q_old; store (q_in, res) in the ring buffer
+//   1. residual = q_new - q_old; store (Δq_in = q_in−q0, res) in the ring buffer
 //   2. rms = √(Σ res² / n_atoms)   — RMS, not L2; matches CPU SCC tol
 //   3. n < 2 after this store: α-mix (never 1-vector DIIS; that is undamped q_new)
 //   4. n ≥ 2: Gram in f64, scale by max|B_ij|, tiny GE in f64
-//   5. small pivot / non-finite / |Σc−1|>tol → α-mix + printf, never silent c_i=0
+//   5. On rank failure: drop the OLDEST history vector and retry n−1 once;
+//      only then α-mix. Fallbacks are recorded in diis_flag/diis_reason —
+//      no printf in production kernels (manifest §12 D9).
+//   6. Mix in Δq = q − q0 space: q_next = q0 + Σc_p·(Δq_p + r_p). The
+//      Σc_p=1 constraint is then algebraically exact — f32 coefficient
+//      rounding can no longer inject the large neutral population q0.
 //
 // Buffers (all per-system, indexed by sid * stride + ...):
 //   q_new       — [batch*n_atoms] current SCC output charges
 //   q_old       — [batch*n_atoms] current input charges (overwritten with mixed)
-//   q_hist      — [batch*max_hist*n_atoms] ring buffer of q_in vectors
+//   q0          — [batch*n_atoms] neutral atom charges (Δq anchor)
+//   dq_hist     — [batch*max_hist*n_atoms] ring buffer of Δq_in vectors
 //   r_hist      — [batch*max_hist*n_atoms] ring buffer of residual vectors
 //   buf_idx     — [batch] ring buffer write position (i32)
 //   n_filled    — [batch] number of valid history entries (i32)
-//   b_mat       — [batch*(max_hist+1)*(max_hist+1)] unused host-visible workspace
-//   rhs         — [batch*(max_hist+1)] unused host-visible workspace
 //   coeffs      — [batch*max_hist] DIIS coefficients output
+//   diis_flag   — [batch] fallback counter (host reads after solve; reset_diis clears)
+//   diis_reason — [batch] last fallback reason (1=pivot/scale 2=nonfinite 3=sum(c)!=1)
 //   rms         — [batch] residual RMS output
 //
 // Specialization: DIIS_MAX_HIST must be set (default 10).
@@ -1255,28 +1420,31 @@ __kernel void diis_step_batched(
     const float alpha,           // simple mixing fallback parameter
     __global const float* q_new, // [batch*n_atoms]
     __global float* q_old,       // [batch*n_atoms] — overwritten with mixed result
-    __global float* q_hist,      // [batch*DIIS_MAX_HIST*n_atoms]
+    __global const float* q0,    // [batch*n_atoms] neutral reference (Δq anchor)
+    __global float* dq_hist,     // [batch*DIIS_MAX_HIST*n_atoms]
     __global float* r_hist,      // [batch*DIIS_MAX_HIST*n_atoms]
     __global int* buf_idx,       // [batch]
-    __global int* n_filled,       // [batch]
-    __global float* b_mat,        // [batch*DIIS_NP1*DIIS_NP1]
-    __global float* rhs,         // [batch*DIIS_NP1]
+    __global int* n_filled,      // [batch]
     __global float* coeffs,      // [batch*DIIS_MAX_HIST]
+    __global int* diis_flag,     // [batch] fallback counter
+    __global int* diis_reason,   // [batch] last fallback reason
     __global float* rms,         // [batch]
-    __local float* scratch        // workgroup scratch (≥ n_atoms + DIIS_NP1*DIIS_NP1)
+    __local float* scratch       // workgroup scratch (≥ lsz)
 ) {
     const int sid = get_group_id(0);
     const int lid = get_local_id(0);
     const int lsz = get_local_size(0);
     __local int l_diis_ok;
+    __local int l_ne;     // effective history count after drop-oldest retry
+    __local int l_skip;   // slot dropped this step (-1 = none)
     if (sid >= batch) return;
 
     __global const float* qn = q_new + (size_t)sid * n_atoms;
+    __global const float* q0s = q0 + (size_t)sid * n_atoms;
     __global float* qo = q_old + (size_t)sid * n_atoms;
-    __global float* qh = q_hist + (size_t)sid * DIIS_MAX_HIST * n_atoms;
+    __global float* qh = dq_hist + (size_t)sid * DIIS_MAX_HIST * n_atoms;
     __global float* rh = r_hist + (size_t)sid * DIIS_MAX_HIST * n_atoms;
     __global float* c = coeffs + (size_t)sid * DIIS_MAX_HIST;
-    // b_mat / rhs kept in the signature (bound at GpuSccPlan::new); solve uses private f64.
 
     int idx = buf_idx[sid];
     int nf = n_filled[sid];
@@ -1285,7 +1453,7 @@ __kernel void diis_step_batched(
     for (int a = lid; a < n_atoms; a += lsz) {
         float res = qn[a] - qo[a];
         rh[idx * n_atoms + a] = res;
-        qh[idx * n_atoms + a] = qo[a];
+        qh[idx * n_atoms + a] = qo[a] - q0s[a];   // store Δq_in, not q_in
         partial += res * res;
     }
 
@@ -1304,7 +1472,6 @@ __kernel void diis_step_batched(
     barrier(CLK_GLOBAL_MEM_FENCE | CLK_LOCAL_MEM_FENCE);
 
     int n = n_filled[sid];
-    int np1 = n + 1;
 
     // First history point: α-mix. 1-vector DIIS is Σc=1 → c_0=1 → undamped q_new.
     if (n < 2) {
@@ -1314,107 +1481,310 @@ __kernel void diis_step_batched(
         return;
     }
 
+    // Oldest ring slot: when full it is the next write position (buf_idx was
+    // already advanced); otherwise writes started at slot 0.
+    const int oldest = (nf >= DIIS_MAX_HIST) ? buf_idx[sid] : 0;
+
     if (lid == 0) {
         double Bd[DIIS_NP1 * DIIS_NP1];
         double bd[DIIS_NP1];
-        int ok = 1;
-        int reason = 0;
-        double scale = 0.0;
-        for (int i = 0; i < n; i++) {
-            for (int j = 0; j < n; j++) {
-                double dot = 0.0;
-                __global float* ri = rh + i * n_atoms;
-                __global float* rj = rh + j * n_atoms;
-                for (int a = 0; a < n_atoms; a++) {
-                    dot += (double)ri[a] * (double)rj[a];
+        int ok = 0;
+        int reason = 1;
+        int skip = -1;
+        int ne = n;
+        // D9: on rank failure drop the oldest history vector and retry once.
+        for (int attempt = 0; attempt < 2 && !ok; attempt++) {
+            ne = n - (skip >= 0 ? 1 : 0);
+            if (ne < 2) { reason = 1; break; }
+            const int np1 = ne + 1;
+            ok = 1;
+            double scale = 0.0;
+            for (int i = 0; i < ne; i++) {
+                const int si = (skip >= 0 && i >= skip) ? i + 1 : i;
+                for (int j = 0; j < ne; j++) {
+                    const int sj = (skip >= 0 && j >= skip) ? j + 1 : j;
+                    double dot = 0.0;
+                    __global float* ri = rh + si * n_atoms;
+                    __global float* rj = rh + sj * n_atoms;
+                    for (int a = 0; a < n_atoms; a++) {
+                        dot += (double)ri[a] * (double)rj[a];
+                    }
+                    Bd[i * np1 + j] = dot;
+                    scale = fmax(scale, fabs(dot));
                 }
-                Bd[i * np1 + j] = dot;
-                scale = fmax(scale, fabs(dot));
             }
-        }
-        if (!isfinite(scale) || scale < 1.0e-30) {
-            ok = 0; reason = 1;
-        } else {
-            for (int i = 0; i < n; i++) {
-                for (int j = 0; j < n; j++) Bd[i * np1 + j] /= scale;
-                Bd[i * np1 + n] = 1.0;
-                Bd[n * np1 + i] = 1.0;
-            }
-            Bd[n * np1 + n] = 0.0;
-            for (int i = 0; i < np1; i++) bd[i] = 0.0;
-            bd[n] = 1.0;
+            if (!isfinite(scale) || scale < 1.0e-30) {
+                ok = 0; reason = 1;
+            } else {
+                for (int i = 0; i < ne; i++) {
+                    for (int j = 0; j < ne; j++) Bd[i * np1 + j] /= scale;
+                    Bd[i * np1 + ne] = 1.0;
+                    Bd[ne * np1 + i] = 1.0;
+                }
+                Bd[ne * np1 + ne] = 0.0;
+                for (int i = 0; i < np1; i++) bd[i] = 0.0;
+                bd[ne] = 1.0;
 
-            for (int k = 0; k < np1 && ok; k++) {
-                int max_row = k;
-                double max_val = fabs(Bd[k * np1 + k]);
-                for (int i = k + 1; i < np1; i++) {
-                    double v = fabs(Bd[i * np1 + k]);
-                    if (v > max_val) { max_val = v; max_row = i; }
-                }
-                if (max_row != k) {
-                    for (int j = k; j < np1; j++) {
-                        double tmp = Bd[k * np1 + j];
-                        Bd[k * np1 + j] = Bd[max_row * np1 + j];
-                        Bd[max_row * np1 + j] = tmp;
+                for (int k = 0; k < np1 && ok; k++) {
+                    int max_row = k;
+                    double max_val = fabs(Bd[k * np1 + k]);
+                    for (int i = k + 1; i < np1; i++) {
+                        double v = fabs(Bd[i * np1 + k]);
+                        if (v > max_val) { max_val = v; max_row = i; }
                     }
-                    double tmp = bd[k]; bd[k] = bd[max_row]; bd[max_row] = tmp;
-                }
-                if (!isfinite(max_val) || max_val < 1.0e-12) {
-                    ok = 0; reason = 1;
-                    break;
-                }
-                double piv = Bd[k * np1 + k];
-                for (int i = k + 1; i < np1; i++) {
-                    double factor = Bd[i * np1 + k] / piv;
-                    Bd[i * np1 + k] = 0.0;
-                    for (int j = k + 1; j < np1; j++) {
-                        Bd[i * np1 + j] -= factor * Bd[k * np1 + j];
+                    if (max_row != k) {
+                        for (int j = k; j < np1; j++) {
+                            double tmp = Bd[k * np1 + j];
+                            Bd[k * np1 + j] = Bd[max_row * np1 + j];
+                            Bd[max_row * np1 + j] = tmp;
+                        }
+                        double tmp = bd[k]; bd[k] = bd[max_row]; bd[max_row] = tmp;
                     }
-                    bd[i] -= factor * bd[k];
-                }
-            }
-            if (ok) {
-                for (int i = np1 - 1; i >= 0; i--) {
-                    double sum = bd[i];
-                    for (int j = i + 1; j < np1; j++) sum -= Bd[i * np1 + j] * bd[j];
-                    double piv = Bd[i * np1 + i];
-                    if (!isfinite(piv) || fabs(piv) < 1.0e-12 || !isfinite(sum)) {
-                        ok = 0; reason = 2;
+                    if (!isfinite(max_val) || max_val < 1.0e-12) {
+                        ok = 0; reason = 1;
                         break;
                     }
-                    bd[i] = sum / piv;
+                    double piv = Bd[k * np1 + k];
+                    for (int i = k + 1; i < np1; i++) {
+                        double factor = Bd[i * np1 + k] / piv;
+                        Bd[i * np1 + k] = 0.0;
+                        for (int j = k + 1; j < np1; j++) {
+                            Bd[i * np1 + j] -= factor * Bd[k * np1 + j];
+                        }
+                        bd[i] -= factor * bd[k];
+                    }
+                }
+                if (ok) {
+                    for (int i = np1 - 1; i >= 0; i--) {
+                        double sum = bd[i];
+                        for (int j = i + 1; j < np1; j++) sum -= Bd[i * np1 + j] * bd[j];
+                        double piv = Bd[i * np1 + i];
+                        if (!isfinite(piv) || fabs(piv) < 1.0e-12 || !isfinite(sum)) {
+                            ok = 0; reason = 2;
+                            break;
+                        }
+                        bd[i] = sum / piv;
+                    }
+                }
+                if (ok) {
+                    double csum = 0.0;
+                    for (int i = 0; i < ne; i++) {
+                        if (!isfinite(bd[i]) || fabs(bd[i]) > 10.0) { ok = 0; reason = 2; break; }
+                        csum += bd[i];
+                    }
+                    if (ok && fabs(csum - 1.0) > 1.0e-4) { ok = 0; reason = 3; }
                 }
             }
-            if (ok) {
-                double csum = 0.0;
-                for (int i = 0; i < n; i++) {
-                    if (!isfinite(bd[i]) || fabs(bd[i]) > 10.0) { ok = 0; reason = 2; break; }
-                    csum += bd[i];
-                }
-                if (ok && fabs(csum - 1.0) > 1.0e-4) { ok = 0; reason = 3; }
-            }
-            if (ok) {
-                for (int i = 0; i < n; i++) c[i] = (float)bd[i];
-            }
+            if (!ok && skip < 0) { skip = oldest; continue; }  // drop-oldest retry
+            break;
         }
-        if (!ok) {
-            printf("DIIS fallback sid=%d n=%d reason=%d (1=pivot/scale 2=nonfinite 3=sum(c)!=1) — α-mix\n", sid, n, reason);
+        if (ok) {
+            for (int i = 0; i < ne; i++) c[i] = (float)bd[i];
+        } else {
+            // Structured status, no printf (D9): counter + last reason.
+            diis_flag[sid] += 1;
+            diis_reason[sid] = reason;
         }
         l_diis_ok = ok;
+        l_ne = ne;
+        l_skip = ok ? skip : -1;
     }
     barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
 
+    const int ne2 = l_ne;
+    const int skip2 = l_skip;
     if (l_diis_ok) {
         for (int a = lid; a < n_atoms; a += lsz) {
             float sum = 0.0f;
-            for (int i = 0; i < n; i++) {
-                sum += c[i] * (qh[i * n_atoms + a] + rh[i * n_atoms + a]);
+            for (int i = 0; i < ne2; i++) {
+                const int s = (skip2 >= 0 && i >= skip2) ? i + 1 : i;
+                sum += c[i] * (qh[s * n_atoms + a] + rh[s * n_atoms + a]);
             }
-            qo[a] = sum;
+            qo[a] = q0s[a] + sum;   // Δq-space mix: Σc=1 exactly preserves q0
         }
     } else {
         for (int a = lid; a < n_atoms; a += lsz) {
             qo[a] = alpha * qn[a] + (1.0f - alpha) * qo[a];
         }
     }
+}
+
+// ------------------------------------------------------------------
+// occ_normalize_batched
+//
+// Manifest §12 D3: renormalize occupied eigenvector columns of C′
+// (orthonormal-basis Jacobi output). n_k = ||C'[:,k]||², then
+// C'[:,k] ← C'[:,k]/√n_k for occ_mask[k]!=0. O(N·N_occ) repair of the
+// Jacobi orthonormality loss; preserves column direction so ε/W stay valid.
+// One workgroup per (system, column); unoccupied columns early-exit.
+// ------------------------------------------------------------------
+__kernel void occ_normalize_batched(
+    const int n,
+    const int batch,
+    __global const int* occ_mask,
+    __global float* Cp,
+    __local float* scratch
+) {
+    const int gid = get_group_id(0);
+    const int sid = gid / n;
+    const int k = gid - sid * n;
+    const int lid = get_local_id(0);
+    const int lsz = get_local_size(0);
+    if (sid >= batch) return;
+    if (occ_mask[sid * n + k] == 0) return;
+    __global float* col = Cp + (size_t)sid * n * n + k;
+    float acc = 0.0f;
+    for (int r = lid; r < n; r += lsz) {
+        float x = col[r * n];
+        acc = fma(x, x, acc);
+    }
+    scratch[lid] = acc;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int off = lsz >> 1; off > 0; off >>= 1) {
+        if (lid < off) scratch[lid] += scratch[lid + off];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    const float inv = rsqrt(scratch[0]);
+    for (int r = lid; r < n; r += lsz) col[r * n] *= inv;
+}
+
+// ------------------------------------------------------------------
+// occ_rayleigh_batched
+//
+// Manifest §12 D3/D4: generalized Rayleigh quotient of the AO eigenvectors,
+// rho[k] = (c_kᵀ H_scc c_k) / (c_kᵀ S c_k), occupied columns only.
+// The Jacobi diagonal ε_k drifts from the true Rayleigh quotient of the
+// stored vectors (measured max|ε−ρ|~1e-6 at N=87, biased sum ~2.8e-5 Ha);
+// ρ is the variationally correct weight for the energy and the EDM W.
+// rho[k]=0 for unoccupied columns.
+// One workgroup per (system, column).
+// loc layout: t_h[n] | t_s[n] | red[2*lsz]
+// ------------------------------------------------------------------
+__kernel void occ_rayleigh_batched(
+    const int n,
+    const int batch,
+    __global const int* occ_mask,
+    __global const float* C,
+    __global const float* H,
+    __global const float* S,
+    __global float* rho,
+    __local float* loc
+) {
+    const int gid = get_group_id(0);
+    const int sid = gid / n;
+    const int k = gid - sid * n;
+    const int lid = get_local_id(0);
+    const int lsz = get_local_size(0);
+    if (sid >= batch) return;
+    if (occ_mask[sid * n + k] == 0) {
+        if (lid == 0) rho[sid * n + k] = 0.0f;
+        return;
+    }
+    __local float* t_h = loc;
+    __local float* t_s = loc + n;
+    __local float* red = loc + 2 * n;
+    const size_t base = (size_t)sid * n * n;
+    __global const float* col = C + base + k;
+    __global const float* Hb = H + base;
+    __global const float* Sb = S + base;
+    for (int r = lid; r < n; r += lsz) {
+        const int ro = r * n;
+        float sh = 0.0f, ss = 0.0f;
+        for (int cc = 0; cc < n; ++cc) {
+            const float x = col[cc * n];
+            sh = fma(Hb[ro + cc], x, sh);
+            ss = fma(Sb[ro + cc], x, ss);
+        }
+        t_h[r] = sh;
+        t_s[r] = ss;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    float ah = 0.0f, asx = 0.0f;
+    for (int r = lid; r < n; r += lsz) {
+        const float x = col[r * n];
+        ah = fma(x, t_h[r], ah);
+        asx = fma(x, t_s[r], asx);
+    }
+    red[lid] = ah;
+    red[lid + lsz] = asx;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int off = lsz >> 1; off > 0; off >>= 1) {
+        if (lid < off) {
+            red[lid] += red[lid + off];
+            red[lid + lsz] += red[lid + lsz + off];
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (lid == 0) rho[sid * n + k] = red[0] / red[lsz];
+}
+
+// ==================================================================
+// §12 D5: Löwdin X repair on GPU — M=XᵀSX via ordinary f32 GEMMs in the
+// driver; these three kernels cover the elementwise/reduction steps.
+// ==================================================================
+
+// Q = (3I − M)/2 elementwise. One WG per system.
+__kernel void lowdin_q_from_m_batched(
+    const int n,
+    const int batch,
+    __global const float* M,
+    __global float* Q
+) {
+    const int sid = get_group_id(0);
+    if (sid >= batch) return;
+    const int lid = get_local_id(0);
+    const int lsz = get_local_size(0);
+    __global const float* Mb = M + (size_t)sid * n * n;
+    __global float* Qb = Q + (size_t)sid * n * n;
+    for (int idx = lid; idx < n * n; idx += lsz) {
+        const int r = idx / n;
+        const int c = idx - r * n;
+        Qb[idx] = 0.5f * ((r == c ? 3.0f : 0.0f) - Mb[idx]);
+    }
+}
+
+// res[sid] = max |M − I| — first-order metric defect of X (Löwdin residual).
+__kernel void metric_residual_batched(
+    const int n,
+    const int batch,
+    __global const float* M,
+    __global float* res,
+    __local float* scratch
+) {
+    const int sid = get_group_id(0);
+    if (sid >= batch) return;
+    const int lid = get_local_id(0);
+    const int lsz = get_local_size(0);
+    __global const float* Mb = M + (size_t)sid * n * n;
+    float mx = 0.0f;
+    for (int idx = lid; idx < n * n; idx += lsz) {
+        const int r = idx / n;
+        const int c = idx - r * n;
+        mx = fmax(mx, fabs(Mb[idx] - (r == c ? 1.0f : 0.0f)));
+    }
+    scratch[lid] = mx;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int off = lsz >> 1; off > 0; off >>= 1) {
+        if (lid < off) scratch[lid] = fmax(scratch[lid], scratch[lid + off]);
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (lid == 0) res[sid] = scratch[0];
+}
+
+// X ← X1 where the repair improved the metric (e1 < e0); NaN-safe skip.
+__kernel void lowdin_accept_batched(
+    const int n,
+    const int batch,
+    __global const float* e0,
+    __global const float* e1,
+    __global const float* X1,
+    __global float* X
+) {
+    const int sid = get_group_id(0);
+    if (sid >= batch) return;
+    if (!(e1[sid] < e0[sid])) return;
+    const int lid = get_local_id(0);
+    const int lsz = get_local_size(0);
+    const size_t base = (size_t)sid * n * n;
+    for (int idx = lid; idx < n * n; idx += lsz) X[base + idx] = X1[base + idx];
 }

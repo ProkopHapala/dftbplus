@@ -23,6 +23,25 @@ const BSR4_KERNEL_SOURCE: &str = include_str!("sparse_bsr4_purification.cl");
 /// `||KSK−K||` alone accepts a wrong-rank projector, including K=0.
 pub const TC2_TRACE_TOL: f32 = 5e-2;
 
+/// Relative Tr(KS) deviation that triggers the TC2 trace-rescaling guard.
+/// Healthy f32 jitter is ~1e-5 relative (measured: ±0.03 on Nocc=2627);
+/// spectral leakage outside [0,1] shows up as a DOUBLING drift starting
+/// around 1e-4. 5e-5 catches the runaway without touching normal operation.
+pub const TC2_TRACE_GUARD_REL: f64 = 5e-5;
+
+/// Relative Tr(KS) deviation below which TC2 is considered to have LOCKED
+/// onto Nocc; the rescaling guard arms only after that. Before the lock the
+/// trace legitimately swings (driving it to Nocc is what the branch does).
+pub const TC2_TRACE_LOCK_REL: f64 = 1e-3;
+
+/// Idempotency residual below which TC2 counts as being in its endgame
+/// (required, together with `TC2_TRACE_LOCK_REL`, to arm the trace guard).
+pub const TC2_LOCK_RI: f32 = 1e-2;
+
+/// Consecutive TC2 checks without joint (R_I, trace) improvement before the
+/// iteration is declared at its floor and exits with the best valid K.
+pub const TC2_STAGNANT_MAX: usize = 8;
+
 /// Performance statistics for a sparse SCC/purification run.
 ///
 /// Every performance run should end with `print_execution_audit()` to make
@@ -161,7 +180,11 @@ pub struct SparseBsr4Config {
     /// (one 16-thread team per output 4×4 block). Default 128.
     pub wg: i32,
     /// Max blocks in a left row that fits in the local-memory cache.
-    /// Local mem ≈ `MAX_LEFT_BLOCKS * (16*4 + 4)` bytes. Default 256 (~17 KiB).
+    /// Local mem ≈ `MAX_LEFT_BLOCKS * (16*4 + 4)` bytes. Default 512 (~34.8 KiB
+    /// of the 48 KiB/SM budget — halves SpGEMM occupancy vs 256 but required:
+    /// matsci Si r_hs≈11.7 Å gives ~280 block-neighbors/row on bulk-like
+    /// interiors). Denser chemistries may need more; degree-bucketed kernels
+    /// are the scalable answer (see R7/Gate-E).
     pub max_left_blocks: i32,
     /// Workgroup size for reduction kernels. Default 256.
     pub reduce_wg: i32,
@@ -171,7 +194,7 @@ impl Default for SparseBsr4Config {
     fn default() -> Self {
         Self {
             wg: 128,
-            max_left_blocks: 256,
+            max_left_blocks: 512,
             reduce_wg: 256,
         }
     }
@@ -215,6 +238,17 @@ pub struct SparseBsr4Gpu {
     // GPT-5.6 #19: device-side Gershgorin spectral bounds
     k_gershgorin_partial: Kernel,
     k_reduce_min: Kernel,
+    // Phase F (second GPT-5.6 review): device Hscc build (R13), masked
+    // trace/mulliken (R14), sparse Tr(K·H0) energy (R7), ‖X‖² partial (R12),
+    // cross-mask restrict for K0's Z|M_K (R8b).
+    k_build_hscc: Kernel,
+    k_trace_hk: Kernel,
+    k_frob_sq: Kernel,
+    k_restrict: Kernel,
+    /// Device-buffer allocation counter (F3): incremented by every
+    /// `buf_*`/`zero_*` helper. The persistent-workspace contract requires
+    /// this to be flat across an SCC iteration — tests assert zero growth.
+    pub n_buf_allocs: std::cell::Cell<u64>,
 }
 
 impl SparseBsr4Gpu {
@@ -264,6 +298,13 @@ impl SparseBsr4Gpu {
             .flags(flags::MEM_READ_WRITE)
             .len(1)
             .fill_val(0.0f32)
+            .build()
+            .map_err(map_ocl_err)?;
+        let dummy_i32 = Buffer::<i32>::builder()
+            .queue(queue.clone())
+            .flags(flags::MEM_READ_WRITE)
+            .len(1)
+            .fill_val(-1i32)
             .build()
             .map_err(map_ocl_err)?;
 
@@ -343,19 +384,22 @@ impl SparseBsr4Gpu {
             b.arg(0u32); b.arg(&dummy_u32); b.arg(&dummy_f32);
             b.build().map_err(map_ocl_err)?
         };
-        // bsr4_mulliken_KS: nrow, diag_block, ks, q -> 1 u32, 2 u32 buf (diag_block is u32), 2 f32 buf (ks, q)
-        //   Actually: diag_block is u32 buf, ks is f32 buf, q is f32 buf
+        // bsr4_mulliken_KS (R14): nrow, diag_block, ks, n_orb, q, q_dum
+        //   -> 1 u32 scalar, 2 u32 bufs (diag_block, n_orb), 3 f32 bufs
+        // bsr4_mulliken_KS (R14, packed out F7): nrow, diag_block, ks, n_orb, q_pack
+        //   -> 1 u32, 2 u32 bufs, 2 f32 bufs
         let k_mulliken_ks = {
             let mut b = Kernel::builder();
             b.program(&program).name("bsr4_mulliken_KS").queue(queue.clone());
-            b.arg(0u32); b.arg(&dummy_u32); b.arg(&dummy_f32); b.arg(&dummy_f32);
+            b.arg(0u32); b.arg(&dummy_u32); b.arg(&dummy_f32); b.arg(&dummy_u32); b.arg(&dummy_f32);
             b.build().map_err(map_ocl_err)?
         };
-        // bsr4_trace_KS_partial: nrow, diag_block, ks, partial -> 1 u32, 1 u32 buf, 2 f32 buf
+        // bsr4_trace_KS_partial (R14): nrow, diag_block, ks, n_orb, partial
+        //   -> 1 u32, 2 u32 bufs, 2 f32 bufs
         let k_trace_partial = {
             let mut b = Kernel::builder();
             b.program(&program).name("bsr4_trace_KS_partial").queue(queue.clone());
-            b.arg(0u32); b.arg(&dummy_u32); b.arg(&dummy_f32); b.arg(&dummy_f32);
+            b.arg(0u32); b.arg(&dummy_u32); b.arg(&dummy_f32); b.arg(&dummy_u32); b.arg(&dummy_f32);
             b.build().map_err(map_ocl_err)?
         };
         // reduce_sum_f32: n, input, output -> 1 u32, 2 f32 buf
@@ -408,7 +452,8 @@ impl SparseBsr4Gpu {
             b.arg(0u32); b.arg(&dummy_f32); b.arg(&dummy_f32);
             b.build().map_err(map_ocl_err)?
         };
-        // bsr4_build_identity_dev: n_atom, diag_block, values
+        // bsr4_build_identity_dev: nblock, diag_flag, values (writes ALL
+        // structural entries — cold-restart safe for persistent buffers)
         //   -> 1 u32 scalar, 1 u32 buf, 1 f32 buf
         let k_build_identity = {
             let mut b = Kernel::builder();
@@ -442,6 +487,39 @@ impl SparseBsr4Gpu {
             b.arg(0u32); b.arg(&dummy_f32); b.arg(&dummy_f32);
             b.build().map_err(map_ocl_err)?
         };
+        // bsr4_build_Hscc (R13): nrow, row_ptr, col_idx, H0, S, V, n_orb, H
+        //   -> 1 u32 scalar, 3 u32 bufs, 4 f32 bufs
+        let k_build_hscc = {
+            let mut b = Kernel::builder();
+            b.program(&program).name("bsr4_build_Hscc").queue(queue.clone());
+            b.arg(0u32); b.arg(&dummy_u32); b.arg(&dummy_u32);
+            b.arg(&dummy_f32); b.arg(&dummy_f32); b.arg(&dummy_f32);
+            b.arg(&dummy_u32); b.arg(&dummy_f32);
+            b.build().map_err(map_ocl_err)?
+        };
+        // bsr4_trace_hk_partial (R7): nblock_hs, H, K, hs_to_kT, partial
+        //   -> 1 u32 scalar, 2 f32 bufs, 1 i32 buf, 1 f32 buf
+        let k_trace_hk = {
+            let mut b = Kernel::builder();
+            b.program(&program).name("bsr4_trace_hk_partial").queue(queue.clone());
+            b.arg(0u32); b.arg(&dummy_f32); b.arg(&dummy_f32); b.arg(&dummy_i32); b.arg(&dummy_f32);
+            b.build().map_err(map_ocl_err)?
+        };
+        // bsr4_frobenius_sq_partial (R12): n, x, partial -> 1 u32, 2 f32 bufs
+        let k_frob_sq = {
+            let mut b = Kernel::builder();
+            b.program(&program).name("bsr4_frobenius_sq_partial").queue(queue.clone());
+            b.arg(0u32); b.arg(&dummy_f32); b.arg(&dummy_f32);
+            b.build().map_err(map_ocl_err)?
+        };
+        // bsr4_restrict (R8b): nblock_out, map(i32), in, out
+        //   -> 1 u32 scalar, 1 i32 buf, 2 f32 bufs
+        let k_restrict = {
+            let mut b = Kernel::builder();
+            b.program(&program).name("bsr4_restrict").queue(queue.clone());
+            b.arg(0u32); b.arg(&dummy_i32); b.arg(&dummy_f32); b.arg(&dummy_f32);
+            b.build().map_err(map_ocl_err)?
+        };
 
         let _ = gws_spgemm; let _ = gws_elem; let _ = gws_reduce; let _ = build_k;
 
@@ -456,6 +534,8 @@ impl SparseBsr4Gpu {
             k_spgemm_plan_bsym,
             k_row_abs_sum, k_reduce_max, k_build_identity, k_scale,
             k_gershgorin_partial, k_reduce_min,
+            k_build_hscc, k_trace_hk, k_frob_sq, k_restrict,
+            n_buf_allocs: std::cell::Cell::new(0),
         })
     }
 
@@ -498,12 +578,29 @@ impl SparseBsr4Gpu {
         self.check_row_degree(&row_ptr, n_atom)
     }
 
+    /// Left-operand degree check for the row-caching SpGEMM kernels —
+    /// uses the struct's host-computed `max_deg` (no device read).
+    fn check_left_degree(&self, a: &GpuBsrMatrix) -> Result<()> {
+        let max = self.config.max_left_blocks as u32;
+        if a.struct_.max_deg > max {
+            return Err(DftbError::InvalidInput(format!(
+                "bsr4_spgemm: left-operand row degree {} > MAX_LEFT_BLOCKS={max}. \
+                 The GPU kernel caches the left row in local memory. \
+                 Options: (1) increase SparseBsr4Config.max_left_blocks, \
+                 (2) use a sparser mask, (3) implement degree-bucketed kernels.",
+                a.struct_.max_deg
+            )));
+        }
+        Ok(())
+    }
+
     // ------------------------------------------------------------------
     // Buffer helpers
     // ------------------------------------------------------------------
 
     /// Allocate a `u32` GPU buffer from a host slice.
     pub fn buf_u32(&self, data: &[u32]) -> Result<Buffer<u32>> {
+        self.n_buf_allocs.set(self.n_buf_allocs.get() + 1);
         Buffer::<u32>::builder()
             .queue(self.rt.queue().clone())
             .flags(flags::MEM_READ_WRITE | flags::MEM_COPY_HOST_PTR)
@@ -515,7 +612,20 @@ impl SparseBsr4Gpu {
 
     /// Allocate an `f32` GPU buffer from a host slice.
     pub fn buf_f32(&self, data: &[f32]) -> Result<Buffer<f32>> {
+        self.n_buf_allocs.set(self.n_buf_allocs.get() + 1);
         Buffer::<f32>::builder()
+            .queue(self.rt.queue().clone())
+            .flags(flags::MEM_READ_WRITE | flags::MEM_COPY_HOST_PTR)
+            .len(data.len())
+            .copy_host_slice(data)
+            .build()
+            .map_err(map_ocl_err)
+    }
+
+    /// Allocate an `i32` GPU buffer from a host slice.
+    pub fn buf_i32(&self, data: &[i32]) -> Result<Buffer<i32>> {
+        self.n_buf_allocs.set(self.n_buf_allocs.get() + 1);
+        Buffer::<i32>::builder()
             .queue(self.rt.queue().clone())
             .flags(flags::MEM_READ_WRITE | flags::MEM_COPY_HOST_PTR)
             .len(data.len())
@@ -526,6 +636,7 @@ impl SparseBsr4Gpu {
 
     /// Allocate a zero-filled `f32` buffer.
     pub fn zero_f32(&self, len: usize) -> Result<Buffer<f32>> {
+        self.n_buf_allocs.set(self.n_buf_allocs.get() + 1);
         Buffer::<f32>::builder()
             .queue(self.rt.queue().clone())
             .flags(flags::MEM_READ_WRITE)
@@ -533,6 +644,11 @@ impl SparseBsr4Gpu {
             .fill_val(0.0f32)
             .build()
             .map_err(map_ocl_err)
+    }
+
+    /// Device→device copy of `len` f32 elements (same queue order).
+    pub fn copy_f32(&self, src: &Buffer<f32>, dst: &Buffer<f32>, len: usize) -> Result<()> {
+        src.copy(dst, Some(0), Some(len)).enq().map_err(map_ocl_err)
     }
 
     /// Read an `f32` buffer back to host (blocking).
@@ -765,13 +881,15 @@ impl SparseBsr4Gpu {
         self.rt.finish()
     }
 
-    /// Mulliken charges from `KS`: `q_A = 2 * Tr((KS)_AA)`.
+    /// Mulliken charges from `KS`: `q_A = 2 * Tr((KS)_AA)` on physical lanes;
+    /// `qpack` is a 2·nrow buffer — q at [0..nrow), q_dum at [nrow..2nrow).
     pub fn mulliken_ks(
         &self,
         nrow: usize,
         diag_block: &Buffer<u32>,
         ks: &Buffer<f32>,
-        q: &Buffer<f32>,
+        n_orb: &Buffer<u32>,
+        qpack: &Buffer<f32>,
     ) -> Result<()> {
         let kernel = Kernel::builder()
             .program(&self.program)
@@ -781,7 +899,8 @@ impl SparseBsr4Gpu {
             .arg(nrow as u32)
             .arg(diag_block)
             .arg(ks)
-            .arg(q)
+            .arg(n_orb)
+            .arg(qpack)
             .build()
             .map_err(map_ocl_err)?;
         unsafe {
@@ -797,6 +916,7 @@ impl SparseBsr4Gpu {
         nrow: usize,
         diag_block: &Buffer<u32>,
         ks: &Buffer<f32>,
+        n_orb: &Buffer<u32>,
     ) -> Result<f32> {
         let reduce_wg = self.config.reduce_wg as usize;
         // Stage 1: per-atom diagonal trace + first reduction.
@@ -811,6 +931,7 @@ impl SparseBsr4Gpu {
             .arg(nrow as u32)
             .arg(diag_block)
             .arg(ks)
+            .arg(n_orb)
             .arg(&partial)
             .build()
             .map_err(map_ocl_err)?;
@@ -976,11 +1097,12 @@ impl SparseBsr4Gpu {
         k_mask: &(Vec<u32>, Vec<u32>),
         t_mask: &(Vec<u32>, Vec<u32>),
         diag_block: &Buffer<u32>,
+        n_orb: &Buffer<u32>,
     ) -> Result<(Bsr4Matrix, f32)> {
         // T = K·S (on T mask); trace uses T's diagonal blocks.
         let t = self.matmul_masked_bsym(k, s, t_mask)?;
         // Tr(KS) = sum_A Tr(T_AA). diag_block indexes into T's structure.
-        let n = self.trace_ks(k.n_atom, diag_block, &self.buf_f32(&t.values)?)?;
+        let n = self.trace_ks(k.n_atom, diag_block, &self.buf_f32(&t.values)?, n_orb)?;
         // Q = T·K (on K mask).
         let q = self.matmul_masked_bsym(&t, k, k_mask)?;
         let nblock = k.nblock();
@@ -1006,16 +1128,20 @@ impl SparseBsr4Gpu {
         Bsr4Matrix::from_parts(m.n_atom, m.row_ptr.clone(), m.col_idx.clone(), out)
     }
 
-    /// Mulliken charges `q_A = 2·Tr((KS)_AA)` from a `KS` matrix.
-    pub fn mulliken(&self, ks: &Bsr4Matrix) -> Result<Vec<f32>> {
+    /// Mulliken charges `q_A = 2·Tr((KS)_AA)` on physical lanes from a `KS`
+    /// matrix. Returns `(q_phys, q_dum)` — `q_dum` is the dummy-lane
+    /// occupation diagnostic (R14).
+    pub fn mulliken(&self, ks: &Bsr4Matrix, atom_n_orb: &[u8]) -> Result<(Vec<f32>, Vec<f32>)> {
         let diag = crate::methods::sparse::bsr4::diag_block_map(ks)?;
         let diag_buf = self.buf_u32(&diag)?;
         let ks_buf = self.buf_f32(&ks.values)?;
-        let qbuf = self.zero_f32(ks.n_atom)?;
-        self.mulliken_ks(ks.n_atom, &diag_buf, &ks_buf, &qbuf)?;
-        let mut q = vec![0.0f32; ks.n_atom];
-        self.read_f32(&qbuf, &mut q)?;
-        Ok(q)
+        let n_orb_u32: Vec<u32> = atom_n_orb.iter().map(|&n| n as u32).collect();
+        let n_orb_buf = self.buf_u32(&n_orb_u32)?;
+        let qpack = self.zero_f32(2 * ks.n_atom)?;
+        self.mulliken_ks(ks.n_atom, &diag_buf, &ks_buf, &n_orb_buf, &qpack)?;
+        let mut packed = vec![0.0f32; 2 * ks.n_atom];
+        self.read_f32(&qpack, &mut packed)?;
+        Ok((packed[..ks.n_atom].to_vec(), packed[ks.n_atom..].to_vec()))
     }
 
     // ==================================================================
@@ -1270,6 +1396,7 @@ impl SparseBsr4Gpu {
         nocc: f32,
         k_mask: &(Vec<u32>, Vec<u32>),
         t_mask: &(Vec<u32>, Vec<u32>),
+        n_orb: &[u8],
         max_iter: usize,
         tol: f32,
     ) -> Result<(Bsr4Matrix, f32, f32, usize, Vec<(usize, f32, f32)>)> {
@@ -1281,6 +1408,8 @@ impl SparseBsr4Gpu {
             )?;
         let diag = crate::methods::sparse::bsr4::diag_block_map(&diag_dummy)?;
         let diag_buf = self.buf_u32(&diag)?;
+        let n_orb_u32: Vec<u32> = n_orb.iter().map(|&n| n as u32).collect();
+        let n_orb_buf = self.buf_u32(&n_orb_u32)?;
 
         let mut k = k0.clone();
         let mut r_i = f32::INFINITY;
@@ -1306,7 +1435,7 @@ impl SparseBsr4Gpu {
             // Tr(KS) via T = K·S
             let t = self.matmul_masked_bsym(&k, s, t_mask)?;
             let t_buf = self.buf_f32(&t.values)?;
-            tr = self.trace_ks(k.n_atom, &diag_buf, &t_buf)?;
+            tr = self.trace_ks(k.n_atom, &diag_buf, &t_buf, &n_orb_buf)?;
 
             if algebra_verbose() {
                 println!("  TC2 iter {iter}: R_I={r_i:e}  Tr(KS)={tr:.6}  (Nocc={nocc})");
@@ -1343,7 +1472,7 @@ impl SparseBsr4Gpu {
                 )));
             }
 
-            let (knew, _) = self.tc2_step(&k, s, nocc, k_mask, t_mask, &diag_buf)?;
+            let (knew, _) = self.tc2_step(&k, s, nocc, k_mask, t_mask, &diag_buf, &n_orb_buf)?;
             k = self.symmetrize_mat(&knew)?;
         }
 
@@ -1405,6 +1534,9 @@ pub use crate::methods::sparse::bsr4::{BS as PUB_BS, BS2 as PUB_BS2};
 pub struct GpuBsrStructure {
     pub n_atom: usize,
     pub nblock: usize,
+    /// Max blocks in any row — the SpGEMM kernels cache the LEFT row in
+    /// local mem (MAX_LEFT_BLOCKS); only left operands are degree-checked.
+    pub max_deg: u32,
     row_ptr: Buffer<u32>,
     col_idx: Buffer<u32>,
     diag_block: Buffer<u32>,
@@ -1421,15 +1553,18 @@ impl GpuBsrStructure {
     pub fn row_ptr(&self) -> &Buffer<u32> { &self.row_ptr }
     /// Public accessor for the column index buffer.
     pub fn col_idx(&self) -> &Buffer<u32> { &self.col_idx }
+    /// Public accessor for the diagonal-block flag buffer (1 per block).
+    pub fn diag_flag(&self) -> &Buffer<u32> { &self.diag_flag }
 
     /// Build a device-resident structure from a host CSR mask `(row_ptr,
     /// col_idx)`. Computes `diag_block_map` and `transpose_block_map` on the
     /// host, then uploads all four arrays once.
     pub fn new(gpu: &SparseBsr4Gpu, n_atom: usize, mask: &(Vec<u32>, Vec<u32>)) -> Result<Self> {
-        // Fail-loud check: verify no row exceeds MAX_LEFT_BLOCKS before
-        // uploading. The GPU kernel silently returns (producing zero output)
-        // for rows that overflow the local-memory cache.
-        gpu.check_row_degree(&mask.0, n_atom)?;
+        // Store max row degree — checked only when the structure is used as
+        // the LEFT operand of a row-caching SpGEMM (see check_row_degree at
+        // the *_dev entry points). Output/product masks can legitimately be
+        // wider than MAX_LEFT_BLOCKS.
+        let max_deg = (0..n_atom).map(|i| mask.0[i + 1] - mask.0[i]).max().unwrap_or(0);
         let nblock = mask.1.len();
         let row_ptr = gpu.buf_u32(&mask.0)?;
         let col_idx = gpu.buf_u32(&mask.1)?;
@@ -1445,7 +1580,7 @@ impl GpuBsrStructure {
         let diag_block = gpu.buf_u32(&diag)?;
         let diag_flag = gpu.buf_u32(&diag_flag)?;
         let transpose_block = gpu.buf_u32(&transpose)?;
-        Ok(Self { n_atom, nblock, row_ptr, col_idx, diag_block, diag_flag, transpose_block })
+        Ok(Self { n_atom, nblock, max_deg, row_ptr, col_idx, diag_block, diag_flag, transpose_block })
     }
 
     pub fn n_atom(&self) -> usize { self.n_atom }
@@ -1555,6 +1690,7 @@ impl SparseBsr4Gpu {
         b: &GpuBsrMatrix,
         c: &GpuBsrMatrix,
     ) -> Result<()> {
+        self.check_left_degree(a)?;
         let nrow = a.struct_.n_atom;
         let gws = nrow * self.config.wg as usize;
         let k = &self.k_spgemm_bsym;
@@ -1595,6 +1731,7 @@ impl SparseBsr4Gpu {
         b: &GpuBsrMatrix,
         c: &GpuBsrMatrix,
     ) -> Result<()> {
+        self.check_left_degree(a)?;
         let nrow = a.struct_.n_atom;
         let gws = nrow * self.config.wg as usize;
         let k = &self.k_spgemm_masked;
@@ -1642,6 +1779,7 @@ impl SparseBsr4Gpu {
         plan: &SpgemmPlanGpu,
         c: &GpuBsrMatrix,
     ) -> Result<()> {
+        self.check_left_degree(a)?;
         let nrow = a.struct_.n_atom;
         let gws = nrow * self.config.wg as usize;
         let k = &self.k_spgemm_plan_bsym;
@@ -1745,11 +1883,14 @@ impl SparseBsr4Gpu {
 
     /// Device-resident `Tr(KS)` partial reduction. Writes partial sums to
     /// `partial` buffer. No `finish()`.
+    /// `n_orb` masks physical diagonal lanes (R14): only lanes d < n_orb[i]
+    /// count toward Tr(KS). Pass a buffer of `u32` per atom.
     pub fn trace_ks_partial_dev(
         &self,
         nrow: usize,
         diag_block: &Buffer<u32>,
         ks: &Buffer<f32>,
+        n_orb: &Buffer<u32>,
         partial: &Buffer<f32>,
     ) -> Result<()> {
         let reduce_wg = self.config.reduce_wg as usize;
@@ -1758,7 +1899,8 @@ impl SparseBsr4Gpu {
         k.set_arg(0, nrow as u32).map_err(map_ocl_err)?;
         k.set_arg(1, diag_block).map_err(map_ocl_err)?;
         k.set_arg(2, ks).map_err(map_ocl_err)?;
-        k.set_arg(3, partial).map_err(map_ocl_err)?;
+        k.set_arg(3, n_orb).map_err(map_ocl_err)?;
+        k.set_arg(4, partial).map_err(map_ocl_err)?;
         unsafe {
             k.cmd()
                 .global_work_size(n_groups * reduce_wg)
@@ -1881,10 +2023,12 @@ impl SparseBsr4Gpu {
     }
 
     /// Enqueue Tr(KS) into a preallocated one-float device buffer.
+    /// `n_orb` masks physical diagonal lanes (R14).
     pub fn trace_ks_to_dev(
         &self,
         struct_: &GpuBsrStructure,
         ks: &Buffer<f32>,
+        n_orb: &Buffer<u32>,
         partial: &Buffer<f32>,
         scratch_a: &Buffer<f32>,
         scratch_b: &Buffer<f32>,
@@ -1892,7 +2036,7 @@ impl SparseBsr4Gpu {
     ) -> Result<()> {
         let reduce_wg = self.config.reduce_wg as usize;
         let n_groups = div_ceil(struct_.n_atom, reduce_wg);
-        self.trace_ks_partial_dev(struct_.n_atom, &struct_.diag_block, ks, partial)?;
+        self.trace_ks_partial_dev(struct_.n_atom, &struct_.diag_block, ks, n_orb, partial)?;
         self.reduce_to_output_dev(n_groups, partial, scratch_a, scratch_b, output)
     }
 
@@ -1931,13 +2075,13 @@ impl SparseBsr4Gpu {
 
     /// Device-resident full `Tr(KS)` reduction: enqueues partial + recursive
     /// reduction, returns one f32 to host. This is the **only** host transfer
-    /// in the hot loop — a single scalar.
-    pub fn trace_ks_dev(&self, struct_: &GpuBsrStructure, ks: &Buffer<f32>) -> Result<f32> {
+    /// in the hot loop — a single scalar. `n_orb` masks physical lanes (R14).
+    pub fn trace_ks_dev(&self, struct_: &GpuBsrStructure, ks: &Buffer<f32>, n_orb: &Buffer<u32>) -> Result<f32> {
         let nrow = struct_.n_atom;
         let reduce_wg = self.config.reduce_wg as usize;
         let n_groups = div_ceil(nrow, reduce_wg);
         let partial = self.zero_f32(n_groups)?;
-        self.trace_ks_partial_dev(nrow, &struct_.diag_block, ks, &partial)?;
+        self.trace_ks_partial_dev(nrow, &struct_.diag_block, ks, n_orb, &partial)?;
         self.reduce_to_one_dev(n_groups, &partial)
     }
 
@@ -1975,22 +2119,166 @@ impl SparseBsr4Gpu {
         Ok(host[0])
     }
 
-    /// Device-resident Mulliken charges: `q_A = 2*Tr((KS)_AA)`.
-    /// Reads `n_atom` floats to host.
-    pub fn mulliken_dev(&self, struct_: &GpuBsrStructure, ks: &Buffer<f32>) -> Result<Vec<f32>> {
+    /// Device-resident Mulliken charges: `q_A = 2*Tr_phys((KS)_AA)`.
+    /// `n_orb` masks physical diagonal lanes (R14); `q_dum` receives the
+    /// dummy-lane diagonal content (should be ~0 — occupation leak check).
+    /// Reads `2*n_atom` floats to host; returns `(q_phys, q_dum)`.
+    pub fn mulliken_dev(
+        &self,
+        struct_: &GpuBsrStructure,
+        ks: &Buffer<f32>,
+        n_orb: &Buffer<u32>,
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
         let nrow = struct_.n_atom;
         let qbuf = self.zero_f32(nrow)?;
+        let dbuf = self.zero_f32(nrow)?;
         let k = &self.k_mulliken_ks;
         k.set_arg(0, nrow as u32).map_err(map_ocl_err)?;
         k.set_arg(1, &struct_.diag_block).map_err(map_ocl_err)?;
         k.set_arg(2, ks).map_err(map_ocl_err)?;
-        k.set_arg(3, &qbuf).map_err(map_ocl_err)?;
+        k.set_arg(3, n_orb).map_err(map_ocl_err)?;
+        k.set_arg(4, &qbuf).map_err(map_ocl_err)?;
+        k.set_arg(5, &dbuf).map_err(map_ocl_err)?;
         unsafe {
             k.cmd().global_work_size(nrow).enq().map_err(map_ocl_err)?;
         }
         let mut q = vec![0.0f32; nrow];
+        let mut qd = vec![0.0f32; nrow];
         self.read_f32(&qbuf, &mut q)?;
-        Ok(q)
+        self.read_f32(&dbuf, &mut qd)?;
+        Ok((q, qd))
+    }
+
+    /// Device-resident Mulliken into caller-owned buffers (no per-call alloc).
+    /// `qbuf`/`dbuf` must be `n_atom` floats.
+    pub fn mulliken_to_dev(
+        &self,
+        struct_: &GpuBsrStructure,
+        ks: &Buffer<f32>,
+        n_orb: &Buffer<u32>,
+        qpack: &Buffer<f32>,
+    ) -> Result<()> {
+        let nrow = struct_.n_atom;
+        let k = &self.k_mulliken_ks;
+        k.set_arg(0, nrow as u32).map_err(map_ocl_err)?;
+        k.set_arg(1, &struct_.diag_block).map_err(map_ocl_err)?;
+        k.set_arg(2, ks).map_err(map_ocl_err)?;
+        k.set_arg(3, n_orb).map_err(map_ocl_err)?;
+        k.set_arg(4, qpack).map_err(map_ocl_err)?;
+        unsafe {
+            k.cmd().global_work_size(nrow).enq().map_err(map_ocl_err)?;
+        }
+        Ok(())
+    }
+
+    /// Device-resident SCC Hamiltonian build (R13):
+    ///   H_scc[μ,ν] = H0[μ,ν] + ½·S[μ,ν]·(V_i + V_j)   on physical lanes only
+    /// Dummy lanes keep H0 (E_DUMMY diagonals, zero elsewhere). One kernel
+    /// launch; `v` is `n_atom` floats (atom potentials, already uploaded).
+    pub fn build_hscc_dev(
+        &self,
+        struct_: &GpuBsrStructure,
+        h0: &Buffer<f32>,
+        s: &Buffer<f32>,
+        v_atom: &Buffer<f32>,
+        n_orb: &Buffer<u32>,
+        h_out: &Buffer<f32>,
+    ) -> Result<()> {
+        let wg = self.config.wg as usize;
+        let k = &self.k_build_hscc;
+        k.set_arg(0, struct_.n_atom as u32).map_err(map_ocl_err)?;
+        k.set_arg(1, &struct_.row_ptr).map_err(map_ocl_err)?;
+        k.set_arg(2, &struct_.col_idx).map_err(map_ocl_err)?;
+        k.set_arg(3, h0).map_err(map_ocl_err)?;
+        k.set_arg(4, s).map_err(map_ocl_err)?;
+        k.set_arg(5, v_atom).map_err(map_ocl_err)?;
+        k.set_arg(6, n_orb).map_err(map_ocl_err)?;
+        k.set_arg(7, h_out).map_err(map_ocl_err)?;
+        unsafe {
+            k.cmd()
+                .global_work_size(struct_.n_atom * wg)
+                .local_work_size(wg)
+                .enq()
+                .map_err(map_ocl_err)?;
+        }
+        Ok(())
+    }
+
+    /// Enqueue `Tr(K·H)` over the H/S support into a 1-float device buffer.
+    /// `hs_to_kT` maps hs block (i,j) → k block of (j,i), or −1 (R7).
+    pub fn trace_hk_to_dev(
+        &self,
+        nblock_hs: usize,
+        h: &Buffer<f32>,
+        k: &Buffer<f32>,
+        hs_to_kT: &Buffer<i32>,
+        partial: &Buffer<f32>,
+        scratch_a: &Buffer<f32>,
+        scratch_b: &Buffer<f32>,
+        output: &Buffer<f32>,
+    ) -> Result<()> {
+        let reduce_wg = self.config.reduce_wg as usize;
+        let n_groups = div_ceil(nblock_hs * BS2, reduce_wg);
+        let kern = &self.k_trace_hk;
+        kern.set_arg(0, nblock_hs as u32).map_err(map_ocl_err)?;
+        kern.set_arg(1, h).map_err(map_ocl_err)?;
+        kern.set_arg(2, k).map_err(map_ocl_err)?;
+        kern.set_arg(3, hs_to_kT).map_err(map_ocl_err)?;
+        kern.set_arg(4, partial).map_err(map_ocl_err)?;
+        unsafe {
+            kern.cmd()
+                .global_work_size(n_groups * reduce_wg)
+                .local_work_size(reduce_wg)
+                .enq()
+                .map_err(map_ocl_err)?;
+        }
+        self.reduce_to_output_dev(n_groups, partial, scratch_a, scratch_b, output)
+    }
+
+    /// Enqueue `||X||_F²` of a values buffer into a 1-float device buffer (R12).
+    pub fn frob_sq_to_dev(
+        &self,
+        n: usize,
+        x: &Buffer<f32>,
+        partial: &Buffer<f32>,
+        scratch_a: &Buffer<f32>,
+        scratch_b: &Buffer<f32>,
+        output: &Buffer<f32>,
+    ) -> Result<()> {
+        let reduce_wg = self.config.reduce_wg as usize;
+        let n_groups = div_ceil(n, reduce_wg);
+        let kern = &self.k_frob_sq;
+        kern.set_arg(0, n as u32).map_err(map_ocl_err)?;
+        kern.set_arg(1, x).map_err(map_ocl_err)?;
+        kern.set_arg(2, partial).map_err(map_ocl_err)?;
+        unsafe {
+            kern.cmd()
+                .global_work_size(n_groups * reduce_wg)
+                .local_work_size(reduce_wg)
+                .enq()
+                .map_err(map_ocl_err)?;
+        }
+        self.reduce_to_output_dev(n_groups, partial, scratch_a, scratch_b, output)
+    }
+
+    /// Restrict values from a wider mask to a narrower one via a block map
+    /// (out-block → in-block, −1 → zeros). Used for Z|M_K in K0 (R8b).
+    pub fn restrict_dev(
+        &self,
+        nblock_out: usize,
+        map: &Buffer<i32>,
+        input: &Buffer<f32>,
+        output: &Buffer<f32>,
+    ) -> Result<()> {
+        let k = &self.k_restrict;
+        k.set_arg(0, nblock_out as u32).map_err(map_ocl_err)?;
+        k.set_arg(1, map).map_err(map_ocl_err)?;
+        k.set_arg(2, input).map_err(map_ocl_err)?;
+        k.set_arg(3, output).map_err(map_ocl_err)?;
+        unsafe {
+            k.cmd().global_work_size(nblock_out * BS2).enq().map_err(map_ocl_err)?;
+        }
+        Ok(())
     }
 
     /// Device-resident Frobenius norm of a values buffer.
@@ -2000,10 +2288,15 @@ impl SparseBsr4Gpu {
         self.idempotency_err_dev(nblock, vals, &zero)
     }
 
-    /// Device-resident direct identity residual `||A-I||_F` via the
+    /// Device-resident direct identity residual `||A-I||_F` (true Frobenius
+    /// norm — `sqrt` applied on host) via the
     /// `bsr4_identity_residual_partial` kernel.  Avoids the catastrophic
     /// cancellation in `||A||² - 2·Tr(A) + N` when A ≈ I. Reads 1 scalar.
-    pub fn identity_residual_scalar_dev(
+    ///
+    /// Contract: returns ‖A−I‖_F, NOT its square. `identity_residual_to_dev`
+    /// writes the *squared* norm into the output buffer; this function takes
+    /// the square root. The N4 "NS residual failure" was this missing sqrt.
+    pub fn identity_residual_norm_dev(
         &self,
         struct_: &GpuBsrStructure,
         a: &Buffer<f32>,
@@ -2017,7 +2310,7 @@ impl SparseBsr4Gpu {
         self.identity_residual_to_dev(struct_, a, &partial, &scratch_a, &scratch_b, &output)?;
         let mut host = [0.0f32; 1];
         self.read_f32(&output, &mut host)?;
-        Ok(host[0])
+        Ok(host[0].sqrt())
     }
 
     // ------------------------------------------------------------------
@@ -2073,19 +2366,22 @@ impl SparseBsr4Gpu {
     }
 
     /// Build identity matrix on the device into `values` (on the given
-    /// structure). Uses `diag_block` map — no host download of row_ptr/col_idx.
+    /// structure). **Writes every structural entry** — diagonal blocks get I,
+    /// all other entries get 0 — so a cold restart never leaves stale
+    /// off-diagonal values in a persistent buffer (second review R6).
+    /// Uses `diag_flag` — no host download of row_ptr/col_idx.
     pub fn build_identity_dev(
         &self,
         struct_: &GpuBsrStructure,
         values: &Buffer<f32>,
     ) -> Result<()> {
-        let n_atom = struct_.n_atom;
+        let nblock = struct_.nblock;
         let k = &self.k_build_identity;
-        k.set_arg(0, n_atom as u32).map_err(map_ocl_err)?;
-        k.set_arg(1, &struct_.diag_block).map_err(map_ocl_err)?;
+        k.set_arg(0, nblock as u32).map_err(map_ocl_err)?;
+        k.set_arg(1, &struct_.diag_flag).map_err(map_ocl_err)?;
         k.set_arg(2, values).map_err(map_ocl_err)?;
         unsafe {
-            k.cmd().global_work_size(n_atom * BS2).enq().map_err(map_ocl_err)?;
+            k.cmd().global_work_size(nblock * BS2).enq().map_err(map_ocl_err)?;
         }
         Ok(())
     }
@@ -2139,6 +2435,73 @@ impl SparseBsr4Gpu {
         let emin = self.reduce_min_dev(n_orb, &emin_partial)?;
         let emax = self.reduce_max_scalar_dev(n_orb, &emax_partial)?;
         Ok((emin, emax))
+    }
+
+    /// Gershgorin bounds with caller-owned buffers — no allocation.
+    /// `emin_partial`/`emax_partial` need `n_atom*BS` floats; `scratch_a/b`
+    /// need `ceil(n_orb/reduce_wg)`; `emin_out`/`emax_out` are 1 float each.
+    /// Caller reads the two scalar outputs.
+    pub fn gershgorin_to_dev(
+        &self,
+        struct_: &GpuBsrStructure,
+        values: &Buffer<f32>,
+        emin_partial: &Buffer<f32>,
+        emax_partial: &Buffer<f32>,
+        scratch_a: &Buffer<f32>,
+        scratch_b: &Buffer<f32>,
+        emin_out: &Buffer<f32>,
+        emax_out: &Buffer<f32>,
+    ) -> Result<()> {
+        let n_orb = struct_.n_atom * BS;
+        let k = &self.k_gershgorin_partial;
+        k.set_arg(0, struct_.n_atom as u32).map_err(map_ocl_err)?;
+        k.set_arg(1, &struct_.row_ptr).map_err(map_ocl_err)?;
+        k.set_arg(2, &struct_.col_idx).map_err(map_ocl_err)?;
+        k.set_arg(3, values).map_err(map_ocl_err)?;
+        k.set_arg(4, &struct_.diag_flag).map_err(map_ocl_err)?;
+        k.set_arg(5, emin_partial).map_err(map_ocl_err)?;
+        k.set_arg(6, emax_partial).map_err(map_ocl_err)?;
+        unsafe {
+            k.cmd().global_work_size(n_orb).enq().map_err(map_ocl_err)?;
+        }
+        self.reduce_minmax_to_dev(n_orb, emin_partial, scratch_a, scratch_b, emin_out, false)?;
+        self.reduce_minmax_to_dev(n_orb, emax_partial, scratch_a, scratch_b, emax_out, true)?;
+        Ok(())
+    }
+
+    /// Ping-pong min/max reduction into a caller-owned 1-float output
+    /// (no allocation — used inside the workspace's persistent buffers).
+    fn reduce_minmax_to_dev(
+        &self,
+        mut n: usize,
+        input: &Buffer<f32>,
+        scratch_a: &Buffer<f32>,
+        scratch_b: &Buffer<f32>,
+        output: &Buffer<f32>,
+        is_max: bool,
+    ) -> Result<()> {
+        let reduce_wg = self.config.reduce_wg as usize;
+        let kern = if is_max { &self.k_reduce_max } else { &self.k_reduce_min };
+        let mut current = input;
+        let mut use_a = true;
+        loop {
+            let n_groups = div_ceil(n, reduce_wg);
+            let out = if n_groups == 1 { output } else if use_a { scratch_a } else { scratch_b };
+            kern.set_arg(0, n as u32).map_err(map_ocl_err)?;
+            kern.set_arg(1, current).map_err(map_ocl_err)?;
+            kern.set_arg(2, out).map_err(map_ocl_err)?;
+            unsafe {
+                kern.cmd()
+                    .global_work_size(n_groups * reduce_wg)
+                    .local_work_size(reduce_wg)
+                    .enq()
+                    .map_err(map_ocl_err)?;
+            }
+            if n_groups == 1 { return Ok(()); }
+            current = out;
+            use_a = !use_a;
+            n = n_groups;
+        }
     }
 
     /// Device-side min reduction to a single scalar. Reads 1 float to host.
@@ -2265,7 +2628,7 @@ impl SparseBsr4Gpu {
     ///
     /// All matrices stay on the GPU for the entire loop. Per iteration:
     ///   T = Z·S          (spgemm_bsym_dev — 0 transfers)
-    ///   ||I-T||_F        (identity_residual_scalar_dev — 1 scalar read)
+    ///   ||I-T||_F        (identity_residual_norm_dev — 1 scalar read)
     ///   R_Z = ||I-T||_F / sqrt(N_orb)  (host)
     ///   Q = T·Z          (spgemm_bsym_dev — 0 transfers)
     ///   Znew = 2·Z - Q   (axpby_dev — 0 transfers)
@@ -2319,7 +2682,7 @@ impl SparseBsr4Gpu {
 
             // R_Z = ||I - T||_F / sqrt(N_orb) — direct identity residual,
             // avoids catastrophic cancellation in ||T||² - 2·Tr(T) + N.
-            let rz = self.identity_residual_scalar_dev(t_struct, &t.values)? / n_orb.sqrt();
+            let rz = self.identity_residual_norm_dev(t_struct, &t.values)? / n_orb.sqrt();
 
             println!(
                 "  Newton-Schulz-dev iter {iter}: R_Z = {rz:e}"
@@ -2358,7 +2721,7 @@ impl SparseBsr4Gpu {
 
         // Final residual — direct identity residual, no cancellation.
         self.spgemm_bsym_dev(&z, s, &t)?;
-        let rz = self.identity_residual_scalar_dev(t_struct, &t.values)? / n_orb.sqrt();
+        let rz = self.identity_residual_norm_dev(t_struct, &t.values)? / n_orb.sqrt();
         let z_out = z.to_host(self)?;
         Err(DftbError::InvalidInput(format!(
             "Newton-Schulz did not converge: exhausted {max_iter} iters, final R_Z={rz:e} (tol={tol:e})"
@@ -2408,6 +2771,9 @@ pub struct SparsePurifyWorkspace {
     reduce_partial: Buffer<f32>,
     reduce_a: Buffer<f32>,
     reduce_b: Buffer<f32>,
+    /// Physical orbitals per atom — masks the padded BSR4 lanes in the
+    /// masked trace/mulliken kernels (second review R14).
+    n_orb_buf: Buffer<u32>,
     /// Number of occupied orbitals.
     nocc: f32,
     /// P4: Precomputed symbolic plans for the two recurring SpGEMMs.
@@ -2436,8 +2802,16 @@ impl SparsePurifyWorkspace {
         s: &Bsr4Matrix,
         k_mask: &(Vec<u32>, Vec<u32>),
         t_mask: &(Vec<u32>, Vec<u32>),
+        n_orb: &[u8],
         nocc: f32,
     ) -> Result<Self> {
+        if n_orb.len() != k0.n_atom {
+            return Err(DftbError::InvalidInput(format!(
+                "SparsePurifyWorkspace::new: n_orb len {} != n_atom {}", n_orb.len(), k0.n_atom
+            )));
+        }
+        let n_orb_u32: Vec<u32> = n_orb.iter().map(|&n| n as u32).collect();
+        let n_orb_buf = gpu.buf_u32(&n_orb_u32)?;
         let k_struct = Arc::new(GpuBsrStructure::new(&gpu, k0.n_atom, k_mask)?);
         let t_struct = Arc::new(GpuBsrStructure::new(&gpu, k0.n_atom, t_mask)?);
 
@@ -2493,7 +2867,8 @@ impl SparsePurifyWorkspace {
 
         Ok(Self {
             gpu, k_struct, t_struct, s: s_mat, k, knew, t, q,
-            trace_buf, residual_buf, reduce_partial, reduce_a, reduce_b, nocc,
+            trace_buf, residual_buf, reduce_partial, reduce_a, reduce_b,
+            n_orb_buf, nocc,
             plan_ks, plan_tk,
         })
     }
@@ -2526,6 +2901,7 @@ impl SparsePurifyWorkspace {
         self.gpu.trace_ks_to_dev(
             &self.t_struct,
             &self.t.values,
+            &self.n_orb_buf,
             &self.reduce_partial,
             &self.reduce_a,
             &self.reduce_b,
@@ -2600,6 +2976,7 @@ impl SparsePurifyWorkspace {
         self.gpu.trace_ks_to_dev(
             &self.t_struct,
             &self.t.values,
+            &self.n_orb_buf,
             &self.reduce_partial,
             &self.reduce_a,
             &self.reduce_b,
@@ -2735,11 +3112,12 @@ impl SparsePurifyWorkspace {
         self.k.to_host(&self.gpu)
     }
 
-    /// Read current Mulliken charges `q_A = 2*Tr((KS)_AA)` from the device.
-    /// Computes T=K·S first, then reads `n_atom` floats.
-    pub fn mulliken_dev(&mut self) -> Result<Vec<f32>> {
+    /// Read current Mulliken charges `q_A = 2*Tr_phys((KS)_AA)` from the
+    /// device (physical lanes only, R14). Computes T=K·S first, then reads
+    /// `n_atom` floats. Returns `(q_phys, q_dum)` — `q_dum` should be ~0.
+    pub fn mulliken_dev(&mut self) -> Result<(Vec<f32>, Vec<f32>)> {
         // T = K·S
         self.gpu.spgemm_bsym_dev(&self.k, &self.s, &self.t)?;
-        self.gpu.mulliken_dev(&self.t_struct, &self.t.values)
+        self.gpu.mulliken_dev(&self.t_struct, &self.t.values, &self.n_orb_buf)
     }
 }

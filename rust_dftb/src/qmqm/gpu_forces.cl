@@ -324,6 +324,11 @@ __kernel void force_pairs(
     if (gid >= n_pairs) return;
 
     PairEntry p = pairs[gid];
+    // D7: frozen all-pairs list — skip pairs beyond the SK table range
+    // (they contribute zero force; the clamped-stencil eval would
+    // extrapolate garbage). Same guard as assemble_pairs.
+    const float r_tab = ((float)n_grid - 1.0f) * dr;
+    if (p.r >= r_tab || p.r < 1e-6f) return;
     Fragment frag = fragments[p.replica];
     int n_orbs = frag.n_orbs;
     int atom_off = frag.atom_off;
@@ -478,6 +483,9 @@ __kernel void force_pairs_scc_shift(
     if (gid >= n_pairs) return;
 
     PairEntry p = pairs[gid];
+    // D7: frozen all-pairs list — skip beyond the SK table range (see force_pairs).
+    const float r_tab = ((float)n_grid - 1.0f) * dr;
+    if (p.r >= r_tab || p.r < 1e-6f) return;
     Fragment frag = fragments[p.replica];
     int n_orbs = frag.n_orbs;
     int atom_off = frag.atom_off;
@@ -658,6 +666,116 @@ inline float gamma_prime_full_f32(float r, float u1, float u2) {
 //     return -1.0f/(r*r) - short_prime;
 // }
 
+// ─── D8: species-pair γ spline evaluator (replaces f64 gamma_prime) ────
+//
+// Natural cubic on uniform knots — same convention as SPAMMM
+// LCAO_grid.cl::evaluate_radial: float4 per knot = (T, T″, T′, T‴),
+// pair = si*n_species + sj, T(r) = 1 − r·γ(r) (smooth: T(0)=1, T(∞)→0).
+// Two VALUE interpolations (never a derivative of noisy f32 knots):
+//   .xy → T   via  y = a·y_lo + b·y_hi + ((a³−a)d2_lo + (b³−b)d2_hi)·dr²/6
+//   .zw → T′  same formula
+//   γ  = (1−T)/r ;  γ′ = −T′/r − (1−T)/r² ;  r ≥ r_max → pure Coulomb.
+// Same numerical γ family as the host G build → energy–force consistent.
+
+/// (γ, γ′) at distance r (Bohr) for species pair (si, sj).
+inline float2 gamma_spline_pair(
+    const __global float* gamma_spl, int n_species, int nk,
+    float dr, float r_max, int si, int sj, float r)
+{
+    if (r >= r_max) {
+        const float inv = 1.0f / r;
+        return (float2)(inv, -inv * inv);   // T=0: pure Coulomb tail
+    }
+    const float x = r * (1.0f / dr);
+    const int k = min((int)x, nk - 2);
+    const float h = x - (float)k;
+    const __global float4* kn = (const __global float4*)gamma_spl
+        + (size_t)(si * n_species + sj) * nk;
+    const float4 lo = kn[k];
+    const float4 hi = kn[k + 1];
+    const float a = 1.0f - h, b = h;
+    const float h2_6 = dr * dr * (1.0f / 6.0f);
+    const float t  = a * lo.x + b * hi.x + ((a * a * a - a) * lo.y + (b * b * b - b) * hi.y) * h2_6;
+    const float td = a * lo.z + b * hi.z + ((a * a * a - a) * lo.w + (b * b * b - b) * hi.w) * h2_6;
+    const float inv_r = 1.0f / r;
+    const float one_t = 1.0f - t;
+    return (float2)(one_t * inv_r, -td * inv_r - one_t * inv_r * inv_r);
+}
+
+// ─── D7: device-resident geometry refresh ──────────────────────────────
+//
+// PairEntry carries template-static fields (replica, atom i/j, orb
+// offsets) built ONCE at engine init; only r,l,m,n change with geometry.
+// In STORED order the direction is always (c_j − c_i)/r — orient_pair
+// already swapped i↔j for 1×4 blocks, so no flip flag is needed.
+// Pairs beyond the SK cutoff stay in the list: the table tail is ~0 and
+// cubic_interp_params clamps — they contribute exactly zero.
+__kernel void refresh_pair_geom(
+    __global PairEntry* pairs,        // in-place r,l,m,n update
+    __global const float* coords,     // [batch*n_atoms*3] Bohr
+    const int n_pairs,
+    const int n_atoms)
+{
+    const int gid = get_global_id(0);
+    if (gid >= n_pairs) return;
+    PairEntry p = pairs[gid];
+    const int base = (int)p.replica * n_atoms * 3;
+    const float dx = coords[base + 3 * (int)p.atom_j    ] - coords[base + 3 * (int)p.atom_i    ];
+    const float dy = coords[base + 3 * (int)p.atom_j + 1] - coords[base + 3 * (int)p.atom_i + 1];
+    const float dz = coords[base + 3 * (int)p.atom_j + 2] - coords[base + 3 * (int)p.atom_i + 2];
+    const float r = sqrt(dx * dx + dy * dy + dz * dz);
+    const float inv_r = 1.0f / fmax(r, 1e-12f);   // coincident atoms: NaN anyway downstream — stay finite
+    p.r = r;
+    p.l = dx * inv_r;
+    p.m = dy * inv_r;
+    p.n = dz * inv_r;
+    pairs[gid] = p;
+}
+
+// G[sid][a,c] = γ(r_ac) — symmetric fill, one thread per upper-triangle
+// element (a ≥ c). Diagonal = Hubbard U_a. Same spline the force kernel
+// uses for γ′ → the SCC energy and the force see one numerical function.
+__kernel void build_gamma_batched(
+    const int n_atoms,
+    const int batch,
+    __global const float* coords,      // [batch*n_atoms*3] Bohr
+    __global const int* species_idx,   // [batch*n_atoms]
+    __global const float* u_hub,       // [n_species]
+    const int n_species,
+    __global const float* gamma_spl,   // [nsp² · nk · 4] D8 float4 table
+    const int gamma_nk,
+    const float gamma_dr,
+    const float gamma_rmax,
+    __global float* G)                 // [batch*n_atoms*n_atoms]
+{
+    const int gid = get_global_id(0);
+    const int ntri = n_atoms * (n_atoms + 1) / 2;
+    const int sid = gid / ntri;
+    const int t = gid - sid * ntri;
+    if (sid >= batch) return;
+    // triangle index → (a,c), a ≥ c (same decode as build_density_occ_batched)
+    int a = (int)(0.5f * (sqrt(8.0f * (float)t + 1.0f) - 1.0f));
+    while ((a + 1) * (a + 2) / 2 <= t) a++;
+    while (a * (a + 1) / 2 > t) a--;
+    const int c = t - a * (a + 1) / 2;
+    const int base = sid * n_atoms;
+    float gv;
+    if (a == c) {
+        gv = u_hub[species_idx[base + a]];
+    } else {
+        const float dx = coords[base * 3 + 3 * a    ] - coords[base * 3 + 3 * c    ];
+        const float dy = coords[base * 3 + 3 * a + 1] - coords[base * 3 + 3 * c + 1];
+        const float dz = coords[base * 3 + 3 * a + 2] - coords[base * 3 + 3 * c + 2];
+        const float r = sqrt(dx * dx + dy * dy + dz * dz);
+        gv = gamma_spline_pair(gamma_spl, n_species, gamma_nk, gamma_dr,
+                               gamma_rmax,
+                               species_idx[base + a], species_idx[base + c], r).x;
+    }
+    __global float* Gb = G + (size_t)sid * n_atoms * n_atoms;
+    Gb[a * n_atoms + c] = gv;
+    Gb[c * n_atoms + a] = gv;
+}
+
 __kernel void force_gamma_deriv_batched(
     const int n_atoms,
     const int batch,
@@ -666,6 +784,10 @@ __kernel void force_gamma_deriv_batched(
     __global const float* delta_q,    // [batch*n_atoms]
     __global const float* u_hub,      // [n_species]
     const int n_species,
+    __global const float* gamma_spl,  // [nsp² · nk · 3] D8 table
+    const int gamma_nk,
+    const float gamma_dr,
+    const float gamma_rmax,
     __global float* forces            // [batch*n_atoms*3] Hartree/Å
 ) {
     const int sid = get_group_id(0);
@@ -702,7 +824,10 @@ __kernel void force_gamma_deriv_batched(
         float u_i = u_hub[si];
         float u_j = u_hub[sj];
 
-        float gprime = gamma_prime_full_f32(r_bohr, u_i, u_j);
+        // D8: γ′ from the species-pair spline (same table as the energy
+        // γ — replaces the f64 analytic island gamma_prime_full_f32).
+        float gprime = gamma_spline_pair(gamma_spl, n_species, gamma_nk,
+                                       gamma_dr, gamma_rmax, si, sj, r_bohr).y;
         float dq_i = dq[i], dq_j = dq[j];
 
         float coeff = -dq_i * dq_j * gprime / r_bohr * ANG2BOHR_F * ANG2BOHR_F;

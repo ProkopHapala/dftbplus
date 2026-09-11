@@ -270,7 +270,7 @@ fn run_one(
     // 4. TC2 purification (K·S on m_t_ks). f32 TC2 typically converges to
     // ~1e-3..1e-4; use 1e-4 as the tolerance and 80 max iters.
     let nocc_f = nocc as f32;
-    let (k_final, r_in, tr, tc2_iters, _hist) = match gpu.tc2_purify(&k0, &s, nocc_f, &m_k, &m_t_ks, 80, 1e-4) {
+    let (k_final, r_in, tr, tc2_iters, _hist) = match gpu.tc2_purify(&k0, &s, nocc_f, &m_k, &m_t_ks, &vec![4u8; n_atom], 80, 1e-4) {
         Ok(r) => r,
         Err(e) => return Err(format!("TC2 failed: {e}")),
     };

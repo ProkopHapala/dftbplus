@@ -260,14 +260,20 @@ impl FireOptimizer {
             for i in 0..n { self.velocities[i] = [0.0; 3]; }
         }
 
-        // Mix velocity: V = (1-alpha)*V + alpha*|F|*F_hat
+        // Mix velocity: V = (1-alpha)*V + alpha*|V|*F_hat — Bitzek 2006 with
+        // GLOBAL norms (whole-system ‖v‖,‖F‖), not per-atom ‖F_i‖F̂_i.
+        let mut v2 = 0.0f64;
+        let mut f2 = 0.0f64;
         for i in 0..n {
-            let f_norm = (forces[i][0].powi(2) + forces[i][1].powi(2) + forces[i][2].powi(2)).sqrt();
-            let f_hat = if f_norm > 1e-12 {
-                [forces[i][0]/f_norm, forces[i][1]/f_norm, forces[i][2]/f_norm]
-            } else { [0.0; 3] };
             for c in 0..3 {
-                self.velocities[i][c] = (1.0 - self.alpha) * self.velocities[i][c] + self.alpha * f_norm * f_hat[c];
+                v2 += self.velocities[i][c] * self.velocities[i][c];
+                f2 += forces[i][c] * forces[i][c];
+            }
+        }
+        let scale = if f2 > 1e-24 { self.alpha * v2.sqrt() / f2.sqrt() } else { 0.0 };
+        for i in 0..n {
+            for c in 0..3 {
+                self.velocities[i][c] = (1.0 - self.alpha) * self.velocities[i][c] + scale * forces[i][c];
             }
         }
 

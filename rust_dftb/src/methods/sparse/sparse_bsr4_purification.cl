@@ -479,7 +479,10 @@ __kernel void bsr4_spgemm_plan_Bsym(
         const uint t0 = plan_ptr[cb];
         const uint t1 = plan_ptr[cb+1];
 
-        float sum = 0.0f;
+        // Four independent FMA accumulators, one per column index m —
+        // breaks the serial dependency chain across plan terms (F7).
+        float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+        bool bad = false;
 
         // Iterate precomputed plan terms — no intersection, no search.
         for(uint t=t0; t<t1; ++t){
@@ -489,7 +492,7 @@ __kernel void bsr4_spgemm_plan_Bsym(
 
             // Fail-loud: ia out of range means the plan is corrupt.
             if(ia >= na){
-                sum = NAN;
+                bad = true;
                 break;
             }
 
@@ -497,13 +500,13 @@ __kernel void bsr4_spgemm_plan_Bsym(
             __global const float* Bjk = B + bb*BS2;
 
             // C_ij[r,c] += sum_m A_ik[r,m] * B_jk[c,m]  (B_kj = B_jk^T)
-            sum = fma(Ab[4*r+0], Bjk[4*c+0], sum);
-            sum = fma(Ab[4*r+1], Bjk[4*c+1], sum);
-            sum = fma(Ab[4*r+2], Bjk[4*c+2], sum);
-            sum = fma(Ab[4*r+3], Bjk[4*c+3], sum);
+            s0 = fma(Ab[4*r+0], Bjk[4*c+0], s0);
+            s1 = fma(Ab[4*r+1], Bjk[4*c+1], s1);
+            s2 = fma(Ab[4*r+2], Bjk[4*c+2], s2);
+            s3 = fma(Ab[4*r+3], Bjk[4*c+3], s3);
         }
 
-        C[cb*BS2 + lane] = sum;
+        C[cb*BS2 + lane] = bad ? NAN : (s0 + s1) + (s2 + s3);
     }
 }
 
@@ -763,6 +766,12 @@ __kernel void bsr4_build_Hscc(
 
     __global const float* V_atom,
 
+    // Physical orbitals per atom (1 or 4). The SCC shift applies ONLY to
+    // physical (i_r < n_orb[i], j_c < n_orb[j]) lanes — dummy lanes keep H0
+    // (E_DUMMY on dummy diagonals, zero elsewhere). Applying ½S·(V_i+V_j) to
+    // dummy lanes would pollute the padded space (second review R13).
+    __global const uint* n_orb,
+
     __global float* H
 ){
     const uint i   = get_group_id(0);
@@ -781,6 +790,7 @@ __kernel void bsr4_build_Hscc(
 
 
     __local float lVj[MAX_LEFT_BLOCKS];
+    __local uint  lNj[MAX_LEFT_BLOCKS];
     __local float lVi;
 
 
@@ -796,10 +806,15 @@ __kernel void bsr4_build_Hscc(
 
         lVj[k] =
             V_atom[j];
+        lNj[k] =
+            n_orb[j];
     }
     barrier(CLK_LOCAL_MEM_FENCE);
     const uint team = lid >> 4;
     const uint lane = lid & 15;
+    const uint lr   = lane >> 2;   // row within 4x4 block
+    const uint lc   = lane & 3;    // col within 4x4 block
+    const uint ni   = n_orb[i];
     for(uint bl=team; bl<nb; bl+=NTEAM){
 
         const uint b = b0+bl;
@@ -818,13 +833,15 @@ __kernel void bsr4_build_Hscc(
             +
             lane;
 
+        const bool active = (lr < ni) && (lc < lNj[bl]);
 
-        H[p] =
-            fma(
+        H[p] = active
+            ? fma(
                 S[p],
                 dV,
                 H0[p]
-            );
+            )
+            : H0[p];
     }
 }
 
@@ -844,6 +861,12 @@ __kernel void bsr4_build_Hscc(
 //
 // ============================================================================
 
+// Physical-orbital masked Mulliken (second review R14): only lanes
+// d < n_orb[i] are physical; the rest are padded dummies that must not
+// contribute to the charge. `q_dum[i]` reports the dummy-lane diagonal
+// content of KS — a leak/occupation diagnostic (should be ~0).
+// Packed output (F7): q_pack[i] = q_phys, q_pack[nrow+i] = q_dum — one
+// device buffer, one host read for both.
 __kernel void bsr4_mulliken_KS(
     const uint nrow,
 
@@ -851,7 +874,9 @@ __kernel void bsr4_mulliken_KS(
 
     __global const float* KS,
 
-    __global float* q
+    __global const uint* n_orb,
+
+    __global float* q_pack
 ){
     const uint i =
         get_global_id(0);
@@ -866,17 +891,15 @@ __kernel void bsr4_mulliken_KS(
     __global const float* X =
         KS + b*BS2;
 
-
-    q[i] =
-        2.0f*(
-            X[0]
-            +
-            X[5]
-            +
-            X[10]
-            +
-            X[15]
-        );
+    const uint ni = n_orb[i];
+    float qp = 0.0f;
+    float qd = 0.0f;
+    for(uint d = 0; d < BS; d++){
+        const float v = X[d * BS + d];
+        if(d < ni){ qp += v; } else { qd += v; }
+    }
+    q_pack[i]        = 2.0f * qp;
+    q_pack[nrow + i] = 2.0f * qd;
 }
 
 
@@ -894,6 +917,8 @@ __kernel void bsr4_mulliken_KS(
 //
 // ============================================================================
 
+// Physical-orbital masked trace (second review R14): sums only diagonal
+// lanes d < n_orb[i] — padded dummy lanes do not count toward Tr(KS)=Nocc.
 __attribute__((reqd_work_group_size(REDUCE_WG,1,1)))
 __kernel void bsr4_trace_KS_partial(
     const uint nrow,
@@ -901,6 +926,8 @@ __kernel void bsr4_trace_KS_partial(
     __global const uint* diag_block,
 
     __global const float* KS,
+
+    __global const uint* n_orb,
 
     __global float* partial
 ){
@@ -933,15 +960,10 @@ __kernel void bsr4_trace_KS_partial(
         __global const float* X =
             KS + b*BS2;
 
-
-        sum +=
-            X[0]
-            +
-            X[5]
-            +
-            X[10]
-            +
-            X[15];
+        const uint ni = n_orb[i];
+        for(uint d = 0; d < ni; d++){
+            sum += X[d * BS + d];
+        }
     }
 
 
@@ -972,6 +994,119 @@ __kernel void bsr4_trace_KS_partial(
         partial[get_group_id(0)] =
             buf[0];
     }
+}
+
+
+// ============================================================================
+// TRACE Tr(K·H0) OVER THE H/S SUPPORT  (sparse masked band energy, review R7)
+//
+//   Tr(K·H0) = Σ_{(i,j)∈M_HS} <K_ji, H_ij>_F
+//
+// `hs_to_kT[b]` maps an M_HS block (i,j) to the M_K block index of the
+// *transposed* block (j,i), or −1 if (j,i) is outside M_K (contributes 0 —
+// consistent with K truncation on M_K). One FMA per stored element.
+// ============================================================================
+
+__attribute__((reqd_work_group_size(REDUCE_WG,1,1)))
+__kernel void bsr4_trace_hk_partial(
+    const uint nblock_hs,
+
+    __global const float* H,        // values on M_HS
+    __global const float* K,        // values on M_K
+    __global const int* hs_to_kT,   // hs block -> k block of (j,i), or -1
+
+    __global float* partial
+){
+    const uint lid =
+        get_local_id(0);
+    const uint gid =
+        get_global_id(0);
+    const uint gsize =
+        get_global_size(0);
+
+    __local float buf[REDUCE_WG];
+    float sum = 0.0f;
+
+    for(uint idx = gid; idx < nblock_hs * BS2; idx += gsize){
+        const uint b = idx / BS2;
+        const int kb = hs_to_kT[b];
+        if(kb < 0) continue;
+        const uint lane = idx % BS2;
+        const uint r = lane / BS;
+        const uint c = lane % BS;
+        // K_ji[c,r] pairs with H_ij[r,c]
+        sum += H[idx] * K[(uint)kb * BS2 + c * BS + r];
+    }
+
+    buf[lid] = sum;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for(uint step = REDUCE_WG >> 1; step > 0; step >>= 1){
+        if(lid < step){ buf[lid] += buf[lid + step]; }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if(lid == 0){ partial[get_group_id(0)] = buf[0]; }
+}
+
+
+// ============================================================================
+// FROBENIUS NORM²  (for normalized residuals, review R12)
+//
+//   partial reduction of ||X||_F² = Σ_l x_l² over the whole values array.
+// ============================================================================
+
+__attribute__((reqd_work_group_size(REDUCE_WG,1,1)))
+__kernel void bsr4_frobenius_sq_partial(
+    const uint n,
+
+    __global const float* x,
+
+    __global float* partial
+){
+    const uint lid =
+        get_local_id(0);
+    const uint gid =
+        get_global_id(0);
+    const uint gsize =
+        get_global_size(0);
+
+    __local float buf[REDUCE_WG];
+    float sum = 0.0f;
+    for(uint idx = gid; idx < n; idx += gsize){
+        sum += x[idx] * x[idx];
+    }
+
+    buf[lid] = sum;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for(uint step = REDUCE_WG >> 1; step > 0; step >>= 1){
+        if(lid < step){ buf[lid] += buf[lid + step]; }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if(lid == 0){ partial[get_group_id(0)] = buf[0]; }
+}
+
+
+// ============================================================================
+// RESTRICT / PROJECT VALUES BETWEEN MASKS  (Z on M_Z → Z|M_K for K0, R8b)
+//
+//   out[b] = in[map[b]]   if map[b] >= 0   (map: out-block -> in-block)
+//   out[b] = 0            otherwise
+//
+// Gather-only copy; used to project Z (on M_Z) onto M_K for the K0 axpby.
+// ============================================================================
+
+__kernel void bsr4_restrict(
+    const uint nblock_out,
+
+    __global const int* map,
+    __global const float* in,
+
+    __global float* out
+){
+    const uint idx = get_global_id(0);
+    if(idx >= nblock_out * BS2) return;
+    const uint b = idx / BS2;
+    const int src = map[b];
+    out[idx] = (src < 0) ? 0.0f : in[(uint)src * BS2 + (idx % BS2)];
 }
 
 
@@ -1425,21 +1560,22 @@ __kernel void reduce_max_f32(
     if (lid == 0) out[get_group_id(0)] = buf[0];
 }
 
-// Build identity matrix on the device: I[i,i] = 1 on diagonal blocks,
-// 0 elsewhere. Uses diag_block map to find diagonal blocks.
-// Each work-item handles one element of one diagonal block.
+// Build identity matrix on the device: I = 1 on diagonal-block diagonal
+// lanes, 0 **everywhere else**. Writes EVERY structural entry — a cold
+// restart must not leave stale off-diagonal values in a persistent buffer
+// (second review R6 / old N4 stale-Z bug).
+// Each work-item handles one element of the values array.
 __kernel void bsr4_build_identity_dev(
-    const uint n_atom,
-    __global const uint* diag_block,
+    const uint nblock,
+    __global const uint* diag_flag,
     __global float* values
 ){
     const uint idx = get_global_id(0);
-    if (idx >= n_atom * BS2) return;
-    const uint i = idx / BS2;
+    if (idx >= nblock * BS2) return;
+    const uint b = idx / BS2;
     const uint lane = idx % BS2;
-    const uint blk = diag_block[i];
-    // Identity: 1.0 on diagonal elements (lane 0, 5, 10, 15), 0.0 elsewhere.
-    values[blk * BS2 + lane] = (lane == 0u || lane == 5u || lane == 10u || lane == 15u) ? 1.0f : 0.0f;
+    const bool is_diag_lane = (lane == 0u || lane == 5u || lane == 10u || lane == 15u);
+    values[idx] = (diag_flag[b] && is_diag_lane) ? 1.0f : 0.0f;
 }
 
 // Scale all elements of a BSR4 values buffer by a scalar alpha.
