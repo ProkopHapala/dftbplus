@@ -512,6 +512,89 @@ __kernel void bsr4_spgemm_plan_Bsym(
 
 
 // ============================================================================
+// SYMBOLIC SpGEMM PLAN — GENERIC variant (no symmetry assumed)
+//
+// Same plan layout as bsr4_spgemm_plan_Bsym, but `plan_b_idx[t]` indexes
+// the DIRECT block B_kj (not B_jk^T) — the plan builder must therefore
+// store the position of (k,j) in B's CSR. Used for the P=KS purifier:
+//   P² = P·P    (P non-symmetric; GPT-5.6 item 4)
+// ============================================================================
+
+__attribute__((reqd_work_group_size(WG,1,1)))
+__kernel void bsr4_spgemm_plan(
+    const uint nrow,
+
+    __global const uint*  A_row,
+    __global const float* A,
+
+    __global const float* B,
+    __global const uint*  plan_ptr,
+    __global const uint*  plan_a_idx,
+    __global const uint*  plan_b_idx,
+
+    __global const uint*  C_row,
+    __global float*       C
+){
+    const uint i   = get_group_id(0);
+    const uint lid = get_local_id(0);
+
+    if(i >= nrow) return;
+
+    const uint a0 = A_row[i];
+    const uint a1 = A_row[i+1];
+    const uint na = a1-a0;
+
+    if(na > MAX_LEFT_BLOCKS) return;
+
+    __local float lA[MAX_LEFT_BLOCKS*BS2];
+
+    for(uint t=lid; t<na*BS2; t+=WG){
+        lA[t] = A[a0*BS2+t];
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    const uint team = lid >> 4;
+    const uint lane = lid & 15;
+    const uint r = lane >> 2;
+    const uint c = lane & 3;
+
+    const uint c0 = C_row[i];
+    const uint c1 = C_row[i+1];
+
+    for(uint cb=c0+team; cb<c1; cb+=NTEAM){
+
+        const uint t0 = plan_ptr[cb];
+        const uint t1 = plan_ptr[cb+1];
+
+        float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+        bool bad = false;
+
+        for(uint t=t0; t<t1; ++t){
+
+            const uint ia = plan_a_idx[t];
+            const uint bb = plan_b_idx[t];
+
+            if(ia >= na){
+                bad = true;
+                break;
+            }
+
+            __local const float* Ab  = lA + ia*BS2;
+            __global const float* Bkj = B + bb*BS2;
+
+            // C_ij[r,c] += sum_m A_ik[r,m] * B_kj[m,c]  (direct, no transpose)
+            s0 = fma(Ab[4*r+0], Bkj[4*0+c], s0);
+            s1 = fma(Ab[4*r+1], Bkj[4*1+c], s1);
+            s2 = fma(Ab[4*r+2], Bkj[4*2+c], s2);
+            s3 = fma(Ab[4*r+3], Bkj[4*3+c], s3);
+        }
+
+        C[cb*BS2 + lane] = bad ? NAN : (s0 + s1) + (s2 + s3);
+    }
+}
+
+
+// ============================================================================
 // SIMPLE ELEMENTWISE OPERATIONS
 // ============================================================================
 
@@ -617,15 +700,18 @@ __kernel void bsr4_mcweeny(
 //
 // ============================================================================
 
+// GPT-5.6 item 2: the TC2 branch is a DISCRETE DECISION — it is made on
+// the host from an f64 trace (per-atom partials, see bsr4_trace_atom) and
+// passed in as a flag. A device-side f32 comparison of the reduced trace
+// against Nocc could flip on ~1e-5 reduction noise; a wrong flip can be
+// catastrophic (λ>1 under the squaring branch diverges).
 __kernel void bsr4_tc2(
     const uint nblock,
 
     __global const float* K,
     __global const float* Q_KSK,
 
-    __global const float* trace_KS,
-
-    const float Nocc,
+    const uint branch,   // host f64 decision: 1 → Knew=Q, 0 → Knew=2K−Q
 
     __global float* Knew
 ){
@@ -638,7 +724,7 @@ __kernel void bsr4_tc2(
     const float q = Q_KSK[i];
 
 
-    if(trace_KS[0] > Nocc){
+    if(branch != 0u){
 
         Knew[i] = q;
 
@@ -994,6 +1080,43 @@ __kernel void bsr4_trace_KS_partial(
         partial[get_group_id(0)] =
             buf[0];
     }
+}
+
+
+// ============================================================================
+// PER-ATOM TRACE CONTRIBUTIONS  (GPT-5.6 item 2: f64 host trace)
+//
+//   trace_atom[i] = Σ_{d < n_orb[i]}  T_{ii}[d,d]
+//
+// One thread per atom; each atom contributes ≤BS physical diagonal lanes
+// so the f32 per-atom sum is essentially exact. The host reads the N_atom
+// floats and reduces them in f64 — the trace/branch decision then carries
+// f64 precision instead of a single f32 tree reduction. Cost: N_atom
+// floats of readback (~6.6 kB at 1648 atoms) where a sync already exists.
+// ============================================================================
+
+__kernel void bsr4_trace_atom(
+    const uint nrow,
+
+    __global const uint* diag_block,
+
+    __global const float* T,
+
+    __global const uint* n_orb,
+
+    __global float* trace_atom
+){
+    const uint i = get_global_id(0);
+    if(i >= nrow) return;
+
+    const uint b = diag_block[i];
+    __global const float* X = T + b*BS2;
+    const uint ni = n_orb[i];
+    float sum = 0.0f;
+    for(uint d = 0; d < ni; d++){
+        sum += X[d * BS + d];
+    }
+    trace_atom[i] = sum;
 }
 
 

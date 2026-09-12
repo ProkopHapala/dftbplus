@@ -713,3 +713,129 @@ yet → parity at d=1.9 is UNVERIFIED until that exists.
    rotation (all three independent, in that order of safety).
 4. relax(): cache last eigensystem, drop the eval-for-logging
    eigensolve.
+
+## 2026-09-13 — Architecture streamlining A1–A4 + B1/B2 done (GPU solver is now lean, warm, and honest-smeared)
+
+All changes live in `rust_dftb/src/qmqm/` (+ `dftb_cpu.rs` for B2). Verified on
+RTX 3090, GC batch-19 + AT/H2O/formic batch-1.
+
+### A1 — SCC commit model (`q_next`)
+
+`q_gpu` is the committed charge state; mixers write `q_next`; `q_next` is
+committed to `q_gpu` only when another iteration is needed. eval()/relax()
+reuse the cached electronic state (H, C, D, ε) — the redundant
+"eigensolve-for-logging" is gone. **Measured: energies/forces identical
+to the pre-A1 path, no stale-state bugs.**
+
+### A2 — Direct cyclic Jacobi replaces the tiled Jacobi for N>64
+
+New kernel `jacobi_cyclic_global_batched` in `gpu_tiled_jacobi.cl`:
+Brent–Luk round-robin, JN−1 rounds × JN/2 disjoint pairs, global-memory
+`A←JᵀAJ` + `V←VJ`, f64 only for scalar c/s, relative pair-skip, exit on
+‖A_off‖/‖A‖_F < ε with an all-skip round counting as *one more round*, not
+convergence. Old `jacobi_tiled_global_batched` kept (marked DEPRECATED) for
+reference. The 16k-barrier strip/pivot machinery is bypassed entirely.
+
+### A3 — Warm AO-basis eigensolver
+
+SCC iterations now solve `A = Bᵀ H_scc B` where B is the AO-space eigenbasis
+from the previous iteration (BᵀSB≈I). Two `batched_gemm` calls replace the
+XᵀHX projection; Jacobi rotates B in place (`init_v=1`). On geometry change
+B is metric-repaired with the same Newton/Löwdin loop as X; if repair misses
+tolerance the solve falls back to cold (XᵀHX, `init_v=0`). New kernel
+`snormalize_batched` does S-metric column normalization (the old
+`occ_normalize` was Euclidean — wrong metric for AO-space vectors).
+**Measured GC batch-19: warm SCC call 1.27 ms (was ~8 ms), eval+forces
+0.73 ms, FIRE step 10.4 ms.** Cold fallback observed on the largest
+geometry jumps (‖BᵀSB−I‖ up to 2.7e-3 → rebuild), succeeds at ~1e-7 for
+moderate steps — correct behaviour, loud logging kept.
+
+### A4 — `active[sid]` device mask on the whole SCC loop
+
+Every per-replica SCC kernel now takes `__global const int* active` as its
+last arg and early-outs when `active[sid]==0`: jacobi, fused dq→V→H_scc,
+extract_diag, select_occupation, density, occ renorm/snorm, rayleigh,
+mulliken, residual+mix, commit. Frozen replicas keep *all* of q, H_scc, C,
+D, eig, W — the solved state is never overwritten by later iterations.
+`finalize()` (eval/forces/measure) calls `activate_all()` first so the
+mask is purely an SCC-loop construct; S-matrix Jacobi and Löwdin GEMMs bind
+a dedicated all-ones buffer (`ones`) — they must never gate. GEMM
+(`batched_gemm`) is intentionally ungated: it is shared with
+`gpu_matrix.rs` helpers and the Löwdin path, and its per-replica cost is
+small next to Jacobi.
+
+### B1 — Mermin free energy + Rayleigh ρ for all weighted columns
+
+`energy_from_state` under smearing now reports F = E_band − TS with
+`−TS = 2kT·Σ[f ln f + (1−f)ln(1−f)]` and `E_band = 2Σ f_k ρ_k`. The
+rayleigh kernel got a `use_w` flag computing ρ for every column with
+f_k>0 (was: occ_mask only — the D1 ε-vs-ρ error was re-appearing at the
+fractional frontier). W (EDM) uses ρ under smearing too. Rayleigh now
+also enqueues at the end of each scc step (needed for the A1 cached-state
+energy path — previously only finalize computed ρ → stale on eval after
+converged SCC).
+
+### B2 — `DftbCpu` Fermi smearing (f64 reference)
+
+`set_smearing(kT)` on `DftbCpu`: host f64 bisection for μ on the dsyevd
+eigenvalues (80 iters, bracket ε_min−32kT..ε_max+32kT), fractional Mulliken
+`p_μ = 2Σ_k f_k·C_μk·(SC)_μk` over all orbitals, fractional D/W in
+`build_result`, energy = Tr(D·H0) + ½ΔqV − TS. `cpu_ref()` (the
+`gpu_cpu_energy` Rhai binding and the `[measure] CPU` comparison) inherits
+`plan.kT` — the CPU reference is now smeared exactly like the GPU.
+
+### Verified numbers after A1–A4 + B1/B2
+
+- **d=1.9 far-transfer GC (the pathological point):** GPU smeared kT=0.002
+  converges in 24 iters (rms=6.4e-7). E_GPU = −44.821318 Ha,
+  E_CPU(smeared f64) = −44.821316 Ha → **|dE| = 1.7e-6 Ha**. This is the
+  first smeared GPU↔CPU parity at the geometry where integer-occupation
+  SCC limit-cycles in f64 on both sides.
+- **Integer-occ regression (unchanged paths):** H2O dE=2.4e-7 /
+  max|ΔF|=2.1e-6; AT N=87 dE=1.8e-6 / max|ΔF|=3.1e-6; formic dimer scan
+  |ΔE_gpu−ΔE_cpu| ≤ 3.3e-7 at all 5 points. All converged, no fallbacks
+  in new code.
+- **Timing (GC batch-19):** warm SCC 1.27 ms, eval+forces 0.73 ms,
+  FIRE step ~10 ms, eval 0.95 ms. FIRE is still dominated by the
+  host→device geometry upload + repulsive spline evaluation (open: keep
+  x,v,F device-resident).
+
+### Still open
+
+- `batched_gemm` active-gating (SCC-loop GEMMs still run for frozen
+  replicas — small cost, correctness preserved).
+- DIIS pivot/scale fallbacks (reason=1) still frequent in batch mode —
+  conditioning issue, not hidden.
+- Constrained relaxed proton-transfer scan (reaction-coordinate
+  constraint) + fully device-resident FIRE.
+- `run_dftb_scc` / `MultiSystemSolver` (the fragment CPU path) has no
+  smearing — B2 covers `DftbCpu` only.
+
+## D13 — device-resident FIRE + distance constraint (gpu_forces.cl, gpu_dftb.rs)
+
+**Review correction:** implementation exists, but correctness/throughput acceptance is OPEN. See `HBond_Relaxed_Scan_GPU.manifest..md` **§13** for the source-grounded review and ordered implementation tickets. The earlier claims “integrator correct”, “physics, not architecture”, “only scalar FIRE traffic”, and “no per-step allocation” were overstated. No new measurements were run for this review.
+
+### Implemented structure, not a certification
+
+- `fire_reduce_batched` and `fire_apply_batched` use persistent device coordinates, velocities and forces; host f64 `dt/alpha/n_pos` decisions use a compact stat/control exchange. The entire FIRE/SCC loop also has overlap-repair and occupation/energy readbacks; it is not just this exchange.
+- Frozen-mask and single distance-constraint projection are present. Frozen force components currently still enter the FIRE norm, and one-frozen-endpoint projection needs correction (review R4).
+- The current device displacement uses an already-kicked velocity plus another `0.5*F*dt²`; it does not match the stated CPU kick–drift convention (R3).
+- Warm AO-basis repair precedes lazy X/Xt rebuilding. Per-replica repair/validity handling and small readbacks still need work.
+- `set_constraint`, `gpu_set_constraint`, `gpu_freeze_atoms`, `sync_coords_to_host` and `gpu_get_coords` expose the new state/constraint functionality. Device coordinates are synchronized lazily for host consumers.
+- Scan acceptor corrected 21→20; the debug rendering identifies atom 20 as N and 21 as C. The constraint is donor–H distance, not a fixed Cartesian proton position or fixed donor–acceptor axis.
+
+### Historical observations — retain the numbers, narrow the conclusions
+
+- `diag_relax_eq`: undisplaced GC reached max|F|=9.96e-4 in 50 steps, E=−44.927796 Ha, CPU energy difference 8.4e-7 Ha and max force difference 6.6e-6. This supports final-state single-replica parity only.
+- `diag_fire_ab`: after 30 steps, the final coordinates across 19 replicas had max|r−d|=1.3e-7 Å (another run 1.6e-7 Å); freeze-mode drift reached ~0.22 Å and free-mode ~0.6 Å. The script does not check constraint residual at each intermediate step.
+- `diag_step_cost`: historical warm SCC 1.67 ms, eval+forces 0.69 ms, fire_step 9.7→5.5 ms, eval-only 1.13 ms. Its consecutive moves omit intervening SCC, so this is not a certified relaxation performance comparison.
+- One ptscan run took 3.2 s for 150 steps × 19 points, scc_iters≈7, energies −44.87…−44.92 Ha, but final max|F|≈0.238 Ha/Å was far above the requested 1e-3. Other runs took ~28 s and failed SCC. Neither is an accepted relaxed PES; the small sample does not establish a success probability.
+
+### Blocking findings from source review
+
+- **R1:** `build_edm` reuses the SCC-active density kernel. Early-converged replicas can retain stale/zero W while force kernels consume it. This is a concrete implementation defect and a strong lead for the batch-dependent trajectories; causal attribution of every historical failure remains untested.
+- **R2:** SCC retry merges better status labels without restoring corresponding physical state; array-index neighbor seeding couples otherwise independent replicas. Parking/status output is not sufficient certification.
+- **R3/R4:** FIRE discretization, frozen-DOF reductions and constraint validation need explicit one-step tests before parameter tuning.
+- **R5:** production uses direct global cyclic Jacobi, whereas the old precision benchmark launches deprecated tiled Jacobi; the old sweep override does not control `MAX_CSWEEPS`. Capacity and stop-state reporting need correction.
+
+Do not attribute the divergence to atomic-order noise or a physical basin without a first-divergent-buffer comparison. Do not resume production scans or claim completion until these contracts are validated and the USER confirms acceptance.

@@ -941,3 +941,207 @@ __kernel void force_repulsive_batched(
         atomic_add_f32(&frc[j*3+2], -fz);
     }
 }
+
+// ═══ FIRE dynamics — device-resident (D13) ════════════════════════════
+//
+// Positions, velocities, forces and the constraint live on the device.
+// The HOST orchestrates: per step it enqueues `fire_reduce_batched`,
+// reads back 4·batch floats, makes the adaptivity decisions in f64
+// (dt, α, n_pos, park/reset — the decision quantities), uploads
+// 4·batch control floats, and enqueues `fire_apply_batched`. No force
+// array or coordinate array ever crosses PCIe inside the loop.
+//
+// stat[4*sid] = {P = F·v, ‖v‖², ‖F‖², max|F|(unfrozen)}
+// ctl [4*sid] = {dt, alpha, mode, _pad};  mode: 0=normal, 1=parked
+//               (v=0, x untouched), 2=v-reset (v←0 then normal update).
+//
+// Distance constraint |x_cj − x_ci| = d (gc=constraint gradient r̂):
+// the Lagrange reaction force MUST be projected out of F BEFORE the
+// FIRE update — otherwise the stretched-bond radial force (the
+// constraint's own reaction, not an optimizable force) drives v each
+// step while the position projection snaps x back → energy injection.
+// With equal (unit) masses:  F_i += wi·f_r·r̂,  F_j -= wj·f_r·r̂,
+// f_r = (F_j−F_i)·r̂,  wi+wj = 1 (0/1 if one endpoint is frozen).
+// The convergence test and P must use these PROJECTED forces.
+
+// Per-replica constraint geometry: returns unit bond vector and the
+// projected radial force f_r = (F_j−F_i)·r̂ (out params via pointers).
+inline float3 constr_axis(
+    __global const float* xa, int ci, int cj,
+    __global const float* fb, float wi, float wj,
+    float* f_r
+) {
+    float3 u;
+    u.x = xa[3*cj] - xa[3*ci];
+    u.y = xa[3*cj+1] - xa[3*ci+1];
+    u.z = xa[3*cj+2] - xa[3*ci+2];
+    float r = sqrt(u.x*u.x + u.y*u.y + u.z*u.z);
+    if (r < 1.0e-12f) { *f_r = 0.0f; return (float3)(0.0f); }
+    u /= r;
+    *f_r = ((fb[3*cj]-fb[3*ci])*u.x + (fb[3*cj+1]-fb[3*ci+1])*u.y + (fb[3*cj+2]-fb[3*ci+2])*u.z);
+    return u;
+}
+
+__kernel void fire_reduce_batched(
+    const int n_atoms,
+    __global const float* F,        // [batch][3n]
+    __global const float* V,        // [batch][3n]
+    __global const float* Xa,       // [batch][3n] positions Å (for ∇g)
+    __global const int* frozen,     // [n_atoms] 1 → pinned
+    const int c_on, const int ci, const int cj,
+    __global float* stat            // [batch][4] out
+) {
+    const int sid = get_group_id(0);
+    const int lid = get_local_id(0);
+    const int lsz = get_local_size(0);
+    const int n3 = 3 * n_atoms;
+    __global const float* fb = F + (size_t)sid * n3;
+    __global const float* vb = V + (size_t)sid * n3;
+    __global const float* xa = Xa + (size_t)sid * n3;
+    __local float red[4 * 256];
+    __local float3 l_u;
+    __local float  l_fr, l_wi, l_wj;
+
+    // constraint geometry (one thread) — projected radial force on ci/cj
+    if (lid == 0) {
+        float wi = frozen[ci] ? 0.0f : 0.5f, wj = frozen[cj] ? 0.0f : 0.5f;
+        float ws = wi + wj; if (ws > 0.0f) { wi /= ws; wj /= ws; }
+        l_wi = wi; l_wj = wj; l_fr = 0.0f; l_u = (float3)(0.0f);
+        if (c_on && ws > 0.0f) l_u = constr_axis(xa, ci, cj, fb, wi, wj, &l_fr);
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    const float3 u = l_u; const float fr = l_fr;
+    const float wi = l_wi, wj = l_wj;
+
+    float p = 0.0f, v2 = 0.0f, f2 = 0.0f, mf = 0.0f;
+    for (int a = lid; a < n_atoms; a += lsz) {
+        float fx = fb[3*a], fy = fb[3*a+1], fz = fb[3*a+2];
+        // projected forces at the constrained endpoints
+        if (c_on && a == ci) { fx += wi*fr*u.x; fy += wi*fr*u.y; fz += wi*fr*u.z; }
+        if (c_on && a == cj) { fx -= wj*fr*u.x; fy -= wj*fr*u.y; fz -= wj*fr*u.z; }
+        float vx = vb[3*a], vy = vb[3*a+1], vz = vb[3*a+2];
+        p  += fx*vx + fy*vy + fz*vz;
+        v2 += vx*vx + vy*vy + vz*vz;
+        f2 += fx*fx + fy*fy + fz*fz;
+        if (!frozen[a]) mf = fmax(mf, fmax(fabs(fx), fmax(fabs(fy), fabs(fz))));
+    }
+    red[lid] = p; red[lsz + lid] = v2; red[2*lsz + lid] = f2; red[3*lsz + lid] = mf;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int off = lsz >> 1; off > 0; off >>= 1) {
+        if (lid < off) {
+            red[lid]          += red[lid + off];
+            red[lsz + lid]    += red[lsz + lid + off];
+            red[2*lsz + lid]  += red[2*lsz + lid + off];
+            red[3*lsz + lid]   = fmax(red[3*lsz + lid], red[3*lsz + lid + off]);
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (lid == 0) {
+        stat[4*sid+0] = red[0]; stat[4*sid+1] = red[lsz];
+        stat[4*sid+2] = red[2*lsz]; stat[4*sid+3] = red[3*lsz];
+    }
+}
+
+__kernel void fire_apply_batched(
+    const int n_atoms,
+    __global float* V,            // [batch][3n] velocities, in/out
+    __global const float* F,      // [batch][3n] forces
+    __global float* Xa,           // [batch][3n] positions Å, in/out
+    __global float* Xb,           // [batch][3n] positions Bohr, out
+    __global const int* frozen,   // [n_atoms] 1 → pinned
+    __global const float* ctl,    // [batch][4] {dt, alpha, mode, _}
+    __global const float* stat,   // [batch][4] {P, v², F², maxF}
+    const int c_on,               // 1 → distance constraint active
+    const int ci, const int cj,   // constrained atom pair (template idx)
+    __global const float* cd,     // [batch] target distance (Å)
+    const float vmax, const float dmax
+) {
+    const int sid = get_group_id(0);
+    const int lid = get_local_id(0);
+    const int lsz = get_local_size(0);
+    const int n3 = 3 * n_atoms;
+    __global float* vb = V + (size_t)sid * n3;
+    __global const float* fb = F + (size_t)sid * n3;
+    __global float* xa = Xa + (size_t)sid * n3;
+    __global float* xb = Xb + (size_t)sid * n3;
+
+    const float dt = ctl[4*sid], alpha = ctl[4*sid+1];
+    const int mode = (int)(ctl[4*sid+2] + 0.5f);
+    if (mode == 1) {                                   // parked/converged
+        for (int i = lid; i < n3; i += lsz) vb[i] = 0.0f;
+        return;
+    }
+    // mode 2 (v-reset after P≤0): host sets alpha=0 → mix term vanishes;
+    // we still must zero v so it does not carry over.
+    const float vnorm = sqrt(stat[4*sid+1]);
+    const float fnorm = sqrt(fmax(stat[4*sid+2], 1.0e-24f));
+    const float mix_s = alpha * vnorm / fnorm;
+
+    // constraint geometry (pre-move positions — same as reduce saw)
+    __local float3 l_u;
+    __local float  l_fr, l_wi, l_wj;
+    if (lid == 0) {
+        float wi = frozen[ci] ? 0.0f : 0.5f, wj = frozen[cj] ? 0.0f : 0.5f;
+        float ws = wi + wj; if (ws > 0.0f) { wi /= ws; wj /= ws; }
+        l_wi = wi; l_wj = wj; l_fr = 0.0f; l_u = (float3)(0.0f);
+        if (c_on && ws > 0.0f) l_u = constr_axis(xa, ci, cj, fb, wi, wj, &l_fr);
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    const float3 u = l_u; const float fr = l_fr;
+    const float wi = l_wi, wj = l_wj;
+
+    for (int a = lid; a < n_atoms; a += lsz) {
+        if (frozen[a]) {
+            vb[3*a] = vb[3*a+1] = vb[3*a+2] = 0.0f;    // pinned: v=0, x fixed
+            xb[3*a]   = xa[3*a]   * ANG2BOHR_F;        // keep Bohr copy current
+            xb[3*a+1] = xa[3*a+1] * ANG2BOHR_F;
+            xb[3*a+2] = xa[3*a+2] * ANG2BOHR_F;
+            continue;
+        }
+        // force with the constraint reaction projected out
+        float3 fe = (float3)(fb[3*a], fb[3*a+1], fb[3*a+2]);
+        if (c_on && a == ci) fe += wi * fr * u;
+        if (c_on && a == cj) fe -= wj * fr * u;
+        float v[3], d[3];
+        for (int c = 0; c < 3; ++c) {
+            int k = 3*a + c;
+            float fc = (c == 0) ? fe.x : (c == 1) ? fe.y : fe.z;
+            float vv = (mode == 2) ? 0.0f : vb[k];
+            vv = (1.0f - alpha) * vv + mix_s * fc + fc * dt;
+            vv = clamp(vv, -vmax, vmax);          // per-component |v| cap
+            vb[k] = vv;
+            v[c] = vv;
+            d[c] = vv * dt + 0.5f * fc * dt * dt; // v·dt + ½F·dt²
+        }
+        float dnorm = sqrt(d[0]*d[0] + d[1]*d[1] + d[2]*d[2]);
+        float dsc = (dnorm > dmax) ? dmax / dnorm : 1.0f;   // |Δx| cap (Å)
+        for (int c = 0; c < 3; ++c) {
+            int k = 3*a + c;
+            float x = xa[k] + dsc * d[c];
+            xa[k] = x;
+            xb[k] = x * ANG2BOHR_F;
+        }
+    }
+    barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
+
+    // Position + velocity projection onto the constraint surface
+    // |x_cj − x_ci| = cd[sid] — single constraint, closed form (no SHAKE
+    // iteration needed). Same weighting as the force projection.
+    if (c_on && lid == 0) {
+        float rx = xa[3*cj]   - xa[3*ci];
+        float ry = xa[3*cj+1] - xa[3*ci+1];
+        float rz = xa[3*cj+2] - xa[3*ci+2];
+        float r = sqrt(rx*rx + ry*ry + rz*rz);
+        if (r > 1.0e-12f && (wi + wj) > 0.0f) {
+            float g = (r - cd[sid]) / r;          // constraint violation /r
+            xa[3*ci]   += wi * g * rx;  xa[3*ci+1] += wi * g * ry;  xa[3*ci+2] += wi * g * rz;
+            xa[3*cj]   -= wj * g * rx;  xa[3*cj+1] -= wj * g * ry;  xa[3*cj+2] -= wj * g * rz;
+            xb[3*ci] = xa[3*ci]*ANG2BOHR_F; xb[3*ci+1] = xa[3*ci+1]*ANG2BOHR_F; xb[3*ci+2] = xa[3*ci+2]*ANG2BOHR_F;
+            xb[3*cj] = xa[3*cj]*ANG2BOHR_F; xb[3*cj+1] = xa[3*cj+1]*ANG2BOHR_F; xb[3*cj+2] = xa[3*cj+2]*ANG2BOHR_F;
+            float ux = rx / r, uy = ry / r, uz = rz / r;
+            float vr = (vb[3*cj]-vb[3*ci])*ux + (vb[3*cj+1]-vb[3*ci+1])*uy + (vb[3*cj+2]-vb[3*ci+2])*uz;
+            vb[3*ci]   += wi * vr * ux;  vb[3*ci+1] += wi * vr * uy;  vb[3*ci+2] += wi * vr * uz;
+            vb[3*cj]   -= wj * vr * ux;  vb[3*cj+1] -= wj * vr * uy;  vb[3*cj+2] -= wj * vr * uz;
+        }
+    }
+}

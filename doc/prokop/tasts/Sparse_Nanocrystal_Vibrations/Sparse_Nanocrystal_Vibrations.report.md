@@ -1,5 +1,7 @@
 # Sparse Nanocrystal Vibrations — Implementation Report
 
+> **Current review correction:** read manifest **§15** before using the later Item 5/6/7 conclusions. W=2(ZH)K still consumes truncated ZH; the quartic clamp is not a certified stability invariant; TRS G3.4 remains red; and the histogram's 3% row-norm budget is 0.09% squared norm mass, not 3% mass or a force-error bound. The ~61-neighbor result lacks symmetric-mask/re-solved force validation. Earlier results are retained as history, not current acceptance. §15 provides the prioritized sparse-only coding-agent instructions; this review made no implementation changes and ran no new benchmarks.
+
 ## Status as of 2025-01-XX
 
 **Repository:** `/home/prokop/git/dftbplus`
@@ -922,3 +924,299 @@ axis.
    stalls at 1e-3).
 4. Then re-run the 330 / 864 / 1648-atom ladder and only then quote
    energies.
+
+## 2026-09-12 (b) — GPT-5.6 review ADOPTED as the work plan (user decision)
+
+GPT-5.6 reviewed the code at 55ddb4c + labbook (chat.md L4044+). Its
+claims were verified against the source. User directives on top:
+
+- Follow GPT-5.6's priority order; architectural changes are WANTED —
+  do not fine-tune a wrong architecture. Keep K-TC2 as deprecated legacy
+  (switchable, measured comparison) — do NOT delete it.
+- NO CPU rescue/fallback when GPU fails — the system is the benchmark
+  for designing the most efficient f32-GPU solver; f64/Kahan only where
+  a cheap scalar decision absolutely needs it.
+- Gate F rescue: GPT-5.6's judgment = rollback + damped retry.
+
+### Verified code facts (re-checked this session)
+
+- `m_t_ks = m_k.clone()` / `m_t_zs = m_z.clone()` / `m_ht = m_k.clone()`
+  (sparse_system.rs:191-197) — intermediates ARE radius-truncated.
+- gate_f = SiH4 = 5 atoms < FULL_MASK_ATOMS(64) → all masks full →
+  `m_t_ks` clone is a NO-OP there. **Suspect #1 (intermediate
+  truncation) is EXONERATED for gate_f** — earlier labbook entry wrong.
+- Proximate fatal line: `sparse_dftb.rs:599`
+  `it > 2 && rms > rms_prev*2.0 && rms > 1e-2` — the observed
+  `rms=3.339e-2 (prev 3.463e-3)` trips it exactly. A single DIIS
+  overshoot is turned into a fatal error. (Same line in scc.rs:381.)
+- TC2 details confirmed: branch-fabrication write `Nocc*(1+1e-6)` (:779),
+  `TC2_TRACE_TOL=0.05` absolute (gpu_sparse.rs:24),
+  `best_r_i < 1e-2` returned as `Ok` (:855,:881), `k_norm` frozen from
+  K0 (:721), Gershgorin bounds on truncated ZH + 10% pad (:652-665).
+- `bsr4_tc2` kernel branches on a device f32 `trace_KS[0] > Nocc`
+  (sparse_bsr4_purification.cl:641).
+
+### Item 1 RESULT — Gate F green again (2026-09-12, verified)
+
+- SCC rescue implemented in `sparse_dftb.rs::scc()`: snapshot
+  (q_in, res) before each mix; on `rms > 2·rms_prev && rms > 1e-2`
+  → restore last accepted q, `mixer.reset()`, damped `mix·res` step,
+  `continue`; ≤8 rescues/call; nonfinite rms fails immediately (the
+  old check could NOT even see NaN — `NaN > x` is false).
+- **AB result: overshoots are PRE-EXISTING, not caused by the TC2
+  machinery.** With `RUST_DFTB_TC2_GUARD=0 RUST_DFTB_TC2_PLATEAU=0`
+  (new machinery fully off) the same overshoots fire at steps 14/15/18+
+  and all recover under rescue. The old abort was simply too aggressive;
+  step-17's overshoot was a bit larger than usual (plausibly nudged by
+  the plateau-restored K) but the same class.
+- gate_f: converged step 72, |F|=9.4e-4, mean Si–H=1.477 Å. All gates
+  green: gate_g3(5) gpu_sparse_bsr4(22) sih(10) gpu_scc_kernels(10)
+  spgemm_plan(1) lib sparse(8).
+- Also fixed (user's in-flight commit-model change): kernel
+  `residual_and_mix_batched` gained an `active` arg — standalone
+  wrapper `gpu_matrix.rs` + `gpu_scc.rs` + 2 test call sites updated
+  with all-ones buffers (legacy path has no frozen replicas).
+- Test `test_row_degree_overflow_fail_loud` updated to the NEW contract:
+  `GpuBsrStructure::new` no longer rejects wide masks (only records
+  `max_deg`); the check fires at `spgemm_*_dev` LEFT-operand entry.
+- Env toggles added (AB bisection, default ON):
+  `RUST_DFTB_TC2_GUARD`, `RUST_DFTB_TC2_PLATEAU`, `RUST_DFTB_SPARSE_PLANS`.
+
+### Item 2 RESULT — host-f64 trace + branch flag (2026-09-12, verified)
+
+Implemented:
+- New kernel `bsr4_trace_atom` — per-atom diagonal partials; host reads
+  N_atom floats (~6.6 kB @1648) and sums in f64. Replaces the device
+  f32 tree-reduce for the TC2 decision path.
+- `bsr4_tc2` now takes an explicit `branch: u32` decided on the host —
+  the `Nocc*(1+1e-6)` fabricated-trace write is GONE.
+- `tc2_trace_tol(nocc) = max(2e-5·Nocc, 1e-4)` replaces the universal
+  0.05 e⁻ constant everywhere (new + legacy paths).
+- `tc2_purify`/`purify_hscc`/`run_scc` return Tr as f64;
+  `tr_ks` reporting fields stay f32 (cast at store).
+
+**Found + fixed in the process — two real numerical lessons:**
+
+1. Post-rescale branch choice matters. tr_eff==Nocc is degenerate; the
+   complement branch (2K−Q) after a rescale RATCHETS — it pushes all
+   λ<1 up, trace rises, guard rescales, repeat (observed doubling
+   excess on SiH4, R_I floor degraded to 7e-4). Choosing the squaring
+   branch after rescale makes the next measured trace dip below Nocc
+   and restores the natural alternation. Implemented as an explicit
+   `branch=1` — no fabricated trace value.
+2. The guard was firing during HEALTHY descent (SiH4 dev_rel~2e-4 at
+   R_I still improving) and its rescale injected ~1e-4 state error —
+   G3.4 force/FD parity degraded 6× (|d|=1.19e-4 → FAIL vs 1.86e-5
+   pass with guard off). Fixed: guard now fires only on CONFIRMED
+   exponential growth — dev_rel>jitter AND dev_rel>1.5×previous for 2
+   consecutive iterations (the λ=1+δ⇒λ²≈1+2δ doubling signature).
+
+**Verified both ends:**
+- SiH4 (gate_g3, gate_f, all small gates): guard never fires; TC2
+  converges R_I≈5e-7; G3.4 force parity |d|=1.9e-5.
+- 1648-atom sphere: doubling leak detected iters 54-56
+  (excess 0.039→0.119→0.305), guard fires at 57/60/63, plateau restore
+  at 63 → R_I=1.07e-3 (better than the earlier 7.9e-3), Tr=2627.000000,
+  SCC rms=8.5e-6, E=-1772.11080 Ha, max|F|=0.131 Ha/Å, ~7 s.
+
+### TRS4 update rule — second revision (a-family + clamp + complement, 2026-09-12)
+
+Two failure modes found at r_k=12 on the 1648-atom sphere:
+
+1. **First prototype** (`a∈[−1,3]` window + TC2 fallback by trace sign):
+   diverged — the trace-sign fallback picked SQUARING when den≤0, which
+   amplifies eigenvalues >1.
+2. **Niklasson β-form** (`P_new = (1+β)Q − βR`, β∈[0,1]): converged on
+   paper but STALLED in practice — when the spectrum is mid-range
+   (Tr(Q)=1355 ≪ Nocc=2627), no β∈[0,1] can reach the trace (2x²−x⁴
+   pushes x≈0.5 DOWN), so Tr(P) collapsed 2627→633 to a wrong-rank
+   fixed point.
+
+**Working rule**: `P_new = a·Q + (1−a)·R`, `a=(Nocc−Tr R)/(Tr Q−Tr R)`
+clamped to [−1,3]; `den=Tr(Q)−Tr(R) ≤ 0` (eigenvalues >1 present) →
+complement `2P−Q`. The a>2 regime (max f = a²/4(a−1) ≤ 9/8 ≈ 1.13)
+mildly overshoots but self-corrects via the next den≤0 complement step.
+
+Measured (1648-atom Si sphere, TRS4):
+| r_k | floor R_I | nnz_k | note |
+|-----|-----------|-------|------|
+| 10 Å | 7.67e-4 | 224k | baseline |
+| 12 Å | 3.34e-4 | 412k | ~2× lower floor, SCC 13 iters, stable |
+
+E(12 Å,TRS)=−1772.3924 vs E(12 Å,P-TC2)=−1772.3966 (4 mHa apart — both
+floor-limited). P-TC2 at r_k=12 works identically (floor 3.7e-4), so the
+mask is fine — the earlier TRS divergence was the fallback-rule bug.
+
+### Item 7 groundwork — K block-norm decay measured (2026-09-12)
+
+`test_k_block_norm_histogram` (ignored diagnostic, gate_g3_energy.rs):
+converged K on the 1648-atom sphere at r_k=12 Å, 411,838 blocks =
+250 nbr/atom, ‖K‖_F²=1344.
+
+Distance profile: mass concentrated at 0–3 Å (diag 0.44 + nn 0.26
+mass/atom) but with a FAT tail — the 10–12 Å bins still hold
+~1.5–2.5e-4 mass/atom and max norms ~5e-3. This is exactly why the
+geometric cut at 10 Å costs a 7.7e-4 floor: it deletes real tail mass.
+
+τ-screen table (block ‖B_ij‖_F > τ kept):
+| τ | nbr/atom | dropped mass frac |
+|---|----------|-------------------|
+| 1e-4 | 240 | 3.9e-8 |
+| 1e-3 | 167 | 3.3e-5 |
+| 3e-3 | 84 | 4.4e-4 |
+
+Per-row error budget (drop smallest blocks until dropped mass = b²·‖row‖_F²):
+| budget b | nbr/atom |
+|----------|----------|
+| 1e-2 | 140 |
+| 3e-2 | 61  |
+| 1e-1 | 20  |
+
+Conclusion: ~64 effective nbr/atom is reachable at ~3% per-row dropped
+mass — that loses real tail weight; the honest working point is more
+like 140 nbr at 1%. The screening must be value-based on a provisional
+K (H-norm proxies undershoot — K decays gap-controlled past H's cutoff),
+so the design is two-phase: provisional purify on the wide mask →
+τ/budget screen → freeze M_K'. Implementation of the mask-rebuild path
+is the remaining work.
+
+### Item 6 RESULT — W=2(ZH)K one-product force path (2026-09-12, verified)
+
+**The identity is EXACT, not approximate.** This code's Z is S⁻¹ (NS
+target ‖I−ZS‖→0), so `Z·H·K = S⁻¹H·Σc cᵀ = Σ_occ εᵢ cᵢcᵢᵀ = ρHρ = W/2`
+since `S⁻¹Hcᵢ = εᵢcᵢ`. Measured in `test_w_zhk_vs_khk_parity`
+(tests/gpu_sparse_bsr4.rs, locked by assert): elementwise match to
+5e-8 in f64 on nonorthogonal S; contraction parity 6e-7 over 50 random
+symmetric dS proxies. My initial derivation said "differs by a Z" — it
+was wrong (I had assumed Z=S^{-1/2}); the measurement settled it.
+
+Production change (`SparseDWWorkspace`, sparse_forces.rs):
+- `W = 2·(Z·H_scc)·K` — ONE SpGEMM instead of two; the ZH operand is
+  `ws.b_zh`, the same truncated product that built K0/P0 for the
+  current H_scc → **the force path now has NO intermediate truncation**
+  at all (the KH→M_K truncation is gone).
+- Default ON (`RUST_DFTB_W_ZK=0` reverts to legacy 2KHK for A/B).
+- G3.3/G3.4 SiH4: |d|=1.864e-5 (was 1.857e-5), max|dF|=1.40e-6 —
+  identical forces. Same under TRS mode (F_ana parity 1.31e-6).
+- All 43 tests green.
+
+### Item 5 RESULT — TRS4 trace-resetting purification on P (2026-09-12, verified)
+
+`trs_purify_p` / `purify_hscc_trs` (sparse_system.rs); switch
+`cfg.purifier_trs` / env `RUST_DFTB_TRS=1` (takes precedence over
+`purifier_p`; both default off). Per iter: Q=P², R=Q² (two planned
+generic SpGEMMs, same plan_pp since Q lives on M_P), then
+P_new = a·Q + b·R with a+b=1 and a·Tr(Q)+b·Tr(R)=Nocc — the trace is
+reset EXACTLY in host f64 every iteration (the rigorous restoring
+mechanism; no guard, no lock, no lockout thresholds needed).
+
+- SiH4: ~10 iters to R_I~7e-7 (vs ~20 for TC2), a→2.0 at convergence
+  (the degree-4 map degenerates to pure squaring near idempotency, as
+  expected). Tr(P)=4.000000 every iter.
+- Si65: ~10 iters per purify (vs ~22 TC2), E_tot=−52.45756303 matches
+  legacy to 2e-7 Ha.
+- **1648-atom sphere: R_I floor 7.6e-4** — best so far (vs 1.15e-3
+  P-TC2, 1.07e-3 K-TC2), still descending ~1e-5/iter at max_iter=80.
+  Tr(P)=2627.000±3e-4 held exactly — occupation invariant is enforced
+  by construction, not by a heuristic.
+- Fallback fix (measured, not hypothetical): when the TRS solve is out
+  of window with den=Tr(Q)−Tr(R) ≤ 0, eigenvalues >1 exist and the
+  COMPLEMENT map 2x−x² must be used — a squaring step there amplified
+  Tr(Q) 2630→2681 and diverged (first prototype run). With
+  `den≤0 → complement`, the single out-of-window event recovered
+  cleanly back to the 8e-4 floor.
+- Consistent finalization: after K=PZ recovery, T=K·S is recomputed and
+  Mulliken reads the recovered K's KS — q and K must come from the same
+  matrix or the SCC energy sits off-stationarity. (Direct Mulliken from
+  P remains available via `p_valid` when no recovered K exists.)
+- G3.4 caveat unchanged: the ~5e-4 FD-vs-ana gap under P modes is
+  per-side SCC noise (~1e-6 Ha at scc_tol=1e-5, ×1/2h=500), NOT a
+  systematic P-path bias — the +h energies agree with K-TC2 to 2e-7.
+- All 42 tests green in default mode.
+
+### Item 4 RESULT — P=KS purifier prototype (2026-09-12, verified)
+
+Iterate P = K·S on mask M_P = M_K: P²=P, Tr(P)=Nocc, q_A = 2·Tr(P_AA)
+directly. ONE generic planned `P²` SpGEMM per iteration (new
+`build_spgemm_plan` + `bsr4_spgemm_plan` — `plan_b_idx` indexes B_kj
+directly, no transpose); P is non-symmetric → no symmetrize. P0 =
+(emax·I − ZH)/Δ (exactly K0·S since ZS=I). K = P·Z recovered after SCC
+(plan_pz, Bsym) for the energy/force path. Switch:
+`SparseDftbConfig.purifier_p` or env `RUST_DFTB_P_TC2=1`; default OFF.
+
+- SiH4 (full mask): converges R_I→3.6e-6 in ~20 iters, Tr(P)=4.000007 —
+  same dynamics as K-TC2 (P=KS algebraically), no guard needed.
+- Si65 cube: E_tot=−52.457555 vs K-TC2 −52.457563 (Δ=7e-6 Ha),
+  R_I=1.9e-7, 8 SCC iters — equivalent.
+- **1648-atom sphere — the runaway is GONE**: trace stays 2627.0±0.03
+  across all 80 iters; the K-TC2 doubling signature (dev 3.9e-2→0.98,
+  guard rescales ×6) never appears. The open-loop spectral instability
+  was therefore STRUCTURAL — the truncated T=K·S feeding Q=T·K — not an
+  f32 arithmetic limit. Confirms the review diagnosis.
+- BUT the R_I floor is NOT lower: best 1.15e-3 at iter 79 (still
+  decreasing ~1e-5/iter when max_iter hit) vs K-TC2's 1.07e-3. The floor
+  is now the M_P=M_K iterate truncation — the honest fixed-point
+  residual of the masked algebra. Lowering it needs a wider/error-
+  budgeted M_P (item 7) or TRS (item 5), not more f32 headroom.
+- E_tot: P −1772.1353 vs K −1772.1108 Ha (Δ=2.4e-2) — the two paths sit
+  at different floor states; neither validated until the mask is wider.
+  R_H=6.3e-3 comparable.
+- NumericalFloor status correctly reported and accepted; SCC converged
+  rms=4.1e-6 in 13 iters; forces evaluated (max|F|=0.131).
+- G3.4 SiH4 FD-vs-ana force gap is ~5.9e-4 under P mode vs ~1.9e-5
+  legacy — marginal; candidate cause: energy uses K=PZ which inherits
+  the NS Z-residual. Not resolved; P mode stays opt-in/experimental.
+
+### Item 3 RESULT — PurifyStatus (2026-09-12, verified)
+
+- `PurifyStatus { Converged, NumericalFloor, Failed }` in gpu_sparse.rs.
+  `tc2_purify`/`purify_hscc`/`run_scc` return it; Err remains the
+  fail-loud `Failed` propagation. `SparseDftbScc` and `SparseDftbEnergy`
+  carry `purify_status`; `SparseDftbConfig.accept_numerical_floor
+  (Option<bool>, default true)` gates NumericalFloor acceptance —
+  a Hessian run can set Some(false) to reject floor states.
+- All sparse gates green; gate_e_determinism stays red BY DESIGN
+  (it is an FD-of-Tr(KH0) non-test kept red to document the pending
+  analytic sparse force — unrelated to this change).
+
+### Adopted implementation order (GPT-5.6, items as in chat.md L4570+)
+
+1. **Gate F**: replace one-jump SCC abort with closed-loop rescue —
+   snapshot (q_in, res) before each mix; on measured residual explosion
+   restore last accepted q, `mixer.reset()` (drop suspect history),
+   damped linear step, retry; fail only after repeated rescue failure
+   or nonfinite. Do NOT touch the shared mixer (dense solver alone).
+   Env toggles for AB bisection: `RUST_DFTB_TC2_GUARD`,
+   `RUST_DFTB_TC2_PLATEAU`.
+2. **Host-f64 trace + branch flag**: per-atom diagonal partials → host
+   f64 sum → explicit `branch` uint into `bsr4_tc2` (removes the
+   `Nocc*1e-6` fabrication). Size-scaled trace tol replaces the absolute
+   0.05. ~N floats readback/iter; sync already exists.
+3. **`enum PurifyStatus {Converged, NumericalFloor, Failed}`** — stop
+   returning R_I<1e-2 as ordinary `Ok`; run mode decides acceptance.
+4. **P = KS purifier (architectural)**: generic planned product for P²
+   (P non-symmetric → Bsym plan can't be reused); 1 SpGEMM/iter instead
+   of 2; P0 = (εmax·I − ZH)/Δε (eliminates ZHZ from every init);
+   Mulliken = 2·Tr P_AA; K = PZ once post-SCC. Coexist via cfg switch;
+   compare iterations/wall/R_I/forces on SiH4, Si65, ~300at.
+5. TRS/trace-resetting purification on P (only after 4 works).
+6. W = 2(ZH)K for forces — parity vs 2KHK on full-mask SiH4/Si65 first;
+   kills the truncated KH intermediate.
+7. τ-screening with per-row error budget on a frozen larger structural
+   mask (the real route to ~64 effective neighbours); freeze active
+   pattern during Hessians.
+8. GPU throughput: MAX_LEFT buckets 64/128/256/512, packed plan indices,
+   fewer syncs. Gamma deprioritized.
+
+Supporting rules adopted:
+- Standing rule: **truncate stored RESULT matrices; never
+  radius-truncate algebraic INTERMEDIATES.**
+- Plateau detector arms only in endgame (|Tr−Nocc|/Nocc AND R_I in
+  floor range), detects 2-cycle / flat log-slope of R_I — not "N
+  non-improvements".
+- Under P: r_I = ‖P²−P‖_F/√Nocc (‖P‖_F ≈ √Nocc for a projector).
+- Spectral bounds: conservative ‖Z‖∞·‖H‖∞ (or enlarge, not shrink,
+  Gershgorin) since bounds on truncated ZH are not bounds.
+- Precision budget: matrices f32 FMA, 2–4 f32 accumulators; f64 ONLY
+  for trace/branch, charge conservation, energy final sum, DIIS small
+  solve, CPU Hessian. No Kahan in SpGEMM dots.

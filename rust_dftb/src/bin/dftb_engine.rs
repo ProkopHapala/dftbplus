@@ -1603,6 +1603,31 @@ fn rhai_gpu_freeze_atoms(name: &str, idx: Array) {
     eprintln!("[gpu] gpu_freeze_atoms '{name}' frozen={ids:?}");
 }
 
+/// gpu_set_constraint(name, i, j, [d0,d1,...]) — per-replica distance
+/// constraint |x_j − x_i| = d[b] Å (the relaxed-scan coordinate; e.g. GC
+/// proton transfer: i=8 donor N1, j=13 transferring H, d = N–H distance).
+/// Applied inside fire_apply_batched as a closed-form equal-mass
+/// projection; a frozen endpoint takes weight 0.
+fn rhai_gpu_set_constraint(name: &str, i: INT, j: INT, targets: Array) {
+    let d: Vec<f64> = targets.iter()
+        .map(|x| dyn_f64(x, &format!("gpu_set_constraint '{name}' d")))
+        .collect();
+    with_gpu(|g| {
+        let h = g.get_mut(name).unwrap_or_else(|| panic!("gpu_set_constraint '{name}': no engine"));
+        h.eng.set_constraint(i as usize, j as usize, &d)
+            .unwrap_or_else(|e| panic!("gpu_set_constraint '{name}': {e}"));
+    });
+    eprintln!("[gpu] gpu_set_constraint '{name}' |x_{j}−x_{i}|=d per replica");
+}
+
+/// gpu_clear_constraint(name) — remove the distance constraint.
+fn rhai_gpu_clear_constraint(name: &str) {
+    with_gpu(|g| {
+        let h = g.get_mut(name).unwrap_or_else(|| panic!("gpu_clear_constraint '{name}': no engine"));
+        h.eng.clear_constraint().unwrap_or_else(|e| panic!("gpu_clear_constraint '{name}': {e}"));
+    });
+}
+
 fn rhai_gpu_max_force(name: &str) -> f64 {
     with_gpu(|g| {
         let h = g.get(name).unwrap_or_else(|| panic!("gpu_max_force '{name}': no engine"));
@@ -1743,7 +1768,7 @@ fn rhai_gpu_measure(name: &str, want_cpu: bool) -> f64 {
 
 fn rhai_gpu_cpu_energy(name: &str) -> f64 {
     with_gpu(|g| {
-        let h = g.get(name).unwrap_or_else(|| panic!("gpu_cpu_energy '{name}': no engine — gpu_new first"));
+        let h = g.get_mut(name).unwrap_or_else(|| panic!("gpu_cpu_energy '{name}': no engine — gpu_new first"));
         let (e, _, _) = h.eng.cpu_ref().unwrap_or_else(|e| panic!("gpu_cpu_energy '{name}': {e}"));
         if !e.is_finite() { panic!("gpu_cpu_energy '{name}': E={e} non-finite"); }
         eprintln!("[gpu] gpu_cpu_energy '{name}' E={e:.12} Ha");
@@ -1778,6 +1803,22 @@ fn rhai_gpu_set_coords(name: &str, xyz: Array) -> INT {
     }
     eprintln!("[gpu] gpu_set_coords '{name}' n_atoms={n_atoms} batch={batch}");
     n_atoms as INT
+}
+
+/// gpu_get_coords(name) -> [x,y,z,...] flat Å, all replicas —
+/// syncs device→host first (device-FIRE moves coords on the GPU only).
+fn rhai_gpu_get_coords(name: &str) -> Array {
+    with_gpu(|g| {
+        let h = g.get_mut(name).unwrap_or_else(|| panic!("gpu_get_coords '{name}': no engine"));
+        h.eng.sync_coords_to_host().unwrap_or_else(|e| panic!("gpu_get_coords '{name}': {e}"));
+        let mut a = Array::new();
+        for p in h.eng.coords() {
+            a.push(Dynamic::from_float(p[0]));
+            a.push(Dynamic::from_float(p[1]));
+            a.push(Dynamic::from_float(p[2]));
+        }
+        a
+    })
 }
 
 fn rhai_get_xyz(name: &str) -> Array {
@@ -1856,12 +1897,16 @@ fn main() {
                 eprintln!("  gpu_scc_mixer(name, max_iter, tol, mix) -> rms   mix 0=GPU DIIS, 1=GPU simple, 2=host f64 DIIS");
                 eprintln!("  gpu_reset_q(name)                       reload q0 + reset DIIS");
                 eprintln!("  gpu_set_coords(name, xyz_flat) -> n_atoms");
+                eprintln!("  gpu_freeze_atoms(name, [i..])           pin template atoms in all replicas");
+                eprintln!("  gpu_set_constraint(name, i, j, [d..])   per-replica |x_j−x_i|=d Å scan coordinate");
+                eprintln!("  gpu_clear_constraint(name)");
                 eprintln!("  gpu_eval(name, want_forces) -> E[0]      (one finalize; forces optional)");
                 eprintln!("  gpu_measure(name, want_cpu) -> E[0]     frozen-H + energy identities; CPU if true");
                 eprintln!("  gpu_cpu_energy(name) -> E               independent CPU f64 SCC+rep at replica 0");
                 eprintln!("  gpu_energy_i(name, i) -> E[i]");
                 eprintln!("  gpu_max_force(name) -> max|F|           (after gpu_eval(..., true))");
                 eprintln!("  get_xyz(name) -> xyz_flat               geometry table, Å");
+                eprintln!("  gpu_get_coords(name) -> xyz_flat      device positions, all replicas, Å");
                 eprintln!("  gpu_n_batch / gpu_n_orbs / gpu_n_atoms / gpu_scc_iters / gpu_scc_stalled / gpu_q_rms");
                 eprintln!("  sparse_new(name, sk_dir) -> n_orbs      (SparseDftb, one system)");
                 eprintln!("  sparse_scc(name, max_iter, tol) -> rms");
@@ -1939,6 +1984,8 @@ fn main() {
     engine.register_fn("gpu_fire_step", rhai_gpu_fire_step);
     engine.register_fn("gpu_relax", rhai_gpu_relax);
     engine.register_fn("gpu_freeze_atoms", rhai_gpu_freeze_atoms);
+    engine.register_fn("gpu_set_constraint", rhai_gpu_set_constraint);
+    engine.register_fn("gpu_clear_constraint", rhai_gpu_clear_constraint);
     engine.register_fn("gpu_smearing", rhai_gpu_smearing);
     engine.register_fn("gpu_n_batch", rhai_gpu_n_batch);
     engine.register_fn("gpu_n_orbs", rhai_gpu_n_orbs);
@@ -1949,6 +1996,7 @@ fn main() {
     engine.register_fn("gpu_x_reuse", rhai_gpu_x_reuse);
     engine.register_fn("gpu_q_rms", rhai_gpu_q_rms);
     engine.register_fn("get_xyz", rhai_get_xyz);
+    engine.register_fn("gpu_get_coords", rhai_gpu_get_coords);
     engine.register_fn("get_species", rhai_get_species);
     engine.register_fn("sparse_new", rhai_sparse_new);
     engine.register_fn("sparse_new", rhai_sparse_new_cut);

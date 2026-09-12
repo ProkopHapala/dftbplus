@@ -689,6 +689,52 @@ pub fn build_spgemm_plan_bsym(
     Ok(SpgemmPlan { plan_ptr, plan_a_idx, plan_b_idx, nblock_c })
 }
 
+/// Build a symbolic SpGEMM plan for `C = P_M(A·B)` with NO symmetry
+/// assumption on B (GPT-5.6 item 4 — needed for the P=KS purifier, where
+/// P is non-symmetric).
+///
+/// Same layout as `build_spgemm_plan_bsym`, except `plan_b_idx[t]` is the
+/// global block index of `B_kj` (row k, col j) found by binary search in
+/// B's sorted row — the `bsr4_spgemm_plan` kernel reads it directly.
+pub fn build_spgemm_plan(
+    a: &Bsr4Matrix,
+    b: &Bsr4Matrix,
+    c_mask: &(Vec<u32>, Vec<u32>),
+) -> Result<SpgemmPlan> {
+    let n_atom = a.n_atom;
+    let mut plan_ptr: Vec<u32> = Vec::with_capacity(c_mask.1.len() + 1);
+    let mut plan_a_idx: Vec<u32> = Vec::new();
+    let mut plan_b_idx: Vec<u32> = Vec::new();
+    plan_ptr.push(0);
+
+    for i in 0..n_atom {
+        let a0 = a.row_ptr[i] as usize;
+        let a1 = a.row_ptr[i + 1] as usize;
+
+        let c0 = c_mask.0[i] as usize;
+        let c1 = c_mask.0[i + 1] as usize;
+
+        for cb in c0..c1 {
+            let j = c_mask.1[cb];
+
+            // For each k in A's row i, find block (k,j) in B's row k.
+            for ia in 0..(a1 - a0) {
+                let k = a.col_idx[a0 + ia] as usize;
+                let b0 = b.row_ptr[k] as usize;
+                let b1 = b.row_ptr[k + 1] as usize;
+                if let Ok(off) = b.col_idx[b0..b1].binary_search(&j) {
+                    plan_a_idx.push(ia as u32);
+                    plan_b_idx.push((b0 + off) as u32);
+                }
+            }
+            plan_ptr.push(plan_a_idx.len() as u32);
+        }
+    }
+
+    let nblock_c = c_mask.1.len();
+    Ok(SpgemmPlan { plan_ptr, plan_a_idx, plan_b_idx, nblock_c })
+}
+
 /// Build a Bsr4Matrix representing the identity (4×4 identity on each
 /// diagonal block, zero elsewhere) on the given mask. The mask must include
 /// all diagonal blocks (i,i).

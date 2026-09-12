@@ -12,9 +12,9 @@ gpu_reset_q("gc");
 gpu_scc("gc", 100, 1.0e-6);
 
 print("=== B: batch=4 scan points (d=1.0,1.4,1.6,1.9) ===");
-let dx = xyz[3*21]   - xyz[3*8];
-let dy = xyz[3*21+1] - xyz[3*8+1];
-let dz = xyz[3*21+2] - xyz[3*8+2];
+let dx = xyz[3*20]   - xyz[3*8];
+let dy = xyz[3*20+1] - xyz[3*8+1];
+let dz = xyz[3*20+2] - xyz[3*8+2];
 let dNN = sqrt(dx*dx + dy*dy + dz*dz);
 dx /= dNN; dy /= dNN; dz /= dNN;
 let dvals = [1.0, 1.4, 1.6, 1.9];

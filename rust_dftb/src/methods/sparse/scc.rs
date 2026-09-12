@@ -16,7 +16,7 @@ use crate::methods::dftb::sk_data::SkData;
 use crate::methods::sparse::bsr4::{
     build_full_mask, pad_physical_to_bsr4, Bsr4Matrix, BS,
 };
-use crate::methods::sparse::gpu_sparse::{SparseBsr4Gpu, TC2_TRACE_TOL};
+use crate::methods::sparse::gpu_sparse::{SparseBsr4Gpu, tc2_trace_tol};
 use crate::methods::sparse::sparse_forces::sparse_analytic_forces;
 use crate::qmqm::shifts::compute_intra_shifts;
 
@@ -45,6 +45,9 @@ pub struct SparseDftbEnergy {
     pub r_scc: f64,
     /// ||HKS − SKH||_F of the returned (K, H). NaN if not computed.
     pub r_h: f32,
+    /// Purification outcome that produced this energy (GPT-5.6 #3):
+    /// `NumericalFloor` ⇒ this energy is NOT validated.
+    pub purify_status: crate::methods::sparse::gpu_sparse::PurifyStatus,
 }
 
 /// Tr(A B) for row-major f32, accumulated in f64.
@@ -164,9 +167,10 @@ pub fn purify_h_with_z(
     if verbose {
         eprintln!("  TC2: {iters} iters, R_I={r_i:.3e}, Tr(KS)={tr:.6} (Nocc={nocc})");
     }
-    if (tr - nocc).abs() > TC2_TRACE_TOL {
+    let tol_tr = tc2_trace_tol(nocc as f64);
+    if (tr as f64 - nocc as f64).abs() > tol_tr {
         return Err(DftbError::InvalidInput(format!(
-            "purify_h: Tr(KS)={tr} far from Nocc={nocc} (tol={TC2_TRACE_TOL})"
+            "purify_h: Tr(KS)={tr} far from Nocc={nocc} (tol={tol_tr})"
         )));
     }
     Ok((k, r_i, tr, iters))
@@ -198,6 +202,7 @@ pub fn energy_non_scc(
         q: vec![0.0; n_atom], tr_ks: tr, r_i, n_scc: 0, tc2_iters,
         k_pad: k_dense, h_scc_pad: h_pad, v: vec![0.0; n_atom],
         r_scc: 0.0, r_h: f32::NAN,
+        purify_status: crate::methods::sparse::gpu_sparse::PurifyStatus::Converged,
     })
 }
 
@@ -230,6 +235,7 @@ fn energy_from_k(
         e_h0, e_scc, e_el, e_rep, e_tot: e_el + e_rep,
         q: q.to_vec(), tr_ks: tr, r_i, n_scc, tc2_iters,
         k_pad: k_dense.to_vec(), h_scc_pad: h_scc, v, r_scc, r_h,
+        purify_status: crate::methods::sparse::gpu_sparse::PurifyStatus::Converged,
     }
 }
 
@@ -310,6 +316,7 @@ pub fn run_sparse_scc(
         q: q.clone(), tr_ks: 0.0, r_i: 0.0, n_scc: 0, tc2_iters: 0,
         k_pad: vec![], h_scc_pad: vec![], v: vec![0.0; n_atom],
         r_scc: 0.0, r_h: f32::NAN,
+        purify_status: crate::methods::sparse::gpu_sparse::PurifyStatus::Failed,
     };
     let mut rms_prev = f64::INFINITY;
     for it in 0..max_scc {

@@ -26,11 +26,11 @@
 
 use crate::core::error::{DftbError, Result};
 use crate::methods::sparse::bsr4::{
-    build_product_mask, build_spgemm_plan_bsym, inf_norm, Bsr4Matrix, BS, BS2,
+    build_spgemm_plan_bsym, inf_norm, Bsr4Matrix, BS, BS2,
 };
 use crate::methods::sparse::gpu_sparse::{
-    GpuBsrMatrix, GpuBsrStructure, SparseBsr4Gpu, SpgemmPlanGpu, TC2_TRACE_TOL,
-    TC2_TRACE_GUARD_REL, TC2_TRACE_LOCK_REL, TC2_LOCK_RI, TC2_STAGNANT_MAX,
+    GpuBsrMatrix, GpuBsrStructure, PurifyStatus, SparseBsr4Gpu, SpgemmPlanGpu,
+    TC2_TRACE_GUARD_REL, TC2_TRACE_LOCK_REL, TC2_LOCK_RI,
 };
 use ocl::Buffer;
 use std::sync::Arc;
@@ -116,7 +116,8 @@ pub struct SparseSystemWorkspace {
     k_to_z: Buffer<i32>,     // k block (i,j) → z block (i,j) or -1 (R8b)
 
     // ── Reduction / diagnostic scratch ──
-    trace_buf: Buffer<f32>,
+    trace_atom: Buffer<f32>,    // per-atom Tr(T_ii) partials → host f64 sum
+    trace_atom_host: Vec<f32>,  // persistent staging (no per-iter alloc)
     residual_buf: Buffer<f32>,
     ksq_buf: Buffer<f32>,
     emin_buf: Buffer<f32>,
@@ -138,6 +139,26 @@ pub struct SparseSystemWorkspace {
     /// — the converged K is the one that produced t_ks). Mulliken reuses it
     /// instead of a spare SpGEMM (R8a).
     t_ks_valid: bool,
+
+    // ── P = K·S purifier (GPT-5.6 item 4, EXPERIMENTAL) ──
+    // P is the density-side projector in the non-orthogonal metric:
+    // P² = (KS)² = KSKS = KS = P iff KSK = K, Tr(P) = Nocc, and
+    // q_A = 2·Tr(P_AA) directly. ONE generic planned P² SpGEMM per
+    // iteration — no intermediate product to truncate. P is NOT symmetric
+    // (no symmetrize step); K = P·Z is recovered after convergence for the
+    // energy/force path. Mask: M_P = M_K for the prototype.
+    m_p: (Vec<u32>, Vec<u32>),
+    p_struct: Arc<GpuBsrStructure>,
+    p: GpuBsrMatrix,
+    q_p2: GpuBsrMatrix,      // P² product buffer (also P0-build scratch)
+    r_p4: GpuBsrMatrix,      // P⁴=Q² buffer for TRS4 (item 5)
+    pnew: GpuBsrMatrix,      // TC2 update (also P0-build scratch)
+    p_best: Buffer<f32>,     // plateau snapshot
+    plan_pp: Option<SpgemmPlanGpu>,   // generic P·P on M_P
+    plan_pz: Option<SpgemmPlanGpu>,   // K = P·Z on M_K (Z symmetric → Bsym)
+    p_to_tzs: Buffer<i32>,            // restrict map M_P-block → M_TZS-block
+    /// True when `p` holds the converged P = K·S (P-purifier path).
+    p_valid: bool,
 }
 
 impl SparseSystemWorkspace {
@@ -247,7 +268,9 @@ impl SparseSystemWorkspace {
         let qpack_host = vec![0.0f32; 2 * n_atom];
 
         // Build symbolic plans for all recurring SpGEMMs.
+        let plans_on = crate::methods::sparse::gpu_sparse::sparse_plans_enabled();
         let build_plan = |a: &Bsr4Matrix, b: &Bsr4Matrix, c_mask: &(Vec<u32>, Vec<u32>), label: &str| -> Option<SpgemmPlanGpu> {
+            if !plans_on { return None; }   // RUST_DFTB_SPARSE_PLANS=0 AB toggle
             match build_spgemm_plan_bsym(a, b, c_mask) {
                 Ok(plan) => match gpu.upload_plan(&plan) {
                     Ok(gpu_plan) => Some(gpu_plan),
@@ -276,8 +299,33 @@ impl SparseSystemWorkspace {
         let plan_zh = build_plan(&z_dummy, &hs_dummy, &m_t_zs, "plan_zh");
         let plan_bz = build_plan(&t_zs_dummy, &z_dummy, &m_k, "plan_bz");
 
+        // ── P = K·S purifier buffers (GPT-5.6 item 4) ──
+        // M_P = M_K for the prototype (same sparsity class as the legacy
+        // T=KS mask; the error-budgeted widening is item 7).
+        let m_p = m_k.clone();
+        let p_struct = Arc::new(GpuBsrStructure::new(&gpu, n_atom, &m_p)?);
+        let p = GpuBsrMatrix::zero(&gpu, &p_struct)?;
+        let q_p2 = GpuBsrMatrix::zero(&gpu, &p_struct)?;
+        let r_p4 = GpuBsrMatrix::zero(&gpu, &p_struct)?;
+        let pnew = GpuBsrMatrix::zero(&gpu, &p_struct)?;
+        let p_best = gpu.zero_f32(p_struct.nblock * BS2)?;
+        let p_to_tzs_host = block_map_same(&m_p, &m_t_zs, n_atom);
+        let p_to_tzs = gpu.buf_i32(&p_to_tzs_host)?;
+        let p_dummy = Bsr4Matrix::from_structure(n_atom, m_p.0.clone(), m_p.1.clone())?;
+        let plan_pp = if plans_on {
+            match crate::methods::sparse::bsr4::build_spgemm_plan(&p_dummy, &p_dummy, &m_p) {
+                Ok(plan) => match gpu.upload_plan(&plan) {
+                    Ok(gpu_plan) => Some(gpu_plan),
+                    Err(e) => { eprintln!("P4: plan_pp upload failed, falling back to masked SpGEMM: {e}"); None }
+                },
+                Err(e) => { eprintln!("P4: plan_pp build failed, falling back to masked SpGEMM: {e}"); None }
+            }
+        } else { None };
+        let plan_pz = build_plan(&p_dummy, &z_dummy, &m_k, "plan_pz");
+
         // Reduction scratch buffers.
-        let trace_buf = gpu.zero_f32(1)?;
+        let trace_atom = gpu.zero_f32(n_atom)?;
+        let trace_atom_host = vec![0.0f32; n_atom];
         let residual_buf = gpu.zero_f32(1)?;
         let ksq_buf = gpu.zero_f32(1)?;
         let emin_buf = gpu.zero_f32(1)?;
@@ -342,7 +390,8 @@ impl SparseSystemWorkspace {
             qpack_host,
             hs_to_kt,
             k_to_z,
-            trace_buf,
+            trace_atom,
+            trace_atom_host,
             residual_buf,
             ksq_buf,
             emin_buf,
@@ -357,6 +406,17 @@ impl SparseSystemWorkspace {
             s_inf,
             nocc,
             t_ks_valid: false,
+            m_p,
+            p_struct,
+            p,
+            q_p2,
+            r_p4,
+            pnew,
+            p_best,
+            plan_pp,
+            plan_pz,
+            p_to_tzs,
+            p_valid: false,
         })
     }
 
@@ -379,10 +439,16 @@ impl SparseSystemWorkspace {
     pub fn k(&self) -> &GpuBsrMatrix { &self.k }
     /// Current device H_scc (for `SparseDWWorkspace::build_dw_into`).
     pub fn h_scc(&self) -> &GpuBsrMatrix { &self.h_scc }
+    /// Current device B = Z·H_scc on M_TZS (for the `W=2(ZH)K` force path).
+    /// Fresh from the last `compute_k0_impl`/`compute_p0` — the same H_scc
+    /// the forces are taken at.
+    pub fn b_zh(&self) -> &GpuBsrMatrix { &self.b_zh }
     /// Shared K structure (M_K) — for `SparseDWWorkspace::new`.
     pub fn k_struct(&self) -> &Arc<GpuBsrStructure> { &self.k_struct }
     /// Shared H/S structure (M_HS) — for `SparseDWWorkspace::new`.
     pub fn hs_struct(&self) -> &Arc<GpuBsrStructure> { &self.hs_struct }
+    /// Shared TZS structure (M_TZS, ZH/ZS products) — for `SparseDWWorkspace::new`.
+    pub fn t_zs_struct(&self) -> &Arc<GpuBsrStructure> { &self.t_zs_struct }
     /// Host map: hs block (i,j) → k block (j,i) or −1 (force contraction).
 
 
@@ -456,13 +522,27 @@ impl SparseSystemWorkspace {
     /// Returns `(q_phys, q_dum)` — `q_dum` is the dummy-lane occupation and
     /// should be ~0 (R14 leak diagnostic).
     pub fn mulliken_charges(&mut self) -> Result<(Vec<f32>, Vec<f32>)> {
-        if !self.t_ks_valid {
+        // Prefer t_ks = K·S of the CURRENT K: the reported (K,q) state must
+        // be mutually consistent or the SCC energy sits off-stationarity
+        // (FD-vs-analytic force parity breaks ~5e-4 on SiH4 G3.4 when q
+        // came from P while the energy used the recovered K=PZ).
+        if self.t_ks_valid {
+            self.gpu.mulliken_to_dev(
+                &self.t_ks_struct, &self.t_ks.values, &self.n_orb_buf, &self.qpack_buf,
+            )?;
+        } else if self.p_valid {
+            // P-purifier fast path: P IS K·S — Mulliken reads P's diagonal
+            // directly (only when no recovered K exists yet).
+            self.gpu.mulliken_to_dev(
+                &self.p_struct, &self.p.values, &self.n_orb_buf, &self.qpack_buf,
+            )?;
+        } else {
             self.spgemm_ks();
             self.t_ks_valid = true;
+            self.gpu.mulliken_to_dev(
+                &self.t_ks_struct, &self.t_ks.values, &self.n_orb_buf, &self.qpack_buf,
+            )?;
         }
-        self.gpu.mulliken_to_dev(
-            &self.t_ks_struct, &self.t_ks.values, &self.n_orb_buf, &self.qpack_buf,
-        )?;
         self.gpu.read_f32(&self.qpack_buf, &mut self.qpack_host)?;
         let (q, qd) = self.qpack_host.split_at(self.n_atom);
         Ok((q.to_vec(), qd.to_vec()))
@@ -708,8 +788,11 @@ impl SparseSystemWorkspace {
     /// `r_I = ‖KSK−K‖_F / max(‖K‖_F, ε)`. Raw ‖KSK−K‖_F saturates at the
     /// f32 SpGEMM floor (~1e-5·‖K‖) — a raw absolute threshold mislabels
     /// normal f32 saturation as non-convergence.
-    /// `Tr(KS)` counts physical lanes only (masked trace, R14).
-    pub fn tc2_purify(&mut self, max_iter: usize, tol: f32, check_every: usize) -> Result<(f32, f32, usize)> {
+    /// `Tr(KS)` counts physical lanes only (masked trace, R14) and is
+    /// reduced in **f64 on the host** from per-atom partials (GPT-5.6
+    /// item 2) — the trace feeds a discrete branch decision where an
+    /// f32-comparison flip is catastrophic. Returns (r_I, Tr[f64], iters).
+    pub fn tc2_purify(&mut self, max_iter: usize, tol: f32, check_every: usize) -> Result<(PurifyStatus, f32, f64, usize)> {
         // Normalization scale: ‖K‖_F of the incoming K (K0 or previous
         // iterate — drifts little during purification).
         self.gpu.frob_sq_to_dev(
@@ -720,13 +803,17 @@ impl SparseSystemWorkspace {
         self.gpu.read_f32(&self.ksq_buf, &mut ksq)?;
         let k_norm = ksq[0].sqrt().max(1e-30);
 
+        let nocc64 = self.nocc as f64;
+        let tol_tr = crate::methods::sparse::gpu_sparse::tc2_trace_tol(nocc64);
         let mut best_r_i = f32::INFINITY;
-        let mut best_tr = 0.0f32;
+        let mut best_tr = 0.0f64;
         let mut best_snapshotted = false;
-        let mut last_tr = 0.0f32;
+        let mut last_tr = 0.0f64;
         let mut last_r_i = f32::INFINITY;
         let mut n_stagnant = 0usize;
         let mut trace_locked = false;
+        let mut dev_prev = f64::MAX;   // previous |Tr−Nocc|/Nocc — growth detector
+        let mut dev_run = 0usize;      // consecutive exponentially-growing deviations
         self.t_ks_valid = false;
 
         for iter in 0..max_iter {
@@ -737,26 +824,19 @@ impl SparseSystemWorkspace {
                 Some(plan) => self.gpu.spgemm_plan_bsym_dev(&self.k, &self.s, plan, &self.t_ks)?,
                 None => self.gpu.spgemm_bsym_dev(&self.k, &self.s, &self.t_ks)?,
             }
-            self.gpu.trace_ks_to_dev(
+            // Per-atom partials → host f64 sum (GPT-5.6 item 2): the trace
+            // feeds a discrete branch where an f32-comparison flip is
+            // catastrophic. N_atom floats of readback on an existing sync.
+            let tr_now: f64 = self.gpu.trace_ks_f64(
                 &self.t_ks_struct, &self.t_ks.values, &self.n_orb_buf,
-                &self.reduce_partial, &self.reduce_a, &self.reduce_b, &self.trace_buf,
+                &self.trace_atom, &mut self.trace_atom_host,
             )?;
-            // ── ENFORCED RESTORING INVARIANT: Tr(KS) ≈ Nocc (AGENTS.md f32 rule) ──
-            // TC2's polynomials λ→λ² and λ→2λ−λ² are UNCONDITIONALLY divergent
-            // outside [0,1]. Under f32 + masked SpGEMM the spectrum leaks out
-            // (observed on 1648 atoms: Tr drifted 2627→2655 with the excess
-            // DOUBLING each iteration — the exact λ=1+δ ⇒ λ²=1+2δ signature).
-            // Tr(αKS)=α·Tr(KS) is exactly linear, so rescaling K pins the trace
-            // and caps that growth. Triggered only outside the f32 jitter band
-            // (~1e-5 relative) so healthy iterations are untouched.
-            let mut tr_now = [0.0f32; 1];
-            self.gpu.read_f32(&self.trace_buf, &mut tr_now)?;
-            if !tr_now[0].is_finite() {
+            if !tr_now.is_finite() {
                 return Err(DftbError::InvalidInput(format!(
-                    "TC2 trace non-finite at iter {iter}: Tr(KS)={}", tr_now[0]
+                    "TC2 trace non-finite at iter {iter}: Tr(KS)={tr_now}"
                 )));
             }
-            let dev_rel = ((tr_now[0] - self.nocc) as f64 / self.nocc.max(1.0) as f64).abs();
+            let dev_rel = ((tr_now - nocc64) / nocc64.max(1.0)).abs();
             // The guard applies ONLY in the endgame. During the transient the
             // trace legitimately swings far from Nocc (driving it there is
             // exactly what the TC2 branch does — Tr started at 2841 vs
@@ -768,22 +848,47 @@ impl SparseSystemWorkspace {
             // its way (observed Tr=2628.19 at iter 2 while R_I was still
             // O(1)), so the trace alone must not arm the guard.
             if dev_rel < TC2_TRACE_LOCK_REL && last_r_i < TC2_LOCK_RI { trace_locked = true; }
-            let guard = trace_locked && dev_rel > TC2_TRACE_GUARD_REL && tr_now[0] > 0.0;
-            if guard {
-                let alpha = (self.nocc as f64 / tr_now[0] as f64) as f32;
+            // Runaway signature (1648-atom sphere): a leaked eigenvalue
+            // λ=1+δ grows as λ²≈1+2δ under the squaring branch — the trace
+            // excess DOUBLES each iteration. Fire the guard only on
+            // confirmed growth (≥2 consecutive ~1.5×+ expansions), not on
+            // healthy endgame jitter: on SiH4 the deviation plateaus ~2e-4
+            // and plain TC2 alternation removes it, while a premature
+            // rescale injects ~1e-4 state error that broke the G3.4
+            // force/FD parity by 6×.
+            if trace_locked && dev_rel > TC2_TRACE_GUARD_REL && dev_rel > 1.5 * dev_prev {
+                dev_run += 1;
+            } else {
+                dev_run = 0;
+            }
+            dev_prev = dev_rel;
+            let guard = crate::methods::sparse::gpu_sparse::tc2_guard_enabled()
+                && dev_run >= 2 && tr_now > 0.0;
+            // tr_eff = trace of the state that produces Q this iteration.
+            // After a rescale Tr(α·KS)=α·Tr is exactly linear → tr_eff=Nocc
+            // by construction (no fabricated trace — GPT-5.6).
+            let tr_eff = if guard {
+                let alpha = (nocc64 / tr_now) as f32;
                 self.gpu.scale_dev(self.k.struct_.nblock, alpha, &self.k.values)?;
                 self.gpu.scale_dev(self.t_ks.struct_.nblock, alpha, &self.t_ks.values)?;
-                // Trace is now exactly Nocc, so the sign-based branch is
-                // undefined; bias it to the CONTRACTING branch (Knew=Q maps
-                // λ→λ², shrinking in [0,1]) by writing Nocc·(1+ε).
-                self.gpu.write_f32(&self.trace_buf, &[self.nocc * (1.0 + 1e-6)])?;
                 if crate::methods::sparse::gpu_sparse::algebra_verbose() {
                     eprintln!(
-                        "    TC2 trace guard @iter {iter}: Tr={:.4} (dev_rel={dev_rel:.2e}) → rescaled K by {alpha:.8}",
-                        tr_now[0]
+                        "    TC2 trace guard @iter {iter}: Tr={tr_now:.6} (dev_rel={dev_rel:.2e}) → rescaled K by {alpha:.8}"
                     );
                 }
-            }
+                nocc64
+            } else {
+                tr_now
+            };
+            // Host f64 branch decision. Post-rescale Tr==Nocc is degenerate:
+            // choose SQUARING (branch=1) so the next measured trace dips
+            // below Nocc and the following iteration takes the complement —
+            // preserving the natural TC2 alternation. Taking the complement
+            // here instead ratchets: complement pushes all λ<1 up (trace
+            // rises) → guard rescales → complement again — observed on SiH4
+            // as a limit cycle with the excess doubling each iteration and
+            // the R_I floor degrading to 7e-4.
+            let branch: u32 = if guard { 1 } else { (tr_now > nocc64) as u32 };
             match &self.plan_tk {
                 Some(plan) => self.gpu.spgemm_plan_bsym_dev(&self.t_ks, &self.k, plan, &self.q)?,
                 None => self.gpu.spgemm_bsym_dev(&self.t_ks, &self.k, &self.q)?,
@@ -793,8 +898,7 @@ impl SparseSystemWorkspace {
                     self.k.struct_.nblock, &self.q.values, &self.k.values,
                     &self.reduce_partial, &self.reduce_a, &self.reduce_b, &self.residual_buf,
                 )?;
-                // Trace of the state that produced this Q (post-guard).
-                let tr = [if guard { self.nocc } else { tr_now[0] }];
+                let tr = tr_eff;
                 let mut ri_sq = [0.0f32; 1];
                 self.gpu.read_f32(&self.residual_buf, &mut ri_sq)?;
                 let ri = ri_sq[0].sqrt() / k_norm;
@@ -803,16 +907,16 @@ impl SparseSystemWorkspace {
                         "TC2 residual non-finite at iter {iter}: R_I={}", ri
                     )));
                 }
-                last_tr = tr[0];
+                last_tr = tr;
                 last_r_i = ri;
                 // JOINT snapshot criterion: min R_I among iterates whose trace
                 // is ALSO valid. Selecting on R_I alone once captured an
                 // iterate that was already mid-runaway (best R_I at the same
                 // iter where Tr had drifted 0.7 e⁻) — the snapshot was then
                 // rejected by the trace gate and the run hard-failed.
-                if ri < best_r_i && (tr[0] - self.nocc).abs() <= TC2_TRACE_TOL {
+                if ri < best_r_i && (tr - nocc64).abs() <= tol_tr {
                     best_r_i = ri;
-                    best_tr = tr[0];
+                    best_tr = tr;
                     self.gpu.copy_f32(&self.k.values, &self.k_best, self.k.struct_.nblock * BS2)?;
                     best_snapshotted = true;
                     n_stagnant = 0;
@@ -820,18 +924,18 @@ impl SparseSystemWorkspace {
                     n_stagnant += 1;
                 }
                 if crate::methods::sparse::gpu_sparse::algebra_verbose() {
-                    eprintln!("    TC2 iter {iter:3}  R_I={ri:.4e}  Tr(KS)={:.6}", tr[0]);
+                    eprintln!("    TC2 iter {iter:3}  R_I={ri:.4e}  Tr(KS)={tr:.6}");
                 }
 
                 if ri < tol {
-                    if (tr[0] - self.nocc).abs() <= TC2_TRACE_TOL {
+                    if (tr - nocc64).abs() <= tol_tr {
                         // Converged: K was not updated after this T — t_ks
                         // still holds K·S for the returned K (R8a reuse).
                         self.t_ks_valid = true;
-                        return Ok((ri, tr[0], iter + 1));
+                        return Ok((PurifyStatus::Converged, ri, tr, iter + 1));
                     }
                     if crate::methods::sparse::gpu_sparse::algebra_verbose() {
-                        eprintln!("  TC2 R_I={ri:e} < tol but Tr(KS)={} != Nocc={} (wrong-rank projector not accepted)", tr[0], self.nocc);
+                        eprintln!("  TC2 R_I={ri:e} < tol but Tr(KS)={tr} != Nocc={nocc64} (wrong-rank projector not accepted)");
                     }
                 }
                 // NOTE (tried and REVERTED): a "stagnation break" that exits
@@ -852,7 +956,8 @@ impl SparseSystemWorkspace {
                     // (Tr(KS)≈Nocc, R_I small), return the BEST-K snapshot —
                     // that is the honest achievable answer. Only a genuine
                     // blowup (best residual still large) is a hard error.
-                    if best_snapshotted && (best_tr - self.nocc).abs() <= TC2_TRACE_TOL && best_r_i < 1e-2 {
+                    if crate::methods::sparse::gpu_sparse::tc2_plateau_enabled()
+                        && best_snapshotted && (best_tr - nocc64).abs() <= tol_tr && best_r_i < 1e-2 {
                         eprintln!(
                             "  TC2 plateau at iter {iter} ({}): restoring best K (R_I={best_r_i:e}, Tr(KS)={best_tr}) — this IS the f32/mask floor",
                             if stagnant { "stagnant" } else { "oscillating" }
@@ -860,7 +965,7 @@ impl SparseSystemWorkspace {
                         self.gpu.copy_f32(&self.k_best, &mut self.k.values, self.k.struct_.nblock * BS2)?;
                         self.spgemm_ks();            // T consistent with restored K
                         self.t_ks_valid = true;
-                        return Ok((best_r_i, best_tr, iter + 1));
+                        return Ok((PurifyStatus::NumericalFloor, best_r_i, best_tr, iter + 1));
                     }
                     return Err(DftbError::InvalidInput(format!(
                         "TC2 diverged at iter {iter}, R_I={ri:e}, best={best_r_i:e}"
@@ -868,24 +973,25 @@ impl SparseSystemWorkspace {
                 }
             }
 
-            // Update K: Knew = TC2_branch(K, Q, trace, Nocc), symmetrize, swap.
+            // Update K: Knew = TC2_branch(K, Q, branch), symmetrize, swap.
+            // `branch` is the host f64 decision (GPT-5.6 item 2).
             let nblock = self.k.struct_.nblock;
             self.gpu.tc2_dev(
-                nblock, &self.k.values, &self.q.values, &self.trace_buf,
-                self.nocc, &self.knew.values,
+                nblock, &self.k.values, &self.q.values, branch, &self.knew.values,
             )?;
             self.gpu.symmetrize_dev(nblock, &self.k_struct.transpose_block(), &self.knew.values)?;
             std::mem::swap(&mut self.k.values, &mut self.knew.values);
         }
 
-        if best_snapshotted && (best_tr - self.nocc).abs() <= TC2_TRACE_TOL && best_r_i < 1e-2 {
+        if crate::methods::sparse::gpu_sparse::tc2_plateau_enabled()
+            && best_snapshotted && (best_tr - nocc64).abs() <= tol_tr && best_r_i < 1e-2 {
             eprintln!(
                 "  TC2 exhausted {max_iter} iters — restoring best K at floor (R_I={best_r_i:e} < tol={tol:e} not reached, Tr(KS)={best_tr})"
             );
             self.gpu.copy_f32(&self.k_best, &mut self.k.values, self.k.struct_.nblock * BS2)?;
             self.spgemm_ks();
             self.t_ks_valid = true;
-            return Ok((best_r_i, best_tr, max_iter));
+            return Ok((PurifyStatus::NumericalFloor, best_r_i, best_tr, max_iter));
         }
         Err(DftbError::InvalidInput(format!(
             "TC2 exhausted {max_iter} iters, final r_I={last_r_i:e} Tr(KS)={last_tr} (rel. tol={tol:e} Nocc={})",
@@ -893,8 +999,434 @@ impl SparseSystemWorkspace {
         )))
     }
 
+    // ── P = K·S purifier (GPT-5.6 item 4) ──
+
+    /// P0 = (emax·I − ZH)/Δ on M_P — the non-orthogonal analogue of K0.
+    /// Exact identity: K0·S = (emax·I − ZH)·Z·S/Δ = (emax·I − ZH)/Δ.
+    /// Shares the Z·H product + Gershgorin bounds with `compute_k0_impl`.
+    fn compute_p0_impl(&mut self, h: &GpuBsrMatrix, padding: f32) -> Result<(f32, f32)> {
+        // B = Z·H on M_TZS (planned; H symmetric right operand).
+        match &self.plan_zh {
+            Some(plan) => self.gpu.spgemm_plan_bsym_dev(&self.z, h, plan, &self.b_zh)?,
+            None => self.gpu.spgemm_bsym_dev(&self.z, h, &self.b_zh)?,
+        }
+        self.gpu.gershgorin_to_dev(
+            &self.b_zh.struct_, &self.b_zh.values,
+            &self.gersh_emin, &self.gersh_emax,
+            &self.reduce_a, &self.reduce_b, &self.emin_buf, &self.emax_buf,
+        )?;
+        let mut lo = [0.0f32; 1];
+        let mut hi = [0.0f32; 1];
+        self.gpu.read_f32(&self.emin_buf, &mut lo)?;
+        self.gpu.read_f32(&self.emax_buf, &mut hi)?;
+        let (mut emin, mut emax) = (lo[0], hi[0]);
+        let span = (emax - emin).abs() * padding;
+        emin -= span;
+        emax += span;
+        if !emin.is_finite() || !emax.is_finite() || emax <= emin {
+            return Err(DftbError::InvalidInput(format!(
+                "compute_p0: bad ZH Gershgorin emin={emin} emax={emax}"
+            )));
+        }
+
+        // P0 = (emax·I − B)|_{M_P}/Δ : identity into pnew (scratch),
+        // B restricted M_TZS→M_P into q_p2 (scratch), axpby → p.
+        self.gpu.build_identity_dev(&self.p_struct, &self.pnew.values)?;
+        self.gpu.restrict_dev(self.p_struct.nblock, &self.p_to_tzs, &self.b_zh.values, &self.q_p2.values)?;
+        let delta = (emax - emin).max(1e-12);
+        self.gpu.axpby_dev(
+            self.p_struct.nblock, emax / delta, &self.pnew.values,
+            -1.0 / delta, &self.q_p2.values, &self.p.values,
+        )?;
+        self.p_valid = false;
+        self.t_ks_valid = false;
+        Ok((emin, emax))
+    }
+
+    /// P0 from the current **H_scc** (not H0). Call after `build_hscc_dev`.
+    pub fn compute_p0_from_hscc(&mut self, padding: f32) -> Result<(f32, f32)> {
+        let h = GpuBsrMatrix { struct_: self.h_scc.struct_.clone(), values: self.h_scc.values.clone() };
+        self.compute_p0_impl(&h, padding)
+    }
+
+    /// P=KS TC2 purification (GPT-5.6 item 4, EXPERIMENTAL).
+    ///
+    /// The iterate is the density-side projector P = K·S:
+    ///   P² = (KS)² = KSKS = K·S = P   iff  KSK = K,
+    ///   Tr(P) = Tr(KS) = Nocc,  q_A = 2·Tr(P_AA) directly.
+    ///
+    /// ONE generic planned P² SpGEMM per iteration — unlike K-TC2 there is
+    /// no truncated intermediate product feeding a second product; the only
+    /// truncation is the iterate's own M_P result-mask (the same class of
+    /// approximation as truncating K to M_K). P is NOT symmetric → no
+    /// symmetrize step. Same f64-trace/guard/plateau machinery as
+    /// `tc2_purify` — the restoring invariant is identical (Tr(P)≈Nocc).
+    pub fn tc2_purify_p(&mut self, max_iter: usize, tol: f32, check_every: usize) -> Result<(PurifyStatus, f32, f64, usize)> {
+        self.gpu.frob_sq_to_dev(
+            self.p_struct.nblock * BS2, &self.p.values,
+            &self.reduce_partial, &self.reduce_a, &self.reduce_b, &self.ksq_buf,
+        )?;
+        let mut p_sq = [0.0f32; 1];
+        self.gpu.read_f32(&self.ksq_buf, &mut p_sq)?;
+        let p_norm = p_sq[0].sqrt().max(1e-30);
+
+        let nocc64 = self.nocc as f64;
+        let tol_tr = crate::methods::sparse::gpu_sparse::tc2_trace_tol(nocc64);
+        let mut best_r_i = f32::INFINITY;
+        let mut best_tr = 0.0f64;
+        let mut best_snapshotted = false;
+        let mut last_tr = 0.0f64;
+        let mut last_r_i = f32::INFINITY;
+        let mut trace_locked = false;
+        let mut dev_prev = f64::MAX;
+        let mut dev_run = 0usize;
+        self.p_valid = false;
+        self.t_ks_valid = false;
+
+        for iter in 0..max_iter {
+            let do_check = (iter % check_every == 0) || (iter == max_iter - 1);
+
+            // Q = P·P on M_P — the ONLY product per iteration.
+            match &self.plan_pp {
+                Some(plan) => self.gpu.spgemm_plan_dev(&self.p, &self.p, plan, &self.q_p2)?,
+                None => self.gpu.spgemm_masked_dev(&self.p, &self.p, &self.q_p2)?,
+            }
+            // Tr(P) = Tr(KS) — per-atom partials, host f64 (item 2).
+            let tr_now: f64 = self.gpu.trace_ks_f64(
+                &self.p_struct, &self.p.values, &self.n_orb_buf,
+                &self.trace_atom, &mut self.trace_atom_host,
+            )?;
+            if !tr_now.is_finite() {
+                return Err(DftbError::InvalidInput(format!(
+                    "P-TC2 trace non-finite at iter {iter}: Tr(P)={tr_now}"
+                )));
+            }
+            let dev_rel = ((tr_now - nocc64) / nocc64.max(1.0)).abs();
+            if dev_rel < TC2_TRACE_LOCK_REL && last_r_i < TC2_LOCK_RI { trace_locked = true; }
+            if trace_locked && dev_rel > TC2_TRACE_GUARD_REL && dev_rel > 1.5 * dev_prev {
+                dev_run += 1;
+            } else {
+                dev_run = 0;
+            }
+            dev_prev = dev_rel;
+            let guard = crate::methods::sparse::gpu_sparse::tc2_guard_enabled()
+                && dev_run >= 2 && tr_now > 0.0;
+            let tr_eff = if guard {
+                let alpha = (nocc64 / tr_now) as f32;
+                self.gpu.scale_dev(self.p.struct_.nblock, alpha, &self.p.values)?;
+                if crate::methods::sparse::gpu_sparse::algebra_verbose() {
+                    eprintln!(
+                        "    P-TC2 trace guard @iter {iter}: Tr={tr_now:.6} (dev_rel={dev_rel:.2e}) → rescaled P by {alpha:.8}"
+                    );
+                }
+                nocc64
+            } else {
+                tr_now
+            };
+            // Post-rescale branch=1 (squaring) — see tc2_purify for why.
+            let branch: u32 = if guard { 1 } else { (tr_now > nocc64) as u32 };
+
+            if do_check {
+                self.gpu.idempotency_to_dev(
+                    self.p_struct.nblock, &self.q_p2.values, &self.p.values,
+                    &self.reduce_partial, &self.reduce_a, &self.reduce_b, &self.residual_buf,
+                )?;
+                let tr = tr_eff;
+                let mut ri_sq = [0.0f32; 1];
+                self.gpu.read_f32(&self.residual_buf, &mut ri_sq)?;
+                let ri = ri_sq[0].sqrt() / p_norm;
+                if !ri.is_finite() {
+                    return Err(DftbError::InvalidInput(format!(
+                        "P-TC2 residual non-finite at iter {iter}: R_I={ri}"
+                    )));
+                }
+                last_tr = tr;
+                last_r_i = ri;
+                if ri < best_r_i && (tr - nocc64).abs() <= tol_tr {
+                    best_r_i = ri;
+                    best_tr = tr;
+                    self.gpu.copy_f32(&self.p.values, &self.p_best, self.p_struct.nblock * BS2)?;
+                    best_snapshotted = true;
+                }
+                if crate::methods::sparse::gpu_sparse::algebra_verbose() {
+                    eprintln!("    P-TC2 iter {iter:3}  R_I={ri:.4e}  Tr(P)={tr:.6}");
+                }
+
+                if ri < tol {
+                    if (tr - nocc64).abs() <= tol_tr {
+                        self.p_valid = true;
+                        return Ok((PurifyStatus::Converged, ri, tr, iter + 1));
+                    }
+                    if crate::methods::sparse::gpu_sparse::algebra_verbose() {
+                        eprintln!("  P-TC2 R_I={ri:e} < tol but Tr(P)={tr} != Nocc={nocc64} (wrong-rank projector not accepted)");
+                    }
+                }
+                if ri > best_r_i * 10.0 && best_r_i < f32::INFINITY {
+                    if crate::methods::sparse::gpu_sparse::tc2_plateau_enabled()
+                        && best_snapshotted && (best_tr - nocc64).abs() <= tol_tr && best_r_i < 1e-2 {
+                        eprintln!(
+                            "  P-TC2 plateau at iter {iter}: restoring best P (R_I={best_r_i:e}, Tr(P)={best_tr}) — f32/mask floor"
+                        );
+                        self.gpu.copy_f32(&self.p_best, &mut self.p.values, self.p_struct.nblock * BS2)?;
+                        self.p_valid = true;
+                        return Ok((PurifyStatus::NumericalFloor, best_r_i, best_tr, iter + 1));
+                    }
+                    return Err(DftbError::InvalidInput(format!(
+                        "P-TC2 diverged at iter {iter}, R_I={ri:e}, best={best_r_i:e}"
+                    )));
+                }
+            }
+
+            // Update P: Pnew = TC2_branch(P, P², branch). NO symmetrize —
+            // P = KS is genuinely non-symmetric.
+            let nblock = self.p_struct.nblock;
+            self.gpu.tc2_dev(
+                nblock, &self.p.values, &self.q_p2.values, branch, &self.pnew.values,
+            )?;
+            std::mem::swap(&mut self.p.values, &mut self.pnew.values);
+        }
+
+        if crate::methods::sparse::gpu_sparse::tc2_plateau_enabled()
+            && best_snapshotted && (best_tr - nocc64).abs() <= tol_tr && best_r_i < 1e-2 {
+            eprintln!(
+                "  P-TC2 exhausted {max_iter} iters — restoring best P at floor (R_I={best_r_i:e} < tol={tol:e} not reached, Tr(P)={best_tr})"
+            );
+            self.gpu.copy_f32(&self.p_best, &mut self.p.values, self.p_struct.nblock * BS2)?;
+            self.p_valid = true;
+            return Ok((PurifyStatus::NumericalFloor, best_r_i, best_tr, max_iter));
+        }
+        Err(DftbError::InvalidInput(format!(
+            "P-TC2 exhausted {max_iter} iters, final r_I={last_r_i:e} Tr(P)={last_tr} (rel. tol={tol:e} Nocc={})",
+            self.nocc
+        )))
+    }
+
+    /// TRS4 purification on P (GPT-5.6 item 5 — Niklasson et al., trace-
+    /// resetting purification). The rigorous restoring mechanism:
+    ///
+    ///   Q = P²,  R = Q²;   P_new = a·Q + b·R
+    ///   a + b = 1            (preserves idempotent fixed points)
+    ///   a·Tr(Q) + b·Tr(R) = Nocc   (trace reset EXACTLY each iteration)
+    ///
+    /// ⇒ a = (Nocc − Tr(R)) / (Tr(Q) − Tr(R)),  b = 1 − a.
+    /// Tr(Q) ≥ Tr(R) while eigenvalues ∈ [0,1] (x²≥x⁴), so the solve is
+    /// well-conditioned near convergence. Two planned SpGEMMs per iter
+    /// (P² and P⁴ — both reuse plan_pp since Q lives on M_P) + three
+    /// O(N_atom) diagonal readbacks, all decisions in host f64.
+    ///
+    /// Fallback (fail-loud, documented): if the solve is degenerate
+    /// (Tr(Q)≈Tr(R) → P already idempotent) or `a` leaves the stability
+    /// window (−1 ≤ a ≤ 3 for f(x)=ax²+(1−a)x⁴ on [0,1]), the iteration
+    /// takes a TC2 branch step instead. No guard needed — the trace is
+    /// reset by construction every iteration.
+    pub fn trs_purify_p(&mut self, max_iter: usize, tol: f32, check_every: usize) -> Result<(PurifyStatus, f32, f64, usize)> {
+        self.gpu.frob_sq_to_dev(
+            self.p_struct.nblock * BS2, &self.p.values,
+            &self.reduce_partial, &self.reduce_a, &self.reduce_b, &self.ksq_buf,
+        )?;
+        let mut p_sq = [0.0f32; 1];
+        self.gpu.read_f32(&self.ksq_buf, &mut p_sq)?;
+        let p_norm = p_sq[0].sqrt().max(1e-30);
+
+        let nocc64 = self.nocc as f64;
+        let tol_tr = crate::methods::sparse::gpu_sparse::tc2_trace_tol(nocc64);
+        let mut best_r_i = f32::INFINITY;
+        let mut best_tr = 0.0f64;
+        let mut best_snapshotted = false;
+        let mut last_tr = 0.0f64;
+        let mut last_r_i = f32::INFINITY;
+        let nblock = self.p_struct.nblock;
+        self.p_valid = false;
+        self.t_ks_valid = false;
+
+        for iter in 0..max_iter {
+            let do_check = (iter % check_every == 0) || (iter == max_iter - 1);
+
+            // Q = P², R = Q² = P⁴ — same M_P structure, same plan.
+            match &self.plan_pp {
+                Some(plan) => {
+                    self.gpu.spgemm_plan_dev(&self.p, &self.p, plan, &self.q_p2)?;
+                    self.gpu.spgemm_plan_dev(&self.q_p2, &self.q_p2, plan, &self.r_p4)?;
+                }
+                None => {
+                    self.gpu.spgemm_masked_dev(&self.p, &self.p, &self.q_p2)?;
+                    self.gpu.spgemm_masked_dev(&self.q_p2, &self.q_p2, &self.r_p4)?;
+                }
+            }
+            // Three scalar decisions in host f64 (item 2 machinery).
+            let tr_p: f64 = self.gpu.trace_ks_f64(
+                &self.p_struct, &self.p.values, &self.n_orb_buf,
+                &self.trace_atom, &mut self.trace_atom_host,
+            )?;
+            let tr_q: f64 = self.gpu.trace_ks_f64(
+                &self.q_p2.struct_, &self.q_p2.values, &self.n_orb_buf,
+                &self.trace_atom, &mut self.trace_atom_host,
+            )?;
+            let tr_r: f64 = self.gpu.trace_ks_f64(
+                &self.r_p4.struct_, &self.r_p4.values, &self.n_orb_buf,
+                &self.trace_atom, &mut self.trace_atom_host,
+            )?;
+            if !tr_p.is_finite() || !tr_q.is_finite() || !tr_r.is_finite() {
+                return Err(DftbError::InvalidInput(format!(
+                    "TRS4 trace non-finite at iter {iter}: Tr(P)={tr_p} Tr(Q)={tr_q} Tr(R)={tr_r}"
+                )));
+            }
+
+            // Trace-resetting degree-4 update: P_new = a·Q + (1−a)·R with
+            // a = (Nocc − Tr R)/(Tr Q − Tr R) so Tr(P_new) = Nocc exactly.
+            // a∈[1,2] is the provably-monotone band (a=2 ⇔ 2x²−x⁴);
+            // a∈(2,3] overshoots slightly (max f = a²/4(a−1) ≤ 9/8 ≈ 1.13)
+            // but is REQUIRED to raise the trace when the spectrum sits
+            // mid-range (Tr(Q) ≪ Nocc — clamping to a≤2 stalls at a
+            // wrong-rank fixed point, measured at r_k=12). The overshoot
+            // self-corrects: eigenvalues pushed above 1 make the NEXT
+            // den = Tr(Q)−Tr(R) ≤ 0, which selects the complement map
+            // 2x−x² — it pulls x>1 back below 1 (a squaring step there
+            // would amplify them — measured divergence, first prototype).
+            let den = tr_q - tr_r;
+            enum TrsUpd { Coef(f64), Complement }
+            let upd = if den > 1e-9 {
+                TrsUpd::Coef(((nocc64 - tr_r) / den).clamp(-1.0, 3.0))
+            } else {
+                TrsUpd::Complement
+            };
+
+            if do_check {
+                self.gpu.idempotency_to_dev(
+                    nblock, &self.q_p2.values, &self.p.values,
+                    &self.reduce_partial, &self.reduce_a, &self.reduce_b, &self.residual_buf,
+                )?;
+                let mut ri_sq = [0.0f32; 1];
+                self.gpu.read_f32(&self.residual_buf, &mut ri_sq)?;
+                let ri = ri_sq[0].sqrt() / p_norm;
+                if !ri.is_finite() {
+                    return Err(DftbError::InvalidInput(format!(
+                        "TRS4 residual non-finite at iter {iter}: R_I={ri}"
+                    )));
+                }
+                // Trace AFTER the update = Nocc by construction (TRS) or
+                // the branch result (fallback) — report tr_p honestly.
+                let tr = tr_p;
+                last_tr = tr;
+                last_r_i = ri;
+                if ri < best_r_i && (tr - nocc64).abs() <= tol_tr {
+                    best_r_i = ri;
+                    best_tr = tr;
+                    self.gpu.copy_f32(&self.p.values, &self.p_best, nblock * BS2)?;
+                    best_snapshotted = true;
+                }
+                if crate::methods::sparse::gpu_sparse::algebra_verbose() {
+                    let a_s = match upd { TrsUpd::Coef(a) => format!("{a:.4}"), TrsUpd::Complement => "compl".to_string() };
+                    eprintln!(
+                        "    TRS4 iter {iter:3}  R_I={ri:.4e}  Tr(P)={tr_p:.6}  Tr(Q)={tr_q:.6}  a={a_s}"
+                    );
+                }
+
+                if ri < tol {
+                    if (tr - nocc64).abs() <= tol_tr {
+                        self.p_valid = true;
+                        return Ok((PurifyStatus::Converged, ri, tr, iter + 1));
+                    }
+                    if crate::methods::sparse::gpu_sparse::algebra_verbose() {
+                        eprintln!("  TRS4 R_I={ri:e} < tol but Tr(P)={tr} != Nocc={nocc64} (wrong-rank projector not accepted)");
+                    }
+                }
+                if ri > best_r_i * 10.0 && best_r_i < f32::INFINITY {
+                    if crate::methods::sparse::gpu_sparse::tc2_plateau_enabled()
+                        && best_snapshotted && (best_tr - nocc64).abs() <= tol_tr && best_r_i < 1e-2 {
+                        eprintln!(
+                            "  TRS4 plateau at iter {iter}: restoring best P (R_I={best_r_i:e}, Tr(P)={best_tr}) — f32/mask floor"
+                        );
+                        self.gpu.copy_f32(&self.p_best, &mut self.p.values, nblock * BS2)?;
+                        self.p_valid = true;
+                        return Ok((PurifyStatus::NumericalFloor, best_r_i, best_tr, iter + 1));
+                    }
+                    return Err(DftbError::InvalidInput(format!(
+                        "TRS4 diverged at iter {iter}, R_I={ri:e}, best={best_r_i:e}"
+                    )));
+                }
+            }
+
+            // Update P: a·Q + (1−a)·R, or the complement map 2P−Q when
+            // the denominator is degenerate/contaminated (eigs > 1).
+            match upd {
+                TrsUpd::Coef(a) => {
+                    self.gpu.axpby_dev(nblock, a as f32, &self.q_p2.values, (1.0 - a) as f32, &self.r_p4.values, &self.pnew.values)?;
+                }
+                TrsUpd::Complement => {
+                    if crate::methods::sparse::gpu_sparse::algebra_verbose() {
+                        eprintln!("    TRS4 iter {iter}: den={den:.4} ≤ 0 — complement step 2P−Q (eigs>1 cleanup)");
+                    }
+                    self.gpu.axpby_dev(nblock, 2.0, &self.p.values, -1.0, &self.q_p2.values, &self.pnew.values)?;
+                }
+            }
+            std::mem::swap(&mut self.p.values, &mut self.pnew.values);
+        }
+
+        if crate::methods::sparse::gpu_sparse::tc2_plateau_enabled()
+            && best_snapshotted && (best_tr - nocc64).abs() <= tol_tr && best_r_i < 1e-2 {
+            eprintln!(
+                "  TRS4 exhausted {max_iter} iters — restoring best P at floor (R_I={best_r_i:e} < tol={tol:e} not reached, Tr(P)={best_tr})"
+            );
+            self.gpu.copy_f32(&self.p_best, &mut self.p.values, nblock * BS2)?;
+            self.p_valid = true;
+            return Ok((PurifyStatus::NumericalFloor, best_r_i, best_tr, max_iter));
+        }
+        Err(DftbError::InvalidInput(format!(
+            "TRS4 exhausted {max_iter} iters, final r_I={last_r_i:e} Tr(P)={last_tr} (rel. tol={tol:e} Nocc={})",
+            self.nocc
+        )))
+    }
+
+    /// P0 + TRS4 on the current device H_scc; K = P·Z recovered after.
+    pub fn purify_hscc_trs(&mut self, tc2_max: usize, tc2_tol: f32) -> Result<(PurifyStatus, f32, f64, usize)> {
+        let (emin, emax) = self.compute_p0_from_hscc(0.1)?;
+        if crate::methods::sparse::gpu_sparse::algebra_verbose() {
+            eprintln!("  bounds (ZH Gershgorin, H_scc): emin={emin:.4} emax={emax:.4}  [TRS4]");
+        }
+        let out = self.trs_purify_p(tc2_max, tc2_tol, 1)?;
+        self.recover_k_from_p()?;
+        self.spgemm_ks();
+        self.t_ks_valid = true;
+        Ok(out)
+    }
+
+    /// Recover K = P·Z on M_K (P non-symmetric left, Z symmetric right →
+    /// the Bsym plan applies). K is symmetrized once — P·Z is symmetric to
+    /// within the P- and Z-residuals. Needed by the energy/force path.
+    fn recover_k_from_p(&mut self) -> Result<()> {
+        match &self.plan_pz {
+            Some(plan) => self.gpu.spgemm_plan_bsym_dev(&self.p, &self.z, plan, &self.k)?,
+            None => self.gpu.spgemm_bsym_dev(&self.p, &self.z, &self.k)?,
+        }
+        self.gpu.symmetrize_dev(self.k_struct.nblock, &self.k_struct.transpose_block(), &self.k.values)?;
+        self.t_ks_valid = false;
+        Ok(())
+    }
+
+    /// P0 + P-TC2 of the current device H_scc using the current Z. No NS.
+    /// K = P·Z is recovered afterwards so the downstream energy/force
+    /// path is unchanged. Returns (status, r_I, Tr[P] as f64, iters).
+    pub fn purify_hscc_p(&mut self, tc2_max: usize, tc2_tol: f32) -> Result<(PurifyStatus, f32, f64, usize)> {
+        let (emin, emax) = self.compute_p0_from_hscc(0.1)?;
+        if crate::methods::sparse::gpu_sparse::algebra_verbose() {
+            eprintln!("  bounds (ZH Gershgorin, H_scc): emin={emin:.4} emax={emax:.4}");
+        }
+        let out = self.tc2_purify_p(tc2_max, tc2_tol, 1)?;
+        self.recover_k_from_p()?;
+        // Consistent finalization: the reported (K,q) state must come from
+        // the SAME matrix or the SCC energy is evaluated off-stationarity —
+        // q from P while K=PZ leaves an O(ZS−I) inconsistency that leaks
+        // into FD-vs-analytic force parity (measured ~5e-4 on SiH4 G3.4).
+        // One K·S product per SCC iteration; Mulliken then reads t_ks.
+        self.spgemm_ks();
+        self.t_ks_valid = true;
+        Ok(out)
+    }
+
     /// K0 + TC2 of the current device H_scc using the current Z. No NS.
-    pub fn purify_hscc(&mut self, tc2_max: usize, tc2_tol: f32) -> Result<(f32, f32, usize)> {
+    /// Returns (status, r_I, Tr[KS] as f64, tc2_iters) — see `PurifyStatus`.
+    pub fn purify_hscc(&mut self, tc2_max: usize, tc2_tol: f32) -> Result<(PurifyStatus, f32, f64, usize)> {
         let (emin, emax) = self.compute_k0_from_hscc(0.1)?;
         if crate::methods::sparse::gpu_sparse::algebra_verbose() {
             eprintln!("  bounds (ZH Gershgorin, H_scc): emin={emin:.4} emax={emax:.4}");
@@ -924,8 +1456,9 @@ impl SparseSystemWorkspace {
     /// 3. TC2 purification → K
     /// 4. Mulliken charges
     ///
-    /// Returns (q_phys, q_dum, r_I, Tr, tc2_iters) — `r_I` is the *relative*
-    /// idempotency residual `‖KSK−K‖/‖K‖` (R12).
+    /// Returns (q_phys, q_dum, status, r_I, Tr[f64], tc2_iters) — `r_I` is
+    /// the *relative* idempotency residual `‖KSK−K‖/‖K‖` (R12); `status`
+    /// is `PurifyStatus` (NumericalFloor ⇒ energies NOT validated).
     pub fn run_scc(
         &mut self,
         ns_max_iter: usize,
@@ -933,7 +1466,7 @@ impl SparseSystemWorkspace {
         tc2_max_iter: usize,
         tc2_tol: f32,
         tc2_check_every: usize,
-    ) -> Result<(Vec<f32>, Vec<f32>, f32, f32, usize)> {
+    ) -> Result<(Vec<f32>, Vec<f32>, PurifyStatus, f32, f64, usize)> {
         // 1. Z ≈ S⁻¹ (cold start — one-shot purify API has no previous Z)
         let (_, _) = self.compute_z(ns_max_iter, ns_tol, 3, false)?;
 
@@ -941,12 +1474,12 @@ impl SparseSystemWorkspace {
         let _ = self.compute_k0(0.1)?;
 
         // 3. TC2
-        let (r_i, tr, iters) = self.tc2_purify(tc2_max_iter, tc2_tol, tc2_check_every)?;
+        let (status, r_i, tr, iters) = self.tc2_purify(tc2_max_iter, tc2_tol, tc2_check_every)?;
 
         // 4. Mulliken charges (reuses t_ks — converged TC2 leaves T = K·S)
         let (charges, q_dum) = self.mulliken_charges()?;
 
-        Ok((charges, q_dum, r_i, tr, iters))
+        Ok((charges, q_dum, status, r_i, tr, iters))
     }
 }
 
@@ -1114,15 +1647,16 @@ mod tests {
         let mut ws = SparseSystemWorkspace::new(gpu, &h0, &s, &mask, &mask, &all4, nocc).unwrap();
 
         // Run full SCC pipeline. r_I is the RELATIVE residual ‖KSK−K‖/‖K‖ (R12).
-        let (charges, q_dum, r_i, tr, iters) = ws.run_scc(30, 1e-4, 40, 1e-5, 1).unwrap();
+        let (charges, q_dum, status, r_i, tr, iters) = ws.run_scc(30, 1e-4, 40, 1e-5, 1).unwrap();
         println!("SCC: {iters} TC2 iters, r_I={r_i:e} (relative), Tr(KS)={tr:.6}");
         println!("Mulliken charges: {:?}", &charges);
         let qd_max: f32 = q_dum.iter().map(|x| x.abs()).fold(0.0, f32::max);
         println!("Dummy occupation: {qd_max:e} (should be ~0, R14)");
 
         // Verify convergence — relative idempotency residual.
+        assert_eq!(status, crate::methods::sparse::gpu_sparse::PurifyStatus::Converged);
         assert!(r_i < 1e-5, "TC2 did not converge: r_I={r_i:e} (G2)");
-        assert!((tr - nocc).abs() < 1e-5, "Tr(KS) mismatch: {tr} vs {nocc} (G2)");
+        assert!((tr - nocc as f64).abs() < 1e-5, "Tr(KS) mismatch: {tr} vs {nocc} (G2)");
         assert_eq!(charges.len(), n_atom);
 
         // G1.8: Tr(KS)=Nocc, never Tr(K²) for a non-orthogonal metric.
@@ -1246,11 +1780,11 @@ mod tests {
         let mut ws = SparseSystemWorkspace::new(gpu, &h0, &s, &mask, &mask, &all4, nocc).unwrap();
 
         // First run.
-        let (_, _, r_i1, tr1, _) = ws.run_scc(30, 1e-4, 60, 1e-5, 1).unwrap();
+        let (_, _, _, r_i1, tr1, _) = ws.run_scc(30, 1e-4, 60, 1e-5, 1).unwrap();
         println!("Run 1: r_I={r_i1:e}, Tr={tr1:.6}");
 
         // Second run with same geometry (should give same result).
-        let (_, _, r_i2, tr2, _) = ws.run_scc(30, 1e-4, 60, 1e-5, 1)
+        let (_, _, _, r_i2, tr2, _) = ws.run_scc(30, 1e-4, 60, 1e-5, 1)
             .unwrap_or_else(|e| panic!("Run 2 failed (no skip): {e}"));
         println!("Run 2: R_I={r_i2:e}, Tr={tr2:.6}");
 

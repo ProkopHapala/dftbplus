@@ -390,7 +390,8 @@ fn test_residual_and_mix() {
     let qo_buf = rt.buffer_from_slice(&q_old).unwrap();
     let qm_buf = rt.zero_buffer::<f32>(batch * n_atoms).unwrap();
     let rms_buf = rt.zero_buffer::<f32>(batch).unwrap();
-    residual_and_mix_batched(&mut rt, &qn_buf, &qo_buf, &qm_buf, &rms_buf, alpha, n_atoms, batch)
+    let act_buf = rt.buffer_from_slice(&vec![1i32; batch]).unwrap();
+    residual_and_mix_batched(&mut rt, &qn_buf, &qo_buf, &qm_buf, &rms_buf, &act_buf, alpha, n_atoms, batch)
         .unwrap();
     rt.finish().unwrap();
 
@@ -554,7 +555,8 @@ fn test_batched_scc_kernels() {
     let qo_buf = rt.buffer_from_slice(&q_old).unwrap();
     let qm_buf = rt.zero_buffer::<f32>(batch * n_atoms).unwrap();
     let rms_buf = rt.zero_buffer::<f32>(batch).unwrap();
-    residual_and_mix_batched(&mut rt, &dq_buf, &qo_buf, &qm_buf, &rms_buf, 0.3, n_atoms, batch)
+    let act_buf = rt.buffer_from_slice(&vec![1i32; batch]).unwrap();
+    residual_and_mix_batched(&mut rt, &dq_buf, &qo_buf, &qm_buf, &rms_buf, &act_buf, 0.3, n_atoms, batch)
         .unwrap();
     rt.finish().unwrap();
     let mut qm_gpu = vec![0.0f32; batch * n_atoms];

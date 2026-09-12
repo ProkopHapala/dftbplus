@@ -3,9 +3,9 @@
 const sk_dir = SK_DIR;
 load_xyz("gc", "/home/prokop/git/dftbplus/data/xyz/guanine-cytosine.xyz");
 let xyz = get_xyz("gc");
-let dx = xyz[3*21]   - xyz[3*8];
-let dy = xyz[3*21+1] - xyz[3*8+1];
-let dz = xyz[3*21+2] - xyz[3*8+2];
+let dx = xyz[3*20]   - xyz[3*8];
+let dy = xyz[3*20+1] - xyz[3*8+1];
+let dz = xyz[3*20+2] - xyz[3*8+2];
 let dNN = sqrt(dx*dx + dy*dy + dz*dz);
 dx /= dNN; dy /= dNN; dz /= dNN;
 let d = 1.9;

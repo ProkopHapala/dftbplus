@@ -94,7 +94,223 @@ inline int2 inner_jacobi_pair(int round, int ipair) {
 }
 
 // ------------------------------------------------------------------
-// tiled_jacobi_batched
+// jacobi_cyclic_global_batched  (N>64 direct solver — replaces the
+// tiled block-Jacobi whose cost was ~16k workgroup barriers/eigensolve)
+//
+// Direct parallel cyclic Jacobi on the FULL matrix in global memory.
+// One WG/system, one kernel launch, ~3 barriers per round.
+//
+// Schedule: N padded to even JN; Brent–Luk round-robin gives JN/2
+// disjoint pairs per round, JN−1 rounds per sweep. Each pair (p,q)
+// applies the SAME rotation convention as the old inner pivot:
+//   A ← JᵀAJ on the 2×2 blocks (pa,qa)×(pb,qb) for ALL pair-combos (a,b)
+//   V ← VJ  on columns (pa,qa)
+// The pad index (when n odd) is never stored: pairs touching it are
+// identity and out-of-range writes are skipped.
+//
+// Exit test (f32-aware): off = ‖offdiag(A)‖_F each sweep; stop when
+//   off < JACOBI_OFF_TOL · ‖A‖_F
+// ‖A‖_F is invariant under orthogonal similarity → computed ONCE at
+// entry; the test does not get harder on warm-started (near-diagonal) A.
+// Backstop: stagnation counter as before.
+//
+// Rotations (c,s) still built in f64 when JACOBI_PREC>=1 — one scalar
+// pair per (round,pair), off the throughput path. PAIR_SKIP is now
+// RELATIVE to the local diagonal scale (the old absolute 1e-12 could
+// never trigger in f32).
+//
+// init_v: 0 → V=I (cold), 1 → keep V (warm AO basis B; A=BᵀHB formed
+// by the caller's GEMMs — on exit V holds the new eigenvectors C=BJ).
+// ------------------------------------------------------------------
+#ifndef JACOBI_OFF_TOL
+#define JACOBI_OFF_TOL 1.0e-6f    // off/‖A‖_F exit threshold
+#endif
+#ifndef PAIR_SKIP_REL
+#define PAIR_SKIP_REL 3.0e-8f     // |a_pq| < ε·(|a_pp|+|a_qq|) → skip
+#endif
+#ifndef MAX_CSWEEPS
+#define MAX_CSWEEPS 40
+#endif
+
+inline int2 cyclic_jacobi_pair(int round, int ipair, int jn) {
+    int m = jn - 1;
+    if (ipair == 0) return (int2)(m, round % m);
+    return (int2)((round + ipair) % m, (round + m - ipair) % m);
+}
+
+__kernel void jacobi_cyclic_global_batched(
+    __global float* A,   // [batch][n*n] in/out — eigenvalues on diag at exit
+    __global float* V,   // [batch][n*n] in/out — eigenvectors (cols) at exit
+    const int n,
+    const int batch,
+    const int init_v,
+    __global const int* active      // [batch] 0 → replica frozen, early-out
+) {
+    const int gid = get_group_id(0);
+    const int lid = get_local_id(0);
+    const int lsz = get_local_size(0);
+    if (active[gid] == 0) return;
+
+    const int jn = (n & 1) ? n + 1 : n;   // even pad
+    const int jpair = jn / 2;
+    const int jround = jn - 1;
+
+    __local jrot_t rot_c[128];    // supports n ≤ 256
+    __local jrot_t rot_s[128];
+    __local int    rot_p[128];
+    __local int    rot_q[128];
+    __local volatile int l_nrot;  // live (non-skipped) rotations this round
+    __local float  reduce[WG];
+
+    __global float* gA = A + (size_t)gid * n * n;
+    __global float* gV = V + (size_t)gid * n * n;
+    const int nn = n * n;
+
+    // ---- V init ----
+    if (init_v == 0) {
+        for (int idx = lid; idx < nn; idx += lsz) {
+            int r = idx / n;
+            gV[idx] = (r == idx - r * n) ? 1.0f : 0.0f;
+        }
+    }
+
+    // ---- ‖A‖_F once (Jacobi similarity preserves it) + initial off ----
+    float fa = 0.0f, fo = 0.0f;
+    for (int idx = lid; idx < nn; idx += lsz) {
+        float v = gA[idx];
+        fa += v * v;
+        int r = idx / n;
+        if (r != idx - r * n) fo += v * v;
+    }
+    reduce[lid] = fa;  barrier(CLK_LOCAL_MEM_FENCE);
+    for (int off = lsz >> 1; off > 0; off >>= 1) {
+        if (lid < off) reduce[lid] += reduce[lid + off];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    const float frob = sqrt(fmax(reduce[0], 1.0e-30f));
+    barrier(CLK_LOCAL_MEM_FENCE);
+    reduce[lid] = fo;  barrier(CLK_LOCAL_MEM_FENCE);
+    for (int off = lsz >> 1; off > 0; off >>= 1) {
+        if (lid < off) reduce[lid] += reduce[lid + off];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    float off_cur = sqrt(reduce[0]);
+    barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
+
+    const float off_exit = JACOBI_OFF_TOL * frob;
+    float prev_off = fmax(off_cur, 1.0e-30f);
+    int stall = 0;
+
+    for (int sweep = 0; sweep < MAX_CSWEEPS && off_cur > off_exit; ++sweep) {
+        for (int r = 0; r < jround; ++r) {
+            // ---- Phase 1: rotation params per pair (strided for n>256) ----
+            // KNOWN COST (JACOBI_PREC≥1, jrot_t=double): only jpair≈44 of the
+            // 256 threads do work here, each running an f64 divide + 2 f64
+            // square roots. On consumer GPUs (RTX 3090: FP64 = 1/64 FP32 rate,
+            // f64 sqrt/div are multi-instruction software sequences) this is
+            // a serialized scalar island — the rest of the workgroup waits at
+            // the barrier below. GPT-5.6 instruction 5: once this kernel is
+            // fast, retry JACOBI_PREC=0 (f32 c,s): the formula
+            // t = sign(τ)/(|τ|+√(1+τ²)) is already cancellation-safe in f32;
+            // a ~1e-7 rotation-angle error is self-correcting (later rounds
+            // re-zero the off-diagonal; accuracy is set by JACOBI_OFF_TOL and
+            // the Rayleigh/renorm repair, not by rotation exactness).
+            // A/B: rebuild with JACOBI_PREC=0 and compare δ_eig, ‖HC−SCε‖,
+            // AT/GC ΔE vs prec1.
+            if (lid == 0) l_nrot = 0;
+            barrier(CLK_LOCAL_MEM_FENCE);
+            for (int ip = lid; ip < jpair; ip += lsz) {
+                int2 pq = cyclic_jacobi_pair(r, ip, jn);
+                int p = min(pq.x, pq.y);   // p < q
+                int q = max(pq.x, pq.y);
+                rot_p[ip] = p; rot_q[ip] = q;
+                float apq = (q < n) ? gA[p * n + q] : 0.0f;
+                float app = gA[p * n + p];
+                float aqq = (q < n) ? gA[q * n + q] : 1.0f;
+                if (fabs(apq) < PAIR_SKIP_REL * (fabs(app) + fabs(aqq))) {
+                    rot_c[ip] = (jrot_t)1.0; rot_s[ip] = (jrot_t)0.0;
+                } else {
+                    jrot_t aq = (jrot_t)apq;
+                    jrot_t tau = ((jrot_t)aqq - (jrot_t)app) / ((jrot_t)2.0 * aq);
+                    jrot_t t = (tau >= (jrot_t)0.0)
+                        ? (jrot_t)1.0 / (tau + sqrt((jrot_t)1.0 + tau * tau))
+                        : -(jrot_t)1.0 / (-tau + sqrt((jrot_t)1.0 + tau * tau));
+                    jrot_t c = (jrot_t)1.0 / sqrt((jrot_t)1.0 + t * t);
+                    rot_c[ip] = c; rot_s[ip] = t * c;
+                    atomic_inc(&l_nrot);
+                }
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
+            if (l_nrot == 0) continue;   // this round's pairs all below skip; other rounds may not be
+
+            // ---- Phase 2+3 fused: A 2×2 blocks + V columns, one barrier ----
+            const int nblk = jpair * jpair;
+            const int nvt = n * jpair;
+            for (int it = lid; it < nblk + nvt; it += lsz) {
+                if (it < nblk) {
+                    int a = it / jpair, b = it - a * jpair;
+                    jupd_t sa = (jupd_t)rot_s[a], sb = (jupd_t)rot_s[b];
+                    if (sa == (jupd_t)0.0 && sb == (jupd_t)0.0) continue;  // both identity
+                    int pa = rot_p[a], qa = rot_q[a];
+                    int pb = rot_p[b], qb = rot_q[b];
+                    jupd_t ca = (jupd_t)rot_c[a], cb = (jupd_t)rot_c[b];
+                    jupd_t apr = (jupd_t)gA[pa * n + pb];
+                    jupd_t aps = (qb < n) ? (jupd_t)gA[pa * n + qb] : (jupd_t)0.0;
+                    jupd_t aqr = (qa < n) ? (jupd_t)gA[qa * n + pb] : (jupd_t)0.0;
+                    jupd_t aqs = (qa < n && qb < n) ? (jupd_t)gA[qa * n + qb] : (jupd_t)0.0;
+                    jupd_t tpr = fma(cb, apr, -sb * aps);
+                    jupd_t tps = fma(sb, apr, cb * aps);
+                    jupd_t tqr = fma(cb, aqr, -sb * aqs);
+                    jupd_t tqs = fma(sb, aqr, cb * aqs);
+                    gA[pa * n + pb] = (float)fma(ca, tpr, -sa * tqr);
+                    if (qb < n) gA[pa * n + qb] = (float)fma(ca, tps, -sa * tqs);
+                    if (qa < n) {
+                        gA[qa * n + pb] = (float)fma(sa, tpr, ca * tqr);
+                        if (qb < n) gA[qa * n + qb] = (float)fma(sa, tps, ca * tqs);
+                    }
+                } else {
+                    int t = it - nblk;
+                    int k = t / jpair, a = t - (t / jpair) * jpair;
+                    jupd_t s = (jupd_t)rot_s[a];
+                    if (s == (jupd_t)0.0) continue;
+                    int p = rot_p[a], q = rot_q[a];
+                    jupd_t c = (jupd_t)rot_c[a];
+                    jupd_t vkp = (jupd_t)gV[k * n + p];
+                    jupd_t vkq = (q < n) ? (jupd_t)gV[k * n + q] : (jupd_t)0.0;
+                    gV[k * n + p] = (float)fma(c, vkp, -s * vkq);
+                    if (q < n) gV[k * n + q] = (float)fma(s, vkp, c * vkq);
+                }
+            }
+            barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
+        }
+
+        // ---- Sweep-end off-norm + exit/stagnation tests ----
+        fo = 0.0f;
+        for (int idx = lid; idx < nn; idx += lsz) {
+            int r = idx / n;
+            if (r != idx - r * n) { float v = gA[idx]; fo += v * v; }
+        }
+        reduce[lid] = fo;  barrier(CLK_LOCAL_MEM_FENCE);
+        for (int off = lsz >> 1; off > 0; off >>= 1) {
+            if (lid < off) reduce[lid] += reduce[lid + off];
+            barrier(CLK_LOCAL_MEM_FENCE);
+        }
+        off_cur = sqrt(reduce[0]);
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (off_cur > 0.9f * prev_off) { if (++stall >= 3) break; } else { stall = 0; }
+        prev_off = off_cur;
+    }
+
+    // ---- Eigenvalues on the diagonal; zero the off-diagonal residue ----
+    for (int idx = lid; idx < nn; idx += lsz) {
+        int r = idx / n;
+        if (r != idx - r * n) gA[idx] = 0.0f;
+    }
+}
+
+// ------------------------------------------------------------------
+// tiled_jacobi_batched  (DEPRECATED — kept for A/B measurement only;
+// the production N>64 path is jacobi_cyclic_global_batched)
 //
 // Diagonalizes `batch` symmetric N×N matrices. One workgroup per system.
 // A and V reside in global memory; only the 2B×2B compound pivot and

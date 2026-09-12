@@ -848,6 +848,74 @@ fn test_k0_and_tc2_vs_dense_projector() {
 }
 
 // =====================================================================
+// 12b. GPT-5.6 item 6 parity check: W = 2(ZH)K vs W = 2KHK.
+//
+//      This code's Z is S⁻¹ (NS target ‖I−ZS‖→0), so the identity is
+//      EXACT, not approximate:
+//        Z·H·K = S⁻¹H·Σ_occ c cᵀ = Σ_occ εᵢ cᵢ cᵢᵀ = ρHρ = W/2
+//      (since S⁻¹H cᵢ = εᵢ cᵢ). Measured: elementwise match ~5e-8 in f64
+//      on a nonorthogonal random problem → the shortcut is VALID and
+//      removes the KH intermediate (one SpGEMM instead of two, reusing
+//      the B=Z·H_scc product that P0/K0 already computes).
+//      This test locks in the identity — if it ever breaks, the W path
+//      must revert to 2KHK.
+// =====================================================================
+
+#[test]
+fn test_w_zhk_vs_khk_parity() {
+    let n_atom = 3;
+    let n = n_atom * BS;
+    let nocc = 3;
+    let mut rng = Rng(0x7777_1111_2222_3333);
+    let mut h_dense = random_symmetric_dense(n_atom, &mut rng, 0.4);
+    for i in 0..n {
+        h_dense[i * n + i] += 2.0;
+    }
+    // Deliberately NON-orthogonal overlap (offdiag 0.2) — the Z≠I regime.
+    let s_dense = make_overlap_dense(n_atom, &mut rng, 0.2);
+
+    let hf = row_major_to_dmatrix_f64(&h_dense, n);
+    let sf = row_major_to_dmatrix_f64(&s_dense, n);
+
+    // Exact K (dense generalized eigensolve) and exact Z = S⁻¹.
+    let k_ref = row_major_to_dmatrix_f64(&cpu_density_kernel(&h_dense, &s_dense, n, nocc), n);
+    let se = SymmetricEigen::new(sf.clone());
+    let mut dinv = DMatrix::<f64>::zeros(n, n);
+    for i in 0..n {
+        dinv[(i, i)] = 1.0 / se.eigenvalues[i].max(1e-12);
+    }
+    let z = &se.eigenvectors * &dinv * se.eigenvectors.transpose();
+
+    let w_ref = 2.0 * &k_ref * &hf * &k_ref;   // 2KHK — validated convention
+    let w_gpt = 2.0 * &z * &hf * &k_ref;       // 2(ZH)K — GPT-5.6 shortcut
+
+    let elem_diff = (&w_gpt - &w_ref).iter().map(|x| x.abs()).fold(0.0f64, f64::max);
+    let w_ref_max = w_ref.iter().map(|x| x.abs()).fold(0.0f64, f64::max);
+    println!("W-parity: max|W_gpt−W_ref|={elem_diff:e}  max|W_ref|={w_ref_max:e}");
+
+    // Contraction parity over random symmetric X (dS proxy): what the
+    // force formula actually samples is ⟨W, X⟩ = Tr(W·X).
+    let mut worst_rel = 0.0f64;
+    let mut worst_abs = 0.0f64;
+    for _ in 0..50 {
+        let xr = random_symmetric_dense(n_atom, &mut rng, 1.0);
+        let x = row_major_to_dmatrix_f64(&xr, n);
+        let c_ref = (&w_ref * &x).trace();
+        let c_gpt = (&w_gpt * &x).trace();
+        let d = (c_gpt - c_ref).abs();
+        worst_abs = worst_abs.max(d);
+        worst_rel = worst_rel.max(d / c_ref.abs().max(1e-12));
+    }
+    println!("W-parity contraction: max|ΔTr(W·X)|={worst_abs:e}  worst rel={worst_rel:e}");
+    // Exact-identity guard: the two forms are analytically equal given
+    // Z=S⁻¹; the residual gap is pure f64 rounding (~1e-7 elementwise).
+    assert!(
+        worst_rel < 1e-4 && elem_diff < 1e-4 * w_ref_max.max(1.0),
+        "W=2(ZH)K no longer matches 2KHK (elem={elem_diff:e} rel={worst_rel:e}) — the identity requires Z=S⁻¹; revert the W path to 2KHK"
+    );
+}
+
+// =====================================================================
 // 13. R_H distinguishes eigenvector-aligned from non-aligned projectors
 //     R_H = ||HKS-SKH||_F = 0 for ANY projector onto eigenvectors of the
 //     generalized problem (occupied or not), because Hc_i = Sc_i ε_i for
@@ -1098,22 +1166,36 @@ fn test_tc2_dev_vs_host_parity() {
 #[test]
 fn test_row_degree_overflow_fail_loud() {
     let Some(gpu) = try_gpu() else { return };
-    // Create a mask with a row that has > MAX_LEFT_BLOCKS (default 256) blocks.
-    // With n_atom = 300 and full mask, row 0 has 300 blocks > 256.
-    let n_atom = 300;
+    // Create a mask with a row that has > MAX_LEFT_BLOCKS (default 512) blocks.
+    // With n_atom = 600 and full mask, row 0 has 600 blocks > 512.
+    let n_atom = 600;
     let mask = build_full_mask(n_atom);
-    // GpuBsrStructure::new should fail with a descriptive error.
-    let result = rust_dftb::methods::sparse::gpu_sparse::GpuBsrStructure::new(&gpu, n_atom, &mask);
-    assert!(result.is_err(), "GpuBsrStructure::new should fail for row degree > MAX_LEFT_BLOCKS");
-    let err_msg = match result {
-        Err(e) => format!("{e}"),
-        Ok(_) => "unexpected success".to_string(),
-    };
-    println!("Row-degree overflow error (expected): {err_msg}");
-    assert!(
-        err_msg.contains("MAX_LEFT_BLOCKS") || err_msg.contains("max_left_blocks"),
-        "Error should mention MAX_LEFT_BLOCKS: {err_msg}"
-    );
+    // New contract (post multiply-truncate): construction SUCCEEDS and only
+    // records `max_deg` — output/product masks legitimately exceed the cap.
+    // The check fires when the structure is used as a SpGEMM LEFT operand
+    // (its row is cached in local memory). Test THAT, not construction.
+    let s_struct = rust_dftb::methods::sparse::gpu_sparse::GpuBsrStructure::new(&gpu, n_atom, &mask)
+        .unwrap_or_else(|e| panic!("GpuBsrStructure::new must not fail for a wide output mask: {e}"));
+    assert!(s_struct.max_deg > gpu.config().max_left_blocks as u32,
+        "test setup: expected max_deg {} > {}", s_struct.max_deg, gpu.config().max_left_blocks);
+    let s_arc = std::sync::Arc::new(s_struct);
+    let a = rust_dftb::methods::sparse::gpu_sparse::GpuBsrMatrix::zero(&gpu, &s_arc).unwrap();
+    let b = rust_dftb::methods::sparse::gpu_sparse::GpuBsrMatrix::zero(&gpu, &s_arc).unwrap();
+    let c = rust_dftb::methods::sparse::gpu_sparse::GpuBsrMatrix::zero(&gpu, &s_arc).unwrap();
+    for (name, res) in [
+        ("spgemm_bsym_dev", gpu.spgemm_bsym_dev(&a, &b, &c)),
+        ("spgemm_masked_dev", gpu.spgemm_masked_dev(&a, &b, &c)),
+    ] {
+        let err_msg = match res {
+            Err(e) => format!("{e}"),
+            Ok(_) => panic!("{name} should fail for left-operand row degree > MAX_LEFT_BLOCKS"),
+        };
+        println!("{name} row-degree overflow error (expected): {err_msg}");
+        assert!(
+            err_msg.contains("MAX_LEFT_BLOCKS") || err_msg.contains("max_left_blocks"),
+            "{name} error should mention MAX_LEFT_BLOCKS: {err_msg}"
+        );
+    }
 }
 
 // =====================================================================

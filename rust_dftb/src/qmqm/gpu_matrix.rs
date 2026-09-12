@@ -885,13 +885,15 @@ pub fn mulliken_charges_batched(
 ///   rms     = ||q_new - q_old||_2
 ///
 /// `q_new_buf`/`q_old_buf`/`q_mixed_buf` are `[batch][Na]`; `rms_buf`
-/// is `[batch]`. One workgroup per system with tree reduction.
+/// is `[batch]`; `active_buf` is `[batch]` i32 (0 → replica frozen,
+/// kernel early-outs). One workgroup per system with tree reduction.
 pub fn residual_and_mix_batched(
     rt: &mut GpuRuntime,
     q_new_buf: &Buffer<f32>,
     q_old_buf: &Buffer<f32>,
     q_mixed_buf: &Buffer<f32>,
     rms_buf: &Buffer<f32>,
+    active_buf: &Buffer<i32>,
     alpha: f32,
     n_atoms: usize,
     batch: usize,
@@ -915,6 +917,7 @@ pub fn residual_and_mix_batched(
         .arg(q_old_buf)
         .arg(q_mixed_buf)
         .arg(rms_buf)
+        .arg(active_buf)
         .arg_local::<f32>(wg)
         .build()
         .map_err(map_ocl_err)?;

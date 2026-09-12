@@ -774,12 +774,13 @@ __kernel void mulliken_charges_batched(
     __global const float* S,
     __global const int* orb_atom,
     __global float* q,
-    __local float* diag
+    __local float* diag,
+    __global const int* active      // [batch] 0 → replica frozen, early-out
 ) {
     const int sid = get_group_id(0);
     const int lid = get_local_id(0);
     const int lsz = get_local_size(0);
-    if (sid >= batch) return;
+    if (sid >= batch || active[sid] == 0) return;
     __global const float* Db = D + (size_t)sid * n * n;
     __global const float* Sb = S + (size_t)sid * n * n;
     __global const int* oa   = orb_atom + (size_t)sid * n;
@@ -822,12 +823,13 @@ __kernel void residual_and_mix_batched(
     __global const float* q_old,
     __global float* q_mixed,
     __global float* rms,
+    __global const int* active,   // [batch] 0 → replica frozen, early-out
     __local float* scratch
 ) {
     const int sid = get_group_id(0);
     const int lid = get_local_id(0);
     const int lsz = get_local_size(0);
-    if (sid >= batch) return;
+    if (sid >= batch || active[sid] == 0) return;
     __global const float* qn = q_new + (size_t)sid * n_atoms;
     __global const float* qo = q_old + (size_t)sid * n_atoms;
     __global float* qm       = q_mixed + (size_t)sid * n_atoms;
@@ -845,6 +847,29 @@ __kernel void residual_and_mix_batched(
         barrier(CLK_LOCAL_MEM_FENCE);
     }
     if (lid == 0) rms[sid] = sqrt(scratch[0] / (float)n_atoms);
+}
+
+// ------------------------------------------------------------------
+// commit_q_batched   (commit-model SCC)
+//
+// q[sid][a] = q_next[sid][a] for active replicas; done/failed replicas
+// keep q (the just-solved input) so the device electronic state stays
+// consistent with q. One WG/system, threads stride over atoms.
+// ------------------------------------------------------------------
+__kernel void commit_q_batched(
+    const int n_atoms,
+    const int batch,
+    __global const float* q_next,
+    __global float* q,
+    __global const int* active
+) {
+    const int sid = get_group_id(0);
+    const int lid = get_local_id(0);
+    const int lsz = get_local_size(0);
+    if (sid >= batch || active[sid] == 0) return;
+    __global const float* qn = q_next + (size_t)sid * n_atoms;
+    __global float* qb = q + (size_t)sid * n_atoms;
+    for (int a = lid; a < n_atoms; a += lsz) qb[a] = qn[a];
 }
 
 // ------------------------------------------------------------------
@@ -870,12 +895,13 @@ __kernel void fused_dq_v_hscc_batched(
     __global float* V,              // [batch*n_atoms] out
     __global float* H,              // [batch*n*n] out
     __local float* ldq,             // [n_atoms] local Δq
-    __local float* lv               // [n_atoms] local V
+    __local float* lv,              // [n_atoms] local V
+    __global const int* active      // [batch] 0 → replica frozen, early-out
 ) {
     const int sid = get_group_id(0);
     const int lid = get_local_id(0);
     const int lsz = get_local_size(0);
-    if (sid >= batch) return;
+    if (sid >= batch || active[sid] == 0) return;
     __global const float* qb  = q  + (size_t)sid * n_atoms;
     __global const float* q0b = q0 + (size_t)sid * n_atoms;
     __global const float* Gb  = G  + (size_t)sid * n_atoms * n_atoms;
@@ -1021,12 +1047,13 @@ __kernel void build_density_occ_batched(
     const int use_w,             // 1 → multiply by occ_w[k] (Fermi smearing)
     __global const float* occ_w, // [batch*n] per-orbital weights f_k
     __local float* lw,      // [n_occ] occupied weights
-    __local int*   loi      // [n_occ] occupied column indices
+    __local int*   loi,     // [n_occ] occupied column indices
+    __global const int* active      // [batch] 0 → replica frozen, early-out
 ) {
     const int sid = get_group_id(0);
     const int lid = get_local_id(0);
     const int lsz = get_local_size(0);
-    if (sid >= batch) return;
+    if (sid >= batch || active[sid] == 0) return;
     __global const float* Cb = C + (size_t)sid * n * n;
     __global float* Db = D + (size_t)sid * n * n;
     __global const float* eb = eig + (size_t)sid * n;
@@ -1143,12 +1170,14 @@ __kernel void extract_diagonal_batched(
     const int n,
     const int batch,
     __global const float* a,
-    __global float* diag
+    __global float* diag,
+    __global const int* active      // [batch] 0 → replica frozen, early-out
 ) {
     const int gid = get_global_id(0);
     const int total = n * batch;
     if (gid >= total) return;
     const int sid = gid / n;
+    if (active[sid] == 0) return;
     const int i = gid % n;
     diag[gid] = a[(size_t)sid * n * n + i * n + i];
 }
@@ -1184,12 +1213,13 @@ __kernel void select_occupation_batched(
     const int batch,
     __global const float* eig_diag,
     __global int* occ_mask,
-    __global int* occ_idx
+    __global int* occ_idx,
+    __global const int* active      // [batch] 0 → replica frozen, early-out
 ) {
     const int sid = get_group_id(0);
     const int lid = get_local_id(0);
     const int lsz = get_local_size(0);
-    if (sid >= batch) return;
+    if (sid >= batch || active[sid] == 0) return;
 
     // Local arrays for bitonic sort: (value, original_index) pairs
     __local float lval[OCC_MAX_N];
@@ -1419,8 +1449,10 @@ __kernel void diis_step_batched(
     const int batch,
     const float alpha,           // simple mixing fallback parameter
     __global const float* q_new, // [batch*n_atoms]
-    __global float* q_old,       // [batch*n_atoms] — overwritten with mixed result
+    __global const float* q_old, // [batch*n_atoms] — current input (read-only)
     __global const float* q0,    // [batch*n_atoms] neutral reference (Δq anchor)
+    __global float* q_next,      // [batch*n_atoms] mixed next iterate (commit model:
+                                 //   host commits q_next→q only for still-active replicas)
     __global float* dq_hist,     // [batch*DIIS_MAX_HIST*n_atoms]
     __global float* r_hist,      // [batch*DIIS_MAX_HIST*n_atoms]
     __global int* buf_idx,       // [batch]
@@ -1429,6 +1461,7 @@ __kernel void diis_step_batched(
     __global int* diis_flag,     // [batch] fallback counter
     __global int* diis_reason,   // [batch] last fallback reason
     __global float* rms,         // [batch]
+    __global const int* active,  // [batch] 0 → replica frozen, early-out
     __local float* scratch       // workgroup scratch (≥ lsz)
 ) {
     const int sid = get_group_id(0);
@@ -1437,11 +1470,12 @@ __kernel void diis_step_batched(
     __local int l_diis_ok;
     __local int l_ne;     // effective history count after drop-oldest retry
     __local int l_skip;   // slot dropped this step (-1 = none)
-    if (sid >= batch) return;
+    if (sid >= batch || active[sid] == 0) return;
 
     __global const float* qn = q_new + (size_t)sid * n_atoms;
     __global const float* q0s = q0 + (size_t)sid * n_atoms;
-    __global float* qo = q_old + (size_t)sid * n_atoms;
+    __global const float* qo = q_old + (size_t)sid * n_atoms;
+    __global float* qn2 = q_next + (size_t)sid * n_atoms;
     __global float* qh = dq_hist + (size_t)sid * DIIS_MAX_HIST * n_atoms;
     __global float* rh = r_hist + (size_t)sid * DIIS_MAX_HIST * n_atoms;
     __global float* c = coeffs + (size_t)sid * DIIS_MAX_HIST;
@@ -1476,7 +1510,7 @@ __kernel void diis_step_batched(
     // First history point: α-mix. 1-vector DIIS is Σc=1 → c_0=1 → undamped q_new.
     if (n < 2) {
         for (int a = lid; a < n_atoms; a += lsz) {
-            qo[a] = alpha * qn[a] + (1.0f - alpha) * qo[a];
+            qn2[a] = alpha * qn[a] + (1.0f - alpha) * qo[a];
         }
         return;
     }
@@ -1600,11 +1634,11 @@ __kernel void diis_step_batched(
                 const int s = (skip2 >= 0 && i >= skip2) ? i + 1 : i;
                 sum += c[i] * (qh[s * n_atoms + a] + rh[s * n_atoms + a]);
             }
-            qo[a] = q0s[a] + sum;   // Δq-space mix: Σc=1 exactly preserves q0
+            qn2[a] = q0s[a] + sum;   // Δq-space mix: Σc=1 exactly preserves q0
         }
     } else {
         for (int a = lid; a < n_atoms; a += lsz) {
-            qo[a] = alpha * qn[a] + (1.0f - alpha) * qo[a];
+            qn2[a] = alpha * qn[a] + (1.0f - alpha) * qo[a];
         }
     }
 }
@@ -1623,14 +1657,15 @@ __kernel void occ_normalize_batched(
     const int batch,
     __global const int* occ_mask,
     __global float* Cp,
-    __local float* scratch
+    __local float* scratch,
+    __global const int* active      // [batch] 0 → replica frozen, early-out
 ) {
     const int gid = get_group_id(0);
     const int sid = gid / n;
     const int k = gid - sid * n;
     const int lid = get_local_id(0);
     const int lsz = get_local_size(0);
-    if (sid >= batch) return;
+    if (sid >= batch || active[sid] == 0) return;
     if (occ_mask[sid * n + k] == 0) return;
     __global float* col = Cp + (size_t)sid * n * n + k;
     float acc = 0.0f;
@@ -1649,6 +1684,56 @@ __kernel void occ_normalize_batched(
 }
 
 // ------------------------------------------------------------------
+// snormalize_batched
+//
+// S-metric column normalization for the warm AO basis B (=C buffer):
+//   n_k = c_kᵀ S c_k,  c_k ← c_k / √n_k  for ALL columns.
+// The warm-Jacobi path rotates B in place (B←BJ); each rotation is
+// orthogonal so BᵀSB≈I is preserved, but f32 rounding drifts the
+// column norms — renormalizing arrests the drift before it perturbs
+// the projected eigenproblem A=BᵀHB.
+// One workgroup per (system, column).
+// loc layout: t_s[n] | red[lsz]
+// ------------------------------------------------------------------
+__kernel void snormalize_batched(
+    const int n,
+    const int batch,
+    __global float* C,
+    __global const float* S,
+    __local float* loc,
+    __global const int* active      // [batch] 0 → replica frozen, early-out
+) {
+    const int gid = get_group_id(0);
+    const int sid = gid / n;
+    const int k = gid - sid * n;
+    const int lid = get_local_id(0);
+    const int lsz = get_local_size(0);
+    if (sid >= batch || active[sid] == 0) return;
+    __local float* t_s = loc;
+    __local float* red = loc + n;
+    const size_t base = (size_t)sid * n * n;
+    __global float* col = C + base + k;
+    __global const float* Sb = S + base;
+    for (int r = lid; r < n; r += lsz) {
+        const int ro = r * n;
+        float ss = 0.0f;
+        for (int cc = 0; cc < n; ++cc) ss = fma(Sb[ro + cc], col[cc * n], ss);
+        t_s[r] = ss;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    float asx = 0.0f;
+    for (int r = lid; r < n; r += lsz) asx = fma(col[r * n], t_s[r], asx);
+    red[lid] = asx;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int off = lsz >> 1; off > 0; off >>= 1) {
+        if (lid < off) red[lid] += red[lid + off];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    const float inv = rsqrt(red[0]);
+    for (int r = lid; r < n; r += lsz) col[r * n] *= inv;
+}
+
+// ------------------------------------------------------------------
 // occ_rayleigh_batched
 //
 // Manifest §12 D3/D4: generalized Rayleigh quotient of the AO eigenvectors,
@@ -1657,6 +1742,8 @@ __kernel void occ_normalize_batched(
 // stored vectors (measured max|ε−ρ|~1e-6 at N=87, biased sum ~2.8e-5 Ha);
 // ρ is the variationally correct weight for the energy and the EDM W.
 // rho[k]=0 for unoccupied columns.
+// use_w=1 (Fermi smearing): every column with occ_w[k]>0 gets a quotient —
+// fractional-weight orbitals need ρ just as much as occupied ones.
 // One workgroup per (system, column).
 // loc layout: t_h[n] | t_s[n] | red[2*lsz]
 // ------------------------------------------------------------------
@@ -1668,15 +1755,19 @@ __kernel void occ_rayleigh_batched(
     __global const float* H,
     __global const float* S,
     __global float* rho,
-    __local float* loc
+    __local float* loc,
+    __global const int* active,     // [batch] 0 → replica frozen, early-out
+    __global const float* occ_w,    // [batch*n] Fermi weights (use_w=1)
+    const int use_w
 ) {
     const int gid = get_group_id(0);
     const int sid = gid / n;
     const int k = gid - sid * n;
     const int lid = get_local_id(0);
     const int lsz = get_local_size(0);
-    if (sid >= batch) return;
-    if (occ_mask[sid * n + k] == 0) {
+    if (sid >= batch || active[sid] == 0) return;
+    const int want = occ_mask[sid * n + k] != 0 || (use_w != 0 && occ_w[sid * n + k] > 1.0e-30f);
+    if (!want) {
         if (lid == 0) rho[sid * n + k] = 0.0f;
         return;
     }

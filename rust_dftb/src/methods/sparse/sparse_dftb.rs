@@ -55,7 +55,7 @@ use crate::methods::dftb::sk_data::SkData;
 use crate::methods::sparse::bsr4::{
     build_full_mask, build_geometric_mask, Bsr4Matrix, BS, BS2,
 };
-use crate::methods::sparse::gpu_sparse::{SparseBsr4Config, SparseBsr4Gpu, TC2_TRACE_TOL};
+use crate::methods::sparse::gpu_sparse::{PurifyStatus, SparseBsr4Config, SparseBsr4Gpu, tc2_trace_tol};
 use crate::methods::sparse::scc::{SparseDftbEnergy, E_DUMMY};
 use crate::methods::sparse::sparse_forces::{
     hs_pairs_from_mask, hs_taper, sparse_forces_bsr, HsPair, SparseDWWorkspace,
@@ -67,6 +67,8 @@ const ANG2BOHR: f64 = 1.889_726_133;
 const SCC_MAX: usize = 100;
 const FULL_MASK_ATOMS: usize = 64;
 const MAX_FIRE_DISP: f64 = 0.1; // Å
+/// Max rollback+damped-retry rescues per scc() call before hard fail.
+const MAX_SCC_RESCUES: usize = 8;
 
 /// Result of one `scc` call.
 #[derive(Debug, Clone)]
@@ -81,6 +83,9 @@ pub struct SparseDftbScc {
     pub r_i: f32,
     /// Hamiltonian stationarity ‖HKS−SKH‖_F/(2‖HKS‖_F) on the final state (R11).
     pub r_h: f32,
+    /// Purification outcome of the last TC2 — `NumericalFloor` means R_I<tol
+    /// was NOT reached and the energy/forces are NOT validated (GPT-5.6 #3).
+    pub purify_status: PurifyStatus,
 }
 
 /// Tunables. `new` uses `Default`. Changing n_atom or mask requires a new engine.
@@ -125,6 +130,25 @@ pub struct SparseDftbConfig {
     /// (Si10H16 oscillates at rms~1.4 under α=0.5 — charge sloshing);
     /// DIIS with linear fallback is required for real nanocrystals.
     pub diis_hist: usize,
+    /// Accept `PurifyStatus::NumericalFloor` as a usable SCC state
+    /// (GPT-5.6 #3). `None` = true — fast screening may run at the floor.
+    /// A vibrational Hessian should set this to `Some(false)`.
+    pub accept_numerical_floor: Option<bool>,
+    /// EXPERIMENTAL (GPT-5.6 #4): use the P=KS purifier instead of legacy
+    /// K-TC2. `None` → env `RUST_DFTB_P_TC2` (default off). Kept switchable
+    /// for A/B measurement — do not remove the legacy path.
+    pub purifier_p: Option<bool>,
+    /// EXPERIMENTAL (GPT-5.6 #5): TRS4 trace-resetting purification on P
+    /// (implies the P machinery). `None` → env `RUST_DFTB_TRS` (default off).
+    /// Takes precedence over `purifier_p`.
+    pub purifier_trs: Option<bool>,
+    /// GPT-5.6 #6: build W = 2(Z·H_scc)·K in ONE SpGEMM (reuses the ZH
+    /// product that P0/K0 already computes, removes the truncated KH
+    /// intermediate). Exact since Z=S⁻¹ — identity locked by
+    /// test_w_zhk_vs_khk_parity. `None` → env `RUST_DFTB_W_ZK`
+    /// (default on — the parity was verified; set 0 to A/B the legacy
+    /// 2KHK path).
+    pub force_w_zk: Option<bool>,
 }
 
 impl Default for SparseDftbConfig {
@@ -136,6 +160,10 @@ impl Default for SparseDftbConfig {
             r_k_ang: None, r_z_ang: None, r_trunc_ang: None, taper_w_ang: 1.0,
             dense_diag: None,
             diis_hist: 8,
+            accept_numerical_floor: None,
+            purifier_p: None,
+            purifier_trs: None,
+            force_w_zk: None,
         }
     }
 }
@@ -218,6 +246,8 @@ pub struct SparseDftb {
     /// fixed-point map changed → stale history extrapolates wrongly).
     mixer: Option<DiisMixer>,
     q_res: Vec<f64>,   // mixer residual scratch q_out − q_in
+    q_snap: Vec<f64>,  // last accepted q_in — SCC rescue restore point
+    res_snap: Vec<f64>,// residual at q_snap — damped retry direction
     e_rep: f64,
     last: SparseDftbEnergy,
     /// Z is a converged inverse of the *current* S.
@@ -371,14 +401,14 @@ impl SparseDftb {
         let h_bsr = Bsr4Matrix::from_structure(n_atom, m_hs.0.clone(), m_hs.1.clone())?;
         let s_bsr = Bsr4Matrix::from_structure(n_atom, m_hs.0.clone(), m_hs.1.clone())?;
         let ws = SparseSystemWorkspace::new(gpu, &h_bsr, &s_bsr, &m_k, &m_z, &atom_n_orb, nocc)?;
-        let dw_ws = SparseDWWorkspace::new(ws.gpu(), ws.k_struct(), ws.hs_struct())?;
+        let dw_ws = SparseDWWorkspace::new(ws.gpu(), ws.k_struct(), ws.hs_struct(), ws.t_zs_struct())?;
 
         let n_pad = n_atom * BS;
         let n_scc = SparseDftbEnergy {
             e_h0: 0.0, e_scc: 0.0, e_el: 0.0, e_rep: 0.0, e_tot: 0.0,
             q: q0.clone(), tr_ks: 0.0, r_i: 0.0, n_scc: 0, tc2_iters: 0,
             k_pad: vec![], h_scc_pad: vec![], v: vec![0.0; n_atom],
-            r_scc: 0.0, r_h: f32::NAN,
+            r_scc: 0.0, r_h: f32::NAN, purify_status: PurifyStatus::Failed,
         };
         let dense_diag = cfg.dense_diag.unwrap_or(n_atom <= FULL_MASK_ATOMS);
         let diis_hist = cfg.diis_hist;
@@ -405,6 +435,7 @@ impl SparseDftb {
                 Some(m)
             } else { None },
             q_res: vec![0.0; n_atom],
+            q_snap: vec![0.0; n_atom], res_snap: vec![0.0; n_atom],
             e_rep: 0.0, last: n_scc, z_valid: false, z_warm: false, dense_diag,
             fire_v: vec![[0.0; 3]; n_atom], fire_dt: 0.1, fire_alpha: 0.1, fire_n_pos: 0,
         };
@@ -441,6 +472,14 @@ impl SparseDftb {
     pub fn gpu(&self) -> &SparseBsr4Gpu { self.ws.gpu() }
     /// Host H0 on M_HS (diagnostic/parity — the same values uploaded to the GPU).
     pub fn h_bsr(&self) -> &Bsr4Matrix { &self.h_bsr }
+    /// Host copy of the device K on its BSR structure (diagnostics /
+    /// mask screening — not a hot path).
+    pub fn k_bsr(&self) -> Result<Bsr4Matrix> { self.ws.k().to_host(self.ws.gpu()) }
+    /// Host M_K mask (row_ptr, col_idx) — pairs with `k_bsr` ordering.
+    pub fn m_k(&self) -> Result<(Vec<u32>, Vec<u32>)> {
+        let g = self.ws.gpu();
+        Ok((self.ws.k_struct().row_ptr_host(g)?, self.ws.k_struct().col_idx_host(g)?))
+    }
     /// Host S on M_HS.
     pub fn s_bsr(&self) -> &Bsr4Matrix { &self.s_bsr }
 
@@ -556,15 +595,31 @@ impl SparseDftb {
         }
         let mix = self.cfg.mix;
         let mut rms_prev = f64::INFINITY;
-        let mut last_info = SparseDftbScc { n_iters: 0, rms: f64::INFINITY, r_scc: 0.0, tr_ks: 0.0, r_i: 0.0, r_h: f32::NAN };
+        let mut n_rescue = 0usize;
+        let mut last_info = SparseDftbScc { n_iters: 0, rms: f64::INFINITY, r_scc: 0.0, tr_ks: 0.0, r_i: 0.0, r_h: f32::NAN, purify_status: PurifyStatus::Failed };
         for it in 0..cap {
             self.compute_v();
             for i in 0..self.n_atom { self.v_f32[i] = self.v[i] as f32; }
             self.ws.build_hscc_from_v(&self.v_f32)?;
-            let (r_i, tr, tc2_iters) = self.ws.purify_hscc(self.cfg.tc2_max, self.cfg.tc2_tol)?;
-            if (tr - self.nocc).abs() > TC2_TRACE_TOL {
+            let env_flag = |name: &str| std::env::var(name).map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false);
+            let use_trs = self.cfg.purifier_trs.unwrap_or_else(|| env_flag("RUST_DFTB_TRS"));
+            let use_p = self.cfg.purifier_p.unwrap_or_else(|| env_flag("RUST_DFTB_P_TC2"));
+            let (pstat, r_i, tr, tc2_iters) = if use_trs {
+                self.ws.purify_hscc_trs(self.cfg.tc2_max, self.cfg.tc2_tol)?
+            } else if use_p {
+                self.ws.purify_hscc_p(self.cfg.tc2_max, self.cfg.tc2_tol)?
+            } else {
+                self.ws.purify_hscc(self.cfg.tc2_max, self.cfg.tc2_tol)?
+            };
+            if pstat == PurifyStatus::NumericalFloor && !self.cfg.accept_numerical_floor.unwrap_or(true) {
                 return Err(DftbError::InvalidInput(format!(
-                    "SparseDftb SCC iter {it}: Tr(KS)={tr} far from Nocc={} (tol={TC2_TRACE_TOL})", self.nocc
+                    "SparseDftb SCC iter {it}: TC2 reached NumericalFloor (R_I={r_i:e} > tol={}) — energies/forces NOT validated; accept_numerical_floor=false", self.cfg.tc2_tol
+                )));
+            }
+            let tol_tr = tc2_trace_tol(self.nocc as f64);
+            if (tr - self.nocc as f64).abs() > tol_tr {
+                return Err(DftbError::InvalidInput(format!(
+                    "SparseDftb SCC iter {it}: Tr(KS)={tr} far from Nocc={} (tol={tol_tr})", self.nocc
                 )));
             }
             let q_new = self.mulliken_checked(tr, it)?;
@@ -576,30 +631,55 @@ impl SparseDftb {
                 max_dq = max_dq.max(d.abs());
             }
             rms = (rms / self.n_atom as f64).sqrt();
+            if !rms.is_finite() || !max_dq.is_finite() {
+                return Err(DftbError::InvalidInput(format!(
+                    "SparseDftb SCC iter {it}: non-finite residual rms={rms} max|dq|={max_dq} — no rescue for NaN/Inf"
+                )));
+            }
             // Energy of the CURRENT state (q_in, K(q_in), V(q_in)) — consistent.
-            self.store_energy(tr, r_i, it + 1, tc2_iters, rms, f32::NAN)?;
+            self.store_energy(tr, r_i, it + 1, tc2_iters, rms, f32::NAN, pstat)?;
             if crate::methods::sparse::gpu_sparse::algebra_verbose() {
                 eprintln!(
                     "  [SparseDftb SCC] iter {it:3}  rms={rms:.3e}  max|dq|={max_dq:.3e}  E_el={:.8}  E_tot={:.8}  r_I={r_i:.3e}  Tr(KS)={tr:.6}",
                     self.last.e_el, self.last.e_tot
                 );
             }
-            last_info = SparseDftbScc { n_iters: it + 1, rms, r_scc: rms, tr_ks: tr, r_i, r_h: f32::NAN };
+            last_info = SparseDftbScc { n_iters: it + 1, rms, r_scc: rms, tr_ks: tr as f32, r_i, r_h: f32::NAN, purify_status: pstat };
             if rms < rms_tol {
                 return self.finalize_scc(&q_new, last_info);
             }
+            // CLOSED-LOOP RESCUE (GPT-5.6 item 1): DIIS residuals are not
+            // monotone — one measured explosion means the last mixer
+            // proposal left the basin, NOT that no fixed point exists.
+            // Roll back to the last accepted input, drop the suspect DIIS
+            // history, retry with a damped linear step; fail only after
+            // repeated rescue failure.
+            if it > 2 && rms > rms_prev * 2.0 && rms > 1e-2 {
+                n_rescue += 1;
+                if n_rescue > MAX_SCC_RESCUES {
+                    return Err(DftbError::InvalidInput(format!(
+                        "SparseDftb SCC diverging at iter {it}: rms={rms:.3e} (prev {rms_prev:.3e}) after {n_rescue} rescues"
+                    )));
+                }
+                eprintln!(
+                    "  [SparseDftb SCC] iter {it}: rms {rms:.3e} >> accepted {rms_prev:.3e} — rescue {n_rescue}/{MAX_SCC_RESCUES}: restore last q, reset mixer, damped retry"
+                );
+                self.q.copy_from_slice(&self.q_snap);
+                if let Some(m) = &mut self.mixer { m.reset(); }
+                for a in 0..self.n_atom { self.q[a] += mix * self.res_snap[a]; }
+                continue;   // rms_prev keeps the last accepted level
+            }
+            // Snapshot the accepted (q_in, residual) BEFORE the mixer
+            // overwrites q — rescue restores this point.
+            for a in 0..self.n_atom { self.q_res[a] = q_new[a] - self.q[a]; }
+            self.q_snap.copy_from_slice(&self.q);
+            self.res_snap.copy_from_slice(&self.q_res);
             if let Some(m) = &mut self.mixer {
-                for a in 0..self.n_atom { self.q_res[a] = q_new[a] - self.q[a]; }
                 m.mix(&mut self.q, &q_new, &self.q_res);
             } else {
                 for a in 0..self.n_atom {
                     self.q[a] = (1.0 - mix) * self.q[a] + mix * q_new[a];
                 }
-            }
-            if it > 2 && rms > rms_prev * 2.0 && rms > 1e-2 {
-                return Err(DftbError::InvalidInput(format!(
-                    "SparseDftb SCC diverging at iter {it}: rms={rms:.3e} (prev {rms_prev:.3e})"
-                )));
             }
             rms_prev = rms;
         }
@@ -664,7 +744,7 @@ impl SparseDftb {
         Ok(())
     }
 
-    fn mulliken_checked(&mut self, tr: f32, it: usize) -> Result<Vec<f64>> {
+    fn mulliken_checked(&mut self, tr: f64, it: usize) -> Result<Vec<f64>> {
         let (q_f32, q_dum) = self.ws.mulliken_charges()?;
         if q_f32.len() != self.n_atom {
             return Err(DftbError::InvalidInput(format!("Mulliken len {} != n_atom {}", q_f32.len(), self.n_atom)));
@@ -688,7 +768,7 @@ impl SparseDftb {
 
     /// Energy of the consistent state (q, K, V) — sparse masked band energy
     /// `2·Tr(K·H0)` over M_HS on device (R7); no k_to_dense/trace_ab.
-    fn store_energy(&mut self, tr: f32, r_i: f32, n_scc: usize, tc2_iters: usize, r_scc: f64, r_h: f32) -> Result<()> {
+    fn store_energy(&mut self, tr: f64, r_i: f32, n_scc: usize, tc2_iters: usize, r_scc: f64, r_h: f32, pstat: PurifyStatus) -> Result<()> {
         let tr_kh0 = self.ws.trace_kh0_dev()? as f64;
         let e_h0 = 2.0 * tr_kh0;
         let e_scc = 0.5 * self.q.iter().zip(self.q0.iter()).zip(self.v.iter())
@@ -699,8 +779,9 @@ impl SparseDftb {
         }
         self.last = SparseDftbEnergy {
             e_h0, e_scc, e_el, e_rep: self.e_rep, e_tot: e_el + self.e_rep,
-            q: self.q.clone(), tr_ks: tr, r_i, n_scc, tc2_iters,
+            q: self.q.clone(), tr_ks: tr as f32, r_i, n_scc, tc2_iters,
             k_pad: vec![], h_scc_pad: vec![], v: self.v.clone(), r_scc, r_h,
+            purify_status: pstat,
         };
         Ok(())
     }
@@ -724,7 +805,12 @@ impl SparseDftb {
             return Err(DftbError::InvalidInput("forces: no SCC yet — call scc first".into()));
         }
         let gpu = self.ws.gpu();
-        self.dw_ws.build_dw_into(gpu, self.ws.k(), self.ws.h_scc())?;
+        let w_zk = self.cfg.force_w_zk.unwrap_or_else(|| {
+            std::env::var("RUST_DFTB_W_ZK")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(true)   // identity verified — on unless disabled
+        });
+        self.dw_ws.build_dw_into(gpu, self.ws.k(), self.ws.h_scc(), self.ws.b_zh(), w_zk)?;
         gpu.read_f32(&self.dw_ws.w().values, &mut self.w_vals)?;
         gpu.read_f32(&self.ws.k().values, &mut self.k_vals)?;
         let ctx = SystemContext::from_sk_data(&self.builder.sk, &self.species)?;

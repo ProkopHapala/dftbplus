@@ -184,6 +184,7 @@ fn test_gate_f_geometry_optimization() {
         q: q0.clone(), tr_ks: 0.0, r_i: 0.0, n_scc: 0, tc2_iters: 0,
         k_pad: vec![], h_scc_pad: vec![], v: vec![],
         r_scc: 0.0, r_h: f32::NAN,
+        purify_status: rust_dftb::methods::sparse::gpu_sparse::PurifyStatus::Failed,
     };
     let mut converged = false;
     let mut step = 0usize;

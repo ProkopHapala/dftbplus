@@ -88,7 +88,7 @@ pub struct SparseDW {
 /// - `plan_kh`: symbolic plan for T = K·H_scc (A=K, B=H_scc sym, C=T)
 /// - `plan_tk`: symbolic plan for W = T·K (A=T, B=K sym, C=W on M_HS)
 pub struct SparseDWWorkspace {
-    /// Scratch T = K·H_scc (on M_TW).
+    /// Scratch T = K·H_scc (on M_TW) — legacy 2KHK path only.
     t: GpuBsrMatrix,
     /// Output W = 2·T·K (on M_HS, reuses h_scc structure).
     w: GpuBsrMatrix,
@@ -98,6 +98,9 @@ pub struct SparseDWWorkspace {
     plan_kh: Option<SpgemmPlanGpu>,
     /// P4: symbolic plan for W = T·K.
     plan_tk: Option<SpgemmPlanGpu>,
+    /// P6: symbolic plan for W = (Z·H_scc)·K — the one-product W path.
+    /// A=ZH is NON-symmetric on M_TZS, B=K symmetric on M_K → Bsym plan.
+    plan_zk: Option<SpgemmPlanGpu>,
 }
 
 impl SparseDWWorkspace {
@@ -114,6 +117,7 @@ impl SparseDWWorkspace {
         gpu: &SparseBsr4Gpu,
         k_struct: &Arc<GpuBsrStructure>,
         h_struct: &Arc<GpuBsrStructure>,
+        tzs_struct: &Arc<GpuBsrStructure>,
     ) -> Result<Self> {
         let n_atom = k_struct.n_atom;
         assert_eq!(h_struct.n_atom, n_atom, "K and H_scc must have same n_atom");
@@ -161,8 +165,24 @@ impl SparseDWWorkspace {
                 }
             }
         };
+        // P6 (GPT-5.6 item 6): plan for W = (Z·H_scc)·K — A=ZH on M_TZS
+        // (non-symmetric), B=K symmetric → Bsym plan. Valid because the
+        // code's Z is S⁻¹: Z·H·K = Σ_occ εᵢ cᵢcᵢᵀ exactly (verified by
+        // test_w_zhk_vs_khk_parity). One SpGEMM, no KH intermediate.
+        let plan_zk = {
+            let b_dummy = Bsr4Matrix::from_structure(
+                n_atom, tzs_struct.row_ptr_host(gpu)?, tzs_struct.col_idx_host(gpu)?)?;
+            let k_dummy = Bsr4Matrix::from_structure(n_atom, k_mask.0.clone(), k_mask.1.clone())?;
+            match build_spgemm_plan_bsym(&b_dummy, &k_dummy, &hs_mask) {
+                Ok(plan) => Some(gpu.upload_plan(&plan)?),
+                Err(e) => {
+                    eprintln!("P6: plan_zk build failed, falling back to intersection: {e}");
+                    None
+                }
+            }
+        };
 
-        Ok(Self { t, w, d, plan_kh, plan_tk })
+        Ok(Self { t, w, d, plan_kh, plan_tk, plan_zk })
     }
 
     /// Build `D = 2K` and `W = 2 K H_scc K` into the workspace's persistent
@@ -171,22 +191,39 @@ impl SparseDWWorkspace {
     /// Returns references to the device-resident D and W. The caller must
     /// not hold these references across another `build_dw_into` call
     /// (they point into the same workspace buffers).
+    /// `b_zh` is the device-resident Z·H_scc on M_TZS (fresh for the
+    /// current H_scc — produced by the last P0/K0 build). `w_zk` selects
+    /// the GPT-5.6 one-product path `W = 2(ZH)·K` — exact since Z=S⁻¹
+    /// (ZHK = Σεccᵀ), removes the truncated KH intermediate.
     pub fn build_dw_into(
         &mut self,
         gpu: &SparseBsr4Gpu,
         k: &GpuBsrMatrix,
         h_scc: &GpuBsrMatrix,
+        b_zh: &GpuBsrMatrix,
+        w_zk: bool,
     ) -> Result<(&GpuBsrMatrix, &GpuBsrMatrix)> {
-        // 1. T = K * H_scc on M_TW (SpGEMM, device-resident).
-        match &self.plan_kh {
-            Some(plan) => gpu.spgemm_plan_bsym_dev(k, h_scc, plan, &self.t)?,
-            None => gpu.spgemm_masked_dev(k, h_scc, &self.t)?,
-        }
+        if w_zk {
+            // W = (Z·H_scc)·K on M_HS — ONE SpGEMM, no intermediate
+            // truncation of the KH kind (the ZH operand is the same
+            // truncated object that built K0/P0 — its error is already
+            // the controlled M_TZS quantity).
+            match &self.plan_zk {
+                Some(plan) => gpu.spgemm_plan_bsym_dev(b_zh, k, plan, &self.w)?,
+                None => gpu.spgemm_bsym_dev(b_zh, k, &self.w)?,
+            }
+        } else {
+            // Legacy: 1. T = K * H_scc on M_TW (SpGEMM, device-resident).
+            match &self.plan_kh {
+                Some(plan) => gpu.spgemm_plan_bsym_dev(k, h_scc, plan, &self.t)?,
+                None => gpu.spgemm_masked_dev(k, h_scc, &self.t)?,
+            }
 
-        // 2. W = T * K on M_HS (SpGEMM, device-resident).
-        match &self.plan_tk {
-            Some(plan) => gpu.spgemm_plan_bsym_dev(&self.t, k, plan, &self.w)?,
-            None => gpu.spgemm_masked_dev(&self.t, k, &self.w)?,
+            // 2. W = T * K on M_HS (SpGEMM, device-resident).
+            match &self.plan_tk {
+                Some(plan) => gpu.spgemm_plan_bsym_dev(&self.t, k, plan, &self.w)?,
+                None => gpu.spgemm_masked_dev(&self.t, k, &self.w)?,
+            }
         }
 
         // 3. Scale W by 2: W = 2 * project_MHS(T * K).

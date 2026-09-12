@@ -1,6 +1,6 @@
 # rust_dftb — Master Roadmap & Status Checklist
 
-**Last updated:** 2026-09-10
+**Last updated:** 2026-09-13
 **Maintained by:** prokop / Devin
 **Purpose:** Single source of truth for what is done (`[*]`) and what is not (`[ ]`)
 across the whole `rust_dftb` reimplementation (DFTB, xTB, QM/QM multi-system, OpenCL GPU).
@@ -46,6 +46,7 @@ file/function where the work should land.
 - [*] SCC total energy matching DFTB+ "Total Electronic energy" — `methods/dftb/hamiltonian.rs::SccResult` (energy field), computed in `build_scc`
 - [*] Parity on 13 molecules (H2O … PTCDA, 3–38 atoms) to `<1e-6` — `tests/parity_scc.rs::scc_convergence_from_xyz` (driven by `tests/run_scc_full.py`)
 - [*] LAPACK `dsyevd` eigensolver (replaces nalgebra Jacobi, 29× faster) — `qmqm/fragment.rs::Fragment::diagonalize`; see `doc/prokop/topical_audit/eigensolver_performance.md`
+- [*] Fermi smearing (kT>0) on `DftbCpu` — `methods/dftb/dftb_cpu.rs::set_smearing` (B2): f64 μ bisection, fractional Mulliken over all orbitals, fractional D/W, Mermin −TS in `build_result`; `GpuDftb::cpu_ref` inherits `plan.kT` — smeared GPU↔CPU parity verified at GC d=1.9 (|dE|=1.7e-6 Ha)
 - [ ] **SCC warm start** (reuse previous charges → 4× fewer iterations) — target: `methods/dftb/hamiltonian.rs::build_scc_warm`; see `eigensolver_performance.md` §Optimization plan
 - [ ] **LAPACK triangular solves** (replace nalgebra `solve_lower_triangular` with `dtrtrs`) — target: `qmqm/fragment.rs::diagonalize`; see `eigensolver_performance.md`
 
@@ -204,7 +205,7 @@ file/function where the work should land.
 > cheap kernels enqueued by host, no PCIe traffic. Active mask skips converged systems.
 
 ### 6.1 Generalized eigenproblem on GPU (Stage 2)
-- [ ] **Brent-Luk parallel cyclic Jacobi kernel** (D8) — N/2 independent rotations per round, one barrier per round, A+V in `__local` for N≤64 — target: `qmqm/gpu_matrix_ops.cl::jacobi_cyclic_local_batched` (new; replace `local_jacobi_blocks_parallel`)
+- [*] **Brent-Luk parallel cyclic Jacobi kernel** (D8) — N/2 independent rotations per round; `jacobi_cyclic_local_batched` for N≤64; **direct cyclic Jacobi `jacobi_cyclic_global_batched`** (`qmqm/gpu_tiled_jacobi.cl`) for N>64 — pads to even JN, JN−1 rounds × JN/2 pairs, global `A←JᵀAJ`+`V←VJ`, f64 only for scalar c/s, relative pair-skip, ‖A_off‖/‖A‖_F<ε exit (all-skip round = continue, not converged). Replaced the ~16k-barrier tiled/strip path: 87×87 eigensolve ~83ms→~1.5ms
 - [ ] **S^{-1/2} via Jacobi** (D9) — jacobi(S) → U·Λ^{-1/2}·U^T, returns λ_min(S) for precision monitoring — target: `qmqm/gpu_matrix_ops.cl::build_inv_sqrt_from_eig` (new)
 - [ ] **Full-local batched GEMM** for N≤64 (§4.3) — load both matrices into `__local` once — target: `qmqm/gpu_matrix_ops.cl::matmul_full_local_batched` (new); benchmark vs `batched_gemm`
 - [ ] **N+1 leading dimension** to avoid power-of-two bank conflicts — target: `qmqm/gpu_matrix_ops.cl` (JLD = N+1)
@@ -221,7 +222,7 @@ file/function where the work should land.
 - [*] **Residual + simple mixer kernel** — RMS = ||q_new - q_old||, q_mixed = α·q_new + (1-α)·q_old — `qmqm/gpu_matrix_ops.cl::residual_and_mix_batched`; parity <1.5e-8
 - [*] **Density / W kernel** — `2 Σ_k occ[k]·s_k·C_k C_kᵀ`; `s_k=1` → D, `s_k=ε_k` → W. Same kernel (`gpu_matrix_ops.cl::build_density_masked_batched`). `GpuSccPlan::build_edm`.
 - [*] **Frobenius trace + dot kernels** — for energy computation Tr(D·H0) and Σ Δq·V — `qmqm/gpu_matrix_ops.cl::frobenius_trace_batched`, `dot_batched` (new, Wave 3)
-- [ ] **Active mask** (§2.2) — active[system] flag, converged systems early-return — target: `qmqm/gpu_scc.rs` (TODO: all systems run all iterations currently)
+- [*] **Active mask** (§2.2) — `active[sid]` device buffer; all per-replica SCC kernels (jacobi, dq→V→H_scc, extract, occ, density, renorm/snorm, rayleigh, mulliken, mix, commit) early-out on `active[sid]==0`; converged replicas keep their full frozen state — `qmqm/gpu_scc_plan.rs` (`set_active`/`activate_all`); `batched_gemm` intentionally ungated (shared kernel)
 - [*] **SCC loop driver** — host enqueues kernel sequence per iteration, minimal readback (RMS + occ_mask only) — `qmqm/gpu_scc.rs::gpu_solve_scc_batched` (new, Wave 3)
 - [*] **CPU-driven DIIS mixer** — `gpu_solve_scc_batched_diis`, `gpu_solve_scc_batched_diis_warmstart` — DIIS on CPU driving GPU charge vectors. 13 iters vs 60-192 for simple mix.
 - [*] **Warm-start + best-effort mode** — `gpu_solve_scc_batched_diis_warmstart` accepts separate init_q; `best_effort` flag returns per-system RMS for unconverged points
@@ -308,11 +309,12 @@ Tiled Jacobi (`gpu_tiled_jacobi.cl`) already does f64 inner sweeps, compound 2×
 - [ ] `repair_lowdin_x` CPU f64 serial GEMMs per replica → 3 GPU f32 GEMMs (`M=XᵀSX`, `X←X(3I−M)/2`, no re-symmetrization); then X reuse across FIRE steps — manifest §12 D5–D6
 
 #### 6.4.5 Engine honesty (not an f32 problem)
-- [ ] FIRE: Bitzek mix uses `|v|`, not `|F|`; per-replica `dt/α`; `apply_disp` mixes Verlet-like displacement with the velocity update — one standard ordering, then move FIRE on GPU — manifest §12 D12
+**Current dense review/work order:** `tasts/HBond_Relaxed_Scan_GPU/HBond_Relaxed_Scan_GPU.manifest..md` **§13**. Source review only; supersedes D13 completion/noise-attribution claims. Fix state contracts before arithmetic tuning; sparse is out of scope.
+- [~] Device FIRE x/v/F and distance constraint implemented; dt/alpha/n_pos remain host f64. Endpoint distance error ~1e-7 Å and single-replica CPU parity are observed, not full validation. OPEN: double acceleration in GPU displacement, frozen-DOF projection/norms, input/finiteness checks, full-loop allocations/readbacks (R3/R4/R6).
 - [ ] `md_step` is not velocity-Verlet (missing half-kick) — rename or fix
-- [ ] `relax` returns **final** rms; do not ignore `stalled`
-- [ ] Per-system `Converged`/`AcceptedAtNumericalPlateau`/`Failed` status + `active[sid]` mask — manifest §12 D11
-- [*] W on GPU (same density kernel as D); `eval(want_forces)` one finalize; `set_coords` in-place pairs
+- [ ] `relax` returns **final** rms and explicit convergence/exhaustion/failure; do not ignore `stalled` (R2)
+- [~] Per-system SCC mask exists; retry can retain a better status without its physical state. Separate iteration activity from accepted-state validity; no implicit array-index neighbor recovery (R2).
+- [~] W is computed on GPU but inherits the SCC-active mask: early-converged replicas can use stale/zero EDM in forces. **First blocker: R1**, mixed-convergence batch W/force parity. Cached eval/finalize needs a complete state contract.
 - [ ] Optional: fuse neighbor+G in one GPU kernel (same O(n²) distances; SK stays) — superseded by §12 D7 (device-resident geometry)
 
 #### 6.4.6 Sparse (other agent — do not “fix f32” here by accident)

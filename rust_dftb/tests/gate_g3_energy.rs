@@ -440,3 +440,86 @@ fn test_f3_no_device_allocs_in_scc() {
     assert_eq!(a2, a1, "F3: {} device buffers allocated inside forces()", a2 - a1);
     assert_eq!(a3, a2, "F3: {} device buffers allocated in geometry-2 scc (warm-Z path)", a3 - a2);
 }
+
+// ============================================================================
+// ITEM-7 DIAGNOSTIC (manual): K block-norm decay on the 1648-atom Si sphere
+// at r_k=12 Å. For each distance bin: block count, total Frobenius mass,
+// max norm; then the τ table — kept nnz vs dropped mass fraction — which
+// decides whether a τ-screened mask can reach ~64 effective nbr/atom while
+// keeping the wide mask's accuracy. Run:
+//   cargo test --release --test gate_g3_energy test_k_block_norm_histogram \
+//     -- --ignored --nocapture
+// ============================================================================
+
+#[test]
+#[ignore]
+fn test_k_block_norm_histogram() {
+    let Some(_gpu) = require_sparse_gpu() else { return };
+    let sk_dir = require_sih_sk_dir();
+    let xyz = concat!(env!("CARGO_MANIFEST_DIR"), "/../debug/nanocrystals/si_sphere_R18.xyz");
+    let mol = rust_dftb::io::parse_xyz(xyz).unwrap_or_else(|e| panic!("parse {xyz}: {e}"));
+    let (species, coords) = (mol.species, mol.coords);
+    let sk = load_sk_for_species(&sk_dir, &species).unwrap();
+    let cfg = rust_dftb::methods::sparse::SparseDftbConfig {
+        r_trunc_ang: Some(8.0), r_k_ang: Some(12.0), r_z_ang: Some(12.0),
+        purifier_trs: Some(true), ..Default::default()
+    };
+    let mut eng = rust_dftb::methods::sparse::SparseDftb::with_config(
+        sk, &sk_dir, species, coords, cfg,
+    ).unwrap_or_else(|e| panic!("SparseDftb::with_config: {e}"));
+    eng.scc(100, 1e-5).unwrap_or_else(|e| panic!("SCC: {e}"));
+
+    let k = eng.k_bsr().unwrap_or_else(|e| panic!("k_bsr: {e}"));
+    let (rp, ci) = eng.m_k().unwrap_or_else(|e| panic!("m_k: {e}"));
+    let cc = eng.coords();
+    let n_atom = rp.len() - 1;
+    assert_eq!(ci.len(), k.values.len() / 16, "mask/values mismatch");
+
+    // Block Frobenius norms per pair + distance bins of 1 Å.
+    let n_bins = 14usize;
+    let (mut cnt, mut mass, mut mx) = (vec![0usize; n_bins], vec![0.0f64; n_bins], vec![0.0f64; n_bins]);
+    let mut norms: Vec<(u32, f64)> = Vec::with_capacity(ci.len()); // (row, ||B_ij||_F²)
+    for i in 0..n_atom {
+        for b in (rp[i] as usize)..(rp[i + 1] as usize) {
+            let j = ci[b] as usize;
+            let bn2: f64 = k.values[b * 16..b * 16 + 16].iter().map(|&v| (v as f64) * (v as f64)).sum();
+            let dx = cc[i][0] - cc[j][0]; let dy = cc[i][1] - cc[j][1]; let dz = cc[i][2] - cc[j][2];
+            let d = (dx * dx + dy * dy + dz * dz).sqrt();
+            let bin = (d as usize).min(n_bins - 1);
+            cnt[bin] += 1; mass[bin] += bn2; mx[bin] = mx[bin].max(bn2.sqrt());
+            norms.push((i as u32, bn2));
+        }
+    }
+    let tot: f64 = mass.iter().sum();
+    eprintln!("\n=== K block-norm decay ({} atoms, {} blocks, ||K||_F²={tot:.4}) ===", n_atom, ci.len());
+    eprintln!("  dist_Å   blocks   mass/row·atom     max||B_ij||");
+    for b in 0..n_bins {
+        if cnt[b] == 0 { continue; }
+        eprintln!("  {:>3}-{:<3}  {:>7}  {:>14.4e}  {:>14.4e}", b, b + 1, cnt[b], mass[b] / n_atom as f64, mx[b]);
+    }
+    // τ table: keep blocks with ||B_ij||_F > τ → nnz + dropped mass fraction.
+    eprintln!("  tau        kept_nnz  nbr/atom  dropped_mass_frac");
+    for &tau in &[1e-6f64, 3e-6, 1e-5, 3e-5, 1e-4, 3e-4, 1e-3, 3e-3] {
+        let t2 = tau * tau;
+        let kept = norms.iter().filter(|(_, n2)| *n2 > t2).count();
+        let dropped: f64 = norms.iter().filter(|(_, n2)| *n2 <= t2).map(|(_, n2)| n2).sum();
+        eprintln!("  {tau:>9.0e}  {:>8}  {:>8.1}  {:>15.4e}", kept, kept as f64 / n_atom as f64, dropped / tot);
+    }
+    // Per-row error budget ε_row = b·‖row‖_F: drop smallest blocks until
+    // cumulative dropped mass hits the budget — nnz the budget buys.
+    eprintln!("  row_budget_frac   kept_nnz  nbr/atom");
+    for &bf in &[1e-3f64, 3e-3, 1e-2, 3e-2, 1e-1] {
+        let mut rows: std::collections::HashMap<u32, Vec<f64>> = std::collections::HashMap::new();
+        for &(i, n2) in &norms { rows.entry(i).or_default().push(n2); }
+        let mut kept = 0usize;
+        for v in rows.values_mut() {
+            let row_f2: f64 = v.iter().sum();
+            let budget = bf * bf * row_f2;
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let mut acc = 0.0; let mut drop = 0usize;
+            while drop < v.len() && acc + v[drop] <= budget { acc += v[drop]; drop += 1; }
+            kept += v.len() - drop;
+        }
+        eprintln!("  {bf:>14.0e}  {:>8}  {:>8.1}", kept, kept as f64 / n_atom as f64);
+    }
+}

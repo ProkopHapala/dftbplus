@@ -21,7 +21,35 @@ const BSR4_KERNEL_SOURCE: &str = include_str!("sparse_bsr4_purification.cl");
 
 /// Occupation contract for a claimed TC2 projector (second review §3.5).
 /// `||KSK−K||` alone accepts a wrong-rank projector, including K=0.
+/// DEPRECATED scale: absolute 0.05-electron trace tolerance. Replaced by
+/// `tc2_trace_tol` (GPT-5.6 item 2) — kept for legacy call sites only.
 pub const TC2_TRACE_TOL: f32 = 5e-2;
+
+/// GPT-5.6 item 3: explicit purification outcome — reaching a numerical
+/// floor is NOT ordinary convergence. `Err` from the purify call is the
+/// `Failed` case (kept as `Err` for fail-loud propagation); a floor result
+/// returns `NumericalFloor` so the caller's run mode decides whether it is
+/// usable (screening may accept it; a vibrational Hessian should not).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PurifyStatus {
+    /// `R_I < tol` with a trace inside `tc2_trace_tol`.
+    Converged,
+    /// Best-K snapshot at the measured f32/mask floor — `R_I < tol` was
+    /// NOT reached. Energies/forces built on this K are NOT validated.
+    NumericalFloor,
+    /// Purification produced no usable state (also the placeholder for
+    /// result structs before any purify has run). Hard purify failures
+    /// still propagate as `Err`.
+    Failed,
+}
+
+/// Size-scaled trace acceptance: `max(2e-5·Nocc, 1e-4)` electrons.
+/// 2e-5·Nocc ≈ the measured f32 SpGEMM noise on T's diagonal (0.05 e⁻ at
+/// Nocc=2627); the 1e-4 floor keeps small systems honest (SiH4 Nocc=4 →
+/// 1e-4, ~500× tighter than the old constant).
+pub fn tc2_trace_tol(nocc: f64) -> f64 {
+    (2e-5 * nocc).max(1e-4)
+}
 
 /// Relative Tr(KS) deviation that triggers the TC2 trace-rescaling guard.
 /// Healthy f32 jitter is ~1e-5 relative (measured: ±0.03 on Nocc=2627);
@@ -209,6 +237,24 @@ pub(crate) fn algebra_verbose() -> bool {
     }
 }
 
+/// `RUST_DFTB_TC2_GUARD=0` disables the endgame trace rescale — AB
+/// bisection toggle for the f32-leakage fix (GPT-5.6 item 1 protocol).
+pub(crate) fn tc2_guard_enabled() -> bool {
+    !matches!(std::env::var("RUST_DFTB_TC2_GUARD"), Ok(v) if v == "0" || v.eq_ignore_ascii_case("false"))
+}
+
+/// `RUST_DFTB_TC2_PLATEAU=0` disables the best-K plateau restore — AB
+/// bisection toggle (restores the old hard-fail-on-runaway behaviour).
+pub(crate) fn tc2_plateau_enabled() -> bool {
+    !matches!(std::env::var("RUST_DFTB_TC2_PLATEAU"), Ok(v) if v == "0" || v.eq_ignore_ascii_case("false"))
+}
+
+/// `RUST_DFTB_SPARSE_PLANS=0` forces the intersection SpGEMM instead of
+/// the planned 4-accumulator kernel — AB bisection toggle.
+pub(crate) fn sparse_plans_enabled() -> bool {
+    !matches!(std::env::var("RUST_DFTB_SPARSE_PLANS"), Ok(v) if v == "0" || v.eq_ignore_ascii_case("false"))
+}
+
 /// Compiled BSR4 sparse kernel set bound to an OpenCL device.
 pub struct SparseBsr4Gpu {
     rt: GpuRuntime,
@@ -230,6 +276,9 @@ pub struct SparseBsr4Gpu {
     k_idempotency: Kernel,
     // P4: symbolic SpGEMM plan kernel (Bsym variant)
     k_spgemm_plan_bsym: Kernel,
+    // GPT-5.6 item 4: generic planned SpGEMM (no symmetry — for P² with
+    // non-symmetric P = KS).
+    k_spgemm_plan: Kernel,
     // GPT-5.6 #9: device-side inf_norm, identity, scale for NS Z0 init
     k_row_abs_sum: Kernel,
     k_reduce_max: Kernel,
@@ -245,6 +294,9 @@ pub struct SparseBsr4Gpu {
     k_trace_hk: Kernel,
     k_frob_sq: Kernel,
     k_restrict: Kernel,
+    // GPT-5.6 item 2: per-atom trace partials → host f64 reduction for the
+    // TC2 trace/branch decision.
+    k_trace_atom: Kernel,
     /// Device-buffer allocation counter (F3): incremented by every
     /// `buf_*`/`zero_*` helper. The persistent-workspace contract requires
     /// this to be flat across an SCC iteration — tests assert zero growth.
@@ -370,11 +422,12 @@ impl SparseBsr4Gpu {
             b.arg(0u32); b.arg(&dummy_f32); b.arg(&dummy_f32); b.arg(&dummy_f32);
             b.build().map_err(map_ocl_err)?
         };
-        // bsr4_tc2: nblock, K, Q_KSK, trace_KS, Nocc, Knew -> 1 u32, 3 f32 buf, 1 f32 scalar
+        // bsr4_tc2: nblock, K, Q_KSK, branch(u32, host f64 decision), Knew
+        //   -> 2 u32 scalars, 3 f32 bufs
         let k_tc2 = {
             let mut b = Kernel::builder();
             b.program(&program).name("bsr4_tc2").queue(queue.clone());
-            b.arg(0u32); b.arg(&dummy_f32); b.arg(&dummy_f32); b.arg(&dummy_f32); b.arg(0.0f32); b.arg(&dummy_f32);
+            b.arg(0u32); b.arg(&dummy_f32); b.arg(&dummy_f32); b.arg(0u32); b.arg(&dummy_f32);
             b.build().map_err(map_ocl_err)?
         };
         // bsr4_symmetrize: nblock, transpose_block, A -> 1 u32, 1 u32 buf, 1 f32 buf
@@ -429,6 +482,18 @@ impl SparseBsr4Gpu {
         let k_spgemm_plan_bsym = {
             let mut b = Kernel::builder();
             b.program(&program).name("bsr4_spgemm_plan_Bsym").queue(queue.clone());
+            b.arg(0u32); // nrow
+            b.arg(&dummy_u32); b.arg(&dummy_f32); // A_row, A
+            b.arg(&dummy_f32); // B
+            b.arg(&dummy_u32); b.arg(&dummy_u32); b.arg(&dummy_u32); // plan_ptr, plan_a_idx, plan_b_idx
+            b.arg(&dummy_u32); b.arg(&dummy_f32); // C_row, C
+            b.build().map_err(map_ocl_err)?
+        };
+        // bsr4_spgemm_plan (generic, GPT-5.6 #4): same signature as the
+        // Bsym variant — plan_b_idx indexes B_kj directly.
+        let k_spgemm_plan = {
+            let mut b = Kernel::builder();
+            b.program(&program).name("bsr4_spgemm_plan").queue(queue.clone());
             b.arg(0u32); // nrow
             b.arg(&dummy_u32); b.arg(&dummy_f32); // A_row, A
             b.arg(&dummy_f32); // B
@@ -520,6 +585,14 @@ impl SparseBsr4Gpu {
             b.arg(0u32); b.arg(&dummy_i32); b.arg(&dummy_f32); b.arg(&dummy_f32);
             b.build().map_err(map_ocl_err)?
         };
+        // bsr4_trace_atom (GPT-5.6 #2): nrow, diag_block, T, n_orb, trace_atom
+        //   -> 1 u32 scalar, 2 u32 bufs, 2 f32 bufs
+        let k_trace_atom = {
+            let mut b = Kernel::builder();
+            b.program(&program).name("bsr4_trace_atom").queue(queue.clone());
+            b.arg(0u32); b.arg(&dummy_u32); b.arg(&dummy_f32); b.arg(&dummy_u32); b.arg(&dummy_f32);
+            b.build().map_err(map_ocl_err)?
+        };
 
         let _ = gws_spgemm; let _ = gws_elem; let _ = gws_reduce; let _ = build_k;
 
@@ -531,10 +604,10 @@ impl SparseBsr4Gpu {
             k_tc2, k_symmetrize, k_mulliken_ks, k_trace_partial, k_reduce,
             k_identity_residual,
             k_idempotency,
-            k_spgemm_plan_bsym,
+            k_spgemm_plan_bsym, k_spgemm_plan,
             k_row_abs_sum, k_reduce_max, k_build_identity, k_scale,
             k_gershgorin_partial, k_reduce_min,
-            k_build_hscc, k_trace_hk, k_frob_sq, k_restrict,
+            k_build_hscc, k_trace_hk, k_frob_sq, k_restrict, k_trace_atom,
             n_buf_allocs: std::cell::Cell::new(0),
         })
     }
@@ -827,15 +900,14 @@ impl SparseBsr4Gpu {
         self.rt.finish()
     }
 
-    /// Metric TC2 update. `trace_ks` is a single-float device buffer holding
-    /// `Tr(KS)`; the kernel reads it uniformly.
+    /// Metric TC2 update. `branch` is the host f64 decision:
+    /// 1 → Knew=Q (Tr>Nocc), 0 → Knew=2K−Q (Tr≤Nocc).
     pub fn tc2(
         &self,
         nblock: usize,
         k: &Buffer<f32>,
         q: &Buffer<f32>,
-        trace_ks: &Buffer<f32>,
-        nocc: f32,
+        branch: u32,
         knew: &Buffer<f32>,
     ) -> Result<()> {
         let total = nblock * BS2;
@@ -847,8 +919,7 @@ impl SparseBsr4Gpu {
             .arg(nblock as u32)
             .arg(k)
             .arg(q)
-            .arg(trace_ks)
-            .arg(nocc)
+            .arg(branch)
             .arg(knew)
             .build()
             .map_err(map_ocl_err)?;
@@ -1108,10 +1179,11 @@ impl SparseBsr4Gpu {
         let nblock = k.nblock();
         let k_buf = self.buf_f32(&k.values)?;
         let q_buf = self.buf_f32(&q.values)?;
-        // trace_ks for the TC2 decision: store n in a 1-float device buffer.
-        let trace_buf = self.buf_f32(&[n])?;
+        // TC2 branch decided on host from the trace (f32 sum here — this is
+        // the legacy host-side path; the production workspace uses f64).
+        let branch = (n > nocc) as u32;
         let knew_buf = self.zero_f32(nblock * BS2)?;
-        self.tc2(nblock, &k_buf, &q_buf, &trace_buf, nocc, &knew_buf)?;
+        self.tc2(nblock, &k_buf, &q_buf, branch, &knew_buf)?;
         let mut values = vec![0.0f32; nblock * BS2];
         self.read_f32(&knew_buf, &mut values)?;
         Bsr4Matrix::from_parts(k.n_atom, k.row_ptr.clone(), k.col_idx.clone(), values).map(|m| (m, n))
@@ -1451,7 +1523,7 @@ impl SparseBsr4Gpu {
             }
 
             if r_i < tol {
-                if (tr - nocc).abs() <= TC2_TRACE_TOL {
+                if (tr as f64 - nocc as f64).abs() <= tc2_trace_tol(nocc as f64) {
                     return Ok((k, r_i, tr, iter + 1, history));
                 }
                 if algebra_verbose() {
@@ -1802,6 +1874,39 @@ impl SparseBsr4Gpu {
         Ok(())
     }
 
+    /// Generic planned SpGEMM `C = P_M(A·B)` — no symmetry assumed on B
+    /// (GPT-5.6 item 4). The plan's `plan_b_idx` indexes `B_kj` directly.
+    /// No host transfer, no `finish()`.
+    pub fn spgemm_plan_dev(
+        &self,
+        a: &GpuBsrMatrix,
+        b: &GpuBsrMatrix,
+        plan: &SpgemmPlanGpu,
+        c: &GpuBsrMatrix,
+    ) -> Result<()> {
+        self.check_left_degree(a)?;
+        let nrow = a.struct_.n_atom;
+        let gws = nrow * self.config.wg as usize;
+        let k = &self.k_spgemm_plan;
+        k.set_arg(0, nrow as u32).map_err(map_ocl_err)?;
+        k.set_arg(1, &a.struct_.row_ptr).map_err(map_ocl_err)?;
+        k.set_arg(2, &a.values).map_err(map_ocl_err)?;
+        k.set_arg(3, &b.values).map_err(map_ocl_err)?;
+        k.set_arg(4, &plan.plan_ptr).map_err(map_ocl_err)?;
+        k.set_arg(5, &plan.plan_a_idx).map_err(map_ocl_err)?;
+        k.set_arg(6, &plan.plan_b_idx).map_err(map_ocl_err)?;
+        k.set_arg(7, &c.struct_.row_ptr).map_err(map_ocl_err)?;
+        k.set_arg(8, &c.values).map_err(map_ocl_err)?;
+        unsafe {
+            k.cmd()
+                .global_work_size(gws)
+                .local_work_size(self.config.wg as usize)
+                .enq()
+                .map_err(map_ocl_err)?;
+        }
+        Ok(())
+    }
+
     /// Device-resident `C = alpha*A + beta*B` (elementwise, same structure).
     /// No host transfer, no `finish()`.
     pub fn axpby_dev(
@@ -1839,15 +1944,14 @@ impl SparseBsr4Gpu {
         Ok(())
     }
 
-    /// Device-resident TC2 update: reads `trace_ks` (1-float buffer) and
-    /// writes `Knew`. No host transfer, no `finish()`.
+    /// Device-resident TC2 update: `branch` is the host f64 decision
+    /// (1 → Knew=Q, 0 → Knew=2K−Q). No host transfer, no `finish()`.
     pub fn tc2_dev(
         &self,
         nblock: usize,
         k: &Buffer<f32>,
         q: &Buffer<f32>,
-        trace_ks: &Buffer<f32>,
-        nocc: f32,
+        branch: u32,
         knew: &Buffer<f32>,
     ) -> Result<()> {
         let total = nblock * BS2;
@@ -1855,9 +1959,8 @@ impl SparseBsr4Gpu {
         kern.set_arg(0, nblock as u32).map_err(map_ocl_err)?;
         kern.set_arg(1, k).map_err(map_ocl_err)?;
         kern.set_arg(2, q).map_err(map_ocl_err)?;
-        kern.set_arg(3, trace_ks).map_err(map_ocl_err)?;
-        kern.set_arg(4, nocc).map_err(map_ocl_err)?;
-        kern.set_arg(5, knew).map_err(map_ocl_err)?;
+        kern.set_arg(3, branch).map_err(map_ocl_err)?;
+        kern.set_arg(4, knew).map_err(map_ocl_err)?;
         unsafe {
             kern.cmd().global_work_size(total).enq().map_err(map_ocl_err)?;
         }
@@ -2020,6 +2123,47 @@ impl SparseBsr4Gpu {
             use_a = !use_a;
             n = n_groups;
         }
+    }
+
+    /// Enqueue per-atom trace contributions `trace_atom[i] = Tr(T_ii)`
+    /// (physical lanes only, R14). One thread per atom — the f32 per-atom
+    /// partial is essentially exact; the host reduces it in f64.
+    /// No `finish()`.
+    pub fn trace_atom_dev(
+        &self,
+        nrow: usize,
+        diag_block: &Buffer<u32>,
+        t: &Buffer<f32>,
+        n_orb: &Buffer<u32>,
+        trace_atom: &Buffer<f32>,
+    ) -> Result<()> {
+        let k = &self.k_trace_atom;
+        k.set_arg(0, nrow as u32).map_err(map_ocl_err)?;
+        k.set_arg(1, diag_block).map_err(map_ocl_err)?;
+        k.set_arg(2, t).map_err(map_ocl_err)?;
+        k.set_arg(3, n_orb).map_err(map_ocl_err)?;
+        k.set_arg(4, trace_atom).map_err(map_ocl_err)?;
+        unsafe {
+            k.cmd().global_work_size(nrow).enq().map_err(map_ocl_err)?;
+        }
+        Ok(())
+    }
+
+    /// `Tr(T)` with an f64 host reduction over per-atom partials
+    /// (GPT-5.6 item 2). `host_out` is a caller-owned staging buffer of
+    /// length `n_atom` (persistent — no per-call allocation). This is the
+    /// ONE sync + N_atom-float readback that the TC2 branch already needs.
+    pub fn trace_ks_f64(
+        &self,
+        struct_: &GpuBsrStructure,
+        t: &Buffer<f32>,
+        n_orb: &Buffer<u32>,
+        trace_atom: &Buffer<f32>,
+        host_out: &mut [f32],
+    ) -> Result<f64> {
+        self.trace_atom_dev(struct_.n_atom, &struct_.diag_block, t, n_orb, trace_atom)?;
+        self.read_f32(trace_atom, host_out)?;
+        Ok(host_out.iter().map(|&x| x as f64).sum())
     }
 
     /// Enqueue Tr(KS) into a preallocated one-float device buffer.
@@ -2921,14 +3065,25 @@ impl SparsePurifyWorkspace {
         Ok(())
     }
 
-    fn tc2_update_dev(&mut self) -> Result<()> {
+    /// TC2 update with host-decided branch. `tc2_products_dev` must have
+    /// run first so `trace_buf` holds Tr(KS); this reads that one scalar
+    /// and decides the branch on the host (f32 read → f64 compare; this is
+    /// the legacy path — the production workspace uses per-atom f64).
+    fn tc2_update_dev(&mut self) -> Result<f32> {
+        let mut tr = [0.0f32; 1];
+        self.gpu.read_f32(&self.trace_buf, &mut tr)?;
+        if !tr[0].is_finite() {
+            return Err(DftbError::InvalidInput(format!(
+                "TC2 trace is non-finite before update: Tr(KS)={}", tr[0]
+            )));
+        }
+        let branch = (tr[0] as f64 > self.nocc as f64) as u32;
         let nblock = self.k.struct_.nblock;
         self.gpu.tc2_dev(
             nblock,
             &self.k.values,
             &self.q.values,
-            &self.trace_buf,
-            self.nocc,
+            branch,
             &self.knew.values,
         )?;
         self.gpu.symmetrize_dev(
@@ -2937,21 +3092,12 @@ impl SparsePurifyWorkspace {
             &self.knew.values,
         )?;
         std::mem::swap(&mut self.k.values, &mut self.knew.values);
-        Ok(())
+        Ok(tr[0])
     }
 
     pub fn tc2_step_dev(&mut self) -> Result<f32> {
         self.tc2_products_dev(false)?;
-        self.tc2_update_dev()?;
-        let mut tr = [0.0f32; 1];
-        self.gpu.read_f32(&self.trace_buf, &mut tr)?;
-        if !tr[0].is_finite() {
-            return Err(DftbError::InvalidInput(format!(
-                "TC2 trace is non-finite after update: Tr(KS)={}",
-                tr[0]
-            )));
-        }
-        Ok(tr[0])
+        self.tc2_update_dev()
     }
 
     /// Compute `R_I = ||KSK - K||_F` on the device. Q already contains KSK
@@ -3048,7 +3194,7 @@ impl SparsePurifyWorkspace {
                 // Convergence: return OLD K (before update) — it is already
                 // good enough. No swap needed.
                 if ri < tol {
-                    if (tr[0] - self.nocc).abs() <= TC2_TRACE_TOL {
+                    if (tr[0] as f64 - self.nocc as f64).abs() <= tc2_trace_tol(self.nocc as f64) {
                         let k_host = self.k.to_host(&self.gpu)?;
                         return Ok((k_host, ri, tr[0], iter + 1, history));
                     }

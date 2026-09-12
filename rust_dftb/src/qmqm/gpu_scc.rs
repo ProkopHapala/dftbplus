@@ -198,6 +198,7 @@ pub fn gpu_solve_scc_batched(
     let dot = rt.zero_buffer::<f32>(batch)?;
     let occ_mask = rt.zero_buffer::<i32>(batch * n)?;
     let eig_diag_buf = rt.zero_buffer::<f32>(batch * n)?; // Phase 0d: diagonal extraction
+    let active = rt.buffer_from_slice(&vec![1i32; batch])?; // legacy path: all replicas active
 
     // Double-buffered charges: q_bufs[q_cur] = current, q_bufs[1-q_cur] = next mixed
     let q_bufs = [q_a, q_b];
@@ -283,7 +284,7 @@ pub fn gpu_solve_scc_batched(
 
         // 10. residual + mix
         residual_and_mix_batched(
-            rt, &q_new, &q_bufs[q_cur], &q_bufs[1 - q_cur], &rms, alpha, n_atoms, batch,
+            rt, &q_new, &q_bufs[q_cur], &q_bufs[1 - q_cur], &rms, &active, alpha, n_atoms, batch,
         )?;
 
         // Check convergence (read batch floats — negligible)

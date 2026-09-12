@@ -4020,3 +4020,570 @@ The implementation order I would give the coding agent is:
 8. Finally benchmark packed plan indices, degree buckets and fused W→force kernels.
 
 The encouraging part is that I don't currently see a reason to abandon the basic **f32 BSR4 + TC2 architecture**. Most of the apparent accuracy/performance limitations are still attributable to correctable contracts, unnecessary dense operations, convergence definitions, or long reductions—not to an inherent inability of f32 to solve this problem. The newly discovered NS square-root bug is a particularly clear example: a result that looked like a 100×–200× numerical-precision failure appears to be mostly a one-line norm-vs-norm-squared mistake.
+
+
+
+
+
+---
+
+# USER
+
+please review the code in context of problem documented by the agents in this labbook, and suggest further path forward (focus on  sparse solver, let dense multi-system solver alone )
+
+give clear instruction and best path forward to high speed and reasonable accuracy with f32 GPU arithmetic
+https://github.com/ProkopHapala/dftbplus/commit/55ddb4c22867923810d2a950c8d9c046b8c7ab24
+
+
+
+
+
+---
+
+
+# Chat GPT 5.6 sol
+
+
+I reviewed the sparse code at commit `55ddb4c22867923810d2a950c8d9c046b8c7ab24` against the newest labbook notes. I agree with the central principle now written into the repository: **f32 is the architecture**, so stability has to be designed around its floor rather than trying to converge an exact-arithmetic algorithm harder. The target remains a genuinely sparse, GPU-resident 300–1000+ atom solver with smooth forces and roughly 5% vibrational accuracy. 
+
+My main conclusion is that the project has now crossed an important threshold: the basic sparse infrastructure is good enough. Direct BSR H/S assembly, persistent buffers, warm NS, sparse energy, sparse \(D/W\), analytic forces, DIIS, C² interpolation, and the multi-accumulator planned SpGEMM are all sound directions. The **remaining large error is primarily algorithmic, not an intrinsic f32 error**.
+
+The 1648-atom result with \(R_I=7.9\times10^{-3}\) should not be accepted as the f32 floor. The labbook itself correctly identifies the much larger error source: truncating an intermediate product. 
+
+## The most important correction: the source still contradicts the labbook
+
+The present `SparseSystemWorkspace::new()` has
+
+```rust
+let m_t_ks = m_k.clone();
+let m_t_zs = m_z.clone();
+```
+
+so it computes
+
+$$
+T=P_{M_K}(KS)
+$$
+
+and subsequently
+
+$$
+Q=P_{M_K}(TK).
+$$
+
+The source comment claims that the dropped pieces of \(KS\) are controlled by the same locality assumption as \(K\).
+
+But your later experiment already disproved precisely that statement. An omitted \(T_{ik}\) can contribute to a perfectly valid in-mask \(Q_{ij}\), so truncating \(T\) is not equivalent to truncating \(Q\). The labbook estimates an \(O(10^{-3})\) perturbation from this mechanism and identifies it as the origin of the large idempotency floor. 
+
+Exactly the same conceptual mistake remains in the current force path: `SparseDWWorkspace` stores
+
+$$
+T=P_{M_K}(KH)
+$$
+
+before computing \(W\). Its comment again says this is controlled by K truncation. It is not.
+
+This needs to become a standing rule in the sparse implementation:
+
+$$
+\boxed{\text{truncate stored physical RESULT matrices; do not radius-truncate algebraic INTERMEDIATES.}}
+$$
+
+The literature agrees with where your experiments are pointing: sparse purification requires control of the error introduced by dropped products, and modern sparse purification work uses screening/error bounds for matrix-product contributions rather than assuming a spatial cutoff on an intermediate is harmless. ([PubMed][1])
+
+## The Gate F regression is almost certainly not the intermediate mask
+
+This can now be narrowed down substantially.
+
+`gate_f_geom_opt` is SiH\(_4\), only five atoms.  And `SparseDftb` explicitly selects a full mask for \(N\le64\).
+
+Therefore for Gate F,
+
+$$
+M_K=M_{HS}=M_Z=\text{full},
+$$
+
+so
+
+```rust
+m_t_ks = m_k.clone()
+```
+
+does **not truncate anything**. This exonerates suspect #1 in the labbook for this particular regression.
+
+I would instead focus first on two interacting changes.
+
+The TC2 loop now sometimes returns a “best plateau” projector with \(R_I\sim10^{-4}\), while the SCC mixer is allowed to extrapolate strongly. Then `SparseDftb::scc()` has this hard abort:
+
+```rust
+if it > 2 && rms > rms_prev * 2.0 && rms > 1e-2 {
+    return Err(...);
+}
+```
+
+DIIS residuals are not monotonic. A temporary jump from \(3.5\times10^{-3}\) to \(3.3\times10^{-2}\) is evidence that the proposed DIIS step was bad; it is **not yet evidence that the electronic fixed point does not exist**. That line turns a recoverable mixer overshoot directly into a fatal solver error.
+
+For Gate F I would reproduce step 16→17 from saved coordinates/charges and compare exactly four variants: old TC2 versus new trace machinery, each with planned four-accumulator SpGEMM on/off. Print only \(R_I\), high-precision trace, selected TC2 polynomial, SCC RMS, DIIS step norm, and whether DIIS was accepted. Since the mask is full, this cleanly isolates arithmetic/control-flow effects.
+
+## The current trace guard is useful containment, but it is not the invariant you actually need
+
+The labbook correctly saw an eigenvalue just above one:
+
+$$
+\lambda=1+\delta
+\quad\Rightarrow\quad
+\lambda^2\simeq1+2\delta,
+$$
+
+which explains the observed doubling runaway. 
+
+The new guard rescales
+
+$$
+K\leftarrow
+\frac{N_\mathrm{occ}}{\operatorname{Tr}(KS)}K.
+$$
+
+That pins the trace. But it **does not guarantee**
+
+$$
+0\le\lambda_i(KS)\le1.
+$$
+
+You could have one eigenvalue at 1.01 and another deficient by 0.01 while the total trace is exactly perfect. So I would change the comments: trace rescaling is a useful emergency containment mechanism, not proof that the TC2 stability domain has been restored.
+
+I also dislike this line conceptually:
+
+```rust
+trace = Nocc*(1+1e-6)  // force Q branch
+```
+
+It deliberately fabricates a trace value to choose one branch. That is another heuristic sitting exactly at the discrete decision that caused the catastrophe.
+
+Trace-resetting purification is a real established family of methods, including Niklasson et al.'s TRS schemes, and is a better conceptual model for a closed-loop purifier than artificially biasing the TC2 branch. ([ResearchGate][2])
+
+I would not immediately rewrite everything as TRS4, though. There is a simpler architectural change that I think is even more valuable.
+
+# Purify \(P=KS\), not \(K\)
+
+I think this deserves a dedicated experimental branch because it simultaneously attacks the **speed problem, the intermediate-mask problem, and the nonorthogonal algebra complexity**.
+
+Define
+
+$$
+P=KS.
+$$
+
+For an exact occupied kernel \(K=C_oC_o^T\),
+
+$$
+P=C_oC_o^TS.
+$$
+
+Then
+
+$$
+P^2=P,
+\qquad
+\operatorname{Tr}P=N_\mathrm{occ}.
+$$
+
+And your Mulliken population is immediately
+
+$$
+q_A=2\,\operatorname{Tr}P_{AA}.
+$$
+
+Most importantly, instead of current metric TC2
+
+$$
+T=KS,
+\qquad
+Q=TK=KSK,
+$$
+
+which costs **two SpGEMMs per purification iteration**, ordinary TC2 on P is simply
+
+$$
+Q=P^2,
+$$
+
+$$
+P_\mathrm{new}=
+\begin{cases}
+Q,&\operatorname{Tr}P>N_\mathrm{occ}\\
+2P-Q,&\operatorname{Tr}P<N_\mathrm{occ}.
+\end{cases}
+$$
+
+That is **one sparse matrix multiplication per iteration**.
+
+There is also no wide \(KS\) intermediate anymore. \(P^2\) is computed directly and projected onto the structural P mask. That is ordinary result sparsification rather than chopping a hidden intermediate halfway through a contraction.
+
+For the generalized eigenproblem
+
+$$
+HC=SC\epsilon,
+$$
+
+let
+
+$$
+Z\simeq S^{-1},
+\qquad
+A=ZH.
+$$
+
+Then the initial scaled projector becomes directly
+
+$$
+P_0=
+\frac{\epsilon_{\max}I-A}
+     {\epsilon_{\max}-\epsilon_{\min}},
+$$
+
+rather than building
+
+$$
+K_0=
+\frac{\epsilon_{\max}Z-ZHZ}{\Delta\epsilon}.
+$$
+
+So you also eliminate the **\(ZHZ\)** multiplication from every SCC purification initialization.
+
+After convergence, recover K only once:
+
+$$
+K=PZ.
+$$
+
+The SCC loop itself only needs P: charges come from its diagonal, and even the band energy can be written
+
+$$
+E_{H0}
+=2\operatorname{Tr}(KH_0)
+=2\operatorname{Tr}\left(PZH_0\right).
+$$
+
+This is a major simplification.
+
+The catch is that P is not ordinarily symmetric, so your existing Bsym product plan cannot be reused for \(P^2\). But that is a very manageable problem: make a **generic symbolic product plan** storing `(a_block,b_block)` contributions for each output block. Then the hot kernel has the same attractive structure as the current planned Bsym kernel—no binary search or row intersection—just cached A blocks and FMAs.
+
+I would expect the one-multiply P-TC2 to beat current two-multiply K-TC2 by much more than any 5–10% microkernel optimization.
+
+I would prototype P-TC2 on SiH\(_4\), Si\(_{65}\), and then the ~300 atom crystal before replacing K-TC2.
+
+## There is a similar simplification for W
+
+Currently you calculate
+
+$$
+W=2KHK
+$$
+
+using
+
+$$
+T=KH,\qquad W=2TK,
+$$
+
+and unfortunately truncate T.
+
+But with
+
+$$
+Z=S^{-1}
+$$
+
+and a converged occupied projector,
+
+$$
+ZHK
+=
+C_o\epsilon_o C_o^T
+=
+KHK.
+$$
+
+Therefore
+
+$$
+\boxed{W=2(ZH)K}.
+$$
+
+So if \(A=ZH\) is already available from the final SCC state, W can be generated with **one sparse multiplication**, directly onto \(M_{HS}\):
+
+$$
+W=2P_{M_{HS}}(AK).
+$$
+
+No \(KH\) intermediate at all.
+
+This identity should first be parity-tested against \(2KHK\) on full-mask SiH\(_4\)/Si\(_{65}\), because your Z is approximate and truncated. But mathematically this is a much cleaner large-system force route.
+
+It also gives a useful diagnostic:
+
+$$
+\|KHK-ZHK\|
+$$
+
+measures consistency among K, Z, H and the sparse approximations.
+
+## Precision should be concentrated at decisions, not matrices
+
+I would use this arithmetic policy:
+
+| Quantity                                                | Arithmetic                        |
+| ------------------------------------------------------- | --------------------------------- |
+| H, S, Z, P/K, W storage                                 | f32                               |
+| SK interpolation and rotations                          | f32 FMA                           |
+| sparse matrix products                                  | f32 FMA                           |
+| block product accumulation                              | 2–4 independent f32 accumulators  |
+| Hscc construction                                       | f32 FMA                           |
+| pair-force contractions                                 | f32 or CPU f64 while transitional |
+| **TC2 trace / branch decision**                         | **host f64**                      |
+| charge conservation                                     | host f64                          |
+| energy final sum                                        | host f64                          |
+| DIIS \(8\times8\) solve                                 | f64                               |
+| Hessian construction / mass weighting / diagonalization | f64 CPU                           |
+| wholesale GPU SpGEMM                                    | **never f64 by default**          |
+
+Your four-independent-accumulator planned SpGEMM is exactly the sort of f32 optimization I like: it shortened the dependency chain, changed results only at ordinary reorder-noise level, and was already slightly faster even on the tiny benchmark. 
+
+I would not add Kahan to every sparse dot product.
+
+### But the trace branch really should become f64
+
+At N=1648, reading one scalar f32 is not the optimal precision compromise.
+
+Have a tiny kernel write one trace contribution per atom:
+
+```text
+trace_atom[i] = sum physical diagonal lanes of P_ii
+```
+
+or KS in the current architecture.
+
+Read those N floats and sum them in host f64.
+
+For 1648 atoms this is only about 6.6 kB per purification iteration. You already require a synchronization for the TC2 branch anyway, so the meaningful cost is synchronization latency, not those few kilobytes.
+
+Then change the TC2 kernel from
+
+```c
+if(trace_KS[0] > Nocc)
+```
+
+to
+
+```c
+branch = host_decision;   // uint
+```
+
+The branch—the dangerous discrete event—is then based on f64. The matrices remain entirely f32.
+
+This follows exactly the rule recorded in your labbook: cheap discrete decisions deserve high precision because the wrong decision can be catastrophic while a \(10^{-5}\) matrix-element error is usually harmless. 
+
+Likewise the absolute
+
+```rust
+TC2_TRACE_TOL = 0.05
+```
+
+should disappear as a universal constant. A 0.05-electron tolerance might match the measured large-N f32 reduction jitter, but it is ridiculously loose for SiH\(_4\). Use a measured relative trace floor plus a tiny absolute floor.
+
+## Do not return a bad projector as ordinary `Ok`
+
+This is another thing I would change immediately.
+
+The current TC2 accepts a best snapshot at exhaustion/divergence if roughly
+
+```rust
+best_r_i < 1e-2
+```
+
+and the trace is acceptable.
+
+That is exactly why the 1648-atom calculation can proceed with
+
+$$
+R_I=7.87\times10^{-3}.
+$$
+
+The labbook itself correctly says this is a **bad ~0.8% idempotency floor and the resulting energy is not validated**. 
+
+Returning it indistinguishably from true convergence violates the otherwise good “report the f32 floor honestly” philosophy.
+
+Use an explicit result such as:
+
+```rust
+enum PurifyStatus {
+    Converged,
+    AcceptedAtNumericalFloor,
+    Failed,
+}
+```
+
+with `ri`, trace error, R_H, iteration count and floor reason.
+
+`SparseDftb::scc()` can decide whether a given run mode accepts `AcceptedAtNumericalFloor`. A fast screening calculation may. A vibrational Hessian should generally not accept a 0.8% projector unless you have independently shown that it changes forces/frequencies within your accuracy target.
+
+Do **not** encode scientific accuracy policy as `best_r_i < 1e-2`.
+
+## The plateau detector should operate only in the endgame
+
+The attempted “N consecutive non-improvements” detector failed because TC2 naturally oscillates while trace correction is still driving occupation. That observation in the labbook is correct. 
+
+A better detector arms only after both
+
+$$
+|\mathrm{Tr}-N_\mathrm{occ}|/N_\mathrm{occ}
+$$
+
+and \(R_I\) are already in an endgame range.
+
+Then maintain a short rolling history of \(R_I\) and detect either a 2-cycle or essentially zero negative slope in \(\log R_I\) over several branch cycles.
+
+This says “we have reached the numerical/sparsity floor,” rather than “the last iteration happened not to improve.”
+
+Also normalize the idempotency residual with a physically fixed scale. Current code computes `k_norm` once from K0 and uses that throughout. K0 is not necessarily a good normalization scale during the transient. In the proposed P representation,
+
+$$
+\|P\|_F\simeq\sqrt{N_\mathrm{occ}}
+$$
+
+for a projector, so
+
+$$
+r_I=
+\frac{\|P^2-P\|_F}{\sqrt{N_\mathrm{occ}}}
+$$
+
+has a particularly clean system-size interpretation.
+
+## Fix the SCC recovery rather than hard-failing on one DIIS overshoot
+
+Since you asked me to leave the dense solver alone, I would **not modify the shared mixer globally**.
+
+Put a sparse-specific safeguard around it, or create `SparseDiisMixer`.
+
+Operate on
+
+$$
+\Delta q=q-q_0
+$$
+
+rather than the large neutral populations themselves, and project each residual onto the fixed-total-charge subspace. For a neutral system:
+
+$$
+\sum_A\Delta q_A=0.
+$$
+
+Then if a DIIS trial makes the *next measured residual* explode, restore the last accepted q, prune/reset the suspect DIIS history, take a damped linear step, and retry. Only fail after repeated rescue failure or nonfinite values.
+
+That is a closed-loop mixer. The current
+
+```rust
+rms > 2*rms_prev
+```
+
+hard error is not.
+
+Keeping DIIS history across small geometry moves was clearly valuable for the Si\(_{10}\)H\(_{16}\) Hessian, so I would retain that behavior, but make stale-history rejection automatic rather than assuming every carried history remains useful. 
+
+## The spectral bound also needs to become deliberately conservative
+
+The present K0 construction evaluates Gershgorin bounds on a **truncated \(ZH\)** and pads them by 10%.
+
+As the labbook already recognizes, those are no longer guaranteed bounds. 
+
+For purification, putting the initial spectrum inside the polynomial stability interval is more important than shaving two iterations.
+
+I would initially use a conservative bound such as
+
+$$
+B=\|Z\|_\infty\,\|H\|_\infty,
+\qquad
+\epsilon_{\min}=-B,\quad
+\epsilon_{\max}=B,
+$$
+
+or use that to enlarge—not shrink—the estimated Gershgorin interval. Matrix norm inequalities make this deliberately conservative.
+
+Once large-system behavior is stable, you can make it tighter using measured parameter-set bounds or a cheap extremal iteration. First make K0 safe.
+
+## For sparsity, τ-screening is the right next technology
+
+Do not try to reach 64 neighbors by forcing \(R_K\) down to 6–8 Å. Your own Si65 tests already show that K/Z truncation is much more expensive than H/S truncation. 
+
+The H/S situation is different. The measured SK decay and the energy sweep make the current matsci choice quite defensible:
+
+$$
+r_{HS}\approx8\ \text{Å}
+$$
+
+with the smooth 1 Å taper is a good accuracy-oriented default; 7 Å may be a good faster mode after vibration testing.  
+
+For K/P/Z, keep a larger frozen structural super-mask—initially perhaps the 10–12 Å regime you are already testing—and make the **computational** sparsity depend on block magnitude.
+
+A useful GPU implementation is to compute a Frobenius norm for every 4×4 block and let the symbolic product kernel skip a contribution when a conservative product bound says it cannot matter:
+
+$$
+\|A_{ik}B_{kj}\|_F
+\le
+\|A_{ik}\|_F\|B_{kj}\|_F.
+$$
+
+A naive per-term threshold is not rigorous because many small omitted terms can sum, so accumulate or budget the discarded bound per output block/row. That is essentially the direction used by sparse purification schemes with error-controlled submatrix-product screening. ([ScienceDirect][3])
+
+For Hessians I would freeze the selected active pattern at the central geometry, or use strong hysteresis, so threshold crossings do not inject force discontinuities.
+
+## The remaining safe performance gains are quite clear
+
+The default `MAX_LEFT_BLOCKS=512` means the planned kernel reserves about 32 KiB just for cached 4×4 values per WG. The code already notes that this costs occupancy.
+
+Your measured large-Si degrees are mostly much lower: at 8 Å max ~111, at 10 Å ~206. 
+
+Compile degree buckets:
+
+```text
+MAX_LEFT = 64
+MAX_LEFT = 128
+MAX_LEFT = 256
+MAX_LEFT = 512
+```
+
+and dispatch rows by degree. This is almost pure performance improvement with essentially zero numerical risk.
+
+Likewise pack the symbolic plan indices. With `MAX_LEFT<=512`, `plan_a_idx` needs only 9 bits. One `uint` can hold local-A index plus ~23 bits of B-block index, enough for millions of blocks. That cuts plan-term index traffic roughly in half.
+
+Keep the four independent f32 accumulators. Do not add full compensated multiplication until frozen-input tests show a meaningful remaining arithmetic error.
+
+## Gamma is not where I would spend effort first
+
+The current explicit dense f64 gamma matrix is aesthetically inconsistent with “GPU resident,” but for 1648 atoms it is only about 2.7 million elements, ~22 MB, and a few million f64 multiply-adds per SCC iteration. That may still be small compared with sparse purification. The code makes this explicit rather than silently falling back, which I prefer.
+
+So first profile after fixing purification.
+
+If it becomes important during thousands of Hessian geometries, then move it cleanly to GPU. I would pretabulate the short-range species-pair gamma correction in CPU f64 and evaluate gamma and gamma′ from the **same** smooth f32 spline on GPU, with the long-range \(1/r\) handled analytically. That preserves energy/force consistency and avoids the ill-conditioned close-U analytic formula at runtime.
+
+## My implementation order
+
+I would give the coding agent exactly this order:
+
+1. **Restore Gate F first.** Recognize that full-mask SiH\(_4\) rules out intermediate truncation as the cause. Replace the SCC one-jump hard abort with rollback/rescue and AB-test trace guard × four-accumulator SpGEMM against the parent behavior. Do not touch the dense solver.
+2. **Move TC2 trace and branch selection to host f64.** Read per-atom diagonal contributions, f64-sum them, pass an explicit branch flag. Replace the universal 0.05-electron contract by a measured size-scaled tolerance.
+3. **Stop returning \(R_I<10^{-2}\) as ordinary success.** Add `Converged / NumericalFloor / Failed`, and make accuracy mode decide whether a floor is acceptable.
+4. **Prototype the \(P=KS\) purifier.** One generic planned \(P^2\) SpGEMM per TC2 iteration, direct Mulliken from P, direct \(P_0=(\epsilon_\max I-ZH)/\Delta\), recover \(K=PZ\) only after SCC. Compare iterations, wall time, \(R_I\), force and energy against current K-TC2 on SiH\(_4\), Si65 and ~300 atoms.
+5. **If P-TC2 works, make it the production baseline and then test trace-resetting/TRS-style purification.** This is the right place to put the rigorous restoring mechanism rather than bolting more heuristics onto K-TC2. Trace-resetting purification was designed precisely around predefined occupation and stable purification. ([ResearchGate][2])
+6. **Remove the force intermediate truncation.** First test \(W=2(ZH)K\) against \(2KHK\); if parity is good, it gives W in one sparse product and removes the problematic \(KH\) intermediate.
+7. **Implement error-budgeted τ screening**, keeping a larger frozen structural K/P/Z mask. Measure energy, forces and spectra versus τ; do not infer an error from radius alone.
+8. **Then optimize GPU throughput:** degree-bucketed 64/128/256/512 SpGEMMs, packed plan indices, existing four-accumulator FMA kernel, fewer diagnostic synchronizations. Only afterward profile gamma and CPU pair-force contraction.
+
+The most important strategic change I would make is therefore **not “better TC2 tuning.”** I would stop investing heavily in the present \(K\rightarrow KS\rightarrow KSK\) architecture because the wide intermediate is structurally at odds with the sparsity you want. The \(P=KS\) formulation looks unusually well matched to this application: it removes that intermediate, halves the purification SpGEMM count, makes charge and trace trivial, and naturally exposes where f64 should be spent—the scalar decisions rather than the matrices.
+
+And I would keep the present 1648-atom 7.5 s run as a valuable **scaling/pipeline milestone**, not an accuracy milestone. The labbook is right to flag its \(R_I=7.9\times10^{-3}\) energy as unvalidated. 
+
+[1]: https://pubmed.ncbi.nlm.nih.gov/18298139/?utm_source=chatgpt.com "Density matrix purification with rigorous error control - PubMed"
+[2]: https://www.researchgate.net/publication/252723010_Trace_resetting_density_matrix_purification_in_ON_self-consistent-field_theory?utm_source=chatgpt.com "(PDF) Trace resetting density matrix purification in O(N) self-consistent-field theory"
+[3]: https://www.sciencedirect.com/science/article/pii/S0021999121002497?utm_source=chatgpt.com "Sparse approximate matrix-matrix multiplication for density matrix purification with error control - ScienceDirect"

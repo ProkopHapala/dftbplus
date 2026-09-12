@@ -2553,3 +2553,260 @@ Two corrections are important. First, **do not replace mathematical unit tests w
 I would add a native coarse `gpu_bench()` operation to `dftb_engine` which times, with OpenCL events, `set_coords`, S orthogonalization, one SCC iteration, Jacobi, GEMMs, finalize, P/W, forces and total wall time for **N=28 and N=87 at batch=1, 100, 500**. That is the benchmark that should drive all further optimization.
 
 The largest immediate wins, in my view, are therefore **(1) remove broad FP64 Jacobi arithmetic, (2) cheap C′ normalization/orthogonality repair, (3) kill the CPU Löwdin repair, (4) stop rebuilding/uploading geometric pair records, and (5) correct/move FIRE to GPU**. Those five changes improve accuracy *and* throughput rather than trading one for the other.
+
+
+
+
+
+
+
+---
+
+
+# USER
+
+please review the code in context of problem documented by the agents in this labbook, and suggest further path forward (focu on dense multi-system solver, let the sparse solver alone 
+
+give clear instruction and best path forward to high speed and reasonable accuracy with f32 GPU arithmetic
+https://github.com/ProkopHapala/dftbplus/commit/55ddb4c22867923810d2a950c8d9c046b8c7ab24
+
+
+---
+
+
+# Chat GPT 5.6 sol
+
+
+I reviewed commit `55ddb4c22867923810d2a950c8d9c046b8c7ab24` against the labbook, focusing only on the dense `GpuDftb/GpuSccPlan` path. The central conclusion is stronger now:
+
+**The FP32 accuracy problem is largely solved. The N>64 performance problem is not. Stop spending effort on generic compensation/Kahan/f64 islands and replace the tiled block-Jacobi architecture.**
+
+The current verified chemistry is already quite good: AT/GC/AZA total-energy errors are around \(10^{-6}\) Ha, forces a few \(10^{-6}\) Ha/Å, and the formic relative PES agrees to about \(10^{-6}\) Ha. The occupied-column normalization and Rayleigh correction were the decisive accuracy fixes.   The later γ/γ′ spline and device-resident geometry work also look like the correct architecture and should be left alone. 
+
+The performance evidence is equally decisive: an N=87 production eigensolve takes **~83 ms**, batch 1 and batch 8 cost almost identically, and one warm SCC iteration is ~74 ms all the way from batch 1 to batch 64. The kernel is not compute-bound; it is a single workgroup spending its life behind thousands of barriers. 
+
+### Instructions I would give the coding agent
+
+1. **First remove all redundant eigensolves. Do this before designing a new eigensolver.** `eval()` unconditionally calls `finalize()`, which performs another H′ construction + Jacobi even immediately after SCC. `fire_step()` calls `eval(true)`, and then `relax()` calls `scc()` followed by another `eval(false)` merely to print energy. The code confirms the labbook accounting.
+
+   Change the SCC state machine. Do **not** overwrite `q_gpu` with the mixed next iterate before knowing whether another SCC iteration is needed. Introduce `q_next`. One iteration should be:
+
+   $$
+   q_n\rightarrow H(q_n)\rightarrow C,D\rightarrow q_D
+   \rightarrow{\rm DIIS}(q_n,q_D)\rightarrow q_{n+1}.
+   $$
+
+   If the residual is acceptable, retain \(q_n\) and the electronic state just calculated. That state is already mutually consistent to the requested SCC tolerance. `eval()` can then reuse `H,C,D,\epsilon` and only build W/energy/forces. If another iteration is required, commit `q_next→q_gpu`.
+
+   This removes the expensive “finalize for consistency” rather than merely hiding it. Also delete `eval(false)` from every FIRE logging step; calculate energy from the valid cached electronic state. This alone should cut roughly 2–3 eigensolves from each geometry step.
+
+2. **Replace the N>64 block-Jacobi kernel. Do not optimize its current nested structure.** This is the most important instruction. Current N=86/87 does 3 compound block pivots per outer sweep; each pivot performs **20 inner sweeps × 63 Brent–Luk rounds**, with several workgroup barriers per round. `JACOBI_TOL=1e-9` then never terminates normally in FP32, so the solver waits for its stagnation heuristic.   The labbook correctly identified this as the ~83 ms catastrophe and also correctly notes that the relative-to-`off0` stopping criterion actively sabotages warm starts. 
+
+   For the immediate N≈65–128 target, I recommend a **direct full-matrix parallel cyclic Jacobi**, still one kernel launch and one WG/system:
+
+   * A and V remain in global memory.
+   * Pad N to even `JN`; N=87 becomes 88, giving 44 independent Jacobi pairs per round.
+   * One round has 44 disjoint rotations.
+   * Each pair computes \(c,s\).
+   * The WG applies \(J^TAJ\) to the whole matrix as pair×pair 2×2 blocks, exactly the algebra you already use inside the local 64×64 pivot.
+   * Update eigenvector columns \(V\leftarrow VJ\).
+   * Barrier; proceed to the next of 87 rounds.
+   * No 64×64 “inner eigensolve”, no block-pair outer hierarchy.
+
+   The current architecture performs of order **tens of thousands of synchronized Jacobi rounds** per eigensolve. Direct cyclic Jacobi needs roughly \(87\times N_{\rm sweep}\) rounds. Even five cold sweeps is only 435 rounds. That attacks the actual latency mechanism instead of shaving FLOPs inside it.
+
+   Keep N≤64 exactly as it is; it is already fast. This replacement is only for the N>64 path.
+
+3. **Make warm-starting intrinsic to the mathematical formulation.** Simply loading the previous eigenvectors into V while diagonalizing the new H′ is wrong unless A is transformed into that basis. Instead I recommend a particularly clean formulation using the **previous AO eigenbasis itself**.
+
+   Maintain a full \(S\)-orthonormal basis \(B\), initially the previous eigenvectors:
+
+   $$
+   B^T S B\simeq I.
+   $$
+
+   For the next SCC iteration form
+
+   $$
+   A = B^T H_{\rm SCC} B.
+   $$
+
+   This needs two ordinary batched GEMMs. Because H changes only slightly between SCC iterations, A should already be almost diagonal.
+
+   Then run direct Jacobi on A while applying every Jacobi rotation directly to B:
+
+   $$
+   A\leftarrow J^TAJ,\qquad B\leftarrow BJ.
+   $$
+
+   On exit **B is the new AO eigenvector matrix C**. There is no \(X C'\) back-transform at all.
+
+   This is exact, not an approximation: any full basis satisfying \(B^TSB=I\) converts the generalized eigenproblem to an ordinary symmetric one. It also naturally carries eigenvectors from SCC iteration to SCC iteration. The expected regime should be **1–2 Jacobi sweeps after the first iteration**, rather than eight cold sweeps every time.
+
+   Across FIRE geometry changes, repair the previous B against the new overlap:
+
+   $$
+   G=B^TS_{\rm new}B,\qquad
+   B\leftarrow B(3I-G)/2.
+   $$
+
+   You already proved this metric-Newton idea works for X. If it fails its residual test, fall back to the existing X construction. The corrected \(X^THX\) gauge handling was an important fix and validates exactly this more general view of the orthogonalizer. 
+
+   I would implement this warm basis only **after** the direct-global Jacobi works cold, so the two changes can be validated independently.
+
+4. **Replace the impossible Jacobi stopping rule with one tied to the physical matrix scale.** Never again use
+
+   $$
+   \|A_{\rm off}\|/\|A_{\rm off}^{(0)}\|<10^{-9}.
+   $$
+
+   A better invariant is
+
+   $$
+   \frac{\|A_{\rm off}\|_F}{\|A\|_F}<\epsilon_{\rm eig},
+   $$
+
+   where \(\|A\|_F\) is invariant under Jacobi similarity transforms and, crucially, does not become smaller merely because the warm start is better.
+
+   Do not guess an absurd tolerance. Start around the currently demonstrated prec1 accuracy and tune against the actual scientific diagnostic:
+
+   $$
+   \max_k\|HC_k-\rho_kSC_k\|,
+   $$
+
+   plus AT/GC/AZA energy parity and relative PES parity. The existing successful Rayleigh repair should stay.
+
+   Likewise `PAIR_SKIP_TOL=1e-12f` is inappropriate for FP32. A rotation whose off-diagonal element is many orders below the FP32 scale cannot improve the stored matrix. Use a relative criterion such as
+
+   $$
+   |a_{pq}| < \epsilon_J(|a_{pp}|+|a_{qq}|),
+   $$
+
+   with \(\epsilon_J\) empirically around the FP32 solver floor. That will increasingly skip useless rotations as the matrix diagonalizes.
+
+5. **Keep FP64 only where it is cheap; do not chase compensated arithmetic inside the current Jacobi.** The labbook already shows prec1 is scientifically sufficient while prec0 in the current formulation is not.  For now keep f64 only for scalar \(c,s\) construction. Everything that touches N²/N³ data stays FP32 FMA.
+
+   Once the direct solver is fast, retry a stable all-FP32 rotation formula. The current 83→47 ms prec1→prec0 difference shows that even the scalar f64 sqrt/div sequence hurts badly on a 3090 because every round waits on it. But that is **second priority**. Removing ~100× excess synchronization comes first.
+
+   Do not implement TwoSum/Kahan inside the old tiled Jacobi now. It would polish arithmetic inside an algorithm whose wall time is dominated by barriers.
+
+6. **Add a real device `active[sid]` mask. This is both performance and correctness.** There is a subtle bug in the current host-side “done” machinery: `scc_mix()` stops tracking a converged replica, but subsequent GPU iterations still run Jacobi, density, Mulliken and DIIS for that replica because none of the kernels knows it is done. At the end, status is reconstructed from the *latest* RMS, so a previously converged system can in principle drift again.
+
+   Add `active[batch]`. Major kernels should uniformly return for `active[sid]==0`, including GEMM tiles and the eigensolver. When a replica reaches either accepted convergence or an accepted numerical plateau, freeze its \(q,C,D,\rho\) state.
+
+   Also tighten `PLATEAU_FLOOR`. The current **5×10⁻⁴** is much looser than the measured dense FP32 floor of roughly \(10^{-6}\)–\(10^{-5}\). A sensible production policy is something like
+
+   $$
+   r_{\rm plateau,max} =
+   \max(3\,r_{\rm target},\,2\times10^{-5}),
+   $$
+
+   calibrated on AT/GC/AZA. A stagnant \(10^{-3}\) or \(10^{-2}\) state is a failed SCC, not an accepted plateau.
+
+   I would also make **1e-5 the default production SCC target**, not 1e-6. Use 1e-6 for validation runs. The current physics parity is already much better than the chemistry requires while AT/GC sit near that numerical boundary. 
+
+7. **Fix finite-temperature smearing before trusting the proton-transfer PES.** The smearing was a good numerical/physical solution to the real 0.45 mHa gap problem, but the labbook correctly identifies two current scientific errors. 
+
+   First, with Fermi occupations the reported quantity must be the Mermin free energy:
+
+   $$
+   F_{\rm el}
+   =
+   E_{\rm el}
+   +
+   2kT\sum_k
+   \left[
+   f_k\ln f_k+(1-f_k)\ln(1-f_k)
+   \right].
+   $$
+
+   At \(kT=0.002\) Ha, a half-occupied spatial orbital contributes roughly
+
+   $$
+   -2 kT\ln2\approx-2.77\times10^{-3}\ {\rm Ha}
+   \approx-1.74\ {\rm kcal/mol},
+   $$
+
+   so this is absolutely not negligible for the proton-transfer profile.
+
+   Second, the current code is internally inconsistent under smearing. `build_density_occ_batched` includes **all N orbitals** with Fermi weights, while `occ_rayleigh_batched` explicitly computes \(\rho_k\) only for the integer `occ_mask` and writes zero for the others.   Yet W chooses `eig_rho` whenever `occ_repair` is enabled. That makes fractionally occupied virtual states contribute correctly to D but incorrectly to W.
+
+   Under smearing:
+
+   $$
+   D=2\sum_k f_k C_kC_k^T,
+   \qquad
+   W=2\sum_k f_k\rho_k C_kC_k^T,
+   \qquad
+   E_{\rm band}=2\sum_k f_k\rho_k.
+   $$
+
+   Normalize/Rayleigh-repair **all states with non-negligible \(f_k\)**—for N≈87, simply doing all N is fine—and add the entropy term. Host-f64 μ bisection is exactly the kind of tiny discrete decision where FP64 is appropriate; leave that alone for now.
+
+   Once this is done, finite-temperature forces built from fractional D/W are the appropriate stationary derivative of the Mermin free energy. Label the result by kT; it is no longer a zero-temperature PES.
+
+8. **Only after the replacement eigensolver is working, benchmark against a professional batched solver.** Current NVIDIA cuSOLVER provides `cusolverDnXsyevBatched` for batches of same-size contiguous symmetric matrices, including FP32 matrices/eigenvectors. ([NVIDIA Docs][1]) Do a standalone CUDA microbenchmark at exactly N=87 and batch 1/19/64/256 as a **performance oracle**, not as a silent production fallback.
+
+   I would not integrate CUDA into the OpenCL engine yet; moving `cl_mem` back and forth merely to call cuSOLVER defeats the architecture. But if a redesigned OpenCL eigensolver is still taking 10–50 ms while cuSOLVER does the same work orders of magnitude faster, that is useful evidence about whether a later CUDA dense backend is justified.
+
+I would **not implement LOBPCG/subspace iteration next**, despite the labbook mentioning it. For GC, 43-ish occupied states out of 86 is already half the spectrum, and smearing requires several frontier virtuals exactly where the gap becomes tiny. You would introduce a much more complicated convergence problem to avoid diagonalizing a matrix that is only 86×86. A sane full eigensolver at this size should be cheap. Partial eigensolvers become attractive only if the dense target grows substantially beyond ~100–200 orbitals.
+
+### Precision policy I would freeze now
+
+| Quantity / operation                 | Precision                                            |
+| ------------------------------------ | ---------------------------------------------------- |
+| H, S, C, D, W, X/B storage           | **f32**                                              |
+| GEMM, Jacobi matrix/vector updates   | **f32 FMA**                                          |
+| Jacobi \(c,s\)                       | **f64 temporarily**, then test stable f32            |
+| occupied/all-weighted normalization  | f32                                                  |
+| Rayleigh quotients                   | f32 matrix work; optional f64 final scalar reduction |
+| DIIS Gram + tiny solve               | **f64**                                              |
+| Fermi μ / convergence decisions      | **f64 host**                                         |
+| γ/γ′                                 | current f32 spline                                   |
+| final energy / entropy / scalar dots | **f64 reduction**                                    |
+| coordinates API                      | f64 host → f32 device                                |
+
+This follows the principle already written into the project: **spend precision on decisions/scalars and restoring invariants, not on bulk matrices.** The current renormalization/Rayleigh repair is a very good example of this: it improved AT energy by roughly 30× and made SCC converge faster, rather than making the matrix algebra more expensive. 
+
+### The concrete target architecture
+
+For N>64, I would aim for this hot SCC loop:
+
+$$
+\boxed{
+q
+\rightarrow H_{\rm SCC}
+\rightarrow A=B^THB
+\rightarrow
+\text{1--2 warm direct-Jacobi sweeps}
+\rightarrow C=BJ
+\rightarrow D,q_D
+\rightarrow DIIS
+}
+$$
+
+with `B←C` only when another iteration is required. No cold eigensolve, no X transforms during ordinary SCC iterations, no redundant finalize, no work on already-converged replicas.
+
+For a geometry step:
+
+$$
+\boxed{
+R_{\rm new}
+\rightarrow H_0,S,G
+\rightarrow
+\text{metric-repair previous }B\text{ to new }S
+\rightarrow
+5\text{--}10\ {\rm SCC\ iterations}
+\rightarrow
+E/W/F
+\rightarrow FIRE
+}
+$$
+
+The labbook explicitly states that **batch-parallel execution is the product**, not merely an optimization.  I would therefore set hard performance gates for the next agent: N=87 direct eigensolve **<5 ms cold as the first milestone, <1–2 ms warm**, ordinary warm SCC **<10 iterations**, no routine 100-iteration calls, and the 19-point GC relaxed scan should move from 108 seconds toward **a few seconds**, not merely 50–70 seconds. The current 108 s is almost entirely accounted for by repeatedly paying the 83 ms Jacobi tax, so this is a realistic place to expect an order-of-magnitude-plus improvement. 
+
+One final scientific housekeeping point: the later labbook notes a 1–2 Ha CPU/GPU discrepancy in some separate diagnostic scripts, while the same-engine parity tests report ~\(10^{-6}\) Ha. The actual CPU implementation uses \(E=\mathrm{Tr}(DH_0)+\tfrac12\Delta q\cdot V\), which is equivalent to the GPU band form for the same converged state.  Therefore **do not debug that multi-Hartree discrepancy as FP32**. First require comparisons to go through the same `GpuDftb` object/geometry/species via `gpu_measure(..., true)` and `cpu_ref()`. A multi-Hartree difference is a mismatched system or energy convention until proven otherwise.
+
+The immediate work order I would enforce is therefore: **cached SCC state → direct-global Jacobi → warm AO basis → active mask → fix smeared free energy/W → only then secondary micro-optimizations.**
+
+[1]: https://docs.nvidia.com/cuda/cusolver/index.html?highlight=cholesky&utm_source=chatgpt.com "1. Introduction — cuSOLVER 13.4 documentation"

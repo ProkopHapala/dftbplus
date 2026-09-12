@@ -117,6 +117,12 @@ pub struct DftbCpu {
     mixer: MixerKind,
     pub n_scc_iter: usize,
 
+    // ─── Fermi smearing (B2: f64 CPU reference for the GPU path) ──────
+    pub kT: f64,               // 0 = integer occupation
+    pub mu: f64,               // last chemical potential
+    occ_w: Vec<f64>,           // [n_orbs] Fermi weights f_k ∈ [0,1]
+    sc_full: DMatrix<f64>,     // n×n S·C for fractional Mulliken (kT>0)
+
     // ─── LAPACK workspace (preallocated) ──────────────────────────────
     lapack_work: Vec<f64>,
     lapack_iwork: Vec<i32>,
@@ -200,6 +206,12 @@ pub struct CpuSccResult {
     pub q0: Vec<f64>,
     pub energy: f64,
     pub n_iter: usize,
+    /// Fermi smearing diagnostics (0/0.0 when kT=0): chemical potential μ and
+    /// the −T·S Mermin term already included in `energy`.
+    pub mu: f64,
+    pub mermin_ts: f64,
+    /// Per-orbital Fermi weights f_k (1.0/0.0 under integer occupation).
+    pub occ_w: Vec<f64>,
 }
 
 impl DftbCpu {
@@ -296,6 +308,10 @@ impl DftbCpu {
             eigenvectors: DMatrix::zeros(n_orbs, n_orbs),
             mixer: MixerKind::Diis(DiisMixer::new(10, n_atoms)),
             n_scc_iter: 0,
+            kT: 0.0,
+            mu: 0.0,
+            occ_w: vec![0.0; n_orbs],
+            sc_full: DMatrix::zeros(n_orbs, n_orbs),
             lapack_work,
             lapack_iwork,
             fws: ForceWorkspace {
@@ -518,6 +534,27 @@ impl DftbCpu {
             let y_full = DMatrix::from_vec(n, n, self.h_prime_data.clone());
             if timing { t_dsyevd += t3.elapsed().as_secs_f64() * 1e6; }
 
+            // 3b. Fermi weights when smeared: host f64 bisection on ε_k for
+            //     μ s.t. 2·Σ f_k = 2·n_occ  (discrete decision in f64, same
+            //     contract as the GPU occupation path).
+            if self.kT > 0.0 {
+                let kt = self.kT;
+                let nel = 2.0 * self.n_occ as f64;
+                let mut lo = self.eig_tmp.iter().fold(f64::INFINITY, |a, &v| a.min(v)) - 32.0 * kt;
+                let mut hi = self.eig_tmp.iter().fold(f64::NEG_INFINITY, |a, &v| a.max(v)) + 32.0 * kt;
+                for _ in 0..80 {
+                    let mid = 0.5 * (lo + hi);
+                    let s: f64 = self.eig_tmp.iter().map(|&e| 2.0 / (1.0 + ((e - mid) / kt).exp())).sum();
+                    if s > nel { hi = mid } else { lo = mid }
+                }
+                self.mu = 0.5 * (lo + hi);
+                assert!(self.mu.is_finite(), "Fermi smearing: μ non-finite (kT={})", self.kT);
+                for k in 0..n {
+                    let x = (self.eig_tmp[k] - self.mu) / kt;
+                    self.occ_w[k] = 1.0 / (1.0 + x.exp().min(1e300));
+                }
+            }
+
             // 4. Back-transform: C = L⁻ᵀ · Y
             let t4 = ts();
             let c = self.cholesky_l.tr_solve_lower_triangular(&y_full)
@@ -525,30 +562,41 @@ impl DftbCpu {
             self.eigenvectors = c;
             if timing { t_backtr += t4.elapsed().as_secs_f64() * 1e6; }
 
-            // 5. Mulliken charges
-            let t5 = ts();
-            self.y_occ.copy_from(&y_full.columns(0, n_occ));
-            self.c_occ.copy_from(&self.eigenvectors.columns(0, n_occ));
-            self.sc_occ = &self.cholesky_l * &self.y_occ;
-
             // 5. Mulliken charges: SC = L·Y_occ, p_μ = 2·Σ_k C_μk·(SC)_μk, q_A = Σ_{μ∈A} p_μ
             //    SC = S·C = L·Lᵀ·L⁻ᵀ·Y = L·Y, so we need Y_occ (before back-transform)
             // M3: use preallocated y_occ, c_occ, sc_occ
-            self.y_occ.copy_from(&y_full.columns(0, n_occ));
-            self.c_occ.copy_from(&self.eigenvectors.columns(0, n_occ));
-            // sc_occ = L · y_occ
-            self.sc_occ = &self.cholesky_l * &self.y_occ;
-
-            for a in 0..nat {
-                let mut pop_a = 0.0;
-                let off = self.ctx.atom_orb_off[a] as usize;
-                let norb_a = self.ctx.atom_n_orb[a] as usize;
-                for mu in off..off + norb_a {
-                    for k in 0..n_occ {
-                        pop_a += 2.0 * self.c_occ[(mu, k)] * self.sc_occ[(mu, k)];
+            // B2: smeared → fractional Mulliken over ALL orbitals, weight 2·f_k.
+            let t5 = ts();
+            if self.kT > 0.0 {
+                self.sc_full = &self.cholesky_l * &y_full;
+                for a in 0..nat {
+                    let mut pop_a = 0.0;
+                    let off = self.ctx.atom_orb_off[a] as usize;
+                    let norb_a = self.ctx.atom_n_orb[a] as usize;
+                    for mu in off..off + norb_a {
+                        for k in 0..n {
+                            pop_a += 2.0 * self.occ_w[k] * self.eigenvectors[(mu, k)] * self.sc_full[(mu, k)];
+                        }
                     }
+                    self.q_out[a] = pop_a;
                 }
-                self.q_out[a] = pop_a;
+            } else {
+                self.y_occ.copy_from(&y_full.columns(0, n_occ));
+                self.c_occ.copy_from(&self.eigenvectors.columns(0, n_occ));
+                // sc_occ = L · y_occ
+                self.sc_occ = &self.cholesky_l * &self.y_occ;
+
+                for a in 0..nat {
+                    let mut pop_a = 0.0;
+                    let off = self.ctx.atom_orb_off[a] as usize;
+                    let norb_a = self.ctx.atom_n_orb[a] as usize;
+                    for mu in off..off + norb_a {
+                        for k in 0..n_occ {
+                            pop_a += 2.0 * self.c_occ[(mu, k)] * self.sc_occ[(mu, k)];
+                        }
+                    }
+                    self.q_out[a] = pop_a;
+                }
             }
             if timing { t_mull += t5.elapsed().as_secs_f64() * 1e6; }
 
@@ -591,23 +639,47 @@ impl DftbCpu {
         let n = self.n_orbs;
         let n_occ = self.n_occ;
 
-        // C_occ = eigenvectors[:, :n_occ]
-        let c_occ = self.eigenvectors.columns(0, n_occ).into_owned();
-
-        // D = 2 · C_occ · C_occᵀ
-        let density = &c_occ * c_occ.transpose() * 2.0;
-
-        // W = 2 · C_occ · diag(eps_occ) · C_occᵀ
-        // M5: use preallocated eps_occ
-        for k in 0..n_occ { self.eps_occ[k] = self.eigenvalues[k]; }
-        let mut ce = c_occ.clone();
-        for k in 0..n_occ {
-            let e = self.eps_occ[k];
-            for mu in 0..n {
-                ce[(mu, k)] *= 2.0 * e;
+        // B2: smeared → D = 2Σ_k f_k c_k c_kᵀ and W = 2Σ_k f_k ε_k c_k c_kᵀ
+        // over ALL orbitals; integer path unchanged.
+        let (density, edm, mermin_ts) = if self.kT > 0.0 {
+            let mut fw = DMatrix::zeros(n, n);
+            let mut few = DMatrix::zeros(n, n);
+            for k in 0..n {
+                let f = self.occ_w[k];
+                fw[(k, k)] = 2.0 * f;
+                few[(k, k)] = 2.0 * f * self.eigenvalues[k];
             }
-        }
-        let edm = &ce * c_occ.transpose();
+            let ct = self.eigenvectors.transpose();
+            let den = &self.eigenvectors * &fw * &ct;
+            let ed = &self.eigenvectors * &few * &ct;
+            // −T·S = 2kT·Σ_k [f ln f + (1−f)ln(1−f)]  (≤0; Mermin free energy)
+            let mut mts = 0.0f64;
+            for k in 0..n {
+                let f = self.occ_w[k];
+                let g = 1.0 - f;
+                if f > 1e-300 { mts += f * f.ln(); }
+                if g > 1e-300 { mts += g * g.ln(); }
+            }
+            (den, ed, 2.0 * self.kT * mts)
+        } else {
+            // C_occ = eigenvectors[:, :n_occ]
+            let c_occ = self.eigenvectors.columns(0, n_occ).into_owned();
+
+            // D = 2 · C_occ · C_occᵀ
+            let density = &c_occ * c_occ.transpose() * 2.0;
+
+            // W = 2 · C_occ · diag(eps_occ) · C_occᵀ
+            // M5: use preallocated eps_occ
+            for k in 0..n_occ { self.eps_occ[k] = self.eigenvalues[k]; }
+            let mut ce = c_occ.clone();
+            for k in 0..n_occ {
+                let e = self.eps_occ[k];
+                for mu in 0..n {
+                    ce[(mu, k)] *= 2.0 * e;
+                }
+            }
+            (density, &ce * c_occ.transpose(), 0.0)
+        };
 
         // H_scc = H0 + ½(S·V + V·S) where V is diagonal in AO space.
         // (S·V)[mu,nu] = S[mu,nu] * V[nu]  (V diagonal, right multiply)
@@ -637,7 +709,7 @@ impl DftbCpu {
             e_scc += dq * self.v_shift[a];
         }
         e_scc *= 0.5;
-        let energy = e_h0 + e_scc;
+        let energy = e_h0 + e_scc + mermin_ts;   // Mermin free energy when smeared
 
         CpuSccResult {
             h0: self.h0.clone(),
@@ -651,6 +723,9 @@ impl DftbCpu {
             q0: self.q0.clone(),
             energy,
             n_iter: self.n_scc_iter,
+            mu: self.mu,
+            mermin_ts,
+            occ_w: self.occ_w.clone(),
         }
     }
 
@@ -665,6 +740,14 @@ impl DftbCpu {
     /// Reset charges to neutral (q0). Use for the first geometry or after a large jump.
     pub fn reset_charges(&mut self) {
         self.charges.copy_from_slice(&self.q0);
+    }
+
+    /// Fermi smearing kT in Hartree (0 = integer occupation). B2: the f64
+    /// CPU reference for the GPU smeared path — stabilizes SCC fixed points
+    /// the same way (fractional occupations contract the charge response).
+    pub fn set_smearing(&mut self, kt: f64) {
+        assert!(kt.is_finite() && kt >= 0.0, "set_smearing: kT={kt}");
+        self.kT = kt;
     }
 
     /// Switch to Broyden quasi-Newton mixing.

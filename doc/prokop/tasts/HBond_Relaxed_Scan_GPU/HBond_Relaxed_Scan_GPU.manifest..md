@@ -235,6 +235,9 @@ Source: `HBond_Relaxed_Scan_GPU.chat.md` lines 2355–2555. Full item list + FP3
 - **Never loosen a test to green; never let "stalled" read as "converged".** A red test localizes broken physics. If the solver misses its contract, fix the solver — or document the measured reason and keep the contract visible.
 - **Patience over shortcuts.** Do the cheap correct thing first (D1–D3 are ~hours of work and may remove the entire "floor"), verify on real molecules (AT/GC/azaindole, not 12×H2O), and record numbers in this manifest — not impressions.
 
+### 0.8 Current review after device-FIRE — read §13 before implementing
+
+**Dense solver only; notes-only review.** The earlier completion claims are withdrawn. First investigate stale W caused by the SCC activity mask, status-only retry merging, and the GPU FIRE kick/displacement mismatch. Then remove the remaining host allocations/readbacks and repeated work. Only afterwards tune the **production direct cyclic Jacobi** (not the deprecated block-Jacobi benchmark), including local-A/global-V storage and FP32 rotation A/B. Full evidence, acceptance checks, accuracy budget and handoff order: **§13**. No source-code changes or new benchmarks were performed by this review.
 
 ---
 
@@ -1995,3 +1998,172 @@ is the opposite tradeoff.
 5. Correct FIRE and move it to GPU (D12).
 
 Each improves accuracy *and* throughput — none is a tradeoff.
+
+## 13. Dense multi-solver review after device-FIRE — implementation notes, not a completion claim
+
+**Scope:** `GpuDftb` → `GpuSccPlan` → dense OpenCL kernels, including dense relaxation. No sparse work. Source review only in this pass; no solver edits, builds, new benchmarks, or attribution of a measured speedup. Line ranges below refer to the reviewed working tree and may move. This section supersedes earlier D13 claims that the architecture/integrator were verified and that divergent runs were explained by atomic noise.
+
+### 13.1 Verdict and what to retain
+
+**Keep the architecture; repair its state contracts before tuning arithmetic.** Persistent buffers/kernels, batched GPU assembly, device positions/velocities/forces, analytic derivatives, FP32 matrices, fractional occupations, and warm AO-basis reuse are the right foundation. A wholesale eigensolver rewrite or a mega-kernel is not the next step.
+
+However, the current dense path is neither certified correct nor allocation-/synchronization-free. The strongest finding is stale energy-weighted density on early-converged replicas. This is a concrete implementation defect, not a speculative FP32 limitation. A single-replica equilibrium calculation cannot exercise it.
+
+Historical observations must be interpreted narrowly:
+
+- Equilibrium GC reached `max|F|≈9.96e-4 Ha/Å` with CPU energy/force agreement at its final geometry. This supports that single configuration, not the correctness of the integration scheme or mixed-convergence batching.
+- `diag_fire_ab.rhai:53–68` measures distance error only **after** 30 steps. The reported `~1.3–1.6e-7 Å` is an endpoint check across 19 replicas, not verification at every step.
+- The 3.2 s scan still ended with `max|F|≈0.238 Ha/Å`, versus requested `1e-3`; it was not a converged relaxed PES. Other runs failed SCC. None is a production success-time benchmark.
+- The claim that different runs are explained by atomic summation/chaos was not demonstrated. The source defects below can amplify small timing/numerical differences into qualitatively wrong forces. Do not tune dt or smearing to hide them.
+- N20 is the intended acceptor in `debug/hbond_constraint/gc_atoms.png`; `2.916−1.9≈1.016 Å` between H13 and N20 is a possible covalent N–H distance after transfer, not by itself evidence of an unphysical clash.
+
+### 13.2 P0 — first implementation tickets
+
+#### R1. Separate SCC activity from force-state validity; W is currently stale
+
+**Source:** `gpu_scc_plan.rs:399–407,1338–1349`; `gpu_matrix_ops.cl:1038–1056`; `gpu_dftb.rs:738–759,864–899,989–995`.
+
+`k_density` is permanently bound to the SCC `active` buffer. `build_edm()` changes its output to W and `use_eig=1`, but leaves that mask unchanged. After SCC, replicas which converged before the last iteration have `active=0`. Cached-state force evaluation skips `finalize()`, then `build_edm()` skips those replicas. W is therefore left from an older geometry/electronic state, or remains zero after initialization. The other force kernels still run for them and use current D with wrong W in the Pulay term.
+
+The last iteration's active replicas differ from earlier-converged ones because the all-done SCC exit occurs before uploading the final mask. This makes the bug depend on convergence ordering. Batch=1 largely evades it. An extra SCC/eval call is not a valid fix.
+
+**Required invariant:** for every replica allowed to move, H/S/C/occupations/D/W/charges refer to the same geometry and electronic-state version. The SCC iteration mask and the force-evaluation mask are different concepts.
+
+**Smallest fix direction:** bind an appropriate force-valid/all-requested mask for EDM construction and restore the SCC binding afterwards, or retain separate persistent D/W kernel handles. Do not re-diagonalize all systems merely to reset the mask. Failed electronic states must remain invalid, not be made valid by an all-ones mask. Add per-replica validity/version information without extra N² readbacks.
+
+**Acceptance:** force a heterogeneous batch to converge at different SCC iterations; compare W against `2 C diag(f·rho) Cᵀ` and forces against independently evaluated replicas at the same coordinates. Test first-force W initialization, `scc→forces`, `scc→eval(false)→forces`, and batch permutation. Diagnose the first bad W/force before running another long trajectory. Whether R1 explains all past divergence remains untested.
+
+#### R2. Retry must restore physical state, not only a better status label
+
+**Source:** `gpu_dftb.rs:614–648,738–807,1082–1096`.
+
+`scc()` seeds failed replicas from the nearest **array index**, reruns the entire batch, then retains the better old/new status. It does not restore the old C/D/q/V/occupations when retaining the old status. A previously converged replica can be reported converged, and `scc_ok=true`, while its actual buffers contain the failed retry state. Geometry similarity cannot be inferred from batch index in a general multi-solver; results should not depend on replica ordering.
+
+At the iteration cap, `scc_mix()` can also commit a next charge iterate that has not been solved and set `state_fresh=false`; the reported RMS describes the preceding solve. `finalize()` performs one electronic map evaluation, not an SCC convergence certification. `relax()` returns initial `scc0.rms`, combines pre-move maximum force with post-move energy, and does not return a distinct exhausted/failed relaxation result. A parked failed replica is not a converged replica.
+
+**Direction:** retain accepted states; retry only explicitly failed replicas within one declared total work budget, if recovery is enabled. Do not merge status without the corresponding snapshot/state. Remove implicit cross-replica continuation from the default independent solver; if scientifically wanted, make it an explicit scan policy using geometry/coordinate metadata and record branch selection. An uncertified state must not move or enter a reported PES. Numerical plateau acceptance needs an explicit force/energy error budget, not merely `status != Failed`.
+
+**Acceptance:** synthetic retry where an originally valid replica would fail on reevaluation; verify its state remains unchanged. Check exhausted SCC and relaxation report final residuals and a non-success result. Batch permutation must preserve independent solutions, within the declared numerical tolerance.
+
+#### R3. Define and verify one FIRE discretization; current GPU update adds acceleration twice
+
+**Source:** `gpu_forces.cl:1105–1114`; `gpu_dftb.rs:981–982`; `examples/hbond_ref.rs:263–292`.
+
+GPU first computes `v_new = v_mix + F·dt`, then `dx = v_new·dt + 0.5 F·dt²`. With zero old velocity and inactive caps this is `dx=1.5 F·dt²`. The cited CPU optimizer uses `dx=v_new·dt` after the kick. The GPU code therefore does not match that reference or the stated kick–drift ordering. Successful minimization of one molecule does not establish a correct integration formula.
+
+**Recommended minimum:** retain the existing documented semi-implicit kick–drift FIRE convention and make the device step match it, with an independently checked scalar reference. Do not insert an additional half-acceleration term. Alternatively choose a fully specified Verlet FIRE variant, including force time levels and half-kicks; do not mix formulas. FIRE is an optimizer, so equal fictitious masses are acceptable; it is not automatically physical MD.
+
+**Acceptance:** one-step constant-force algebra; harmonic/quadratic relaxation; positive/negative-power branches; reset, parking/resume, frozen DOFs and constraints; compare x/v/dt/alpha/counter state, not just final energy. Plain FIRE need not decrease energy every step, but the relaxation must settle with bounded transients. Do not demand artificial monotonicity or fix instability by increasing the iteration cap. `md_step` remains a separate, uncertified MD interface.
+
+#### R4. Projection/finiteness contracts are incomplete
+
+**Source:** `gpu_forces.cl:969–1042,1070–1145`; `gpu_dftb.rs:907–970,999–1030`.
+
+- Frozen atoms are excluded from `maxF`, but **not** from P, v² or F² in `fire_reduce`. Even with zero frozen velocity, the frozen force incorrectly changes the FIRE mixing denominator.
+- With one frozen constraint endpoint, projecting `(F_j−F_i)·u` is wrong: the reaction force on the immobile endpoint must not drive the mobile endpoint. Let mobility `m_i,m_j∈{0,1}` and use `lambda = (m_j F_j−m_i F_i)·u/(m_i+m_j)`, then `F_i_eff=m_i(F_i+lambda u)`, `F_j_eff=m_j(F_j−lambda u)`. For both mobile atoms this reduces to the existing equal/opposite half correction. Use the same admissible DOFs for norms, power and convergence.
+- `set_constraint` does not validate finite positive targets after f64→f32 conversion. Later `set_frozen_atoms` can make an existing pair immobile. Coincident endpoints are silently skipped. These are invalid-input/constraint failures, not numerical floors.
+- Initial coordinates need projection/validation before the first constrained force and convergence check. Otherwise a small force can park a replica with the wrong distance. Projection after the displacement cap can enlarge the actual displacement; certify the **final** move and tangent velocity.
+- FIRE reductions are f32; casting P to host f64 does not recover cancellation already lost. Only P/maxF are checked, not v²/F². Use finite flags and accurate small reductions for decision quantities. Avoid `fmax` concealing NaNs.
+- `set_smearing` changes the occupation/free-energy model without invalidating `state_fresh` or SCC validity. All physics-changing settings must invalidate the corresponding caches.
+
+**Acceptance:** all-mobile, one-frozen and both-frozen constraints; zero distance, NaN/Inf/negative target; freezing after constraint setup; nonzero frozen input velocity; rotation of the molecular coordinates; zero force with unsatisfied constraint. Check distance and tangent-velocity residuals at every diagnostic step, not just at the endpoint. Keep these checks device-side/compact in production.
+
+#### R5. The production Jacobi contract differs from the old tested solver
+
+**Source:** `gpu_scc_plan.rs:83–103,1474–1505`; `gpu_tiled_jacobi.cl:126–308`; `tests/gpu_tiled_jacobi.rs:188–249`.
+
+Production N>64 uses **direct `jacobi_cyclic_global_batched`**, not the deprecated `tiled_jacobi_batched`. The existing `jacobi_prec_bench` explicitly launches the deprecated kernel. Its precision timings/residuals cannot justify the current production default or a future precision change.
+
+- `RUST_DFTB_JACOBI_SWEEPS` replaces `MAX_SWEEPS`; the direct kernel uses **`MAX_CSWEEPS=40`**. That knob does not control production direct-Jacobi sweeps.
+- `rot_*[128]` supports at most 128 pairs, i.e. N≤256. No constructor guard was found for the direct path. The header's larger-N claims do not apply; striding work-items does not enlarge scratch arrays. Reject unsupported N until a size-safe route is deliberately implemented.
+- Stagnation/exhaustion stop reasons and achieved residual are not returned. Remaining off-diagonals are zeroed unconditionally. This destroys the easiest diagnostic; zero output off-diagonals are not evidence of diagonalization.
+- Zero pivots need an explicit no-rotation case: strict `abs(apq)<eps*(abs(app)+abs(aqq))` is false for all-zero entries. A matrix with a zero subblock and nonzero off-diagonals elsewhere can reach `tau=0/0`.
+- Independently check symmetry, relative eigen residual and `CᵀSC−I`; normalizing column lengths alone does not enforce mutual orthogonality. Cold normalization currently uses the integer occupation mask even when fractional occupations use all columns.
+- Metric reduction uses `fmax` without an explicit nonfinite flag (`gpu_matrix_ops.cl:1838–1862`), so a NaN matrix entry can be hidden. `repair_lowdin_gpu` returns a batch aggregate chosen by whether **any** replica accepted, instead of the maximum of each replica's actually retained defect. The post-cold repair's returned defect is not certified by the caller. Track acceptance and residual per replica; distinguish max-entry norm from the induced infinity norm.
+
+**Acceptance:** exercise the actual direct kernel on zero/diagonal, repeated and clustered eigenvalues, symmetric indefinite matrices, odd N and padding, N=64/65/86/87/128/256 and rejection beyond capacity; then generalized eigenproblems and finite-temperature D/W. Measure residual against the original matrix, not its overwritten diagonal. Warm basis quality must be checked in the S metric. A monotone metric-defect improvement alone is not a proof of the Newton convergence domain; use a valid norm/spectral bound when far from identity.
+
+### 13.3 P1 — remove work and synchronization before changing numerical accuracy
+
+#### R6. Finish the persistent hot path
+
+Concrete remaining costs:
+
+- `GpuDftb::scc_mix:673–686,769–806`: allocates history/flags, host-DIIS scratch even in GPU mode, statuses and formatted strings per solve. `scc:620–647` adds retry buffers and collections. `reset_diis:1153–1160` allocates and uploads zero arrays every geometry step. Retain capacity/state; reset in place/device fills; gate diagnostics before constructing strings.
+- `energy_from_state:1219–1263`: reads eig_diag, rho, mask, two dot arrays and repulsive energies separately, allocates outputs, computes entropy on host. `eval` adds two charge-array reads. `relax` calls this every step even if only a progress message needs E[0]. Produce one compact per-replica diagnostic record; keep the small final arithmetic accurate. Public allocating convenience APIs can remain, but must not be the implementation of the inner loop.
+- `GpuRuntime::read_buffer:164–168` ends every read with `queue.finish()`. Audit ocl's blocking semantics before removing redundant waits. Use one deliberate synchronization boundary per needed host decision, not one per field. The production queue currently has no profiling flag (`gpu_runtime.rs:55`); add opt-in event profiling during initialization, not in the loop.
+- `repair_basis_c` performs five GEMMs, three scalar/elementwise kernels and an accept kernel even when the old basis already satisfies tolerance. It reads two arrays for each attempt. Certify retained state, skip unnecessary correction work, combine status reads, and avoid repeating the old Gram products after a just-certified new Gram. Do not skip necessary overlap repair on moving geometries.
+- `b_warm` is one batch-wide Boolean; one failed repair makes **all** replicas cold. Keep valid warm states and a per-replica cold/repair mask; do not rebuild X for successful replicas. General GEMMs currently lack SCC activity gating. Add a uniform per-system gate or compact index list, without allowing stale products to be consumed downstream.
+- `assemble` re-enqueues constant onsite diagonals each geometry. Parked geometries, gamma, repulsion, and fixed pair metadata should not be recomputed merely because another replica moved. Keep dirty/active meanings separate. Derivative tables and Coulomb ranges must remain physically consistent; do not cut long-range gamma to save work.
+
+**Acceptance:** allocation and OpenCL-object-creation counters flat after warmup across `scc→force→FIRE→geometry`; trace launches/bytes/waits for the complete loop, not only `fire_apply`. Preserve numerical output and all fail-loud statuses. `fire_dt/alpha/n_pos` currently live on the **host**; only their control packet is uploaded. That is compatible with host f64 decisions and need not be moved just to claim everything is device-resident.
+
+#### R7. Smearing: keep the physics, remove unnecessary work
+
+`occupation:1035–1068` runs integer sorting, then copies every spectrum to the host and performs **80 serial f64 bisections per replica**, including inactive replicas. For 1,000 replicas × 86 orbitals that is 6.88 million exponential evaluations per SCC iteration. This is a source operation count, not a measured timing. The integer sort is not needed for full Fermi-weighted D/W, except where current diagnostics/normalization still rely on that mask.
+
+First, within the current host-f64-decision rule: reuse brackets/previous chemical potentials with verified bracketing; skip inactive replicas; stop by electron-count and chemical-potential resolution rather than 80 unconditional iterations; use bounded safeguarded Newton/bisection and certify the **uploaded f32 weights**. Keep `0≤f≤1`, `2Σf=N_e`, finite spectrum and a fixed kT. If host work dominates large batches, process independent μ solves in a bounded persistent worker pool rather than serially. Do not add a PCIe round trip per bisection.
+
+A device-resident batched Fermi solve is a later explicit policy decision: it removes the mid-SCC host dependency, but moving branch/occupation decisions to the GPU is an exception to the current host-f64 rule and requires approval. Do not replace the serial host loop with a serial FP64-exp loop on a single GPU lane and assume it is faster.
+
+At finite temperature compare **Mermin free energy**, consistent forces, weighted D/W and total electron count, not integer-projector idempotency. `measure:1149–1185` still contains integer-mask sums and `D−2C_occ C_occᵀ`; these diagnostics are not a valid finite-temperature decomposition. Label unused lazy X/old C′ as stale rather than treating their defects as current solver failures. kT=0.002 Ha is about **632 K**, a physical/modeling choice—not an accuracy tolerance to increase whenever SCC struggles. Quantify kT sensitivity separately on identical geometries.
+
+#### R8. Fuse force contractions and use deterministic ownership where worthwhile
+
+`force_pairs` and `force_pairs_scc_shift` independently load/interpolate S and construct its derivatives. Fuse their contraction:
+
+`D*dH0 + (0.5*(V_i+V_j)*D − W)*dS`
+
+with the existing sign, factor-of-two and Bohr/Å conversion. Keep analytic derivatives and the same splines. Contract small orbital blocks as they are formed to limit private-array/register pressure; do not materialize derivatives for every pair unless profiling proves that memory trade beneficial.
+
+Prefer a preallocated pair-force buffer plus signed atom-owned gather: one evaluation per pair, fixed accumulation order, no contended float CAS updates. Static template adjacency makes this simple. It removes a source of nondeterminism and makes force parity easier; it does **not** prove that atomics caused the past failures. Benchmark against current atomics, since an extra gather launch/traffic is not free. Gamma and repulsive force contributions need the same ownership discipline for the complete force to be repeatable. Fuse energy/derivative spline evaluation where they share geometry and retain per-geometry repulsion.
+
+**Local-memory issue outside Jacobi:** `force_pairs` and `assemble_pairs` reserve two `512*5` float SK arrays = **20 KiB per workgroup**, even for smaller channel counts. Each group copies the whole live table before checking whether its pair is out of range. Compare compact per-species/channel specialization with direct cached-global four-knot loads, or a smaller shared tile. Do not shrink/interpolate away the physical SK table merely to fit local memory. Check actual kernel local/private allocation and spills.
+
+### 13.4 P2 — hardware-aware dense eigensolver tuning
+
+#### Preferred next experiment: direct Jacobi with only A in local memory
+
+The actual production direct kernel uses roughly 4 KiB of rotation/reduction scratch in mode 1; A and V are global. Its cost is repeated round-robin movement/updates of both matrices and barriers, not the deprecated compound-pivot/strip workspace. For a cold full sweep with most rotations active, logical A/V load+store traffic is of order `16*N²*(N_even−1)` bytes per replica; caches can serve much of it, so this is not a DRAM bandwidth measurement.
+
+At N=86–87:
+
+- Two unpadded FP32 matrices alone require **59,168–60,552 bytes**, exceeding a 48 KiB local budget before scratch.
+- One requires **29,584–30,276 bytes**. A plus current rotation/reduction scratch is roughly 33–35 KiB including modest padding: feasible under that budget.
+- Therefore compare **A local, V global**, preserving the direct cyclic schedule and unique ownership of each 2×2 update. Load/store A once per solve; leave V in global memory initially. This is a storage specialization, not a new physical algorithm. Do not add more simultaneous whole-matrix locals.
+
+Query the device's actual local-memory limit, kernel maximum WG size, preferred multiple, compiled local/private memory and spills; 48 KiB is a design example, not an asserted universal RTX/OpenCL limit. Benchmark WG=64/128/256 with correct reductions/array specialization. Lower global traffic can be offset by fewer resident WGs or bank conflicts. At larger N, use the size-safe global/tiled path selected **at initialization and reported explicitly**; no silent CPU/slow-path escape. A configured unsupported size should fail before launching.
+
+Retain the existing N≤64 full-local route until measurements justify extending/changing its threshold. Do not resurrect the old nested 20-inner-sweep block-Jacobi solely because it is called tiled; it has a very different barrier cost. Consider block methods or alternate dense factorizations only if the repaired direct/local-A variants miss measured scaling goals.
+
+#### Precision: FP32 bulk, accurate reductions, enforce the metric
+
+1. Keep H/S/C/D/W, force arrays, Jacobi updates and GEMMs FP32. Keep FP64 for small cancellation-sensitive reductions, DIIS Gram/small solves, and host decisions. Final addition in f64 does not repair a dot product already rounded in f32 (`dot_batched`, repulsive reduction and FIRE statistics currently do this).
+2. Test production direct-Jacobi modes 0/1/2 on **identical frozen matrices**, both cold and warm. Mode 2 is a diagnostic reference, not a consumer-GPU default. Mode 0 is attractive but must earn acceptance on eigen residual, full metric, charge, free energy and forces—not simply small off-diagonals. Use scaled/hypot-safe rotation formulas and exact zero-pivot handling. Renormalizing columns does not repair all orthogonality loss; a precision demotion can change the rotation itself, not just its norm.
+3. `batched_gemm:120–156` still uses a serial Kahan recurrence for every K contribution, unlike the four-FMA-accumulator density kernel. Compare FP32 FMA with a few independent accumulators and balanced combine; if needed compensate the final partial sums rather than every multiply. Keep the Kahan baseline for diagnostics. Ensure beta=0 does not unnecessarily read/propagate an old NaN output. Transpose-specific/coalesced loading and small register output tiles come before exotic arithmetic.
+4. Reuse C-based warm solves, but certify `G=CᵀSC≈I`, including off-diagonals. State the norm and measured floor. Repair only when needed and accept only a certified state; if columns are mixed, re-solve the projected Hamiltonian and recompute occupations/D/W consistently. S normalization and Rayleigh kernels both recalculate SC, and Rayleigh calculates HC every SCC iteration. First share products/fuse compatible work; consider deferring Rayleigh/W work until accepted electronics, rather than removing checks blindly.
+5. Recenter independent replicas in host f64 before f32 upload and retain origin offsets for export. Large absolute coordinates must not destroy small bond vectors. Quantify error by rotation/translation tests; do not change molecular geometry to improve numerical appearances.
+
+#### Parallelism: batch many real systems, not one giant kernel
+
+Use one persistent homogeneous template batch and a **sequence of batched kernels**. One kernel launch for all geometries per stage is the goal; one launch for the entire SCC/FIRE algorithm is not. One-WG-per-system Jacobi with batch=19 supplies only 19 WGs, insufficient for full-device utilization on this GPU. Test real batches 1/19/128/512/1024 (within capacity), report throughput and latency separately; do not extrapolate single-batch latency to 1,000 replicas.
+
+Use cheap uniform activity masks first. If long tails leave few active systems, compact **indices**, not all matrix buffers, into preallocated lists; schedule additional independent jobs when available. Never infer physical neighbors from packed batch position. Keep trajectory identity, accepted state, warm basis and convergence flags attached to each replica. Avoid creating a separate context/engine per scan point.
+
+### 13.5 Handoff order and acceptance budget
+
+**Implement one ticket at a time:**
+
+1. R1 W/mask regression and correction. This is the highest-value first task.
+2. R2 state/retry/termination honesty, R3 FIRE ordering and R4 projection checks. No long production scans until these pass.
+3. R5 production-kernel diagnostics/capacity guards, plus weighted finite-temperature `measure`. Establish a reproducible fixed-geometry baseline.
+4. R6 persistent scratch, compact diagnostics, per-replica dirty/activity handling; R7 bounded smearing and R8 force fusion/ownership. These remove work without sacrificing physical accuracy.
+5. Profile the repaired path; then one local-A/WG experiment and one direct-Jacobi precision A/B. Do not change storage, arithmetic, SCC tolerance and FIRE parameters simultaneously.
+
+**Accuracy budget to confirm with USER:** retain existing scientific contracts; do not weaken them. As a useful proposed target for these small molecules, aim at relative free-energy differences within `1e-5 Ha` (~0.27 meV), analytic forces within `1e-5 Ha/Å` of matched reference, and constrained optimization `max|F_tangent|≤1e-3 Ha/Å`. These are acceptance targets, not newly measured floors. SCC `1e-5` charge RMS alone does not imply any of them. Tighten only where a matched-reference/error decomposition demonstrates the need and reachability. Measure directional energy derivatives over several displacement sizes to separate truncation, FP32 cancellation and unconverged-SCC error.
+
+**Minimal diagnostic matrix:** GC/AT/azaindole plus the smaller formic case; equilibrium and representative transfer geometries; both identical and heterogeneous batches; cold/warm solves; controlled failed/early-converged replicas; same kT, SK interpolation and constraints in the CPU f64/Fortran references. No molecule-specific branch or scenario changes to pass. Full L0 numerical tests, L1 unfiltered logs, and L2 scan/trajectory visuals remain distinct acceptance levels.
+
+**Timing record:** production kernel names/build options, actual device, local/private bytes, launch counts, host allocations, transfer bytes and waits, per-stage event times, wall time, SCC/FIRE iteration distributions, warm-repair/cold counts, and final per-replica residual/status. Time initialization/JIT separately. `diag_step_cost.rhai:17–22` currently makes five geometry moves with no intervening SCC: it is not a valid BOMD/relaxation benchmark. Replace its *measurement protocol* with certified fixed-state force timings and complete SCC+FIRE steps. Report total wall time to accepted results, including declared recovery, with success/failure counts—not the fastest failed scan or only kernel FLOP/s.
+
+**Defer:** wholesale FP64, FP16/TF32/tensor-core approximations, partial-eigenspace truncation under smearing, molecule-specific damping, blanket extra SCC/Jacobi/FIRE iterations, and a monolithic persistent mega-kernel. None addresses the demonstrated stale-state defects. The fastest credible route is eliminating wrong/redundant work, exploiting batch parallelism, then using local memory and precision selectively.

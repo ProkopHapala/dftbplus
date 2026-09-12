@@ -122,7 +122,25 @@ pub struct GpuDftb {
     #[allow(dead_code)]
     u_per_atom: Vec<f64>,
     coords: Vec<[f64; 3]>,
-    fire_v: Vec<[f64; 3]>,
+    // ── D13: device-resident FIRE ── x lives in buf_coords_ang/_bohr (written
+    // in place by fire_apply_batched); v, per-replica stat/ctl and the frozen
+    // mask are device buffers. Host only makes the f64 adaptivity decisions.
+    v_dev: Buffer<f32>,           // [batch*3n] velocities
+    fire_stat: Buffer<f32>,       // [batch*4] {P=F·v, v², F², maxF(unfrozen)}
+    fire_ctl: Buffer<f32>,        // [batch*4] {dt, alpha, mode, _}
+    frozen_dev: Buffer<i32>,      // [n_atoms] freeze mask (same all replicas)
+    constr_d: Buffer<f32>,        // [batch] distance-constraint targets (Å)
+    k_fire_reduce: Kernel,
+    k_fire_apply: Kernel,
+    fire_stat_h: Vec<f32>,        // [batch*4] persistent host scratch
+    fire_ctl_h: Vec<f32>,         // [batch*4] persistent host scratch
+    /// Distance constraint |x_j − x_i| = constr_d[b] per replica (None = off).
+    constr: Option<(usize, usize)>,
+    /// Device x is authoritative: assemble() skips the host coord upload.
+    coords_on_device: bool,
+    /// Device x newer than host `coords` — sync before host-side use.
+    coords_dirty: bool,
+    fire_v: Vec<[f64; 3]>,        // host mirror of v_dev (md_step only)
     // D12: per-replica FIRE state — batched systems adapt independently.
     fire_dt: Vec<f64>,
     fire_alpha: Vec<f64>,
@@ -137,6 +155,11 @@ pub struct GpuDftb {
     /// the replica's max|F| convergence test (their force is the constraint
     /// reaction force, not an optimizable one).
     frozen: Vec<bool>,
+    /// Device electronic state (h_scc, dq, v, eig, cp, c, d, q_new) is
+    /// consistent with q_gpu — i.e. `eval` may skip `finalize` (a redundant
+    /// eigensolve). Set by scc_mix loop exit / finalize; cleared by
+    /// set_coords and any write to q_gpu.
+    state_fresh: bool,
 
     // Host scratch (per-geometry / per-force; never reallocated)
     scratch_ang: Vec<f32>,
@@ -328,6 +351,32 @@ impl GpuDftb {
             .arg(n_species).arg(&buf_rep_data).arg(&buf_forces)
             .build().map_err(map_ocl_err)?;
 
+        // ── D13: device-resident FIRE — all state allocated once here. ──
+        let v_dev = rt.zero_buffer::<f32>(3 * batch * n_atoms)?;
+        let fire_stat = rt.zero_buffer::<f32>(4 * batch)?;
+        let fire_ctl = rt.zero_buffer::<f32>(4 * batch)?;
+        let frozen_dev = rt.zero_buffer::<i32>(n_atoms)?;
+        let constr_d = rt.zero_buffer::<f32>(batch)?;
+        let k_fire_reduce = Kernel::builder()
+            .program(&force).name("fire_reduce_batched").queue(rt.queue().clone())
+            .global_work_size(batch * 256).local_work_size(256)
+            .arg(n_atoms as i32)
+            .arg(&buf_forces).arg(&v_dev).arg(&buf_coords_ang).arg(&frozen_dev)
+            .arg(0i32).arg(0i32).arg(0i32)          // c_on, ci, cj — set_constraint
+            .arg(&fire_stat)
+            .build().map_err(map_ocl_err)?;
+        let k_fire_apply = Kernel::builder()
+            .program(&force).name("fire_apply_batched").queue(rt.queue().clone())
+            .global_work_size(batch * 256).local_work_size(256)
+            .arg(n_atoms as i32)
+            .arg(&v_dev).arg(&buf_forces)
+            .arg(&buf_coords_ang).arg(&buf_coords_bohr)
+            .arg(&frozen_dev).arg(&fire_ctl).arg(&fire_stat)
+            .arg(0i32).arg(0i32).arg(0i32)          // c_on, ci, cj — set by set_constraint
+            .arg(&constr_d)
+            .arg(2.0f32).arg(0.1f32)              // vmax, dmax (disp cap Å)
+            .build().map_err(map_ocl_err)?;
+
         let atom_sp: Vec<i32> = gpu_batch.atom_species[..n_atoms].to_vec();
         let mut pair_buckets = gpu_batch.pair_buckets.clone();
         ensure_template_pair_buckets(&mut pair_buckets, &tmpl, &atom_sp, &gpu_batch.sk_tables, unique.len())?;
@@ -440,10 +489,18 @@ impl GpuDftb {
             gamma_spl, buf_gamma_spl,
             k_onsite, k_gamma_f, k_gamma_build, k_rep_force, buckets, q0,
             u_per_atom, coords,
+            v_dev, fire_stat, fire_ctl, frozen_dev, constr_d,
+            k_fire_reduce, k_fire_apply,
+            fire_stat_h: vec![0.0; 4 * batch],
+            fire_ctl_h: vec![0.0; 4 * batch],
+            constr: None,
+            coords_on_device: false,
+            coords_dirty: false,
             fire_v: vec![[0.0; 3]; batch * n_atoms],
             fire_dt: vec![1.0; batch], fire_alpha: vec![0.1; batch], fire_n_pos: vec![0; batch],
             scc_ok: vec![true; batch],
             frozen: vec![false; n_atoms],
+            state_fresh: false,
             scratch_ang: coords_ang,
             scratch_bohr: coords_bohr.clone(),
             scratch_f: vec![0.0; 3 * batch * n_atoms],
@@ -459,6 +516,10 @@ impl GpuDftb {
         };
         eng.plan.set_repulsive_splines(&mut eng.rt, &coords_bohr, &gpu_batch.atom_species, &rep_off, &rep_data, unique.len(), max_int)
             .map_err(|e| DftbError::InvalidInput(format!("GpuDftb set_repulsive_splines: {e}")))?;
+        // D13: repulsive energy reads the shared coords_bohr buffer — no
+        // per-geometry rep_coords upload (set_repulsive_coords retired).
+        eng.plan.bind_rep_energy_coords(&eng.buf_coords_bohr)
+            .map_err(|e| DftbError::InvalidInput(format!("GpuDftb bind_rep_energy_coords: {e}")))?;
         eng.assemble()
             .map_err(|e| DftbError::InvalidInput(format!("GpuDftb initial assemble: {e}")))?;
         eng.plan.set_geometry(&mut eng.rt, &eng.buf_s)
@@ -474,6 +535,8 @@ impl GpuDftb {
     pub fn n_atoms(&self) -> usize { self.n_atoms }
     pub fn n_occ(&self) -> usize { self.n_occ }
     pub fn batch(&self) -> usize { self.batch }
+    /// Host copy of positions — after device-FIRE steps call
+    /// `sync_coords_to_host()` first (this getter is &self and cannot sync).
     pub fn coords(&self) -> &[[f64; 3]] { &self.coords }
 
     /// Per-geometry update (D7): uploads coords, then everything else is
@@ -487,9 +550,25 @@ impl GpuDftb {
             )));
         }
         self.coords.copy_from_slice(coords);
+        self.coords_on_device = false;   // host path uploads coords
+        self.coords_dirty = false;
         self.assemble()?;
         self.plan.set_geometry(&mut self.rt, &self.buf_s)?;
         self.plan.reset_diis(&self.rt)?;
+        self.state_fresh = false;
+        Ok(())
+    }
+
+    /// Host copy of positions may lag the device after device-FIRE steps —
+    /// sync before any host-side use (cpu_ref, measure, coords()).
+    pub fn sync_coords_to_host(&mut self) -> Result<()> {
+        if self.coords_dirty {
+            self.rt.read_buffer(&self.buf_coords_ang, &mut self.scratch_ang)?;
+            for i in 0..self.coords.len() {
+                for c in 0..3 { self.coords[i][c] = self.scratch_ang[3 * i + c] as f64; }
+            }
+            self.coords_dirty = false;
+        }
         Ok(())
     }
 
@@ -504,11 +583,13 @@ impl GpuDftb {
     /// onsite_diagonal / the persistent S=I. V_asm stays zero (zeroed at
     /// `new`; the SCC shift path uses plan buffers, not this one).
     fn assemble(&mut self) -> Result<()> {
-        fill_coord_scratch(&self.coords, &mut self.scratch_ang, &mut self.scratch_bohr);
-        self.rt.write_buffer(&self.buf_coords_ang, &self.scratch_ang)
-            .map_err(|e| DftbError::InvalidInput(format!("write coords_ang: {e}")))?;
-        self.rt.write_buffer(&self.buf_coords_bohr, &self.scratch_bohr)
-            .map_err(|e| DftbError::InvalidInput(format!("write coords_bohr: {e}")))?;
+        if !self.coords_on_device {
+            fill_coord_scratch(&self.coords, &mut self.scratch_ang, &mut self.scratch_bohr);
+            self.rt.write_buffer(&self.buf_coords_ang, &self.scratch_ang)
+                .map_err(|e| DftbError::InvalidInput(format!("write coords_ang: {e}")))?;
+            self.rt.write_buffer(&self.buf_coords_bohr, &self.scratch_bohr)
+                .map_err(|e| DftbError::InvalidInput(format!("write coords_bohr: {e}")))?;
+        }
         unsafe { self.k_gamma_build.enq().map_err(|e| DftbError::InvalidInput(format!("build_gamma: {e}")))?; }
         for (i, slot) in self.buckets.iter().enumerate() {
             if slot.n_live == 0 { continue; }
@@ -519,7 +600,7 @@ impl GpuDftb {
             if slot.n_live == 0 { continue; }
             unsafe { slot.k_assemble.enq().map_err(|e| DftbError::InvalidInput(format!("assemble_pairs bucket {i}: {e}")))?; }
         }
-        self.plan.set_repulsive_coords(&self.rt, &self.scratch_bohr)?;
+        // repulsive energy kernel bound to buf_coords_bohr at new() — no upload.
         Ok(())
     }
 
@@ -569,6 +650,7 @@ impl GpuDftb {
 
     pub fn reset_q0(&mut self) -> Result<()> {
         self.plan.reset_diis(&self.rt)?;
+        self.state_fresh = false;
         self.plan.set_initial_charges(&self.rt, &self.q0)
     }
 
@@ -582,7 +664,9 @@ impl GpuDftb {
         // everyone, and "plateau" was declared for ANY stagnant residual
         // (rms=0.2 counted as plateau — that's divergence, not a floor).
         // Plateau = iterate stopped moving AND residual near the f32 floor.
-        const PLATEAU_FLOOR: f32 = 5e-4;   // measured floor ~1e-6..1e-5; above this, stagnant = failed
+        // Plateau acceptance floor: stagnant replicas below max(3·tol, 2e-5)
+        // are reported Plateau, not Failed (measured f32 floor ~1e-6..1e-5).
+        let plateau_floor = (3.0 * rms_tol).max(2e-5f32);
         let mut rms = f32::INFINITY;
         let mut n_iters = 0;
         // per-replica ring of last-10 rms + done flags
@@ -602,6 +686,12 @@ impl GpuDftb {
         let mut q_f32 = vec![0.0f32; self.n_atoms];
         let cap = max_iter;
         eprintln!("[GpuDftb] scc_mix mix={mix} (0=GPU DIIS hist={}, 1=GPU simple, 2=host f64 DIIS hist={}) max_iter={max_iter} rms_tol={rms_tol:.3e}", self.plan.diis_max_hist, self.n_atoms.min(10));
+        // Commit-model SCC: mixers write q_next; q_gpu is only advanced for
+        // replicas still active. On exit the device state (C,D,H_scc,Δq,V)
+        // corresponds to q_gpu exactly → eval() can skip re-diagonalizing.
+        self.state_fresh = false;
+        for f in self.plan.active_host.iter_mut() { *f = 1; }
+        self.plan.set_active(&self.rt)?;
         for it in 0..cap {
             n_iters = it + 1;
             rms = match mix {
@@ -638,34 +728,41 @@ impl GpuDftb {
                         }
                         q_f32[a] = q_in[a] as f32;
                     }
-                    self.plan.set_initial_charges(&self.rt, &q_f32)?;
+                    // commit model: write the mixed iterate to q_next; the
+                    // shared commit below moves it into q_gpu iff active.
+                    self.plan.q_next.write(&q_f32).enq().map_err(map_ocl_err)?;
                     r as f32
                 }
                 other => return Err(DftbError::InvalidInput(format!("scc_mix: mix={other} not 0/1/2"))),
             };
+            // State now consistent with q_gpu (q_next not yet committed).
+            self.state_fresh = true;
             // per-replica convergence: done when r<tol, stagnant when the
             // last-10 window stops moving (status decided by floor at end)
             for b in 0..self.batch {
                 if done[b] { continue; }
                 let r_b = if mix == 2 { rms } else { self.plan.rms_host.get(b).copied().unwrap_or(rms) };
                 hist[b][n_iters % 10] = r_b;
-                if r_b < rms_tol { done[b] = true; n_active -= 1; continue; }
-                if !r_b.is_finite() { done[b] = true; n_active -= 1; continue; }  // Failed — stop iterating it
+                if r_b < rms_tol { done[b] = true; self.plan.active_host[b] = 0; n_active -= 1; continue; }
+                if !r_b.is_finite() { done[b] = true; self.plan.active_host[b] = 0; n_active -= 1; continue; }  // Failed — stop iterating it
                 if n_iters >= 25 {
                     let (mut rmin, mut rmax) = (f32::INFINITY, 0.0f32);
                     for &r in &hist[b] { rmin = rmin.min(r); rmax = rmax.max(r); }
-                    if rmax < 4.0 * rmin { done[b] = true; stagnant[b] = true; n_active -= 1; }
+                    if rmax < 4.0 * rmin { done[b] = true; stagnant[b] = true; self.plan.active_host[b] = 0; n_active -= 1; }
                 }
             }
             if n_active == 0 { break; }
+            // Commit mixed iterates for still-active replicas only; frozen
+            // replicas keep q_n and their just-solved electronic state.
+            self.plan.set_active(&self.rt)?;
+            self.plan.commit_q_next(&self.rt)?;
+            self.state_fresh = false;
         }
         let mut stalled = false;
-        let mut plateau = false;
         for b in 0..self.batch {
             let r_b = if mix == 2 { rms } else { self.plan.rms_host.get(b).copied().unwrap_or(f32::NAN) };
             if r_b < rms_tol { continue; }
             stalled = true;
-            if stagnant[b] && r_b < PLATEAU_FLOOR { plateau = true; }
         }
         // D9: report device-side DIIS fallbacks (replaces kernel printf).
         if mix == 0 {
@@ -689,7 +786,7 @@ impl GpuDftb {
             let r = if mix == 2 { rms } else { self.plan.rms_host.get(sid).copied().unwrap_or(f32::NAN) };
             if !r.is_finite() { SccStatus::Failed }
             else if r < rms_tol { SccStatus::Converged }
-            else if stagnant[sid] && r < PLATEAU_FLOOR { SccStatus::Plateau }
+            else if stagnant[sid] && r < plateau_floor { SccStatus::Plateau }
             else { SccStatus::Failed }
         }).collect();
         if self.batch > 1 || statuses.first() != Some(&SccStatus::Converged) {
@@ -710,11 +807,17 @@ impl GpuDftb {
         Ok(GpuDftbScc { n_iters, rms, stalled, statuses })
     }
 
-    /// One finalize: energy always; forces if `want_forces`. Do not call energy() then forces().
+    /// Energy always; forces if `want_forces`. Do not call energy() then forces().
+    /// Reuses the cached electronic state when scc_mix exited with q_next
+    /// uncommitted (state_fresh) — finalize re-solves only after a geometry
+    /// or charge change.
     pub fn eval(&mut self, want_forces: bool) -> Result<GpuDftbEval> {
-        self.plan.finalize(
-            &mut self.rt, &self.buf_h0, &self.buf_s, &self.buf_g, &self.buf_q0, &self.buf_oa, self.n_occ,
-        )?;
+        if !self.state_fresh {
+            self.plan.finalize(
+                &mut self.rt, &self.buf_h0, &self.buf_s, &self.buf_g, &self.buf_q0, &self.buf_oa, self.n_occ,
+            )?;
+            self.state_fresh = true;
+        }
         let energy = self.plan.energy_from_state(&mut self.rt, &self.buf_q0)?;
         let (q_rms, q_max) = self.charge_residual()?;
         let forces = if want_forces { Some(self.forces_from_state()?) } else { None };
@@ -754,11 +857,13 @@ impl GpuDftb {
         Ok((q_rms, q_max))
     }
 
-    /// Force kernels from the current finalized D/C/ε. Caller must have `finalize`d.
-    fn forces_from_state(&mut self) -> Result<Vec<f32>> {
+    /// Force kernels into `buf_forces` from the current finalized D/C/ε.
+    /// Device-only: forces are zeroed with a device fill (no host upload)
+    /// and left in `buf_forces` — `forces_from_state` adds the readback.
+    /// Caller must have `finalize`d.
+    fn enqueue_force_kernels(&mut self) -> Result<()> {
         self.plan.build_edm(&self.buf_edm, self.n_occ)?;
-        self.scratch_f0.fill(0.0);
-        self.rt.write_buffer(&self.buf_forces, &self.scratch_f0)?;
+        self.buf_forces.cmd().fill(0.0f32, None).enq().map_err(map_ocl_err)?;
         for slot in &self.buckets {
             if slot.n_live == 0 { continue; }
             slot.k_force.set_arg(4u32, &self.plan.d).map_err(map_ocl_err)?;
@@ -773,8 +878,25 @@ impl GpuDftb {
         unsafe { self.k_gamma_f.enq().map_err(map_ocl_err)?; }
         self.k_rep_force.set_arg(2u32, &self.buf_coords_bohr).map_err(map_ocl_err)?;
         unsafe { self.k_rep_force.enq().map_err(map_ocl_err)?; }
+        Ok(())
+    }
+
+    /// Force kernels + host readback — public/API path (once per call).
+    fn forces_from_state(&mut self) -> Result<Vec<f32>> {
+        self.enqueue_force_kernels()?;
         self.rt.read_buffer(&self.buf_forces, &mut self.scratch_f)?;
         Ok(self.scratch_f.clone())
+    }
+
+    /// eval forces without the array readback — the FIRE hot path.
+    fn eval_forces_device(&mut self) -> Result<()> {
+        if !self.state_fresh {
+            self.plan.finalize(
+                &mut self.rt, &self.buf_h0, &self.buf_s, &self.buf_g, &self.buf_q0, &self.buf_oa, self.n_occ,
+            )?;
+            self.state_fresh = true;
+        }
+        self.enqueue_force_kernels()
     }
 
     /// Fermi smearing kT in Hartree (0 = integer occupation). Stabilizes SCC
@@ -802,10 +924,55 @@ impl GpuDftb {
             }
             self.frozen[i] = true;
         }
+        let m: Vec<i32> = self.frozen.iter().map(|&f| f as i32).collect();
+        self.rt.write_buffer(&self.frozen_dev, &m)
+            .map_err(|e| DftbError::InvalidInput(format!("write frozen_dev: {e}")))
+    }
+
+    /// Distance constraint |x_j − x_i| = d[b] per replica (Å) — the relaxed
+    /// scan coordinate. Closed-form equal-mass projection inside
+    /// `fire_apply_batched`; a frozen endpoint gets weight 0 (the other
+    /// endpoint carries the full correction). Fails loudly if both
+    /// endpoints are frozen or indices are invalid.
+    pub fn set_constraint(&mut self, i: usize, j: usize, targets: &[f64]) -> Result<()> {
+        if i == j || i >= self.n_atoms || j >= self.n_atoms {
+            return Err(DftbError::InvalidInput(format!(
+                "set_constraint: invalid pair ({i},{j}) n_atoms={}", self.n_atoms
+            )));
+        }
+        if self.frozen[i] && self.frozen[j] {
+            return Err(DftbError::InvalidInput(format!(
+                "set_constraint: both endpoints frozen ({i},{j}) — no free DOF to satisfy the constraint"
+            )));
+        }
+        if targets.len() != self.batch {
+            return Err(DftbError::InvalidInput(format!(
+                "set_constraint: targets.len()={} != batch={}", targets.len(), self.batch
+            )));
+        }
+        let t: Vec<f32> = targets.iter().map(|&d| d as f32).collect();
+        self.rt.write_buffer(&self.constr_d, &t)
+            .map_err(|e| DftbError::InvalidInput(format!("write constr_d: {e}")))?;
+        self.k_fire_apply.set_arg(8u32, 1i32).map_err(map_ocl_err)?;
+        self.k_fire_apply.set_arg(9u32, i as i32).map_err(map_ocl_err)?;
+        self.k_fire_apply.set_arg(10u32, j as i32).map_err(map_ocl_err)?;
+        self.k_fire_reduce.set_arg(5u32, 1i32).map_err(map_ocl_err)?;
+        self.k_fire_reduce.set_arg(6u32, i as i32).map_err(map_ocl_err)?;
+        self.k_fire_reduce.set_arg(7u32, j as i32).map_err(map_ocl_err)?;
+        self.constr = Some((i, j));
+        eprintln!("[GpuDftb] distance constraint |x_{j} − x_{i}| = d[b] set ({} replicas)", self.batch);
         Ok(())
     }
 
-    /// One FIRE step on all replicas (Bitzek 2006, D12-fixed).
+    /// Remove the distance constraint.
+    pub fn clear_constraint(&mut self) -> Result<()> {
+        self.k_fire_apply.set_arg(8u32, 0i32).map_err(map_ocl_err)?;
+        self.k_fire_reduce.set_arg(5u32, 0i32).map_err(map_ocl_err)?;
+        self.constr = None;
+        Ok(())
+    }
+
+    /// One FIRE step on all replicas (Bitzek 2006, D12-fixed, D13 device-resident).
     /// Correct physics: mixing is `v ← (1−α)v + α·F̂·‖v‖` with ‖v‖,‖F‖ the
     /// GLOBAL per-replica norms (NOT per-atom α‖F_i‖F̂_i — that would pin
     /// each atom's speed to its force). dt/α/n_pos are per-replica state —
@@ -813,6 +980,11 @@ impl GpuDftb {
     /// UNfrozen atoms) < f_tol is parked with zero velocity.
     /// Ordering (matches `FireOptimizer` in examples/hbond_ref.rs):
     ///   P=F·v → adapt → mix → v+=F·dt (vmax cap) → x+=v·dt (disp cap).
+    ///
+    /// Data flow per step (nothing larger than 4·batch floats crosses PCIe):
+    ///   forces → buf_forces (device) → fire_reduce → host f64 decisions
+    ///   (dt/α/mode) → fire_apply updates v_dev + coords_ang/bohr in place
+    ///   → assemble reads the device coords directly.
     /// Call `scc` first. Returns global max |F|.
     pub fn fire_step(&mut self, f_tol: f64) -> Result<f64> {
         const N_MIN: usize = 10;
@@ -820,31 +992,24 @@ impl GpuDftb {
         const F_DEC: f64 = 0.7;
         const ALPHA_START: f64 = 0.1;
         const F_ALPHA: f64 = 0.95;
-        const VMAX: f64 = 2.0;
-        let ev = self.eval(true)?;
-        let f = ev.forces.as_ref().expect("eval(true) returns forces").clone();
-        let n_atoms = self.n_atoms;
+        self.eval_forces_device()?;                       // forces stay on device
+        unsafe { self.k_fire_reduce.enq().map_err(map_ocl_err)?; }
+        self.rt.read_buffer(&self.fire_stat, &mut self.fire_stat_h)?;   // 4·batch floats
         let mut max_f = 0.0f64;
         for b in 0..self.batch {
-            let lo = b * n_atoms;
-            let hi = lo + n_atoms;
-            // per-replica convergence over UNfrozen atoms only
-            let mut max_fb = 0.0f64;
-            for i in lo..hi {
-                if self.frozen[i - lo] { continue; }
-                for c in 0..3 { max_fb = max_fb.max(f[3 * i + c].abs() as f64); }
+            let p = self.fire_stat_h[4 * b] as f64;
+            let mf = self.fire_stat_h[4 * b + 3] as f64;
+            if !p.is_finite() || !mf.is_finite() {
+                return Err(DftbError::InvalidInput(format!(
+                    "fire_step replica {b}: non-finite stat P={p} max|F|={mf}"
+                )));
             }
-            max_f = max_f.max(max_fb);
-            if max_fb < f_tol || !self.scc_ok[b] {
-                for v in &mut self.fire_v[lo..hi] { *v = [0.0; 3]; }
-                continue;   // replica parked — converged or SCC failed
-            }
-            // P = F·v over this replica's degrees of freedom
-            let mut p = 0.0f64;
-            for i in lo..hi {
-                for c in 0..3 { p += f[3 * i + c] as f64 * self.fire_v[i][c]; }
-            }
-            if p > 0.0 {
+            max_f = max_f.max(mf);
+            let mut mode = 0.0f32;
+            if mf < f_tol || !self.scc_ok[b] {
+                mode = 1.0;                       // parked: v=0, x untouched
+                self.fire_n_pos[b] = 0;
+            } else if p > 0.0 {
                 self.fire_n_pos[b] += 1;
                 if self.fire_n_pos[b] > N_MIN {
                     self.fire_dt[b] = (self.fire_dt[b] * F_INC).min(5.0);
@@ -854,49 +1019,42 @@ impl GpuDftb {
                 self.fire_n_pos[b] = 0;
                 self.fire_dt[b] *= F_DEC;
                 self.fire_alpha[b] = ALPHA_START;
-                for v in &mut self.fire_v[lo..hi] { *v = [0.0; 3]; }
+                mode = 2.0;                       // v-reset then normal update
             }
-            // Global per-replica norms for the mix
-            let mut v2 = 0.0f64;
-            let mut f2 = 0.0f64;
-            for i in lo..hi {
-                for c in 0..3 {
-                    v2 += self.fire_v[i][c] * self.fire_v[i][c];
-                    f2 += f[3 * i + c] as f64 * f[3 * i + c] as f64;
-                }
-            }
-            let vnorm = v2.sqrt();
-            let fnorm = f2.sqrt();
-            let alpha = self.fire_alpha[b];
-            let dt = self.fire_dt[b];
-            let scale = if fnorm > 1e-12 { alpha * vnorm / fnorm } else { 0.0 };
-            for i in lo..hi {
-                if self.frozen[i - lo] {
-                    self.fire_v[i] = [0.0; 3];    // constraint: F and v dead
-                    continue;
-                }
-                for c in 0..3 {
-                    let mut v = (1.0 - alpha) * self.fire_v[i][c] + scale * f[3 * i + c] as f64;
-                    v += f[3 * i + c] as f64 * dt;           // v += F·dt
-                    if v.abs() > VMAX { v = v.signum() * VMAX; }
-                    self.fire_v[i][c] = v;
-                }
-                let v = self.fire_v[i];
-                apply_disp(&mut self.coords[i], &v, 0.0, 0.0, 0.0, dt); // x += v·dt (disp-capped)
-            }
+            self.fire_ctl_h[4 * b] = self.fire_dt[b] as f32;
+            // mode 2: alpha=0 so mix_s=0 — after a P≤0 v-reset the step is
+            // pure F·dt (matches the old host code where vnorm=0 → scale=0).
+            self.fire_ctl_h[4 * b + 1] = if mode == 2.0 { 0.0 } else { self.fire_alpha[b] as f32 };
+            self.fire_ctl_h[4 * b + 2] = mode;
         }
-        if max_f < f_tol { return Ok(max_f); }
-        let c = self.coords.clone();
-        self.set_coords(&c)?;
+        if max_f < f_tol { return Ok(max_f); }    // all converged — nothing moves
+        self.rt.write_buffer(&self.fire_ctl, &self.fire_ctl_h)?;
+        unsafe { self.k_fire_apply.enq().map_err(map_ocl_err)?; }
+        // Positions now live on the device — assemble reads them in place.
+        self.coords_on_device = true;
+        self.coords_dirty = true;
+        self.assemble()?;
+        self.plan.set_geometry(&mut self.rt, &self.buf_s)?;
+        self.plan.reset_diis(&self.rt)?;
+        self.state_fresh = false;
         Ok(max_f)
     }
 
     /// One velocity-Verlet step (mass=1, same reduced units as FIRE). Call `scc` first.
     /// Displacement capped at 0.1 Å. Returns max |F|. Caller must `scc` after this.
+    /// Host-side legacy path: v/coords are synced in from the device state and
+    /// written back through `set_coords` (md_step is diagnostic, not the hot loop).
     pub fn md_step(&mut self, dt: f64) -> Result<f64> {
         if !dt.is_finite() || dt <= 0.0 {
             return Err(DftbError::InvalidInput(format!("md_step: dt={dt} must be finite and > 0")));
         }
+        // sync device v + x into the host mirrors (v_dev→fire_v, coords_ang→coords)
+        self.rt.read_buffer(&self.v_dev, &mut self.scratch_f)
+            .map_err(|e| DftbError::InvalidInput(format!("md_step v readback: {e}")))?;
+        for i in 0..self.fire_v.len() {
+            for c in 0..3 { self.fire_v[i][c] = self.scratch_f[3 * i + c] as f64; }
+        }
+        self.sync_coords_to_host()?;
         let ev = self.eval(true)?;
         let f = ev.forces.as_ref().expect("eval(true) returns forces");
         let ntot = self.batch * self.n_atoms;
@@ -909,7 +1067,13 @@ impl GpuDftb {
             self.fire_v[i][1] += fy * dt;
             self.fire_v[i][2] += fz * dt;
         }
-        let c = self.coords.clone();
+        // write v back to the device, coords through the host path
+        for i in 0..self.fire_v.len() {
+            for c in 0..3 { self.scratch_f[3 * i + c] = self.fire_v[i][c] as f32; }
+        }
+        self.rt.write_buffer(&self.v_dev, &self.scratch_f)
+            .map_err(|e| DftbError::InvalidInput(format!("md_step v upload: {e}")))?;
+        let c = self.coords.clone();   // host API — not the hot loop
         self.set_coords(&c)?;
         Ok(max_f)
     }
@@ -928,6 +1092,7 @@ impl GpuDftb {
             eprintln!("[GpuDftb] FIRE {step}/{max_steps} max|F|={max_f:.4e} E[0]={:.8} rms={:.3e} scc_iters={}", e[0], scc.rms, scc.n_iters);
             if max_f < f_tol { break; }
         }
+        self.sync_coords_to_host()?;   // host `coords` reflects final device x
         Ok((step, max_f, scc0.rms))
     }
 
@@ -937,6 +1102,8 @@ impl GpuDftb {
             return Err(DftbError::InvalidInput(format!("measure: batch={} — replica-0 diagnostics only, use batch=1", self.batch)));
         }
         let ev = self.eval(want_cpu)?;
+        // cpu_ref is &mut (syncs device coords) — call before scratch borrows.
+        let cpu = if want_cpu { Some(self.cpu_ref()?) } else { None };
         let n = self.n;
         let n_atoms = self.n_atoms;
         let n_occ = self.n_occ;
@@ -1029,8 +1196,7 @@ impl GpuDftb {
         eprintln!("[measure] r·V={rdotv:.3e} ½rᵀGr={half_rgr:.3e}  bandform−dens={ident:.3e}  predicted(δ_eig−½rGr)={pred:.3e}");
         eprintln!("[measure] q_rms={:.3e} q_max={:.3e}", ev.q_rms, ev.q_max);
 
-        if want_cpu {
-            let (e_cpu, f_cpu, q_cpu) = self.cpu_ref()?;
+        if let Some((e_cpu, f_cpu, q_cpu)) = cpu {
             let de = (ev.energy[0] - e_cpu).abs();
             let f_gpu = ev.forces.as_ref().expect("measure want_cpu implies eval(true)");
             let mut df = 0.0f64;
@@ -1064,6 +1230,7 @@ impl GpuDftb {
             {
                 let mut cpu = crate::methods::dftb::dftb_cpu::DftbCpu::new(self.sk.clone(), self.species.clone())?;
                 cpu.update_geometry(&self.coords[..n_atoms])?;
+                cpu.set_smearing(self.plan.kT as f64);
                 for i in 0..n {
                     for j in 0..n {
                         dh0 = dh0.max((h0[i * n + j] as f64 - cpu.h0[(i, j)]).abs());
@@ -1077,11 +1244,13 @@ impl GpuDftb {
     }
 
     /// CPU f64 SCC + repulsive + forces at replica-0 coords. Independent of GPU charges.
-    pub fn cpu_ref(&self) -> Result<(f64, Vec<[f64; 3]>, Vec<f64>)> {
+    pub fn cpu_ref(&mut self) -> Result<(f64, Vec<[f64; 3]>, Vec<f64>)> {
+        self.sync_coords_to_host()?;
         let n_atoms = self.n_atoms;
         let xyz = &self.coords[..n_atoms];
         let mut cpu = crate::methods::dftb::dftb_cpu::DftbCpu::new(self.sk.clone(), self.species.clone())?;
         cpu.update_geometry(xyz)?;
+        cpu.set_smearing(self.plan.kT as f64);
         cpu.reset_charges();
         cpu.solve_scc(100, 1e-8)?;
         let scc = cpu.build_result();

@@ -1,7 +1,10 @@
 // GC proton-transfer relaxed scan — the real workload.
-// Replica i = H13 (guanine N1–H···cytosine N3) frozen at d = d0 + i·step
-// along the N8→N21 axis; all other atoms relax by FIRE.
-// 0-based atom indices: donor N = 8, proton H = 13, acceptor N = 21.
+// Replica i = H13 (guanine N1–H···cytosine N3) constrained to d = d0 + i·step
+// along the N8→N20 axis; all other atoms relax by FIRE.
+// 0-based atom indices: donor N = 8, proton H = 13, acceptor N = 20.
+// (Fixed 2026-09-13: the axis endpoint was atom 21 = C — a 1-based indexing
+// slip; the true N3 acceptor is atom 20. Constraint is now a DISTANCE
+// r(N8–H13)=d — 1 DOF — not a full freeze of H13.)
 const sk_dir = SK_DIR;
 const N_PTS = 19;
 const D0 = 1.0;      // Å — N8–H distance at first point
@@ -12,13 +15,13 @@ load_xyz("gc", "/home/prokop/git/dftbplus/data/xyz/guanine-cytosine.xyz");
 let xyz = get_xyz("gc");
 let n_atoms = 29;
 
-// donor N8, proton H13, acceptor N21 — unit vector along the H-bond axis
-let dx = xyz[3*21]   - xyz[3*8];
-let dy = xyz[3*21+1] - xyz[3*8+1];
-let dz = xyz[3*21+2] - xyz[3*8+2];
+// donor N8, proton H13, acceptor N20 — unit vector along the H-bond axis
+let dx = xyz[3*20]   - xyz[3*8];
+let dy = xyz[3*20+1] - xyz[3*8+1];
+let dz = xyz[3*20+2] - xyz[3*8+2];
 let dNN = sqrt(dx*dx + dy*dy + dz*dz);
 dx /= dNN; dy /= dNN; dz /= dNN;
-print("N8–N21 = " + ftos(dNN) + " A; scan " + N_PTS + " pts from " + ftos(D0) + " A, step " + ftos(DSTEP));
+print("N8–N20 = " + ftos(dNN) + " A; scan " + N_PTS + " pts from " + ftos(D0) + " A, step " + ftos(DSTEP));
 
 // build all scan geometries (H13 displaced along the axis, rest = ref)
 let all = [];
@@ -39,7 +42,11 @@ for p in 0..N_PTS {
 
 gpu_new("gc", sk_dir, N_PTS);
 gpu_set_coords("gc", all);
-gpu_freeze_atoms("gc", [13]);
+// distance constraint r(N8–H13) = d per replica — 1 DOF, H can relax
+// off-axis; N8 stays free. (Replaces the full freeze of H13.)
+let d_targets = [];
+for p in 0..N_PTS { d_targets.push(D0 + p * DSTEP); }
+gpu_set_constraint("gc", 8, 13, d_targets);
 gpu_smearing("gc", 0.002);   // ~630 K — stabilizes mid-transfer SCC (gap ~0.5 mHa)
 gpu_reset_q("gc");
 
