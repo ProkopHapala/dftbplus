@@ -240,7 +240,7 @@ impl GpuMatrixContext {
         );
         let local = SpatialDims::Two(self.config.tile_n, self.config.tile_m);
         let a_local = self.config.tile_m * self.config.tile_k;
-        let b_local = self.config.tile_k * self.config.tile_n;
+        let b_local = self.config.tile_n * (self.config.tile_k + 1);   // W2: padded Bs for the trans-B layout
         let kernel = Kernel::builder()
             .program(&self.program)
             .name("batched_gemm")

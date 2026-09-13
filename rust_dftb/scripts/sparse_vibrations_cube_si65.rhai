@@ -25,7 +25,11 @@ print("=== SparseDftb vibrations: cube_Si (65 atoms, matsci) ===");
 print("ref E_tot = -53.4520493137 Ha");
 
 load_xyz("cube", ref_dir + "/relaxed.xyz");
-let n_orbs = sparse_new("cube", sk_dir);
+// Full-radius reference masks preserved, but the degree budget is now
+// declared explicitly (§15.9 SC1): max_deg=512 covers the full-SK-radius
+// geometric masks (~300 nbr/atom on the 65-atom cube). Tighter masks are
+// a separate sweep — this script is the wide-reference parity harness.
+let n_orbs = sparse_new("cube", sk_dir, 0.0, 0.0, 0.0, 0.0, 512.0);
 sparse_tc2_tol("cube", 1.0e-6);
 print("n_atoms=" + itos(sparse_n_atoms("cube")) + " n_orbs(padded)=" + itos(n_orbs));
 

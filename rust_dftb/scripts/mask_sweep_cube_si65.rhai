@@ -11,7 +11,7 @@ let e0 = 0.0;
 for rk in [0.0, 12.0, 10.0, 8.0, 6.0] {
     let name = "k" + itos((rk * 10.0).to_int());
     load_xyz(name, xyz);
-    sparse_new(name, sk_dir, 8.0, 1.0, rk, rk);
+    sparse_new(name, sk_dir, 8.0, 1.0, rk, rk, 512.0);   // max_deg=512: sweep includes full-radius reference (deg ~300) — budget declared explicitly (§15.9 SC1)
     sparse_tc2_tol(name, 1.0e-5);
     sparse_ns_tol(name, 1.0e-4);   // truncated Z can't beat the mask floor
     let rms = sparse_scc(name, 80, 1.0e-6);

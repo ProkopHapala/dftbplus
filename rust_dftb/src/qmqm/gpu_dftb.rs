@@ -726,15 +726,67 @@ impl GpuDftb {
         self.plan.set_active(&self.rt)?;
         // Replicas outside the retry mask are already done: never iterated,
         // never committed — their device state stays the converged run-1 one.
+        // W1: snapshot which replicas will launch H-Jacobi this solve — the
+        // deferred check_jacobi at the end must not read stale diag records
+        // of replicas that never ran.
+        let jacobi_ran: Vec<i32> = self.plan.active_host.clone();
         for (b, &a) in self.plan.active_host.iter().enumerate() {
             if a == 0 { done[b] = true; n_active -= 1; }
         }
+        if mix == 0 {
+            // W4 (manifest §14): chunked SCC. CHUNK iterations are enqueued
+            // back-to-back with NO host readback — diis_step_batched clears
+            // active[sid] itself on rms<tol or nonfinite, and every
+            // per-iteration kernel (incl. batched_gemm_active) gates on the
+            // device mask. The host syncs once per chunk to read rms+active
+            // for bookkeeping (status, stagnation). Converged replicas stop
+            // paying for any further work inside the chunk.
+            const CHUNK: usize = 8;
+            let mut it = 0usize;
+            let mut samples = vec![0usize; self.batch];
+            while it < cap && n_active > 0 {
+                let step = (cap - it).min(CHUNK);
+                for _ in 0..step {
+                    self.plan.scc_step_diis_enq(
+                        &mut self.rt, &self.buf_h0, &self.buf_s, &self.buf_g, &self.buf_q0, &self.buf_oa,
+                        self.n_occ, 0.3, rms_tol,
+                    )?;
+                    self.plan.commit_q_next(&self.rt)?;
+                    self.rt.prof_tick("scc.commit");
+                }
+                it += step;
+                n_iters = it;
+                self.plan.read_chunk_status(&self.rt)?;   // one finish covers both reads
+                self.rt.prof_tick("scc.chunkend");
+                self.state_fresh = false;                 // commits advanced q_gpu past the solved state
+                let mut host_dirty = false;
+                for b in 0..self.batch {
+                    if done[b] { continue; }
+                    if self.plan.active_host[b] == 0 {
+                        // device-side stop — converged (rms<tol) or nonfinite;
+                        // the status is decided from the last rms at the end.
+                        done[b] = true; n_active -= 1; continue;
+                    }
+                    let r_b = self.plan.rms_host[b];
+                    hist[b][samples[b] % 10] = r_b;
+                    samples[b] += 1;
+                    if !r_b.is_finite() { done[b] = true; self.plan.active_host[b] = 0; n_active -= 1; host_dirty = true; continue; }
+                    if samples[b] >= 8 {
+                        let (mut rmin, mut rmax) = (f32::INFINITY, 0.0f32);
+                        for &r in &hist[b] { rmin = rmin.min(r); rmax = rmax.max(r); }
+                        if rmax < 4.0 * rmin { done[b] = true; stagnant[b] = true; self.plan.active_host[b] = 0; n_active -= 1; host_dirty = true; }
+                    }
+                }
+                if host_dirty { self.plan.set_active(&self.rt)?; }
+            }
+            rms = self.plan.rms_host.iter().fold(0.0f32, |a, &x| a.max(x));
+        } else {
         for it in 0..cap {
             n_iters = it + 1;
             rms = match mix {
                 0 => self.plan.scc_step_diis(
                     &mut self.rt, &self.buf_h0, &self.buf_s, &self.buf_g, &self.buf_q0, &self.buf_oa,
-                    self.n_occ, 0.3,
+                    self.n_occ, 0.3, rms_tol,
                 )?,
                 1 => self.plan.scc_step(
                     &mut self.rt, &self.buf_h0, &self.buf_s, &self.buf_g, &self.buf_q0, &self.buf_oa,
@@ -795,6 +847,7 @@ impl GpuDftb {
             self.plan.commit_q_next(&self.rt)?;
             self.state_fresh = false;
         }
+        }
         let mut stalled = false;
         for b in 0..self.batch {
             let r_b = if mix == 2 { rms } else { self.plan.rms_host.get(b).copied().unwrap_or(f32::NAN) };
@@ -816,12 +869,18 @@ impl GpuDftb {
                 eprintln!("[GpuDftb] DIIS fallbacks: {n_fb} total, last reason={worst} at sid={worst_sid} (1=pivot/scale 2=nonfinite 3=sum(c)!=1)");
             }
         }
+        // W1 (manifest §14): certify the LAST Jacobi solve per replica, once —
+        // this is the single deferred diag read that replaced the
+        // per-iteration report_jacobi queue drain. An uncertified eigensolve
+        // makes the replica Failed regardless of charge rms.
+        let j_ok = self.plan.check_jacobi(&self.rt, &jacobi_ran)?;
+        self.rt.prof_tick("scc.check_jacobi");
         // D11: per-system status — Converged only when the final residual is
         // below tol; Plateau when the iterate stopped moving; else Failed.
         // mix=2 (host DIIS) fills only the scalar rms (batch=1 path).
         let statuses: Vec<SccStatus> = (0..self.batch).map(|sid| {
             let r = if mix == 2 { rms } else { self.plan.rms_host.get(sid).copied().unwrap_or(f32::NAN) };
-            if !r.is_finite() { SccStatus::Failed }
+            if !r.is_finite() || !j_ok[sid] { SccStatus::Failed }
             else if r < rms_tol { SccStatus::Converged }
             else if stagnant[sid] && r < plateau_floor { SccStatus::Plateau }
             else { SccStatus::Failed }
@@ -857,6 +916,13 @@ impl GpuDftb {
                 &mut self.rt, &self.buf_h0, &self.buf_s, &self.buf_g, &self.buf_q0, &self.buf_oa, self.n_occ,
             )?;
             self.state_fresh = true;
+            // W1: certify the just-run eigensolve — one deferred diag read
+            // per eval (not per SCC iteration). Uncertified replicas are
+            // parked like an SCC failure, not silently consumed.
+            let j_ok = self.plan.check_jacobi(&self.rt, &vec![1i32; self.batch])?;
+            for (b, ok) in j_ok.iter().enumerate() {
+                if !ok { self.scc_ok[b] = false; }
+            }
         }
         let energy = self.plan.energy_from_state(&mut self.rt, &self.buf_q0)?;
         let (q_rms, q_max) = self.charge_residual()?;
@@ -930,13 +996,28 @@ impl GpuDftb {
 
     /// eval forces without the array readback — the FIRE hot path.
     fn eval_forces_device(&mut self) -> Result<()> {
+        let mut solved = false;
         if !self.state_fresh {
             self.plan.finalize(
                 &mut self.rt, &self.buf_h0, &self.buf_s, &self.buf_g, &self.buf_q0, &self.buf_oa, self.n_occ,
             )?;
+            self.rt.prof_tick("fire.finalize");
             self.state_fresh = true;
+            solved = true;
         }
-        self.enqueue_force_kernels()
+        self.enqueue_force_kernels()?;
+        self.rt.prof_tick("fire.force_kernels");
+        if solved {
+            // W1: certify the eigensolve AFTER the force kernels are queued —
+            // the single read_buffer/finish then drains finalize+forces in
+            // one sync instead of a mid-pipeline drain after finalize alone.
+            let j_ok = self.plan.check_jacobi(&self.rt, &vec![1i32; self.batch])?;
+            self.rt.prof_tick("fire.check_jacobi");
+            for (b, ok) in j_ok.iter().enumerate() {
+                if !ok { self.scc_ok[b] = false; }
+            }
+        }
+        Ok(())
     }
 
     /// Fermi smearing kT in Hartree (0 = integer occupation). Stabilizes SCC
@@ -1086,8 +1167,10 @@ impl GpuDftb {
         const ALPHA_START: f64 = 0.1;
         const F_ALPHA: f64 = 0.95;
         self.eval_forces_device()?;                       // forces stay on device
+        self.rt.prof_tick("fire.eval_forces");
         unsafe { self.k_fire_reduce.enq().map_err(map_ocl_err)?; }
         self.rt.read_buffer(&self.fire_stat, &mut self.fire_stat_h)?;   // 4·batch floats
+        self.rt.prof_tick("fire.reduce");
         let mut max_f = 0.0f64;
         for b in 0..self.batch {
             let p = self.fire_stat_h[4 * b] as f64;
@@ -1127,12 +1210,16 @@ impl GpuDftb {
         if max_f < f_tol { return Ok(max_f); }    // all converged — nothing moves
         self.rt.write_buffer(&self.fire_ctl, &self.fire_ctl_h)?;
         unsafe { self.k_fire_apply.enq().map_err(map_ocl_err)?; }
+        self.rt.prof_tick("fire.apply");
         // Positions now live on the device — assemble reads them in place.
         self.coords_on_device = true;
         self.coords_dirty = true;
         self.assemble()?;
+        self.rt.prof_tick("fire.assemble");
         self.plan.set_geometry(&mut self.rt, &self.buf_s)?;
+        self.rt.prof_tick("fire.set_geometry");
         self.plan.reset_diis(&self.rt)?;
+        self.rt.prof_tick("fire.reset_diis");
         self.state_fresh = false;
         Ok(max_f)
     }
@@ -1181,7 +1268,9 @@ impl GpuDftb {
     /// are NOT a relaxed geometry (R2: exhaustion must not be misreported as
     /// convergence; the old signature returned the INITIAL scc rms).
     pub fn relax(&mut self, max_steps: usize, f_tol: f64, scc_tol: f32) -> Result<(usize, f64, f32, bool)> {
+        self.rt.prof_reset();
         let scc0 = self.scc(SCC_MAX_ITER, scc_tol)?;
+        self.rt.prof_tick("relax.scc0");
         eprintln!("[GpuDftb] relax start rms={:.3e} iters={} stalled={}", scc0.rms, scc0.n_iters, scc0.stalled);
         let mut max_f = f64::INFINITY;
         let mut last_rms = scc0.rms;
@@ -1189,18 +1278,29 @@ impl GpuDftb {
         for s in 0..max_steps {
             step = s + 1;
             max_f = self.fire_step(f_tol)?;
+            self.rt.prof_tick("relax.fire_step");
             let scc = self.scc(SCC_MAX_ITER, scc_tol)?;
+            self.rt.prof_tick("relax.scc");
             last_rms = scc.rms;
             let e = self.eval(false)?.energy;
+            self.rt.prof_tick("relax.eval");
             eprintln!("[GpuDftb] FIRE {step}/{max_steps} max|F|={max_f:.4e} E[0]={:.8} rms={:.3e} scc_iters={}", e[0], scc.rms, scc.n_iters);
             if max_f < f_tol { break; }
         }
         self.sync_coords_to_host()?;   // host `coords` reflects final device x
+        self.rt.prof_tick("relax.sync_coords");
+        self.prof_report("relax");
         let converged = max_f < f_tol;
         if !converged {
             eprintln!("[GpuDftb] relax EXHAUSTED after {step} steps: max|F|={max_f:.4e} > f_tol={f_tol:.3e} — NOT a converged geometry");
         }
         Ok((step, max_f, last_rms, converged))
+    }
+
+    /// Print the env-gated (`RUST_DFTB_PROF=1`) stage-timer table for this
+    /// engine and reset it — called by `relax` and at script end.
+    pub fn prof_report(&self, ctx: &str) {
+        self.rt.prof_report(&format!("GpuDftb {ctx} batch={} n={}", self.batch, self.n));
     }
 
     /// Frozen-H + energy-identity + optional CPU force/energy (replica 0). Call after `scc`. Prints; does not retune physics.

@@ -4801,3 +4801,979 @@ So the code's *structural* choice — every product writes onto a fixed target m
 - **Consequence for the 512 limit:** once every product is truncated to an honestly-sized mask (say ≤128 blocks/row), the kernel never sees a wide row — the ceiling stops being a correctness question and becomes purely a sizing parameter you set to match the mask. The bounded-memory SpGEMM (S4) is then insurance for the wide-mask *diagnostic* runs, not a production need.
 
 **Bottom line:** truncate after every multiply — yes, mandatory, and already the architecture's intent. What must change: masks sized by measured decay + dropped-mass accounting on every product, so truncation is a *controlled* approximation instead of a silent one. That plus cutting H/S to its physical ~6–7 Å is the difference between a sparse solver that wins and one that's just a slower diagonalization.
+
+
+
+
+---
+
+# USER
+
+please analyse the sparse code and kernels again. 1) I think critical think for the desing is to keep number of neighbors and band-width (sparcity patern) under control duting all multiplications, which means basically agresively pishing down the number of neighbors, and truncated elebemtns which would lead to desnification (even at the cost of accuracy, although we should attepnt for some compromise preseverve reasaoble accuracy while truncating), not sure if better apporach is set the sparcity pattern of the results fixed from start so we compute only the valid eleemnts (that is perhsp faster and makes easily kernel which can be better optimized - perhaps I slightly prefer that), or the compute more lements (halo) but then agresively set o zero smaller elements before passing the matrix to next matrix multiplication (that perhaps preserve more accuracy, but result in more complex code and redudant work) 2)the other quetion is where exacly we should apply Kahan error compensating sum or f64 sum in imporve accuracy without copromising performance on our cheap hardware (which is like 40x faster in f32 than f64) 
+https://github.com/ProkopHapala/dftbplus/tree/main/rust_dftb/src/methods/sparse 
+sparse_bsr4_purification.cl 
+gpu_sparse.rs see discussion which I had with my coding agent ---
+
+---
+
+# Chat GPT 5.6 sol
+
+
+Yes. After looking again at the current `main`, I think your instinct is basically right, but I would sharpen it into a more specific architectural rule:
+
+> **The production sparse solver should use fixed, deliberately narrow sparsity patterns, and every matrix multiplication should write directly into its prescribed narrow output pattern. Do not let matrices structurally densify and then clean them up afterward.**
+
+The important qualification is that we should avoid algorithms where a **wide intermediate is mathematically necessary to obtain an accurate narrow final result**. That is exactly why the new \(P=KS\) purifier is attractive: it turns purification into repeated
+
+$$
+P_{n+1}=f\!\left(P_M(P_nP_n)\right)
+$$
+
+with **one multiplication and one fixed mask**, instead of the old
+
+$$
+T=P_M(KS),\qquad Q=P_M(TK),
+$$
+
+where truncating \(T\) corrupts even in-mask elements of \(Q\).
+
+That distinction is more important than “fixed mask vs thresholding” by itself.
+
+## 1. I would choose fixed sparsity patterns for production
+
+Your pasted discussion says that the solver must not allow the bandwidth to double after every multiplication. I agree completely with that design objective. 
+
+The current OpenCL multiplication already has the right fundamental abstraction:
+
+$$
+C=P_{M_C}(AB),
+$$
+
+where `C_row/C_col` define the allowed result blocks and blocks outside \(M_C\) are never allocated or computed.
+
+That is what I would keep.
+
+I would **not** make the normal algorithm:
+
+$$
+A B \rightarrow \text{large halo matrix}
+\rightarrow \text{measure blocks}
+\rightarrow \text{drop small blocks}
+\rightarrow \text{compress CSR}
+\rightarrow \text{rebuild plan}.
+$$
+
+That destroys most of the advantages you are building: fixed GPU buffers, fixed plans, predictable local-memory requirements, deterministic work, smooth Hessians, and zero structural work inside SCC.
+
+There is also a subtle but important point: if you compute a larger halo of the **final result** and then immediately throw it away, this does not improve the values of the elements inside your original mask at all. For one multiplication,
+
+$$
+C_{ij}=\sum_k A_{ik}B_{kj},
+$$
+
+computing extra \(C_{ij}\)'s outside the mask does nothing to improve the retained \(C_{ij}\)'s.
+
+A halo is useful only when that wider result is subsequently used as an **intermediate in another multiplication**. And that is exactly the situation we should try to remove algorithmically rather than make the normal case.
+
+So I would use:
+
+$$
+\boxed{\text{fixed input masks + fixed output mask + direct projected multiplication}}
+$$
+
+as the production algebra.
+
+Dynamic halo/threshold multiplication should be primarily a **diagnostic/calibration tool**, or used for the few unavoidable intermediate products where experiments demonstrate that a narrow intermediate is inaccurate.
+
+This is also consistent with the sparse-purification literature: thresholding/screening is essential to obtain linear scaling, but sophisticated implementations control the error of omitted submatrix products rather than allowing unrestricted fill-in. ([ScienceDirect][1])
+
+---
+
+# 2. The current code still does not impose the neighbor limit you actually want
+
+This is probably the most important implementation-level issue.
+
+At present `build_geometric_mask()` simply includes **every atom inside a radius**. There is no physical/performance contract such as
+
+```text
+max_degree <= 96
+```
+
+or
+
+```text
+max_degree <= 128
+```
+
+when the masks are constructed.
+
+`MAX_LEFT_BLOCKS=512` is merely an emergency kernel capacity. It is not a sparsity policy.
+
+Worse, `SparseDftb` constructs the GPU with
+
+```rust
+SparseBsr4Config::default()
+```
+
+whose `max_left_blocks` is 512.
+
+So even if your real matrix has only, say, 70 neighbors per row, the planned kernel statically reserves
+
+$$
+512\times16\times4=32768\ {\rm bytes}
+$$
+
+of local memory for `lA` in every work-group. The plan kernel no longer stores the column indices, so its actual local-memory cost is ~32 KiB, not the ~34 KiB quoted in the pasted discussion; 34 KiB applies approximately to the intersection kernel, which also has `lcol[512]`.
+
+This is backwards.
+
+The sequence should be:
+
+$$
+\text{choose masks}
+\rightarrow
+\text{measure max degree}
+\rightarrow
+\text{choose MAX\_LEFT\_BLOCKS}
+\rightarrow
+\text{compile OpenCL once}.
+$$
+
+Conveniently, your current initialization order already allows this: masks are generated before `SparseBsr4Gpu::new()`.
+
+I would initially use a **hard production ceiling around 128 blocks/row**, with an engineering goal that most matrices are closer to 64–96.
+
+Then the plan kernel uses only:
+
+$$
+128\times16\times4=8\ {\rm KiB}
+$$
+
+or, for 64,
+
+$$
+4\ {\rm KiB}.
+$$
+
+That is a huge difference from 32 KiB.
+
+I would actually **not implement four degree-bucket kernels yet**. That is more complexity than necessary.
+
+For your single-large-system use case, compile one kernel at engine initialization with the smallest reasonable static capacity, e.g.
+
+```text
+actual max degree = 73
+compile MAX_LEFT_BLOCKS = 96 or 128
+```
+
+and then run the entire simulation with it.
+
+If an “accurate/reference” setup genuinely needs >128, make that explicit and compile 256. Never silently get 512 because that happened to be a historical default.
+
+---
+
+# 3. The current physical defaults are also still too permissive
+
+`SparseDftbConfig` currently defaults to:
+
+```rust
+r_trunc_ang = None
+r_k_ang     = None
+r_z_ang     = None
+r_skin_ang  = 1.0
+```
+
+and therefore H/S, K and Z default essentially to the full SK-table radius plus the skin.
+
+The mask construction confirms this: H/S use the table cutoff unless `r_trunc_ang` is supplied; K and Z default to the same full table radius plus skin.
+
+For the production large-system sparse solver I would invert that philosophy.
+
+A large calculation should **not be allowed to start without an explicit sparsity budget**.
+
+I would think in terms of separate degree budgets:
+
+| Matrix              | Role                     | Desired policy                                                      |
+| ------------------- | ------------------------ | ------------------------------------------------------------------- |
+| \(H,S\)             | physical local operator  | very tight, species-dependent cutoff                                |
+| \(P=KS\)            | hot purification iterate | **tightest important computational mask**, target ~64–96, hard ≤128 |
+| \(K\)               | recovered density kernel | same structural scale as P, perhaps slightly wider if required      |
+| \(Z\approx S^{-1}\) | inverse overlap          | can be somewhat wider, because evaluated once per geometry          |
+| \(ZH\)              | auxiliary for P0/W       | modest fixed halo if needed                                         |
+| \(W\)               | force result             | only \(M_{HS}\) needed                                              |
+
+Do **not** assume \(K\) is more local than \(H\). The coding agent said something close to that in the pasted discussion, and that is not generally safe.
+
+For an insulator the density matrix decays exponentially, yes, but the decay length is controlled by the electronic gap and basis. It can easily be longer-ranged than the finite-range Hamiltonian. In fact, published SP2 work explicitly reports density matrices becoming several times denser than the original Hamiltonian. ([ScienceDirect][2])
+
+Your own previous numerical observations were already pointing in that direction.
+
+So the goal is not:
+
+> K must fit inside H because it “should decay faster.”
+
+It is:
+
+> K/P must fit inside the smallest degree budget that still gives acceptable energy/force/frequency errors.
+
+That is a measured approximation.
+
+---
+
+# 4. The P purifier is much better matched to this design than legacy K-TC2
+
+Current `main` already contains the experimental \(P=KS\) purifier. This is a very good development.
+
+The hot operation is now simply
+
+$$
+Q=P_M(PP)
+$$
+
+followed by TC2.
+
+Only **one SpGEMM per purification iteration**, with no \(KS\) intermediate whose support wants to expand. The implementation does exactly that and uses the new generic planned multiplication because P is nonsymmetric.
+
+This is exactly the architecture I would optimize around.
+
+The legacy path still does
+
+$$
+T=P_M(KS),
+\qquad
+Q=P_M(TK),
+$$
+
+and `m_t_ks=m_k`, so the intermediate is deliberately truncated. That keeps memory bounded, but it introduces the intermediate-truncation error we already diagnosed.
+
+So I would make the medium-term goal:
+
+$$
+\boxed{\text{P-TC2 becomes production; K-TC2 becomes reference/legacy}}
+$$
+
+provided the parity tests remain acceptable.
+
+Right now P-TC2 is still experimental/off by default; `SparseDftb::scc()` only uses it when the config/environment selects it.
+
+I would concentrate validation there rather than spend much more time perfecting the two-multiply K-TC2 loop.
+
+TRS4 is interesting for stability, but it requires \(P^2\) and \(P^4\), i.e. two sparse products per iteration again. I would therefore regard P-TC2 as the **speed baseline** and only use TRS if its greater stability actually reduces total work enough to compensate.
+
+---
+
+# 5. The new W path is also the right kind of simplification
+
+Current `main` now supports
+
+$$
+W=2(ZH)K
+$$
+
+directly rather than
+
+$$
+T=KH,\qquad
+W=2TK.
+$$
+
+That is another excellent change because it eliminates another dangerous truncated intermediate and cuts two products to one.
+
+This is exactly the principle I want applied everywhere:
+
+> Instead of making wide intermediates and inventing clever ways to truncate them, reformulate the algebra so the desired narrow matrix is produced directly whenever possible.
+
+---
+
+# 6. One place where a modest halo still makes sense: Z / Newton–Schulz
+
+The inverse overlap is the awkward piece.
+
+Newton–Schulz uses
+
+$$
+T=ZS,
+$$
+
+$$
+Z' = 2Z-TZ.
+$$
+
+So there really is an intermediate.
+
+If both \(T\) and \(Z\) are forced onto the same very narrow mask, some contributions to the final in-mask \(TZ\) are lost.
+
+Here I would allow a **fixed, modest intermediate halo**, not a dynamically growing matrix.
+
+For example conceptually:
+
+$$
+M_Z : \text{degree } 96,
+$$
+
+$$
+M_{ZS} : \text{degree } 128,
+$$
+
+$$
+Z_{\rm new} : M_Z.
+$$
+
+The important point is that 128 is an explicit fixed ceiling. It never becomes the full structural radius \(R_Z+R_S\).
+
+NS is performed once per geometry and warm-started, so it can afford somewhat more work than the P-purification loop which is repeated in every SCC iteration.
+
+This is where I would spend some accuracy budget.
+
+---
+
+# 7. Dynamic magnitude thresholding is useful mainly for choosing the fixed masks
+
+I would not make threshold-induced CSR changes part of every multiplication.
+
+For vibrations that is particularly dangerous: a block appearing/disappearing when its norm crosses a threshold creates numerical non-smoothness.
+
+Instead, use a wider calculation occasionally to answer:
+
+$$
+\epsilon_M=
+\frac{
+\|C_{\rm wide}-P_M C_{\rm wide}\|_F
+}{
+\|C_{\rm wide}\|_F
+}.
+$$
+
+Then choose a fixed mask satisfying the accuracy target.
+
+You can make the mask magnitude-aware rather than purely radius-aware. For example, do one wider P/K calculation, compute a block score
+
+$$
+s_{ij}=\|P_{ij}\|_F,
+$$
+
+and retain the most important symmetric neighbor graph subject to
+
+$$
+d_i\le D_{\max}.
+$$
+
+This can outperform a purely spherical cutoff around defects/surfaces while preserving a completely static GPU layout.
+
+A very important correction to the coding-agent discussion: it said that “dropped mass” could be calculated “almost for free” at **plan build time**. 
+
+That is false for numerical dropped mass.
+
+At plan-build time you know only structure. You can count omitted paths
+
+$$
+(i,k,j),
+$$
+
+but you do not know
+
+$$
+\|A_{ik}B_{kj}\|
+$$
+
+until you have the matrix values.
+
+To get an error estimate you need either a wider numerical reference multiplication, or run-time bounds such as
+
+$$
+\|A_{ik}B_{kj}\|_F
+\le
+\|A_{ik}\|_F\,\|B_{kj}\|_F.
+$$
+
+That kind of submatrix-product screening is precisely what error-controlled sparse multiplication methods use. ([ScienceDirect][1])
+
+But I would add it only after the simpler fixed-mask architecture is working.
+
+---
+
+# 8. Precision: no, Kahan is still not in the hot SpGEMM
+
+The current planned kernel has four f32 accumulators:
+
+```c
+float s0, s1, s2, s3;
+```
+
+corresponding to the four orbital inner-index contributions. This is much better than one long serial FMA chain: dependency length is approximately the number of contributing blocks rather than four times that number. But it is **not compensated summation**.
+
+There is no Kahan correction variable.
+
+And I would **not jump directly to f64 accumulation inside SpGEMM** on a consumer NVIDIA GPU where FP64 throughput is catastrophically worse.
+
+The first precision optimization I would test is actually cheaper than Kahan:
+
+$$
+\boxed{\text{increase independent f32 partial accumulators}}
+$$
+
+Currently each `s_m` accumulates every k contribution.
+
+Instead use two accumulators per orbital channel, alternating terms:
+
+```text
+s00, s01
+s10, s11
+s20, s21
+s30, s31
+```
+
+then pairwise combine at the end.
+
+This doubles registers from 4 to 8 but adds essentially **no extra multiply-add work** and halves each serial summation chain.
+
+If your degree is capped at ~64–96, this may already reduce the arithmetic floor enough.
+
+Only after that would I benchmark Kahan.
+
+---
+
+# 9. Where Kahan and f64 actually make sense
+
+The most important distinction is between **matrix arithmetic** and **small reductions / decisions**.
+
+| Operation                           | My choice                                                |
+| ----------------------------------- | -------------------------------------------------------- |
+| P² / sparse SpGEMM early iterations | 4–8-way f32 FMA                                          |
+| P² final purification iterations    | optional f32 Kahan variant                               |
+| ZS / ZSZ                            | f32; possibly compensated only when NS stalls near floor |
+| K=PZ final recovery                 | compensated f32 is attractive: done only once            |
+| W=(ZH)K                             | compensated f32 worth testing: only once per force call  |
+| Mulliken per atom                   | plain f32; only ≤4 diagonal terms                        |
+| TC2 trace / branch                  | **f64 host**, as now                                     |
+| TRS coefficients                    | **f64 host**, as now                                     |
+| DIIS small solve                    | **f64 CPU**, keep                                        |
+| idempotency residual                | f32 square + tree reduction + **f64 tail**               |
+| NS residual                         | same: f32 partials + **f64 tail**                        |
+| band energy \(2\mathrm{Tr}(KH_0)\)  | **f64 final reduction**                                  |
+| spectral-bound decisions            | f32 matrix arithmetic but conservative/f64 scalar logic  |
+| Hessian assembly/eigensolve         | f64 CPU                                                  |
+
+The current trace handling is already exactly what I want: one per-atom f32 contribution is downloaded and summed in host f64.
+
+That is a very cheap “f64 island”.
+
+Do the same philosophy elsewhere.
+
+### Idempotency and NS residuals
+
+Currently the idempotency/Frobenius reductions are recursively reduced all the way down to **one f32 scalar** on the GPU.
+
+These sums are of positive squares, so Kahan is unnecessary.
+
+Instead stop the GPU tree when, say, 32–128 partial values remain, download those and sum them in host f64.
+
+This costs almost nothing because these diagnostics already cause synchronization.
+
+It makes the measured floor trustworthy without putting any FP64 in the big kernels.
+
+### Band energy
+
+`trace_hk_to_dev()` currently reduces the entire extensive band-energy sum to one f32 scalar.
+
+That is a much better candidate for a f64 tail than SpGEMM itself because the energy is an extensive sum with cancellation.
+
+Even better: I question whether you need band energy on **every SCC iteration** at all.
+
+SCC convergence uses charge residuals, not energy.
+
+Compute the accurate energy only when convergence is reached, plus optionally in verbose/debug mode. That simultaneously removes a reduction kernel and a host sync from most SCC iterations.
+
+That is preferable to making the reduction more elaborate.
+
+---
+
+# 10. Kahan should probably be an endgame mode, not a permanent tax
+
+This is the compromise I like most for your hardware.
+
+Most purification iterations are far from the f32 floor. Running Kahan during those iterations achieves nothing.
+
+So use the fast kernel until something like
+
+$$
+R_I\lesssim10^{-3}
+$$
+
+or until the residual starts flattening.
+
+Then switch P² to a **compensated-f32 kernel** for the last few iterations.
+
+If Kahan lowers
+
+$$
+10^{-5}\rightarrow10^{-6}
+$$
+
+while being, say, 1.5–2× slower, but is used for only 3 out of 25 iterations, the overall cost is tiny.
+
+This is far more sensible than either:
+
+> everything f32 forever
+
+or
+
+> everything f64 because f32 isn't accurate enough.
+
+For Kahan inside the planned kernel I would retain the four independent orbital accumulators, each with its own compensation. Whether 8 simple accumulators outperform 4 Kahan accumulators is something the RTX 3090 benchmark can decide.
+
+---
+
+# 11. Aggressive sparsity also improves f32 accuracy
+
+This connection is easy to miss.
+
+If an output scalar accumulates \(n\) terms, ordinary sequential f32 error scales roughly with \(nu\) in the pessimistic case.
+
+Reducing each row from 300 contributions to 64 does not only make the kernel faster; it makes the summation problem substantially better conditioned numerically.
+
+Your current multi-accumulator layout plus a hard degree cap around 64–128 may push the residual floor down enough that Kahan becomes unnecessary.
+
+So I would **reduce the degree before spending engineering effort on compensated arithmetic**.
+
+---
+
+# 12. Two current code issues I would fix regardless
+
+`build_hscc_dev()` still has a real fail-silent hole.
+
+The kernel contains
+
+```c
+if(nb > MAX_LEFT_BLOCKS) return;
+```
+
+but the Rust `build_hscc_dev()` launcher does not call the degree guard before enqueueing.
+
+So if H/S ever exceeded the compile-time capacity, those rows would remain unwritten/stale.
+
+Once we enforce max degree 128 this should never happen, but the guard should still be there.
+
+The second issue is the plan fallback. Both `SparseSystemWorkspace` and `SparseDWWorkspace` still implement:
+
+```rust
+Some(plan) => fast_plan_kernel
+None       => slower_intersection_kernel
+```
+
+and plan construction failures turn into `None`.
+
+For production I would remove that semantics entirely.
+
+The intersection kernel is useful as a reference test and AB benchmark. It should require an explicit diagnostic flag.
+
+---
+
+## What I would tell the coding agent to do next
+
+1. **Make sparsity a hard solver contract.** Add explicit max-degree reporting for H/S, P/K, Z and auxiliary masks. Production target initially `max_degree <= 128`, aim for ~64–96. Fail initialization if it is exceeded rather than silently enlarging the kernel.
+
+2. **Compile `MAX_LEFT_BLOCKS` from the actual production mask budget**, not the historical default 512. One program compile at engine initialization is fine. Do not implement degree buckets yet unless profiling later proves they are necessary.
+
+3. **Make the plan kernel mandatory in production.** Plan build/upload failure is an error. Keep intersection only behind an explicit diagnostic/reference switch.
+
+4. **Promote P-TC2 as the main performance candidate.** It has exactly the algebra we want: one `P_M(P²)` product per iteration and no densifying intermediate. Validate it on the wide-mask reference, then make it the default if energies/forces/frequencies pass.
+
+5. **Keep `W=2(ZH)K` as the production force path.** Do not return to the `KH→KHK` intermediate except for parity testing.
+
+6. **Shrink H/S aggressively and shrink the 1 Å skin.** The skin counts toward structural degree and plan work even where pair values are currently zero. For a Hessian with ±0.02 Å displacements the required frozen-topology skin is much smaller than 1 Å; geometry optimization can rebuild masks at explicit checkpoints instead of carrying a huge skin forever.
+
+7. **Use a modest fixed halo only where algebra genuinely needs an intermediate**, primarily `ZS` in Newton–Schulz. Never permit unrestricted `R_A+R_B` product support. Give the halo its own hard degree cap.
+
+8. **Precision order:** first test 8-way f32 partial accumulation; then add an optional compensated-f32 planned SpGEMM used only in purification endgame/final K/W products. Do not use GPU f64 for full matrix products. Convert scalar decision/reduction tails to host f64 instead.
+
+9. **Make the measurements decisive:** for each max-degree target (64, 96, 128), report wall time, plan terms, local memory/WG, \(R_Z\), \(R_I\), SCC residual, ΔE/atom, max ΔF, and finally selected vibrational frequencies versus the widest reference. That directly answers the real question: **how little connectivity can we get away with before losing the ~5% physics target?**
+
+The main architectural choice is therefore clearer to me now than in the previous review: **fixed sparse graphs win for this GPU solver**. Use threshold/halo calculations to *design and validate* those graphs, not as the routine representation of every intermediate. And the P-purifier is particularly attractive because it lets you enforce that rule without paying the large mathematical error that came from truncating \(KS\) halfway through \(KSK\).
+
+[1]: https://www.sciencedirect.com/science/article/pii/S0021999121002497?utm_source=chatgpt.com "Sparse approximate matrix-matrix multiplication for density matrix purification with error control - ScienceDirect"
+[2]: https://www.sciencedirect.com/science/article/abs/pii/S0010465518300365?utm_source=chatgpt.com "A sparse matrix–vector multiplication based algorithm for accurate density matrix computations on systems of millions of atoms - ScienceDirect"
+
+
+
+---
+
+# USER
+
+the agent did some tests but I'm not happy about the result :-( it seems we cannot use less than several hundrets of neighbors which is non acceptable it defeates the purpose it make the sparse solver kinda useless it cannot compete with dense solver this way... resp. it can copete but it will not provide clear advantage in systems which are smaller than many throuands of atoms can we do something about it? maybe some smooth daping the tails? use specifically constrained basis? we must do something about it, maybe some smooth_step damping? try to look what basis set we have available which would have effectlively shorter cutoff? (it is not commit to git yet so do not look in code) ----
+
+
+---
+
+# Chat GPT 5.6 sol
+
+Yes — I think there are still several serious ways forward, and I would **not** conclude from this sweep that sparse DFTB intrinsically needs 200–400 neighbors.
+
+What the sweep establishes is that **blind radial truncation of the current `matsci` density kernel is not compressible below ~200 neighbors without large error**. At 10 Å / degree 212 the error is already only ~0.16 mHa/atom, while 8 Å / degree 108 jumps to ~0.8 mHa/atom and K-TC2 becomes unstable.  But that mixes together three things: the physical locality of the occupied subspace, the particular nonorthogonal atomic basis, and the very crude choice “keep every atom inside a sphere”.
+
+I would attack all three before abandoning the idea.
+
+## The most promising immediate experiment: use `pbc`, not `matsci`
+
+I found a striking difference in the actual public Si parameter files.
+
+Your current `matsci` Si basis uses a harmonic confinement radius \(r_0=4.2\,a_0\) for the Si \(s,p\) functions.  Its Si–Si SKF grid is
+
+$$
+\Delta r=0.05\,a_0,\qquad N=400,
+$$
+
+so the electronic tables extend to about
+
+$$
+20\,a_0 \simeq 10.6\ \text{Å}.
+$$
+
+The `pbc` Si parameters are **much more strongly confined**. The SKF documentation says the Si \(3s,3p\) wavefunctions use confinement radius \(3.3\,a_0\), versus 4.2 in matsci.  More dramatically, the Si–Si table has
+
+$$
+\Delta r=0.02\,a_0,\qquad N=520,
+$$
+
+so its entire electronic range is only
+
+$$
+10.4\,a_0\simeq5.5\ \text{Å},
+$$
+
+roughly **half the matsci range**.  The Si–H `pbc` file has the same 10.4-\(a_0\) tabulation range.
+
+And this is not some inappropriate parameter set: the authors explicitly say the `pbc` Si parameters are good for **silicon clusters using an \(sp\) basis**.  DFTB.org lists `pbc` specifically as an SCC set for solids and surfaces containing Si/H. ([dftb.org][1])
+
+That is exactly your problem.
+
+So before doing anything elaborate I would repeat the **same R14 degree sweep with `pbc`**.
+
+I would be very interested in whether the P/K block norm decay changes. The H/S matrix certainly becomes drastically sparser; whether P becomes sufficiently shorter-ranged is the key experiment.
+
+### The available Si alternatives look like this
+
+| set        | Si basis / purpose                          | electronic table range | suitability here                                                                  |
+| ---------- | ------------------------------------------- | ---------------------: | --------------------------------------------------------------------------------- |
+| **matsci** | \(sp\), \(r_0=4.2a_0\)                      |                ~10.6 Å | current baseline; rather diffuse                                                  |
+| **pbc**    | \(sp\), wavefunction confinement \(3.3a_0\) |             **~5.5 Å** | **very promising**; explicitly used for Si clusters                               |
+| **siband** | requires Si \(d\) orbitals                  |                 ~9.5 Å | bad for our objective: larger 9-orbital Si blocks and no real repulsive potential |
+| **PTBP**   | modern minimal-basis solid-state set        |    parameter-dependent | worth testing later; also a good framework for custom reparameterization          |
+
+`siband` is interesting electronically—it was designed to reproduce Si band structure and can give the experimental-like Si gap—but its documentation requires \(d\) orbitals on Si and explicitly says there is **no usable repulsive potential**, so it cannot be used for structural optimization as-is. ([GitHub][2]) It would make your GPU problem worse anyway: 9 orbitals/Si instead of 4.
+
+`pbc` is the obvious first candidate.
+
+---
+
+## But there is another important possibility: perhaps **P is already local enough and K recovery is what kills you**
+
+I would test this before trusting the present energy sweep too much.
+
+Your P-TC2 calculation at 8 Å actually **converges nicely**, unlike K-TC2. The bad number comes from the final energy after recovering
+
+$$
+K=PZ
+$$
+
+and projecting K back onto the narrow K mask. The agent even found that K recovery inherits the finite \(ZS-I\) error and required a trace repair. 
+
+So there are two separate questions:
+
+$$
+\text{Can }P=KS\text{ be represented accurately with 64–128 neighbors?}
+$$
+
+and
+
+$$
+\text{Can }K=PZ\text{ be represented accurately with 64–128 neighbors?}
+$$
+
+The second may be substantially harder because \(S^{-1}\) has an orthogonalization tail. There is good general evidence that the spectrum of the overlap matrix can severely reduce locality of quantities involving \(S^{-1}\). ([Taylor & Francis Online][3])
+
+But we may **not need to store global K at all**.
+
+For example, the band energy can be written directly using P:
+
+$$
+E_{\rm band}
+=2\operatorname{Tr}(KH)
+=2\operatorname{Tr}(P\,Z H).
+$$
+
+You already form
+
+$$
+A=ZH
+$$
+
+for P initialization.
+
+Therefore test
+
+$$
+\boxed{E_P=2\operatorname{Tr}(P\,A)}
+$$
+
+directly, without ever constructing globally truncated \(K=PZ\).
+
+Likewise Mulliken populations are already simply
+
+$$
+q_A=2\operatorname{Tr}P_{AA}.
+$$
+
+This is a **very important diagnostic**. Take the 12 Å wide reference, then purify P with 6/8/10 Å masks and compare:
+
+$$
+E_P=2\mathrm{Tr}(PZH)
+$$
+
+against the reference **before K recovery**.
+
+If P at degree 108 is actually accurate but \(K=PZ\) at degree 108 is not, then the current conclusion “we need 200 neighbors” is misleading. The hot SCC purifier may still run at degree ~64–128; we would only construct the few K/W blocks needed for short-range force contractions afterward.
+
+That would be a major win.
+
+---
+
+# Smooth damping: useful, but not the cure by itself
+
+Your idea of a smooth step is reasonable, but I would be careful about what it can accomplish.
+
+Instead of
+
+$$
+P_{ij}\rightarrow
+\begin{cases}
+P_{ij},&r<r_c\\
+0,&r>r_c
+\end{cases}
+$$
+
+use
+
+$$
+P_{ij}\rightarrow w(r_{ij})P_{ij},
+$$
+
+with for example
+
+$$
+w=1 \qquad r<r_0
+$$
+
+and for \(x=(r-r_0)/(r_c-r_0)\),
+
+$$
+w(x)=1-\left(6x^5-15x^4+10x^3\right),
+$$
+
+then \(w=0\) beyond \(r_c\).
+
+That gives zero first and second derivative at both ends, which is exactly what I would want for Hessians.
+
+But there is a fundamental issue:
+
+> **At the same outer cutoff, smooth damping removes more density-matrix amplitude than a hard cutoff.**
+
+So I expect it may improve numerical stability and geometry smoothness, but **not recover the missing 0.7 Ha at 8 Å**. It might even make the energy bias worse.
+
+There is one situation where it becomes much more interesting: if after applying the localization window you **variationally re-optimize the retained matrix elements**.
+
+That brings me to what I think may be the deeper algorithmic solution.
+
+---
+
+# Instead of truncating the exact projector, optimize the best projector *inside the sparse space*
+
+Right now purification approximately does
+
+$$
+P_{\rm exact}\rightarrow P_M P_{\rm exact}
+$$
+
+repeatedly.
+
+When the mask is too short, you're asking an impossible question:
+
+> “Can the exact density matrix simply be chopped at 8 Å?”
+
+Apparently not.
+
+But what you really need is:
+
+> “What is the **best variational density matrix constrained to this 8 Å / 64-neighbor space**?”
+
+Those are not the same matrix.
+
+There is a classic approach designed exactly around this idea: **Li–Nunes–Vanderbilt density-matrix minimization**. Its nonorthogonal extension was explicitly constructed so that **\(S\), but not \(S^{-1}\), appears in the functional**, and the variational density matrix remains localized. ([APS Journals][4])
+
+One writes an auxiliary sparse matrix \(L\) and defines
+
+$$
+K(L)=3LSL-2LSLSL.
+$$
+
+Then instead of repeatedly purifying and truncating an exact solution, you minimize the electronic energy with respect to the **allowed sparse elements of \(L\)**. This is used in linear-scaling methods such as ONETEP; the density-kernel cutoff is a genuine variational constraint rather than an after-the-fact deletion. ([ResearchGate][5])
+
+And there is very relevant history here: early LNV linear-scaling DFT was explicitly tested on **512-atom silicon**, with the density matrix constrained to a finite localization range, and reported rapid convergence of total energy as the localization range increased. ([APS Journals][6])
+
+That makes me think this is not a crazy detour.
+
+For you I would not replace everything. I would try:
+
+$$
+\text{P-TC2}
+\rightarrow
+\text{fast initial localized state}
+$$
+
+followed by perhaps 5–15 **variational localized-DM refinement steps** on the same fixed degree-64/96/128 mask.
+
+Then the matrix inside the cutoff can adjust to compensate optimally for the missing tail.
+
+That has a much better chance of making 6–8 Å useful than simply changing hard zero to smooth zero.
+
+---
+
+# Even cheaper than LNV: test whether radial masks are simply stupid
+
+Before implementing any new solver, there is one experiment I consider essential.
+
+Take your good wide reference at \(r=12\) Å. For each atom, calculate
+
+$$
+b_{ij}=\|P_{ij}\|_F
+$$
+
+for every 4×4 block.
+
+Then construct masks containing the **largest** 32, 48, 64, 96, 128 blocks per row, symmetrized between \(i,j\), regardless of distance.
+
+Then rerun the exact same calculation with those frozen masks.
+
+This gives a crucial answer:
+
+### Case A: top-64 or top-96 works
+
+Excellent. The density matrix is compressible; **spherical radius was simply a terrible sparsifier**.
+
+This is quite plausible in tetrahedral Si. A 10 Å sphere contains hundreds of atoms, but because of bonding geometry many of their 4×4 blocks may be tiny.
+
+Then production masking can use a predictor based on:
+
+$$
+\|P_{ij}\|,\quad
+\|H_{ij}\|,\quad
+\text{bond/path connectivity},
+$$
+
+rather than Euclidean radius alone.
+
+For a Hessian, determine that graph once at the central geometry and freeze it.
+
+### Case B: even the optimum top-128 block mask fails
+
+Then the occupied projector really is not sufficiently sparse in the present atomic basis.
+
+At that point I would stop optimizing TC2 kernels. We need a different representation.
+
+This one experiment is vastly more informative than another radius sweep.
+
+---
+
+# A more radical basis change may indeed be the ultimate solution
+
+Silicon is a textbook case where the **occupied subspace has highly localized bond-centered Wannier functions** even though its density matrix in an atomic AO representation can have a rather long orthogonalization tail.
+
+So your intuition about a “specifically constrained basis” is very relevant.
+
+An on-site \(s,p\rightarrow sp^3\) rotation alone will **not** help your present BSR4 representation: a unitary transformation within each 4-orbital atom preserves
+
+$$
+\|P_{ij}\|_F,
+$$
+
+so the same atom blocks remain nonzero.
+
+But **localized bond/support orbitals optimized over several neighboring atoms** are different. This is the philosophy behind CONQUEST/ONETEP and orbital-minimization methods.
+
+For diamond Si, I would expect a basis of localized occupied bond orbitals to need perhaps a few bond shells rather than a 10–12 Å atomic density-kernel sphere.
+
+That is a larger rewrite, but if top-128 magnitude sparsification fails, I would seriously consider it instead of accepting a 400-neighbor “linear-scaling” matrix.
+
+---
+
+# Another inexpensive knob: finite electronic temperature
+
+There is also a mathematically clean way to shorten the density-matrix decay: finite electronic temperature.
+
+The density matrix is exponentially localized for insulators and also at finite temperature; estimates show its range decreases with increasing gap and temperature. ([The Hebrew University of Jerusalem][7])
+
+So if the Si sphere has small-gap surface or frontier states, a modest Fermi smearing could substantially improve locality.
+
+For example, test dense/sufficiently-wide references at
+
+$$
+k_BT=0,\ 0.02,\ 0.05,\ 0.10\ {\rm eV}
+$$
+
+and measure the radial/block decay of P.
+
+But this changes the formal problem: you should then minimize the Mermin free energy and include the electronic entropy consistently in energies/forces. Zero-temperature TC2 is no longer the correct occupation map.
+
+So I rank this below the `pbc` and top-k-mask tests.
+
+---
+
+# A purpose-built “sparse DFTB” parameterization is actually plausible
+
+If `pbc` demonstrates that stronger atomic confinement dramatically improves sparse locality while keeping acceptable Si/H physics, you could go one step further.
+
+DFTB parameters are generated from confined atomic orbitals; changing the confinement is a legitimate parameterization degree of freedom. DFTB.org explicitly describes the usual basis as minimal and the two-center electronic integrals as being generated from confined atomic calculations. ([dftb.org][8]) Modern parameterization work explicitly optimizes wavefunction confinement parameters; the recent DSKO work even treats Si confinement as an optimization variable. ([American Chemical Society Publications][9])
+
+I could imagine fitting a **sparsity-aware Si/H parameter set** with an objective like
+
+$$
+\chi^2 =
+\chi^2_{\rm energy}
++\chi^2_{\rm forces}
++\chi^2_{\rm bands}
++\lambda_{\rm loc}\,\chi^2_{\rm locality}.
+$$
+
+The locality term could penalize long-range H/S and perhaps poor conditioning of S.
+
+Keep the minimal \(sp\) Si basis—do **not** add the \(d\) shell used by siband/modern high-band-quality Si parameterizations, because that doubles the computational problem.
+
+Fit against diamond Si, strained diamond, Si clusters, Si–H bonds and H-passivated surfaces.
+
+`pbc` is already a proof that a much more confined \(sp\) Si DFTB parameterization can exist and be useful for clusters.
+
+---
+
+## What I would do next
+
+I would **not implement Kahan or more GPU micro-optimization now**. The attached results show truncation/model representation dominates f32 arithmetic by orders of magnitude. 
+
+I would run exactly these experiments, in this order:
+
+1. **Repeat the R14 sweep using `pbc` Si/H.** Measure H/S degree, P block decay, degree required for ΔE/atom and forces. This is very cheap and could completely change the picture.
+2. **On current matsci, evaluate P directly before K recovery:** compare \(2\mathrm{Tr}(PZH)\) for degree 52/108/212/386. Find out whether the long range is really P or mostly \(PZ\rightarrow K\).
+3. **From the wide reference, construct optimal magnitude masks:** top-32/48/64/96/128 \(P_{ij}\) blocks per row. This tells us whether a 64–128-neighbor representation exists at all.
+4. Only if top-k works poorly, test a **localized variational LNV refinement** on a fixed ~64–128-neighbor mask. Smooth radial damping can be included there as a localization penalty/window.
+5. If even variational sparse DM fails, then I would move to **localized occupied/support orbitals**, not accept a 400-neighbor density matrix.
+
+So I would not give up yet. In fact, the `pbc` discovery makes me considerably more optimistic: **5.5 Å versus 10.6 Å electronic range and \(r_\mathrm{wf}=3.3\) versus 4.2 bohr is a very large change in precisely the quantity we care about.** Whether it translates into P-locality needs one experiment, but it is much more promising than trying to squeeze another factor of two out of the current matsci projector with a smoothstep.
+
+[1]: https://www.dftb.org/parameters/download.html "Download — dftb.org"
+[2]: https://github.com/dftbparams/siband?utm_source=chatgpt.com "GitHub - dftbparams/siband: DFTB parameter set providing electronic parameters for accurate silicon and silicon dioxide band structures · GitHub"
+[3]: https://www.tandfonline.com/doi/full/10.1080/00268976.2020.1765034?utm_source=chatgpt.com "Full article: The spectrum of the atomic orbital overlap matrix and the locality of the virtual electronic density matrix"
+[4]: https://journals.aps.org/prb/abstract/10.1103/PhysRevB.50.17611?utm_source=chatgpt.com "Generalization of the density-matrix method to a nonorthogonal basis | Phys. Rev. B"
+[5]: https://www.researchgate.net/publication/228927861_Density_kernel_optimization_in_the_ONETEP_code?utm_source=chatgpt.com "(PDF) Density kernel optimization in the ONETEP code"
+[6]: https://journals.aps.org/prb/abstract/10.1103/PhysRevB.53.7147?utm_source=chatgpt.com "Linear-scaling density-functional-theory technique: The density-matrix approach | Phys. Rev. B"
+[7]: https://cris.huji.ac.il/en/publications/sparsity-of-the-density-matrix-in-kohn-sham-density-functional-th/?utm_source=chatgpt.com "Sparsity of the density matrix in kohn-sham density functional theory and an assessment of linear system-size scaling methods - The Hebrew University of Jerusalem"
+[8]: https://dftb.org/parameters/introduction.html?utm_source=chatgpt.com "Introduction — dftb.org"
+[9]: https://pubs.acs.org/doi/10.1021/acs.jctc.6c00121?utm_source=chatgpt.com "DSKO: Dancing through DFTB Parametrization | Journal of Chemical Theory and Computation | ACS Publications"

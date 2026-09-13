@@ -994,3 +994,41 @@ production scan still gated on USER acceptance.
 - Verified: `dftb_engine --script scripts/diag_relax_eq.rhai` with no env
   var finds the SIMULATIONS path and the GC relax converges identically
   (45 steps, max|F|=8.1e-4, max|F_gpu−F_cpu|=9.5e-6, |dE|=3.1e-6).
+
+## 2026-09-13 — GPT-5.6 work order W1–W4 implemented + verified
+
+**W1 deferred Jacobi certification.** `report_jacobi` removed from
+`eigh_solve` (it was one `queue.finish()` per SCC iteration). Diagnostics
+stay device-resident; `GpuSccPlan::check_jacobi` reads `jacobi_diag` once
+per `scc_mix_inner` / per `eval_forces_device` solve, gated by a
+`jacobi_ran` snapshot so retry-masked replicas aren't certified on stale
+records. Policy: stop=3 → Err (capacity); stop=4 nonfinite → Failed;
+stop=1 stall / stop=2 max-sweeps accepted only below the measured
+warm-residual floor else Failed. Kernel no longer zeroes off-diagonals on
+stop≠0 — the residue survives for diagnostics (`gpu_tiled_jacobi.cl`).
+
+**W2 GEMM.** `batched_gemm`: Kahan (4 serial ops/FMA) replaced by 4
+independent f32 FMA accumulators — same-or-better accuracy, shorter dep
+chain. Transposed-A loads were stride-n uncoalesced; the local-tile layout
+now follows the transpose flags (As k-major for trans_a, Bs padded col-major
+LDB=TILE_K+1 for trans_b) so all global loads are coalesced stride-1; Bs
+local-arg sizes updated at all 5 launch sites. `matmul_full_local_batched`
+got the same 4-accumulator treatment. GC relax: `|dE−CPU|` 1.5e-6→8e-7.
+
+**W3 Jacobi prec/WG A/B** (`direct_jacobi_bench`, production kernel):
+prec1/512 is fastest AND accurate — N=87: 4.37 ms vs 6.85 @256 (~1.55×);
+prec0 saves ~30% but its eig parity hits 4.7e-3 Ha at N=128 (≫1e-4 target)
+→ production keeps JACOBI_PREC=1, WG=256→512 (clamped to device limit).
+
+**W4 chunked SCC.** `diis_step_batched` now owns convergence: mutable
+`active` + `rms_tol` arg — rms<tol or nonfinite → active=0 on device, no
+host sync. New `batched_gemm_active` (shared `batched_gemm_core`) gates the
+3 SCC GEMMs; `scc_step_diis_enq` + `commit_q_next` run CHUNK=8 iterations
+back-to-back; host reads rms+active once per chunk (`read_chunk_status`).
+Stagnation window is chunk-sampled (≥8 samples). mix 1/2 keep the per-iter
+path. GC relax 45 steps: 0.370→0.306 s; batch=4 scan (diag_scc_batch):
+3×converged + honest FAILED on the stretched d=1.9 replica, masked
+warm-start retry intact through the chunked path.
+
+Tests: gpu_dftb 6/6, gpu_tiled_jacobi 4/4 (+1 ignored bench). All
+verification on NVIDIA RTX 3090.

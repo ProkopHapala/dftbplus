@@ -12,9 +12,12 @@ load_xyz("big", xyz);
 // r_trunc=8 A: matsci measured error <0.05 mHa on cube_si65 (taper [7,8] A).
 // M_HS mask = 9 A -> ~165 nbr/atom (vs ~270 at full 11.7 A table range).
 // r_k=r_z=10 A: K/Z masks -> ~285 nbr/atom (full-radius 12.7 A -> ~620 rows
-// exceeds MAX_LEFT_BLOCKS=512 local-mem cap). K truncation error is a
-// separate axis to quantify — this run tests feasibility + convergence.
-let n_orbs = sparse_new("big", sk_dir, 8.0, 1.0, 10.0, 10.0);
+// exceeds the kernel local-mem cap). K truncation error is a separate axis
+// to quantify — this run tests feasibility + convergence.
+// max_deg=384 (7th arg, §15.9 SC1): explicit degree-budget declaration —
+// ~285 > default ceilings (k≤128, z≤256), so the budget is stated, not
+// silently exceeded.
+let n_orbs = sparse_new("big", sk_dir, 8.0, 1.0, 10.0, 10.0, 384.0);
 sparse_tc2_tol("big", 1.0e-6);
 sparse_ns_tol("big", 1.0e-4);   // r_z=10 truncation floor ~2e-5 — accept explicitly
 print("n_atoms=" + itos(sparse_n_atoms("big")) + " n_orbs(padded)=" + itos(n_orbs));

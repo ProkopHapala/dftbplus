@@ -1259,3 +1259,172 @@ Supporting rules adopted:
 - Precision budget: matrices f32 FMA, 2–4 f32 accumulators; f64 ONLY
   for trace/branch, charge conservation, energy final sum, DIIS small
   solve, CPU Hessian. No Kahan in SpGEMM dots.
+
+## 2026-09-13 — Review-3 work order implemented (manifest §15.9 SC1–SC4, PR3, PR4)
+
+The third GPT-5.6 review (chat §"Chat GPT 5.6 sol" from line 4819) was
+recorded as a checkable work order in manifest §15.9 and the first-pass
+items were implemented:
+
+**Sparsity contract / kernel sizing**
+- **SC1**: `SparseDftb::with_config` measures `max_deg` of M_HS, M_K, M_Z
+  at init, prints `deg_*/budget`, and hard-`Err`s when a mask exceeds its
+  budget (`cfg.max_deg_{hs,k,z}` or env `RUST_DFTB_MAX_DEG_*`; defaults
+  512/128/256). Derived masks are clones of the three base masks.
+- **SC2**: `MAX_LEFT_BLOCKS` is now compiled from the measured degree
+  (`ceil16(max(deg_hs, deg_k, deg_z))`), not the historical 512 — e.g.
+  SiH4 gets 16 (~1.0 KiB/WG local instead of 32 KiB). Frozen topology ⇒
+  the degree cannot grow during a run.
+- **SC3**: plan-build/upload failure is a **hard error** in
+  `SparseSystemWorkspace`, `SparseDWWorkspace`, and `Tc2Workspace`. The
+  intersection kernel remains only under the explicit
+  `RUST_DFTB_SPARSE_PLANS=0` diagnostic toggle — no silent switch to the
+  slow path. New `plan_ht`: the R_H stationarity product `H_scc·(K·S)`
+  uses the generic planned gather kernel (was the only production
+  intersection-kernel product left).
+- **SC4**: `build_hscc_dev` now has the host-side degree guard — the
+  kernel's `if(nb > MAX_LEFT_BLOCKS) return;` stale-row bail can no
+  longer fire silently.
+
+**Selective precision**
+- **PR3**: `reduce_partials_f64` — GPU reductions now stop at ≤128
+  partials and finish with an f64 host sum. Applied to idempotency
+  (‖KSK−K‖², ‖P²−P‖²), NS residual (‖I−T‖²), ‖K‖/‖P‖ norms, and the
+  band energy. Every accept/reject decision scalar has an f64 tail.
+- **PR4**: `trace_kh0_dev` returns f64 (host-f64 tail) and
+  `store_energy` runs only on the converged SCC iteration (or verbose) —
+  the band-energy reduction + host sync are removed from non-final
+  iterations.
+
+**Verified:** `cargo test --release` — lib sparse 10/10,
+gpu_sparse_bsr4 23/23 (+1 intentionally ignored), sparse_dftb 1/1,
+gate_g3_energy 7/7 (+1 ignored), gate_f_geom_opt 1/1, gate_g_hessian
+1/1. Init line on SiH4: `deg_hs=5/512 deg_k=5/128 deg_z=5/256
+MAX_LEFT_BLOCKS=16 (~1.0 KiB local/WG)`.
+
+**Not done (next):** SC5/SC6 (explicit radii/smaller skin — config-level,
+needs script updates), SC7 (NS ZS halo), AL1 (P-TC2 validation→default),
+MS1–MS3 (mask calibration + degree-sweep measurements), PR1/PR2
+(8-accumulator / Kahan A-B experiments). Note: `sparse_big_nc.rhai`
+(r_k=r_z=10 Å → ~285 nbr/atom) will now trip the degree budgets — it
+needs explicit `max_deg_*` override or tighter radii, which is the
+intended contract.
+
+## 2026-09-13 (b) — SC5/SC7/PR1/AL1-prep + MS3 measured degree matrix
+
+Continued through manifest §15.9:
+
+**Done**
+- **SC7 (Z·S halo):** `SparseSystemWorkspace::new` now takes an explicit
+  `tzs_mask`; `SparseDftbConfig.r_zs_halo_ang` (default 0 = legacy
+  `M_TZS = M_Z`) builds `M_TZS = geometric(r_z + halo)`. Degree-measured,
+  budget-checked under the M_Z ceiling, included in `MAX_LEFT_BLOCKS`.
+  `plan_zs`/`plan_zh` write on it; `plan_tz`/`plan_bz` read it and
+  truncate results to `M_Z`/`M_K` — the "halo only for intermediates,
+  results always projected" contract is enforced structurally.
+- **SC5 (partial):** init prints a loud warning when all radii default to
+  the permissive full-SK-radius+skin regime. Hard-Err deferred: MS3 data
+  showed the right radius is system-dependent.
+- **PR1 (8 accumulators):** implemented on both plan kernels as `-DACC8`
+  (two FMA quads alternating over plan terms, odd-term tail into the
+  first quad). Selected via `SparseBsr4Config.spgemm_acc8` /
+  `RUST_DFTB_SPGEMM_ACC8=1`, **default OFF** — the reassociation noise
+  (~ulp in K, ~1e-4 in the FD force) trips the tight G3.4 gate. Physics
+  unchanged; needs a wall-clock A/B before promotion.
+- **AL1 (partial):** `set_purifier("k"|"p"|"trs")` + rhai
+  `sparse_purifier`. **Real bug found by the sweep:** `K=P·Z` recovery
+  inherited the ZS−I residual — `Tr(KS)` drifted 0.165/1305 at 864 atoms
+  and hard-failed the SCC Tr-gate. `recover_k_from_p` now restores
+  charge conservation (one K·S product, rescale K and T by Nocc/Tr;
+  T is linear in K) and leaves `t_ks` fresh — callers' redundant
+  `spgemm_ks` removed.
+- **MS3 (measured):** degree sweep on `si_sphere_R14` (864 atoms);
+  cube_si65 proved too small (deg saturates at n_atom=65 at every
+  radius — cannot discriminate the {64,96,128} targets). Full table in
+  manifest §15.9 MS3. Headline: **deg ~200 (r_k≈10 Å) is the usable
+  floor on Si spheres** — deg 108 SCC-limit-cycles under K-TC2, deg 52
+  converges to a state 2.1 mHa/atom wrong. New
+  `sparse_scc_try` (rms or NaN, loud stderr) lets sweeps record
+  non-convergence as data without aborting.
+
+**Tests:** `cargo test --release` — lib sparse 10/10, gpu_sparse_bsr4
+23/23(+1 ig), sparse_dftb 1/1, gate_g3_energy 7/7(+1 ig),
+gate_f_geom_opt 1/1, gate_g_hessian 1/1 — all green with ACC8 off
+(default) and trace-restore in place.
+
+**Not done:** SC6 (skin/r_trunc tightening — needs per-chemistry
+calibration), PR1 wall-clock A/B + PR2 (Kahan endgame), AL1 promotion
+(needs wide/dense reference comparison), MS1/MS2/MS4, degree-bucketed
+kernels for >512 rows.
+
+### Recommended radii (opinion, from the MS3 matrix)
+
+On matsci Si spheres the mask degree — not the kernel — sets the error:
+
+- **r_trunc (H/S) = 8 Å** — validated on cube_si65 (<0.05 mHa); Si–Si
+  coupling is ~1e-4 Ha at 7 Å, the 10.6 Å table end is not physics.
+- **r_k = r_z ≈ 10 Å (deg ~210)** — screening/energies tier:
+  0.16 mHa/atom, 3 s/SCC on R14.
+- **r_k = r_z ≈ 12 Å (deg ~390, budget 512)** — vibrational tier:
+  needed for the 1e-5 Ha/atom phonon criterion; this was the sweep
+  reference and is ~2× slower than r_k=10.
+- **deg ≤ ~110 is dead territory** for Si: non-convergent or wrong by
+  ~1 mHa/atom. The deg-64–128 ambition fails here — the fix, if any, is
+  better intermediates (M_TZS halo, MS2 magnitude-aware masks), not
+  smaller masks.
+- Radii are system-dependent; budgets + the SC5 warning are the
+  contract, not a hard-coded default.
+
+### Next on the list (priority order)
+
+1. **SC7 value test** — does `r_zs_halo_ang` = 2–4 Å recover accuracy at
+   r_k=8–10? The machinery exists; needs one sweep.
+2. **AL1 finish** — dense or full-radius reference E/F for P-TC2 vs
+   K-TC2 at deg ~390 to adjudicate the −4 mHa fixed-point difference;
+   P-TC2 is ~2× faster wall-clock and converges where K-TC2 cycles.
+3. **PR1 A/B benchmark** — wall-clock deg~200–400, ACC8 on/off.
+4. **SC6** — skin reduction (Hessian ±0.02 Å needs << 1 Å) +
+   r_trunc confirmation on the sphere (8 Å was validated on the cube).
+5. **PR2** — Kahan endgame only if the mask-floor analysis shows f32,
+   not truncation, is the binding term.
+6. **Batch-parallel driver** — the actual product: many configs on
+   frozen masks; the sparse stack is now ready for it.
+7. MS1/MS2/MS4, degree buckets (>512-row rows), as needed later.
+
+## 2026-09-13 (c) — L1: pbc basis solves the locality problem
+
+GPT-5.6 (chat §5400) noted pbc-0-3 Si is far more confined than matsci
+(r₀=3.3 vs 4.2 a₀; tables end at 5.5 Å vs 10.6 Å). Ran the R14 degree
+sweep with `pbc-0-3` (script `sparse_degree_sweep_pbc.rhai`,
+r_trunc=5.3 Å):
+
+- **Full pbc mask (r_k=0 → 6.5 Å incl. skin): deg_k=95, deg_hs=54 —
+  converges cleanly: 19 SCC iters, 537 ms, E=−845.11517 Ha.** Compare
+  matsci reference: deg 386, 7073 ms. **13× faster, 4× fewer
+  neighbors, and deg 95 is already under the 128 budget.**
+- Truncating below pbc's own table range fails: r_k=3.0–6.2 Å
+  (deg 6–52) → K-TC2 diverges (`R_I=inf`, truncated Z breaks the
+  spectral bounds) and P-TC2 plateaus at r_I~1e-2.
+- P-TC2 fails on pbc even at full mask (r_I floor ~1.5e-2) — K-TC2 is
+  the working purifier on this basis; worth investigating later.
+
+**Conclusion:** the ~200-neighbor floor was a *matsci basis* property,
+not a sparse-solver limit. The confined pbc parameterization makes the
+density matrix genuinely short-ranged.
+
+**DIRECTIVE (user, 2026-09-13): strongly prefer pbc-0-3 over matsci-0-3
+for the sparse solver.** Fewer neighbors is the single most important
+thing for performance, and pbc delivers deg 95 vs 386 by construction.
+matsci remains the reference/parity baseline only.
+
+The "can't go below the 5.5 Å table end" is what *blind radial
+truncation* showed — it is NOT a proven floor. GPT-5.6's §15.10 routes
+(L3 P-locality vs K recovery, L4 top-k magnitude masks, L5 LNV
+variational refinement on a fixed mask, L7 smooth-step windows) are
+still open and may push the working degree well below 95 — measure
+before concluding.
+
+Next required checks before trusting pbc numbers: (1) Fortran DFTB+
+parity E/F on R14 with pbc-0-3 (validate the parameterization itself);
+(2) forces/vibration quality; (3) why P-TC2 fails on pbc. Then
+L3 → L4 → L5 to push degree down further.

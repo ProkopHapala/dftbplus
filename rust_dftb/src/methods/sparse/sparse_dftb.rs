@@ -149,6 +149,22 @@ pub struct SparseDftbConfig {
     /// (default on — the parity was verified; set 0 to A/B the legacy
     /// 2KHK path).
     pub force_w_zk: Option<bool>,
+    /// Hard degree ceilings (max blocks/row) per mask — manifest §15.9 SC1.
+    /// Enforced on the MEASURED degree at init: exceeding it fails loudly,
+    /// it never silently gets a bigger kernel. `None` → env
+    /// `RUST_DFTB_MAX_DEG_{HS,K,Z}` → defaults 512 / 128 / 256. The iterate
+    /// masks (M_K, M_P, M_TKS, M_TZS — all the hot left operands) share the
+    /// M_K budget; M_Z may be wider (built once per geometry); M_HS follows
+    /// r_trunc + skin and only needs to stay under kernel sanity.
+    pub max_deg_hs: Option<u32>,
+    pub max_deg_k: Option<u32>,
+    pub max_deg_z: Option<u32>,
+    /// SC7 (manifest §15.9): modest fixed halo for the NS intermediate
+    /// M_TZS = geometric(r_z + halo). T=Z·S on the wider mask improves the
+    /// in-mask values of the later T·Z product (dropped boundary terms are
+    /// real contributions). Default 0.0 → M_TZS = M_Z (legacy). This is
+    /// the ONLY intermediate allowed a halo — bounded by the M_Z budget.
+    pub r_zs_halo_ang: f64,
 }
 
 impl Default for SparseDftbConfig {
@@ -164,6 +180,8 @@ impl Default for SparseDftbConfig {
             purifier_p: None,
             purifier_trs: None,
             force_w_zk: None,
+            max_deg_hs: None, max_deg_k: None, max_deg_z: None,
+            r_zs_halo_ang: 0.0,
         }
     }
 }
@@ -364,7 +382,19 @@ impl SparseDftb {
         } else {
             build_geometric_mask(&coords, cfg.r_z_ang.unwrap_or(r_full_ang))
         };
-        for (name, m) in [("m_hs", &m_hs), ("m_k", &m_k), ("m_z", &m_z)] {
+        // SC7 (§15.9): modest fixed halo for the NS intermediate T=Z·S.
+        // The ONLY intermediate allowed wider than its result mask — still
+        // bounded, still measured against a budget, never product support.
+        let m_tzs = if !full_mask && cfg.r_zs_halo_ang > 0.0 {
+            Some(build_geometric_mask(&coords, cfg.r_z_ang.unwrap_or(r_full_ang) + cfg.r_zs_halo_ang))
+        } else { None };
+        // SC5 (§15.9): a geometric run on ALL-default radii is the
+        // permissive regime — say so loudly (it still runs; the degree
+        // budgets below are the hard contract).
+        if !full_mask && cfg.r_trunc_ang.is_none() && cfg.r_k_ang.is_none() && cfg.r_z_ang.is_none() {
+            eprintln!("[SparseDftb] WARNING: all sparsity radii defaulted (r_trunc/r_k/r_z=None → full SK radius + skin). This is the permissive wide-mask regime — pass explicit radii for production runs (manifest §15.9 SC5).");
+        }
+        for (name, m) in [("m_hs", &m_hs), ("m_k", &m_k), ("m_z", &m_z), ("m_tzs", m_tzs.as_ref().unwrap_or(&m_z))] {
             if m.1.is_empty() {
                 return Err(DftbError::InvalidInput(format!("SparseDftb: empty BSR mask {name}")));
             }
@@ -397,10 +427,38 @@ impl SparseDftb {
             }
         }
 
-        let gpu = SparseBsr4Gpu::new(SparseBsr4Config::default())?;
+        // SC1/SC2 (manifest §15.9): measure the real row degree of every
+        // mask, enforce the degree budgets, and compile MAX_LEFT_BLOCKS
+        // from the measured maximum — the kernel's local row-cache must be
+        // sized by the masks, not by a historical 512 default. Frozen
+        // topology ⇒ the degree cannot grow during a run. The max covers
+        // every structure: all derived masks are clones of these three,
+        // and build_hscc additionally caches an M_HS row (V_j/n_orb_j).
+        let deg = |m: &(Vec<u32>, Vec<u32>)| -> u32 {
+            (0..n_atom).map(|i| m.0[i + 1] - m.0[i]).max().unwrap_or(0)
+        };
+        let deg_hs = deg(&m_hs); let deg_k = deg(&m_k); let deg_z = deg(&m_z);
+        let deg_tzs = m_tzs.as_ref().map(|m| deg(m)).unwrap_or(deg_z);
+        let env_deg = |name: &str, dflt: u32| -> u32 {
+            std::env::var(name).ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(dflt)
+        };
+        let bud_hs = cfg.max_deg_hs.unwrap_or_else(|| env_deg("RUST_DFTB_MAX_DEG_HS", 512));
+        let bud_k  = cfg.max_deg_k.unwrap_or_else(|| env_deg("RUST_DFTB_MAX_DEG_K", 128));
+        let bud_z  = cfg.max_deg_z.unwrap_or_else(|| env_deg("RUST_DFTB_MAX_DEG_Z", 256));
+        for (name, d, bud) in [("M_HS", deg_hs, bud_hs), ("M_K/M_P", deg_k, bud_k), ("M_Z", deg_z, bud_z), ("M_TZS(halo)", deg_tzs, bud_z)] {
+            if d > bud {
+                return Err(DftbError::InvalidInput(format!(
+                    "SparseDftb: {name} max row degree {d} > budget {bud} (manifest §15.9 SC1 — the sparse solver only wins if masks stay narrow). \
+                     Shrink the mask radius (r_trunc_ang / r_k_ang / r_z_ang / r_skin_ang) or raise the budget via cfg.max_deg_* / RUST_DFTB_MAX_DEG_*."
+                )));
+            }
+        }
+        let max_left = deg_hs.max(deg_k).max(deg_z).max(deg_tzs).max(16);
+        let max_left_blocks = ((max_left + 15) / 16 * 16) as i32;
+        let gpu = SparseBsr4Gpu::new(SparseBsr4Config { max_left_blocks, ..Default::default() })?;
         let h_bsr = Bsr4Matrix::from_structure(n_atom, m_hs.0.clone(), m_hs.1.clone())?;
         let s_bsr = Bsr4Matrix::from_structure(n_atom, m_hs.0.clone(), m_hs.1.clone())?;
-        let ws = SparseSystemWorkspace::new(gpu, &h_bsr, &s_bsr, &m_k, &m_z, &atom_n_orb, nocc)?;
+        let ws = SparseSystemWorkspace::new(gpu, &h_bsr, &s_bsr, &m_k, &m_z, m_tzs.as_ref(), &atom_n_orb, nocc)?;
         let dw_ws = SparseDWWorkspace::new(ws.gpu(), ws.k_struct(), ws.hs_struct(), ws.t_zs_struct())?;
 
         let n_pad = n_atom * BS;
@@ -414,8 +472,9 @@ impl SparseDftb {
         let diis_hist = cfg.diis_hist;
         let mix_alpha = cfg.mix;
         eprintln!(
-            "[SparseDftb] n_atom={n_atom} n_orbs={n_orbs} nocc={nocc} nnz_hs={} nnz_k={} nnz_z={} full_mask={full_mask} r_hs={r_hs_ang:.3} Å taper={:?} dense_diag={dense_diag}  valence_q0={q0:?}",
-            m_hs.1.len(), m_k.1.len(), m_z.1.len(), hs_taper
+            "[SparseDftb] n_atom={n_atom} n_orbs={n_orbs} nocc={nocc} nnz_hs={} nnz_k={} nnz_z={} full_mask={full_mask} r_hs={r_hs_ang:.3} Å taper={:?} dense_diag={dense_diag}  valence_q0={q0:?}\n             deg_hs={deg_hs}/{bud_hs} deg_k={deg_k}/{bud_k} deg_z={deg_z}/{bud_z} deg_tzs={deg_tzs} MAX_LEFT_BLOCKS={max_left_blocks} (~{:.1} KiB local/WG)",
+            m_hs.1.len(), m_k.1.len(), m_z.1.len(), hs_taper,
+            max_left_blocks as f64 * 64.0 / 1024.0
         );
         let mut eng = Self {
             builder, species, species_names, species_code,
@@ -461,6 +520,17 @@ impl SparseDftb {
     pub fn set_tc2_tol(&mut self, tol: f32) {
         if !(tol > 0.0) || !tol.is_finite() { panic!("set_tc2_tol: tol={tol}"); }
         self.cfg.tc2_tol = tol;
+    }
+
+    /// Select the purifier for subsequent SCC calls (AL1 A/B): "k" = legacy
+    /// K-TC2, "p" = P=KS purifier, "trs" = TRS4 on P. Explicit cfg beats env.
+    pub fn set_purifier(&mut self, mode: &str) {
+        match mode {
+            "k"   => { self.cfg.purifier_trs = Some(false); self.cfg.purifier_p = Some(false); }
+            "p"   => { self.cfg.purifier_trs = Some(false); self.cfg.purifier_p = Some(true); }
+            "trs" => { self.cfg.purifier_trs = Some(true);  self.cfg.purifier_p = Some(true); }
+            _ => panic!("set_purifier: mode '{mode}' — expected \"k\"|\"p\"|\"trs\""),
+        }
     }
     /// Diagnostic dense padded K (only when `dense_diag`; else empty).
     pub fn k_pad(&self) -> &[f32] { &self.k_pad }
@@ -664,7 +734,13 @@ impl SparseDftb {
                 )));
             }
             // Energy of the CURRENT state (q_in, K(q_in), V(q_in)) — consistent.
-            self.store_energy(tr, r_i, it + 1, tc2_iters, rms, f32::NAN, pstat)?;
+            // PR4 (manifest §15.9): E is diagnostic-only — SCC convergence
+            // runs on charge residuals, so the Tr(K·H0) reduction + host
+            // sync is computed only on the converged iteration (needed by
+            // finalize_scc → last) or in verbose mode, not every iter.
+            if rms < rms_tol || crate::methods::sparse::gpu_sparse::algebra_verbose() {
+                self.store_energy(tr, r_i, it + 1, tc2_iters, rms, f32::NAN, pstat)?;
+            }
             if crate::methods::sparse::gpu_sparse::algebra_verbose() {
                 eprintln!(
                     "  [SparseDftb SCC] iter {it:3}  rms={rms:.3e}  max|dq|={max_dq:.3e}  E_el={:.8}  E_tot={:.8}  r_I={r_i:.3e}  Tr(KS)={tr:.6}",
@@ -807,7 +883,7 @@ impl SparseDftb {
     /// Energy of the consistent state (q, K, V) — sparse masked band energy
     /// `2·Tr(K·H0)` over M_HS on device (R7); no k_to_dense/trace_ab.
     fn store_energy(&mut self, tr: f64, r_i: f32, n_scc: usize, tc2_iters: usize, r_scc: f64, r_h: f32, pstat: PurifyStatus) -> Result<()> {
-        let tr_kh0 = self.ws.trace_kh0_dev()? as f64;
+        let tr_kh0 = self.ws.trace_kh0_dev()?;
         let e_h0 = 2.0 * tr_kh0;
         let e_scc = 0.5 * self.q.iter().zip(self.q0.iter()).zip(self.v.iter())
             .map(|((a, b), vi)| (a - b) * vi).sum::<f64>();

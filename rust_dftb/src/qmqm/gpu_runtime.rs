@@ -11,7 +11,9 @@
 
 use crate::core::error::{DftbError, Result};
 use ocl::{flags, Buffer, Context, Device, Platform, Program, Queue};
-use std::collections::HashMap;
+use std::cell::{Cell, RefCell};
+use std::collections::{BTreeMap, HashMap};
+use std::time::Instant;
 
 /// Device capability information queried at startup.
 #[derive(Debug, Clone)]
@@ -30,6 +32,19 @@ pub struct GpuCapabilities {
     pub global_mem_size: u64,
 }
 
+/// Env-gated stage profiler (`RUST_DFTB_PROF=1`). Interior-mutable so the
+/// `&self` sync paths can count without signature changes. `prof_tick`
+/// inserts a `queue.finish()` — OFF by default so production never pays
+/// for extra syncs; it exists for benchmarking, not for correctness.
+#[derive(Debug, Default)]
+pub struct Prof {
+    pub enabled: bool,
+    tick: Cell<Option<Instant>>,
+    stages: RefCell<BTreeMap<&'static str, (u64, f64)>>, // name → (count, sec)
+    pub n_finish: Cell<u64>,   // queue.finish() calls (sync count)
+    pub n_read: Cell<u64>,     // blocking device→host reads
+}
+
 /// Shared OpenCL runtime. Holds context, queue, device capabilities, and
 /// a program cache keyed by source string hash.
 pub struct GpuRuntime {
@@ -38,6 +53,7 @@ pub struct GpuRuntime {
     device: Device,
     caps: GpuCapabilities,
     program_cache: HashMap<u64, Program>,
+    pub prof: Prof,
 }
 
 impl GpuRuntime {
@@ -62,6 +78,11 @@ impl GpuRuntime {
             device,
             caps,
             program_cache: HashMap::new(),
+            prof: Prof {
+                enabled: std::env::var("RUST_DFTB_PROF").map(|v| v != "0").unwrap_or(false),
+                tick: Cell::new(Some(Instant::now())),
+                ..Prof::default()
+            },
         })
     }
 
@@ -163,7 +184,9 @@ impl GpuRuntime {
 
     /// Copy a GPU buffer back to host memory (blocking).
     pub fn read_buffer<T: ocl::OclPrm>(&self, buf: &Buffer<T>, out: &mut [T]) -> Result<()> {
+        self.prof.n_read.set(self.prof.n_read.get() + 1);
         buf.read(out).enq().map_err(map_ocl_err)?;
+        self.prof.n_finish.set(self.prof.n_finish.get() + 1);
         self.queue.finish().map_err(map_ocl_err)
     }
 
@@ -175,7 +198,42 @@ impl GpuRuntime {
 
     /// Finish all queued operations (blocking).
     pub fn finish(&self) -> Result<()> {
+        self.prof.n_finish.set(self.prof.n_finish.get() + 1);
         self.queue.finish().map_err(map_ocl_err)
+    }
+
+    /// Restart the stage clock (no sync). Call once before a measured region.
+    pub fn prof_reset(&self) {
+        if self.prof.enabled { self.prof.tick.set(Some(Instant::now())); }
+    }
+
+    /// Close a measured stage: guarded `queue.finish()` then accumulate the
+    /// elapsed wall time (GPU-inclusive) under `name`. No-op when
+    /// `RUST_DFTB_PROF` is unset — the finish is benchmarking-only.
+    pub fn prof_tick(&self, name: &'static str) {
+        if !self.prof.enabled { return; }
+        self.prof.n_finish.set(self.prof.n_finish.get() + 1);
+        let _ = self.queue.finish();
+        let dt = self.prof.tick.get().map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0);
+        let mut st = self.prof.stages.borrow_mut();
+        let e = st.entry(name).or_insert((0, 0.0));
+        e.0 += 1; e.1 += dt;
+        drop(st);
+        self.prof.tick.set(Some(Instant::now()));
+    }
+
+    /// Print the accumulated stage table (sorted by time) + sync counts.
+    pub fn prof_report(&self, title: &str) {
+        if !self.prof.enabled { return; }
+        let st = self.prof.stages.borrow();
+        let mut rows: Vec<(&&'static str, &(u64, f64))> = st.iter().collect();
+        rows.sort_by(|a, b| b.1.1.partial_cmp(&a.1.1).unwrap_or(std::cmp::Ordering::Equal));
+        let total: f64 = rows.iter().map(|r| r.1.1).sum();
+        eprintln!("[prof] {title}: total={:.1} ms, finishes={} reads={}",
+            total * 1e3, self.prof.n_finish.get(), self.prof.n_read.get());
+        for (name, (cnt, sec)) in rows {
+            eprintln!("[prof]   {name:<28} {:9.3} ms  n={cnt}  ({:.1} ms/call)", sec * 1e3, sec * 1e3 / *cnt as f64);
+        }
     }
 }
 

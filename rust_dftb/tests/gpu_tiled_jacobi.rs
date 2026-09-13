@@ -253,6 +253,95 @@ fn jacobi_prec_bench() {
     }
 }
 
+/// W3 (manifest §14): A/B on the PRODUCTION direct kernel
+/// `jacobi_cyclic_global_batched` — prec ∈ {0,1} × WG ∈ {128,256,512},
+/// event-timed. The deprecated `jacobi_prec_bench` measures the tiled path;
+/// this is the kernel GpuSccPlan actually runs. Run:
+///   cargo test --release --test gpu_tiled_jacobi direct_jacobi_bench -- --ignored --nocapture
+#[test]
+#[ignore]
+fn direct_jacobi_bench() {
+    use ocl::{enums::ProfilingInfo, flags, Event, Kernel, Queue};
+    use rust_dftb::qmqm::gpu_eigen::render_tiled_source;
+
+    let Some(mut rt) = try_runtime() else { return; };
+    let queue = Queue::new(rt.context(), *rt.device(), Some(flags::CommandQueueProperties::new().profiling()))
+        .expect("profiling queue for direct Jacobi bench");
+    let repeats = 5usize;
+    for &n in &[87usize, 128] {
+        for &batch in &[1usize, 8, 19] {
+            let mut input = vec![0.0f32; batch * n * n];
+            for b in 0..batch {
+                let a = random_symmetric(n, 42 + b as u64);
+                input[b * n * n..(b + 1) * n * n].copy_from_slice(&a);
+            }
+            let orig = input.clone();
+            let src = rt.buffer_from_slice(&input).unwrap();
+            let a_buf = rt.zero_buffer::<f32>(input.len()).unwrap();
+            let v_buf = rt.zero_buffer::<f32>(input.len()).unwrap();
+            let ones = rt.buffer_from_slice(&vec![1i32; batch]).unwrap();
+            let diag_buf = rt.zero_buffer::<f32>(4 * batch).unwrap();
+            let mut ah = vec![0.0f32; input.len()];
+            let mut vh = vec![0.0f32; input.len()];
+            let mut dh = vec![0.0f32; 4 * batch];
+            for prec in [0u32, 1] {
+                for &wg in &[128usize, 256, 512] {
+                    let source = render_tiled_source(32, wg, prec);
+                    let program = match rt.build_program(&source) {
+                        Ok(p) => p,
+                        Err(e) => { eprintln!("direct prec={prec} wg={wg}: build failed {e}"); continue; }
+                    };
+                    let kernel = match Kernel::builder()
+                        .program(&program).name("jacobi_cyclic_global_batched").queue(queue.clone())
+                        .global_work_size(batch * wg).local_work_size(wg)
+                        .arg(&a_buf).arg(&v_buf).arg(n as i32).arg(batch as i32).arg(0i32)
+                        .arg(&ones).arg(&diag_buf)
+                        .build()
+                    {
+                        Ok(k) => k,
+                        Err(e) => { eprintln!("direct prec={prec} wg={wg}: kernel build failed {e} (WG limit?)"); continue; }
+                    };
+                    let mut times = Vec::new();
+                    for r in 0..=repeats {
+                        src.cmd().queue(&queue).copy(&a_buf, None, None).enq().expect("reset Jacobi input");
+                        queue.finish().expect("finish input reset");
+                        let mut ev = Event::empty();
+                        unsafe { kernel.cmd().enew(&mut ev).enq().expect("enqueue direct Jacobi"); }
+                        ev.wait_for().expect("wait direct Jacobi event");
+                        let t0 = ev.profiling_info(ProfilingInfo::Start).unwrap().time().unwrap();
+                        let t1 = ev.profiling_info(ProfilingInfo::End).unwrap().time().unwrap();
+                        assert!(t1 > t0, "invalid event timestamps N={n} prec={prec} wg={wg}");
+                        if r > 0 { times.push((t1 - t0) as f64 * 1e-3); }
+                    }
+                    times.sort_by(f64::total_cmp);
+                    a_buf.cmd().queue(&queue).read(&mut ah).enq().expect("read A");
+                    v_buf.cmd().queue(&queue).read(&mut vh).enq().expect("read V");
+                    diag_buf.cmd().queue(&queue).read(&mut dh).enq().expect("read diag");
+                    queue.finish().expect("finish reads");
+                    assert!(ah.iter().chain(vh.iter()).all(|x| x.is_finite()),
+                        "non-finite output N={n} batch={batch} prec={prec} wg={wg}");
+                    let (mut wres, mut worth, mut wpar, mut nstop) = (0.0f64, 0.0f64, 0.0f64, 0);
+                    for b in 0..batch {
+                        let a0 = &orig[b * n * n..(b + 1) * n * n];
+                        let v = &vh[b * n * n..(b + 1) * n * n];
+                        let mut eigs = vec![0.0f32; n];
+                        for i in 0..n { eigs[i] = ah[b * n * n + i * n + i]; }
+                        wres = wres.max(residual(a0, v, &eigs, n));
+                        worth = worth.max(orthogonality(v, n));
+                        let (ce, _) = cpu_eig(a0, n);
+                        let mut gs = eigs.clone(); gs.sort_by(|x, y| x.partial_cmp(y).unwrap());
+                        let mut cs = ce.clone();   cs.sort_by(|x, y| x.partial_cmp(y).unwrap());
+                        for i in 0..n { wpar = wpar.max((gs[i] as f64 - cs[i] as f64).abs()); }
+                        if dh[4 * b + 2] as i32 != 0 { nstop += 1; }
+                    }
+                    eprintln!("DIRECT N={n} batch={batch} prec={prec} wg={wg}: median_us={:.1} res={:.3e} orth={:.3e} eig_par={:.3e} bad_stop={nstop}",
+                        times[times.len() / 2], wres, worth, wpar);
+                }
+            }
+        }
+    }
+}
+
 /// A = Q·diag(eigs)·Qᵀ with Q from a random symmetric matrix's CPU eigvec.
 fn from_spectrum(n: usize, eigs: &[f64], seed: u64) -> Vec<f32> {
     let r = random_symmetric(n, seed);

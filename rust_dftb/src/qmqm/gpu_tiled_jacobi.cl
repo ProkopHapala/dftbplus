@@ -335,9 +335,16 @@ __kernel void jacobi_cyclic_global_batched(
     }
 
     // ---- Eigenvalues on the diagonal; zero the off-diagonal residue ----
-    for (int idx = lid; idx < nn; idx += lsz) {
-        int r = idx / n;
-        if (r != idx - r * n) gA[idx] = 0.0f;
+    // W1 (manifest §14): only on a converged exit — on stall/max-sweeps the
+    // residue is the diagnostic record of WHERE the solver stopped (read it
+    // back when debugging a bad replica); zeroing it on bad exits destroyed
+    // exactly the information needed. Downstream reads only the diagonal
+    // (extract_diag), so residue left on failure is safe.
+    if (stop == 0) {
+        for (int idx = lid; idx < nn; idx += lsz) {
+            int r = idx / n;
+            if (r != idx - r * n) gA[idx] = 0.0f;
+        }
     }
 }
 

@@ -2,7 +2,7 @@ const sk_dir = SK_DIR;
 const xyz = "/home/prokop/SIMULATIONS/SiNCs/DFTB/L1/cube_Si_matsci-0-3/relaxed.xyz";
 print("=== taper debug t90 ===");
 load_xyz("t90", xyz);
-sparse_new("t90", sk_dir, 9.0, 1.0);
+sparse_new("t90", sk_dir, 9.0, 1.0, 0.0, 0.0, 512.0);   // max_deg=512: default r_k/r_z exceed production budget (§15.9 SC1)
 sparse_tc2_tol("t90", 1.0e-5);
 let rms = sparse_scc("t90", 80, 1.0e-6);
 let e = sparse_eval("t90", true);

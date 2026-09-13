@@ -143,44 +143,40 @@ impl SparseDWWorkspace {
         // P4: Build symbolic plans for the two SpGEMMs.
         // Plan for T = K·H_scc: A=K (k_mask), B=H_scc (hs_mask, sym), C=T (m_tw).
         // Plan for W = T·K: A=T (m_tw), B=K (k_mask, sym), C=W (hs_mask).
-        let plan_kh = {
+        // SC3 (manifest §15.9): plan build/upload failure is a hard error —
+        // no silent switch to the slower intersection kernel. `None` is
+        // reachable only via the explicit RUST_DFTB_SPARSE_PLANS=0
+        // diagnostic toggle.
+        let plans_on = crate::methods::sparse::gpu_sparse::sparse_plans_enabled();
+        let plan_kh = if plans_on {
             let k_dummy = Bsr4Matrix::from_structure(n_atom, k_mask.0.clone(), k_mask.1.clone())?;
             let h_dummy = Bsr4Matrix::from_structure(n_atom, hs_mask.0.clone(), hs_mask.1.clone())?;
-            match build_spgemm_plan_bsym(&k_dummy, &h_dummy, &m_tw) {
-                Ok(plan) => Some(gpu.upload_plan(&plan)?),
-                Err(e) => {
-                    eprintln!("P4: plan_kh build failed, falling back to intersection: {e}");
-                    None
-                }
-            }
-        };
-        let plan_tk = {
+            let plan = build_spgemm_plan_bsym(&k_dummy, &h_dummy, &m_tw)
+                .map_err(|e| DftbError::InvalidInput(format!("plan_kh build failed (plans are mandatory in production — fix the mask or set RUST_DFTB_SPARSE_PLANS=0 for diagnostic intersection mode): {e}")))?;
+            Some(gpu.upload_plan(&plan)
+                .map_err(|e| DftbError::InvalidInput(format!("plan_kh upload failed: {e}")))?)
+        } else { None };
+        let plan_tk = if plans_on {
             let t_dummy = Bsr4Matrix::from_structure(n_atom, m_tw.0.clone(), m_tw.1.clone())?;
             let k_dummy = Bsr4Matrix::from_structure(n_atom, k_mask.0.clone(), k_mask.1.clone())?;
-            match build_spgemm_plan_bsym(&t_dummy, &k_dummy, &hs_mask) {
-                Ok(plan) => Some(gpu.upload_plan(&plan)?),
-                Err(e) => {
-                    eprintln!("P4: plan_tk build failed, falling back to intersection: {e}");
-                    None
-                }
-            }
-        };
+            let plan = build_spgemm_plan_bsym(&t_dummy, &k_dummy, &hs_mask)
+                .map_err(|e| DftbError::InvalidInput(format!("plan_tk build failed (plans are mandatory in production): {e}")))?;
+            Some(gpu.upload_plan(&plan)
+                .map_err(|e| DftbError::InvalidInput(format!("plan_tk upload failed: {e}")))?)
+        } else { None };
         // P6 (GPT-5.6 item 6): plan for W = (Z·H_scc)·K — A=ZH on M_TZS
         // (non-symmetric), B=K symmetric → Bsym plan. Valid because the
         // code's Z is S⁻¹: Z·H·K = Σ_occ εᵢ cᵢcᵢᵀ exactly (verified by
         // test_w_zhk_vs_khk_parity). One SpGEMM, no KH intermediate.
-        let plan_zk = {
+        let plan_zk = if plans_on {
             let b_dummy = Bsr4Matrix::from_structure(
                 n_atom, tzs_struct.row_ptr_host(gpu)?, tzs_struct.col_idx_host(gpu)?)?;
             let k_dummy = Bsr4Matrix::from_structure(n_atom, k_mask.0.clone(), k_mask.1.clone())?;
-            match build_spgemm_plan_bsym(&b_dummy, &k_dummy, &hs_mask) {
-                Ok(plan) => Some(gpu.upload_plan(&plan)?),
-                Err(e) => {
-                    eprintln!("P6: plan_zk build failed, falling back to intersection: {e}");
-                    None
-                }
-            }
-        };
+            let plan = build_spgemm_plan_bsym(&b_dummy, &k_dummy, &hs_mask)
+                .map_err(|e| DftbError::InvalidInput(format!("plan_zk build failed (plans are mandatory in production): {e}")))?;
+            Some(gpu.upload_plan(&plan)
+                .map_err(|e| DftbError::InvalidInput(format!("plan_zk upload failed: {e}")))?)
+        } else { None };
 
         Ok(Self { t, w, d, plan_kh, plan_tk, plan_zk })
     }

@@ -2230,3 +2230,64 @@ Use cheap uniform activity masks first. If long tails leave few active systems, 
 **Timing record:** production kernel names/build options, actual device, local/private bytes, launch counts, host allocations, transfer bytes and waits, per-stage event times, wall time, SCC/FIRE iteration distributions, warm-repair/cold counts, and final per-replica residual/status. Time initialization/JIT separately. `diag_step_cost.rhai:17–22` currently makes five geometry moves with no intervening SCC: it is not a valid BOMD/relaxation benchmark. Replace its *measurement protocol* with certified fixed-state force timings and complete SCC+FIRE steps. Report total wall time to accepted results, including declared recovery, with success/failure counts—not the fastest failed scan or only kernel FLOP/s.
 
 **Defer:** wholesale FP64, FP16/TF32/tensor-core approximations, partial-eigenspace truncation under smearing, molecule-specific damping, blanket extra SCC/Jacobi/FIRE iterations, and a monolithic persistent mega-kernel. None addresses the demonstrated stale-state defects. The fastest credible route is eliminating wrong/redundant work, exploiting batch parallelism, then using local memory and precision selectively.
+
+---
+
+## 14. Dense GPU production path — HARD architecture invariants + work order (GPT-5.6 review #2, 2026-09-13, chat 2820–3476)
+
+**Verdict:** the catastrophic hot spots are gone (direct Jacobi, warm basis, device FIRE, honest masks). Remaining wins are **eliminating synchronization points, fixing the generic GEMM, replacing atomic force accumulation, and removing residual allocation/fallback traps** — not a new eigensolver and not bulk f64. f32 accuracy is already ~µHa; the pattern to keep is `fast f32 evolution + cheap restoring projection + accurate scalar certification`.
+
+**USER amendments (binding, override the reviewer where they differ):**
+
+- Convergence control stays on the HOST, but is consulted only every **~8–10 iterations** (chunked async runs, then one compact `rms[batch]`/status read). Do **NOT** add a dedicated GPU convergence-control kernel — parallel reductions are inefficient; piggyback the residual on Mulliken/DIIS work already done and simply don't look at it every iteration.
+- A dedicated energy kernel is NOT wanted either: `E=Tr[H·ρ]` and `F=dE/dR` share the same pair machinery → **energy piggybacks inside the force evaluation** (per-atom `e_atom` output from the gather kernel; host sums only when a value is requested).
+- Fermi occupation goes further than "on GPU": **fuse μ/f_k into the Jacobi kernel tail** — its workgroup already owns the whole spectrum; a standalone kernel is wasted launch overhead.
+- **Global atomics are banned outright** — gather-only, always. "Own output → gather inputs → write once."
+- **Zero allocations/compilations in hot loops** — stated for the 20th time; now enforced by a regression counter test, not discipline.
+- **No fallback traps** — stated for the 20th time; any silent slower-path switch is a defect.
+
+### 14.A Hard invariants (a coding agent MUST NOT violate these because a simpler implementation is easier)
+
+- [ ] **I1. NO global atomics in production kernels.** `atomic_add(force[atom], …)` forbidden; global atomics require explicit USER approval. **OWN OUTPUT → GATHER INPUTS → WRITE ONCE:** atom owns force & Mulliken population, matrix tile owns its tile, replica owns SCC/DIIS state.
+- [ ] **I2. ZERO allocation/compilation in hot loops.** After `GpuDftb::new`/`GpuSccPlan::new`, SCC iters, `eval`, forces, FIRE steps and geometry updates do ZERO `Buffer`/`Kernel`/`Program`/context creation and ZERO dimension-dependent `Vec` allocation — host AND device. All scratch is persistent fields; clearing = device fill kernel, not a fresh zero-vector upload. Diagnostic-only code may allocate but must be visibly outside the hot path.
+- [ ] **I3. Automated allocation/compilation regression guard.** Counters on buffer allocs, program builds/cache misses, kernel constructions; a test snapshots them post-construction, runs SCC+force+FIRE steps, asserts no increase. Reintroducing a hot-loop alloc must fail CI, not a comment.
+- [ ] **I4. NO implicit fallbacks.** No silent CPU solver, no alternate/deprecated eigensolver, no automatic nearest-index replica re-seed, no mixer switch, no tolerance loosening, no context rebuild. `Failed` is a valid core-solver result; continuation seeding (`retry_with_seed(src,dst)`) is an explicit scan-driver operation — array index is not a physical metric.
+- [ ] **I5. Minimize kernel launches per SCC iteration.** Target ≈5–6: `q→H_scc → BᵀH → (BᵀH)B → Jacobi+occupations → Mulliken/DIIS`. Fuse operations sharing inputs/workgroup; every additional hot-loop kernel requires written justification of why it cannot be fused.
+- [ ] **I6. No host sync per iteration.** Chunked SCC (~8–10 iters async → one small status read; benchmark the chunk size). Same for FIRE steps — host polls a compact flag occasionally, not every step.
+- [ ] **I7. Fermi smearing is device-resident and fused.** μ via safeguarded Newton + in-kernel bisection fallback (Σf_k=N_occ) in the Jacobi kernel tail; f32 `exp`/weights sufficient, μ/count scalar optionally f64. FORBIDDEN: eig download → host bisection → weight upload per iteration. Integer-occupation sort is skipped entirely on the smeared path (D/W weight all columns).
+- [ ] **I8. FIRE controller fully device-resident.** `dt/α/n_pos/mode/park` are persistent per-replica device state updated by the reduction kernel that already computes P/‖v‖²/‖F‖²/maxF; `fire_apply` reads it directly. FORBIDDEN: download 4·batch stats → host decide → upload controls each step.
+- [ ] **I9. Forces are gather-based and fully fused.** Pair kernel writes `Fpair[p]` OR one WG per (replica,atom) gathers its static incident-pair list — benchmark both; each pair evaluated twice from endpoints is acceptable if it beats the extra launch/global intermediate. One pass computes `2Σ_μν [D ∂H⁰ + (V̄D−W) ∂S]` + γ′ + repulsive — never interpolate the same SK pair twice for a historically split formula. Optional f64 per-atom gather (few terms/atom, deterministic). Fix p–p register pressure: contract derivatives into 3 force components, don't materialize six 4×4 derivative matrices.
+- [ ] **I10. Energy piggybacks on forces.** The gather kernel emits `e_atom[replica][atom]`; host sums only on request. Keep Rayleigh/band energy as the numerical reference until pairwise `Tr[DH⁰]` proves equal accuracy.
+- [ ] **I11. Don't build D every SCC iteration.** Mulliken populations `q_A = 2Σ_{μ∈A}Σ_k f_k C_μk(SC)_μk` come straight from orbitals; materialize D (and W, Rayleigh repair) only for the final certified state — unless measurement proves otherwise.
+- [ ] **I12. f32 bulk; f64 only on cheap scalar decisions.** f32 storage + f32 FMA; **NO Kahan in GEMM** — 4 independent f32 accumulators + balanced sum. f64 for: DIIS small solve (pivoted QR of residual history — never square the conditioning via RᵀR), scalar energy/entropy tails, optional atom-force gather, optional μ/count scalar, convergence scalars.
+- [ ] **I13. Enforce invariants, don't widen arithmetic.** S-orthogonality of the whole warm basis `BᵀSB=I` is the invariant — monitor occasionally/on stall and apply `B←B(3I−G)/2` only when needed; certifiable via `e_new ≤ 0.75e²+0.25e³` on a submultiplicative norm (‖E‖∞ row-sum). Column-wise `snormalize` alone does not repair off-diagonal metric.
+- [ ] **I14. One production route, visibly fenced.** `GpuDftb → GpuSccPlan` is THE dense engine. Deprecated tiled Jacobi, `GpuMatrixContext`, `jacobi_batched` N>64 dispatch (currently routes to the DEPRECATED tiled kernel!), one-shot helpers, CPU-DIIS `mix==2` — marked diagnostic/deprecated; production code must not link to them.
+
+### 14.B Work order (highest payoff first)
+
+- [ ] **W1. Kill the per-iteration blocking Jacobi diagnostic read.** `eigh_solve→report_jacobi` calls `read_buffer` → `queue.finish()` every N>64 SCC iter — forcibly drains the async pipeline (P0). Keep diag on device; host reads it only at solve end or when a nonzero stop was flagged. Policy for stops: `stop=4` nonfinite → hard-fail replica; `stop=2` max-sweeps → fail unless residual within accepted f32 floor; `stop=1` warm → explicit GPU cold-solve recovery, not just a warning. Stop zeroing off-diagonals on bad exits (destroys diagnostics).
+- [ ] **W2. GEMM: remove Kahan → 4 independent f32 FMA accumulators.** Then fix the uncoalesced transposed loader (`trans_a=1` does stride-N loads; `BᵀH` runs every warm iter): remap work-item→tile so the fast index varies along memory, store transposed into `As` — or maintain `Bᵀ` and use the NN kernel. Benchmark both.
+- [ ] **W3. Direct-Jacobi precision/WG A/B on the PRODUCTION kernel** (not deprecated tiled): `JACOBI_PREC` 0 vs 1 — inputs are already f32 so f64 c/s only prevents formula rounding; if marginal, prefer f32 early sweeps + one f64 refinement sweep. WG ∈ {128,256,512(,1024)} at N≈87 — batch=19×WG=256 uses only 19/82 SMs; query kernel-specific WG limit/preferred multiple/local/register usage. Metrics: event time, HC−SCε residual, CᵀSC−I, relative PES energy, force parity, SCC iters.
+- [ ] **W4. Chunked host convergence control (per USER amendment).** Store per-replica `{active,status,rms,rms_hist,niter}` on device; enqueue ~8–10 SCC iters without host read; then one compact status read. Requires **active-gated SCC GEMM** (`batched_gemm_active`; keep ungated GEMM for Löwdin/metric work) — today done replicas still burn GEMM tiles. Do NOT add a dedicated GPU convergence kernel (USER decision) — residual rides on the Mulliken/DIIS pass.
+- [ ] **W5. Fermi μ+f_k fused into the Jacobi tail** (I7); skip the integer-occupation bitonic sort on the smeared path.
+- [ ] **W6. FIRE control device-resident** (I8) + **geometry-active mask** — parked/converged replicas must not rebuild γ, H0/S, pair geometry, metric repair while others relax.
+- [ ] **W7. Metric repair cheaper + certified on device** (I13): acceptance loop fully on GPU (currently several GEMMs + two blocking scalar reads per Newton attempt); use the `e_new ≤ 0.75e²+0.25e³` bound with a true ‖·‖∞ row-sum norm to certify small FIRE steps after BᵀSB + one BQ multiply.
+- [ ] **W8. Geometry refresh fused into H/S assembly.** PairEntry should carry template-static data only (i, j, orbital offsets, SK-table id); `assemble_pairs` computes R,r,l,m,n itself from coordinates — kills one launch + a global write/read of the dynamic pair struct. Force kernel does the same. Onsite diagonals are geometry-independent → initialize once, not per geometry.
+- [ ] **W9. Atomic-free fused forces** (I9/I10): fuse `force_pairs` + `force_pairs_scc_shift` (one SK interpolation, one pair force), remove six-way atomic scatter, gather per atom; emit `e_atom` alongside. Fix p–p register spill (contract to 3 components). Only then tune `PAIR_WG` (64→128/256 amortizes the SK table load).
+- [ ] **W10. Allocation sweep** (I2/I3): `reset_diis` → device fill not Vec+i32 upload×4; `scc_mix_inner` → persistent `hist/stagnant/done`, host-f64-DIIS arrays only when `mix==2`; energy/DIIS-status temp vectors → persistent; then the counter regression test.
+- [ ] **W11. Fallback-trap removal** (I4): move automatic failed→nearest-index re-seed out of `scc()` into the scan driver as explicit `retry_with_seed(src,dst)`; mark/route legacy APIs (I14).
+- [ ] **W12. GPU energy/residual reductions where cheap** — `{q_rms,q_max}` from one reduction (not two atom-vector downloads); `E_band`, Mermin entropy, `½Δq·V`, `q_0·V` in one WG/system f64 pass writing `double E[batch]` — but as part of W9's gather where the machinery already exists, not a new hot-loop kernel (I10).
+- [ ] **W13. DIIS f64 pivoted QR** on the residual-history matrix (few k flops/system); drop dependent history columns on the QR diagonal; reason-1 simple-mixing fallback becomes exceptional, not routine.
+
+### 14.C Precision table (frozen; f64 only where nearly free)
+
+f32: H/S/C/B/D/W/X storage, GEMM (4-acc FMA), Jacobi A/V updates, Rayleigh matvecs, Mulliken rows, pair-force algebra. f64: DIIS QR, Rayleigh final scalars (optional), energy/entropy/Δq·V reduction tails, atom-force gather (optional), μ/count scalar (optional), convergence decisions. **NOT** Kahan-in-GEMM; if a 30–100-term scalar contraction needs more, Neumaier/TwoSum there only.
+
+### 14.D Profile first (event time + host wall; GPU-event-sum vs wall reveals sync-vs-arithmetic)
+
+- [ ] GEMM Kahan vs 4×FMA · GEMM transposed-load coalescing
+- [ ] direct Jacobi prec0-vs-1 · WG 128/256/512
+- [ ] SCC host-control vs chunked
+- [ ] basis repair 5-GEMM-verified vs 3-GEMM-bounded
+- [ ] pair-force atomic vs pair-write+atom-gather vs WG-per-atom
+- [ ] stages to instrument: BᵀHB GEMM, Jacobi, Mulliken+DIIS, sync overhead, geometry assembly, metric repair, W+forces, FIRE

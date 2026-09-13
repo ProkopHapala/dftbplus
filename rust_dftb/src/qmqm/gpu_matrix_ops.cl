@@ -92,6 +92,94 @@
 // purification (D², D³), density matrix construction, and block
 // Jacobi rotation updates.
 // ------------------------------------------------------------------
+// Shared tile body — Ab/Bb/Cb already offset to this workgroup's batch.
+static void batched_gemm_core(
+    const int n,
+    const int trans_a,
+    const int trans_b,
+    const float alpha,
+    const float beta,
+    __global const float* Ab,
+    __global const float* Bb,
+    __global float* Cb,
+    __local float* As,
+    __local float* Bs
+) {
+    const int lx = get_local_id(0);
+    const int ly = get_local_id(1);
+    const int row = get_group_id(0) * TILE_M + ly;
+    const int col = get_group_id(1) * TILE_N + lx;
+
+    // W2 (manifest §14): 4 independent f32 FMA accumulators — shorter
+    // dependency chain AND better accuracy than one serial sum; Kahan here
+    // serialized every multiply and didn't move the measured error.
+    float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+    const int lid = ly * TILE_N + lx;
+    const int wg = TILE_M * TILE_N;
+
+    // Local-tile layouts follow the transpose flags so GLOBAL reads are
+    // always coalesced (consecutive lanes → consecutive addresses):
+    //   A nn : As[rr*TILE_K + kk]      trans: As[kk*TILE_M + rr]
+    //   B nn : Bs[kk*TILE_N + cc]      trans: Bs[cc*LDB + kk], LDB=TILE_K+1
+    const int LDB = TILE_K + 1;
+    // Compute-side index: element k of this thread's dot is
+    //   As[abase + k*astr] · Bs[bbase + k*bstr]
+    const int abase = trans_a ? ly : ly * TILE_K;
+    const int astr  = trans_a ? TILE_M : 1;
+    const int bbase = trans_b ? lx * LDB : lx;
+    const int bstr  = trans_b ? 1 : TILE_N;
+
+    for (int k0 = 0; k0 < n; k0 += TILE_K) {
+        if (trans_a) {
+            // consecutive t → consecutive ar → coalesced stride-1 reads
+            for (int t = lid; t < TILE_M * TILE_K; t += wg) {
+                int kk = t / TILE_M, rr = t - kk * TILE_M;
+                int ar = get_group_id(0) * TILE_M + rr, ac = k0 + kk;
+                As[kk * TILE_M + rr] = (ar < n && ac < n) ? Ab[ac * n + ar] : 0.0f;
+            }
+        } else {
+            for (int t = lid; t < TILE_M * TILE_K; t += wg) {
+                int rr = t / TILE_K, kk = t - rr * TILE_K;
+                int ar = get_group_id(0) * TILE_M + rr, ac = k0 + kk;
+                As[rr * TILE_K + kk] = (ar < n && ac < n) ? Ab[ar * n + ac] : 0.0f;
+            }
+        }
+        if (trans_b) {
+            for (int t = lid; t < TILE_K * TILE_N; t += wg) {
+                int cc = t / TILE_K, kk = t - cc * TILE_K;
+                int br = k0 + kk, bc = get_group_id(1) * TILE_N + cc;
+                Bs[cc * LDB + kk] = (br < n && bc < n) ? Bb[bc * n + br] : 0.0f;
+            }
+        } else {
+            for (int t = lid; t < TILE_K * TILE_N; t += wg) {
+                int kk = t / TILE_N, cc = t - kk * TILE_N;
+                int br = k0 + kk, bc = get_group_id(1) * TILE_N + cc;
+                Bs[kk * TILE_N + cc] = (br < n && bc < n) ? Bb[br * n + bc] : 0.0f;
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        if (row < n && col < n) {
+            int kk = 0;
+            for (; kk + 4 <= TILE_K; kk += 4) {
+                s0 = fma(As[abase + kk       * astr], Bs[bbase + kk       * bstr], s0);
+                s1 = fma(As[abase + (kk + 1) * astr], Bs[bbase + (kk + 1) * bstr], s1);
+                s2 = fma(As[abase + (kk + 2) * astr], Bs[bbase + (kk + 2) * bstr], s2);
+                s3 = fma(As[abase + (kk + 3) * astr], Bs[bbase + (kk + 3) * bstr], s3);
+            }
+            for (; kk < TILE_K; ++kk) {
+                s0 = fma(As[abase + kk * astr], Bs[bbase + kk * bstr], s0);
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    if (row < n && col < n) {
+        int idx = row * n + col;
+        Cb[idx] = alpha * ((s0 + s1) + (s2 + s3)) + beta * Cb[idx];
+    }
+}
+
 __kernel void batched_gemm(
     const int n,
     const int batch,
@@ -105,64 +193,35 @@ __kernel void batched_gemm(
     __local float* As,
     __local float* Bs
 ) {
-    const int lx = get_local_id(0);
-    const int ly = get_local_id(1);
-    const int row = get_group_id(0) * TILE_M + ly;
-    const int col = get_group_id(1) * TILE_N + lx;
     const int ib = get_group_id(2);
     if (ib >= batch) return;
-
     const int stride = n * n;
-    __global const float* Ab = A + ib * stride;
-    __global const float* Bb = B + ib * stride;
-    __global float* Cb = C + ib * stride;
+    batched_gemm_core(n, trans_a, trans_b, alpha, beta,
+        A + ib * stride, B + ib * stride, C + ib * stride, As, Bs);
+}
 
-    float sum = 0.0f;
-    float kahan_c = 0.0f; // f32 Kahan across K (not f64 GEMM — that reverted: worse E, DIIS blowup)
-    const int lid = ly * TILE_N + lx;
-    const int wg = TILE_M * TILE_N;
-
-    for (int k0 = 0; k0 < n; k0 += TILE_K) {
-        for (int t = lid; t < TILE_M * TILE_K; t += wg) {
-            int rr = t / TILE_K;
-            int kk = t - rr * TILE_K;
-            int ar = get_group_id(0) * TILE_M + rr;
-            int ac = k0 + kk;
-            float v = 0.0f;
-            if (ar < n && ac < n) {
-                v = trans_a ? Ab[ac * n + ar] : Ab[ar * n + ac];
-            }
-            As[t] = v;
-        }
-        for (int t = lid; t < TILE_K * TILE_N; t += wg) {
-            int kk = t / TILE_N;
-            int cc = t - kk * TILE_N;
-            int br = k0 + kk;
-            int bc = get_group_id(1) * TILE_N + cc;
-            float v = 0.0f;
-            if (br < n && bc < n) {
-                v = trans_b ? Bb[bc * n + br] : Bb[br * n + bc];
-            }
-            Bs[t] = v;
-        }
-        barrier(CLK_LOCAL_MEM_FENCE);
-
-        if (row < n && col < n) {
-            for (int kk = 0; kk < TILE_K; ++kk) {
-                float prod = As[ly * TILE_K + kk] * Bs[kk * TILE_N + lx];
-                float y = prod - kahan_c;
-                float t = sum + y;
-                kahan_c = (t - sum) - y;
-                sum = t;
-            }
-        }
-        barrier(CLK_LOCAL_MEM_FENCE);
-    }
-
-    if (row < n && col < n) {
-        int idx = row * n + col;
-        Cb[idx] = alpha * sum + beta * Cb[idx];
-    }
+// W4 (manifest §14): SCC-path variant — replicas with active[ib]==0 exit
+// before loading any tile, so a converged replica stops paying for GEMM
+// work inside an un-interrupted chunk. Identical output to batched_gemm.
+__kernel void batched_gemm_active(
+    const int n,
+    const int batch,
+    const int trans_a,
+    const int trans_b,
+    const float alpha,
+    const float beta,
+    __global const float* A,
+    __global const float* B,
+    __global float* C,
+    __local float* As,
+    __local float* Bs,
+    __global const int* active
+) {
+    const int ib = get_group_id(2);
+    if (ib >= batch || active[ib] == 0) return;
+    const int stride = n * n;
+    batched_gemm_core(n, trans_a, trans_b, alpha, beta,
+        A + ib * stride, B + ib * stride, C + ib * stride, As, Bs);
 }
 
 // ------------------------------------------------------------------
@@ -661,14 +720,22 @@ __kernel void matmul_full_local_batched(
     barrier(CLK_LOCAL_MEM_FENCE);
 
     // Strided output: each thread computes N²/WG elements.
+    // W2: 4 independent f32 FMA accumulators — shorter dependency chain AND
+    // better accuracy than one serial sum (no Kahan: it serialized every FMA).
     for (int idx = lid; idx < n * n; idx += lsz) {
         int r = idx / n;
         int c = idx - r * n;
-        float sum = 0.0f;
-        for (int k = 0; k < n; ++k) {
-            sum += LA[r * ld + k] * LB[k * ld + c];
+        const __local float* Ar = LA + r * ld;
+        float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+        int k = 0;
+        for (; k + 4 <= n; k += 4) {
+            s0 = fma(Ar[k],     LB[k       * ld + c], s0);
+            s1 = fma(Ar[k + 1], LB[(k + 1) * ld + c], s1);
+            s2 = fma(Ar[k + 2], LB[(k + 2) * ld + c], s2);
+            s3 = fma(Ar[k + 3], LB[(k + 3) * ld + c], s3);
         }
-        Cb[r * n + c] = sum;
+        for (; k < n; ++k) s0 = fma(Ar[k], LB[k * ld + c], s0);
+        Cb[r * n + c] = (s0 + s1) + (s2 + s3);
     }
 }
 
@@ -1461,7 +1528,10 @@ __kernel void diis_step_batched(
     __global int* diis_flag,     // [batch] fallback counter
     __global int* diis_reason,   // [batch] last fallback reason
     __global float* rms,         // [batch]
-    __global const int* active,  // [batch] 0 → replica frozen, early-out
+    __global int* active,        // [batch] 0 → replica frozen; W4: also WRITTEN —
+                                 // rms < rms_tol or non-finite → active = 0 (device-side
+                                 // convergence so the host can run chunked iterations)
+    const float rms_tol,         // SCC convergence tolerance (f32 copy of the host tol)
     __local float* scratch       // workgroup scratch (≥ lsz)
 ) {
     const int sid = get_group_id(0);
@@ -1502,8 +1572,13 @@ __kernel void diis_step_batched(
     if (lid == 0) {
         buf_idx[sid] = (idx + 1) % DIIS_MAX_HIST;
         if (nf < DIIS_MAX_HIST) n_filled[sid] = nf + 1;
+        // W4: mark convergence on-device. !(r >= tol) also catches NaN/Inf —
+        // a nonfinite replica must not keep iterating. The mix below and the
+        // commit gate on the same flag, so nothing downstream consumes it.
+        if (!(rms[sid] >= rms_tol)) active[sid] = 0;
     }
     barrier(CLK_GLOBAL_MEM_FENCE | CLK_LOCAL_MEM_FENCE);
+    if (active[sid] == 0) return;   // converged/invalid this step: skip the mix
 
     int n = n_filled[sid];
 

@@ -12,7 +12,7 @@ let e0 = 0.0;
 for r_trunc in [0.0, 9.0, 8.0, 7.0, 6.0, 5.0] {
     let name = "t" + itos((r_trunc * 10.0).to_int());
     load_xyz(name, xyz);
-    sparse_new(name, sk_dir, r_trunc, 1.0);
+    sparse_new(name, sk_dir, r_trunc, 1.0, 0.0, 0.0, 512.0);   // max_deg=512: default r_k/r_z exceed production budget (§15.9 SC1)
     sparse_tc2_tol(name, 1.0e-5);
     let rms = sparse_scc(name, 80, 1.0e-6);
     let e = sparse_eval(name, true);

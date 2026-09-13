@@ -102,6 +102,7 @@ pub struct SparseSystemWorkspace {
     plan_tz: Option<SpgemmPlanGpu>,  // T·Z → M_Z (NS Q = ZSZ)
     plan_zh: Option<SpgemmPlanGpu>,  // Z·H → M_TZS (K0 B = Z·H)
     plan_bz: Option<SpgemmPlanGpu>,  // B·Z → M_K (K0 A = ZHZ)
+    plan_ht: Option<SpgemmPlanGpu>,  // H·T → M_HT (R11 stationarity residual, generic plan)
 
     // ── Atom-level buffers ──
     v_buf: Buffer<f32>,      // atom potentials V[N] for device Hscc (R13)
@@ -127,6 +128,9 @@ pub struct SparseSystemWorkspace {
     reduce_partial: Buffer<f32>,
     reduce_a: Buffer<f32>,
     reduce_b: Buffer<f32>,
+    /// Host staging for the f64 reduction tail (PR3, §15.9): ≤128 partials
+    /// downloaded once, summed in f64. Persistent — no per-iter alloc.
+    reduce_tail_host: Vec<f32>,
 
     // Host scratch for K download (`k_values_host`, force/energy diagnostics).
     k_host: Vec<f32>,
@@ -185,6 +189,12 @@ impl SparseSystemWorkspace {
         s: &Bsr4Matrix,
         k_mask: &(Vec<u32>, Vec<u32>),
         z_mask: &(Vec<u32>, Vec<u32>),
+        // SC7 (manifest §15.9): optional modest fixed halo for the NS
+        // intermediate T=Z·S — `Some(m)` uses it for M_TZS, `None` clones
+        // M_Z (legacy). The halo improves in-mask T values (dropped terms
+        // near the M_Z boundary feed in-mask products); never the full
+        // product support.
+        tzs_mask: Option<&(Vec<u32>, Vec<u32>)>,
         n_orb: &[u8],
         nocc: f32,
     ) -> Result<Self> {
@@ -214,7 +224,7 @@ impl SparseSystemWorkspace {
         // diagonal blocks (always in-mask), and the dropped off-diagonal
         // terms are bounded by the same K-decay that justifies M_K itself.
         let m_t_ks = m_k.clone();
-        let m_t_zs = m_z.clone();
+        let m_t_zs = tzs_mask.cloned().unwrap_or_else(|| m_z.clone());
         // A = H·(KS) for the stationarity residual R_H (R11) — evaluated on
         // M_K, consistent with R_I (M_K) and R_Z (M_Z): the residual is
         // masked like the algebra it diagnoses. (product(M_HS,M_K) is NOT
@@ -272,22 +282,17 @@ impl SparseSystemWorkspace {
         let qpack_host = vec![0.0f32; 2 * n_atom];
 
         // Build symbolic plans for all recurring SpGEMMs.
+        // SC3 (manifest §15.9): plan kernels are MANDATORY in production —
+        // a build/upload failure is a hard error, never a silent switch to
+        // the many-times-slower intersection kernel. `None` is reachable
+        // only via the explicit diagnostic toggle RUST_DFTB_SPARSE_PLANS=0.
         let plans_on = crate::methods::sparse::gpu_sparse::sparse_plans_enabled();
-        let build_plan = |a: &Bsr4Matrix, b: &Bsr4Matrix, c_mask: &(Vec<u32>, Vec<u32>), label: &str| -> Option<SpgemmPlanGpu> {
-            if !plans_on { return None; }   // RUST_DFTB_SPARSE_PLANS=0 AB toggle
-            match build_spgemm_plan_bsym(a, b, c_mask) {
-                Ok(plan) => match gpu.upload_plan(&plan) {
-                    Ok(gpu_plan) => Some(gpu_plan),
-                    Err(e) => {
-                        eprintln!("P4: {label} plan upload failed, falling back to intersection: {e}");
-                        None
-                    }
-                },
-                Err(e) => {
-                    eprintln!("P4: {label} plan build failed, falling back to intersection: {e}");
-                    None
-                }
-            }
+        let build_plan = |a: &Bsr4Matrix, b: &Bsr4Matrix, c_mask: &(Vec<u32>, Vec<u32>), label: &str| -> Result<Option<SpgemmPlanGpu>> {
+            if !plans_on { return Ok(None); }   // RUST_DFTB_SPARSE_PLANS=0 diagnostic toggle
+            let plan = build_spgemm_plan_bsym(a, b, c_mask)
+                .map_err(|e| DftbError::InvalidInput(format!("{label} plan build failed (plans are mandatory in production — fix the mask or set RUST_DFTB_SPARSE_PLANS=0 for diagnostic intersection mode): {e}")))?;
+            gpu.upload_plan(&plan).map(Some)
+                .map_err(|e| DftbError::InvalidInput(format!("{label} plan upload failed: {e}")))
         };
 
         let k_dummy = Bsr4Matrix::from_structure(n_atom, m_k.0.clone(), m_k.1.clone())?;
@@ -296,12 +301,20 @@ impl SparseSystemWorkspace {
         let t_ks_dummy = Bsr4Matrix::from_structure(n_atom, m_t_ks.0.clone(), m_t_ks.1.clone())?;
         let t_zs_dummy = Bsr4Matrix::from_structure(n_atom, m_t_zs.0.clone(), m_t_zs.1.clone())?;
 
-        let plan_ks = build_plan(&k_dummy, &hs_dummy, &m_t_ks, "plan_ks");
-        let plan_tk = build_plan(&t_ks_dummy, &k_dummy, &m_k, "plan_tk");
-        let plan_zs = build_plan(&z_dummy, &hs_dummy, &m_t_zs, "plan_zs");
-        let plan_tz = build_plan(&t_zs_dummy, &z_dummy, &m_z, "plan_tz");
-        let plan_zh = build_plan(&z_dummy, &hs_dummy, &m_t_zs, "plan_zh");
-        let plan_bz = build_plan(&t_zs_dummy, &z_dummy, &m_k, "plan_bz");
+        let plan_ks = build_plan(&k_dummy, &hs_dummy, &m_t_ks, "plan_ks")?;
+        let plan_tk = build_plan(&t_ks_dummy, &k_dummy, &m_k, "plan_tk")?;
+        let plan_zs = build_plan(&z_dummy, &hs_dummy, &m_t_zs, "plan_zs")?;
+        let plan_tz = build_plan(&t_zs_dummy, &z_dummy, &m_z, "plan_tz")?;
+        let plan_zh = build_plan(&z_dummy, &hs_dummy, &m_t_zs, "plan_zh")?;
+        let plan_bz = build_plan(&t_zs_dummy, &z_dummy, &m_k, "plan_bz")?;
+        // plan_ht: A = H_scc·(K·S) on M_HT for the R_H stationarity
+        // residual (R11). T is non-symmetric → generic plan kernel.
+        let plan_ht = if plans_on {
+            let plan = crate::methods::sparse::bsr4::build_spgemm_plan(&hs_dummy, &t_ks_dummy, &m_ht)
+                .map_err(|e| DftbError::InvalidInput(format!("plan_ht build failed (plans are mandatory in production): {e}")))?;
+            Some(gpu.upload_plan(&plan)
+                .map_err(|e| DftbError::InvalidInput(format!("plan_ht upload failed: {e}")))?)
+        } else { None };
 
         // ── P = K·S purifier buffers (GPT-5.6 item 4) ──
         // M_P = M_K for the prototype (same sparsity class as the legacy
@@ -317,15 +330,12 @@ impl SparseSystemWorkspace {
         let p_to_tzs = gpu.buf_i32(&p_to_tzs_host)?;
         let p_dummy = Bsr4Matrix::from_structure(n_atom, m_p.0.clone(), m_p.1.clone())?;
         let plan_pp = if plans_on {
-            match crate::methods::sparse::bsr4::build_spgemm_plan(&p_dummy, &p_dummy, &m_p) {
-                Ok(plan) => match gpu.upload_plan(&plan) {
-                    Ok(gpu_plan) => Some(gpu_plan),
-                    Err(e) => { eprintln!("P4: plan_pp upload failed, falling back to masked SpGEMM: {e}"); None }
-                },
-                Err(e) => { eprintln!("P4: plan_pp build failed, falling back to masked SpGEMM: {e}"); None }
-            }
+            let plan = crate::methods::sparse::bsr4::build_spgemm_plan(&p_dummy, &p_dummy, &m_p)
+                .map_err(|e| DftbError::InvalidInput(format!("plan_pp build failed (plans are mandatory in production): {e}")))?;
+            Some(gpu.upload_plan(&plan)
+                .map_err(|e| DftbError::InvalidInput(format!("plan_pp upload failed: {e}")))?)
         } else { None };
-        let plan_pz = build_plan(&p_dummy, &z_dummy, &m_k, "plan_pz");
+        let plan_pz = build_plan(&p_dummy, &z_dummy, &m_k, "plan_pz")?;
 
         // Reduction scratch buffers.
         let trace_atom = gpu.zero_f32(n_atom)?;
@@ -346,6 +356,7 @@ impl SparseSystemWorkspace {
         let reduce_partial = gpu.zero_f32(reduce_len)?;
         let reduce_a = gpu.zero_f32(reduce_len)?;
         let reduce_b = gpu.zero_f32(reduce_len)?;
+        let reduce_tail_host = vec![0.0f32; crate::methods::sparse::gpu_sparse::SparseBsr4Gpu::REDUCE_TAIL];
         let k_host = vec![0.0f32; k_struct.nblock * BS2];
         let a_ht_host = vec![0.0f32; ht_struct.nblock * BS2];
         let s_inf = inf_norm(s); // may be 0 at construction if S is a zero placeholder
@@ -398,6 +409,7 @@ impl SparseSystemWorkspace {
             trace_atom_host,
             residual_buf,
             ksq_buf,
+            reduce_tail_host,
             emin_buf,
             emax_buf,
             gersh_emin,
@@ -420,6 +432,7 @@ impl SparseSystemWorkspace {
             p_best,
             plan_pp,
             plan_pz,
+            plan_ht,
             p_to_tzs,
             p_valid: false,
         })
@@ -478,17 +491,16 @@ impl SparseSystemWorkspace {
         )
     }
 
-    /// Sparse masked band energy `Tr(K·H0)` on device (R7) — one reduction
-    /// + one scalar read, no `k_to_dense`/`trace_ab`. Caller multiplies by 2
-    /// (spin) and adds E_scc/E_rep.
-    pub fn trace_kh0_dev(&mut self) -> Result<f32> {
-        self.gpu.trace_hk_to_dev(
+    /// Sparse masked band energy `Tr(K·H0)` on device (R7) — f32 partials
+    /// + host-f64 tail (PR3/PR4, §15.9): this is an extensive sum with
+    /// cancellation, so the final reduction is done in f64, not collapsed
+    /// to one f32 scalar. No `k_to_dense`/`trace_ab`. Caller multiplies by
+    /// 2 (spin) and adds E_scc/E_rep.
+    pub fn trace_kh0_dev(&mut self) -> Result<f64> {
+        self.gpu.trace_hk_to_f64(
             self.hs_struct.nblock, &self.h0.values, &self.k.values, &self.hs_to_kt,
-            &self.reduce_partial, &self.reduce_a, &self.reduce_b, &self.residual_buf,
-        )?;
-        let mut tr = [0.0f32; 1];
-        self.gpu.read_f32(&self.residual_buf, &mut tr)?;
-        Ok(tr[0])
+            &self.reduce_partial, &self.reduce_a, &self.reduce_b, &mut self.reduce_tail_host,
+        )
     }
 
     /// Hamiltonian stationarity residual (R11):
@@ -501,7 +513,12 @@ impl SparseSystemWorkspace {
             self.spgemm_ks();
             self.t_ks_valid = true;
         }
-        self.gpu.spgemm_masked_dev(&self.h_scc, &self.t_ks, &self.a_ht)?;
+        // A = H_scc·T on M_HT — generic planned SpGEMM (T non-symmetric).
+        // None only under the explicit RUST_DFTB_SPARSE_PLANS=0 diagnostic.
+        match &self.plan_ht {
+            Some(plan) => self.gpu.spgemm_plan_dev(&self.h_scc, &self.t_ks, plan, &self.a_ht)?,
+            None => self.gpu.spgemm_masked_dev(&self.h_scc, &self.t_ks, &self.a_ht)?,
+        }
         self.gpu.read_f32(&self.a_ht.values, &mut self.a_ht_host)?;
         // ‖A − Aᵀ‖ and ‖A‖ on host f64 over M_HT.
         let rp = &self.m_ht.0;
@@ -631,11 +648,12 @@ impl SparseSystemWorkspace {
     /// Compute Z ≈ S⁻¹ via Newton-Schulz on persistent GPU buffers.
     ///
     /// Products use the precomputed symbolic plans `plan_zs`/`plan_tz`
-    /// (intersection kernel fallback if plan build failed). Residual is
-    /// `||I−T||_F/√N` measured **on the device** — `identity_residual_to_dev`
-    /// writes the *squared* norm into `residual_buf`, one scalar read per
-    /// iteration (the N4 bug was a missing sqrt in the old scalar path, plus
-    /// stale off-diagonal Z after a diagonal-only identity write).
+    /// (mandatory — plan-build failure is a construction error, SC3;
+    /// intersection kernel only under the explicit SPARSE_PLANS=0 toggle).
+    /// Residual is `||I−T||_F/√N` from device f32 partials + host-f64 tail
+    /// (PR3 — `identity_residual_to_f64`), one ≤128-float read per
+    /// iteration (the N4 bug was a missing sqrt in the old scalar path,
+    /// plus stale off-diagonal Z after a diagonal-only identity write).
     ///
     /// `warm`: if true, keep the persistent Z from the previous geometry and
     /// NS-correct it against the new S (one step gives ≈ Z − Z·δS·Z, the
@@ -667,14 +685,14 @@ impl SparseSystemWorkspace {
                     Some(plan) => self.gpu.spgemm_plan_bsym_dev(&self.z, &self.s, plan, &self.t_zs)?,
                     None => self.gpu.spgemm_bsym_dev(&self.z, &self.s, &self.t_zs)?,
                 }
-                // ||I−T||² → device scalar → one host read; sqrt on host.
-                self.gpu.identity_residual_to_dev(
+                // ||I−T||² → f32 partials + host-f64 tail (PR3) — the
+                // residual drives the NS accept decision; sqrt + normalize
+                // in f64 on host.
+                let r2 = self.gpu.identity_residual_to_f64(
                     &self.t_zs_struct, &self.t_zs.values,
-                    &self.reduce_partial, &self.reduce_a, &self.reduce_b, &self.residual_buf,
+                    &self.reduce_partial, &self.reduce_a, &self.reduce_b, &mut self.reduce_tail_host,
                 )?;
-                let mut r2 = [0.0f32; 1];
-                self.gpu.read_f32(&self.residual_buf, &mut r2)?;
-                rz = r2[0].sqrt() / n_orb.sqrt();
+                rz = (r2.sqrt() / n_orb as f64) as f32;
                 if crate::methods::sparse::gpu_sparse::algebra_verbose() {
                     eprintln!("  Newton-Schulz (workspace) iter {iter}: R_Z = {rz:e}  (device ||I−T||_F/√N)");
                 }
@@ -800,13 +818,11 @@ impl SparseSystemWorkspace {
     pub fn tc2_purify(&mut self, max_iter: usize, tol: f32, check_every: usize) -> Result<(PurifyStatus, f32, f64, usize)> {
         // Normalization scale: ‖K‖_F of the incoming K (K0 or previous
         // iterate — drifts little during purification).
-        self.gpu.frob_sq_to_dev(
+        let ksq = self.gpu.frob_sq_to_f64(
             self.k_struct.nblock * BS2, &self.k.values,
-            &self.reduce_partial, &self.reduce_a, &self.reduce_b, &self.ksq_buf,
+            &self.reduce_partial, &self.reduce_a, &self.reduce_b, &mut self.reduce_tail_host,
         )?;
-        let mut ksq = [0.0f32; 1];
-        self.gpu.read_f32(&self.ksq_buf, &mut ksq)?;
-        let k_norm = ksq[0].sqrt().max(1e-30);
+        let k_norm = (ksq.sqrt() as f32).max(1e-30);
 
         let nocc64 = self.nocc as f64;
         let tol_tr = crate::methods::sparse::gpu_sparse::tc2_trace_tol(nocc64);
@@ -911,14 +927,12 @@ impl SparseSystemWorkspace {
                 None => self.gpu.spgemm_bsym_dev(&self.t_ks, &self.k, &self.q)?,
             }
             if do_check {
-                self.gpu.idempotency_to_dev(
+                let ri_sq = self.gpu.idempotency_to_f64(
                     self.k.struct_.nblock, &self.q.values, &self.k.values,
-                    &self.reduce_partial, &self.reduce_a, &self.reduce_b, &self.residual_buf,
+                    &self.reduce_partial, &self.reduce_a, &self.reduce_b, &mut self.reduce_tail_host,
                 )?;
                 let tr = tr_eff;
-                let mut ri_sq = [0.0f32; 1];
-                self.gpu.read_f32(&self.residual_buf, &mut ri_sq)?;
-                let ri = ri_sq[0].sqrt() / k_norm;
+                let ri = (ri_sq.sqrt() as f32) / k_norm;
                 if !ri.is_finite() {
                     return Err(DftbError::InvalidInput(format!(
                         "TC2 residual non-finite at iter {iter}: R_I={}", ri
@@ -1079,13 +1093,11 @@ impl SparseSystemWorkspace {
     /// symmetrize step. Same f64-trace/guard/plateau machinery as
     /// `tc2_purify` — the restoring invariant is identical (Tr(P)≈Nocc).
     pub fn tc2_purify_p(&mut self, max_iter: usize, tol: f32, check_every: usize) -> Result<(PurifyStatus, f32, f64, usize)> {
-        self.gpu.frob_sq_to_dev(
+        let p_sq = self.gpu.frob_sq_to_f64(
             self.p_struct.nblock * BS2, &self.p.values,
-            &self.reduce_partial, &self.reduce_a, &self.reduce_b, &self.ksq_buf,
+            &self.reduce_partial, &self.reduce_a, &self.reduce_b, &mut self.reduce_tail_host,
         )?;
-        let mut p_sq = [0.0f32; 1];
-        self.gpu.read_f32(&self.ksq_buf, &mut p_sq)?;
-        let p_norm = p_sq[0].sqrt().max(1e-30);
+        let p_norm = (p_sq.sqrt() as f32).max(1e-30);
 
         let nocc64 = self.nocc as f64;
         let tol_tr = crate::methods::sparse::gpu_sparse::tc2_trace_tol(nocc64);
@@ -1163,14 +1175,12 @@ impl SparseSystemWorkspace {
             }
 
             if do_check {
-                self.gpu.idempotency_to_dev(
+                let ri_sq = self.gpu.idempotency_to_f64(
                     self.p_struct.nblock, &self.q_p2.values, &self.p.values,
-                    &self.reduce_partial, &self.reduce_a, &self.reduce_b, &self.residual_buf,
+                    &self.reduce_partial, &self.reduce_a, &self.reduce_b, &mut self.reduce_tail_host,
                 )?;
                 let tr = tr_eff;
-                let mut ri_sq = [0.0f32; 1];
-                self.gpu.read_f32(&self.residual_buf, &mut ri_sq)?;
-                let ri = ri_sq[0].sqrt() / p_norm;
+                let ri = (ri_sq.sqrt() as f32) / p_norm;
                 if !ri.is_finite() {
                     return Err(DftbError::InvalidInput(format!(
                         "P-TC2 residual non-finite at iter {iter}: R_I={ri}"
@@ -1256,13 +1266,11 @@ impl SparseSystemWorkspace {
     /// takes a TC2 branch step instead. No guard needed — the trace is
     /// reset by construction every iteration.
     pub fn trs_purify_p(&mut self, max_iter: usize, tol: f32, check_every: usize) -> Result<(PurifyStatus, f32, f64, usize)> {
-        self.gpu.frob_sq_to_dev(
+        let p_sq = self.gpu.frob_sq_to_f64(
             self.p_struct.nblock * BS2, &self.p.values,
-            &self.reduce_partial, &self.reduce_a, &self.reduce_b, &self.ksq_buf,
+            &self.reduce_partial, &self.reduce_a, &self.reduce_b, &mut self.reduce_tail_host,
         )?;
-        let mut p_sq = [0.0f32; 1];
-        self.gpu.read_f32(&self.ksq_buf, &mut p_sq)?;
-        let p_norm = p_sq[0].sqrt().max(1e-30);
+        let p_norm = (p_sq.sqrt() as f32).max(1e-30);
 
         let nocc64 = self.nocc as f64;
         let tol_tr = crate::methods::sparse::gpu_sparse::tc2_trace_tol(nocc64);
@@ -1328,13 +1336,11 @@ impl SparseSystemWorkspace {
             };
 
             if do_check {
-                self.gpu.idempotency_to_dev(
+                let ri_sq = self.gpu.idempotency_to_f64(
                     nblock, &self.q_p2.values, &self.p.values,
-                    &self.reduce_partial, &self.reduce_a, &self.reduce_b, &self.residual_buf,
+                    &self.reduce_partial, &self.reduce_a, &self.reduce_b, &mut self.reduce_tail_host,
                 )?;
-                let mut ri_sq = [0.0f32; 1];
-                self.gpu.read_f32(&self.residual_buf, &mut ri_sq)?;
-                let ri = ri_sq[0].sqrt() / p_norm;
+                let ri = (ri_sq.sqrt() as f32) / p_norm;
                 if !ri.is_finite() {
                     return Err(DftbError::InvalidInput(format!(
                         "TRS4 residual non-finite at iter {iter}: R_I={ri}"
@@ -1421,9 +1427,7 @@ impl SparseSystemWorkspace {
             eprintln!("  bounds (ZH Gershgorin, H_scc): emin={emin:.4} emax={emax:.4}  [TRS4]");
         }
         let out = self.trs_purify_p(tc2_max, tc2_tol, 1)?;
-        self.recover_k_from_p()?;
-        self.spgemm_ks();
-        self.t_ks_valid = true;
+        self.recover_k_from_p()?;   // leaves fresh t_ks (t_ks_valid)
         let (r_i_k, tr_ks) = self.recovered_k_diagnostics()?;
         Ok((out.0, r_i_k, tr_ks, out.3))
     }
@@ -1431,13 +1435,43 @@ impl SparseSystemWorkspace {
     /// Recover K = P·Z on M_K (P non-symmetric left, Z symmetric right →
     /// the Bsym plan applies). K is symmetrized once — P·Z is symmetric to
     /// within the P- and Z-residuals. Needed by the energy/force path.
+    ///
+    /// Charge-conservation restore: K=P·Z inherits the ZS−I residual, so
+    /// Tr(KS) drifts off Nocc by O(R_Z) — at 864 atoms / wide masks that
+    /// was 6× the SCC trace gate (measured: Tr=1304.835 vs Nocc=1305).
+    /// Same invariant enforcement as the TC2 trace guard: build T=K·S once,
+    /// rescale K ← K·(Nocc/Tr) and T ← T·(Nocc/Tr) (T is linear in K).
+    /// Leaves `t_ks` FRESH and valid — callers must not rebuild it.
     fn recover_k_from_p(&mut self) -> Result<()> {
         match &self.plan_pz {
             Some(plan) => self.gpu.spgemm_plan_bsym_dev(&self.p, &self.z, plan, &self.k)?,
             None => self.gpu.spgemm_bsym_dev(&self.p, &self.z, &self.k)?,
         }
         self.gpu.symmetrize_dev(self.k_struct.nblock, &self.k_struct.transpose_block(), &self.k.values)?;
-        self.t_ks_valid = false;
+        self.spgemm_ks();
+        let tr = self.gpu.trace_ks_f64(
+            &self.t_ks_struct, &self.t_ks.values, &self.n_orb_buf,
+            &self.trace_atom, &mut self.trace_atom_host,
+        )?;
+        if !tr.is_finite() || tr.abs() < 1e-30 {
+            return Err(DftbError::InvalidInput(format!(
+                "recover_k_from_p: Tr(KS)={tr} non-finite/zero — cannot restore charge"
+            )));
+        }
+        let scale = (self.nocc as f64 / tr) as f32;
+        if !scale.is_finite() {
+            return Err(DftbError::InvalidInput(format!(
+                "recover_k_from_p: scale=Nocc/Tr={scale} non-finite (Tr={tr})"
+            )));
+        }
+        if (scale - 1.0).abs() > 1e-7 {
+            if crate::methods::sparse::gpu_sparse::algebra_verbose() {
+                eprintln!("  K-recovery trace restore: Tr(KS)={tr:.6} → rescale K,T by {scale:.8}");
+            }
+            self.gpu.scale_dev(self.k_struct.nblock, scale, &self.k.values)?;
+            self.gpu.scale_dev(self.t_ks_struct.nblock, scale, &self.t_ks.values)?;
+        }
+        self.t_ks_valid = true;
         Ok(())
     }
 
@@ -1452,14 +1486,13 @@ impl SparseSystemWorkspace {
             eprintln!("  bounds (ZH Gershgorin, H_scc): emin={emin:.4} emax={emax:.4}");
         }
         let out = self.tc2_purify_p(tc2_max, tc2_tol, 1)?;
-        self.recover_k_from_p()?;
         // Consistent finalization: the reported (K,q) state must come from
         // the SAME matrix or the SCC energy is evaluated off-stationarity —
         // q from P while K=PZ leaves an O(ZS−I) inconsistency that leaks
         // into FD-vs-analytic force parity (measured ~5e-4 on SiH4 G3.4).
-        // One K·S product per SCC iteration; Mulliken then reads t_ks.
-        self.spgemm_ks();
-        self.t_ks_valid = true;
+        // recover_k_from_p builds T=K·S once (needed for the trace restore)
+        // and leaves it fresh — Mulliken then reads t_ks.
+        self.recover_k_from_p()?;   // leaves fresh t_ks (t_ks_valid)
         let (r_i_k, tr_ks) = self.recovered_k_diagnostics()?;
         Ok((out.0, r_i_k, tr_ks, out.3))
     }
@@ -1477,30 +1510,25 @@ impl SparseSystemWorkspace {
             &self.t_ks_struct, &self.t_ks.values, &self.n_orb_buf,
             &self.trace_atom, &mut self.trace_atom_host,
         )?;
-        self.gpu.frob_sq_to_dev(
+        let ksq = self.gpu.frob_sq_to_f64(
             self.k_struct.nblock * BS2, &self.k.values,
-            &self.reduce_partial, &self.reduce_a, &self.reduce_b, &self.ksq_buf,
+            &self.reduce_partial, &self.reduce_a, &self.reduce_b, &mut self.reduce_tail_host,
         )?;
         // Q = (K·S)·K = KSK on M_K — reuses the tc2_purify Q buffer/plan.
         match &self.plan_tk {
             Some(plan) => self.gpu.spgemm_plan_bsym_dev(&self.t_ks, &self.k, plan, &self.q)?,
             None => self.gpu.spgemm_bsym_dev(&self.t_ks, &self.k, &self.q)?,
         }
-        self.gpu.idempotency_to_dev(
+        let ri_sq = self.gpu.idempotency_to_f64(
             self.k_struct.nblock, &self.q.values, &self.k.values,
-            &self.reduce_partial, &self.reduce_a, &self.reduce_b, &self.residual_buf,
+            &self.reduce_partial, &self.reduce_a, &self.reduce_b, &mut self.reduce_tail_host,
         )?;
-        let mut ksq = [0.0f32; 1];
-        let mut ri_sq = [0.0f32; 1];
-        self.gpu.read_f32(&self.ksq_buf, &mut ksq)?;
-        self.gpu.read_f32(&self.residual_buf, &mut ri_sq)?;
-        if !tr.is_finite() || !ri_sq[0].is_finite() || !ksq[0].is_finite() {
+        if !tr.is_finite() || !ri_sq.is_finite() || !ksq.is_finite() {
             return Err(DftbError::InvalidInput(format!(
-                "recovered-K diagnostics non-finite: Tr(KS)={tr} ||KSK−K||²={} ||K||²={}",
-                ri_sq[0], ksq[0]
+                "recovered-K diagnostics non-finite: Tr(KS)={tr} ||KSK−K||²={ri_sq} ||K||²={ksq}"
             )));
         }
-        let r_i = ri_sq[0].sqrt() / ksq[0].sqrt().max(1e-30);
+        let r_i = (ri_sq.sqrt() / ksq.sqrt().max(1e-30)) as f32;
         if crate::methods::sparse::gpu_sparse::algebra_verbose() {
             eprintln!("  recovered-K: R_I(K)={r_i:.4e}  Tr(KS)={tr:.6}  (state feeding q/E)");
         }
@@ -1727,7 +1755,7 @@ mod tests {
         let s = make_overlap_bsr4(n_atom, &mask, 99);
 
         let all4 = vec![4u8; n_atom];
-        let mut ws = SparseSystemWorkspace::new(gpu, &h0, &s, &mask, &mask, &all4, nocc).unwrap();
+        let mut ws = SparseSystemWorkspace::new(gpu, &h0, &s, &mask, &mask, None, &all4, nocc).unwrap();
 
         // Run full SCC pipeline. r_I is the RELATIVE residual ‖KSK−K‖/‖K‖ (R12).
         let (charges, q_dum, status, r_i, tr, iters) = ws.run_scc(30, 1e-4, 40, 1e-5, 1).unwrap();
@@ -1771,7 +1799,7 @@ mod tests {
         let h0 = random_symmetric_bsr4(n_atom, &mask, 42);
         let s = make_overlap_bsr4(n_atom, &mask, 99);
         let all4 = vec![4u8; n_atom];
-        let mut ws = SparseSystemWorkspace::new(gpu, &h0, &s, &mask, &mask, &all4, nocc).unwrap();
+        let mut ws = SparseSystemWorkspace::new(gpu, &h0, &s, &mask, &mask, None, &all4, nocc).unwrap();
         let (rz_reported, iters) = ws.compute_z(30, 1e-4, 3, false).unwrap();
 
         // Recompute T = Z·S and measure the same residual two ways.
@@ -1815,7 +1843,7 @@ mod tests {
         let h0 = random_symmetric_bsr4(n_atom, &mask, 42);
         let s1 = make_overlap_bsr4(n_atom, &mask, 99);
         let all4 = vec![4u8; n_atom];
-        let mut ws = SparseSystemWorkspace::new(gpu, &h0, &s1, &mask, &mask, &all4, nocc).unwrap();
+        let mut ws = SparseSystemWorkspace::new(gpu, &h0, &s1, &mask, &mask, None, &all4, nocc).unwrap();
 
         let (rz1, it1) = ws.compute_z(30, 1e-4, 3, false).unwrap();
         println!("geom1 cold: {it1} iters R_Z={rz1:e}");
@@ -1860,7 +1888,7 @@ mod tests {
         let s = make_overlap_bsr4(n_atom, &mask, 99);
 
         let all4 = vec![4u8; n_atom];
-        let mut ws = SparseSystemWorkspace::new(gpu, &h0, &s, &mask, &mask, &all4, nocc).unwrap();
+        let mut ws = SparseSystemWorkspace::new(gpu, &h0, &s, &mask, &mask, None, &all4, nocc).unwrap();
 
         // First run.
         let (_, _, _, r_i1, tr1, _) = ws.run_scc(30, 1e-4, 60, 1e-5, 1).unwrap();
@@ -1918,7 +1946,7 @@ mod tests {
         let h0 = random_symmetric_bsr4(n_atom, &mask, 42);
         let s = make_overlap_bsr4(n_atom, &mask, 99);
         let all4 = vec![4u8; n_atom];
-        let mut ws = SparseSystemWorkspace::new(gpu, &h0, &s, &mask, &mask, &all4, nocc).unwrap();
+        let mut ws = SparseSystemWorkspace::new(gpu, &h0, &s, &mask, &mask, None, &all4, nocc).unwrap();
         ws.upload_h_scc(&h0).unwrap();
         let (rz, _) = ws.compute_z(30, 1e-4, 3, false).unwrap();
         println!("NS inverse: R_Z={rz:e}");
@@ -1974,7 +2002,7 @@ mod tests {
         let h0 = random_symmetric_bsr4(n_atom, &mask, 42);
         let s = make_overlap_bsr4(n_atom, &mask, 99);
         let all4 = vec![4u8; n_atom];
-        let mut ws = SparseSystemWorkspace::new(gpu, &h0, &s, &mask, &mask, &all4, nocc).unwrap();
+        let mut ws = SparseSystemWorkspace::new(gpu, &h0, &s, &mask, &mask, None, &all4, nocc).unwrap();
 
         let (_, _, st, r_i, tr, _) = ws.run_scc(30, 1e-4, 60, 1e-5, 1).unwrap();
         println!("K-TC2 baseline: status={st:?} R_I={r_i:e} Tr={tr:.6}");

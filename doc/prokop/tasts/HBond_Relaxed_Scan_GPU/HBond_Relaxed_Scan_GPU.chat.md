@@ -2810,3 +2810,839 @@ One final scientific housekeeping point: the later labbook notes a 1–2 Ha CPU/
 The immediate work order I would enforce is therefore: **cached SCC state → direct-global Jacobi → warm AO basis → active mask → fix smeared free energy/W → only then secondary micro-optimizations.**
 
 [1]: https://docs.nvidia.com/cuda/cusolver/index.html?highlight=cholesky&utm_source=chatgpt.com "1. Introduction — cuSOLVER 13.4 documentation"
+
+
+
+
+
+
+
+---
+
+# USER
+
+please analyse recent changes  in code primarily in
+https://github.com/ProkopHapala/dftbplus/tree/main/rust_dftb/src/qmqm
+https://github.com/ProkopHapala/dftbplus/blob/main/rust_dftb/src/qmqm/gpu_scc_plan.rs
+https://github.com/ProkopHapala/dftbplus/blob/main/rust_dftb/src/qmqm/gpu_tiled_jacobi.cl
+end report/notes in
+https://github.com/ProkopHapala/dftbplus/blob/main/doc/prokop/tasts/HBond_Relaxed_Scan_GPU/HBond_Relaxed_Scan_GPU.labbook.md
+
+suggest what are the biggest architectureal problems, optimization opportunitie, and how we can adress limitations of f32 precisions efficiently by some hybrid f64 appoach or better Kahan error compensating sum without hampering the performance. Make sure we remove all stupid fallback, allocation of buffers and compilation of kernels in hot loops and also eliminate unnecessary CPU-GPU data transfer, also that the lernels are optimally using local memory and workgroup sizes, and does not suffer by other issues hampering performance
+
+
+
+---
+
+# Chat GPT 5.6 sol
+
+I reviewed the current `main` dense path, including the recent A1–A4/B1–B2/R1–R5 work in the labbook. The code is in a much better state than at `55ddb4c`: the catastrophic 83 ms tiled Jacobi has been bypassed by the direct cyclic solver, SCC has a proper `q_gpu/q_next` commit model, the AO eigenbasis is warm-started, early-converged replicas are masked correctly, W has its own state-validity mask, Mermin smearing is now physically consistent with a smeared f64 CPU reference, and FIRE is device-resident and much more defensible. The reported GC batch-19 warm SCC around 1.3 ms and GPU↔CPU energies around \(10^{-6}\) Ha show that the basic scientific architecture is now working.
+
+The main conclusion has changed accordingly: **the dominant opportunities are no longer “invent a better eigensolver” or “use more f64.” They are eliminating synchronization points, making the generic GEMM genuinely fast, reducing unnecessary matrix repair work, and replacing nondeterministic atomic force accumulation.** The existing f32 accuracy is already considerably better than needed for screening H-bond PESs; the correct strategy is to enforce invariants and use tiny f64 reductions, not to widen bulk matrix arithmetic.
+
+## What I would change next
+
+1. **Remove the blocking Jacobi diagnostic read from every SCC iteration. This is now a P0 performance bug.** `eigh_solve()` calls `report_jacobi()` immediately after every N>64 H eigensolve. `report_jacobi()` downloads `jacobi_diag`, and `GpuRuntime::read_buffer()` explicitly calls `queue.finish()`. So every otherwise asynchronous SCC iteration is forcibly drained immediately after Jacobi.
+
+   Keep the excellent `{off, off/frob, stop, sweeps}` diagnostics, but leave them on device. A tiny SCC-control kernel should inspect the Jacobi stop record together with the charge residual and update per-replica state. Only read the diagnostics when a solve ends or when a nonzero stop is actually detected. For S-Jacobi, which occurs only on exceptional cold geometry rebuilding, a blocking check is fine.
+
+   Also change the policy for nonzero Jacobi stops. At present the code warns and still consumes the eigenvectors/eigenvalues. `stop=4` nonfinite must hard-fail that replica. `stop=2` max-sweep should fail unless the achieved residual is explicitly within an accepted f32 floor. `stop=1` on a warm solve may trigger a **GPU cold solve**, but that must be an explicit numerical recovery, not merely a warning. The direct kernel currently zeros the residual off-diagonal even on bad exits, which destroys useful diagnostic information.
+
+2. **Move the SCC convergence controller onto the GPU. Right now you still synchronize CPU↔GPU once or more per iteration.** `scc_step_diis()` reads the entire RMS vector every iteration; the host then decides which systems are done, uploads a new `active` mask, and enqueues `q_next→q_gpu`.   The bytes transferred are tiny, but the latency/queue serialization is the problem.
+
+   Add one persistent device-side SCC-control record per system:
+
+   $$
+   \{\text{active,status,rms,rms-history,niter}\}.
+   $$
+
+   At the end of an SCC iteration a tiny kernel should classify convergence/plateau/failure, update `active`, and commit `q_next` only for replicas which need another iteration.
+
+   Then enqueue SCC iterations in chunks of perhaps 4 without any host read. After a chunk, read only a small global `n_active/status` record. Once all heavy kernels respect `active`, iterations after a replica converges are practically free. This can later become 8–16 queued iterations if profiling supports it.
+
+   This requires an **active-gated SCC GEMM** as well. Right now the Jacobi/density/etc. kernels exit for inactive systems, but the GEMM tiles still run. Make a dedicated `batched_gemm_active` for the SCC path; keep the existing ungated GEMM for Löwdin/metric work.
+
+3. **The current generic `batched_gemm` should lose Kahan summation.** This is one of the clearest remaining “accuracy fix that hurts speed without solving the real error.” Every multiply currently does Kahan:
+
+   $$
+   y=p-c,\quad t=s+y,\quad c=(t-s)-y.
+   $$
+
+   That serializes the inner product, prevents an optimal FMA dependency structure, and adds several instructions per multiply. The earlier experiments already found generic GEMM Kahan did not cure the electronic error—the successful fixes were normalization, Rayleigh quotients and metric restoration.
+
+   Use four independent FP32 FMA accumulators:
+
+   ```c
+   s0 = fma(a0,b0,s0);
+   s1 = fma(a1,b1,s1);
+   s2 = fma(a2,b2,s2);
+   s3 = fma(a3,b3,s3);
+   ...
+   sum = (s0+s1) + (s2+s3);
+   ```
+
+   This simultaneously reduces dependency-chain latency and usually improves summation accuracy over one long FP32 accumulator.
+
+   There is an additional potentially large GEMM problem: **transposed operands are currently loaded uncoalesced**. For `trans_a=1`, consecutive loader threads effectively access `A[ac*n+ar]`, i.e. stride-N addresses. The warm SCC path performs \(B^T H\) every iteration, so this matters directly.
+
+   For the transposed loader, change the work-item→tile mapping so `ar` varies fastest in global memory, then store the values transposed into `As`. Alternatively maintain `Bᵀ` explicitly and use the fast NN GEMM. Benchmark both. I suspect this plus removing Kahan will be a substantial fraction of the next speedup.
+
+4. **Re-profile the direct Jacobi with pure f32 rotations now. The old “prec0 is bad” conclusion was about a substantially different solver.** The new direct solver is mathematically much cleaner: stable \(t\)-formula, absolute norm-scaled convergence, relative pair skipping, warm input and Rayleigh/normalization repair. Its current production mode still computes every \(c,s\) with f64 sqrt/div while the entire WG waits.
+
+   Importantly, `app`, `aqq`, and `apq` are already f32. Casting them to double cannot recover information that was lost when the matrix was stored; it only prevents additional rounding in the scalar formula.
+
+   Benchmark the **production direct kernel**, not deprecated tiled Jacobi, with `JACOBI_PREC=0` and `1` on AT/GC/AZA. Compare event time, generalized residual, \(C^TSC-I\), relative PES energy, force parity and SCC iteration count. The latest direct-kernel tests already show N=87 residuals around \(10^{-6}\) and orthogonality around \(10^{-7}\) in the current implementation.
+
+   If pure f32 is marginal, I would prefer “f32 early sweeps + one high-precision refinement sweep” over f64 rotations throughout. But first test pure f32: I think there is a good chance the current Rayleigh/metric restoration makes it sufficient.
+
+   Also benchmark WG = 128, 256, 512 and possibly 1024 for N≈87. With batch=19, one-WG/system fundamentally activates only 19 of 82 SMs; a larger WG may at least provide more warps and memory-level parallelism on each active SM. The direct kernel has little local-memory pressure compared with the old tiled kernel, so 512 is quite plausible. Query the **kernel-specific** workgroup limit, preferred multiple, local memory and private/register allocation rather than relying only on device defaults.
+
+5. **Treat S-orthogonality of the entire warm basis as the invariant—not just individual column normalization.** The warm formulation
+
+   $$
+   A=B^THB
+   $$
+
+   is exact only when
+
+   $$
+   B^TSB=I.
+   $$
+
+   `snormalize_batched` repairs \(b_k^TSb_k=1\) independently, which is useful but does not repair off-diagonal \(b_i^TSb_j\).
+
+   Jacobi rotations should preserve the metric if B starts good, so I would not pay for a full polar repair every SCC iteration. Instead monitor the full metric occasionally or when SCC/Jacobi stalls, and apply
+
+   $$
+   G=B^TSB,\qquad
+   B\leftarrow B(3I-G)/2
+   $$
+
+   only when required. This is the right kind of f32 correction: **restore the invariant**, rather than increasing precision everywhere.
+
+   The geometry-change basis repair is mathematically sensible but currently expensive: each Newton attempt performs several GEMMs and then two blocking scalar-array reads.  Move the acceptance loop completely onto the GPU.
+
+   There is also a useful cheap bound. If
+
+   $$
+   G=I+E,\qquad Q=I-E/2,
+   $$
+
+   then
+
+   $$
+   Q^TGQ-I=-\frac34E^2+\frac14E^3.
+   $$
+
+   Hence with a submultiplicative norm \(e=\|E\|\),
+
+   $$
+   e_{\rm new}\le 0.75e^2+0.25e^3.
+   $$
+
+   If the initial metric defect is \(2.7\times10^{-3}\), this bound is roughly \(5.5\times10^{-6}\). You can therefore certify many small FIRE geometry updates after **BᵀSB + one BQ multiply**, without recomputing \(B_1^TSB_1\). Use a true matrix infinity/row-sum norm if you want to rely rigorously on this bound.
+
+6. **Move Fermi occupation completely onto the GPU.** Smearing currently downloads all eigenvalues every SCC iteration, runs 80 f64 host bisection iterations per replica, then uploads all weights.  The algorithm is scientifically correct now—the Mermin \(-TS\) term and weighted Rayleigh values have been fixed—but this is still an unnecessary host synchronization.
+
+   One WG/system can solve μ directly. I would use safeguarded Newton:
+
+   $$
+   N(\mu)=\sum_k f_k,\qquad
+   N'(\mu)=\frac1{kT}\sum_k f_k(1-f_k).
+   $$
+
+   Parallelize the two sums over the ~87 states. Usually 5–8 iterations should suffice; retain a bracket and fall back to bisection *inside the same GPU kernel* when Newton leaves it.
+
+   FP32 `exp` and weights are sufficient here. If you want a precision island, keep only μ and the final particle-count reduction in f64. Eight GPU iterations are preferable to 80 host iterations plus two PCIe synchronizations.
+
+   In the smeared path you can also skip the bitonic integer occupation sort entirely: D and W use all orbitals weighted by \(f_k\), so sorting is irrelevant unless requested for diagnostics.
+
+7. **Move final energy and residual reductions onto GPU, using f64 exactly where it is cheap.** `energy_from_state()` presently downloads `eig_diag`, `eig_rho`, `occ_mask`, \(\Delta q\cdot V\), \(q_0\cdot V\), and repulsive energy, and allocates several host vectors every call. `charge_residual()` downloads the full q and q_D vectors.
+
+   This is an ideal hybrid-f64 target. One WG/system should calculate in f64:
+
+   $$
+   E_{\rm band}=2\sum f_k\rho_k,
+   $$
+
+   the Mermin entropy,
+
+   $$
+   \tfrac12\Delta q\cdot V,\qquad q_0\cdot V,
+   $$
+
+   and add \(E_{\rm rep}\). Only one `double E[batch]` needs to reach the host.
+
+   Similarly make one GPU reduction return `{q_rms,q_max}`. There is no need to transfer two atom-sized vectors merely to calculate two scalars.
+
+   This is where f64 is nearly free and actually scientifically valuable. It is much better than f64 GEMM.
+
+8. **The FIRE loop is device-resident, but the adaptive controller still round-trips every step.** `fire_step()` downloads \(4\times batch\) floats, performs dt/α decisions on CPU in f64, uploads \(4\times batch\) controls, and then applies the step on GPU.  This is far better than downloading forces/coordinates, but at a millisecond-scale target the synchronization itself becomes relevant.
+
+   Put `dt`, `alpha`, `n_pos`, and mode permanently on device. The reduction kernel can update them directly after P, \(\|v\|^2\), \(\|F\|^2\), maxF are known. These are exactly the tiny scalar decisions where f64 on the GPU is acceptable if you want it. Then `fire_apply` consumes the device control structure directly.
+
+   The host only needs a compact global “all relaxed?” flag/maxF every few steps or at the end.
+
+   Also add a **geometry-active mask**. Once one scan replica has converged/parked, do not rebuild its γ, H0/S, pair geometry or metric repair every FIRE step while other replicas continue.
+
+9. **Fuse geometry refresh with H/S assembly and, later, with force evaluation.** Current geometry assembly first writes dynamic `r,l,m,n` into every `PairEntry`, then later assembly reads those values back from global memory.  For ≤30 atoms this intermediate representation is unnecessary.
+
+   Store only template-static pair data:
+
+   $$
+   i,j,\text{orbital offsets},\text{SK table id}.
+   $$
+
+   `assemble_pairs` should load the two coordinates and calculate \(R,r,l,m,n\) itself. The force kernel can do exactly the same. This removes a kernel launch and global write/read of the dynamic pair structure.
+
+   Also, onsite diagonal values are geometry independent. Initialize those once instead of launching an onsite kernel every geometry unless some future model actually changes them.
+
+10. **The force kernels should be the next numerical+performance cleanup after GEMM.** `force_pairs` computes the non-SCC term and atomically scatters six components; `force_pairs_scc_shift` separately recomputes \(dS/dR\) and performs another six atomics.  The formula naturally combines:
+
+    $$
+    F_{ij}
+    =
+    2\sum_{\mu\nu}
+    \left[
+      D_{\mu\nu}\frac{\partial H^0_{\mu\nu}}{\partial R}
+      +
+      \left(\bar V D_{\mu\nu}-W_{\mu\nu}\right)
+      \frac{\partial S_{\mu\nu}}{\partial R}
+    \right].
+    $$
+
+    Fuse those first. One interpolation/derivative evaluation, one pair-force result.
+
+    More importantly, get rid of atomic force accumulation. Have the pair kernel write one `float3 Fpair[p]`; a second atom-owned kernel gathers all incident pair forces using a static pair→atom adjacency list. That gives deterministic summation, avoids CAS loops and makes a tiny **f64 per-atom gather** possible. An atom has only a few tens of incident pairs, so accumulating those in double then storing f32 is vastly cheaper than doing f64 inside the SK derivative algebra.
+
+    There is another likely performance issue in the p–p force path: each work-item declares many `float4[4]` derivative arrays for H and S. That is well over a hundred scalar floats before compiler optimization and risks register spilling/private-memory traffic. The block values themselves are often not even consumed. Rewrite the p–p routine to **contract derivatives directly into the three force components** rather than materializing six 4×4 derivative matrices.
+
+    Only after that tune `PAIR_WG`. The current 64-thread WG reloads the SK table for every WG. A 128/256-thread WG amortizes that load better, but private-register pressure must be fixed first.
+
+11. **Remove the remaining allocations from normal solver control.** There are still small but unnecessary allocations once the code is supposed to run in milliseconds. `reset_diis()` allocates a fresh `Vec<i32>` and uploads it to four buffers every geometry. Replace that with device `fill(0)` operations or one reset kernel.
+
+    Production `scc_mix_inner()` also creates `hist`, `stagnant`, `done`, and even the host-f64-DIIS work arrays on every solve although production uses GPU DIIS.  Once SCC control is device-side most of these disappear. Until then, make them persistent fields and allocate the host-DIIS arrays only when `mix==2`.
+
+    The same applies to energy and DIIS-status temporary vectors.
+
+    Diagnostic `measure()` can allocate freely; it is not the hot path.
+
+12. **Eliminate the remaining architectural “fallback traps.”** I do not see a silent CPU fallback in the current production `GpuDftb` dense path, which is good. The CPU DIIS route is explicitly selected by `mix==2` and batch=1. But there are still three traps worth removing.
+
+    First, `scc()` automatically seeds a failed replica from the **nearest array-index** converged replica.  This is now state-honest, but it is still inappropriate as a generic SCC solver behavior. Array index is not a physical metric. Move this into the proton-scan driver where the continuation graph is known explicitly. Core SCC should report `Failed`; an explicit `retry_with_seed(src,dst)` workflow may then be invoked.
+
+    Second, `gpu_eigen.rs` still presents `jacobi_batched()` as the “production entry point” but dispatches N>64 to the **deprecated tiled solver**, while the actual production `GpuSccPlan` uses direct Jacobi. Its one-shot helpers also build kernels and allocate diagnostic buffers per call.  Mark these APIs diagnostic/deprecated or make them dispatch to the new direct solver.
+
+    Third, `GpuMatrixContext` still creates its own OpenCL context/queue and builds kernels in individual operation calls.  That is fine as legacy/test code, but it should be visibly fenced off so a future agent cannot accidentally use it in `GpuDftb`. `GpuDftb + GpuRuntime + GpuSccPlan` should be documented as the **only production dense engine**.
+
+## Precision strategy I would freeze
+
+| Operation                      | Production choice                                                        | Why                                            |
+| ------------------------------ | ------------------------------------------------------------------------ | ---------------------------------------------- |
+| H/S/C/B/D/W/X storage          | **f32**                                                                  | Current parity already ~µHa                    |
+| GEMM                           | **f32 FMA, 4 accumulators**                                              | Fast; generic Kahan is counterproductive       |
+| Jacobi A/V updates             | **f32 FMA**                                                              | Bulk O(N³) work                                |
+| Jacobi \(c,s\)                 | Test **f32 default** now; f64 only if direct-kernel A/B proves necessary | Inputs are already f32                         |
+| \(B^TSB\) restoration          | f32 GEMM + Newton/polar correction                                       | Enforce invariant rather than widen arithmetic |
+| Rayleigh \(Hc,Sc\)             | f32 FMA                                                                  | Bulk matrix-vector work                        |
+| Rayleigh final \(c^THc,c^TSc\) | optional **f64 scalar reduction**                                        | Cheap useful precision                         |
+| Mulliken rows                  | f32, 4 accumulators                                                      | Prevent long serial accumulation               |
+| DIIS                           | **f64 QR / tiny solve**                                                  | Tiny dimensions; conditioning matters          |
+| μ for smearing                 | GPU f32 weights; optional f64 μ/count scalar                             | No PCIe synchronization                        |
+| Total energy / entropy / dq·V  | **f64 reduction**                                                        | Essentially free                               |
+| Force pair algebra             | f32                                                                      | Bulk                                           |
+| Final atom force gather        | optional **f64 accumulation**                                            | Few terms/atom, deterministic                  |
+| Convergence decisions          | f64 or robust f32 scalar                                                 | Precision belongs at decisions                 |
+
+I would specifically **not use Kahan in GEMM**. If a final 30–100-term scalar contraction needs better accuracy and f64 is undesirable, Neumaier/TwoSum or float-float is reasonable there. But compensating every one of millions of matrix multiply terms is the wrong trade.
+
+The broader pattern that has already worked extremely well in this project is:
+
+$$
+\boxed{\text{fast f32 evolution} + \text{cheap restoring projection} + \text{accurate scalar certification}}
+$$
+
+Occupied normalization, Rayleigh correction, metric Newton repair and Mermin particle-number enforcement are all examples of that.
+
+## One numerical change I would also make to DIIS
+
+The labbook still mentions frequent `reason=1` DIIS pivot/scale fallbacks. Rather than tolerating frequent fallback to simple α-mixing, fix the small linear algebra.
+
+Do not form and invert a poorly conditioned Gram/KKT system if you can avoid it. With ~29 atoms and history ≤10, solve the Pulay constrained least-squares problem using **f64 pivoted QR** of the residual-history matrix itself. This avoids squaring the condition number through \(R^TR\). The operation count is only a few thousand f64 operations/system—negligible compared with the dense electronic solve. Dependent history vectors can be explicitly dropped based on the QR diagonal. Then simple mixing becomes an exceptional first-iteration behavior, not a routine numerical fallback.
+
+## What I would profile now
+
+The old 83 ms Jacobi monster is gone, so previous profiling priorities are obsolete. The labbook reports the post-A1–A4 warm GC batch-19 SCC at about 1.27 ms and eval+forces around 0.73 ms, but the subsequent R1–R5 work focused mainly on correctness and the labbook does not yet establish a fresh complete event-timing breakdown for the latest code.
+
+I would now instrument exactly these stages with OpenCL event times and host wall time: projected GEMM \(B^THB\), direct Jacobi, density+Mulliken+DIIS, CPU synchronization overhead, geometry assembly, basis metric repair, W+forces, and FIRE. The important number is **GPU event sum versus host wall time**. If the GPU events sum to 0.3 ms but SCC wall time is 1.3 ms, we know immediately that the remaining problem is synchronization rather than arithmetic.
+
+The first performance experiments I would run are therefore:
+
+| Experiment                                                         | Expected information                         |
+| ------------------------------------------------------------------ | -------------------------------------------- |
+| GEMM Kahan vs 4×FMA                                                | likely direct speed win                      |
+| GEMM transposed-load old vs coalesced                              | warm-basis SCC bottleneck                    |
+| Direct Jacobi prec0 vs prec1                                       | whether f64 scalar island is still justified |
+| Direct Jacobi WG 128/256/512                                       | occupancy/latency optimum for N≈87           |
+| SCC current host-control vs 4-iteration device-control chunks      | cost of queue synchronization                |
+| Basis repair current 5-GEMM verified vs 3-GEMM bounded common path | geometry/FIRE cost                           |
+| Pair-force atomic vs pair-write+atom-gather                        | force speed + deterministic precision        |
+
+I would **not start another eigensolver project yet**. The current direct warm Jacobi has moved from ~83 ms to the low-millisecond regime and passes demanding N=65–256 eigenquality tests.  There is a lot of much safer performance left in removing queue drains, fixing GEMM, and cutting geometry/force overhead.
+
+The highest-payoff work order I would enforce on the coding agent is: **remove per-Jacobi/per-iteration host synchronization → fast/coalesced non-Kahan GEMM → direct-Jacobi f32/WG A/B → device smearing+SCC control → cheaper metric repair → GPU energy/FIRE decisions → fused atomic-free forces → deprecate legacy production-looking APIs.**
+
+That should improve speed while actually making the f32 numerics *more* controlled, rather than trading accuracy for performance.
+
+
+---
+
+# USER
+
+
+Where I agree especially
+
+"6.Move Fermi occupation completely onto the GPU."
+sure, it is totally idiotic do this on CPU! I would go further - it should be merged into some kernel (e.g. endeity matrix build from MO coefs?) because it is small amout of calculations and can be amortized, not worth the overhead of running another kernel. Kernel exacution have singinficant overhead, so we want to keep number of kernels run each SCC loop at minimum. (write that desing goal in the manifest explicitly!)
+
+
+"8. The FIRE loop is device-resident, but the adaptive controller still round-trips every step."
+yes, this is idiotic! thotally defeates the point!!!
+
+
+10.The force kernels should be the next numerical+performance cleanup after GEMM.
+"More importantly, get rid of atomic force accumulation."
+
+- EXACTLY!!!!! I insist you must not used fucking atomic aditions!!!! they are slow as hell in OpenCL !!!! we must alsyas stronly favourize gather approach wherever posible. We must desing the force-evaluation architecutre around ather architecture atom by atom (e.g. one workgroup per atom?) Not sure what is best layout?
+I hate the coding agent still push fucking stupid atomic gather when everywhre in GPU optimiazation skills is intruction to avoid it and prefer GATHER! How syould I say it more clarly and more stronly that it never violates it!!!!
+
+
+"11. Remove the remaining allocations from normal solver control."
+FUCK!!!!!! This is for 10x I'm stressing we must tetally remove all allocation crap from inside SCC loop!!! why that fucking idiotic coding agent keep doing this! how can I stress it  more!!! this is for 20x stilla same crap!!!
+
+"12. Eliminate the remaining architectural “fallback traps.” the same neverending stroyy !!!! pressing 20x already the idiot still do this crap!!!! I'mg really getting crazzy!!!
+
+
+---
+
+but I disagree at some points
+"2.Move the SCC convergence controller onto the GPU. Right now you still synchronize CPU↔GPU once or more per iteration" - I agree we should not do this transfer every iteration, but I would rather check for convergece e.g. every 10 iterations, rather than impleemnt these check on GPU as they are anyways ineffcinet (parralle reduction) 
+
+ad "Move final energy and residual reductions onto GPU, using f64 exactly where it is cheap." - not sure - energy itself is perhaps not work tho do on GPU, byt what is worth is computing of the forces in GpU, I think it would make sense to merge this Energy and Force clauclation into one kernel as it reuse singificant part of the machinery (it is bacially E=Tr[H*rho] and F=dE/dR )
+
+
+---
+
+
+Yes. I would sharpen the design rules substantially and make them **non-negotiable invariants of the dense production path**, not “optimization suggestions.”
+
+Your two disagreements are also mostly right. I would **not** add a dedicated GPU convergence-control kernel just for the sake of avoiding a tiny host decision. And I agree energy should not drive another kernel launch if it can be obtained almost for free while doing the force contraction.
+
+The current code still demonstrates exactly why these rules need to be written aggressively: Fermi smearing downloads eigenvalues, does 80 host bisection iterations and uploads occupations each SCC iteration; FIRE still transfers `4*batch` statistics to the CPU and sends controls back; force accumulation still uses CAS atomics; there are still `Vec` allocations in SCC/DIIS control; and failed SCC systems still have an automatic “nearest array index” recovery policy.
+
+Here is the section I would put directly into the manifest.
+
+## Dense GPU production path — hard architecture invariants
+
+These rules apply to the homogeneous batched dense DFTB path used for H-bond / proton-transfer systems, especially `GpuDftb`, `GpuSccPlan`, SCC iterations, force evaluation, and FIRE relaxation.
+
+They are **hard requirements**, not recommendations. A coding agent MUST NOT violate them merely because a simpler implementation is easier to write.
+
+### 1. Minimize kernel launches as a primary design objective
+
+Kernel launch and synchronization latency is significant for matrices of only N≈30–100. The steady-state SCC loop must therefore be designed as a small number of coarse kernels.
+
+Every additional kernel launched inside one SCC iteration requires an explicit justification.
+
+Prefer fusing operations when:
+
+* they consume the same data,
+* they naturally belong to the same workgroup/domain,
+* fusion avoids writing and rereading intermediate global buffers,
+* and fusion does not introduce a global synchronization requirement inside the kernel.
+
+Do NOT create one small kernel for every algebraic operation.
+
+Target steady-state SCC structure should be approximately:
+
+`q → Hscc`
+→ `BᵀH`
+→ `(BᵀH)B`
+→ `Jacobi + eigenvalue extraction + occupations`
+→ `Mulliken/residual/DIIS`
+
+approximately 5–6 launches, not 10–20.
+
+Any proposed additional hot-loop kernel must explain why it cannot be fused with an existing stage.
+
+### 2. Fermi occupation MUST stay on the GPU
+
+It is forbidden to:
+
+* download eigenvalues each SCC iteration,
+* solve μ on the CPU,
+* upload occupation weights again.
+
+For the direct Jacobi solver, the preferred design is to calculate Fermi μ and `f_k` at the end of the Jacobi kernel, because that workgroup already owns the complete eigenvalue spectrum.
+
+The extra work is tiny compared with the eigensolve and should be amortized inside that kernel.
+
+Use a safeguarded Newton/bisection calculation of μ satisfying
+
+$$
+\sum_k f_k = N_{\rm occ},
+\qquad
+f_k = [1+\exp((\epsilon_k-\mu)/kT)]^{-1}.
+$$
+
+No additional occupation kernel should exist unless profiling demonstrates that fusion is worse.
+
+Integer occupation selection should likewise be fused into the eigensolver tail where practical.
+
+### 3. Do not build the full density matrix during SCC unless it is actually needed
+
+During ordinary SCC iterations the purpose of the electronic solution is primarily to obtain Mulliken populations and hence the next charge vector.
+
+The full AO density matrix D is required for final energy/forces, but it is not intrinsically required for every SCC iteration.
+
+Prefer computing Mulliken populations directly from orbitals:
+
+$$
+q_A =
+2\sum_{\mu\in A}\sum_k
+f_k C_{\mu k}(SC)_{\mu k}.
+$$
+
+A specialized post-eigensolve kernel should investigate computing:
+
+* Mulliken populations,
+* charge residual,
+* DIIS history/update,
+* RMS residual,
+
+without first materializing the complete N×N density matrix.
+
+Build D and W only once for the final converged electronic state unless measurements prove the direct-population route slower.
+
+Rayleigh-quotient repair is likewise normally needed for the final certified E/W state, not necessarily during every SCC iteration.
+
+### 4. NO global atomic additions in production force evaluation
+
+Global atomic force accumulation is forbidden in the dense production path.
+
+In particular, code of the form
+
+`atomic_add(force[atom], pair_force)`
+
+must not be used.
+
+The force architecture MUST be gather-based.
+
+Preferred first implementation:
+
+`one workgroup = one (replica, atom)`
+
+with a static incident-pair adjacency list.
+
+Each atom workgroup:
+
+1. loops/gathers all interactions involving that atom,
+2. evaluates their SK/SCC/repulsive force contribution,
+3. accumulates the result privately/local,
+4. writes exactly one final `float3` force for that atom.
+
+No global force atomics.
+
+For H-bond systems with ≈20–40 atoms, WG≈32 or 64 is a natural starting point: approximately one lane per neighbour, with warp/subgroup or local reduction.
+
+This evaluates a physical pair twice, once from each endpoint. That duplication is ACCEPTABLE if it is faster than an extra kernel launch/global intermediate buffer. The canonical pair orientation and sign should make the two evaluations deterministic.
+
+The alternative architecture to benchmark is:
+
+`pair-evaluation kernel → pair_force[p]`
+followed by
+`atom-gather kernel → F_atom`.
+
+This evaluates each pair only once but costs one extra launch and global pair-force traffic.
+
+Benchmark these two gather architectures. Do NOT benchmark them against an atomic implementation and then retain atomics as a fallback.
+
+### 5. Fuse all force terms before gathering
+
+The pair/atom force evaluator should compute in one pass
+
+$$
+2\sum_{\mu\nu}
+\left[
+D_{\mu\nu}\partial_R H^0_{\mu\nu}
++
+(\bar V D_{\mu\nu}-W_{\mu\nu})
+\partial_R S_{\mu\nu}
+\right]
+$$
+
+plus SCC γ′ and repulsive contributions.
+
+Do not evaluate `dS/dR` once for non-SCC force and again in a second SCC-shift kernel.
+
+Do not interpolate the same SK table twice for the same physical pair merely because the force formula was split historically into separate functions.
+
+### 6. Energy should piggyback on force work, not create another hot-loop kernel
+
+Energy itself is not performance-critical compared with forces.
+
+When force evaluation already evaluates the pair H/S/repulsive interactions, it may accumulate per-atom or per-pair energy contributions at essentially no extra memory traffic.
+
+For example an atom-gather force kernel may also emit
+
+`e_atom[replica][atom]`.
+
+The host may sum these small arrays only when an energy value is actually requested.
+
+Do NOT add a dedicated energy kernel to every FIRE/SCC step merely to produce logging output.
+
+Retain the Rayleigh/band-energy formulation as the numerical reference until the pairwise `Tr[D H0]` formulation is demonstrated to achieve equal accuracy.
+
+### 7. NO heap/buffer allocation inside SCC, force, or FIRE hot loops
+
+After `GpuDftb::new()` / `GpuSccPlan::new()` has completed, normal execution of:
+
+* SCC iterations,
+* `eval`,
+* force evaluation,
+* FIRE steps,
+* geometry updates,
+
+must perform ZERO dynamic GPU-buffer allocation and ZERO program/kernel construction.
+
+Forbidden in the hot path:
+
+* `Buffer::builder`
+* `zero_buffer`
+* `buffer_from_slice`
+* `Kernel::builder`
+* `build_program`
+* creation of another OpenCL context or queue
+* dimension-dependent `vec![...]`, `Vec::new`, or equivalent scratch allocation.
+
+All GPU buffers, host staging arrays, masks, DIIS history, force scratch, occupation scratch, energy scratch and FIRE control buffers must be persistent members of the engine/plan.
+
+Reset persistent buffers with device fill/reset kernels. Do not allocate a host zero vector merely to clear them.
+
+Diagnostic functions may allocate, but they must be clearly outside the production hot path.
+
+### 8. Add automated regression guards against hot-loop allocation/compilation
+
+Do not rely on comments or agent discipline alone.
+
+Add instrumentation/counters for:
+
+* GPU buffer allocations,
+* OpenCL program compilations/cache misses,
+* kernel construction.
+
+A regression test should snapshot these counters after engine construction, execute several SCC + force + FIRE steps, and assert that the counters have not increased.
+
+Where practical, add a test-only Rust allocation counter around the steady-state solver loop as well.
+
+An optimization that reintroduces allocation or compilation into the hot loop must fail a test.
+
+### 9. NO implicit CPU fallback or hidden algorithm fallback
+
+The dense GPU engine either runs the requested GPU algorithm or returns a clear status/error.
+
+It must NOT silently:
+
+* fall back to a CPU solver,
+* switch to an old eigensolver,
+* rebuild a different context,
+* seed from another replica,
+* change mixer,
+* loosen a tolerance,
+* change occupation physics.
+
+Recovery strategies must be explicit higher-level operations.
+
+For example:
+
+`SCC failed for replica 7`
+
+is a valid core-solver result.
+
+The proton-transfer scan driver may then explicitly request
+
+`retry replica 7 using replica 6 as continuation seed`.
+
+The generic SCC solver must NOT assume that adjacent array indices are physically adjacent configurations.
+
+### 10. CPU↔GPU synchronization is forbidden per SCC iteration
+
+Do not read RMS/eigenvalues/occupations/charges after every iteration.
+
+The residual is already computed as part of SCC/DIIS work; store it on device.
+
+Run SCC in chunks, initially e.g. 8–10 iterations, then read only a compact O(batch) convergence/status array.
+
+The exact chunk length should be benchmarked.
+
+Do NOT add a separate expensive GPU convergence-reduction kernel merely to avoid this host check. Piggyback residual/RMS calculation on work that already has to be done for Mulliken/DIIS.
+
+The objective is:
+
+many GPU iterations
+→ one small host status check,
+
+not:
+
+GPU iteration
+→ host synchronization
+→ GPU iteration
+→ host synchronization.
+
+### 11. FIRE control is fully device-resident
+
+`dt`, `alpha`, `n_positive`, convergence/park status and velocity reset mode are persistent per-replica device state.
+
+FIRE reduction and FIRE adaptation belong on the GPU.
+
+It is forbidden to download `{P,v²,F²,maxF}` every FIRE step, calculate adaptation on the CPU and upload controls again.
+
+Host intervention is needed only occasionally to inspect convergence or report progress.
+
+### 12. Prefer gather everywhere
+
+The general GPU rule for this project is:
+
+**OWN OUTPUT → GATHER INPUTS → WRITE ONCE.**
+
+Prefer one workgroup/thread owning the output entity:
+
+* atom owns force,
+* atom owns Mulliken population,
+* matrix tile owns its output tile,
+* replica owns SCC/DIIS state.
+
+Avoid architectures where many work-items scatter into shared global outputs.
+
+Global atomics require explicit USER approval.
+
+### 13. Bulk arithmetic remains FP32; precision is spent only on cheap reductions/invariants
+
+Do not solve FP32 limitations by converting O(N²) or O(N³) matrix arithmetic to FP64.
+
+Use:
+
+* FP32 storage,
+* FP32 FMA,
+* several independent accumulators instead of a long serial sum,
+* explicit normalization,
+* Rayleigh quotient correction,
+* S-metric/polar correction,
+* physically meaningful finite-T smearing.
+
+Use FP64 only for tiny operations where the cost is negligible:
+
+* DIIS small linear solve,
+* final scalar energy accumulation,
+* optional final atom-force gather,
+* chemical-potential scalar solve if profiling shows it useful,
+* convergence/diagnostic scalars.
+
+Kahan compensation is NOT the default for GEMM.
+
+For GEMM prefer multiple independent FP32 FMA accumulators and a balanced final sum.
+
+### 14. Production and diagnostic APIs must be impossible to confuse
+
+There must be one clearly documented dense production route:
+
+`GpuDftb → GpuSccPlan`.
+
+Deprecated tiled Jacobi, legacy `GpuDriver`, standalone `GpuMatrixContext`, CPU DIIS measurement paths and one-shot helper functions must be marked diagnostic/deprecated and must not be called from production code.
+
+A future coding agent should not be able to accidentally select an old slow path because its function name still says “production entry point”.
+
+That wording is deliberately much stronger. In particular I would put **“global atomics require explicit USER approval”** in the manifest. That is hard to misinterpret.
+
+On your convergence point, I agree with you more than with my previous proposal. A separate GPU convergence-control layer could easily become another collection of tiny reductions/kernels. The better architecture is:
+
+$$
+\boxed{\text{residual calculation already inside post-SCC/DIIS work}}
+$$
+
+and then simply don't look at it every iteration.
+
+For example, run 8 iterations completely asynchronously, read `rms[batch]`, and continue another 8 if necessary. If normal warm SCC convergence is around 6–15 iterations, perhaps a chunk of 4 or 5 eventually proves optimal rather than 10; that is a benchmark question. What matters architecturally is **no host synchronization per iteration**.
+
+There is one useful refinement: inactive-replica detection need not happen between every iteration. Even if a replica converges at iteration 3 and continues uselessly to iteration 8, five unnecessary N≈87 solves may be cheaper than five CPU/GPU synchronization barriers. That trade should be measured instead of assuming that perfect early stopping is free.
+
+### I would go even further on Fermi occupation
+
+Your instinct to fuse it is right, but I would fuse it into the **eigensolver**, not the density kernel.
+
+The direct Jacobi kernel ends with one WG owning the entire spectrum of one replica. At that point it already has all \(\epsilon_k\). Before returning, that same WG can:
+
+$$
+\epsilon_k
+\rightarrow \mu
+\rightarrow f_k
+$$
+
+and write `eig_diag[]` and `occ_w[]`.
+
+That removes:
+
+* `extract_diagonal`,
+* `select_occupation`,
+* eigenvalue readback,
+* host μ bisection,
+* occupation upload.
+
+This is an exceptionally natural fusion because there is no inter-workgroup synchronization problem.
+
+Then the subsequent electronic-state kernel simply consumes `C` and `f_k`.
+
+In fact, I think there is an even larger architectural improvement hiding here: **do not construct D during SCC at all.**
+
+The current sequence effectively does
+
+$$
+C \rightarrow D \rightarrow DS \rightarrow q_A.
+$$
+
+But Mulliken populations can be calculated directly:
+
+$$
+q_A=
+2\sum_{\mu\in A,k}
+f_k C_{\mu k}
+\sum_\nu S_{\mu\nu}C_{\nu k}.
+$$
+
+For N≈87 and only ~29 atoms, this can be a dedicated gather calculation which directly produces `q_new`. Then the same WG/system can immediately calculate residual and run the tiny DIIS solve.
+
+So the long-term SCC could become:
+
+$$
+q
+\xrightarrow{1} H_{\rm SCC}
+\xrightarrow{2,3} B^THB
+\xrightarrow{4} {\rm Jacobi}+\mu+f
+\xrightarrow{5} q_{\rm Mulliken}+{\rm DIIS}.
+$$
+
+**Five launches per SCC iteration.**
+
+Full D and W are then constructed once after SCC converges, because they are needed for the force.
+
+That, to me, is a much cleaner architecture than endlessly optimizing a density matrix that SCC does not fundamentally need.
+
+### Force layout: I would start with one WG per atom
+
+For your systems this is unusually attractive.
+
+If GC has ~29 atoms and batch=19:
+
+$$
+29\times19=551\ {\rm workgroups}.
+$$
+
+That fills an RTX 3090 far better than one-WG-per-system.
+
+I would start with WG=32. Each workgroup owns exactly one atom, and approximately one lane handles one other atom/pair. For ~30 atoms this maps beautifully onto a warp.
+
+The static initialization creates something like:
+
+```text
+atom_pair_offset[a]
+atom_pair_count[a]
+atom_pair_index[]
+atom_pair_sign[]
+```
+
+and all dynamic geometry comes directly from coordinates.
+
+Each lane evaluates its incident pair contribution. Then reduce `float3` within the warp/workgroup and lane 0 writes:
+
+```text
+force[replica][atom]
+```
+
+exactly once.
+
+No atomic. Ever.
+
+The price is evaluating each physical pair twice. I would **deliberately accept that first**, because it buys:
+
+* one force kernel,
+* hundreds of independent workgroups,
+* no global pair buffer,
+* no second gather launch,
+* no atomics,
+* deterministic accumulation.
+
+Then benchmark against the two-kernel alternative:
+
+$$
+{\rm pair}\rightarrow F_{ij}
+\quad;\quad
+{\rm atom\ gather}.
+$$
+
+If the expensive 4×4 SK derivative calculation makes the 2× duplicated arithmetic dominant, the two-kernel version may win. But both architectures obey the essential rule: **pair forces are gathered, never atomically scattered**.
+
+Also, the current force kernel materializes large arrays of 4×4 H/S derivatives inside each work-item. That is likely to create huge register pressure or spills.  For a gather kernel I would directly contract the analytic expressions with D/W while they are generated. Do not construct:
+
+```text
+dh_dx[4][4]
+dh_dy[4][4]
+dh_dz[4][4]
+ds_dx[4][4]
+...
+```
+
+when ultimately only three accumulated force numbers are needed.
+
+That could be a very large improvement.
+
+### Energy + force
+
+I also agree with your correction here.
+
+I would **not build a special GPU energy pipeline**.
+
+When the force gather already computes for every pair:
+
+* SK H/S,
+* D and W contractions,
+* SCC shift,
+* γ′,
+* repulsive spline,
+
+it is nearly free to accumulate corresponding pair energy terms.
+
+For example the same atom gather can produce:
+
+```text
+force_atom[3]
+energy_atom
+```
+
+where each atom gets half of every pair energy.
+
+Then if FIRE does not need the energy, nobody reduces `energy_atom`.
+
+If you want logging every tenth step, read ~30×batch energy numbers and sum them on CPU—or reduce only when requested.
+
+The only caveat is numerical: your Rayleigh/band-energy route was introduced because raw f32 `Tr(DH0)` was measurably noisier. So I would keep **Rayleigh energy as the scientific reference** and A/B test the fused force-derived energy using f64 accumulation. If it achieves µHa agreement, great: it can replace the separate path. If not, energy remains an occasional diagnostic calculation and does not contaminate the hot force architecture.
+
+So I think the architectural principle should be:
+
+$$
+\boxed{\text{FORCES determine the hot-loop design; energy piggybacks when convenient.}}
+$$
+
+not the reverse.
+
+And for the repeated agent violations, prose clearly isn't enough anymore. I would add **tests that fail** if a production SCC/FIRE call increases counters for GPU allocations, program compilations or kernel construction. The agent can ignore a paragraph; it cannot merge code while `test_dense_hotloop_has_zero_alloc_and_zero_compile` fails.
+

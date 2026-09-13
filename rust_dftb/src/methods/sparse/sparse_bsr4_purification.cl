@@ -479,11 +479,43 @@ __kernel void bsr4_spgemm_plan_Bsym(
         const uint t0 = plan_ptr[cb];
         const uint t1 = plan_ptr[cb+1];
 
-        // Four independent FMA accumulators, one per column index m —
-        // breaks the serial dependency chain across plan terms (F7).
+        // Independent FMA accumulators — break the serial dependency chain
+        // across plan terms (F7 = 4-way; PR1 ACC8 = 8-way, two quads
+        // alternating over terms — halves the chain again).
         float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
         bool bad = false;
 
+#if ACC8
+        float q0 = 0.0f, q1 = 0.0f, q2 = 0.0f, q3 = 0.0f;
+        uint t = t0;
+        for(; t+1<t1; t+=2){
+            const uint ia0 = plan_a_idx[t];   const uint bb0 = plan_b_idx[t];
+            const uint ia1 = plan_a_idx[t+1]; const uint bb1 = plan_b_idx[t+1];
+            if(ia0 >= na || ia1 >= na){ bad = true; break; }
+            __local const float* A0 = lA + ia0*BS2;
+            __global const float* B0 = B + bb0*BS2;
+            __local const float* A1 = lA + ia1*BS2;
+            __global const float* B1 = B + bb1*BS2;
+            s0 = fma(A0[4*r+0], B0[4*c+0], s0);   q0 = fma(A1[4*r+0], B1[4*c+0], q0);
+            s1 = fma(A0[4*r+1], B0[4*c+1], s1);   q1 = fma(A1[4*r+1], B1[4*c+1], q1);
+            s2 = fma(A0[4*r+2], B0[4*c+2], s2);   q2 = fma(A1[4*r+2], B1[4*c+2], q2);
+            s3 = fma(A0[4*r+3], B0[4*c+3], s3);   q3 = fma(A1[4*r+3], B1[4*c+3], q3);
+        }
+        if(t<t1){   // odd term count: one leftover into the s-quad
+            const uint ia = plan_a_idx[t];
+            const uint bb = plan_b_idx[t];
+            if(ia >= na){ bad = true; }
+            else{
+                __local const float* Ab = lA + ia*BS2;
+                __global const float* Bjk = B + bb*BS2;
+                s0 = fma(Ab[4*r+0], Bjk[4*c+0], s0);
+                s1 = fma(Ab[4*r+1], Bjk[4*c+1], s1);
+                s2 = fma(Ab[4*r+2], Bjk[4*c+2], s2);
+                s3 = fma(Ab[4*r+3], Bjk[4*c+3], s3);
+            }
+        }
+        s0 += q0; s1 += q1; s2 += q2; s3 += q3;
+#else
         // Iterate precomputed plan terms — no intersection, no search.
         for(uint t=t0; t<t1; ++t){
 
@@ -505,6 +537,7 @@ __kernel void bsr4_spgemm_plan_Bsym(
             s2 = fma(Ab[4*r+2], Bjk[4*c+2], s2);
             s3 = fma(Ab[4*r+3], Bjk[4*c+3], s3);
         }
+#endif
 
         C[cb*BS2 + lane] = bad ? NAN : (s0 + s1) + (s2 + s3);
     }
@@ -569,6 +602,38 @@ __kernel void bsr4_spgemm_plan(
         float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
         bool bad = false;
 
+#if ACC8
+        float q0 = 0.0f, q1 = 0.0f, q2 = 0.0f, q3 = 0.0f;
+        uint t = t0;
+        for(; t+1<t1; t+=2){
+            const uint ia0 = plan_a_idx[t];   const uint bb0 = plan_b_idx[t];
+            const uint ia1 = plan_a_idx[t+1]; const uint bb1 = plan_b_idx[t+1];
+            if(ia0 >= na || ia1 >= na){ bad = true; break; }
+            __local const float* A0 = lA + ia0*BS2;
+            __global const float* B0 = B + bb0*BS2;
+            __local const float* A1 = lA + ia1*BS2;
+            __global const float* B1 = B + bb1*BS2;
+            // C_ij[r,c] += sum_m A_ik[r,m] * B_kj[m,c]  (direct, no transpose)
+            s0 = fma(A0[4*r+0], B0[4*0+c], s0);   q0 = fma(A1[4*r+0], B1[4*0+c], q0);
+            s1 = fma(A0[4*r+1], B0[4*1+c], s1);   q1 = fma(A1[4*r+1], B1[4*1+c], q1);
+            s2 = fma(A0[4*r+2], B0[4*2+c], s2);   q2 = fma(A1[4*r+2], B1[4*2+c], q2);
+            s3 = fma(A0[4*r+3], B0[4*3+c], s3);   q3 = fma(A1[4*r+3], B1[4*3+c], q3);
+        }
+        if(t<t1){
+            const uint ia = plan_a_idx[t];
+            const uint bb = plan_b_idx[t];
+            if(ia >= na){ bad = true; }
+            else{
+                __local const float* Ab  = lA + ia*BS2;
+                __global const float* Bkj = B + bb*BS2;
+                s0 = fma(Ab[4*r+0], Bkj[4*0+c], s0);
+                s1 = fma(Ab[4*r+1], Bkj[4*1+c], s1);
+                s2 = fma(Ab[4*r+2], Bkj[4*2+c], s2);
+                s3 = fma(Ab[4*r+3], Bkj[4*3+c], s3);
+            }
+        }
+        s0 += q0; s1 += q1; s2 += q2; s3 += q3;
+#else
         for(uint t=t0; t<t1; ++t){
 
             const uint ia = plan_a_idx[t];
@@ -588,6 +653,7 @@ __kernel void bsr4_spgemm_plan(
             s2 = fma(Ab[4*r+2], Bkj[4*2+c], s2);
             s3 = fma(Ab[4*r+3], Bkj[4*3+c], s3);
         }
+#endif
 
         C[cb*BS2 + lane] = bad ? NAN : (s0 + s1) + (s2 + s3);
     }

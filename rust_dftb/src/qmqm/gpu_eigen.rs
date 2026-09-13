@@ -187,13 +187,16 @@ pub fn direct_jacobi_batched(
     if batch == 0 {
         return Ok(Vec::new());
     }
-    let source = render_tiled_source(32, 256, prec);
+    // W3: WG=512 ~1.55× faster than 256 on RTX 3090 (direct_jacobi_bench);
+    // clamp to the device limit so the helper stays portable.
+    let wg = rt.caps().max_work_group_size.min(512).max(64);
+    let source = render_tiled_source(32, wg, prec);
     let program = rt.build_program(&source)?;
     let ones = rt.buffer_from_slice(&vec![1i32; batch])?;
     let diag = rt.zero_buffer::<f32>(4 * batch)?;
     let kernel = Kernel::builder()
         .program(&program).name("jacobi_cyclic_global_batched").queue(rt.queue().clone())
-        .global_work_size(batch * 256).local_work_size(256)
+        .global_work_size(batch * wg).local_work_size(wg)
         .arg(a_buf).arg(v_buf).arg(n as i32).arg(batch as i32).arg(0i32)
         .arg(&ones).arg(&diag)
         .build().map_err(map_ocl_err)?;

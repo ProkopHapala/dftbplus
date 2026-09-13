@@ -10,7 +10,7 @@ const DELTA = 0.001;   // Å
 
 print("=== taper E-Fd check (r_trunc=7 A, taper [6,7] A) ===");
 load_xyz("t7", xyz);
-sparse_new("t7", sk_dir, 7.0, 1.0);
+sparse_new("t7", sk_dir, 7.0, 1.0, 0.0, 0.0, 512.0);   // max_deg=512: default r_k/r_z exceed production budget (§15.9 SC1)
 sparse_tc2_tol("t7", 1.0e-5);
 sparse_scc("t7", 80, 1.0e-6);
 let n = sparse_n_atoms("t7");

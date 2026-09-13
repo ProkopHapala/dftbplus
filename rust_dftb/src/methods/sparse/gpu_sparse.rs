@@ -216,6 +216,14 @@ pub struct SparseBsr4Config {
     pub max_left_blocks: i32,
     /// Workgroup size for reduction kernels. Default 256.
     pub reduce_wg: i32,
+    /// PR1 (manifest §15.9): compile the plan SpGEMMs with 8 independent
+    /// f32 accumulators per lane (two quads alternating over plan terms —
+    /// halves the serial FMA dependency chain vs F7's 4). A/B experiment:
+    /// default OFF — the reassociation shifts K by ~ulp noise, which the
+    /// tight FD-vs-analytic force gate (G3.4, ~1e-4) can detect. Enable
+    /// via `RUST_DFTB_SPGEMM_ACC8=1` for perf measurement; promote to
+    /// default only if it actually wins.
+    pub spgemm_acc8: bool,
 }
 
 impl Default for SparseBsr4Config {
@@ -224,6 +232,7 @@ impl Default for SparseBsr4Config {
             wg: 128,
             max_left_blocks: 512,
             reduce_wg: 256,
+            spgemm_acc8: matches!(std::env::var("RUST_DFTB_SPGEMM_ACC8"), Ok(v) if v == "1" || v.eq_ignore_ascii_case("true")),
         }
     }
 }
@@ -326,6 +335,7 @@ impl SparseBsr4Gpu {
         builder.cmplr_def("WG", config.wg);
         builder.cmplr_def("MAX_LEFT_BLOCKS", config.max_left_blocks);
         builder.cmplr_def("REDUCE_WG", config.reduce_wg);
+        builder.cmplr_def("ACC8", config.spgemm_acc8 as i32);
         let program = builder.build(&context).map_err(map_ocl_err)?;
 
         // Touch the program cache so the runtime is aware (no-op effectively,
@@ -2328,6 +2338,20 @@ impl SparseBsr4Gpu {
         n_orb: &Buffer<u32>,
         h_out: &Buffer<f32>,
     ) -> Result<()> {
+        // SC4 (manifest §15.9): the kernel caches the row's V/n_orb in
+        // `__local` arrays sized MAX_LEFT_BLOCKS and silently `return`s on
+        // a wider row — leaving those H_scc rows stale. Guard like the
+        // SpGEMM left operands: fail loud before enqueue.
+        let max = self.config.max_left_blocks as u32;
+        if struct_.max_deg > max {
+            return Err(DftbError::InvalidInput(format!(
+                "bsr4_build_hscc: row degree {} > MAX_LEFT_BLOCKS={max} — \
+                 the kernel caches the row's V_j/n_orb_j in local memory and would \
+                 silently leave the row stale. Shrink the H/S mask or raise \
+                 SparseBsr4Config.max_left_blocks.",
+                struct_.max_deg
+            )));
+        }
         let wg = self.config.wg as usize;
         let k = &self.k_build_hscc;
         k.set_arg(0, struct_.n_atom as u32).map_err(map_ocl_err)?;
@@ -2377,6 +2401,130 @@ impl SparseBsr4Gpu {
                 .map_err(map_ocl_err)?;
         }
         self.reduce_to_output_dev(n_groups, partial, scratch_a, scratch_b, output)
+    }
+
+    /// Tail size for reductions finished on the host in f64 (PR3, manifest
+    /// §15.9): the device tree shrinks partials until ≤ REDUCE_TAIL remain,
+    /// then they are downloaded and summed in f64. Sums of squares need no
+    /// Kahan — an f64 sum of ≤128 f32 partials is already exact for our
+    /// purposes, and it makes the measured f32 floor trustworthy.
+    pub const REDUCE_TAIL: usize = 128;
+
+    /// Reduce device `partial[0..n]` to a host f64: shrink on GPU until
+    /// ≤ `tail.len()` entries remain, then download and sum in f64.
+    /// `tail` is caller-provided staging (resized once to REDUCE_TAIL).
+    fn reduce_partials_f64(
+        &self,
+        mut n: usize,
+        input: &Buffer<f32>,
+        scratch_a: &Buffer<f32>,
+        scratch_b: &Buffer<f32>,
+        tail: &mut Vec<f32>,
+    ) -> Result<f64> {
+        if n == 0 {
+            return Err(DftbError::InvalidInput("reduction input is empty".into()));
+        }
+        if tail.len() < Self::REDUCE_TAIL { tail.resize(Self::REDUCE_TAIL, 0.0); }
+        let reduce_wg = self.config.reduce_wg as usize;
+        let mut current = input;
+        let mut use_a = true;
+        while n > tail.len() {
+            let out = if use_a { scratch_a } else { scratch_b };
+            self.reduce_dev(n, current, out)?;
+            current = out;
+            use_a = !use_a;
+            n = div_ceil(n, reduce_wg);
+        }
+        self.read_f32(current, &mut tail[..n])?;
+        Ok(tail[..n].iter().map(|&x| x as f64).sum())
+    }
+
+    /// `‖KSK−K‖_F²` → host f64 (f32 partials + ≤128-entry GPU tail).
+    pub fn idempotency_to_f64(
+        &self,
+        nblock: usize,
+        q_ksk: &Buffer<f32>,
+        k: &Buffer<f32>,
+        partial: &Buffer<f32>,
+        scratch_a: &Buffer<f32>,
+        scratch_b: &Buffer<f32>,
+        tail: &mut Vec<f32>,
+    ) -> Result<f64> {
+        let n_groups = div_ceil(nblock * BS2, self.config.reduce_wg as usize);
+        self.idempotency_partial_dev(nblock, q_ksk, k, partial)?;
+        self.reduce_partials_f64(n_groups, partial, scratch_a, scratch_b, tail)
+    }
+
+    /// `‖A−I‖_F²` over a BSR structure → host f64 (PR3 tail).
+    pub fn identity_residual_to_f64(
+        &self,
+        struct_: &GpuBsrStructure,
+        a: &Buffer<f32>,
+        partial: &Buffer<f32>,
+        scratch_a: &Buffer<f32>,
+        scratch_b: &Buffer<f32>,
+        tail: &mut Vec<f32>,
+    ) -> Result<f64> {
+        let n_groups = div_ceil(struct_.nblock * BS2, self.config.reduce_wg as usize);
+        self.identity_residual_partial_dev(struct_.nblock, &struct_.diag_flag, a, partial)?;
+        self.reduce_partials_f64(n_groups, partial, scratch_a, scratch_b, tail)
+    }
+
+    /// `‖X‖_F²` of a values buffer → host f64 (PR3 tail).
+    pub fn frob_sq_to_f64(
+        &self,
+        n: usize,
+        x: &Buffer<f32>,
+        partial: &Buffer<f32>,
+        scratch_a: &Buffer<f32>,
+        scratch_b: &Buffer<f32>,
+        tail: &mut Vec<f32>,
+    ) -> Result<f64> {
+        let n_groups = div_ceil(n, self.config.reduce_wg as usize);
+        let kern = &self.k_frob_sq;
+        kern.set_arg(0, n as u32).map_err(map_ocl_err)?;
+        kern.set_arg(1, x).map_err(map_ocl_err)?;
+        kern.set_arg(2, partial).map_err(map_ocl_err)?;
+        let reduce_wg = self.config.reduce_wg as usize;
+        unsafe {
+            kern.cmd()
+                .global_work_size(n_groups * reduce_wg)
+                .local_work_size(reduce_wg)
+                .enq()
+                .map_err(map_ocl_err)?;
+        }
+        self.reduce_partials_f64(n_groups, partial, scratch_a, scratch_b, tail)
+    }
+
+    /// `Tr(K·H)` over the H/S support → host f64 (PR3 tail; PR4 wants this
+    /// extensive sum with an f64 final reduction, not one f32 scalar).
+    pub fn trace_hk_to_f64(
+        &self,
+        nblock_hs: usize,
+        h: &Buffer<f32>,
+        k: &Buffer<f32>,
+        hs_to_kT: &Buffer<i32>,
+        partial: &Buffer<f32>,
+        scratch_a: &Buffer<f32>,
+        scratch_b: &Buffer<f32>,
+        tail: &mut Vec<f32>,
+    ) -> Result<f64> {
+        let reduce_wg = self.config.reduce_wg as usize;
+        let n_groups = div_ceil(nblock_hs * BS2, reduce_wg);
+        let kern = &self.k_trace_hk;
+        kern.set_arg(0, nblock_hs as u32).map_err(map_ocl_err)?;
+        kern.set_arg(1, h).map_err(map_ocl_err)?;
+        kern.set_arg(2, k).map_err(map_ocl_err)?;
+        kern.set_arg(3, hs_to_kT).map_err(map_ocl_err)?;
+        kern.set_arg(4, partial).map_err(map_ocl_err)?;
+        unsafe {
+            kern.cmd()
+                .global_work_size(n_groups * reduce_wg)
+                .local_work_size(reduce_wg)
+                .enq()
+                .map_err(map_ocl_err)?;
+        }
+        self.reduce_partials_f64(n_groups, partial, scratch_a, scratch_b, tail)
     }
 
     /// Enqueue `||X||_F²` of a values buffer into a 1-float device buffer (R12).
@@ -2986,28 +3134,25 @@ impl SparsePurifyWorkspace {
         // P4: Build symbolic plans for the two recurring SpGEMMs.
         // Plan for T = K·S: A=K (k_mask), B=S (s_mask, sym), C=T (t_mask).
         // Plan for Q = T·K: A=T (t_mask), B=K (k_mask, sym), C=Q (k_mask).
-        let plan_ks = {
+        // SC3 (manifest §15.9): plan failure is a hard error — `None` (the
+        // intersection kernel) only via the explicit SPARSE_PLANS=0 toggle.
+        let plans_on = sparse_plans_enabled();
+        let plan_ks = if plans_on {
             let k_dummy = Bsr4Matrix::from_structure(k0.n_atom, k_mask.0.clone(), k_mask.1.clone())?;
             let s_dummy = Bsr4Matrix::from_structure(s.n_atom, s.row_ptr.clone(), s.col_idx.clone())?;
-            match crate::methods::sparse::bsr4::build_spgemm_plan_bsym(&k_dummy, &s_dummy, t_mask) {
-                Ok(plan) => Some(gpu.upload_plan(&plan)?),
-                Err(e) => {
-                    eprintln!("P4: plan_ks build failed, falling back to intersection kernel: {e}");
-                    None
-                }
-            }
-        };
-        let plan_tk = {
+            let plan = crate::methods::sparse::bsr4::build_spgemm_plan_bsym(&k_dummy, &s_dummy, t_mask)
+                .map_err(|e| DftbError::InvalidInput(format!("plan_ks build failed (plans are mandatory in production — fix the mask or set RUST_DFTB_SPARSE_PLANS=0 for diagnostic intersection mode): {e}")))?;
+            Some(gpu.upload_plan(&plan)
+                .map_err(|e| DftbError::InvalidInput(format!("plan_ks upload failed: {e}")))?)
+        } else { None };
+        let plan_tk = if plans_on {
             let t_dummy = Bsr4Matrix::from_structure(k0.n_atom, t_mask.0.clone(), t_mask.1.clone())?;
             let k_dummy = Bsr4Matrix::from_structure(k0.n_atom, k_mask.0.clone(), k_mask.1.clone())?;
-            match crate::methods::sparse::bsr4::build_spgemm_plan_bsym(&t_dummy, &k_dummy, k_mask) {
-                Ok(plan) => Some(gpu.upload_plan(&plan)?),
-                Err(e) => {
-                    eprintln!("P4: plan_tk build failed, falling back to intersection kernel: {e}");
-                    None
-                }
-            }
-        };
+            let plan = crate::methods::sparse::bsr4::build_spgemm_plan_bsym(&t_dummy, &k_dummy, k_mask)
+                .map_err(|e| DftbError::InvalidInput(format!("plan_tk build failed (plans are mandatory in production): {e}")))?;
+            Some(gpu.upload_plan(&plan)
+                .map_err(|e| DftbError::InvalidInput(format!("plan_tk upload failed: {e}")))?)
+        } else { None };
 
         Ok(Self {
             gpu, k_struct, t_struct, s: s_mat, k, knew, t, q,

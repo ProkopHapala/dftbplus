@@ -1081,15 +1081,27 @@ fn rhai_sparse_new_cut(name: &str, sk_dir: &str, r_trunc_ang: f64, taper_w_ang: 
 /// sparse_new(name, sk_dir, r_trunc, taper_w, r_k, r_z) — r_k/r_z <= 0 = default
 /// (full SK radius + skin). K/Z decay is set by the gap, not the H/S range.
 fn rhai_sparse_new_full(name: &str, sk_dir: &str, r_trunc_ang: f64, taper_w_ang: f64, r_k_ang: f64, r_z_ang: f64) -> INT {
+    rhai_sparse_new_budget(name, sk_dir, r_trunc_ang, taper_w_ang, r_k_ang, r_z_ang, 0.0)
+}
+
+/// sparse_new(name, sk_dir, r_trunc, taper_w, r_k, r_z, max_deg) — §15.9
+/// SC1: max_deg > 0 overrides ALL degree budgets (hs/k/z) — the explicit
+/// sparsity-budget declaration for runs whose masks are wider than the
+/// production ceilings (512/128/256). Pick the smallest value that fits.
+fn rhai_sparse_new_budget(name: &str, sk_dir: &str, r_trunc_ang: f64, taper_w_ang: f64, r_k_ang: f64, r_z_ang: f64, max_deg: f64) -> INT {
     let (species, coords) = geom_species_coords(name, "sparse_new");
     let n_atom = species.len();
-    eprintln!("[sparse] sparse_new '{name}' n_atom={n_atom} sk={sk_dir} r_trunc={r_trunc_ang} taper_w={taper_w_ang} r_k={r_k_ang} r_z={r_z_ang}");
+    eprintln!("[sparse] sparse_new '{name}' n_atom={n_atom} sk={sk_dir} r_trunc={r_trunc_ang} taper_w={taper_w_ang} r_k={r_k_ang} r_z={r_z_ang} max_deg={max_deg}");
     let sk = load_sk_for_species(sk_dir, &species).unwrap_or_else(|e| panic!("sparse_new '{name}' load SK from {sk_dir}: {e}"));
     let mut cfg = SparseDftbConfig::default();
     if r_trunc_ang > 0.0 { cfg.r_trunc_ang = Some(r_trunc_ang); }
     if taper_w_ang > 0.0 { cfg.taper_w_ang = taper_w_ang; }
     if r_k_ang > 0.0 { cfg.r_k_ang = Some(r_k_ang); }
     if r_z_ang > 0.0 { cfg.r_z_ang = Some(r_z_ang); }
+    if max_deg > 0.0 {
+        let d = max_deg as u32;
+        cfg.max_deg_hs = Some(d); cfg.max_deg_k = Some(d); cfg.max_deg_z = Some(d);
+    }
     let eng = SparseDftb::with_config(sk, sk_dir, species, coords, cfg)
         .unwrap_or_else(|e| panic!("sparse_new '{name}' SparseDftb::with_config: {e}"));
     let n_orbs = eng.n_orbs() as INT;
@@ -1113,6 +1125,30 @@ fn rhai_sparse_scc(name: &str, max_iter: INT, tol: f64) -> f64 {
         eprintln!("[sparse] sparse_scc '{name}' rms={:.3e} iters={} Tr(KS)={:.6} R_I={:.3e} r_scc={:.3e}",
             scc.rms, scc.n_iters, scc.tr_ks, scc.r_i, scc.r_scc);
         scc.rms
+    })
+}
+
+/// sparse_scc_try(name, max_iter, tol) — measurement variant: returns the
+/// final rms, or NaN if scc fails. "Did not converge" IS data in a sweep —
+/// the failure is still printed loudly to stderr; only the panic becomes
+/// a recorded value. Production scripts should use `sparse_scc`.
+fn rhai_sparse_scc_try(name: &str, max_iter: INT, tol: f64) -> f64 {
+    with_sparse(|g| {
+        let h = g.get_mut(name).unwrap_or_else(|| panic!("sparse_scc_try '{name}': no engine — sparse_new first"));
+        match h.eng.scc(max_iter as usize, tol) {
+            Ok(scc) => {
+                h.last_rms = scc.rms;
+                h.last_iters = scc.n_iters as i64;
+                h.have_forces = false;
+                eprintln!("[sparse] sparse_scc_try '{name}' rms={:.3e} iters={} Tr(KS)={:.6} R_I={:.3e}",
+                    scc.rms, scc.n_iters, scc.tr_ks, scc.r_i);
+                scc.rms
+            }
+            Err(e) => {
+                eprintln!("[sparse] sparse_scc_try '{name}' FAILED (recorded as NaN): {e}");
+                f64::NAN
+            }
+        }
     })
 }
 
@@ -1258,6 +1294,16 @@ fn rhai_sparse_ns_tol(name: &str, tol: f64) {
         let h = g.get_mut(name).unwrap_or_else(|| panic!("sparse_ns_tol '{name}': no engine"));
         h.eng.set_ns_tol(tol as f32);
         eprintln!("[sparse] sparse_ns_tol '{name}' tol={tol:e}");
+    });
+}
+
+/// sparse_purifier(name, "k"|"p"|"trs") — AL1 A/B: select K-TC2 vs P=KS
+/// vs TRS4 purifier for subsequent scc calls.
+fn rhai_sparse_purifier(name: &str, mode: &str) {
+    with_sparse(|g| {
+        let h = g.get_mut(name).unwrap_or_else(|| panic!("sparse_purifier '{name}': no engine"));
+        h.eng.set_purifier(mode);
+        eprintln!("[sparse] sparse_purifier '{name}' mode={mode}");
     });
 }
 
@@ -2016,7 +2062,9 @@ fn main() {
     engine.register_fn("sparse_new", rhai_sparse_new);
     engine.register_fn("sparse_new", rhai_sparse_new_cut);
     engine.register_fn("sparse_new", rhai_sparse_new_full);
+    engine.register_fn("sparse_new", rhai_sparse_new_budget);
     engine.register_fn("sparse_scc", rhai_sparse_scc);
+    engine.register_fn("sparse_scc_try", rhai_sparse_scc_try);
     engine.register_fn("sparse_eval", rhai_sparse_eval);
     engine.register_fn("sparse_max_force", rhai_sparse_max_force);
     engine.register_fn("sparse_force_at", rhai_sparse_force_at);
@@ -2032,6 +2080,7 @@ fn main() {
     engine.register_fn("sparse_vibrations", rhai_sparse_vibrations);
     engine.register_fn("sparse_tc2_tol", rhai_sparse_tc2_tol);
     engine.register_fn("sparse_ns_tol", rhai_sparse_ns_tol);
+    engine.register_fn("sparse_purifier", rhai_sparse_purifier);
     engine.register_fn("assert_finite", rhai_assert_finite);
     engine.register_fn("assert_close", rhai_assert_close);
     engine.register_fn("die", rhai_die);
@@ -2079,6 +2128,13 @@ fn main() {
     if let Err(e) = engine.run_with_scope(&mut scope, &script) {
         eprintln!("ERROR: rhai script failed: {e}");
         std::process::exit(1);
+    }
+
+    // RUST_DFTB_PROF=1: dump each GPU engine's accumulated stage table.
+    if std::env::var("RUST_DFTB_PROF").map(|v| v != "0").unwrap_or(false) {
+        with_gpu(|g| {
+            for (name, h) in g.iter() { h.eng.prof_report(&format!("'{name}' (script total)")); }
+        });
     }
 
     eprintln!("\nScript completed successfully.");

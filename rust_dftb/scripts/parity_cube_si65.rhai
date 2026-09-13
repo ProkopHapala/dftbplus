@@ -6,7 +6,7 @@ const ref_dir = "/home/prokop/SIMULATIONS/SiNCs/DFTB/L1/cube_Si_matsci-0-3";
 
 print("=== parity: sparse vs Fortran at DFTB+ min ===");
 load_xyz("cube", ref_dir + "/relaxed.xyz");
-sparse_new("cube", sk_dir);
+sparse_new("cube", sk_dir, 0.0, 0.0, 0.0, 0.0, 512.0);   // max_deg=512: full-radius masks declared explicitly (§15.9 SC1)
 sparse_tc2_tol("cube", 1.0e-6);
 let rms = sparse_scc("cube", 100, 1.0e-5);
 let e = sparse_eval("cube", false);
