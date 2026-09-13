@@ -416,6 +416,42 @@ pub fn build_full_mask(n_atom: usize) -> (Vec<u32>, Vec<u32>) {
     (row_ptr, col_idx)
 }
 
+/// L4 (manifest §15.10): magnitude-aware mask — keep the `k` largest
+/// ‖block‖_F entries per row of `src` (the diagonal is always kept), then
+/// symmetrize by union with the transpose: (i,j) survives iff it was
+/// top-k in row i OR row j. Measures whether the projector is compressible
+/// by block importance where a geometric sphere is not. Returns sorted CSR.
+pub fn build_topk_mask(src: &Bsr4Matrix, k: usize) -> (Vec<u32>, Vec<u32>) {
+    let n = src.n_atom;
+    // Per-block Frobenius norm² — src.values is nblock×16.
+    let norm2: Vec<f32> = (0..src.nblock())
+        .map(|b| src.values[b * 16..b * 16 + 16].iter().map(|&x| x * x).sum())
+        .collect();
+    let mut keep = vec![vec![false; n]; n];
+    for i in 0..n {
+        let (a, b) = (src.row_ptr[i] as usize, src.row_ptr[i + 1] as usize);
+        let mut ranked: Vec<usize> = (a..b).collect();
+        ranked.sort_by(|&x, &y| norm2[y].partial_cmp(&norm2[x]).unwrap_or(std::cmp::Ordering::Equal));
+        for &blk in ranked.iter().take(k) {
+            keep[i][src.col_idx[blk] as usize] = true;
+        }
+        keep[i][i] = true;
+    }
+    // Symmetrize by union.
+    let mut row_ptr = Vec::with_capacity(n + 1);
+    let mut col_idx = Vec::new();
+    row_ptr.push(0u32);
+    for i in 0..n {
+        for j in 0..n {
+            if keep[i][j] || keep[j][i] {
+                col_idx.push(j as u32);
+            }
+        }
+        row_ptr.push(col_idx.len() as u32);
+    }
+    (row_ptr, col_idx)
+}
+
 /// For each block b=(i,j), find the block index of the transpose (j,i).
 /// Returns `INVALID = 0xffffffff` if the transpose is not in the mask
 /// (should not happen for symmetric masks, but is checked on the GPU side

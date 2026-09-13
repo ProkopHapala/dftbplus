@@ -28,6 +28,9 @@
 //   idempotency_reduce            — per-batch idempotency error ||D²−D||_F
 //   local_jacobi_blocks           — serial-in-workgroup Jacobi eigendecomposition of small blocks
 //   local_jacobi_blocks_parallel  — row-parallel Jacobi eigendecomposition of small blocks
+//   fermi_occ_batched             — device-side Fermi μ bisection + occ_w (W5)
+
+#pragma OPENCL EXTENSION cl_khr_fp64 : enable   // f64 for bisection/DIIS decisions
 //
 // ------------------------------------------------------------------
 // Algorithm overview:
@@ -1337,6 +1340,98 @@ __kernel void select_occupation_batched(
 }
 
 // ------------------------------------------------------------------
+// fermi_occ_batched   (W5)
+//
+// Device-side Fermi level + occupation weights: per replica solves
+//   Σ_k f_k(μ) = n_occ,  f_k = 1/(1+exp((ε_k−μ)/kT))
+// by bracketed bisection on eig_diag (unsorted Jacobi output is fine —
+// the sum is order-independent), then writes occ_w[k]=f_k and mu[sid].
+// Replaces the per-iteration eig readback + host bisection + occ_w upload.
+//
+// One workgroup per system. The bisection sum/decision runs in f64
+// (discrete-decision rule: decisions in f64; f_k itself is stored f32).
+// Eigenvalues are staged in __local le[n]; bisection needs ~40 iterations
+// of a workgroup reduction — all inside the one launch, zero host sync.
+// ------------------------------------------------------------------
+__kernel void fermi_occ_batched(
+    const int n,
+    const int batch,
+    const int n_occ,
+    const float kT,
+    __global const float* eig_diag,
+    __global float* occ_w,
+    __global float* mu_out,
+    __local float* le,          // [n] staged eigenvalues
+    __local double* red,        // [lsz] f64 reduction scratch
+    __local double* lohi,       // [4] lo, hi, s_mid, mu
+    __global const int* active  // [batch] 0 → replica frozen, early-out
+) {
+    const int sid = get_group_id(0);
+    const int lid = get_local_id(0);
+    const int lsz = get_local_size(0);
+    if (sid >= batch || active[sid] == 0) return;
+    __global const float* eb = eig_diag + (size_t)sid * n;
+    __global float* ob = occ_w + (size_t)sid * n;
+    const double kt = (double)kT;
+
+    for (int k = lid; k < n; k += lsz) le[k] = eb[k];
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    // bracket: [min−32kT, max+32kT] — f_k≈0/1 beyond, same as the host path
+    double lo = 1.0e300, hi = -1.0e300;
+    for (int k = lid; k < n; k += lsz) {
+        const double e = (double)le[k];
+        lo = fmin(lo, e); hi = fmax(hi, e);
+    }
+    red[lid] = lo;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int off = lsz >> 1; off > 0; off >>= 1) {
+        if (lid < off) red[lid] = fmin(red[lid], red[lid + off]);
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    const double lo_b = red[0];
+    barrier(CLK_LOCAL_MEM_FENCE);
+    red[lid] = hi;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int off = lsz >> 1; off > 0; off >>= 1) {
+        if (lid < off) red[lid] = fmax(red[lid], red[lid + off]);
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    if (lid == 0) {
+        lohi[0] = lo_b - 32.0 * kt;
+        lohi[1] = red[0] + 32.0 * kt;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    // bisection: s(μ) decreasing in −μ... s(μ)=Σf is INCREASING in μ:
+    // s>n_occ → μ too high → hi=mid; else lo=mid.
+    for (int it = 0; it < 40; ++it) {
+        const double mid = 0.5 * (lohi[0] + lohi[1]);
+        double s = 0.0;
+        for (int k = lid; k < n; k += lsz) {
+            const double x = ((double)le[k] - mid) / kt;
+            s += (x > 40.0) ? 0.0 : ((x < -40.0) ? 1.0 : 1.0 / (1.0 + exp(x)));
+        }
+        red[lid] = s;
+        barrier(CLK_LOCAL_MEM_FENCE);
+        for (int off = lsz >> 1; off > 0; off >>= 1) {
+            if (lid < off) red[lid] += red[lid + off];
+            barrier(CLK_LOCAL_MEM_FENCE);
+        }
+        if (lid == 0) {
+            if (red[0] > (double)n_occ) { lohi[1] = mid; } else { lohi[0] = mid; }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    const double mu = 0.5 * (lohi[0] + lohi[1]);
+    if (lid == 0) mu_out[sid] = (float)mu;
+    for (int k = lid; k < n; k += lsz) {
+        const double x = ((double)le[k] - mu) / kt;
+        ob[k] = (float)((x > 40.0) ? 0.0 : ((x < -40.0) ? 1.0 : 1.0 / (1.0 + exp(x))));
+    }
+}
+
+// ------------------------------------------------------------------
 // repulsive_energy_batched
 //
 // Computes the repulsive pair-potential energy per system:
@@ -1508,8 +1603,6 @@ __kernel void repulsive_energy_batched(
 #define DIIS_MAX_HIST 10
 #endif
 #define DIIS_NP1 (DIIS_MAX_HIST + 1)
-
-#pragma OPENCL EXTENSION cl_khr_fp64 : enable
 
 __kernel void diis_step_batched(
     const int n_atoms,

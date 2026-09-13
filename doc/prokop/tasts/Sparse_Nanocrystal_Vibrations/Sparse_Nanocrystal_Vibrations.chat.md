@@ -5777,3 +5777,373 @@ So I would not give up yet. In fact, the `pbc` discovery makes me considerably m
 [7]: https://cris.huji.ac.il/en/publications/sparsity-of-the-density-matrix-in-kohn-sham-density-functional-th/?utm_source=chatgpt.com "Sparsity of the density matrix in kohn-sham density functional theory and an assessment of linear system-size scaling methods - The Hebrew University of Jerusalem"
 [8]: https://dftb.org/parameters/introduction.html?utm_source=chatgpt.com "Introduction — dftb.org"
 [9]: https://pubs.acs.org/doi/10.1021/acs.jctc.6c00121?utm_source=chatgpt.com "DSKO: Dancing through DFTB Parametrization | Journal of Chemical Theory and Computation | ACS Publications"
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+---
+
+# USER
+
+
+OK, there are test with pbc basis instead of matsci. It is big success, but I think the agent is unnecessarily peisimisty about possibility to reduce the cutoff futher? What you think. There are certainly some ways wehich you pertially explored also in previous sugestions, can you explain it to hem more clearly?
+
+
+
+OK, there are test with pbc basis instead of matsci. It is big success, but I think the agent is unnecessarily peisimisty about possibility to reduce the cutoff futher? What you think. There are certainly some ways wehich you pertially explored also in previous sugestions, can you explain it to hem more clearly?
+
+---
+
+# SWE-2
+
+Let me read the full GPT-5.6 suggestion first:
+
+Let me check whether the `pbc` parameter set is available locally:
+
+`pbc-0-3` exists and Si–Si indeed tabulates only to 10.4 a₀ ≈ 5.5 Å. Check the sphere's composition and required SKFs:
+
+All SKFs present, sphere is Si582H282 (H-passivated). First, write the GPT-5.6 plan into the manifest as a new work-order section:
+
+Now write the pbc variant sweep (L1 — the user's priority):
+
+**Huge result.** pbc at full table (5.5 Å) gives deg_k=95 — converges cleanly in **0.54 s** (matsci needed deg 386, 7.1 s — 13×). The confined basis genuinely shortens the DM range. Below 5.5 Å it still fails, but we no longer need it to. Let me find the actual floor — sweep between 5.0 and 5.5:
+
+Odd — deg_k=95 at r_k=0 (full table, ~5.5 Å) vs deg 36 at r_k=5.4? That gap is too big for a 0.1 Å difference. Check how `sparse_new` interprets r_k=0:
+
+r_k=0 → full SK radius, yet deg jumped 36→95 between r_k=5.4 and "full" — inconsistent with a 5.5 Å table end. Check what `r_full_ang` actually is for pbc:
+
+`r_full` uses `t.cutoff()` — probably the *repulsive* spline cutoff, not the 5.5 Å electronic end. Check:
+
+`r_full` = table end 5.5 Å + 1 Å skin = 6.5 Å. The working config was at 6.5, failures at ≤5.4 — the boundary is between. Also deg 95 at 6.5 Å is higher than pure-density estimate (~60) — H passivation adds surface rows. Bracket the transition:
+
+Clear picture now. Let me update the manifest L1 entry with the measured result:
+
+Done. Written into manifest §15.10 (the full GPT-5.6 rescue plan, L1–L8) and the report. **And I ran L1 — the result is genuinely good news:**
+
+## pbc result (R14 sphere, 864 atoms)
+
+| config | deg_k | deg_hs | outcome |
+|--------|-------|--------|---------|
+| pbc full mask (~6.5 Å) | **95** | 54 | **converges clean — 19 iters, 537 ms** |
+| matsci reference (12 Å) | 386 | 168 | 7073 ms |
+| pbc truncated (3.0–6.2 Å) | 6–52 | — | all fail (TC2 diverges, `R_I=inf`) |
+
+**The ~200-neighbor floor was a matsci-basis property, not a sparse-solver limit.** The pbc confinement makes the density matrix genuinely short-ranged — deg 95 is already under the 128 budget, and it's ~13× faster than the matsci reference. The catch: it's all-or-nothing — you can't cut below pbc's own 5.5 Å table (Z on a narrower mask breaks the TC2 spectral bounds → divergence, not graceful degradation).
+
+## Caveats before celebrating
+
+1. **pbc physics unvalidated** — need a Fortran DFTB+ parity run (E/F) on R14 with pbc-0-3 to confirm the parameterization is good for this system.
+2. **P-TC2 fails on pbc even at full mask** (r_I floor ~1.5e-2) — K-TC2 is the working purifier there; worth investigating.
+3. E=−845.1 Ha can't be compared to matsci's −882.5 — different parameterizations.
+
+## Next in the manifest order
+
+L1 done → **L3** (P-locality diagnostic: is `2Tr(P·ZH)` accurate at low degree even when K=PZ isn't?) → **L4** (top-k magnitude masks — the decisive "does a 64-neighbor representation exist at all" test) → L5 (LNV variational refinement) → L6 (localized orbitals, last resort).
+
+
+
+
+---
+
+# Chat GPT 5.6 sol
+
+Yes — I agree with you. The agent is drawing a stronger conclusion than the data justify.
+
+The pbc result is actually much more encouraging than “95 neighbors is the floor.” What it demonstrates is that **locality is highly basis-dependent**: changing only the Si/H parameterization moved you from roughly 386 neighbors and 7 s to 95 neighbors and 0.54 s. That alone tells us that the previous “physics requires hundreds of neighbors” conclusion was wrong. The remaining question is whether we can push the **hot-loop** degree from ~95 toward perhaps 48–64. I think there are several plausible routes.
+
+The key conceptual correction for the agent is this:
+
+> **Failure of a calculation in which \(K\), \(Z\), and all intermediates are simultaneously chopped by the same spherical radius does not prove that the density matrix requires that radius. It only proves that this particular truncated algebra fails.**
+
+In particular, `pbc full ≈6.5 Å` is not even the physical pbc electronic cutoff. The SKF electronic range is ~5.5 Å; the extra ~1 Å comes from your structural skin/default mask convention. The inverse overlap \(Z=S^{-1}\) and density kernel can legitimately extend beyond the H/S range. So the observation “r=6.2 fails, r=6.5 succeeds” may simply mean **\(Z\) or one intermediate requires the extra shell**, not that the repeatedly purified density representation must contain all ~95 neighbors.
+
+There is another reason I would audit that transition carefully: diamond Si has discrete neighbor shells at approximately 2.35, 3.84, 4.50, 5.43, 5.92, then 6.65 Å. Moving a bulk radial cutoff from 6.2 to 6.5 Å does not cross a new bulk-Si shell. Therefore a reported maximum degree jump from ~52 to ~95 in that interval is probably dominated by surface H atoms, skin/mask semantics, or which matrix's degree is being quoted. It should not immediately be interpreted as a fundamental localization length.
+
+## The first experiment should separate \(P/K\) from \(Z\)
+
+I would do this before L3/L4 as currently ordered.
+
+Keep
+
+$$
+R_Z \approx 6.5\text{–}7.0\ {\rm Å}
+$$
+
+and the \(ZS/ZH\) intermediate halo at least that wide, because Z is constructed **once per geometry**.
+
+Then independently sweep only the matrix that lives in the repeated purification loop:
+
+$$
+R_P\ \text{or}\ R_K
+=4.5,\ 5.0,\ 5.5,\ 6.0,\ldots
+$$
+
+The performance objective is not:
+
+$$
+\text{every matrix must have degree}<64.
+$$
+
+It is:
+
+$$
+\boxed{\text{the matrix multiplied 10–30 times per SCC iteration should have degree}\sim64.}
+$$
+
+If Z has degree 95 but is corrected once per geometry, that is cheap. If the final force construction briefly uses a 95-neighbor auxiliary matrix once after SCC convergence, that is also cheap.
+
+This distinction is essential.
+
+The same applies to \(K=PZ\). If P can be kept at degree 48–64, I would **not necessarily construct a full degree-95 K in every SCC iteration**.
+
+Mulliken charge is already directly available from P:
+
+$$
+q_A=2\,\mathrm{Tr}\,P_{AA}.
+$$
+
+And the band energy can be written
+
+$$
+E_{\rm band}
+=2\operatorname{Tr}(KH)
+=2\operatorname{Tr}(P\,Z H).
+$$
+
+You already have \(A=ZH\). So test
+
+$$
+\boxed{E_{\rm band}=2\operatorname{Tr}(PA)}
+$$
+
+directly from the narrow P, **before recovering K**.
+
+This is perhaps the single most important diagnostic now.
+
+If degree-52 or degree-64 P gives a good \(2\mathrm{Tr}(PZH)\), but recovering \(K=PZ\) and truncating it makes the energy bad, then the long tail belongs mainly to the inverse-overlap transformation, not to the physically important occupied projector.
+
+That would radically change the architecture: run SCC on narrow P; recover only those K blocks actually required for forces after convergence.
+
+The literature on nonorthogonal bases gives a strong reason to suspect exactly this effect: inverse-overlap factors can substantially degrade locality. ([Taylor & Francis Online][1])
+
+## Then do the “oracle top-N” experiment
+
+I think the agent's L4 is actually more decisive than another radius sweep, but I would formulate it more strongly.
+
+Take the converged good pbc reference and calculate for every atom pair
+
+$$
+b_{ij}=\|P_{ij}\|_F
+$$
+
+and separately
+
+$$
+k_{ij}=\|K_{ij}\|_F.
+$$
+
+Then create **oracle masks** retaining the strongest 32, 48, 64, 80 blocks per row, symmetrize the graph, freeze it, and rerun SCC self-consistently.
+
+Do not merely truncate the reference matrix and measure its energy.
+
+This answers:
+
+> Does a 64-neighbor representation of the actual electronic state exist at all?
+
+A radial mask is a very crude approximation. In a tetrahedral covalent solid, a farther atom connected through an important bonding pathway may matter more than a closer atom in an unimportant direction. There is no reason that “nearest 64 atoms” should equal “64 most important matrix blocks.”
+
+Sparse purification literature does exactly this sort of magnitude/error-aware screening rather than relying only on geometric radius; there are schemes that bound errors of discarded block products explicitly. ([PubMed][2])
+
+If top-64 works while radius-64 fails, we have essentially solved the conceptual problem. Then the task becomes predicting a good frozen graph without first computing the wide reference—using previous geometry, H/S connectivity, previous P, etc.
+
+For Hessians this is especially convenient: build the graph once at the central geometry and freeze it for all ±h columns.
+
+## Smooth damping is worth testing — but not as the main cure
+
+Your smooth-step idea can help, particularly with stability.
+
+A hard operation
+
+$$
+K_{ij}\rightarrow0
+$$
+
+at a radius boundary creates a discontinuous approximation and can badly disturb eigenvalues/idempotency. A compact taper
+
+$$
+K_{ij}\rightarrow w(r_{ij})K_{ij}
+$$
+
+could behave much better.
+
+I would use something smoother than the usual cubic smoothstep because you care about Hessians. For example a \(C^2\) compact Wendland taper,
+
+$$
+w(x)=
+(1-x)^4(1+4x),
+\qquad
+0\le x<1,
+$$
+
+and zero outside. Wendland functions can be chosen compactly supported and positive definite. ([Springer][3])
+
+There is a nice mathematical bonus if this is applied to the **symmetric PSD K** rather than nonsymmetric P: if the taper matrix \(W_{ij}=w(r_{ij})\) is positive semidefinite, then
+
+$$
+K_{\rm tapered}=W\circ K
+$$
+
+remains positive semidefinite by the Schur-product theorem.
+
+It will still violate \(KSK=K\), so purification/refinement must follow it. But it is considerably more principled than an arbitrary hard chop.
+
+However, I would not expect tapering alone to magically make a physically important tail disappear. It can turn a catastrophic limit cycle into graceful degradation; it cannot recover information that was removed.
+
+The more powerful version of your intuition is:
+
+> **softly localize, then allow the remaining matrix elements to re-optimize.**
+
+That leads directly to LNV.
+
+## This is where LNV/variational refinement becomes genuinely interesting
+
+The present purification approach effectively asks:
+
+$$
+\text{take an unconstrained projector}
+\rightarrow
+\text{throw away everything outside }M.
+$$
+
+But perhaps the best projector **inside \(M\)** is quite different.
+
+For a fixed 48- or 64-neighbor graph, minimize the electronic energy with respect to the allowed density-kernel elements. The retained short-range elements can then rearrange to compensate for the missing tail.
+
+This is exactly the motivation of the Li–Nunes–Vanderbilt family of linear-scaling methods. Importantly for us, Nunes and Vanderbilt explicitly generalized it to **nonorthogonal bases so that \(S\), rather than \(S^{-1}\), enters the functional**, and noted that the resulting density matrix remains localized. ([APS Journals][4])
+
+And this is not hypothetical for silicon: variational finite-range density-matrix approaches were tested on crystalline Si systems up to 512 atoms and showed systematic convergence as the imposed density-matrix range was increased. ([APS Journals][5])
+
+I therefore like this hybrid:
+
+$$
+\text{fast P-TC2}
+\rightarrow
+\text{reasonable localized initial P}
+\rightarrow
+5\text{–}10\text{ constrained variational refinement steps}.
+$$
+
+That is much less radical than replacing the entire implementation with an LNV solver.
+
+## And pbc itself tells us we can probably push the basis further
+
+The biggest lesson from this experiment should not be “pbc gives degree 95.”
+
+It is:
+
+$$
+\boxed{\text{basis confinement changed the required degree by a factor of 4.}}
+$$
+
+That is enormous.
+
+So a purpose-built sparse Si/H parameterization is now a credible long-term option. You could make the atomic \(sp\) orbitals slightly more confined than pbc, refit the repulsive potential, and benchmark against the same target physics.
+
+I would not do that yet, because top-N masking and P-vs-K locality may already get us to 64. But pbc demonstrates that this lever is physically real rather than speculative.
+
+---
+
+Here is the instruction I would give the coding agent; I think this frames the next work more correctly.
+
+Do **not** interpret the pbc result `deg≈95 works, smaller radial masks fail` as evidence that ~95 neighbors is a fundamental lower bound.
+
+The pbc result actually disproves the previous conclusion that Si intrinsically requires ~200–400 neighbors: changing only basis localization reduced the working degree from ~386 to ~95 and SCC time by ~13×. Therefore locality is strongly representation-dependent, and we should now determine which part of the remaining degree is genuinely necessary.
+
+The next experiments must separate the different matrices instead of shrinking `r_k=r_z=...` together.
+
+1. **Separate hot-loop P/K locality from Z locality.**
+
+   Keep `M_Z` and `M_TZS` at the successful full-pbc support (~6.5–7 Å initially). Z is computed only once per geometry, so its degree is not the main performance target.
+
+   Independently sweep only `M_P` (and, for comparison, legacy `M_K`) to much smaller supports/degrees.
+
+   The objective is not “every matrix ≤64 neighbors”. The objective is “the matrix multiplied repeatedly during purification ≤64 neighbors”. A degree-95 Z or one-off force auxiliary is acceptable.
+
+2. **Measure P locality before recovering K.**
+
+   For P-TC2, evaluate Mulliken charges directly from `P_AA`.
+
+   Evaluate the band energy directly as
+
+   $$
+   E_\mathrm{band}=2\,\mathrm{Tr}[P(ZH)]
+   $$
+
+   using the existing `ZH` matrix.
+
+   Compare this for narrow P masks against the wide pbc reference **before computing `K=PZ`**.
+
+   This is critical: if narrow P is accurate but recovered/truncated K is not, then the apparent long-range requirement comes primarily from `S^{-1}`/orthogonalization tails. In that case SCC should stay in P representation and K should only be constructed locally after convergence for force contractions.
+
+3. **Audit the strange 6.2→6.5 Å degree jump.**
+
+   For each mask print:
+
+   * average, p95, and maximum row degree;
+   * species and atom index of maximum-degree row;
+   * number of Si and H neighbors separately;
+   * histogram of neighbor distances;
+   * separate max degrees of `M_HS`, `M_P/K`, `M_Z`, `M_TZS`.
+
+   Diamond-Si has no new bulk Si neighbor shell between roughly 5.92 and 6.65 Å, so a jump from ~52 to ~95 over 6.2→6.5 Å should be understood before treating it as physical.
+
+4. **Run an oracle magnitude-mask test.**
+
+   From the successful wide pbc calculation compute block norms
+
+   $$
+   b_{ij}=\|P_{ij}\|_F
+   $$
+
+   and optionally `||K_ij||_F`.
+
+   Construct symmetric frozen masks retaining approximately the strongest 32, 48, 64, 80 blocks per row, independent of distance, and rerun the full SCC calculation on those masks.
+
+   This is the decisive test of whether a degree-64 representation exists. A radial cutoff is only one very crude sparsifier.
+
+   If top-64 works while radial degree-64 fails, then move to magnitude/error-aware graph selection rather than trying more radii.
+
+5. **Test smooth compact tapering only as a stability/localization aid.**
+
+   Do not expect a generic smoothstep to recover missing physics. Test a C² compact taper on K, preferably a positive-definite compact radial function such as a Wendland taper, then repurify/refine.
+
+   Measure whether this converts abrupt divergence/limit cycles into a smooth accuracy-versus-range curve.
+
+6. **If fixed top-64 remains inaccurate, test constrained variational refinement before abandoning the target.**
+
+   A hard truncated purified projector is not necessarily the minimum-energy projector inside that sparsity space.
+
+   Starting from P-TC2, perform a small number of LNV-like/local density-matrix minimization steps with the sparsity graph fixed. This allows retained near-field blocks to relax and compensate optimally for the omitted tail.
+
+Only after these experiments should we decide that degree 64 is physically impossible.
+
+Do **not** spend time on Kahan/ACC8 or further SpGEMM micro-optimization during this phase. The dominant question is representation/truncation, not f32 rounding.
+
+The experiment I would prioritize above everything else is **wide Z + narrow P + direct \(2\mathrm{Tr}(PZH)\)**. It can tell us very quickly whether the remaining 95-neighbor requirement is real occupied-state nonlocality or mostly an artifact of forcing \(S^{-1}\) and recovered K into the same short radial mask.
+
+[1]: https://www.tandfonline.com/doi/full/10.1080/00268976.2020.1765034?utm_source=chatgpt.com "Full article: The spectrum of the atomic orbital overlap matrix and the locality of the virtual electronic density matrix"
+[2]: https://pubmed.ncbi.nlm.nih.gov/16170798/?utm_source=chatgpt.com "Systematic sparse matrix error control for linear scaling electronic structure calculations - PubMed"
+[3]: https://link.springer.com/article/10.1007/s11071-025-11407-6?utm_source=chatgpt.com "Barrier Lyapunov Functions and Model Reference Adaptive Control with Uncertainty in Native Spaces | Nonlinear Dynamics | Springer Nature Link"
+[4]: https://journals.aps.org/prb/abstract/10.1103/PhysRevB.50.17611?utm_source=chatgpt.com "Generalization of the density-matrix method to a nonorthogonal basis | Phys. Rev. B"
+[5]: https://journals.aps.org/prb/abstract/10.1103/PhysRevB.51.10157?utm_source=chatgpt.com "Self-consistent first-principles technique with linear scaling | Phys. Rev. B"

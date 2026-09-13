@@ -1307,6 +1307,17 @@ fn rhai_sparse_purifier(name: &str, mode: &str) {
     });
 }
 
+/// sparse_eval_p(name) — L3 diagnostic: 2·Tr(P·Z·H_scc), the band energy
+/// from P without K=PZ recovery. Panics if the last purifier wasn't P-based.
+fn rhai_sparse_eval_p(name: &str) -> f64 {
+    with_sparse(|g| {
+        let h = g.get_mut(name).unwrap_or_else(|| panic!("sparse_eval_p '{name}': no engine"));
+        let e = h.eng.band_energy_p().unwrap_or_else(|err| panic!("sparse_eval_p '{name}': {err}"));
+        eprintln!("[sparse] sparse_eval_p '{name}' E_band(P)={e:.8}");
+        e
+    })
+}
+
 fn rhai_sparse_charges(name: &str) -> String {
     with_sparse(|g| {
         let h = g.get(name).unwrap_or_else(|| panic!("sparse_charges '{name}': no engine"));
@@ -2081,6 +2092,7 @@ fn main() {
     engine.register_fn("sparse_tc2_tol", rhai_sparse_tc2_tol);
     engine.register_fn("sparse_ns_tol", rhai_sparse_ns_tol);
     engine.register_fn("sparse_purifier", rhai_sparse_purifier);
+    engine.register_fn("sparse_eval_p", rhai_sparse_eval_p);
     engine.register_fn("assert_finite", rhai_assert_finite);
     engine.register_fn("assert_close", rhai_assert_close);
     engine.register_fn("die", rhai_die);

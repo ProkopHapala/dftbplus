@@ -165,6 +165,11 @@ pub struct SparseDftbConfig {
     /// real contributions). Default 0.0 → M_TZS = M_Z (legacy). This is
     /// the ONLY intermediate allowed a halo — bounded by the M_Z budget.
     pub r_zs_halo_ang: f64,
+    /// L4 (manifest §15.10): inject an explicit CSR mask used for BOTH M_K
+    /// and M_Z (e.g. a magnitude-aware top-k mask built from a wide
+    /// reference run). Skips the geometric build; still validated for
+    /// diagonals/symmetry and measured against the degree budgets.
+    pub mask_kz: Option<(Vec<u32>, Vec<u32>)>,
 }
 
 impl Default for SparseDftbConfig {
@@ -182,6 +187,7 @@ impl Default for SparseDftbConfig {
             force_w_zk: None,
             max_deg_hs: None, max_deg_k: None, max_deg_z: None,
             r_zs_halo_ang: 0.0,
+            mask_kz: None,
         }
     }
 }
@@ -372,12 +378,16 @@ impl SparseDftb {
         let hs_taper = cfg.r_trunc_ang.map(|rt| (rt - cfg.taper_w_ang, cfg.taper_w_ang));
         let full_mask = cfg.full_mask.unwrap_or(n_atom <= FULL_MASK_ATOMS);
         let m_hs = if full_mask { build_full_mask(n_atom) } else { build_geometric_mask(&coords, r_hs_ang) };
-        let m_k = if full_mask {
+        let m_k = if let Some(m) = &cfg.mask_kz {
+            m.clone()
+        } else if full_mask {
             build_full_mask(n_atom)
         } else {
             build_geometric_mask(&coords, cfg.r_k_ang.unwrap_or(r_full_ang))
         };
-        let m_z = if full_mask {
+        let m_z = if let Some(m) = &cfg.mask_kz {
+            m.clone()
+        } else if full_mask {
             build_full_mask(n_atom)
         } else {
             build_geometric_mask(&coords, cfg.r_z_ang.unwrap_or(r_full_ang))
@@ -385,13 +395,24 @@ impl SparseDftb {
         // SC7 (§15.9): modest fixed halo for the NS intermediate T=Z·S.
         // The ONLY intermediate allowed wider than its result mask — still
         // bounded, still measured against a budget, never product support.
-        let m_tzs = if !full_mask && cfg.r_zs_halo_ang > 0.0 {
+        // (Injected masks (L4) carry no halo — M_TZS = M_Z there.)
+        let m_tzs = if cfg.mask_kz.is_none() && !full_mask && cfg.r_zs_halo_ang > 0.0 {
             Some(build_geometric_mask(&coords, cfg.r_z_ang.unwrap_or(r_full_ang) + cfg.r_zs_halo_ang))
         } else { None };
+        // Injected mask contract: CSR shape + symmetry (plans assume it).
+        if let Some(m) = &cfg.mask_kz {
+            if m.0.len() != n_atom + 1 || m.0[0] != 0 || m.0[n_atom] as usize != m.1.len() {
+                return Err(DftbError::InvalidInput(format!(
+                    "SparseDftb: mask_kz malformed CSR (rows {} vs n_atom+1={}, nnz {})",
+                    m.0.len(), n_atom + 1, m.1.len()
+                )));
+            }
+        }
         // SC5 (§15.9): a geometric run on ALL-default radii is the
         // permissive regime — say so loudly (it still runs; the degree
         // budgets below are the hard contract).
-        if !full_mask && cfg.r_trunc_ang.is_none() && cfg.r_k_ang.is_none() && cfg.r_z_ang.is_none() {
+        if !full_mask && (cfg.r_trunc_ang.is_none()
+            || (cfg.mask_kz.is_none() && (cfg.r_k_ang.is_none() || cfg.r_z_ang.is_none()))) {
             eprintln!("[SparseDftb] WARNING: all sparsity radii defaulted (r_trunc/r_k/r_z=None → full SK radius + skin). This is the permissive wide-mask regime — pass explicit radii for production runs (manifest §15.9 SC5).");
         }
         for (name, m) in [("m_hs", &m_hs), ("m_k", &m_k), ("m_z", &m_z), ("m_tzs", m_tzs.as_ref().unwrap_or(&m_z))] {
@@ -532,6 +553,10 @@ impl SparseDftb {
             _ => panic!("set_purifier: mode '{mode}' — expected \"k\"|\"p\"|\"trs\""),
         }
     }
+
+    /// L3 (manifest §15.10): `2·Tr(P·Z·H_scc)` — band energy from P
+    /// directly, no K=PZ recovery. Err if the last purifier wasn't P-based.
+    pub fn band_energy_p(&mut self) -> Result<f64> { self.ws.band_energy_from_p() }
     /// Diagnostic dense padded K (only when `dense_diag`; else empty).
     pub fn k_pad(&self) -> &[f32] { &self.k_pad }
     /// Diagnostic dense padded H_scc (only when `dense_diag`; else empty).

@@ -153,6 +153,7 @@ pub struct GpuSccPlan {
     pub occ_mask: Buffer<i32>,    // occupation mask [batch*n]
     pub occ_idx: Buffer<i32>,     // sorted occupied column indices [batch*n] (D10)
     pub occ_w: Buffer<f32>,       // per-orbital Fermi weights f_k [batch*n] (smearing)
+    pub mu_out: Buffer<f32>,      // Fermi level μ per replica [batch] (W5, diagnostic)
     pub eig_diag: Buffer<f32>,    // extracted diagonal [batch*n]
     pub eig_rho: Buffer<f32>,     // occupied Rayleigh quotients ρ_k [batch*n] (§12 D3/D4)
     pub x_buf: Buffer<f32>,       // Löwdin transform S^{-1/2} [batch*nn]
@@ -195,6 +196,7 @@ pub struct GpuSccPlan {
     k_jacobi: Kernel,         // jacobi (full-local or tiled)
     k_extract_diag: Kernel,   // extract_diagonal_batched
     k_select_occ: Kernel,     // select_occupation_batched (R9: GPU-side occ selection)
+    k_fermi_occ: Kernel,      // fermi_occ_batched (W5: device μ bisection + occ_w)
     k_density: Kernel,         // build_density_occ_batched (D, gated on `active`)
     k_edm: Kernel,             // build_density_occ_batched (W, gated on `state_ok` — R1)
     k_occ_renorm: Kernel,      // occ_normalize_batched (§12 D3: repair C′ orthonormality)
@@ -324,6 +326,7 @@ impl GpuSccPlan {
         let occ_mask = rt.zero_buffer::<i32>(batch * n)?;
         let occ_idx = rt.zero_buffer::<i32>(batch * n)?;
         let occ_w = rt.zero_buffer::<f32>(batch * n)?;
+        let mu_out = rt.zero_buffer::<f32>(batch)?;
         let eig_diag = rt.zero_buffer::<f32>(batch * n)?;
         let eig_rho = rt.zero_buffer::<f32>(batch * n)?;
 
@@ -403,6 +406,19 @@ impl GpuSccPlan {
             .global_work_size(batch * occ_wg).local_work_size(occ_wg)
             .arg(n as i32).arg(0i32).arg(batch as i32)  // n_occ=0 dummy, set per-solve
             .arg(&eig_diag).arg(&occ_mask).arg(&occ_idx).arg(&active)
+            .build().map_err(map_ocl_err)?;
+
+        // 8c. fermi_occ_batched (W5): device μ bisection + occ_w on eig_diag.
+        //     args [0]=n [1]=batch [2]=n_occ [3]=kT [4]=eig_diag [5]=occ_w
+        //     [6]=mu_out [7]=le(n) [8]=red(wg f64) [9]=lohi(4 f64) [10]=active
+        let wg_fermi = occ_wg;
+        let k_fermi_occ = Kernel::builder()
+            .program(&mat_prog).name("fermi_occ_batched").queue(rt.queue().clone())
+            .global_work_size(batch * wg_fermi).local_work_size(wg_fermi)
+            .arg(n as i32).arg(batch as i32).arg(0i32).arg(0.0f32)  // n_occ/kT set per-call
+            .arg(&eig_diag).arg(&occ_w).arg(&mu_out)
+            .arg_local::<f32>(n).arg_local::<f64>(wg_fermi).arg_local::<f64>(4)
+            .arg(&active)
             .build().map_err(map_ocl_err)?;
 
         // 9. build_density_occ_batched (D10): args [0]=n [1]=batch [2]=n_occ
@@ -616,7 +632,7 @@ impl GpuSccPlan {
 
         let mut plan = Self {
             n, n_atoms, batch,
-            q_gpu, dq, v, h_scc, temp, hp, cp, c, d, q_new, q_next, active, state_ok, ones, tr, dot, rms, occ_mask, occ_idx, occ_w, eig_diag, eig_rho,
+            q_gpu, dq, v, h_scc, temp, hp, cp, c, d, q_new, q_next, active, state_ok, ones, tr, dot, rms, occ_mask, occ_idx, occ_w, mu_out, eig_diag, eig_rho,
             x_buf, x_t, s_work, s_v, s_v_scaled, lambda_min, jacobi_diag,
             diis_q_hist, diis_r_hist, diis_buf_idx, diis_n_filled,
             diis_coeffs, diis_flag, diis_reason, diis_max_hist,
@@ -632,7 +648,7 @@ impl GpuSccPlan {
             lowdin_e1_host: vec![0.0; batch],
             k_dq_v_hscc,
             k_matmul_xh, k_matmul_tx, k_matmul_xc, k_transpose,
-            k_jacobi, k_extract_diag, k_select_occ, k_density, k_edm, k_occ_renorm, k_occ_snorm, k_occ_rayleigh, k_mulliken, k_residual_mix,
+            k_jacobi, k_extract_diag, k_select_occ, k_fermi_occ, k_density, k_edm, k_occ_renorm, k_occ_snorm, k_occ_rayleigh, k_mulliken, k_residual_mix,
             k_diis, k_commit, k_frobenius_trace, k_dot,
             matmul_buf_base,
             n_occ: 0,
@@ -1089,34 +1105,16 @@ impl GpuSccPlan {
             self.k_density.set_arg(8u32, 0i32).map_err(map_ocl_err)?;
             return Ok(n_occ as i32);
         }
-        // smearing: host bisection on eig_diag — Σ_k 1/(1+exp((ε−μ)/kT)) = n_occ
-        rt.read_buffer(&self.eig_diag, &mut self.eig_diag_host)?;
-        rt.prof_tick("scc.eig_read");
-        let n = self.n;
-        let kt = self.kT as f64;
-        for b in 0..self.batch {
-            let e = &self.eig_diag_host[b * n..(b + 1) * n];
-            let mut lo = e.iter().fold(f64::INFINITY, |a, &v| a.min(v as f64)) - 32.0 * kt;
-            let mut hi = e.iter().fold(f64::NEG_INFINITY, |a, &v| a.max(v as f64)) + 32.0 * kt;
-            for _ in 0..80 {
-                let mid = 0.5 * (lo + hi);
-                let s: f64 = e.iter().map(|&ek| 1.0 / (1.0 + (((ek as f64) - mid) / kt).exp())).sum();
-                // s(μ) is increasing in μ: too many electrons → μ too high
-                if s > n_occ as f64 { hi = mid } else { lo = mid }
-            }
-            let mu = 0.5 * (lo + hi);
-            if !mu.is_finite() {
-                return Err(DftbError::InvalidInput(format!("Fermi smearing: μ non-finite replica {b} (kT={})", self.kT)));
-            }
-            for k in 0..n {
-                let x = ((e[k] as f64) - mu) / kt;
-                self.occ_w_host[b * n + k] = (1.0 / (1.0 + x.exp().min(1e300))) as f32;
-            }
-        }
-        self.occ_w.write(&self.occ_w_host).enq().map_err(map_ocl_err)?;
-        rt.prof_tick("scc.occ_host");
+        // W5 smearing: fermi_occ_batched solves μ per replica on device
+        // (f64 bracketed bisection on eig_diag) and writes occ_w directly —
+        // the per-iteration eig readback + host bisection + occ_w upload
+        // (~0.7 ms/iter at batch=19, RTX 3090) is gone; no host sync.
+        self.k_fermi_occ.set_arg(2u32, n_occ as i32).map_err(map_ocl_err)?;
+        self.k_fermi_occ.set_arg(3u32, self.kT).map_err(map_ocl_err)?;
+        unsafe { self.k_fermi_occ.enq().map_err(map_ocl_err)?; }
+        rt.prof_tick("scc.fermi_occ");
         self.k_density.set_arg(8u32, 1i32).map_err(map_ocl_err)?;
-        Ok(n as i32)
+        Ok(self.n as i32)
     }
 
     /// One SCC step with GPU DIIS. Returns max residual RMS (√(Σres²/n_atoms)).
@@ -1320,6 +1318,11 @@ impl GpuSccPlan {
         rt.read_buffer(&self.eig_diag, &mut self.eig_diag_host)?;
         rt.read_buffer(&self.eig_rho, &mut self.eig_rho_host)?;
         rt.read_buffer(&self.occ_mask, &mut self.mask_host)?;
+        if self.kT > 0.0 {
+            // W5: occ_w lives on device (fermi_occ_batched) — one eval-time
+            // readback for the f64 band/Mermin energy. Not in the SCC loop.
+            rt.read_buffer(&self.occ_w, &mut self.occ_w_host)?;
+        }
         let mut dqv = vec![0.0f32; batch];
         let mut q0v = vec![0.0f32; batch];
         rt.read_buffer(&self.dot, &mut dqv)?;

@@ -1032,3 +1032,33 @@ warm-start retry intact through the chunked path.
 
 Tests: gpu_dftb 6/6, gpu_tiled_jacobi 4/4 (+1 ignored bench). All
 verification on NVIDIA RTX 3090.
+
+## 2026-09-13 (b) — built-in profiler + W5 GPU Fermi
+
+**Profiler.** `ncu`/`nsys`/`perf` all dead on this box
+(`RmProfilingAdminOnly=1`, `perf_event_paranoid=4`). Built-in stage
+profiler instead: `RUST_DFTB_PROF=1` (tick — guarded clFinish per stage,
+GPU-inclusive attribution) or `RUST_DFTB_PROF=mark` (no sync — pure
+host/enqueue attribution, production wall time). Interior-mutable
+`Prof` on GpuRuntime; counters n_finish/n_read free; report at relax
+end and at script end per engine.
+
+**Breakdown (batch=19, N=86, tick mode — relative attribution; finishes
+inflate totals):** per SCC iter — `hscc` (fused Δq→V→H_scc) 0.71 ms,
+`occ_host` (host Fermi bisection) 0.68 ms, `jacobi` 0.48 ms; everything
+else ≤0.07 ms. Mark mode: warm scc() 0.64 ms/call ≈ 80 µs/iter; per-kernel
+enqueue ≈ 0.15–0.2 ms of host overhead/stage; the GPU drain surfaces at
+`chunkend` (3.0 ms) and `fire.check_jacobi` (3.1 ms).
+
+**W5.** New `fermi_occ_batched` kernel: one WG/replica, eig_diag staged in
+local, f64 bracketed bisection (40 iters, [min−32kT, max+32kT]) on device,
+writes occ_w + mu_out — kills the per-iteration eig readback + host
+bisection + occ_w upload entirely. `select_occupation_batched` kept
+(occ_mask still feeds renorm/rayleigh). Fixed the one stale-mirror bug:
+`energy_from_state` now reads occ_w back once per eval when kT>0.
+
+**Measured (batch=19, diag_step_cost):** warm scc 6.16→1.36 ms profiled,
+0.64 ms in mark mode (≈80 µs/iter for 19 replicas); reads 226→164.
+GC relax identical: 45 steps, max|F|=8.08e-4, E=−44.9278022,
+|dE−CPU|=2.5e-6, max|ΔF|=6.4e-6. gpu_dftb 6/6, batch=4 mixed scan:
+same statuses + masked retry.

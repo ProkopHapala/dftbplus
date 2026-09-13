@@ -165,6 +165,7 @@ pub struct SparseSystemWorkspace {
     plan_pp: Option<SpgemmPlanGpu>,   // generic P·P on M_P
     plan_pz: Option<SpgemmPlanGpu>,   // K = P·Z on M_K (Z symmetric → Bsym)
     p_to_tzs: Buffer<i32>,            // restrict map M_P-block → M_TZS-block
+    p_t: Buffer<i32>,                 // L3: M_P block (i,j) → M_P block (j,i) — for Tr(P·ZH)
     /// True when `p` holds the converged P = K·S (P-purifier path).
     p_valid: bool,
 }
@@ -328,6 +329,11 @@ impl SparseSystemWorkspace {
         let p_best = gpu.zero_f32(p_struct.nblock * BS2)?;
         let p_to_tzs_host = block_map_same(&m_p, &m_t_zs, n_atom);
         let p_to_tzs = gpu.buf_i32(&p_to_tzs_host)?;
+        let p_t_host = block_map_transpose(&m_p, &m_p, n_atom);
+        if p_t_host.iter().any(|&x| x < 0) {
+            return Err(DftbError::InvalidInput("M_P not symmetric — product masks must be symmetric".into()));
+        }
+        let p_t = gpu.buf_i32(&p_t_host)?;
         let p_dummy = Bsr4Matrix::from_structure(n_atom, m_p.0.clone(), m_p.1.clone())?;
         let plan_pp = if plans_on {
             let plan = crate::methods::sparse::bsr4::build_spgemm_plan(&p_dummy, &p_dummy, &m_p)
@@ -434,6 +440,7 @@ impl SparseSystemWorkspace {
             plan_pz,
             plan_ht,
             p_to_tzs,
+            p_t,
             p_valid: false,
         })
     }
@@ -501,6 +508,28 @@ impl SparseSystemWorkspace {
             self.hs_struct.nblock, &self.h0.values, &self.k.values, &self.hs_to_kt,
             &self.reduce_partial, &self.reduce_a, &self.reduce_b, &mut self.reduce_tail_host,
         )
+    }
+
+    /// L3 (manifest §15.10): band energy WITHOUT K recovery —
+    /// `E_band = 2·Tr(P·ZH)` using `b_zh` = Z·H_scc still held from the
+    /// P0 build. Restricts ZH onto M_P and takes the masked trace (same
+    /// kernel as Tr(K·H0), map = M_P transpose). Diagnostic: if this is
+    /// accurate at low degree while the recovered-K path is not, the
+    /// K=PZ recovery — not P locality — is what sets the degree floor.
+    /// Requires a P purifier run (`p_valid`); Errs otherwise.
+    pub fn band_energy_from_p(&mut self) -> Result<f64> {
+        if !self.p_valid {
+            return Err(DftbError::InvalidInput(
+                "band_energy_from_p: no P state — engine ran K-TC2, not purifier p/trs".into()
+            ));
+        }
+        // ZH restricted M_TZS→M_P into q_p2 (free scratch after purify).
+        self.gpu.restrict_dev(self.p_struct.nblock, &self.p_to_tzs, &self.b_zh.values, &self.q_p2.values)?;
+        let tr = self.gpu.trace_hk_to_f64(
+            self.p_struct.nblock, &self.p.values, &self.q_p2.values, &self.p_t,
+            &self.reduce_partial, &self.reduce_a, &self.reduce_b, &mut self.reduce_tail_host,
+        )?;
+        Ok(2.0 * tr)
     }
 
     /// Hamiltonian stationarity residual (R11):
@@ -1428,6 +1457,7 @@ impl SparseSystemWorkspace {
         }
         let out = self.trs_purify_p(tc2_max, tc2_tol, 1)?;
         self.recover_k_from_p()?;   // leaves fresh t_ks (t_ks_valid)
+        self.p_valid = true;
         let (r_i_k, tr_ks) = self.recovered_k_diagnostics()?;
         Ok((out.0, r_i_k, tr_ks, out.3))
     }
@@ -1493,6 +1523,7 @@ impl SparseSystemWorkspace {
         // recover_k_from_p builds T=K·S once (needed for the trace restore)
         // and leaves it fresh — Mulliken then reads t_ks.
         self.recover_k_from_p()?;   // leaves fresh t_ks (t_ks_valid)
+        self.p_valid = true;
         let (r_i_k, tr_ks) = self.recovered_k_diagnostics()?;
         Ok((out.0, r_i_k, tr_ks, out.3))
     }

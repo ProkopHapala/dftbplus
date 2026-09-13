@@ -1428,3 +1428,84 @@ Next required checks before trusting pbc numbers: (1) Fortran DFTB+
 parity E/F on R14 with pbc-0-3 (validate the parameterization itself);
 (2) forces/vibration quality; (3) why P-TC2 fails on pbc. Then
 L3 → L4 → L5 to push degree down further.
+
+### L3 measured — P is NOT more local than K
+
+`band_energy_from_p` = 2·Tr(P·Z·H_scc) via restrict(b_zh→M_P)+masked
+trace (`sparse_eval_p` in rhai). On matsci R14, E_P drift vs the deg-356
+reference: deg 212 → +144 mHa, deg 108 → +205 mHa, deg 52 → +4.65 Ha —
+same as or worse than the recovered-K path. The K=PZ recovery was NOT
+the limiter; the projector itself carries the long tail. The "run the
+hot loop on tiny masks, recover K later" hypothesis is dead on matsci.
+
+### L4 measured — mostly Case B (projector not compressible)
+
+`tests/sparse_topk.rs` (ignored GPU test): top-k masks built from the
+converged wide-run K block norms, symmetrized. Results:
+
+| top-k | deg (symmetrized) | result |
+|------:|------:|--------|
+| 32 | 60 | non-converged (rms 3.9e-4) |
+| 48 | 94 | +384 mHa |
+| 64 | 114 | +206 mHa |
+| 96 | 174 | +83 mHa |
+| 128 | 236 | rms 1.3e-5 ≈ tol, +36 mHa |
+
+Magnitude masks DO beat geometric masks at equal degree (converge at
+deg 114 where geometric deg 108 limit-cycled; deg 174 → 83 mHa vs
+geometric deg 212 → 137 mHa — ~2× better error per neighbor). But even
+optimal block selection leaves 80–400 mHa at deg ~100–230: the matsci
+projector is genuinely not compressible to 64–128 neighbors.
+Consistent with L1: the fix is the basis (pbc), not mask cleverness.
+Top-k machinery (`build_topk_mask`, `mask_kz` injection) stays as the
+MS2 substrate — e.g. to shrink masks *below pbc's native range* later.
+
+## 2026-09-13 (d) — pbc parity vs Fortran DFTB+: OPEN PROBLEM
+
+Parity run `debug/pbc_parity_R14/` (DFTB+ dev build, SCC, pbc-0-3):
+
+| system | basis | DFTB+ | Rust sparse | Δ |
+|--------|-------|-------|-------------|---|
+| SiH4   | matsci | −2.7642057 | −2.7642056 | **+0.00007 Ha — exact** |
+| SiH4   | pbc    | −2.5674616 | −2.5674278 | +0.034 mHa — fine |
+| R14 sphere | matsci | −882.5987 | −882.5152 (deg 356) | +78 mHa (truncation-level) |
+| R14 sphere | pbc    | **−847.0896** | **−845.1152** (deg 95) | **+1974 mHa — WRONG** |
+
+- The sparse engine is validated: SiH4 parity is 1e-7 on matsci and
+  34 μHa on pbc. SKF parsing (repeat tokens, comma separators, Hubbard
+  field position) is consistent between Rust and DFTB+.
+- The 2 Ha gap is scale-dependent, NOT a per-atom parsing/onsite issue:
+  34 μHa on SiH4 → ~30 mHa if it scaled ×864, not 2 Ha.
+- Ruled out: H/S taper (r_trunc 5.3→5.45 moved nothing), Hubbard U
+  (same field both sides).
+- DFTB+ pbc decomposition: band −900.009, electronic −848.511,
+  repulsive +1.421. Rust E_tot −845.117 → electronic ≈ −846.538
+  (if E_rep matches) → the SCC electronic energy is off by ~2 Ha.
+  Suspects: converged-charge state difference at scale (sphere has real
+  Si→H surface charge transfer), or a pbc-specific convention DFTB+
+  applies that the sparse path misses.
+- **ALSO: a rerun of the identical pbc config (r_trunc=5.45) diverged** —
+  TC2 blew up at iter 62 (R_I=0.78, Tr(KS)=1508) after cleanly
+  converging (19 iters, E=−845.117) minutes earlier. Nondeterministic
+  TC2 blowup on pbc — possibly related to in-flight qmqm edits at the
+  time; must be reproduced/investigated before trusting pbc numbers.
+
+**Bottom line: pbc gives the locality we want, but the R14 result is
+not yet trustworthy — 2 Ha off DFTB+. Parity must be resolved before
+pbc is the production basis.**
+
+## GPT-5.6 reframing (chat line 5855+): 95 is NOT a proven floor
+
+Key correction: "failure when K, Z and intermediates are all chopped by
+the SAME radius proves only that this truncated algebra fails — not that
+the density matrix needs that radius." The pbc table end is 5.5 Å; the
+working "full" mask was 6.5 Å incl. skin — Z can legitimately extend
+beyond the H/S range. The 6.2-fail/6.5-work transition may just be Z or
+an intermediate needing the extra shell. Also unexplained: the degree
+jump 52→95 over 6.2→6.5 Å — diamond Si has NO bulk neighbor shell
+between 5.92 and 6.65 Å, so the jump is probably surface-H/skin/mask
+semantics, not a localization length. Audit needed.
+
+The performance objective is NOT "every matrix ≤ 64 neighbors" — it is
+"the matrix multiplied 10–30×/SCC iter (P or K) has degree ~64". Z is
+built once per geometry; wide Z is cheap.

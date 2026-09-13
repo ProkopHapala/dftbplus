@@ -32,13 +32,16 @@ pub struct GpuCapabilities {
     pub global_mem_size: u64,
 }
 
-/// Env-gated stage profiler (`RUST_DFTB_PROF=1`). Interior-mutable so the
-/// `&self` sync paths can count without signature changes. `prof_tick`
-/// inserts a `queue.finish()` — OFF by default so production never pays
-/// for extra syncs; it exists for benchmarking, not for correctness.
+/// Env-gated stage profiler (`RUST_DFTB_PROF`). Interior-mutable so the
+/// `&self` sync paths can count without signature changes.
+///   =mark  — `prof_tick` records wall time only (no finish): per-stage
+///            HOST/enqueue time; the production sync points are unchanged.
+///   =1|tick— each tick inserts a guarded `queue.finish()` first: per-stage
+///            GPU-inclusive time. Off by default — benchmarking only.
 #[derive(Debug, Default)]
 pub struct Prof {
     pub enabled: bool,
+    pub finish: bool,
     tick: Cell<Option<Instant>>,
     stages: RefCell<BTreeMap<&'static str, (u64, f64)>>, // name → (count, sec)
     pub n_finish: Cell<u64>,   // queue.finish() calls (sync count)
@@ -78,10 +81,14 @@ impl GpuRuntime {
             device,
             caps,
             program_cache: HashMap::new(),
-            prof: Prof {
-                enabled: std::env::var("RUST_DFTB_PROF").map(|v| v != "0").unwrap_or(false),
-                tick: Cell::new(Some(Instant::now())),
-                ..Prof::default()
+            prof: {
+                let v = std::env::var("RUST_DFTB_PROF").unwrap_or_default();
+                Prof {
+                    enabled: !v.is_empty() && v != "0",
+                    finish: v != "mark",
+                    tick: Cell::new(Some(Instant::now())),
+                    ..Prof::default()
+                }
             },
         })
     }
@@ -207,13 +214,16 @@ impl GpuRuntime {
         if self.prof.enabled { self.prof.tick.set(Some(Instant::now())); }
     }
 
-    /// Close a measured stage: guarded `queue.finish()` then accumulate the
-    /// elapsed wall time (GPU-inclusive) under `name`. No-op when
-    /// `RUST_DFTB_PROF` is unset — the finish is benchmarking-only.
+    /// Close a measured stage and accumulate the elapsed wall time under
+    /// `name`. In `mark` mode: no sync — measures host/enqueue time only.
+    /// In `tick` mode: guarded `queue.finish()` first — GPU-inclusive.
+    /// No-op when `RUST_DFTB_PROF` is unset.
     pub fn prof_tick(&self, name: &'static str) {
         if !self.prof.enabled { return; }
-        self.prof.n_finish.set(self.prof.n_finish.get() + 1);
-        let _ = self.queue.finish();
+        if self.prof.finish {
+            self.prof.n_finish.set(self.prof.n_finish.get() + 1);
+            let _ = self.queue.finish();
+        }
         let dt = self.prof.tick.get().map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0);
         let mut st = self.prof.stages.borrow_mut();
         let e = st.entry(name).or_insert((0, 0.0));

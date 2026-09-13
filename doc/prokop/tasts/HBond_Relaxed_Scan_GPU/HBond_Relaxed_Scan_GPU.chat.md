@@ -3646,3 +3646,1055 @@ not the reverse.
 
 And for the repeated agent violations, prose clearly isn't enough anymore. I would add **tests that fail** if a production SCC/FIRE call increases counters for GPU allocations, program compilations or kernel construction. The agent can ignore a paragraph; it cannot merge code while `test_dense_hotloop_has_zero_alloc_and_zero_compile` fails.
 
+
+
+
+
+---
+
+# USER
+
+OK we added proper benchmarking and speed measurement, and I think they clearly suggest there are siginficnat overheads still, can you comment on it? Like 
+scc.occ_host       42.2 ms   62   0.68 ms   HOST bisection μ + occ_w upload ← BIGGEST
+seems this should not take so much time definitely.
+
+Suggest where to focus optimization efford now:
+
+https://github.com/ProkopHapala/dftbplus/commit/b3c16f3f15cbb98e4860d9c6a60f4da345ebbdd7
+
+---
+
+# SWE-2
+
+
+Good question — 0.3 s wall for 45 FIRE steps is the *host-observed* time; it hides where GPU work vs. host orchestration sits. Let me check what profiling options exist on this machine, then wire in a breakdown.
+
+`nsys`/`ncu` are installed — `ncu` can profile OpenCL kernels per-name. Let me check nsys's OpenCL trace support and look at the relax loop structure for stage timers:
+
+`nsys` doesn't trace OpenCL on this setup; `ncu` does profile OpenCL kernels (per-kernel GPU time + launch counts) but it's heavy — good for a short run. For the host-side stage breakdown I'll add an env-gated timer with guarded `queue.finish()` at section boundaries, exactly as you suggested. Let me look at the relax loop:
+
+Plan: (a) env-gated stage profiler in `GpuRuntime` — `RUST_DFTB_PROF=1` inserts `queue.finish()` at section boundaries only; (b) per-kernel GPU times via `ncu` on a short run — no code changes needed for that. First, the runtime internals:
+
+`read_buffer`/`finish` are the two sync funnels — I'll count them there. Adding an env-gated stage profiler to `GpuRuntime`:
+
+Now add ticks. In `scc_step_diis_enq` (per-stage granularity inside a step) and the chunk loop:
+
+Now ticks in the chunk loop, `check_jacobi`, `fire_step`, and `relax`:
+
+Now the per-kernel GPU time via `ncu`. Check what `diag_step_cost.rhai` does — probably a short workload already:
+
+One fix first — `tick` starts `None` until `prof_reset`, so ticks outside `relax` record 0. Initialize it at construction:
+
+Also — reports only print at `relax` end. For ad-hoc scripts like `diag_step_cost`, let me print accumulated tables at script completion in `dftb_engine` when profiling is on. Check the engine registry:
+
+Add a `prof_report` passthrough on `GpuDftb` and call it at script end:
+
+Clear picture at batch=19 already: **`scc.occ` (0.67 ms/iter) and `scc.hscc` (0.65 ms/iter) now dominate** — the eigensolve is third. Now the per-kernel GPU breakdown via `ncu`:
+
+ncu didn't intercept any kernels — likely GPU perf-counter permissions (`NVreg_RestrictProfilingToAdminUsers`) or it can't hook the OpenCL runtime. Checking:
+
+GPU perf counters are admin-locked (`RmProfilingAdminOnly: 1`) — ncu can't inject. So our own stage marks are the profiler. To get per-kernel resolution I'll place ticks between the dependent kernel enqueues inside the hot functions (each tick = guarded finish, off by default). Look at `eigh_solve`, `occupation`, `enq_dq_v_hscc`, and `eval_forces_device`:
+
+Adding finer ticks inside `eigh_solve` (GEMM vs Jacobi split), `occupation` (select/eig-readback/host-bisect split), and `eval_forces_device` (finalize vs force kernels):
+
+Now we have a real breakdown. `RUST_DFTB_PROF=1` gives guarded `clFinish`-delimited stage timing (off by default — zero overhead in production). Hardware counters are admin-locked on this box (`RmProfilingAdminOnly: 1`), so `ncu`/`nsys` can't inject — the built-in stage marks are the profiler. Run: `RUST_DFTB_PROF=1 dftb_engine --script ...`
+
+## Batch=19, N=86 — per-SCC-iteration kernel stage times (56 iters)
+
+```
+stage                total      n    per-call   what it is
+────────────────────────────────────────────────────────────────
+scc.occ_host       42.2 ms   62   0.68 ms   HOST bisection μ + occ_w upload ← BIGGEST
+scc.hscc           39.9 ms   56   0.71 ms   fused Δq→V=γΔq→H_scc kernel
+scc.jacobi         29.6 ms   62   0.48 ms   direct cyclic Jacobi (warm, ~2 sweeps)
+fire.force_kernels  6.4 ms    5   1.29 ms   EDM + γ' + repulsive + reduce (per FIRE step)
+scc.diis            4.0 ms   56   0.07 ms   DIIS solve+mix+convergence mark
+scc.rayleigh        3.1 ms   56   0.06 ms   ρ=cᵀHc−ε on occ cols
+scc.density         2.5 ms   56   0.04 ms   D = 2Σ f_k c cᵀ
+scc.extract_diag    2.4 ms   62   0.04 ms   eig extraction
+fire.set_geometry   1.7 ms    5   0.34 ms   Löwdin repair/Jacobi(S) per step
+scc.mulliken        1.6 ms   56
+scc.eigh_finish     1.4 ms   56
+scc.gemm_th2        1.1 ms   62   0.018 ms  W2 GEMMs are already fast
+scc.gemm_th         1.1 ms   62   0.018 ms
+scc.select_occ      1.1 ms   62
+scc.eig_read        0.5 ms   62   0.008 ms  eig_diag readback
+scc.commit          0.4 ms   56
+everything else    <0.1 ms each (commit, chunkend, check_jacobi, fire.*)
+```
+
+## Answers to your questions
+
+**What does the 0.3 s buy?** 45 FIRE steps × (8-iter SCC + finalize + forces + assemble + FIRE update) for the batch=1 relax; at batch=19 a warm SCC call is ~6.2 ms, eval+forces ~0.9 ms, fire_step ~3.5 ms.
+
+**Kernel execution vs harness:** with PROF on, finishes=1220/reads=226 for this script (production: ~100 reads + ~15 finishes — the profiler's own finishes inflate the total, so read the table *relatively*). The genuine per-iteration syncs left are `eig_read` (0.008 ms) and `chunkend` — cheap; the expensive "harness" part is actually **host compute**: the 80-iteration × 86-eig × 19-replica f64 bisection ≈ 0.68 ms/iter — bigger than Jacobi!
+
+**Three real optimization targets, in order:**
+1. **`occ_host` 0.68 ms/iter** — host bisection is pure W5: Fermi μ + f_k on GPU (bracketed bisection is trivially parallel, ~10 tiny kernel passes) — kills both `occ_host` and `eig_read`.
+2. **`hscc` 0.71 ms/iter** — the fused dq→V→H_scc kernel: γΔq matvec over atom pairs. Worth inspecting occupancy/coalescing.
+3. **`jacobi` 0.48 ms/iter** — already prec1/WG512-tuned; warm path is ~2 sweeps, near its floor.
+
+Profiler options in Rust: for CPU-side there's `criterion`/`tracing`/`pprof` (CPU sampling only — useless for GPU). For GPU-side: vendor tools (`ncu` — blocked here), or **OpenCL event profiling** — create the queue with `QueueProfiling` and attach an event per enqueue; that's the "proper" per-kernel timer, needs a wrapper at each `enq()` call site (~40 sites). The guarded-`clFinish` marks give the same per-stage numbers today with 5 lines.
+
+Want me to proceed to **W5 (GPU Fermi)** — it's now the measured #1 cost — or first drill into the `dq_v_hscc` kernel?
+
+
+
+
+
+
+---
+
+# Chat GPT 5.6 sol
+
+
+Yes — these numbers are finally useful, and they point to a fairly clear order of attack. There is also one important catch in the agent’s interpretation:
+
+**W4 “chunked SCC with no host sync” is not actually true for the smeared production path.** `scc_step_diis_enq()` calls `occupation()`, and for `kT>0` that function does a blocking `read_buffer(eig_diag)`, 80 CPU bisection iterations, and an `occ_w` upload **on every SCC iteration**. So the 8-iteration chunk is still being broken apart by the Fermi occupation path.
+
+That is the first thing I would fix.
+
+### Why `occ_host = 0.68 ms/iteration` is actually plausible
+
+For your GC benchmark it does roughly
+
+$$
+19\times86\times80 \approx 1.31\times10^5
+$$
+
+**double-precision exponentials per SCC iteration**, plus another pass to build occupations, plus a device upload. The 80-step bisection is absurdly overaccurate for values ultimately stored in f32: it is trying to determine μ to vastly more precision than the eigenvalues themselves contain.
+
+So 0.68 ms is not evidence that `exp()` is mysteriously slow. It is evidence that the algorithm is doing a completely inappropriate amount of serial CPU work.
+
+More importantly, the cost is worse than the 0.68 ms number suggests because it **forces synchronization between every SCC iteration**, thereby destroying the benefit of W4 chunking.
+
+I would implement the Fermi calculation **inside the eigensolver tail**, not as another GPU kernel.
+
+At the end of `jacobi_cyclic_global_batched`, the workgroup already owns the complete spectrum. Have it directly produce:
+
+$$
+\epsilon_k,\qquad \mu,\qquad f_k.
+$$
+
+For N≈86 the simplest implementation may actually be best: lane 0 scans the 86 diagonal values and performs ~8–12 safeguarded Newton/bisection iterations in f32, stores μ in local memory, barrier once, then all lanes write `occ_w[k]`. That is only ~1000 exponentials per system, running independently across the 19 systems. There is no need for 80 iterations or f64 `exp`.
+
+This also means that for the smeared path you can remove **four current stages at once**:
+
+$$
+\boxed{
+\text{extract\_diag}
++
+\text{select\_occ}
++
+\text{eig readback}
++
+\text{host Fermi}
+}
+$$
+
+`select_occupation_batched` is currently launched even before the code checks `kT>0`, although a smeared density subsequently uses all orbitals anyway.
+
+I would keep the CPU f64 Fermi solver solely as the scientific reference.
+
+---
+
+### The second result I find very suspicious is `scc.hscc = 0.71 ms`
+
+The arithmetic involved is tiny. For GC it is approximately:
+
+$$
+29^2\approx840
+$$
+
+FMAs for \(\gamma\Delta q\), followed by only
+
+$$
+86^2=7396
+$$
+
+Hamiltonian elements/system.
+
+The current kernel architecture explains the poor result: it launches **one 256-thread workgroup per system**. For batch 19 that means only 19 WGs for an 82-SM RTX 3090. Worse, during the \(\Delta q\) and \(\gamma\Delta q\) parts only ~29 threads have useful work. Then those same 19 WGs serially stride over all \(N^2\) H elements.
+
+So I would **not optimize the γ matvec arithmetic**. The architecture is wrong for the N² part.
+
+There is a very simple low-risk fix that still keeps **one kernel launch**:
+
+For each replica launch perhaps 4–5 workgroups rather than one. Every WG redundantly computes the tiny \(\Delta q\) and \(V=\gamma\Delta q\) into its own local memory, then each WG handles a different strided chunk of H.
+
+For batch=19:
+
+$$
+19\times4=76
+$$
+
+workgroups, almost exactly enough to fill the 3090.
+
+The redundant \(\gamma\Delta q\) work is microscopic:
+
+$$
+4\times29^2
+$$
+
+FMAs/system. That is a much better trade than leaving 75% of the GPU unused.
+
+Only one WG should write the global `dq`/`V`; all WGs can calculate identical local copies for their H work. No atomics and no inter-WG synchronization.
+
+I would first benchmark that because it is a small surgical change.
+
+The **better eventual architecture** is to remove `H_scc` materialization entirely. Since
+
+$$
+H^{SCC}_{ij}
+=
+H^0_{ij}
++\frac12 S_{ij}(V_i+V_j),
+$$
+
+the first warm-basis GEMM
+
+$$
+T=B^T H^{SCC}
+$$
+
+can synthesize the H element while loading the B operand tile. Then the current sequence
+
+$$
+H_{\rm SCC}\ {\rm kernel}
+\rightarrow B^TH_{\rm SCC}
+$$
+
+becomes one specialized tiled projection kernel.
+
+That removes:
+
+* one kernel launch,
+* the full Hscc global write,
+* the subsequent Hscc global read.
+
+Given that the GEMMs themselves are already reported at only ~0.018 ms, while materializing Hscc allegedly costs ~0.7 ms, this is exactly the sort of fusion worth doing.
+
+---
+
+### One important profiling caveat
+
+The new profiler is good for finding gross architectural problems, but **the GPU stage timings are not true production kernel timings**.
+
+`prof_tick()` performs `queue.finish()` after every stage.
+
+That destroys the asynchronous queue behavior and measures:
+
+> launch + isolated GPU execution + driver synchronization latency
+
+rather than normal pipelined execution.
+
+This is visible in your own numbers. Summing the per-iteration profiler stages gives roughly 2+ ms/iteration, while the non-profiled SCC timings are substantially lower.
+
+So I trust `occ_host` strongly, because that blocking CPU work exists in production anyway. I regard `hscc=0.71 ms` as a very strong **warning**, but I would remeasure it with proper OpenCL event profiling after fixing Fermi.
+
+You do not need `ncu`. Create the queue with `CL_QUEUE_PROFILING_ENABLE`, attach an event to the kernel enqueue, and later read `START/END` timestamps after one normal end-of-chunk synchronization. That preserves normal scheduling.
+
+---
+
+### My optimization order now
+
+| Priority | Work                                               | Reason                                                      |
+| -------- | -------------------------------------------------- | ----------------------------------------------------------- |
+| **P0**   | **Fuse Fermi μ + occupations into Jacobi tail**    | Largest measured cost and currently destroys SCC chunking   |
+| **P1**   | **Remeasure with OpenCL events**                   | Current `clFinish` profiler exaggerates GPU-stage latency   |
+| **P2**   | **Fix Hscc layout: multiple WGs/system**           | Current one-WG/system is obviously underoccupying batch=19  |
+| **P2b**  | Then test **Hscc-on-the-fly inside \(B^TH\)**      | Potentially eliminates the Hscc kernel/buffer entirely      |
+| **P3**   | **Replace force atomics by gather architecture**   | Already 1.29 ms/FIRE step; will become dominant after P0/P2 |
+| **P4**   | Remove remaining hot allocations + hidden recovery | Not well represented in the GPU stage profiler              |
+| **P5**   | Jacobi micro-optimization                          | Already down to ~0.48 ms; not the current problem           |
+
+I would **not touch Jacobi again yet**. W3 already found that `prec1/WG512` is the best measured compromise and that pure-f32 has a real accuracy loss at larger N.
+
+---
+
+### There are still allocation violations in this commit
+
+Despite the new hard rules added in the same commit, `scc_mix_inner()` still allocates on every solve:
+
+```text
+hist
+stagnant
+done
+q_in
+q_out
+res
+q_f32
+jacobi_ran
+samples
+```
+
+and later allocates DIIS diagnostic vectors. Most amusingly, the host-DIIS arrays are allocated even when production `mix=0` never uses them.
+
+`eval()` / `eval_forces_device()` also literally do:
+
+```rust
+&vec![1i32; self.batch]
+```
+
+when checking Jacobi status.
+
+These are probably not your current 0.7-ms bottleneck, but they should simply disappear. Make every such array a persistent field.
+
+And the code still contains the automatic:
+
+> failed replica → copy charges from nearest array-index converged replica → retry
+
+inside `GpuDftb::scc()`.
+
+That directly contradicts the “NO implicit fallbacks” rule introduced by this very commit. The solver should return `Failed`. The **scan driver**, which actually understands that replica \(i\) and \(i+1\) represent neighboring reaction coordinates, may explicitly request a continuation seed.
+
+So the agent has improved the written rules, but the production code still violates them.
+
+---
+
+### After P0/P2, the force path should become the main target
+
+The current force stage still launches separate electronic/shift kernels per bucket, then γ and repulsive kernels, and the pair kernels scatter with atomics. That 1.29 ms/FIRE step is therefore unsurprising.
+
+For your GC geometry I still favor starting with:
+
+$$
+\boxed{\text{one WG per (replica, atom)}}
+$$
+
+so batch 19 × 29 atoms gives about **551 workgroups**, which is excellent GPU parallelism.
+
+Each WG owns one final `float3 F_A`, gathers all interactions involving atom A, reduces them locally, and writes once. No global atomics.
+
+WG=32 is an obvious first test: essentially one lane per possible neighbor.
+
+The alternative remains:
+
+$$
+\text{pair evaluation}
+\rightarrow F_{pair}
+\rightarrow \text{atom gather}
+$$
+
+which avoids evaluating each pair twice but costs another kernel and intermediate memory. Both are legitimate. **Atomic scatter is not.**
+
+---
+
+One more optimization emerges from these timings: `rayleigh = 0.06 ms/iteration` is being run every SCC iteration, but it does not participate in producing the next charge—the Fermi occupation has already been chosen from `eig_diag`, and D/Mulliken have already been built. Its purpose is to make the stored final state suitable for accurate E/W.
+
+So I would calculate Rayleigh quotients **only once on the final accepted SCC state**, not 8 times while approaching it. That removes another launch from every iteration with no change to SCC convergence.
+
+Ultimately I think your steady-state N≈86 smeared SCC can realistically collapse toward something like:
+
+$$
+\boxed{
+B^TH(q)
+\rightarrow (B^TH)B
+\rightarrow
+\text{Jacobi + Fermi}
+\rightarrow
+\text{charges + DIIS/commit}
+}
+$$
+
+**four coarse launches per iteration**, with no CPU contact for an entire chunk.
+
+That is the architecture I would optimize toward now.
+
+
+
+---
+
+# USER
+
+ad "Why `occ_host = 0.68 ms/iteration` is actually plausible"
+I'm not saying I do not thrust the measurement, I'm saying it shows we do something stupid, I'm not even sure what the bisection should do (should explain it) why we must to do it in double precission, and why so fucking hell many iterations. What I would assume that the matrix diagonalization (Jacobi?) should take by far most of the budget, and if anything else take more (or comparable) amout of time, it is bad desing, wrong setup/parametrs, simply inefficiency. We must press on performance hard, find the sweetpot between precission accuracy, remove all overhead and unnecessary work.
+
+analyse it again with this mindest 
+
+
+---
+
+# Chat GPT 5.6 sol
+
+Yes — with that mindset, I would interpret the benchmark much more aggressively:
+
+> **For N≈86, batched GPU DFTB, Jacobi should be the dominant irreducible cost. If scalar occupations, SCC Hamiltonian assembly, bookkeeping, or host orchestration are comparable to Jacobi, assume bad architecture until proven otherwise.**
+
+Warm Jacobi is already unusually cheap because it starts nearly diagonal, so I would allow the two projection GEMMs and other real \(O(N^3)\) work to become visible. But **Fermi occupation and \(H_{\rm SCC}\) assembly have no business costing more than the eigensolver.**
+
+The current profile is therefore very useful precisely because it exposes two glaring inefficiencies.
+
+## 1. `occ_host = 0.68 ms`: this should essentially disappear
+
+First, what is the bisection actually doing?
+
+With Fermi smearing,
+
+$$
+f_k(\mu)=\frac{1}{1+\exp[(\epsilon_k-\mu)/kT]} .
+$$
+
+You cannot simply occupy the lowest `n_occ` orbitals anymore. You choose the chemical potential \(\mu\) such that the total electron number remains correct:
+
+$$
+\sum_{k=1}^{N} f_k(\mu)=N_{\rm occ}.
+$$
+
+Then
+
+$$
+D=2\sum_k f_k C_kC_k^T.
+$$
+
+So there **is** one scalar nonlinear equation per system to solve. There is generally no analytic closed form for μ, because it depends on all eigenvalues.
+
+Bisection was presumably chosen because \(N(\mu)\) is monotonic, so it is idiot-proof and guaranteed to converge.
+
+That part is reasonable.
+
+What is unreasonable is virtually everything about the present implementation.
+
+The code performs **80 bisection steps**, in f64, on the CPU, over all 86 eigenvalues, separately for 19 systems, and then uploads `occ_w` back to the GPU.
+
+That means per SCC iteration:
+
+$$
+19\times 80\times86
+\approx 131\,000
+$$
+
+double-precision exponentials.
+
+And this is being done to determine 19 scalar chemical potentials.
+
+That is an absurd ratio.
+
+### 80 iterations is numerically nonsensical
+
+Suppose the initial μ bracket is even a very wide 1 Ha.
+
+After \(m\) bisections its width is:
+
+$$
+\Delta\mu=\frac{1}{2^m}.
+$$
+
+So approximately:
+
+* 10 iterations → \(10^{-3}\) Ha
+* 20 → \(10^{-6}\) Ha
+* 24 → \(6\times10^{-8}\) Ha
+* 30 → \(10^{-9}\) Ha
+* 53 → around f64 mantissa resolution
+* 80 → \(8\times10^{-25}\) Ha
+
+The eigenvalues feeding this calculation are **f32**.
+
+Therefore after roughly 20–25 bisections you are already trying to determine μ more accurately than the input spectrum contains.
+
+And after ~53 iterations, many additional f64 bisections literally cannot even generate a distinct midpoint.
+
+So 80 is classic “iterate harder because more precision sounds safer.” It directly violates the numerical philosophy we established.
+
+### Nor does μ need f64 exponentials
+
+The physical reason for finite-T occupation is precisely that occupation becomes **smooth** instead of making a discontinuous HOMO/LUMO decision.
+
+This is therefore one of the places where f32 is particularly safe.
+
+I would implement:
+
+$$
+N(\mu)=\sum_k f_k
+$$
+
+and
+
+$$
+N'(\mu)=\frac{1}{kT}\sum_k f_k(1-f_k)
+$$
+
+and use safeguarded Newton:
+
+$$
+\mu_{n+1}
+=
+\mu_n+\frac{N_{\rm occ}-N(\mu_n)}{N'(\mu_n)}.
+$$
+
+Keep a bracket around μ; if Newton leaves the bracket, take its midpoint.
+
+Because SCC is warm-started, **also warm-start μ from the preceding SCC iteration**.
+
+I would expect something like 1–4 Newton steps normally, perhaps max 6–8.
+
+Not 80.
+
+And there is another easy optimization: for
+
+$$
+x=(\epsilon-\mu)/kT,
+$$
+
+if \(x>20\), then \(f\) is effectively zero in f32; if \(x<-20\), it is effectively one.
+
+So don't even evaluate `exp()` for deep occupied/virtual states. Only a handful of frontier states normally need an exponential.
+
+### Precision sweet spot
+
+I would A/B just two versions:
+
+**Fermi-F32**
+
+* eigenvalues f32
+* μ f32
+* `exp(float)`
+* four FP32 accumulators for \(N\) and \(N'\)
+
+versus
+
+**Fermi-hybrid**
+
+* `exp(float)`
+* occupations f32
+* accumulate \(N,N'\) and update μ in f64.
+
+The second costs almost nothing because only a few scalar additions/divisions are double; crucially, **do not call double `exp()`**.
+
+I strongly expect both to give indistinguishable PES/charge results.
+
+### And fuse it into Jacobi
+
+Do not make another Fermi kernel.
+
+The Jacobi WG already owns exactly the data required: one complete spectrum of one replica.
+
+At the end:
+
+```text
+Jacobi
+   ↓
+diag ε
+   ↓
+solve μ
+   ↓
+write occ_w
+```
+
+all before returning.
+
+That also lets you delete the separate `extract_diagonal` launch for the smeared production path.
+
+And the current code does something even sillier: it **runs integer `select_occupation_batched` before checking `kT>0`**, even though the smeared density ignores the integer occupation set and uses all orbitals.
+
+So the current smeared path is:
+
+```text
+Jacobi
+extract diagonal
+integer bitonic sort
+read eigenvalues to CPU
+80× f64 Fermi solve
+upload weights
+```
+
+when it should be:
+
+```text
+Jacobi + Fermi
+```
+
+That should be a P0 rewrite.
+
+---
+
+# 2. `scc.hscc = 0.71 ms` is even more suspicious
+
+Look at how little arithmetic this operation contains.
+
+For GC roughly:
+
+$$
+N_a\approx29,\quad N=86.
+$$
+
+Per system:
+
+$$
+\gamma\Delta q:
+29^2 = 841
+$$
+
+multiply-adds, and
+
+$$
+H_{ij}^{SCC}
+=
+H^0_{ij}+\frac12S_{ij}(V_i+V_j)
+$$
+
+for
+
+$$
+86^2=7396
+$$
+
+matrix elements.
+
+Across batch 19 that's only about 140,000 H elements.
+
+The kernel reads approximately H0 + S and writes H:
+
+$$
+3\times19\times86^2\times4
+\approx 1.7\ {\rm MB}.
+$$
+
+If 0.71 ms were really GPU execution time, that's roughly:
+
+$$
+2.4\ {\rm GB/s}.
+$$
+
+On an RTX 3090.
+
+That is **ridiculous**. Even obtaining merely 10% of peak bandwidth should push this into a few tens of microseconds.
+
+So I would assume one or more architectural problems.
+
+## The present launch geometry is poor
+
+The kernel is:
+
+```text
+one WG = one system
+WG = 256
+```
+
+Therefore batch 19 launches only:
+
+$$
+19\ {\rm WGs}
+$$
+
+onto an 82-SM GPU.
+
+And in the first two phases only 29 of the 256 lanes actually do useful work:
+
+```text
+dq[29]
+γ·dq[29]
+```
+
+Then those same 19 WGs stride through the \(86^2\) Hamiltonian.
+
+This is a particularly poor match to a 3090.
+
+It gets even worse as the `active` mask shuts systems down: near convergence perhaps only 5–10 workgroups actually do anything.
+
+### Immediate experiment
+
+Do not split this into multiple kernels.
+
+Instead launch perhaps:
+
+```text
+4 or 8 WGs / system
+WG = 64 or 128
+```
+
+Each WG redundantly computes the tiny 29-element `dq` and `V` into its own local memory.
+
+Then each WG owns a slice of the H matrix.
+
+For 19 systems × 4 WGs:
+
+$$
+76\ {\rm WGs},
+$$
+
+almost exactly the 82 SMs of the 3090.
+
+The redundant work is laughably small compared with the cost of poor occupancy.
+
+Benchmark:
+
+```text
+groups/system = 1,2,4,8
+WG            = 64,128,256
+```
+
+I would bet heavily that `1×256` is nowhere near optimum.
+
+---
+
+# 3. But there may be a second reason `hscc` looks so terrible: host OpenCL overhead
+
+The profiler currently works by doing a `queue.finish()` after every stage.
+
+And `scc.hscc` includes not only the kernel itself but also the host orchestration immediately before it.
+
+Look at `enq_dq_v_hscc()`:
+
+```rust
+set_arg(q_gpu)
+set_arg(q0)
+set_arg(g)
+set_arg(h0)
+set_arg(s)
+set_arg(orb_atom)
+enq()
+```
+
+**every SCC iteration.**
+
+But none of those buffer objects changes between SCC iterations!
+
+Their **contents** change, but OpenCL kernel arguments hold buffer handles. You do not have to bind the same buffer handle again because its contents were updated.
+
+So this should basically be:
+
+```rust
+unsafe { self.k_dq_v_hscc.enq()?; }
+```
+
+Nothing else.
+
+The same pattern exists elsewhere: repeated `set_arg()` calls bind persistent C/D/S/etc. buffers in density, Mulliken, Rayleigh and occupation code.
+
+That may be a surprisingly large part of what your stage profiler is calling `scc.hscc`.
+
+So I would make another hard rule:
+
+> **A steady-state SCC iteration should preferably contain only kernel enqueues. `clSetKernelArg` for invariant arguments is initialization/reconfiguration work, not iteration work.**
+
+Prebuild separate handles where necessary:
+
+```text
+k_project_warm
+k_project_cold
+k_density_integer
+k_density_fermi
+```
+
+instead of modifying a generic kernel object repeatedly.
+
+Code duplication of **kernel handles** is cheap. Host API traffic every iteration is not.
+
+---
+
+# 4. Before optimizing more, get proper GPU timings
+
+The current `clFinish` profiler was a very good diagnostic instrument; it revealed the problems.
+
+But now we need to distinguish:
+
+$$
+T_{\rm stage}
+=
+T_{\rm host\ setup}
++
+T_{\rm enqueue}
++
+T_{\rm kernel}
++
+T_{\rm synchronization}.
+$$
+
+Currently these are lumped together.
+
+Enable OpenCL queue profiling and collect events.
+
+Then report two numbers:
+
+```text
+host enqueue time
+GPU event time
+```
+
+for every important kernel.
+
+Importantly, **do not wait for the event immediately**.
+
+Enqueue normal chunks exactly as production does; after the chunk's normal synchronization, inspect all recorded event timestamps.
+
+Then we'll know, for example:
+
+```text
+hscc:
+  host set_arg+enqueue = 0.45 ms
+  GPU event            = 0.04 ms
+```
+
+or conversely:
+
+```text
+host = 0.02 ms
+GPU  = 0.62 ms
+```
+
+Those imply completely different fixes.
+
+Given the amount of arithmetic, I would consider **GPU `hscc` >0.1 ms suspicious**.
+
+---
+
+# 5. I would also remove Rayleigh from every SCC iteration
+
+Current production SCC computes Rayleigh quotients every iteration.
+
+But they are not used to generate the next q.
+
+The order is essentially:
+
+```text
+eigenvectors
+occupations
+D
+Mulliken q_new
+Rayleigh ρ
+DIIS
+```
+
+`ρ` exists to make final:
+
+* band energy,
+* energy-weighted density W,
+
+numerically accurate.
+
+Excellent idea.
+
+But SCC iteration \(n\rightarrow n+1\) doesn't need it.
+
+So do it **once after the final accepted SCC state**.
+
+That takes:
+
+```text
+scc.rayleigh 0.06 ms/iteration
+```
+
+to approximately zero in the iterative loop and removes another launch.
+
+The original Rayleigh correction was numerically important; I'm not suggesting removing it. I'm suggesting putting expensive correction **where its result is consumed**.
+
+---
+
+# 6. `commit` should not be a kernel either
+
+The DIIS kernel now already calculates RMS and knows `rms_tol`. It even changes the active flag itself.
+
+Therefore it knows whether the current electronic state has converged.
+
+If converged:
+
+```text
+leave q_gpu = q_n
+```
+
+so the cached electronic state remains consistent.
+
+If not converged:
+
+```text
+write mixed q directly into q_gpu
+```
+
+for the next iteration.
+
+There is no fundamental reason to write:
+
+```text
+DIIS → q_next
+```
+
+and then launch:
+
+```text
+commit_q_next → q_gpu
+```
+
+as a separate kernel.
+
+The commit model is conceptually correct. The extra kernel is not required to implement it.
+
+So fuse commit into DIIS.
+
+That removes:
+
+* `q_next`,
+* one global write/read,
+* one kernel launch/iteration.
+
+---
+
+# 7. Ultimately I would remove `H_scc` from ordinary SCC iterations entirely
+
+The current warm solve is
+
+$$
+H_{\rm SCC}
+\rightarrow
+B^TH_{\rm SCC}
+\rightarrow
+(B^TH_{\rm SCC})B.
+$$
+
+But
+
+$$
+H^{SCC}_{ij}
+=
+H^0_{ij}
++\frac12S_{ij}(V_A+V_B).
+$$
+
+So the first projection kernel can generate H elements **while loading its H tile**.
+
+Thus:
+
+```text
+dq → V + Hscc
+Bᵀ × Hscc
+```
+
+becomes:
+
+```text
+Bᵀ × Hscc(q)       // H synthesized on load
+```
+
+one kernel.
+
+You avoid materializing and round-tripping an entire N² matrix.
+
+The fused projection WG independently computes the tiny \(\gamma\Delta q\) vector and then proceeds with tiled matrix multiplication.
+
+This is the architecture I would ultimately prefer.
+
+And once Rayleigh is final-only, there is even less justification for keeping Hscc as a persistent per-iteration matrix.
+
+---
+
+# 8. Then the ideal SCC loop becomes much smaller
+
+Current smeared production loop is roughly:
+
+```text
+1 Hscc
+2 GEMM BᵀH
+3 GEMM THB
+4 Jacobi
+5 extract diag
+6 integer occupation sort      <-- useless with smearing
+7 host Fermi read/compute/write
+8 S-normalize
+9 density
+10 Mulliken
+11 Rayleigh
+12 DIIS
+13 commit
+```
+
+That is far too much orchestration.
+
+First realistic target:
+
+```text
+1 Hscc
+2 GEMM BᵀH
+3 GEMM THB
+4 Jacobi + Fermi
+5 S-normalize
+6 density
+7 Mulliken
+8 DIIS + commit
+```
+
+Then second-stage architecture:
+
+```text
+1 Bᵀ Hscc(q)       # fused dq/V/H generation + first projection
+2 T B
+3 Jacobi + Fermi
+4 S-normalize
+5 charge build + DIIS + commit
+```
+
+**Five launches per SCC iteration.**
+
+Potentially four if S-normalization can safely be done less frequently or incorporated elsewhere, but I would not compromise the known numerical benefit just to hit an arbitrary kernel count.
+
+---
+
+# 9. What should the performance budget look like?
+
+I agree with your desired mental model.
+
+For this N≈86 workload, after obvious inefficiencies are removed, I would like something roughly like:
+
+```text
+Jacobi                        60–80 %
+projection matrix algebra     10–25 %
+everything else combined      <20 %
+```
+
+Not:
+
+```text
+Fermi bookkeeping  > Jacobi
+Hscc assembly       > Jacobi
+Jacobi
+...
+```
+
+Those first two are unmistakable red flags.
+
+I would set optimization acceptance goals like:
+
+* **Fermi occupation incremental cost:** <5% of Jacobi.
+* **No CPU contact inside SCC chunks.**
+* **Hscc generation:** <10–20% of Jacobi; preferably eliminated by projection fusion.
+* **No repeated invariant `set_arg` calls.**
+* **No allocations in SCC.**
+* **≤5–6 coarse launches/iteration initially.**
+* **Rayleigh once/final state, not every iteration.**
+* **No commit kernel.**
+
+Only when that is achieved would I return to Jacobi itself.
+
+---
+
+# 10. Jacobi may then expose the next fundamental bottleneck
+
+The W3 result already says `prec1/WG512` is currently the sensible point: pure f32 saved ~30% but produced unacceptable eigenvalue error at N=128.
+
+So I would leave that alone for now.
+
+Once all the nonsense around it is gone and Jacobi genuinely consumes, say, 70% of iteration time, **then** optimize Jacobi again.
+
+At that point the interesting issue will be structural: one WG/system means batch 19 can only occupy at most 19 of 82 SMs. WG512 makes each active SM busy, but most SMs remain unused.
+
+Then the choices become much more substantive:
+
+* run larger batches,
+* reduce Jacobi to one warm sweep more often,
+* develop a more aggressively warm/preconditioned eigensolver,
+* or eventually consider multi-WG/system.
+
+But it is premature to tackle a difficult eigensolver redesign while **131,000 CPU double exponentials** and a ~140k-element H update are each costing more than the eigensolver.
+
+So my work order now would be:
+
+**1. Kill CPU Fermi completely and fuse it into Jacobi.
+2. Add true OpenCL event timings + host enqueue timings.
+3. Prebind all invariant kernel arguments.
+4. Fix Hscc occupancy immediately; then fuse Hscc into the first projection.
+5. Move Rayleigh to final-state certification only.
+6. Fuse DIIS + commit.
+7. Then attack atomic force evaluation / FIRE.
+8. Only then touch Jacobi again.**
+
+That should push the solver toward the performance shape you expect: **diagonalization becomes the obviously dominant cost, rather than being buried under orchestration and tiny scalar work.**
