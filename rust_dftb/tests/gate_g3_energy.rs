@@ -412,6 +412,97 @@ fn test_f2_direct_bsr_hs_parity() {
 }
 
 // ============================================================================
+// S1 state contract (manifest §15.2): energy()/forces() must refuse to serve
+// a stale or non-converged state — after geometry mutation, charge mutation,
+// and after a failed solve. Also the Euclidean (not per-component) skin
+// check: a diagonal move with components < skin/2 but |ΔR| > skin/2 must
+// exhaust the Verlet list.
+// ============================================================================
+
+#[test]
+fn test_s1_state_invalidation_contract() {
+    let Some(_gpu) = require_sparse_gpu() else { return };
+    let sk_dir = require_sih_sk_dir();
+    let (species, coords, _, _, _) = sih4_geom();
+    let sk = load_sk_for_species(&sk_dir, &species).unwrap();
+    let cfg = rust_dftb::methods::sparse::SparseDftbConfig {
+        full_mask: Some(false),
+        ..Default::default()
+    };
+    let mut eng = rust_dftb::methods::sparse::SparseDftb::with_config(
+        sk, &sk_dir, species.clone(), coords.clone(), cfg,
+    ).unwrap_or_else(|e| panic!("S1 engine: {e}"));
+
+    // No solve yet → no energy.
+    assert!(eng.energy().is_err(), "S1: energy() before any scc must fail");
+
+    eng.scc(80, 1e-5).unwrap_or_else(|e| panic!("S1 SCC: {e}"));
+    let e1 = eng.energy().unwrap();
+    eprintln!("S1: E after scc = {e1:.8}");
+
+    // Skin-legal geometry mutation invalidates the accepted state.
+    let mut c2 = coords.clone();
+    c2[0][0] += 0.05;
+    eng.set_coords(&c2).unwrap_or_else(|e| panic!("S1 set_coords: {e}"));
+    assert!(eng.energy().is_err(), "S1: energy() after set_coords must fail (stale state)");
+    assert!(eng.forces().is_err(), "S1: forces() after set_coords must fail (stale state)");
+
+    eng.scc(80, 1e-5).unwrap_or_else(|e| panic!("S1 SCC geom2: {e}"));
+    let e2 = eng.energy().unwrap();
+    eprintln!("S1: E after geom2 scc = {e2:.8}");
+    assert!((e2 - e1).abs() > 1e-12, "S1: geometry change must change the energy");
+
+    // Charge mutation invalidates too.
+    let q = eng.last_energy().q.clone();
+    eng.set_q(&q).unwrap_or_else(|e| panic!("S1 set_q: {e}"));
+    assert!(eng.energy().is_err(), "S1: energy() after set_q must fail (stale state)");
+
+    // A failed solve leaves no usable state: cap at 1 iteration with an
+    // impossible tolerance → scc errs, energy() must not serve the
+    // intermediate `last` written by store_energy inside the loop.
+    match eng.scc(1, 1e-15) {
+        Err(e) => eprintln!("S1 expected SCC failure: {e}"),
+        Ok(_) => panic!("S1: scc(1, 1e-15) unexpectedly converged"),
+    }
+    assert!(eng.energy().is_err(), "S1: energy() after failed scc must fail");
+    assert!(eng.forces().is_err(), "S1: forces() after failed scc must fail");
+}
+
+#[test]
+fn test_s1_skin_euclidean_diagonal() {
+    let Some(_gpu) = require_sparse_gpu() else { return };
+    let sk_dir = require_sih_sk_dir();
+    let (species, coords, _, _, _) = sih4_geom();
+    let sk = load_sk_for_species(&sk_dir, &species).unwrap();
+    let cfg = rust_dftb::methods::sparse::SparseDftbConfig {
+        full_mask: Some(false),
+        ..Default::default()
+    };
+    let mut eng = rust_dftb::methods::sparse::SparseDftb::with_config(
+        sk, &sk_dir, species.clone(), coords.clone(), cfg,
+    ).unwrap_or_else(|e| panic!("S1-skin engine: {e}"));
+
+    // Component 0.4 < skin/2 = 0.5, but |ΔR| = 0.4·√3 ≈ 0.693 > 0.5.
+    // The old per-component check accepted this and silently missed
+    // newly-interacting pairs; the Euclidean check must reject it.
+    let mut moved = coords.clone();
+    moved[1][0] += 0.4;
+    moved[1][1] += 0.4;
+    moved[1][2] += 0.4;
+    match eng.set_coords(&moved) {
+        Err(e) => eprintln!("S1 diagonal skin guard (expected): {e}"),
+        Ok(()) => panic!("S1 skin guard failed: set_coords accepted |ΔR|=0.693 > skin/2=0.5"),
+    }
+
+    // And a genuinely legal diagonal move must still pass.
+    let mut ok = coords.clone();
+    ok[1][0] += 0.2;
+    ok[1][1] += 0.2;
+    ok[1][2] += 0.2;   // |ΔR| = 0.346 < 0.5
+    eng.set_coords(&ok).unwrap_or_else(|e| panic!("S1 legal diagonal move rejected: {e}"));
+}
+
+// ============================================================================
 // F3: zero device-buffer allocations across the SCC/force hot path — the
 // workspace contract. n_buf_allocs counts every buf_*/zero_* device alloc.
 // ============================================================================

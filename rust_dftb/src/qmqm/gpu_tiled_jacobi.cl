@@ -144,7 +144,10 @@ __kernel void jacobi_cyclic_global_batched(
     const int n,
     const int batch,
     const int init_v,
-    __global const int* active      // [batch] 0 → replica frozen, early-out
+    __global const int* active,     // [batch] 0 → replica frozen, early-out
+    __global float* diag            // [batch][4] out: {off, off/‖A‖_F, stop, sweeps}
+                                    // stop: 0 converged · 1 stagnation ·
+                                    //       2 MAX_CSWEEPS · 3 n>capacity · 4 non-finite
 ) {
     const int gid = get_group_id(0);
     const int lid = get_local_id(0);
@@ -161,6 +164,17 @@ __kernel void jacobi_cyclic_global_batched(
     __local int    rot_q[128];
     __local volatile int l_nrot;  // live (non-skipped) rotations this round
     __local float  reduce[WG];
+
+    // R5: defensive capacity guard — rot_*[] hold jpair ≤ 128 → jn ≤ 256.
+    // The host rejects n>256 at plan build; if it ever reaches the kernel,
+    // report loudly via diag instead of scribbling past local arrays.
+    if (jpair > 128) {
+        if (lid == 0) {
+            diag[4*gid] = INFINITY; diag[4*gid+1] = INFINITY;
+            diag[4*gid+2] = 3.0f;   diag[4*gid+3] = 0.0f;
+        }
+        return;
+    }
 
     __global float* gA = A + (size_t)gid * n * n;
     __global float* gV = V + (size_t)gid * n * n;
@@ -200,8 +214,13 @@ __kernel void jacobi_cyclic_global_batched(
     const float off_exit = JACOBI_OFF_TOL * frob;
     float prev_off = fmax(off_cur, 1.0e-30f);
     int stall = 0;
+    int stop = 0;   // R5 stop reason: 0 converged · 1 stagnation · 2 max sweeps · 4 non-finite
+    int nsw  = 0;
 
-    for (int sweep = 0; sweep < MAX_CSWEEPS && off_cur > off_exit; ++sweep) {
+    if (off_cur > off_exit) {
+    stop = 2;
+    for (int sweep = 0; sweep < MAX_CSWEEPS; ++sweep) {
+        nsw = sweep + 1;
         for (int r = 0; r < jround; ++r) {
             // ---- Phase 1: rotation params per pair (strided for n>256) ----
             // KNOWN COST (JACOBI_PREC≥1, jrot_t=double): only jpair≈44 of the
@@ -227,7 +246,10 @@ __kernel void jacobi_cyclic_global_batched(
                 float apq = (q < n) ? gA[p * n + q] : 0.0f;
                 float app = gA[p * n + p];
                 float aqq = (q < n) ? gA[q * n + q] : 1.0f;
-                if (fabs(apq) < PAIR_SKIP_REL * (fabs(app) + fabs(aqq))) {
+                // R5: !(a > b) form is NaN-safe AND handles the exact-zero
+                // pivot (apq=0, app=aqq=0 → 0 > 0 false → skip; the old
+                // `0 < 0` fell through to a 0/0 rotation → NaN).
+                if (!(fabs(apq) > PAIR_SKIP_REL * (fabs(app) + fabs(aqq)))) {
                     rot_c[ip] = (jrot_t)1.0; rot_s[ip] = (jrot_t)0.0;
                 } else {
                     jrot_t aq = (jrot_t)apq;
@@ -297,8 +319,19 @@ __kernel void jacobi_cyclic_global_batched(
         }
         off_cur = sqrt(reduce[0]);
         barrier(CLK_LOCAL_MEM_FENCE);
-        if (off_cur > 0.9f * prev_off) { if (++stall >= 3) break; } else { stall = 0; }
+        if (!isfinite(off_cur)) { stop = 4; break; }        // R5: NaN/Inf → report, don't loop on NaN
+        if (off_cur <= off_exit) { stop = 0; break; }
+        if (off_cur > 0.9f * prev_off) { if (++stall >= 3) { stop = 1; break; } } else { stall = 0; }
         prev_off = off_cur;
+    }
+    }
+
+    // ---- R5: stop-reason + achieved-residual diagnostics ----
+    if (lid == 0) {
+        diag[4*gid]   = off_cur;
+        diag[4*gid+1] = off_cur / frob;
+        diag[4*gid+2] = (float)stop;
+        diag[4*gid+3] = (float)nsw;
     }
 
     // ---- Eigenvalues on the diagonal; zero the off-diagonal residue ----

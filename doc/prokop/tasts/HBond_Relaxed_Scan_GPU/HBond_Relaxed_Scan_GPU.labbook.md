@@ -839,3 +839,158 @@ eigenvalues (80 iters, bracket ε_min−32kT..ε_max+32kT), fractional Mulliken
 - **R5:** production uses direct global cyclic Jacobi, whereas the old precision benchmark launches deprecated tiled Jacobi; the old sweep override does not control `MAX_CSWEEPS`. Capacity and stop-state reporting need correction.
 
 Do not attribute the divergence to atomic-order noise or a physical basin without a first-divergent-buffer comparison. Do not resume production scans or claim completion until these contracts are validated and the USER confirms acceptance.
+
+---
+
+## 2026-09-13 — R1–R5 implemented and validated
+
+### R1 — stale W/EDM for early-converged replicas — FIXED
+
+- **Defect confirmed in source and measured:** `build_density_occ_batched`
+  was bound to the SCC `active` iteration mask. A replica converging early
+  leaves the SCC loop with active=0, so its energy-weighted density W was
+  never rebuilt — force kernels consumed stale/zero W → wrong Pulay term.
+  Measured before fix: early-converged replica batch-vs-solo
+  `max|ΔF| = 0.585 Ha/Å`.
+- **Fix:** separate force/electronic-state validity mask `state_ok`
+  (device buffer + `set_state_ok` upload), dedicated `k_edm` kernel handle
+  bound to it (`gpu_scc_plan.rs`). `active` = "still iterating";
+  `state_ok` = "electronic state is certified for forces". `scc_mix`/`scc`
+  set `state_ok` after SCC completion.
+- **Regression test** `test_gpu_dftb_edm_fresh_mixed_convergence`
+  (tests/gpu_dftb.rs): 6 heterogeneous replicas, mixed convergence order
+  (replica 0 converges early), batched forces vs solo forces:
+  - kT=0 (integer occ): worst `max|ΔF| = 2.98e-8 Ha/Å` (was 0.585)
+  - kT=0.002 Ha (Fermi): worst `max|ΔF| = 8.94e-8 Ha/Å`
+  All six replicas within tolerance in both occupation modes. PASS.
+
+### R2 — SCC retry state honesty — FIXED
+
+- Retry now re-solves only failed replicas (state-producing kernels —
+  Jacobi, density, Mulliken, DIIS, commit — are `active`-gated; converged
+  replicas' device state is untouched). `batched_gemm` still rewrites
+  intermediates for all replicas — harmless, idempotent, inputs unchanged.
+- `GpuDftb::relax` returns/logs final SCC residual + convergence flag
+  (final, not initial). `dftb_engine` `gpu_relax` updated for the new
+  tuple.
+- **Test** `test_gpu_dftb_masked_retry_isolation` (via `#[doc(hidden)]
+  scc_masked`): masked retry on replica 1 re-solved only that replica —
+  replica 0 energy **bitwise identical** (−4.0761430356651545 Ha before
+  and after). Exhausted `scc(1, 1e-12)` → honest `[Failed, Failed]` +
+  `stalled=true`, and `fire_step` on uncertified state moves no atoms.
+  PASS. Open: a test that triggers the real failed→warm-start path in
+  `scc` (needs a deterministic physical SCC failure in a small system).
+
+### R3 — GPU FIRE integrator — FIXED
+
+- Old kernel did `v = v_mix + F·dt` then `x += v·dt + 0.5·F·dt²` —
+  acceleration applied twice (extra 0.5·F·dt² after the kick). Now
+  kick–drift matching the CPU reference `FireOptimizer`
+  (`examples/hbond_ref.rs`): P=F·V → adapt → mix → v+=F·dt → clamp →
+  x+=v·dt → cap displacement AND rescale v consistently.
+- Verified end-to-end (`scripts/diag_relax_eq.rhai`, GC undisplaced,
+  kT=0.002): converged `max|F|=8.08e-4` in 45 steps, E=−44.927802 Ha,
+  `[measure]` reports `max|F_gpu−F_cpu|=8.1e-6`, `|dE|=2.5e-6`,
+  `converged=true`.
+
+### R4 — frozen DOF + constraint — FIXED
+
+- Frozen atoms excluded from `P=F·V`, `‖V‖²`, `‖F‖²`, max|F| reductions
+  (were polluting FIRE adaptivity).
+- Constraint projection now uses mobility-weighted endpoint forces; a
+  frozen endpoint contributes its constraint share to the *movable*
+  endpoint only (was: frozen endpoint's wall reaction leaked into the
+  movable atom's radial force).
+- Host-side validation in `set_constraint`: distinct in-range endpoints,
+  not both frozen, target length = batch, finite positive distances,
+  initial-geometry compatibility within tolerance — all fail loud.
+- `set_smearing` now invalidates `state_fresh` (a kT change must not reuse
+  an electronic state built under a different occupation model).
+- **Test** `test_gpu_dftb_constraint_and_frozen`: invalid inputs all
+  rejected (i==j, out-of-range, wrong targets len, zero/negative/NaN
+  target, both-frozen at `set_constraint`, freezing both endpoints
+  post-hoc at `set_frozen_atoms`); `set_constraint` projects the initial
+  geometry onto the surface (1.516→1.600 Å, then `dist=1.600000` held
+  exactly over 5 FIRE+SCC steps with atoms 0,1 frozen — only atom 2
+  moves); frozen atoms stationary within f32 readback noise (<1e-6 Å;
+  first sync shows one-time ~1e-8 quantization, not motion). PASS.
+  Open: per-step tangent-velocity residual, nonzero frozen input
+  velocity, molecular-rotation invariance.
+
+### R5 — Jacobi production guards — FIXED
+
+- **Capacity:** `jacobi_cyclic_global_batched` holds jn/2 pair rotations
+  in `__local rot_*[128]` → **n ≤ 256** hard cap. Previously n>256 was a
+  silent local-memory overrun. Now: `Err` at `build_jacobi_kernel`
+  (covers both H and S Jacobi paths), plus a defensive kernel-side
+  early-out writing `diag` stop=3 instead of scribbling.
+- **Stop reporting:** new `diag` buffer [batch×4] = {off, off/‖A‖_F,
+  stop, sweeps}; stop = 0 converged · 1 stagnation · 2 MAX_CSWEEPS ·
+  3 n>capacity · 4 non-finite. Host `report_jacobi`/`report_jacobi_all`
+  warn per non-converged replica after each H/S Jacobi launch (silent on
+  success — verified: no warnings in GC relax).
+- **NaN-safety:** pair-skip test rewritten `!(|a_pq| > ε·(|a_pp|+|a_qq|))`
+  — the old `0 < 0` fall-through allowed a 0/0 rotation (NaN) when a_pq
+  and both diagonals were exactly zero; also NaN-safe. Non-finite
+  off-norm now breaks with stop=4 rather than looping on NaN.
+- **Test** `test_gpu_dftb_jacobi_capacity_guard`: n=256 accept
+  (jpair=128 at capacity), n=253 odd accept (pad path), n=260 reject
+  with "exceeds capacity 256". PASS.
+
+### Test suite state
+
+`cargo test --release --test gpu_dftb`: **6/6 pass**
+(h2o_reuse_scc_and_fire, edm_fresh_mixed_convergence, fire_one_step_algebra,
+jacobi_capacity_guard, constraint_and_frozen, masked_retry_isolation).
+`cargo test --release --test gpu_tiled_jacobi`: **4/4 pass** (incl.
+`test_direct_jacobi_eigen_quality` on the production kernel).
+`diag_relax_eq` relax converges with CPU parity as above. Remaining open:
+a test triggering the real failed→warm-start retry in `scc` (deterministic
+small-system SCC failure), R4 tangent-velocity/rotation-invariance cases;
+production scan still gated on USER acceptance.
+
+## 2026-09-13 (cont.) — R3/R5 follow-up: FIRE algebra, eigen quality, SK fallback, sweeps knob
+
+### R3 — one-step FIRE algebra — VERIFIED
+
+- New test `test_gpu_dftb_fire_one_step_algebra` (tests/gpu_dftb.rs):
+  fresh engine (v=0 → P=0 → mode 2 v-reset, dt 1.0→0.7), one `fire_step`,
+  asserts Δx = 0.49·F per component (v=F·dt then x+=v·dt).
+- **Measured max|Δx_pred − Δx_act| = 1.44e-8 Å** (f32 coordinate
+  quantization) vs the old double-acceleration prediction 0.735·F —
+  the kernel provably executes kick–drift, not kick–drift-plus-½F·dt².
+
+### R5 — direct-kernel eigen quality — VERIFIED
+
+- `RUST_DFTB_JACOBI_SWEEPS` now reaches the production kernel: both render
+  sites replace `MAX_CSWEEPS` (default 40) via the shared
+  `gpu_eigen::jacobi_sweeps` helper — previously the knob silently only
+  reached the deprecated tiled path's `MAX_SWEEPS`.
+- New public `gpu_eigen::direct_jacobi_batched` launches the actual
+  `jacobi_cyclic_global_batched` (all-active mask) and returns the
+  [batch×4] diag record — the R5 eigen-quality harness the plan asked for.
+- New test `test_direct_jacobi_eigen_quality` (tests/gpu_tiled_jacobi.rs):
+  - Random symmetric N = 65, 87, 96, 97, 128, 255, 256 (odd N and the
+    n=256 capacity boundary): all stop=0, 7–8 sweeps, res 1.3e-6–1.0e-5,
+    orth ≤1.6e-7. Sorted-eig parity vs CPU f64 grows with N (3e-5 at 87 →
+    1.5e-3 at 256) and sits at the Weyl bound res·‖A‖_F — the f32 residual
+    floor, asserted as `par < 2·res·‖A‖_F + 1e-4` (self-tightening, not a
+    fixed tolerance).
+  - Adversarial spectra at N=87 in one batch: clustered (1e-6-wide
+    cluster + outliers, 4 sweeps), repeated two-level (10 sweeps),
+    exact zero 8×8 subblock (all-zero pivots skipped, no 0/0), and an
+    all-zero matrix (0 sweeps, V=I). All stop=0, res ≤1.8e-6,
+    orth ≤1.5e-7, all outputs finite.
+
+### dftb_engine SK fallback — FIXED
+
+- The stale user-specific default
+  `/home/prokophapala/git_SW/dftbplus/external/slakos/origin/mio-1-1`
+  is replaced by probing known locations
+  (`~/SIMULATIONS/dftbplus/slakos/mio-1-1`,
+  `~/git_SW/dftbplus/external/slakos/origin/mio-1-1`) — verified each
+  contains `.skf` files — else a loud panic listing the tried paths and
+  the `--sk-dir`/`RUST_DFTB_SK_DIR` options.
+- Verified: `dftb_engine --script scripts/diag_relax_eq.rhai` with no env
+  var finds the SIMULATIONS path and the GC relax converges identically
+  (45 steps, max|F|=8.1e-4, max|F_gpu−F_cpu|=9.5e-6, |dE|=3.1e-6).

@@ -301,7 +301,7 @@ Tiled Jacobi (`gpu_tiled_jacobi.cl`) already does f64 inner sweeps, compound 2×
 
 **2026-09-11 review (manifest §12 D2):** the broad f64 is a throughput bug, not a safety net — ~1.29M double block-updates per pivot. Benchmark exactly 3 modes (pure FP32-FMA / FP64 scalar `c,s` only / current broad-FP64 reference) reporting event time + residual + orthogonality + AT ΔE. Strip dots → 4 independent FP32 FMA accumulators (not Kahan, not f64).
 
-- [ ] Surface Jacobi residual + stop reason (rel off-diag / stagnation / exhaustion). Do not treat a **zeroed** off-diagonal as a solved eigenproblem
+- [*] Surface Jacobi residual + stop reason (rel off-diag / stagnation / exhaustion). **DONE 2026-09-13 (R5):** `jacobi_diag` per-replica {off, off/‖A‖_F, stop, sweeps} + `report_jacobi*` host warnings; n≤256 capacity guard (accept 256/253, reject 260); NaN-safe pivot skip; `RUST_DFTB_JACOBI_SWEEPS` now reaches `MAX_CSWEEPS` on the production direct kernel; `test_direct_jacobi_eigen_quality` (via new public `gpu_eigen::direct_jacobi_batched`) — N=65..256 boundary/odd/capacity all stop=0, res ≤1e-5, orth ≤1.6e-7, eig parity within Weyl bound; clustered/repeated/zero-block/all-zero adversarial batch clean. Do not treat a **zeroed** off-diagonal as a solved eigenproblem
 - [ ] Profile kernel time, outer sweeps, local/private, spills, batch util **before** cutting inner sweeps or demoting f64 strips
 - [ ] Then: adaptive inner work vs current f64 reference; f32/FMA or compensated strips only with independent `||HC−SCε||`
 - [ ] `||UᵀU−I||` and `||HC−SCε||` as standing diagnostics (old D10) — `gpu_eigen.rs` / script prints, not a new cargo test crate
@@ -310,11 +310,11 @@ Tiled Jacobi (`gpu_tiled_jacobi.cl`) already does f64 inner sweeps, compound 2×
 
 #### 6.4.5 Engine honesty (not an f32 problem)
 **Current dense review/work order:** `tasts/HBond_Relaxed_Scan_GPU/HBond_Relaxed_Scan_GPU.manifest..md` **§13**. Source review only; supersedes D13 completion/noise-attribution claims. Fix state contracts before arithmetic tuning; sparse is out of scope.
-- [~] Device FIRE x/v/F and distance constraint implemented; dt/alpha/n_pos remain host f64. Endpoint distance error ~1e-7 Å and single-replica CPU parity are observed, not full validation. OPEN: double acceleration in GPU displacement, frozen-DOF projection/norms, input/finiteness checks, full-loop allocations/readbacks (R3/R4/R6).
+- [*] Device FIRE x/v/F and distance constraint implemented; dt/alpha/n_pos remain host f64. **2026-09-13 (R3/R4):** kick–drift fixed (no more double acceleration; GC relax converged max|F|=8.08e-4 in 45 steps, F parity vs CPU 8.1e-6); one-step algebra verified (`test_gpu_dftb_fire_one_step_algebra`: Δx=0.49·F, max dev 1.4e-8 Å — old formula predicted 0.735·F); frozen DOFs excluded from all FIRE reductions; mobility-weighted constraint projection; input/finiteness validation + `test_gpu_dftb_constraint_and_frozen`. OPEN: full-loop allocations/readbacks (R6), per-step tangent-velocity test.
 - [ ] `md_step` is not velocity-Verlet (missing half-kick) — rename or fix
-- [ ] `relax` returns **final** rms and explicit convergence/exhaustion/failure; do not ignore `stalled` (R2)
-- [~] Per-system SCC mask exists; retry can retain a better status without its physical state. Separate iteration activity from accepted-state validity; no implicit array-index neighbor recovery (R2).
-- [~] W is computed on GPU but inherits the SCC-active mask: early-converged replicas can use stale/zero EDM in forces. **First blocker: R1**, mixed-convergence batch W/force parity. Cached eval/finalize needs a complete state contract.
+- [*] `relax` returns **final** rms and explicit convergence/exhaustion/failure; `stalled` is reported, not ignored. **DONE 2026-09-13 (R2)** — returns (steps, final max|F|, final rms, converged); `dftb_engine` updated.
+- [*] Per-system SCC mask + masked retry: re-solves only failed replicas; non-failed replicas keep state AND status. `test_gpu_dftb_masked_retry_isolation`: untouched replica's energy bitwise identical; exhausted SCC → honest Failed + parked. **DONE 2026-09-13 (R2).** Open: real failed→warm-start trigger test.
+- [*] W now built under a dedicated `state_ok` mask via `k_edm` — early-converged replicas get fresh EDM; batched-vs-solo force parity max|ΔF| = 2.98e-8 (kT=0) / 8.94e-8 Ha/Å (kT=0.002), was 0.585. **DONE 2026-09-13 (R1)**, `test_gpu_dftb_edm_fresh_mixed_convergence`.
 - [ ] Optional: fuse neighbor+G in one GPU kernel (same O(n²) distances; SK stays) — superseded by §12 D7 (device-resident geometry)
 
 #### 6.4.6 Sparse (other agent — do not “fix f32” here by accident)
@@ -461,7 +461,9 @@ full 22-issue checklist and `tasks.md` for the phased master task breakdown.
 - [ ] **Gate E** — False positive — FD-of-energy forces, symmetrized Hessian tautology
 - [~] **Gate F / G** — investigating. **SparseDftb** FIRE 72 steps, E=−2.826054, Si–H 1.477 Å, \|F\|=9.3e-4. Gate G Hessian rel **0.116%**, η_asym 3.2e-4. Lab: manifest §0.7. Awaiting USER confirmation.
 
-**Read first for the next LLM:** manifest **§0** + §0.7 lab numbers + `topical_audit/f32_floor_sparse.md`. CLI: `userguide/sparse_dftb.md`. Do not mix with dense `f32_floor_dense_hbond.md`.
+**Read first for the next LLM:** manifest **§15** (current work order — supersedes §13/§14 claims) + §0.7 lab numbers + `topical_audit/f32_floor_sparse.md`. CLI: `userguide/sparse_dftb.md`. Do not mix with dense `f32_floor_dense_hbond.md`.
+
+**2026-09 S1 status (manifest §15.2 — implemented, tests green, awaiting USER acceptance):** stale-product fix in `tc2_purify_p` (Q=P² now formed after the trace guard's rescale; post-rescale trace measured, not assigned); K-TC2 re-measures `Tr(KS)` after rescale; `purify_hscc_p/trs` return recovered-K diagnostics (R_I(K), Tr(KS) of the state feeding q/E); `set_coords` uses Euclidean |ΔR| vs skin/2 and invalidates the accepted state (as do `set_q` and failed `scc`); `mulliken_checked` enforces Σq = 2·Tr(KS) to a worst-case f32 bound. New tests: `test_p_tc2_guard_and_recovery_contract`, `test_k_tc2_guard_fires`, `test_s1_state_invalidation_contract`, `test_s1_skin_euclidean_diagonal`. Battery: sparse lib 10/10, gate_g3 7/7, gpu_dftb 2/2, gate_f 1/1, gate_g 1/1, gpu_sparse_bsr4 23/23, sparse_dftb 1/1; `gate_e_determinism` intentionally red (S3). Next: S2 (error budget + trustworthy short purifier).
 
 ### 7.6.2 Current plan (Phases A–E, see `tasks.md`)
 

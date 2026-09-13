@@ -141,6 +141,13 @@ const GPU_TILED_JACOBI_TEMPLATE: &str = include_str!("gpu_tiled_jacobi.cl");
 /// block pairs are processed sequentially, not in parallel.
 const TILED_MAX_SWEEPS: usize = 100;
 
+/// `RUST_DFTB_JACOBI_SWEEPS` env override (diagnostic), else `default`.
+/// Shared so the production direct kernel (MAX_CSWEEPS) and the deprecated
+/// tiled path (MAX_SWEEPS) honor the same knob — R5.
+pub fn jacobi_sweeps(default: usize) -> usize {
+    std::env::var("RUST_DFTB_JACOBI_SWEEPS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(default)
+}
+
 /// Render the tiled Jacobi OpenCL template with block-size specialization.
 /// `prec` = JACOBI_PREC (0=FP32-FMA, 1=FP64 c/s only, 2=broad FP64 reference).
 /// Public for the event-timed 3-mode benchmark in tests/gpu_tiled_jacobi.rs.
@@ -153,8 +160,47 @@ pub fn render_tiled_source(b: usize, wg: usize, prec: u32) -> String {
         .replace("#define PLD 65", &format!("#define PLD {}", pld))
         .replace("#define WG 256", &format!("#define WG {}", wg))
         .replace("#define STRIP_R 32", &format!("#define STRIP_R {}", b))
-        .replace("#define MAX_SWEEPS 50", &format!("#define MAX_SWEEPS {}", TILED_MAX_SWEEPS))
+        .replace("#define MAX_SWEEPS 50", &format!("#define MAX_SWEEPS {}", jacobi_sweeps(TILED_MAX_SWEEPS)))
+        .replace("#define MAX_CSWEEPS 40", &format!("#define MAX_CSWEEPS {}", jacobi_sweeps(40)))
         .replace("#define JACOBI_PREC 2", &format!("#define JACOBI_PREC {}", prec))
+}
+
+/// Production direct cyclic Jacobi for 64 < N ≤ 256 — the same
+/// `jacobi_cyclic_global_batched` kernel GpuSccPlan runs (global-memory A/V,
+/// round-robin schedule, one WG per system). All systems are active.
+/// Returns the per-system diagnostic record `[batch][4]` =
+/// {off-norm, off/‖A‖_F, stop, sweeps}; stop: 0 converged · 1 stagnation ·
+/// 2 MAX_CSWEEPS · 3 n>capacity · 4 non-finite. `prec` = JACOBI_PREC.
+pub fn direct_jacobi_batched(
+    rt: &mut GpuRuntime,
+    a_buf: &Buffer<f32>,
+    v_buf: &Buffer<f32>,
+    n: usize,
+    batch: usize,
+    prec: u32,
+) -> Result<Vec<f32>> {
+    if n <= 64 || n > 256 {
+        return Err(DftbError::InvalidInput(format!(
+            "direct_jacobi_batched: n={n} out of range 65..=256 (n≤64 → jacobi_cyclic_local_batched; n>256 exceeds __local rot[128] capacity)"
+        )));
+    }
+    if batch == 0 {
+        return Ok(Vec::new());
+    }
+    let source = render_tiled_source(32, 256, prec);
+    let program = rt.build_program(&source)?;
+    let ones = rt.buffer_from_slice(&vec![1i32; batch])?;
+    let diag = rt.zero_buffer::<f32>(4 * batch)?;
+    let kernel = Kernel::builder()
+        .program(&program).name("jacobi_cyclic_global_batched").queue(rt.queue().clone())
+        .global_work_size(batch * 256).local_work_size(256)
+        .arg(a_buf).arg(v_buf).arg(n as i32).arg(batch as i32).arg(0i32)
+        .arg(&ones).arg(&diag)
+        .build().map_err(map_ocl_err)?;
+    unsafe { kernel.enq().map_err(map_ocl_err)?; }
+    let mut d = vec![0.0f32; 4 * batch];
+    rt.read_buffer(&diag, &mut d)?;
+    Ok(d)
 }
 
 /// Tiled block Jacobi eigensolver for N > 64.

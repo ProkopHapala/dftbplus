@@ -2,6 +2,45 @@
 
 > **Current review correction:** read manifest **§15** before using the later Item 5/6/7 conclusions. W=2(ZH)K still consumes truncated ZH; the quartic clamp is not a certified stability invariant; TRS G3.4 remains red; and the histogram's 3% row-norm budget is 0.09% squared norm mass, not 3% mass or a force-error bound. The ~61-neighbor result lacks symmetric-mask/re-solved force validation. Earlier results are retained as history, not current acceptance. §15 provides the prioritized sparse-only coding-agent instructions; this review made no implementation changes and ran no new benchmarks.
 
+## S1 — state & reduction contracts (implemented; manifest §15.2)
+
+Implemented the §15.2 repairs; all new evidence is in the manifest §15.2
+status block. In short:
+
+- **Stale-product fix (the confirmed bug):** `tc2_purify_p` now measures the
+  trace, lets the guard rescale P, and only then forms `Q=P²`; the residual
+  and the update act on the post-rescale state. K-TC2 likewise re-forms
+  `T=K·S` and re-measures `Tr(KS)` after a guard rescale — the reported
+  trace is a measurement, never `Nocc` by assignment.
+- **Recovered-K diagnostics:** `purify_hscc_p`/`purify_hscc_trs` now return
+  `R_I(K)=‖KSK−K‖/‖K‖` and `Tr(KS)` computed on the recovered K — the same
+  state that feeds Mulliken charges and the energy. Measured on SiH4-scale
+  fixtures: `Tr(KS)` of the recovered K deviates ~1.6e-5 from `Tr(P)=3.0`
+  (Z-recovery defect) — previously hidden by reporting the P diagnostics.
+- **Accepted-state validity:** `set_coords`/`set_q` invalidate the cached
+  energy; `scc` invalidates it before propagating a failure; `energy()`/
+  `forces()` refuse post-mutation and post-failure calls (new contract test).
+- **Skin check is now Euclidean:** per-atom `|ΔR|` vs `r_skin/2`; a diagonal
+  move with each component < skin/2 but `|ΔR|` > skin/2 is now correctly
+  rejected (test `test_s1_skin_euclidean_diagonal`).
+- **Charge/trace consistency:** `mulliken_checked` enforces
+  `|Σq − 2·Tr(KS)| ≤ 1e-6·n_atom + 1e-5` (worst-case f32 lane-order bound)
+  on top of the absolute electron-count check.
+- **Guard observability:** `guard_fires` counter; seeded-leak tests prove
+  the guard actually fires on both purifier paths and that the accepted
+  state satisfies the trace tolerance.
+
+Run record (unfiltered, 2026-09): `sparse::` lib 10/10; `gate_g3_energy`
+7/7; `gpu_dftb` 2/2; `gate_f_geom_opt` 1/1; `gate_g_hessian` 1/1;
+`gpu_sparse_bsr4` 23/23; `sparse_dftb` 1/1. `gate_e_determinism` stays red
+by design (no analytic sparse force of E_el+E_rep — S3). New tests:
+`test_p_tc2_guard_and_recovery_contract`, `test_k_tc2_guard_fires`,
+`test_s1_state_invalidation_contract`, `test_s1_skin_euclidean_diagonal`.
+
+Open within S1's scope but deferred by the work order: `trace_kh0_dev`
+single-f32 band-energy reduction (→ S6 selective precision); masked-residual
+honesty on expanded support (→ S2).
+
 ## Status as of 2025-01-XX
 
 **Repository:** `/home/prokop/git/dftbplus`

@@ -501,13 +501,18 @@ impl SparseDftb {
         // Verlet-skin check (F2/R4): M_HS was built at coords_build with
         // radius r_cut + skin. Any pair can newly enter the physical cutoff
         // only if an atom moved > skin/2 relative to the build geometry.
+        // S1: the bound is on the EUCLIDEAN per-atom displacement — a
+        // diagonal move has |ΔR| = √3·(max component), so checking the max
+        // Cartesian component underestimates it by up to √3.
         if !self.full_mask {
-            let mut dmax = 0.0f64;
+            let mut dmax2 = 0.0f64;
             for i in 0..self.n_atom {
-                for c in 0..3 {
-                    dmax = dmax.max((coords[i][c] - self.coords_build[i][c]).abs());
-                }
+                let dx = coords[i][0] - self.coords_build[i][0];
+                let dy = coords[i][1] - self.coords_build[i][1];
+                let dz = coords[i][2] - self.coords_build[i][2];
+                dmax2 = dmax2.max(dx * dx + dy * dy + dz * dz);
             }
+            let dmax = dmax2.sqrt();
             if 2.0 * dmax > self.cfg.r_skin_ang {
                 return Err(DftbError::InvalidInput(format!(
                     "set_coords: Verlet skin exhausted — max |ΔR|={dmax:.4} Å vs skin/2={:.4} Å. \
@@ -544,6 +549,11 @@ impl SparseDftb {
             panic!("set_coords: non-finite E_rep={} n_atom={}", self.e_rep, self.n_atom);
         }
         self.z_valid = false;
+        // S1 state contract: the stored energy/forces describe the OLD
+        // geometry — no accepted state exists for the new one until scc()
+        // finalizes. energy()/forces() gate on last.n_scc.
+        self.last.n_scc = 0;
+        self.last.purify_status = PurifyStatus::Failed;
         // Geometry changes the fixed-point map only smoothly; keep the DIIS
         // subspace (reset_iter_only) — warm-started FD/relax columns converge
         // in a few iters instead of re-fighting the unstable sloshing mode.
@@ -562,6 +572,9 @@ impl SparseDftb {
             }
         }
         self.q.copy_from_slice(q);
+        // S1 state contract: `last` was accepted for the previous q_in.
+        self.last.n_scc = 0;
+        self.last.purify_status = PurifyStatus::Failed;
         if let Some(m) = &mut self.mixer { m.reset_iter_only(); }  // same map, new point
         Ok(())
     }
@@ -583,7 +596,21 @@ impl SparseDftb {
     /// Self-consistent charges. Warm-starts from the previous `q`. Z is
     /// computed (or NS-corrected) once per geometry; H_scc is built on the
     /// device from V[N]; K and charges return to host only as scalars + q.
+    ///
+    /// S1 state contract: a FAILED solve leaves no usable accepted state —
+    /// `store_energy` writes intermediate `last` values inside the loop, so
+    /// any Err path invalidates `last` (energy()/forces() then refuse to
+    /// serve a non-converged or mixed-provenance state).
     pub fn scc(&mut self, max_iter: usize, rms_tol: f64) -> Result<SparseDftbScc> {
+        let r = self.scc_inner(max_iter, rms_tol);
+        if r.is_err() {
+            self.last.n_scc = 0;
+            self.last.purify_status = PurifyStatus::Failed;
+        }
+        r
+    }
+
+    fn scc_inner(&mut self, max_iter: usize, rms_tol: f64) -> Result<SparseDftbScc> {
         let cap = max_iter.min(self.cfg.max_scc).min(SCC_MAX);
         if !self.z_valid {
             // Warm-start NS from the previous geometry's Z when available —
@@ -757,6 +784,17 @@ impl SparseDftb {
         }
         let q: Vec<f64> = q_f32.iter().map(|&x| x as f64).collect();
         let qsum: f64 = q.iter().sum();
+        // S1 consistency: q_out must come from the SAME K·S whose trace was
+        // measured. q_A = 2·Tr((KS)_AA) per atom → sum(q) = 2·Tr(KS) up to
+        // f32 per-atom rounding (~ulp·√N). A mismatch means the charge read
+        // and the trace read saw different matrices (stale t_ks class bug).
+        let tol_consistent = 1e-6 * self.n_atom as f64 + 1e-5;
+        if (qsum - 2.0 * tr).abs() > tol_consistent {
+            return Err(DftbError::InvalidInput(format!(
+                "SCC iter {it}: sum(q)={qsum:.6} != 2·Tr(KS)={:.6} — charges and measured trace came from different states",
+                2.0 * tr
+            )));
+        }
         let n_elec = 2.0 * self.nocc as f64;
         if (qsum - n_elec).abs() > 0.5 {
             return Err(DftbError::InvalidInput(format!(

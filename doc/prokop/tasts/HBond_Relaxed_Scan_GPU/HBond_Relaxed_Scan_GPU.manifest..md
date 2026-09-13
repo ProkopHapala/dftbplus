@@ -2021,6 +2021,17 @@ Historical observations must be interpreted narrowly:
 
 #### R1. Separate SCC activity from force-state validity; W is currently stale
 
+**Status (2026-09-13): FIXED + validated.** `state_ok` device mask +
+`set_state_ok` upload + dedicated `k_edm` handle
+(`gpu_scc_plan.rs`); `active` = still-iterating, `state_ok` = certified
+for forces. Regression `test_gpu_dftb_edm_fresh_mixed_convergence`
+(6 heterogeneous replicas, mixed convergence): worst batched-vs-solo
+`max|ΔF|` = 2.98e-8 Ha/Å at kT=0 and 8.94e-8 at kT=0.002 — was
+0.585 Ha/Å before the fix. Remaining acceptance gap: first-force W init
+and batch-permutation cases are covered by the test; `scc→eval(false)→forces`
+path exercised via `relax` but not singled out. Whether R1 explains all
+past batch divergence is still untested.
+
 **Source:** `gpu_scc_plan.rs:399–407,1338–1349`; `gpu_matrix_ops.cl:1038–1056`; `gpu_dftb.rs:738–759,864–899,989–995`.
 
 `k_density` is permanently bound to the SCC `active` buffer. `build_edm()` changes its output to W and `use_eig=1`, but leaves that mask unchanged. After SCC, replicas which converged before the last iteration have `active=0`. Cached-state force evaluation skips `finalize()`, then `build_edm()` skips those replicas. W is therefore left from an older geometry/electronic state, or remains zero after initialization. The other force kernels still run for them and use current D with wrong W in the Pulay term.
@@ -2035,6 +2046,17 @@ The last iteration's active replicas differ from earlier-converged ones because 
 
 #### R2. Retry must restore physical state, not only a better status label
 
+**Status (2026-09-13): FIXED + tested.** Retry re-solves only failed
+replicas under the `active` mask (converged replicas' C/D/q untouched;
+`batched_gemm` may rewrite intermediates — idempotent, same inputs).
+`relax` reports final residual + convergence, not the initial one.
+`test_gpu_dftb_masked_retry_isolation` (via `scc_masked` test hook):
+masked retry on one replica leaves the other's energy bitwise identical;
+exhausted `scc(1, 1e-12)` reports honest `[Failed, Failed]` + stalled
+and `fire_step` moves no atoms on uncertified state. Open: a test that
+exercises the real failed→warm-start path (needs a deterministic
+physical SCC failure); batch-permutation independence.
+
 **Source:** `gpu_dftb.rs:614–648,738–807,1082–1096`.
 
 `scc()` seeds failed replicas from the nearest **array index**, reruns the entire batch, then retains the better old/new status. It does not restore the old C/D/q/V/occupations when retaining the old status. A previously converged replica can be reported converged, and `scc_ok=true`, while its actual buffers contain the failed retry state. Geometry similarity cannot be inferred from batch index in a general multi-solver; results should not depend on replica ordering.
@@ -2047,6 +2069,14 @@ At the iteration cap, `scc_mix()` can also commit a next charge iterate that has
 
 #### R3. Define and verify one FIRE discretization; current GPU update adds acceleration twice
 
+**Status (2026-09-13): FIXED; one-step algebra test still open.** Device
+step is now kick–drift matching `FireOptimizer`: P=F·V → adapt → mix →
+v+=F·dt → clamp → x+=v·dt → cap (displacement cap rescales v). Verified:
+GC equilibrium relax (`diag_relax_eq`) converged `max|F|=8.08e-4` in 45
+steps, `max|F_gpu−F_cpu|=8.1e-6`, `|dE|=2.5e-6`. Open: one-step
+constant-force algebra check, ±power branch coverage, per-step
+x/v/dt/alpha state comparison vs CPU.
+
 **Source:** `gpu_forces.cl:1105–1114`; `gpu_dftb.rs:981–982`; `examples/hbond_ref.rs:263–292`.
 
 GPU first computes `v_new = v_mix + F·dt`, then `dx = v_new·dt + 0.5 F·dt²`. With zero old velocity and inactive caps this is `dx=1.5 F·dt²`. The cited CPU optimizer uses `dx=v_new·dt` after the kick. The GPU code therefore does not match that reference or the stated kick–drift ordering. Successful minimization of one molecule does not establish a correct integration formula.
@@ -2056,6 +2086,19 @@ GPU first computes `v_new = v_mix + F·dt`, then `dx = v_new·dt + 0.5 F·dt²`.
 **Acceptance:** one-step constant-force algebra; harmonic/quadratic relaxation; positive/negative-power branches; reset, parking/resume, frozen DOFs and constraints; compare x/v/dt/alpha/counter state, not just final energy. Plain FIRE need not decrease energy every step, but the relaxation must settle with bounded transients. Do not demand artificial monotonicity or fix instability by increasing the iteration cap. `md_step` remains a separate, uncertified MD interface.
 
 #### R4. Projection/finiteness contracts are incomplete
+
+**Status (2026-09-13): FIXED + tested.** Frozen atoms excluded from
+P/‖V‖²/‖F‖²/maxF; constraint projection is now mobility-weighted (one
+frozen endpoint → full correction to the mobile one, no wall-reaction
+leak); `set_constraint` validates endpoints, targets, and
+initial-geometry compatibility (fail loud); all four FIRE reduction
+stats get finiteness checks; `set_smearing` invalidates `state_fresh`.
+`test_gpu_dftb_constraint_and_frozen`: all invalid inputs rejected
+(i==j, OOB, bad len, zero/neg/NaN target, both-frozen in both orders);
+initial projection onto target verified (dist held 1.600000 over 5
+FIRE+SCC steps with a frozen endpoint); frozen atoms stationary within
+f32 readback noise. Open: per-step tangent-velocity residual, nonzero
+frozen input velocity, rotation invariance.
 
 **Source:** `gpu_forces.cl:969–1042,1070–1145`; `gpu_dftb.rs:907–970,999–1030`.
 
@@ -2070,11 +2113,31 @@ GPU first computes `v_new = v_mix + F·dt`, then `dx = v_new·dt + 0.5 F·dt²`.
 
 #### R5. The production Jacobi contract differs from the old tested solver
 
+**Status (2026-09-13): guards + reporting FIXED; eigen-quality matrix
+DONE.** n>256 now `Err` at plan build (host guard covers H and S
+Jacobi) plus defensive kernel early-out writing diag stop=3.
+`jacobi_diag` [batch×4] = {off, off/‖A‖_F, stop, sweeps} with stop ∈
+{0 conv, 1 stall, 2 max sweeps, 3 n>cap, 4 non-finite}; host
+`report_jacobi` warns per non-converged replica after each Jacobi
+launch. Pair-skip test is now NaN-safe and handles the exact-zero pivot
+(`!(|a_pq| > ε(|a_pp|+|a_qq|))`); non-finite off-norm breaks loudly.
+Test `test_gpu_dftb_jacobi_capacity_guard`: n=256 accept (at capacity),
+n=253 odd accept (pad path), n=260 reject. Eigen-quality on the actual
+direct kernel is exercised via the new `gpu_eigen::direct_jacobi_batched`
+entry point + `test_direct_jacobi_eigen_quality`: random symmetric
+N=65/87/96/97/128/255/256 all converge (stop=0, 7–8 sweeps,
+res 1.3e-6–1.0e-5, orth ≤1.6e-7, eig parity within the asserted Weyl
+bound 2·res·‖A‖_F); adversarial batch clustered/repeated/zero-8×8-block/
+all-zero spectra all stop=0, res ≤1.8e-6, all outputs finite.
+`RUST_DFTB_JACOBI_SWEEPS` now reaches `MAX_CSWEEPS` via the shared
+`gpu_eigen::jacobi_sweeps` helper at both render sites. Open: metric
+`fmax` NaN hiding, per-replica repair residuals.
+
 **Source:** `gpu_scc_plan.rs:83–103,1474–1505`; `gpu_tiled_jacobi.cl:126–308`; `tests/gpu_tiled_jacobi.rs:188–249`.
 
 Production N>64 uses **direct `jacobi_cyclic_global_batched`**, not the deprecated `tiled_jacobi_batched`. The existing `jacobi_prec_bench` explicitly launches the deprecated kernel. Its precision timings/residuals cannot justify the current production default or a future precision change.
 
-- `RUST_DFTB_JACOBI_SWEEPS` replaces `MAX_SWEEPS`; the direct kernel uses **`MAX_CSWEEPS=40`**. That knob does not control production direct-Jacobi sweeps.
+- ~~`RUST_DFTB_JACOBI_SWEEPS` replaces `MAX_SWEEPS`; the direct kernel uses **`MAX_CSWEEPS=40`**. That knob does not control production direct-Jacobi sweeps.~~ FIXED 2026-09-13: `jacobi_sweeps(default)` applies the env override to both `MAX_SWEEPS` (tiled) and `MAX_CSWEEPS` (direct, default 40).
 - `rot_*[128]` supports at most 128 pairs, i.e. N≤256. No constructor guard was found for the direct path. The header's larger-N claims do not apply; striding work-items does not enlarge scratch arrays. Reject unsupported N until a size-safe route is deliberately implemented.
 - Stagnation/exhaustion stop reasons and achieved residual are not returned. Remaining off-diagonals are zeroed unconditionally. This destroys the easiest diagnostic; zero output off-diagonals are not evidence of diagonalization.
 - Zero pivots need an explicit no-rotation case: strict `abs(apq)<eps*(abs(app)+abs(aqq))` is false for all-zero entries. A matrix with a zero subblock and nonzero off-diagonals elsewhere can reach `tau=0/0`.
@@ -2154,9 +2217,9 @@ Use cheap uniform activity masks first. If long tails leave few active systems, 
 
 **Implement one ticket at a time:**
 
-1. R1 W/mask regression and correction. This is the highest-value first task.
-2. R2 state/retry/termination honesty, R3 FIRE ordering and R4 projection checks. No long production scans until these pass.
-3. R5 production-kernel diagnostics/capacity guards, plus weighted finite-temperature `measure`. Establish a reproducible fixed-geometry baseline.
+1. ~~R1 W/mask regression and correction.~~ **DONE 2026-09-13** — `state_ok`+`k_edm`; batched-vs-solo `max|ΔF|` ≤ 8.94e-8 Ha/Å at kT=0 and 0.002.
+2. ~~R2 state/retry/termination honesty, R3 FIRE ordering and R4 projection checks.~~ **DONE 2026-09-13** — masked-retry isolation + honest-exhaustion test and the constraint/frozen test matrix both pass; GC relax converges with CPU force parity 8.1e-6. R3 one-step algebra verified 2026-09-13 (Δx=0.49·F, max dev 1.4e-8 Å). Remaining: a real failed→warm-start retry trigger, R4 tangent-velocity/rotation-invariance cases.
+3. ~~R5 production-kernel diagnostics/capacity guards,~~ plus weighted finite-temperature `measure`. **R5 DONE 2026-09-13** — n≤256 guard (accept 256/253, reject 260), diag stop reasons, NaN-safe pivots, `MAX_CSWEEPS` env knob wired, and `test_direct_jacobi_eigen_quality` on the actual direct kernel (N≤256 boundary/odd/capacity + clustered/repeated/zero-block spectra, Weyl-bounded eig parity). Remaining: weighted `measure` — then establish the reproducible fixed-geometry baseline.
 4. R6 persistent scratch, compact diagnostics, per-replica dirty/activity handling; R7 bounded smearing and R8 force fusion/ownership. These remove work without sacrificing physical accuracy.
 5. Profile the repaired path; then one local-A/WG experiment and one direct-Jacobi precision A/B. Do not change storage, arithmetic, SCC tolerance and FIRE parameters simultaneously.
 

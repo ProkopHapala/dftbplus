@@ -611,6 +611,14 @@ impl GpuDftb {
     /// mid proton transfer, bare-q0 DIIS oscillates between near-degenerate
     /// charge states; a converged neighbor's q usually lands it in the right
     /// basin on the first iteration).
+    ///
+    /// R2: the retry re-solves ONLY the failed replicas (initial `active`
+    /// mask = failed set). Non-failed replicas are never iterated, so their
+    /// device state is untouched and keeping their run-1 status is coherent
+    /// — the label matches the buffers. The old code re-ran the whole batch
+    /// and merged the better status label WITHOUT restoring the matching
+    /// physical state: a replica could be reported Converged while its
+    /// C/D/q buffers held the failed retry state.
     pub fn scc(&mut self, max_iter: usize, rms_tol: f32) -> Result<GpuDftbScc> {
         let s = self.scc_mix(max_iter, rms_tol, 0)?;
         let n_fail = s.statuses.iter().filter(|st| **st == SccStatus::Failed).count();
@@ -621,31 +629,40 @@ impl GpuDftb {
         self.rt.read_buffer(&self.plan.q_gpu, &mut q)?;
         let ok: Vec<usize> = (0..self.batch).filter(|&b| s.statuses[b] != SccStatus::Failed).collect();
         if ok.is_empty() { return Ok(s); }   // nothing to seed from — keep the honest failures
+        let mut retry = vec![false; self.batch];
         for b in 0..self.batch {
             if s.statuses[b] != SccStatus::Failed { continue; }
             let src = *ok.iter().min_by_key(|&&c| c.abs_diff(b)).unwrap();
             let (dst_lo, src_lo) = (b * na, src * na);
             q.copy_within(src_lo..src_lo + na, dst_lo);
+            retry[b] = true;
             eprintln!("[GpuDftb] SCC warm-start replica {b} ← replica {src} (q copied, DIIS reset)");
         }
         self.plan.reset_diis(&self.rt)?;
         self.plan.set_initial_charges(&self.rt, &q)?;
-        let s2 = self.scc_mix(max_iter, rms_tol, 0)?;
-        // per-replica merge: keep the BETTER outcome — a converged replica
-        // re-seeded from its own q can re-evaluate a hair above tol near the
-        // floor and must not be demoted to Failed by the retry.
-        let rank = |st: &SccStatus| match st { SccStatus::Converged => 0, SccStatus::Plateau => 1, SccStatus::Failed => 2 };
+        let s2 = self.scc_mix_inner(max_iter, rms_tol, 0, Some(&retry))?;
+        // Merge: retried replicas take their run-2 outcome; everyone else
+        // keeps run-1 status AND state (untouched by the masked retry).
         let mut merged = s2;
         for b in 0..self.batch {
-            if rank(&s.statuses[b]) < rank(&merged.statuses[b]) {
-                merged.statuses[b] = s.statuses[b].clone();
-            }
+            if !retry[b] { merged.statuses[b] = s.statuses[b].clone(); }
         }
+        merged.n_iters += s.n_iters;                     // total expended iterations
         merged.stalled = merged.statuses.iter().any(|st| *st != SccStatus::Converged);
         let still = merged.statuses.iter().filter(|st| **st == SccStatus::Failed).count();
         eprintln!("[GpuDftb] SCC warm-start retry: {n_fail} failed → {still} still failed");
         self.scc_ok = merged.statuses.iter().map(|st| *st != SccStatus::Failed).collect();
+        self.plan.set_state_ok(&self.rt, &self.scc_ok)?;   // R1: W-build mask follows certified status
         Ok(merged)
+    }
+
+    /// Test-only R2 hook: run the masked-retry SCC path directly —
+    /// replicas with `retry[b]` are re-solved; others are never iterated
+    /// and keep their device state/status. Production calls go through
+    /// `scc`, which builds this mask from the Failed set.
+    #[doc(hidden)]
+    pub fn scc_masked(&mut self, max_iter: usize, rms_tol: f32, retry: &[bool]) -> Result<GpuDftbScc> {
+        self.scc_mix_inner(max_iter, rms_tol, 0, Some(retry))
     }
 
     pub fn reset_q0(&mut self) -> Result<()> {
@@ -656,6 +673,13 @@ impl GpuDftb {
 
     /// `mix`: 0 GPU DIIS, 1 GPU simple α=0.3, 2 host f64 DiisMixer (hist=min(10,n_atoms), warmup=1).
     pub fn scc_mix(&mut self, max_iter: usize, rms_tol: f32, mix: i32) -> Result<GpuDftbScc> {
+        self.scc_mix_inner(max_iter, rms_tol, mix, None)
+    }
+
+    /// `retry: Some(mask)` starts the loop with `active = mask` — replicas
+    /// outside the mask are never iterated and keep their device state
+    /// (R2 masked retry). `None` = all replicas active.
+    fn scc_mix_inner(&mut self, max_iter: usize, rms_tol: f32, mix: i32, retry: Option<&[bool]>) -> Result<GpuDftbScc> {
         if mix == 2 && self.batch != 1 {
             return Err(DftbError::InvalidInput(format!("scc_mix host DIIS: batch={} — measurement path is replica-0 only", self.batch)));
         }
@@ -690,8 +714,21 @@ impl GpuDftb {
         // replicas still active. On exit the device state (C,D,H_scc,Δq,V)
         // corresponds to q_gpu exactly → eval() can skip re-diagonalizing.
         self.state_fresh = false;
-        for f in self.plan.active_host.iter_mut() { *f = 1; }
+        match retry {
+            Some(m) => {
+                if m.len() != self.batch {
+                    return Err(DftbError::InvalidInput(format!("scc_mix_inner: retry mask len {} != batch {}", m.len(), self.batch)));
+                }
+                for (f, &r) in self.plan.active_host.iter_mut().zip(m.iter()) { *f = r as i32; }
+            }
+            None => for f in self.plan.active_host.iter_mut() { *f = 1; },
+        }
         self.plan.set_active(&self.rt)?;
+        // Replicas outside the retry mask are already done: never iterated,
+        // never committed — their device state stays the converged run-1 one.
+        for (b, &a) in self.plan.active_host.iter().enumerate() {
+            if a == 0 { done[b] = true; n_active -= 1; }
+        }
         for it in 0..cap {
             n_iters = it + 1;
             rms = match mix {
@@ -804,6 +841,9 @@ impl GpuDftb {
         }
         // failed replicas must not be stepped on garbage forces (relax parks them)
         self.scc_ok = statuses.iter().map(|s| *s != SccStatus::Failed).collect();
+        // R1: k_edm (W build) gates on state_ok — certified replicas get a
+        // fresh W even when they converged before the last SCC iteration.
+        self.plan.set_state_ok(&self.rt, &self.scc_ok)?;
         Ok(GpuDftbScc { n_iters, rms, stalled, statuses })
     }
 
@@ -907,6 +947,7 @@ impl GpuDftb {
     pub fn set_smearing(&mut self, kt: f32) {
         if !kt.is_finite() || kt < 0.0 { panic!("set_smearing: kT={kt}"); }
         self.plan.kT = kt;
+        self.state_fresh = false;   // occupation model changed — cached state invalid (R4)
         eprintln!("[GpuDftb] Fermi smearing kT={kt} Ha{}", if kt > 0.0 { "" } else { " (integer occ)" });
     }
 
@@ -923,6 +964,16 @@ impl GpuDftb {
                 )));
             }
             self.frozen[i] = true;
+        }
+        // R4: freezing both constraint endpoints AFTER set_constraint leaves
+        // no free DOF to satisfy the distance — reject at the same place
+        // set_constraint does.
+        if let Some((i, j)) = self.constr {
+            if self.frozen[i] && self.frozen[j] {
+                return Err(DftbError::InvalidInput(format!(
+                    "set_frozen_atoms: would freeze both constraint endpoints ({i},{j}) — no free DOF to satisfy the constraint"
+                )));
+            }
         }
         let m: Vec<i32> = self.frozen.iter().map(|&f| f as i32).collect();
         self.rt.write_buffer(&self.frozen_dev, &m)
@@ -950,7 +1001,49 @@ impl GpuDftb {
                 "set_constraint: targets.len()={} != batch={}", targets.len(), self.batch
             )));
         }
+        // R4: finite positive targets AFTER the f64→f32 cast — a NaN/≤0
+        // target would silently corrupt every projection.
         let t: Vec<f32> = targets.iter().map(|&d| d as f32).collect();
+        for (b, (&d64, &d32)) in targets.iter().zip(t.iter()).enumerate() {
+            if !d64.is_finite() || !d32.is_finite() || d32 <= 0.0 {
+                return Err(DftbError::InvalidInput(format!(
+                    "set_constraint: replica {b} target d={d64} → f32 {d32} — need finite > 0"
+                )));
+            }
+        }
+        // R4: validate + project the INITIAL coordinates onto the constraint
+        // surface. Otherwise the first constrained force/conv check sees a
+        // violated constraint — a small force could park a replica at the
+        // wrong distance. Coincident endpoints cannot be projected → error.
+        self.sync_coords_to_host()?;
+        let na = self.n_atoms;
+        let mi = if self.frozen[i] { 0.0f64 } else { 1.0f64 };
+        let mj = if self.frozen[j] { 0.0f64 } else { 1.0f64 };
+        let ms = mi + mj;                        // >0 — both-frozen rejected above
+        let (wi, wj) = (mi / ms, mj / ms);
+        let mut max_shift = 0.0f64;
+        for b in 0..self.batch {
+            let (bi, bj) = (b * na + i, b * na + j);
+            let rx = self.coords[bj][0] - self.coords[bi][0];
+            let ry = self.coords[bj][1] - self.coords[bi][1];
+            let rz = self.coords[bj][2] - self.coords[bi][2];
+            let r = (rx * rx + ry * ry + rz * rz).sqrt();
+            if !r.is_finite() || r < 1e-6 {
+                return Err(DftbError::InvalidInput(format!(
+                    "set_constraint: replica {b} endpoints ({i},{j}) coincident/non-finite r={r} — cannot project"
+                )));
+            }
+            let g = r - targets[b];
+            let (ux, uy, uz) = (rx / r, ry / r, rz / r);
+            self.coords[bi][0] += wi * g * ux; self.coords[bi][1] += wi * g * uy; self.coords[bi][2] += wi * g * uz;
+            self.coords[bj][0] -= wj * g * ux; self.coords[bj][1] -= wj * g * uy; self.coords[bj][2] -= wj * g * uz;
+            max_shift = max_shift.max(g.abs());
+        }
+        if max_shift > 1e-9 {
+            eprintln!("[GpuDftb] constraint: projected initial coords onto |x_{j}−x_{i}|=d[b] (max |r−d|={max_shift:.3e} Å)");
+            let c = self.coords.clone();
+            self.set_coords(&c)?;
+        }
         self.rt.write_buffer(&self.constr_d, &t)
             .map_err(|e| DftbError::InvalidInput(format!("write constr_d: {e}")))?;
         self.k_fire_apply.set_arg(8u32, 1i32).map_err(map_ocl_err)?;
@@ -998,10 +1091,14 @@ impl GpuDftb {
         let mut max_f = 0.0f64;
         for b in 0..self.batch {
             let p = self.fire_stat_h[4 * b] as f64;
+            let v2 = self.fire_stat_h[4 * b + 1] as f64;
+            let f2 = self.fire_stat_h[4 * b + 2] as f64;
             let mf = self.fire_stat_h[4 * b + 3] as f64;
-            if !p.is_finite() || !mf.is_finite() {
+            // R4: check ALL decision quantities — a NaN in v²/F² would
+            // silently poison mix_s even when P and maxF are finite.
+            if !p.is_finite() || !v2.is_finite() || !f2.is_finite() || !mf.is_finite() {
                 return Err(DftbError::InvalidInput(format!(
-                    "fire_step replica {b}: non-finite stat P={p} max|F|={mf}"
+                    "fire_step replica {b}: non-finite stat P={p} v²={v2} F²={f2} max|F|={mf}"
                 )));
             }
             max_f = max_f.max(mf);
@@ -1079,21 +1176,31 @@ impl GpuDftb {
     }
 
     /// Relax: SCC + FIRE until max|F|<f_tol or `max_steps`. Prints unbuffered progress.
-    pub fn relax(&mut self, max_steps: usize, f_tol: f64, scc_tol: f32) -> Result<(usize, f64, f32)> {
+    /// Returns (steps, max|F| at the final geometry, FINAL scc rms, converged).
+    /// `converged=false` means the loop exhausted max_steps — the coordinates
+    /// are NOT a relaxed geometry (R2: exhaustion must not be misreported as
+    /// convergence; the old signature returned the INITIAL scc rms).
+    pub fn relax(&mut self, max_steps: usize, f_tol: f64, scc_tol: f32) -> Result<(usize, f64, f32, bool)> {
         let scc0 = self.scc(SCC_MAX_ITER, scc_tol)?;
         eprintln!("[GpuDftb] relax start rms={:.3e} iters={} stalled={}", scc0.rms, scc0.n_iters, scc0.stalled);
         let mut max_f = f64::INFINITY;
+        let mut last_rms = scc0.rms;
         let mut step = 0;
         for s in 0..max_steps {
             step = s + 1;
             max_f = self.fire_step(f_tol)?;
             let scc = self.scc(SCC_MAX_ITER, scc_tol)?;
+            last_rms = scc.rms;
             let e = self.eval(false)?.energy;
             eprintln!("[GpuDftb] FIRE {step}/{max_steps} max|F|={max_f:.4e} E[0]={:.8} rms={:.3e} scc_iters={}", e[0], scc.rms, scc.n_iters);
             if max_f < f_tol { break; }
         }
         self.sync_coords_to_host()?;   // host `coords` reflects final device x
-        Ok((step, max_f, scc0.rms))
+        let converged = max_f < f_tol;
+        if !converged {
+            eprintln!("[GpuDftb] relax EXHAUSTED after {step} steps: max|F|={max_f:.4e} > f_tol={f_tol:.3e} — NOT a converged geometry");
+        }
+        Ok((step, max_f, last_rms, converged))
     }
 
     /// Frozen-H + energy-identity + optional CPU force/energy (replica 0). Call after `scc`. Prints; does not retune physics.

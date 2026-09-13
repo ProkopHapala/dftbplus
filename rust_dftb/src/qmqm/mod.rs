@@ -32,5 +32,5 @@ pub use neighbor::FragmentNeighborList;
 pub use fragment::{Fragment, FragmentTemplate};
 pub use solver::MultiSystemSolver;
 pub use gpu_scc_plan::GpuSccPlan;
-pub use gpu_dftb::{GpuDftb, GpuDftbEval, GpuDftbScc};
+pub use gpu_dftb::{GpuDftb, GpuDftbEval, GpuDftbScc, SccStatus};
 pub use gpu_forces::GpuForceDriver;

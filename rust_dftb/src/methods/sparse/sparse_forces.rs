@@ -937,9 +937,16 @@ mod tests {
         let d_oneshot = dw_oneshot.d.to_host(&gpu).unwrap();
         let w_oneshot = dw_oneshot.w.to_host(&gpu).unwrap();
 
-        // Persistent workspace path
-        let mut ws = SparseDWWorkspace::new(&gpu, &k_dev.struct_, &h_scc_dev.struct_).unwrap();
-        let (d_ws_ref, w_ws_ref) = ws.build_dw_into(&gpu, &k_dev, &h_scc_dev).unwrap();
+        // Persistent workspace path (legacy W=2KHK route — w_zk=false;
+        // b_zh is unused on that route but must be a valid M_TZS-shaped
+        // operand for the workspace constructor's plan_zk).
+        let m_tzs = m_hs.clone();
+        let tzs_struct = std::sync::Arc::new(
+            GpuBsrStructure::new(&gpu, n_atom, &m_tzs).unwrap(),
+        );
+        let b_zh = GpuBsrMatrix::from_host(&gpu, &h_scc_host).unwrap();
+        let mut ws = SparseDWWorkspace::new(&gpu, &k_dev.struct_, &h_scc_dev.struct_, &tzs_struct).unwrap();
+        let (d_ws_ref, w_ws_ref) = ws.build_dw_into(&gpu, &k_dev, &h_scc_dev, &b_zh, false).unwrap();
         let d_ws = d_ws_ref.to_host(&gpu).unwrap();
         let w_ws = w_ws_ref.to_host(&gpu).unwrap();
 
@@ -955,7 +962,7 @@ mod tests {
         assert!(w_diff < 1e-6 * w_scale, "W mismatch: {w_diff:e} (rel {})", w_diff / w_scale);
 
         // Verify workspace is reusable: second call should give same result.
-        let (d2_ref, w2_ref) = ws.build_dw_into(&gpu, &k_dev, &h_scc_dev).unwrap();
+        let (d2_ref, w2_ref) = ws.build_dw_into(&gpu, &k_dev, &h_scc_dev, &b_zh, false).unwrap();
         let d2 = d2_ref.to_host(&gpu).unwrap();
         let w2 = w2_ref.to_host(&gpu).unwrap();
         let d2_diff = bsr4_max_abs_diff(&d_oneshot, &d2);

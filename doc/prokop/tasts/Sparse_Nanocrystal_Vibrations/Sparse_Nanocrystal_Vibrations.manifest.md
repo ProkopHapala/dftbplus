@@ -2341,6 +2341,24 @@ semantics, stale-Z reset, unused plans). For this task the following are
 
 **Exit evidence:** guard-on CPU/GPU operation parity; cold/warm same-state trace parity; calls after geometry/charge mutation and after failed SCC rejected or explicitly restored; diagonal-motion skin test. No tolerance relaxation to make these pass.
 
+**Status (implemented, tests green — awaiting user acceptance):**
+
+- `tc2_purify_p` reordered: trace measured → guard may rescale P → `Q=P²` formed from the post-rescale P → residual `||Q−P||` and the branch/update all act on the same state. Post-rescale trace is re-measured (reduction), not assigned Nocc.
+- `tc2_purify` (K path) likewise re-forms `T=K·S` and re-measures `Tr(KS)` after a guard rescale.
+- `guard_fires` counter on the workspace; tests seed a controlled λ>1 leak (scale converged P/K by 1.0001 → dev_rel=1e-4 grows ×2/iter on the squaring branch) and assert the guard fires and the accepted trace is within `tc2_trace_tol`.
+- `recovered_k_diagnostics` computes `R_I(K)=‖KSK−K‖/‖K‖` and `Tr(KS)` on the post-recovery K; `purify_hscc_p/trs` now return the recovered-K diagnostics (the state that feeds charges and the energy), not the P iterate's. Cross-checked vs host-f64 dense recomputation of the downloaded K (`host_k_diagnostics`).
+- `set_coords` uses the Euclidean per-atom displacement vs `r_skin/2` and invalidates `last`; `set_q` invalidates `last`; `scc` invalidates `last` before propagating a failure (a failed solve leaves no usable energy/forces).
+- `mulliken_checked` additionally enforces `|Σq − 2·Tr(KS)| ≤ 1e-6·n_atom + 1e-5` (worst-case lane-order f32 bound) in place of the 0.5-electron check for consistency — the absolute electron-count check is retained.
+- `SparseDWWorkspace::new`/`build_dw_into` test call sites updated for the `(tzs_struct, b_zh, w_zk)` signature — legacy `2KHK` route kept as the comparison in `test_dw_workspace_vs_oneshot`.
+- NS residual contract confirmed: device reduction accumulates the SQUARED Frobenius sum; host applies `sqrt` and `/√N_orb`; `test_ns_device_residual_contract` and `test_compute_z_second_geometry` match host-f64 recompute to f32 tolerance.
+- Cold `Z` rebuild writes a full structural identity (all blocks incl. off-diagonal) before NS — no stale off-diagonal state.
+
+**New tests:** `sparse_system.rs::{test_p_tc2_guard_and_recovery_contract, test_k_tc2_guard_fires}`, `gate_g3_energy.rs::{test_s1_state_invalidation_contract, test_s1_skin_euclidean_diagonal}`.
+
+**Run record (unfiltered):** `cargo test -p rust_dftb --lib sparse::` → 10/10; `--test gate_g3_energy` → 7/7 (1 ignored diagnostic); `--test gpu_dftb` → 2/2; `--test gate_f_geom_opt` → 1/1; `--test gate_g_hessian` → 1/1; `--test gpu_sparse_bsr4` → 23/23 (1 ignored); `--test sparse_dftb` → 1/1; `gate_e_determinism` remains intentionally red (analytic sparse force of E_el+E_rep is an S3 deliverable, not an S1 regression).
+
+**Not done in S1 (deferred per work order):** `trace_kh0_dev` still reduces the band energy to one f32 scalar — selective-precision item for S6, not a state-contract bug. Masked-residual honesty (expanded-support audit of R_H / R_Z) is S2.
+
 ### 15.3 S2 — Establish an error budget and a short, trustworthy purifier
 
 **Use repaired P-TC2 as the comparison baseline**, legacy K-TC2 retained. Keep the current quartic opt-in and uncertified. Do not count “10 TRS iterations vs 20 TC2” as a 2× improvement: TRS uses two SpGEMMs and three separate trace readbacks per iteration; P-TC2 uses one product. Count all products, reductions, copies, and SCC iterations.

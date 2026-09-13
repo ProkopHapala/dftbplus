@@ -960,15 +960,22 @@ __kernel void force_repulsive_batched(
 // FIRE update — otherwise the stretched-bond radial force (the
 // constraint's own reaction, not an optimizable force) drives v each
 // step while the position projection snaps x back → energy injection.
-// With equal (unit) masses:  F_i += wi·f_r·r̂,  F_j -= wj·f_r·r̂,
-// f_r = (F_j−F_i)·r̂,  wi+wj = 1 (0/1 if one endpoint is frozen).
-// The convergence test and P must use these PROJECTED forces.
+// With equal (unit) masses and mobility m∈{0,1} (0 = frozen endpoint):
+//   λ = (m_j·F_j − m_i·F_i)·r̂ / (m_i+m_j);  F_i += m_i·λ·r̂,  F_j -= m_j·λ·r̂.
+// Both-mobile reduces to the old ±½(F_j−F_i)·r̂ split; a frozen endpoint's
+// force is a wall reaction and must not drive the mobile endpoint (R4).
+// Position projection uses the positional split w_i+w_j=1 instead.
+// The convergence test and P must use these PROJECTED forces, and frozen
+// atoms are excluded from P, ‖v‖², ‖F‖² and max|F| entirely (R4).
 
 // Per-replica constraint geometry: returns unit bond vector and the
-// projected radial force f_r = (F_j−F_i)·r̂ (out params via pointers).
+// mobility-weighted radial reaction rate f_r = (m_j·F_j − m_i·F_i)·r̂/(m_i+m_j)
+// (out params via pointers). For both-mobile endpoints this is the old
+// ½(F_j−F_i)·r̂; for a frozen endpoint the immobile atom's force is a wall
+// reaction and must NOT drive the mobile endpoint (R4): m_i=0 → f_r=F_j·r̂.
 inline float3 constr_axis(
     __global const float* xa, int ci, int cj,
-    __global const float* fb, float wi, float wj,
+    __global const float* fb, float mi, float mj, float ms,
     float* f_r
 ) {
     float3 u;
@@ -978,7 +985,9 @@ inline float3 constr_axis(
     float r = sqrt(u.x*u.x + u.y*u.y + u.z*u.z);
     if (r < 1.0e-12f) { *f_r = 0.0f; return (float3)(0.0f); }
     u /= r;
-    *f_r = ((fb[3*cj]-fb[3*ci])*u.x + (fb[3*cj+1]-fb[3*ci+1])*u.y + (fb[3*cj+2]-fb[3*ci+2])*u.z);
+    float fi = fb[3*ci]*u.x + fb[3*ci+1]*u.y + fb[3*ci+2]*u.z;
+    float fj = fb[3*cj]*u.x + fb[3*cj+1]*u.y + fb[3*cj+2]*u.z;
+    *f_r = (mj*fj - mi*fi) / ms;
     return u;
 }
 
@@ -1002,28 +1011,33 @@ __kernel void fire_reduce_batched(
     __local float3 l_u;
     __local float  l_fr, l_wi, l_wj;
 
-    // constraint geometry (one thread) — projected radial force on ci/cj
+    // constraint geometry (one thread) — projected radial force on ci/cj.
+    // mi,mj ∈ {0,1} = endpoint mobility; wi,wj = positional split (sum 1).
     if (lid == 0) {
-        float wi = frozen[ci] ? 0.0f : 0.5f, wj = frozen[cj] ? 0.0f : 0.5f;
-        float ws = wi + wj; if (ws > 0.0f) { wi /= ws; wj /= ws; }
-        l_wi = wi; l_wj = wj; l_fr = 0.0f; l_u = (float3)(0.0f);
-        if (c_on && ws > 0.0f) l_u = constr_axis(xa, ci, cj, fb, wi, wj, &l_fr);
+        float mi = frozen[ci] ? 0.0f : 1.0f, mj = frozen[cj] ? 0.0f : 1.0f;
+        float ms = mi + mj;
+        l_wi = (ms > 0.0f) ? mi / ms : 0.0f;
+        l_wj = (ms > 0.0f) ? mj / ms : 0.0f;
+        l_fr = 0.0f; l_u = (float3)(0.0f);
+        if (c_on && ms > 0.0f) l_u = constr_axis(xa, ci, cj, fb, mi, mj, ms, &l_fr);
     }
     barrier(CLK_LOCAL_MEM_FENCE);
     const float3 u = l_u; const float fr = l_fr;
     const float wi = l_wi, wj = l_wj;
+    (void)wi; (void)wj;   // position-split weights unused in the reduce pass
 
     float p = 0.0f, v2 = 0.0f, f2 = 0.0f, mf = 0.0f;
     for (int a = lid; a < n_atoms; a += lsz) {
+        if (frozen[a]) continue;   // frozen DOF: v=0, x fixed — exclude from P, v², F², maxF (R4)
         float fx = fb[3*a], fy = fb[3*a+1], fz = fb[3*a+2];
-        // projected forces at the constrained endpoints
-        if (c_on && a == ci) { fx += wi*fr*u.x; fy += wi*fr*u.y; fz += wi*fr*u.z; }
-        if (c_on && a == cj) { fx -= wj*fr*u.x; fy -= wj*fr*u.y; fz -= wj*fr*u.z; }
+        // projected forces at the constrained endpoints (unfrozen → m=1)
+        if (c_on && a == ci) { fx += fr*u.x; fy += fr*u.y; fz += fr*u.z; }
+        if (c_on && a == cj) { fx -= fr*u.x; fy -= fr*u.y; fz -= fr*u.z; }
         float vx = vb[3*a], vy = vb[3*a+1], vz = vb[3*a+2];
         p  += fx*vx + fy*vy + fz*vz;
         v2 += vx*vx + vy*vy + vz*vz;
         f2 += fx*fx + fy*fy + fz*fz;
-        if (!frozen[a]) mf = fmax(mf, fmax(fabs(fx), fmax(fabs(fy), fabs(fz))));
+        mf = fmax(mf, fmax(fabs(fx), fmax(fabs(fy), fabs(fz))));
     }
     red[lid] = p; red[lsz + lid] = v2; red[2*lsz + lid] = f2; red[3*lsz + lid] = mf;
     barrier(CLK_LOCAL_MEM_FENCE);
@@ -1081,10 +1095,12 @@ __kernel void fire_apply_batched(
     __local float3 l_u;
     __local float  l_fr, l_wi, l_wj;
     if (lid == 0) {
-        float wi = frozen[ci] ? 0.0f : 0.5f, wj = frozen[cj] ? 0.0f : 0.5f;
-        float ws = wi + wj; if (ws > 0.0f) { wi /= ws; wj /= ws; }
-        l_wi = wi; l_wj = wj; l_fr = 0.0f; l_u = (float3)(0.0f);
-        if (c_on && ws > 0.0f) l_u = constr_axis(xa, ci, cj, fb, wi, wj, &l_fr);
+        float mi = frozen[ci] ? 0.0f : 1.0f, mj = frozen[cj] ? 0.0f : 1.0f;
+        float ms = mi + mj;
+        l_wi = (ms > 0.0f) ? mi / ms : 0.0f;
+        l_wj = (ms > 0.0f) ? mj / ms : 0.0f;
+        l_fr = 0.0f; l_u = (float3)(0.0f);
+        if (c_on && ms > 0.0f) l_u = constr_axis(xa, ci, cj, fb, mi, mj, ms, &l_fr);
     }
     barrier(CLK_LOCAL_MEM_FENCE);
     const float3 u = l_u; const float fr = l_fr;
@@ -1098,25 +1114,30 @@ __kernel void fire_apply_batched(
             xb[3*a+2] = xa[3*a+2] * ANG2BOHR_F;
             continue;
         }
-        // force with the constraint reaction projected out
+        // force with the constraint reaction projected out (unfrozen → m=1)
         float3 fe = (float3)(fb[3*a], fb[3*a+1], fb[3*a+2]);
-        if (c_on && a == ci) fe += wi * fr * u;
-        if (c_on && a == cj) fe -= wj * fr * u;
+        if (c_on && a == ci) fe += fr * u;
+        if (c_on && a == cj) fe -= fr * u;
         float v[3], d[3];
         for (int c = 0; c < 3; ++c) {
             int k = 3*a + c;
             float fc = (c == 0) ? fe.x : (c == 1) ? fe.y : fe.z;
             float vv = (mode == 2) ? 0.0f : vb[k];
-            vv = (1.0f - alpha) * vv + mix_s * fc + fc * dt;
-            vv = clamp(vv, -vmax, vmax);          // per-component |v| cap
-            vb[k] = vv;
+            // R3: kick–drift semi-implicit Euler matching the CPU reference
+            // (examples/hbond_ref.rs): mix → kick → |v| cap → x += v·dt.
+            // The old extra +½F·dt² here double-counted the acceleration
+            // (dx = v·dt + 1.5·F·dt² with zero old velocity).
+            vv = (1.0f - alpha) * vv + mix_s * fc;   // FIRE mix
+            vv += fc * dt;                            // kick
+            vv = clamp(vv, -vmax, vmax);             // per-component |v| cap
             v[c] = vv;
-            d[c] = vv * dt + 0.5f * fc * dt * dt; // v·dt + ½F·dt²
+            d[c] = vv * dt;                           // drift with NEW velocity
         }
         float dnorm = sqrt(d[0]*d[0] + d[1]*d[1] + d[2]*d[2]);
         float dsc = (dnorm > dmax) ? dmax / dnorm : 1.0f;   // |Δx| cap (Å)
         for (int c = 0; c < 3; ++c) {
             int k = 3*a + c;
+            vb[k] = v[c] * dsc;    // disp cap scales stored v back (CPU ref)
             float x = xa[k] + dsc * d[c];
             xa[k] = x;
             xb[k] = x * ANG2BOHR_F;

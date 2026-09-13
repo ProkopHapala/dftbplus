@@ -1549,9 +1549,9 @@ fn rhai_gpu_fire_step(name: &str, f_tol: f64) -> f64 {
 fn rhai_gpu_relax(name: &str, max_steps: INT, f_tol: f64, scc_tol: f64) -> f64 {
     with_gpu(|g| {
         let h = g.get_mut(name).unwrap_or_else(|| panic!("gpu_relax '{name}': no engine"));
-        let (n, max_f, rms0) = h.eng.relax(max_steps as usize, f_tol, scc_tol as f32)
+        let (n, max_f, rms, conv) = h.eng.relax(max_steps as usize, f_tol, scc_tol as f32)
             .unwrap_or_else(|e| panic!("gpu_relax '{name}': {e}"));
-        eprintln!("[gpu] gpu_relax '{name}' steps={n} max|F|={max_f:.4e} rms0={rms0:.3e}");
+        eprintln!("[gpu] gpu_relax '{name}' steps={n} max|F|={max_f:.4e} rms={rms:.3e} converged={conv}");
         max_f
     })
 }
@@ -1950,11 +1950,26 @@ fn main() {
         std::process::exit(2);
     }
 
-    // Default SK dir if not provided
+    // Default SK dir if not provided: env var first, then probe known
+    // locations; fail loud listing what was tried (the old hard-coded
+    // /home/prokophapala path is gone).
     if sk_dir.is_empty() {
-        sk_dir = std::env::var("RUST_DFTB_SK_DIR").unwrap_or_else(|_| {
-            "/home/prokophapala/git_SW/dftbplus/external/slakos/origin/mio-1-1".to_string()
-        });
+        if let Ok(d) = std::env::var("RUST_DFTB_SK_DIR") {
+            sk_dir = d;
+        } else {
+            let home = std::env::var("HOME").unwrap_or_default();
+            let candidates = [
+                "../external/slakos/origin/mio-1-1".to_string(),           // repo-relative (run from rust_dftb/)
+                "external/slakos/origin/mio-1-1".to_string(),              // repo root as CWD
+                format!("{home}/SIMULATIONS/dftbplus/slakos/mio-1-1"),     // user SK install
+                format!("{home}/git_SW/dftbplus/external/slakos/origin/mio-1-1"),
+            ];
+            sk_dir = candidates.iter()
+                .find(|p| std::path::Path::new(p).join("H-H.skf").is_file())
+                .cloned()
+                .unwrap_or_else(|| panic!("no SK dir found — pass --sk-dir <path> or set RUST_DFTB_SK_DIR (tried: {})", candidates.join(", ")));
+            eprintln!("[dftb_engine] SK dir: {sk_dir}");
+        }
     }
 
     // Set up Rhai engine

@@ -139,6 +139,10 @@ pub struct SparseSystemWorkspace {
     /// — the converged K is the one that produced t_ks). Mulliken reuses it
     /// instead of a spare SpGEMM (R8a).
     t_ks_valid: bool,
+    /// Number of endgame trace-guard rescales applied across all purify
+    /// calls (S1 observability — a test can seed a λ>1 leak and assert the
+    /// guard actually fired).
+    guard_fires: usize,
 
     // ── P = K·S purifier (GPT-5.6 item 4, EXPERIMENTAL) ──
     // P is the density-side projector in the non-orthogonal metric:
@@ -406,6 +410,7 @@ impl SparseSystemWorkspace {
             s_inf,
             nocc,
             t_ks_valid: false,
+            guard_fires: 0,
             m_p,
             p_struct,
             p,
@@ -865,18 +870,30 @@ impl SparseSystemWorkspace {
             let guard = crate::methods::sparse::gpu_sparse::tc2_guard_enabled()
                 && dev_run >= 2 && tr_now > 0.0;
             // tr_eff = trace of the state that produces Q this iteration.
-            // After a rescale Tr(α·KS)=α·Tr is exactly linear → tr_eff=Nocc
-            // by construction (no fabricated trace — GPT-5.6).
+            // After a rescale Tr(α·KS)=α·Tr is exactly linear — but we
+            // RE-MEASURE the rescaled T instead of returning Nocc by
+            // assignment (S1: the reported trace must be a measurement of
+            // the state that continues, not a construction claim).
             let tr_eff = if guard {
                 let alpha = (nocc64 / tr_now) as f32;
                 self.gpu.scale_dev(self.k.struct_.nblock, alpha, &self.k.values)?;
                 self.gpu.scale_dev(self.t_ks.struct_.nblock, alpha, &self.t_ks.values)?;
+                self.guard_fires += 1;
                 if crate::methods::sparse::gpu_sparse::algebra_verbose() {
                     eprintln!(
                         "    TC2 trace guard @iter {iter}: Tr={tr_now:.6} (dev_rel={dev_rel:.2e}) → rescaled K by {alpha:.8}"
                     );
                 }
-                nocc64
+                let tr2: f64 = self.gpu.trace_ks_f64(
+                    &self.t_ks_struct, &self.t_ks.values, &self.n_orb_buf,
+                    &self.trace_atom, &mut self.trace_atom_host,
+                )?;
+                if !tr2.is_finite() {
+                    return Err(DftbError::InvalidInput(format!(
+                        "TC2 post-rescale trace non-finite at iter {iter}: Tr(KS)={tr2}"
+                    )));
+                }
+                tr2
             } else {
                 tr_now
             };
@@ -1086,12 +1103,9 @@ impl SparseSystemWorkspace {
         for iter in 0..max_iter {
             let do_check = (iter % check_every == 0) || (iter == max_iter - 1);
 
-            // Q = P·P on M_P — the ONLY product per iteration.
-            match &self.plan_pp {
-                Some(plan) => self.gpu.spgemm_plan_dev(&self.p, &self.p, plan, &self.q_p2)?,
-                None => self.gpu.spgemm_masked_dev(&self.p, &self.p, &self.q_p2)?,
-            }
-            // Tr(P) = Tr(KS) — per-atom partials, host f64 (item 2).
+            // Tr(P) = Tr(KS) on the CURRENT iterate — per-atom partials,
+            // host f64 (item 2). Measured BEFORE the product so the guard
+            // rescale below acts on the state whose residual is evaluated.
             let tr_now: f64 = self.gpu.trace_ks_f64(
                 &self.p_struct, &self.p.values, &self.n_orb_buf,
                 &self.trace_atom, &mut self.trace_atom_host,
@@ -1111,20 +1125,42 @@ impl SparseSystemWorkspace {
             dev_prev = dev_rel;
             let guard = crate::methods::sparse::gpu_sparse::tc2_guard_enabled()
                 && dev_run >= 2 && tr_now > 0.0;
+            // S1 stale-product fix: rescale FIRST, then form Q = P² of the
+            // rescaled state. The old order measured ||P_old² − α·P_old||
+            // and updated with a stale Q whenever the guard fired.
+            // tr_eff is RE-MEASURED after the rescale — never Nocc by
+            // assignment.
             let tr_eff = if guard {
                 let alpha = (nocc64 / tr_now) as f32;
                 self.gpu.scale_dev(self.p.struct_.nblock, alpha, &self.p.values)?;
+                self.guard_fires += 1;
                 if crate::methods::sparse::gpu_sparse::algebra_verbose() {
                     eprintln!(
                         "    P-TC2 trace guard @iter {iter}: Tr={tr_now:.6} (dev_rel={dev_rel:.2e}) → rescaled P by {alpha:.8}"
                     );
                 }
-                nocc64
+                let tr2: f64 = self.gpu.trace_ks_f64(
+                    &self.p_struct, &self.p.values, &self.n_orb_buf,
+                    &self.trace_atom, &mut self.trace_atom_host,
+                )?;
+                if !tr2.is_finite() {
+                    return Err(DftbError::InvalidInput(format!(
+                        "P-TC2 post-rescale trace non-finite at iter {iter}: Tr(P)={tr2}"
+                    )));
+                }
+                tr2
             } else {
                 tr_now
             };
             // Post-rescale branch=1 (squaring) — see tc2_purify for why.
             let branch: u32 = if guard { 1 } else { (tr_now > nocc64) as u32 };
+
+            // Q = P·P on M_P — the ONLY product per iteration, formed from
+            // the (possibly rescaled) iterate.
+            match &self.plan_pp {
+                Some(plan) => self.gpu.spgemm_plan_dev(&self.p, &self.p, plan, &self.q_p2)?,
+                None => self.gpu.spgemm_masked_dev(&self.p, &self.p, &self.q_p2)?,
+            }
 
             if do_check {
                 self.gpu.idempotency_to_dev(
@@ -1388,7 +1424,8 @@ impl SparseSystemWorkspace {
         self.recover_k_from_p()?;
         self.spgemm_ks();
         self.t_ks_valid = true;
-        Ok(out)
+        let (r_i_k, tr_ks) = self.recovered_k_diagnostics()?;
+        Ok((out.0, r_i_k, tr_ks, out.3))
     }
 
     /// Recover K = P·Z on M_K (P non-symmetric left, Z symmetric right →
@@ -1406,7 +1443,9 @@ impl SparseSystemWorkspace {
 
     /// P0 + P-TC2 of the current device H_scc using the current Z. No NS.
     /// K = P·Z is recovered afterwards so the downstream energy/force
-    /// path is unchanged. Returns (status, r_I, Tr[P] as f64, iters).
+    /// path is unchanged. Returns (status, r_I, Tr[KS] as f64, iters) —
+    /// r_I/Tr are measured on the RECOVERED K (S1: the reported state is
+    /// the state that feeds charges and the energy, not the P iterate).
     pub fn purify_hscc_p(&mut self, tc2_max: usize, tc2_tol: f32) -> Result<(PurifyStatus, f32, f64, usize)> {
         let (emin, emax) = self.compute_p0_from_hscc(0.1)?;
         if crate::methods::sparse::gpu_sparse::algebra_verbose() {
@@ -1421,7 +1460,51 @@ impl SparseSystemWorkspace {
         // One K·S product per SCC iteration; Mulliken then reads t_ks.
         self.spgemm_ks();
         self.t_ks_valid = true;
-        Ok(out)
+        let (r_i_k, tr_ks) = self.recovered_k_diagnostics()?;
+        Ok((out.0, r_i_k, tr_ks, out.3))
+    }
+
+    /// Diagnostics of the recovered K state (S1): returns
+    /// (‖KSK−K‖_F/‖K‖_F, Tr(KS)) measured on `t_ks` = K·S of the CURRENT K
+    /// — i.e. the same matrix that produces Mulliken charges and the band
+    /// energy, not the P iterate whose own residual/trace the P-purifier
+    /// reports internally. Requires `t_ks_valid` (fresh `spgemm_ks`).
+    /// Costs one T·K product + three scalar reductions per call — once per
+    /// SCC iteration, after purification.
+    fn recovered_k_diagnostics(&mut self) -> Result<(f32, f64)> {
+        debug_assert!(self.t_ks_valid, "recovered_k_diagnostics: t_ks stale");
+        let tr: f64 = self.gpu.trace_ks_f64(
+            &self.t_ks_struct, &self.t_ks.values, &self.n_orb_buf,
+            &self.trace_atom, &mut self.trace_atom_host,
+        )?;
+        self.gpu.frob_sq_to_dev(
+            self.k_struct.nblock * BS2, &self.k.values,
+            &self.reduce_partial, &self.reduce_a, &self.reduce_b, &self.ksq_buf,
+        )?;
+        // Q = (K·S)·K = KSK on M_K — reuses the tc2_purify Q buffer/plan.
+        match &self.plan_tk {
+            Some(plan) => self.gpu.spgemm_plan_bsym_dev(&self.t_ks, &self.k, plan, &self.q)?,
+            None => self.gpu.spgemm_bsym_dev(&self.t_ks, &self.k, &self.q)?,
+        }
+        self.gpu.idempotency_to_dev(
+            self.k_struct.nblock, &self.q.values, &self.k.values,
+            &self.reduce_partial, &self.reduce_a, &self.reduce_b, &self.residual_buf,
+        )?;
+        let mut ksq = [0.0f32; 1];
+        let mut ri_sq = [0.0f32; 1];
+        self.gpu.read_f32(&self.ksq_buf, &mut ksq)?;
+        self.gpu.read_f32(&self.residual_buf, &mut ri_sq)?;
+        if !tr.is_finite() || !ri_sq[0].is_finite() || !ksq[0].is_finite() {
+            return Err(DftbError::InvalidInput(format!(
+                "recovered-K diagnostics non-finite: Tr(KS)={tr} ||KSK−K||²={} ||K||²={}",
+                ri_sq[0], ksq[0]
+            )));
+        }
+        let r_i = ri_sq[0].sqrt() / ksq[0].sqrt().max(1e-30);
+        if crate::methods::sparse::gpu_sparse::algebra_verbose() {
+            eprintln!("  recovered-K: R_I(K)={r_i:.4e}  Tr(KS)={tr:.6}  (state feeding q/E)");
+        }
+        Ok((r_i, tr))
     }
 
     /// K0 + TC2 of the current device H_scc using the current Z. No NS.
@@ -1791,5 +1874,123 @@ mod tests {
         // Both runs should converge to the same state.
         assert!((tr1 - tr2).abs() < 1e-4, "Tr mismatch: {tr1} vs {tr2}");
         assert!((r_i1 - r_i2).abs() < 1e-4, "R_I mismatch: {r_i1} vs {r_i2}");
+    }
+
+    /// Host-f64 dense reference of the recovered-K state: returns
+    /// (Tr(KS), ‖KSK−K‖_F/‖K‖_F) computed from the downloaded K and the
+    /// host S — the S1 cross-check that the device-reported diagnostics
+    /// describe the same matrix that feeds charges and the energy.
+    fn host_k_diagnostics(k_dense: &[f32], s_dense: &[f32], n: usize) -> (f64, f64) {
+        let mut ks = vec![0.0f64; n * n];
+        let mut ksk = vec![0.0f64; n * n];
+        for i in 0..n { for j in 0..n {
+            let mut a = 0.0f64;
+            for l in 0..n { a += k_dense[i * n + l] as f64 * s_dense[l * n + j] as f64; }
+            ks[i * n + j] = a;
+        }}
+        for i in 0..n { for j in 0..n {
+            let mut a = 0.0f64;
+            for l in 0..n { a += ks[i * n + l] * k_dense[l * n + j] as f64; }
+            ksk[i * n + j] = a;
+        }}
+        let mut tr = 0.0f64;
+        let mut num = 0.0f64;
+        let mut kn = 0.0f64;
+        for i in 0..n { tr += ks[i * n + i]; }
+        for i in 0..n { for j in 0..n {
+            let d = ksk[i * n + j] - k_dense[i * n + j] as f64;
+            num += d * d;
+            kn += (k_dense[i * n + j] as f64) * (k_dense[i * n + j] as f64);
+        }}
+        (tr, num.sqrt() / kn.sqrt())
+    }
+
+    /// S1 contract: the P-TC2 trace guard must act on the state whose
+    /// residual is evaluated (no stale P²), and `purify_hscc_p`'s returned
+    /// (R_I, Tr) must describe the RECOVERED K — checked against a host-f64
+    /// recomputation of the identical matrix.
+    #[test]
+    fn test_p_tc2_guard_and_recovery_contract() {
+        let Some(gpu) = try_gpu() else { return };
+        let n_atom = 3;
+        let nocc = 3.0f32;
+        let mask = build_full_mask(n_atom);
+        let h0 = random_symmetric_bsr4(n_atom, &mask, 42);
+        let s = make_overlap_bsr4(n_atom, &mask, 99);
+        let all4 = vec![4u8; n_atom];
+        let mut ws = SparseSystemWorkspace::new(gpu, &h0, &s, &mask, &mask, &all4, nocc).unwrap();
+        ws.upload_h_scc(&h0).unwrap();
+        let (rz, _) = ws.compute_z(30, 1e-4, 3, false).unwrap();
+        println!("NS inverse: R_Z={rz:e}");
+
+        // Baseline P-TC2 convergence.
+        ws.compute_p0_from_hscc(0.1).unwrap();
+        let (st, r_i, tr, iters) = ws.tc2_purify_p(60, 1e-5, 1).unwrap();
+        println!("P-TC2 cold: {iters} iters status={st:?} R_I={r_i:e} Tr(P)={tr:.6}");
+        assert_eq!(st, PurifyStatus::Converged);
+
+        // Seed a leaked eigenvalue: scaling the converged P by 1+1e-4 gives
+        // eigenvalues {0, 1.0001}; the squaring branch amplifies the leak
+        // ~2×/iter — the exact runaway signature the guard exists for.
+        ws.gpu.scale_dev(ws.p.struct_.nblock, 1.0001, &ws.p.values).unwrap();
+        let g0 = ws.guard_fires;
+        let (st2, r_i2, tr2, it2) = ws.tc2_purify_p(60, 1e-5, 1).unwrap();
+        let fires = ws.guard_fires - g0;
+        println!("P-TC2 seeded leak: {it2} iters status={st2:?} R_I={r_i2:e} Tr(P)={tr2:.6} guard_fires={fires}");
+        assert!(fires > 0, "trace guard never fired on a seeded λ=1.0001 leak");
+        let tol_tr = crate::methods::sparse::gpu_sparse::tc2_trace_tol(nocc as f64);
+        assert!(
+            (tr2 - nocc as f64).abs() <= tol_tr,
+            "accepted state with Tr(P)={tr2} != Nocc={nocc} (guard returned an invalid trace)"
+        );
+
+        // Recovery contract: returned diagnostics must describe the
+        // recovered K — recompute Tr(KS) and ‖KSK−K‖/‖K‖ in host f64.
+        ws.recover_k_from_p().unwrap();
+        ws.spgemm_ks();
+        ws.t_ks_valid = true;
+        let (r_i_k, tr_ks) = ws.recovered_k_diagnostics().unwrap();
+        let k_host = ws.k_to_host().unwrap();
+        let k_dense = k_host.to_dense();
+        let s_dense = s.to_dense();
+        let (tr_host, r_i_host) = host_k_diagnostics(&k_dense, &s_dense, n_atom * BS);
+        println!("recovered K: dev R_I={r_i_k:e} Tr={tr_ks:.6} | host R_I={r_i_host:e} Tr={tr_host:.6}");
+        assert!((tr_ks - tr_host).abs() < 1e-4, "Tr(KS) mismatch dev={tr_ks} host={tr_host}");
+        assert!(
+            (r_i_k as f64 - r_i_host).abs() < 1e-4 + 0.5 * r_i_host,
+            "R_I(K) mismatch dev={r_i_k:e} host={r_i_host:e} — reported residual is not the returned state's"
+        );
+    }
+
+    /// S1 contract: same seeded-leak exercise on the K-TC2 path — the guard
+    /// rescales K and T=K·S consistently and the reported post-rescale
+    /// trace is a measurement, not Nocc by assignment.
+    #[test]
+    fn test_k_tc2_guard_fires() {
+        let Some(gpu) = try_gpu() else { return };
+        let n_atom = 3;
+        let nocc = 3.0f32;
+        let mask = build_full_mask(n_atom);
+        let h0 = random_symmetric_bsr4(n_atom, &mask, 42);
+        let s = make_overlap_bsr4(n_atom, &mask, 99);
+        let all4 = vec![4u8; n_atom];
+        let mut ws = SparseSystemWorkspace::new(gpu, &h0, &s, &mask, &mask, &all4, nocc).unwrap();
+
+        let (_, _, st, r_i, tr, _) = ws.run_scc(30, 1e-4, 60, 1e-5, 1).unwrap();
+        println!("K-TC2 baseline: status={st:?} R_I={r_i:e} Tr={tr:.6}");
+        assert_eq!(st, PurifyStatus::Converged);
+
+        // Same λ>1 seed on K: Tr(KS) scales linearly with K.
+        ws.gpu.scale_dev(ws.k.struct_.nblock, 1.0001, &ws.k.values).unwrap();
+        let g0 = ws.guard_fires;
+        let (st2, r_i2, tr2, it2) = ws.tc2_purify(60, 1e-5, 1).unwrap();
+        let fires = ws.guard_fires - g0;
+        println!("K-TC2 seeded leak: {it2} iters status={st2:?} R_I={r_i2:e} Tr(KS)={tr2:.6} guard_fires={fires}");
+        assert!(fires > 0, "K-TC2 trace guard never fired on a seeded λ=1.0001 leak");
+        let tol_tr = crate::methods::sparse::gpu_sparse::tc2_trace_tol(nocc as f64);
+        assert!(
+            (tr2 - nocc as f64).abs() <= tol_tr,
+            "accepted state with Tr(KS)={tr2} != Nocc={nocc}"
+        );
     }
 }

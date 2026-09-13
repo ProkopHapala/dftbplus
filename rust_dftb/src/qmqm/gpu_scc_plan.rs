@@ -90,16 +90,19 @@ fn tiled_render_source(b: usize, wg: usize, prec: u32) -> String {
         .replace("#define WG 256", &format!("#define WG {}", wg))
         .replace("#define STRIP_R 32", &format!("#define STRIP_R {}", b))
         .replace("#define MAX_SWEEPS 50", &format!("#define MAX_SWEEPS {}", tiled_max_sweeps()))
+        .replace("#define MAX_CSWEEPS 40", &format!("#define MAX_CSWEEPS {}", crate::qmqm::gpu_eigen::jacobi_sweeps(40)))
         .replace("#define JACOBI_PREC 2", &format!("#define JACOBI_PREC {}", prec))
 }
 
-/// Jacobi outer-sweep cap, `RUST_DFTB_JACOBI_SWEEPS` override (diagnostic).
+/// Jacobi outer-sweep cap for the deprecated tiled path (default 100);
+/// `RUST_DFTB_JACOBI_SWEEPS` override (via gpu_eigen::jacobi_sweeps — R5:
+/// the knob now also reaches the production direct kernel's MAX_CSWEEPS).
 /// Measured GC N=86 batch=19, one warm SCC call: cap=5 → 56 ms / rms 4.4e-6,
 /// cap=8 → 80 ms / rms 4.1e-6, cap=16/100 → 80 ms (identical) — i.e. the
 /// stagnation detector fires at ~8 sweeps, ~10 ms PER SWEEP. Capping below 5
 /// is counterproductive: cap=3 → SCC needs 60 iters instead of 10.
 fn tiled_max_sweeps() -> usize {
-    std::env::var("RUST_DFTB_JACOBI_SWEEPS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(TILED_MAX_SWEEPS)
+    crate::qmqm::gpu_eigen::jacobi_sweeps(TILED_MAX_SWEEPS)
 }
 
 fn full_local_wg(n: usize) -> usize {
@@ -142,6 +145,7 @@ pub struct GpuSccPlan {
     pub q_new: Buffer<f32>,       // new charges [batch*n_atoms]
     pub q_next: Buffer<f32>,      // mixed next iterate [batch*n_atoms] (commit model)
     pub active: Buffer<i32>,      // [batch] 1 = still iterating, 0 = frozen/done
+    state_ok: Buffer<i32>,        // [batch] R1: 1 = certified state → k_edm may build its W
     ones: Buffer<i32>,            // [batch] all-ones — for kernels that must never gate (S Jacobi)
     pub tr: Buffer<f32>,          // trace [batch]
     pub dot: Buffer<f32>,         // dot product [batch]
@@ -157,6 +161,7 @@ pub struct GpuSccPlan {
     s_v: Buffer<f32>,             // Jacobi V for S
     s_v_scaled: Buffer<f32>,      // V·rsqrt(λ) (N>64 path; unused N≤64)
     lambda_min: Buffer<f32>,      // [batch] λ_min(S)
+    jacobi_diag: Buffer<f32>,     // [batch*4] R5: {off, off/‖A‖_F, stop, sweeps} per Jacobi launch
 
     // R9b: GPU-side DIIS history buffers
     pub diis_q_hist: Buffer<f32>,     // [batch*max_hist*n_atoms] Δq_in ring buffer (D9: Δq-space)
@@ -174,7 +179,9 @@ pub struct GpuSccPlan {
     pub mask_host: Vec<i32>,      // [batch*n]
     pub rms_host: Vec<f32>,       // [batch]
     pub active_host: Vec<i32>,    // [batch] staging for `active` mask
+    state_ok_host: Vec<i32>,      // [batch] staging for `state_ok` mask
     lambda_min_host: Vec<f32>,    // [batch] overlap λ_min
+    jacobi_diag_h: Vec<f32>,      // [batch*4] host readback for R5 reporting
     lowdin_e0_host: Vec<f32>,     // [batch] ‖XᵀSX−I‖∞ before/after repair
     lowdin_e1_host: Vec<f32>,
 
@@ -188,7 +195,8 @@ pub struct GpuSccPlan {
     k_jacobi: Kernel,         // jacobi (full-local or tiled)
     k_extract_diag: Kernel,   // extract_diagonal_batched
     k_select_occ: Kernel,     // select_occupation_batched (R9: GPU-side occ selection)
-    k_density: Kernel,         // build_density_masked_batched
+    k_density: Kernel,         // build_density_occ_batched (D, gated on `active`)
+    k_edm: Kernel,             // build_density_occ_batched (W, gated on `state_ok` — R1)
     k_occ_renorm: Kernel,      // occ_normalize_batched (§12 D3: repair C′ orthonormality)
     k_occ_snorm: Kernel,       // snormalize_batched (S-metric col renorm for warm AO basis)
     k_occ_rayleigh: Kernel,    // occ_rayleigh_batched (§12 D4: ρ_k for E_band and W)
@@ -284,6 +292,7 @@ impl GpuSccPlan {
         let x_buf = rt.zero_buffer::<f32>(batch * nn)?;
         let x_t = rt.zero_buffer::<f32>(batch * nn)?;
         let lambda_min = rt.zero_buffer::<f32>(batch)?;
+        let jacobi_diag = rt.zero_buffer::<f32>(batch * 4)?;
 
         // Allocate all scratch buffers once
         let q_gpu = rt.zero_buffer::<f32>(batch * n_atoms)?;
@@ -303,6 +312,12 @@ impl GpuSccPlan {
         // the mask is an SCC-loop construct, default = all-ones.
         let active = rt.buffer_from_slice(&vec![1i32; batch])?;
         let ones = rt.buffer_from_slice(&vec![1i32; batch])?;
+        // R1: force-path state-validity mask — a different concept from the
+        // `active` SCC-iteration gate. 1 = replica has a certified state
+        // (SCC status != Failed) whose C/ρ/occ may feed the W build.
+        // All-1 until the first scc(): a pre-SCC eval finalize()s every
+        // replica, so all states are consistent.
+        let state_ok = rt.buffer_from_slice(&vec![1i32; batch])?;
         let tr = rt.zero_buffer::<f32>(batch)?;
         let dot = rt.zero_buffer::<f32>(batch)?;
         let rms = rt.zero_buffer::<f32>(batch)?;
@@ -363,7 +378,7 @@ impl GpuSccPlan {
 
         // 7. Jacobi eigensolver — gated on `active` so done replicas' WGs exit
         let jacobi_prec = JACOBI_PREC.load(std::sync::atomic::Ordering::Relaxed);
-        let k_jacobi = build_jacobi_kernel(rt, n, batch, &hp, &cp, &active, jacobi_prec)?;
+        let k_jacobi = build_jacobi_kernel(rt, n, batch, &hp, &cp, &active, jacobi_prec, &jacobi_diag)?;
 
         // 8. extract_diagonal_batched: args [0]=n, [1]=batch, [2]=a, [3]=diag
         let total_diag = n * batch;
@@ -405,6 +420,22 @@ impl GpuSccPlan {
             .arg(0i32).arg(&occ_w)
             .arg_local::<f32>(n).arg_local::<i32>(n)
             .arg(&active)                                // [12] active mask
+            .build().map_err(map_ocl_err)?;
+
+        // 9a. k_edm — dedicated W=2Σf_kρ_kCCᵀ handle for the FORCE path.
+        //     Same kernel, but gated on `state_ok`, NOT the `active`
+        //     iteration mask: at scc_mix exit replicas that converged before
+        //     the last iteration have active=0 on the device, so sharing the
+        //     mask left their W stale/zero → missing Pulay −W·dS (R1).
+        //     Dedicated handle = no arg-restore dance on k_density.
+        let k_edm = Kernel::builder()
+            .program(&mat_prog).name("build_density_occ_batched").queue(rt.queue().clone())
+            .global_work_size(batch * wg_den).local_work_size(wg_den)
+            .arg(n as i32).arg(batch as i32).arg(0i32)   // n_occ set per-call
+            .arg(&c).arg(&occ_idx).arg(&d).arg(1i32).arg(&eig_diag)  // out/weights set per-call
+            .arg(0i32).arg(&occ_w)                      // use_w set per-call
+            .arg_local::<f32>(n).arg_local::<i32>(n)
+            .arg(&state_ok)                             // [12] force-valid mask
             .build().map_err(map_ocl_err)?;
 
         // 9b. occ_normalize_batched: args [0]=n [1]=batch [2]=occ_mask [3]=cp [4]=local(wg)
@@ -525,7 +556,7 @@ impl GpuSccPlan {
             .arg_local::<f32>(wg_dot)
             .build().map_err(map_ocl_err)?;
 
-        let k_s_jacobi = build_jacobi_kernel(rt, n, batch, &s_work, &s_v, &ones, jacobi_prec)?;
+        let k_s_jacobi = build_jacobi_kernel(rt, n, batch, &s_work, &s_v, &ones, jacobi_prec, &jacobi_diag)?;
         let (k_s_invsqrt, k_s_scale, k_s_xgemm) = build_sinv_kernels(
             rt, &mat_prog, n, batch, &s_work, &s_v, &s_v_scaled, &x_buf, &lambda_min,
         )?;
@@ -584,8 +615,8 @@ impl GpuSccPlan {
 
         let mut plan = Self {
             n, n_atoms, batch,
-            q_gpu, dq, v, h_scc, temp, hp, cp, c, d, q_new, q_next, active, ones, tr, dot, rms, occ_mask, occ_idx, occ_w, eig_diag, eig_rho,
-            x_buf, x_t, s_work, s_v, s_v_scaled, lambda_min,
+            q_gpu, dq, v, h_scc, temp, hp, cp, c, d, q_new, q_next, active, state_ok, ones, tr, dot, rms, occ_mask, occ_idx, occ_w, eig_diag, eig_rho,
+            x_buf, x_t, s_work, s_v, s_v_scaled, lambda_min, jacobi_diag,
             diis_q_hist, diis_r_hist, diis_buf_idx, diis_n_filled,
             diis_coeffs, diis_flag, diis_reason, diis_max_hist,
             eig_diag_host: vec![0.0; batch * n],
@@ -593,12 +624,14 @@ impl GpuSccPlan {
             mask_host: vec![0; batch * n],
             rms_host: vec![0.0; batch],
             active_host: vec![1; batch],
+            state_ok_host: vec![1; batch],
             lambda_min_host: vec![0.0; batch],
+            jacobi_diag_h: vec![0.0; batch * 4],
             lowdin_e0_host: vec![0.0; batch],
             lowdin_e1_host: vec![0.0; batch],
             k_dq_v_hscc,
             k_matmul_xh, k_matmul_tx, k_matmul_xc, k_transpose,
-            k_jacobi, k_extract_diag, k_select_occ, k_density, k_occ_renorm, k_occ_snorm, k_occ_rayleigh, k_mulliken, k_residual_mix,
+            k_jacobi, k_extract_diag, k_select_occ, k_density, k_edm, k_occ_renorm, k_occ_snorm, k_occ_rayleigh, k_mulliken, k_residual_mix,
             k_diis, k_commit, k_frobenius_trace, k_dot,
             matmul_buf_base,
             n_occ: 0,
@@ -666,6 +699,7 @@ impl GpuSccPlan {
             self.k_jacobi.set_arg(1u32, &self.c).map_err(map_ocl_err)?;
             self.k_jacobi.set_arg(4u32, 1i32).map_err(map_ocl_err)?;
             unsafe { self.k_jacobi.enq().map_err(map_ocl_err)?; }
+            self.report_jacobi(rt, "H-warm")?;
         } else {
             if self.n > 64 {
                 // tiled batched_gemm — trans args exist; restore trans_a=0
@@ -682,6 +716,7 @@ impl GpuSccPlan {
             self.k_jacobi.set_arg(1u32, &self.cp).map_err(map_ocl_err)?;
             if self.n > 64 { self.k_jacobi.set_arg(4u32, 0i32).map_err(map_ocl_err)?; }
             unsafe { self.k_jacobi.enq().map_err(map_ocl_err)?; }
+            self.report_jacobi(rt, "H")?;
         }
         self.k_extract_diag.set_arg(2u32, &self.hp).map_err(map_ocl_err)?;
         self.k_extract_diag.set_arg(3u32, &self.eig_diag).map_err(map_ocl_err)?;
@@ -805,6 +840,7 @@ impl GpuSccPlan {
                     rt, s_buf, &self.s_work, self.batch * self.n * self.n,
                     &self.k_s_jacobi, self.k_s_invsqrt.as_ref(), self.k_s_scale.as_ref(), self.k_s_xgemm.as_ref(),
                 )?;
+                self.report_jacobi_all(rt, "S-Jacobi")?;
                 rt.read_buffer(&self.lambda_min, &mut self.lambda_min_host)?;
                 check_overlap_lambda(&self.lambda_min_host)?;
                 self.repair_lowdin_gpu(rt, s_buf)?;
@@ -1133,6 +1169,17 @@ impl GpuSccPlan {
         Ok(())
     }
 
+    /// Upload the force-path validity mask (R1). 1 = replica has a certified
+    /// electronic state (SCC Converged/Plateau) whose C/ρ/occ may feed W.
+    /// A Failed replica keeps its previous W — its (finite, garbage) forces
+    /// are parked via `scc_ok`, whereas rebuilding W from a diverged state
+    /// could produce NaN that poisons the shared FIRE reductions.
+    pub fn set_state_ok(&mut self, rt: &GpuRuntime, ok: &[bool]) -> Result<()> {
+        for (d, &o) in self.state_ok_host.iter_mut().zip(ok.iter()) { *d = o as i32; }
+        self.state_ok.write(&self.state_ok_host).enq().map_err(map_ocl_err)?;
+        Ok(())
+    }
+
     /// Mark every replica active on the device mask. All SCC-loop kernels
     /// gate on `active`; paths outside the SCC loop (finalize/eval/forces/
     /// measure) must run for every replica — call this first.
@@ -1332,22 +1379,50 @@ impl GpuSccPlan {
         Ok(())
     }
 
-    /// W = 2 Σ_{k occ} w_k C_k C_kᵀ into `out`. Same kernel as D (`use_eig=1`).
+    /// W = 2 Σ_{k occ} w_k C_k C_kᵀ into `out`. Dedicated `k_edm` handle
+    /// (R1): same kernel as the D build, but gated on `state_ok` (certified
+    /// state) instead of the SCC `active` iteration mask — at scc_mix exit
+    /// early-converged replicas have active=0 yet still need a fresh W
+    /// matching their final C/ρ for the Pulay force term.
     /// Weight is ρ_k (Rayleigh quotient of the stored vectors, §12 D4) when
-    /// `occ_repair` is on, else the raw Jacobi diagonal ε_k. Restores D args after.
+    /// `occ_repair` or smearing is on, else the raw Jacobi diagonal ε_k.
     pub fn build_edm(&mut self, out: &Buffer<f32>, n_occ: usize) -> Result<()> {
         let n_den = if self.kT > 0.0 { self.n as i32 } else { n_occ as i32 };
-        self.k_density.set_arg(2u32, n_den).map_err(map_ocl_err)?;
-        self.k_density.set_arg(3u32, &self.c).map_err(map_ocl_err)?;
-        self.k_density.set_arg(5u32, out).map_err(map_ocl_err)?;
-        self.k_density.set_arg(6u32, 1i32).map_err(map_ocl_err)?;
+        self.k_edm.set_arg(2u32, n_den).map_err(map_ocl_err)?;
+        self.k_edm.set_arg(5u32, out).map_err(map_ocl_err)?;
         let w = if self.occ_repair || self.kT > 0.0 { &self.eig_rho } else { &self.eig_diag };
-        self.k_density.set_arg(7u32, w).map_err(map_ocl_err)?;
-        let enq = unsafe { self.k_density.enq().map_err(map_ocl_err) };
-        self.k_density.set_arg(5u32, &self.d).map_err(map_ocl_err)?;
-        self.k_density.set_arg(6u32, 0i32).map_err(map_ocl_err)?;
-        self.k_density.set_arg(7u32, &self.eig_diag).map_err(map_ocl_err)?;
-        enq
+        self.k_edm.set_arg(7u32, w).map_err(map_ocl_err)?;
+        self.k_edm.set_arg(8u32, (self.kT > 0.0) as i32).map_err(map_ocl_err)?;
+        unsafe { self.k_edm.enq().map_err(map_ocl_err) }
+    }
+
+    /// R5: read Jacobi stop diagnostics and report non-converged exits for
+    /// replicas that actually ran (`active` mask). diag[sid] =
+    /// {off, off/‖A‖_F, stop, sweeps}; stop: 0 converged · 1 stagnation ·
+    /// 2 MAX_CSWEEPS · 3 n>capacity · 4 non-finite.
+    fn report_jacobi(&mut self, rt: &GpuRuntime, tag: &str) -> Result<()> {
+        self.report_jacobi_impl(rt, tag, false)
+    }
+
+    /// R5: same report for the S-Jacobi — all replicas ran (ones mask).
+    fn report_jacobi_all(&mut self, rt: &GpuRuntime, tag: &str) -> Result<()> {
+        self.report_jacobi_impl(rt, tag, true)
+    }
+
+    fn report_jacobi_impl(&mut self, rt: &GpuRuntime, tag: &str, all: bool) -> Result<()> {
+        if self.n <= 64 { return Ok(()); }   // full-local kernel has no diag arg
+        rt.read_buffer(&self.jacobi_diag, &mut self.jacobi_diag_h)?;
+        for b in 0..self.batch {
+            if !all && self.active_host[b] == 0 { continue; }
+            let stop = self.jacobi_diag_h[4 * b + 2] as i32;
+            if stop != 0 {
+                eprintln!(
+                    "[GpuSccPlan] {tag} replica {b}: Jacobi stop={stop} (1=stall 2=maxsweeps 3=n>256 4=nonfinite) off={:.3e} off/‖A‖={:.3e} sweeps={:.0}",
+                    self.jacobi_diag_h[4 * b], self.jacobi_diag_h[4 * b + 1], self.jacobi_diag_h[4 * b + 3]
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Read back final charges from the plan.
@@ -1470,7 +1545,10 @@ fn build_matmul_kernels(
     }
 }
 
-/// Build the Jacobi eigensolver kernel (full-local for N≤64, tiled for N>64).
+/// Build the Jacobi eigensolver kernel (full-local for N≤64, direct cyclic for N>64).
+/// R5 capacity guard: `jacobi_cyclic_global_batched` keeps jn/2 pair rotations in
+/// `__local` arrays of 128 → n ≤ 256. Larger N is rejected here (the kernel also
+/// early-outs with diag stop=3 rather than overrunning local memory).
 fn build_jacobi_kernel(
     rt: &mut GpuRuntime,
     n: usize,
@@ -1479,6 +1557,7 @@ fn build_jacobi_kernel(
     v_buf: &Buffer<f32>,
     act_buf: &Buffer<i32>,
     prec: u32,
+    diag: &Buffer<f32>,
 ) -> Result<Kernel> {
     if n <= 64 {
         let (_, _, _, _, wg) = eigen_spec_params(n);
@@ -1490,6 +1569,11 @@ fn build_jacobi_kernel(
             .arg(a_buf).arg(v_buf).arg(n as i32).arg(batch as i32)
             .build().map_err(map_ocl_err)
     } else {
+        if n > 256 {
+            return Err(DftbError::InvalidInput(format!(
+                "jacobi_cyclic_global_batched: n={n} exceeds capacity 256 (jn/2 pair rotations fit __local rot[128]) — no safe path yet"
+            )));
+        }
         let b = 32usize;
         let wg = 256usize;
         let source = tiled_render_source(b, wg, prec);
@@ -1497,11 +1581,12 @@ fn build_jacobi_kernel(
         // Direct cyclic Jacobi (replaces the ~16k-barrier tiled path).
         // args: [0]=A [1]=V [2]=n [3]=batch [4]=init_v (0=V←I cold, 1=warm)
         // [5]=active mask — done replicas' WGs exit immediately
+        // [6]=diag — [batch][4] {off, off/‖A‖_F, stop, sweeps} (R5)
         Kernel::builder()
             .program(&program).name("jacobi_cyclic_global_batched").queue(rt.queue().clone())
             .global_work_size(batch * wg).local_work_size(wg)
             .arg(a_buf).arg(v_buf).arg(n as i32).arg(batch as i32).arg(0i32)
-            .arg(act_buf)
+            .arg(act_buf).arg(diag)
             .build().map_err(map_ocl_err)
     }
 }

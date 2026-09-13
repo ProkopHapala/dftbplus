@@ -13,7 +13,7 @@
 //!   - Orthogonality < 1e-5
 //!   - Eigenvalue parity < 1e-4 Ha
 
-use rust_dftb::qmqm::gpu_eigen::{jacobi_batched, jacobi_cyclic_local_batched, tiled_jacobi_batched};
+use rust_dftb::qmqm::gpu_eigen::{direct_jacobi_batched, jacobi_batched, tiled_jacobi_batched};
 use rust_dftb::qmqm::gpu_runtime::GpuRuntime;
 
 fn try_runtime() -> Option<GpuRuntime> {
@@ -250,6 +250,111 @@ fn jacobi_prec_bench() {
                     times[times.len() / 2], wres, worth, wpar);
             }
         }
+    }
+}
+
+/// A = Q·diag(eigs)·Qᵀ with Q from a random symmetric matrix's CPU eigvec.
+fn from_spectrum(n: usize, eigs: &[f64], seed: u64) -> Vec<f32> {
+    let r = random_symmetric(n, seed);
+    let (_, q) = cpu_eig(&r, n);
+    let mut a = vec![0.0f64; n * n];
+    for i in 0..n {
+        for j in 0..n {
+            let mut s = 0.0f64;
+            for k in 0..n { s += q[i * n + k] as f64 * eigs[k] * q[j * n + k] as f64; }
+            a[i * n + j] = s;
+        }
+    }
+    a.iter().map(|&x| x as f32).collect()
+}
+
+/// R5: exercise the PRODUCTION direct kernel `jacobi_cyclic_global_batched`
+/// (what GpuSccPlan actually runs for N>64 — not the deprecated tiled path)
+/// on an eigen-quality matrix: boundary/odd/capacity Ns, clustered, repeated,
+/// indefinite, exact zero-block and all-zero spectra. Checks residual
+/// ‖AV−VΛ‖_F/‖A‖_F vs the ORIGINAL matrix, orthogonality, eigenvalue parity
+/// vs CPU f64, and the per-system stop reason (0 = converged).
+#[test]
+fn test_direct_jacobi_eigen_quality() {
+    let Some(mut rt) = try_runtime() else { return; };
+
+    // --- boundary/capacity sweep on random symmetric ---
+    for &n in &[65usize, 87, 96, 97, 128, 255, 256] {
+        let a_orig = random_symmetric(n, 42);
+        let a_buf = rt.buffer_from_slice(&a_orig).unwrap();
+        let v_buf = rt.zero_buffer::<f32>(n * n).unwrap();
+        let diag = direct_jacobi_batched(&mut rt, &a_buf, &v_buf, n, 1, 1).unwrap();
+        let mut gpu_a = vec![0.0f32; n * n];
+        let mut gpu_v = vec![0.0f32; n * n];
+        rt.read_buffer(&a_buf, &mut gpu_a).unwrap();
+        rt.read_buffer(&v_buf, &mut gpu_v).unwrap();
+        let mut eigs = vec![0.0f32; n];
+        for i in 0..n { eigs[i] = gpu_a[i * n + i]; }
+        let res = residual(&a_orig, &gpu_v, &eigs, n);
+        let orth = orthogonality(&gpu_v, n);
+        let (ce, _) = cpu_eig(&a_orig, n);
+        let mut gs = eigs.clone(); gs.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        let mut cs = ce.clone();   cs.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        let par: f64 = (0..n).map(|i| (gs[i] as f64 - cs[i] as f64).abs()).fold(0.0, f64::max);
+        // Weyl bound: sorted-eig deviation ≤ ‖A − VΛVᵀ‖_F = res·‖A‖_F.
+        // A fixed absolute tol is wrong here — the parity floor scales with
+        // ‖A‖_F (~N·σ for random); the check self-tightens if res improves.
+        let af: f64 = a_orig.iter().map(|&x| (x as f64).powi(2)).sum::<f64>().sqrt();
+        let weyl = 2.0 * res * af + 1e-4;
+        eprintln!("[R5] direct N={n}: stop={} sweeps={} res={res:.3e} orth={orth:.3e} eig_par={par:.3e} (weyl={weyl:.3e})", diag[2], diag[3]);
+        assert_eq!(diag[2] as i32, 0, "direct Jacobi N={n} stop={} (1=stall 2=maxsweeps 3=cap 4=nonfinite)", diag[2]);
+        assert!(res < 1e-4, "direct Jacobi N={n} residual {res:.3e}");
+        assert!(orth < 1e-4, "direct Jacobi N={n} orth {orth:.3e}");
+        assert!(par < weyl, "direct Jacobi N={n} eig parity {par:.3e} exceeds Weyl bound {weyl:.3e} — not explainable by the measured residual");
+    }
+
+    // --- adversarial spectra at N=87, one batch ---
+    let n = 87usize;
+    // b0 clustered: 5 spread + rest in a 1e-6-wide cluster at 1.0
+    let mut e = vec![1.0f64; n];
+    for k in 5..n { e[k] = 1.0 + 1e-6 * (k % 7) as f64; }
+    e[0] = -1.5; e[1] = -0.3; e[2] = 0.1; e[3] = 0.5; e[4] = 2.0;
+    let clustered = from_spectrum(n, &e, 7);
+    // b1 repeated: two identical-eigenvalue clusters
+    let e: Vec<f64> = (0..n).map(|k| if k < n / 2 { 0.5 } else { 1.5 }).collect();
+    let repeated = from_spectrum(n, &e, 11);
+    // b2 exact zero 8×8 subblock: last 8 rows/cols are literal zeros while
+    // the leading block is dense — the all-zero pivot (a_pp=a_qq=a_pq=0)
+    // must be skipped, not turned into a 0/0 rotation.
+    let mut zero_blk = random_symmetric(n, 13);
+    for i in (n - 8)..n { for j in 0..n { zero_blk[i * n + j] = 0.0; zero_blk[j * n + i] = 0.0; } }
+    // b3 all-zero matrix: every pivot is the pathological exact-zero case
+    let all_zero = vec![0.0f32; n * n];
+
+    let cases: Vec<(&str, Vec<f32>)> = vec![
+        ("clustered", clustered), ("repeated", repeated),
+        ("zero_blk", zero_blk), ("all_zero", all_zero),
+    ];
+    let batch = cases.len();
+    let mut a_flat = Vec::new();
+    for (_, a) in &cases { a_flat.extend_from_slice(a); }
+    let orig = a_flat.clone();
+    let a_buf = rt.buffer_from_slice(&a_flat).unwrap();
+    let v_buf = rt.zero_buffer::<f32>(batch * n * n).unwrap();
+    let diag = direct_jacobi_batched(&mut rt, &a_buf, &v_buf, n, batch, 1).unwrap();
+    let mut gpu_a = vec![0.0f32; batch * n * n];
+    let mut gpu_v = vec![0.0f32; batch * n * n];
+    rt.read_buffer(&a_buf, &mut gpu_a).unwrap();
+    rt.read_buffer(&v_buf, &mut gpu_v).unwrap();
+    for (b, (name, _)) in cases.iter().enumerate() {
+        let a0 = &orig[b * n * n..(b + 1) * n * n];
+        let v = &gpu_v[b * n * n..(b + 1) * n * n];
+        assert!(v.iter().all(|x| x.is_finite()), "direct Jacobi {name}: non-finite eigenvectors");
+        let mut eigs = vec![0.0f32; n];
+        for i in 0..n { eigs[i] = gpu_a[b * n * n + i * n + i]; }
+        assert!(eigs.iter().all(|x| x.is_finite()), "direct Jacobi {name}: non-finite eigenvalues");
+        let res = residual(a0, v, &eigs, n);
+        let orth = orthogonality(v, n);
+        let stop = diag[4 * b + 2] as i32;
+        eprintln!("[R5] direct N=87 {name}: stop={stop} sweeps={} res={res:.3e} orth={orth:.3e}", diag[4 * b + 3]);
+        assert_eq!(stop, 0, "direct Jacobi {name}: stop={stop}");
+        assert!(res < 1e-4, "direct Jacobi {name} residual {res:.3e}");
+        assert!(orth < 1e-4, "direct Jacobi {name} orth {orth:.3e}");
     }
 }
 
