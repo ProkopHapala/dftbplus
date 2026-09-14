@@ -105,6 +105,31 @@ fn test_gpu_dftb_fire_one_step_algebra() {
     assert!(worst < 1e-5, "FIRE one-step algebra mismatch {worst:.3e} — kick–drift violated (double acceleration would give 0.735·F)");
 }
 
+/// I10: e_atom from the force gather must reconstruct the band energy —
+/// Σ_a e_atom = Tr(D·H0) = e_band (the Rayleigh scalar in e_scal[4b]).
+#[test]
+fn test_gpu_dftb_e_atom_band_energy() {
+    let dir = sk_dir();
+    let (sp, xyz) = h2o();
+    let mut all = Vec::new();
+    for _ in 0..4 { all.extend(xyz.iter().cloned()); }
+    let sk = load_sk_for_species(&dir, &sp).unwrap();
+    let mut eng = GpuDftb::new(sk, &dir, sp, all, 4).unwrap();
+    eng.scc(100, 1e-6).unwrap();
+    eng.eval(true).unwrap();
+    let ea = eng.read_e_atom().unwrap();
+    for b in 0..4 {
+        let e_pair: f64 = (0..3).map(|a| ea[b * 3 + a] as f64).sum();
+        // e_scal e_band is Rayleigh Tr(D·H_scc) = Tr(D·H0) + Δq·V + q0·V —
+        // the pairwise e_atom covers only the H0 part.
+        let e_band = eng.plan.e_scal_host[4 * b]
+            - eng.plan.e_scal_host[4 * b + 2] - eng.plan.e_scal_host[4 * b + 3];
+        let d = (e_pair - e_band).abs();
+        eprintln!("[I10] replica {b}: Σe_atom={e_pair:.9}  Tr(D·H0)={e_band:.9}  |Δ|={d:.3e}");
+        assert!(d < 1e-4, "e_atom sum {e_pair:.9} != Tr(D·H0) {e_band:.9} (|Δ|={d:.3e} Ha)");
+    }
+}
+
 /// R4: constraint + frozen-DOF contracts on the device FIRE path.
 /// Covers: invalid-input rejection, initial-coordinate projection onto the
 /// constraint surface, distance held over FIRE steps, frozen endpoint and

@@ -101,6 +101,8 @@ pub struct GpuDftb {
     buf_charges_zero: Buffer<f32>,
     buf_forces: Buffer<f32>,
     buf_pair_f: Buffer<f32>,        // W9b: [3*total_pairs] per-pair forces (gather input)
+    buf_pair_e: Buffer<f32>,        // I10: [total_pairs] per-pair band energy
+    buf_e_atom: Buffer<f32>,        // I10: [total_atoms] band energy per atom
     buf_gather_ptr: Buffer<i32>,    // W9b: [total_atoms+1] CSR row pointer
     buf_gather_list: Buffer<i32>,   // W9b: [2*total_pairs] CSR (flat_idx<<1|is_j)
     k_gather: Kernel,               // W9b: force_gather_pairs (per-atom reduce)
@@ -146,6 +148,8 @@ pub struct GpuDftb {
     /// Device x newer than host `coords` — sync before host-side use.
     coords_dirty: bool,
     fire_v: Vec<[f64; 3]>,        // host mirror of v_dev (md_step only)
+    md_f_prev: Vec<[f64; 3]>,     // a(t) at current coords — VV half-kick state
+    md_armed: bool,               // md_f_prev valid for self.coords
     // W10: persistent ones vec for check_jacobi's `ran` arg — the per-call
     // `vec![1i32; batch]` in eval/fire_step allocated every call.
     ones_batch: Vec<i32>,
@@ -451,6 +455,16 @@ impl GpuDftb {
         // W9b: flat per-pair force buffer (gather kernel owns per-atom reduce).
         let total_pairs: usize = lists.iter().map(|l| l.len()).sum();
         let buf_pair_f = rt.zero_buffer::<f32>(3 * total_pairs.max(1))?;
+        // I10: per-pair band energy + per-atom gather output (Tr(D·H0)).
+        let buf_pair_e = rt.zero_buffer::<f32>(total_pairs.max(1))?;
+        let buf_e_atom = rt.zero_buffer::<f32>(total_atoms.max(1))?;
+        let orb_rng: Vec<i32> = (0..total_atoms)
+            .flat_map(|a| {
+                let la = a % n_atoms;
+                [atom_orb_off[la] as i32, n_orb[la]]
+            })
+            .collect();
+        let buf_orb_rng = rt.buffer_from_slice(&orb_rng)?;
         let mut buckets = Vec::with_capacity(pair_buckets.len());
         // W9b: flat pair-force buffer + atom→pair CSR (entry = flat_idx<<1|is_j).
         let mut gather_lists: Vec<Vec<i32>> = vec![Vec::new(); total_atoms];
@@ -491,7 +505,7 @@ impl GpuDftb {
                 .program(&force).name("force_pairs_fused").queue(rt.queue().clone())
                 .global_work_size(gws).local_work_size(PAIR_WG)
                 .arg(&buf_pairs).arg(&buf_fragments).arg(&buf_sk_h).arg(&buf_sk_s)
-                .arg(&buf_h0).arg(&buf_edm).arg(&buf_v_asm).arg(&buf_pair_f).arg(pair_base)
+                .arg(&buf_h0).arg(&buf_edm).arg(&buf_v_asm).arg(&buf_pair_f).arg(&buf_pair_e).arg(pair_base)
                 .arg(skt.dr).arg(skt.n_grid as i32).arg(n_pairs as i32)
                 .arg(n_frags).arg(bkt.block_type as i32).arg(skt.n_sk_cols as i32)
                 .arg(&buf_coords_bohr).arg(n_atoms as i32).arg(&park)   // W8+W6b
@@ -519,7 +533,9 @@ impl GpuDftb {
             .program(&force).name("force_gather_pairs").queue(rt.queue().clone())
             .global_work_size(g_gather).local_work_size(256)
             .arg(&buf_gather_ptr).arg(&buf_gather_list).arg(&buf_pair_f)
-            .arg(&buf_forces).arg(total_atoms as i32)
+            .arg(&buf_pair_e).arg(&buf_forces).arg(&buf_e_atom)
+            .arg(&buf_h0).arg(&buf_h0).arg(&buf_orb_rng)  // dm bound per call (arg 6)
+            .arg(n_atoms as i32).arg(n as i32).arg(total_atoms as i32)
             .build().map_err(map_ocl_err)?;
 
         let plan = GpuSccPlan::new(&mut rt, &buf_s, &buf_h0, &buf_g, &buf_q0, &buf_oa, n, n_atoms, batch)
@@ -528,7 +544,7 @@ impl GpuDftb {
             rt, sk, sk_dir: sk_dir.to_string(), species, tmpl, gamma_tbl, n, n_atoms, n_occ, batch,
             buf_h0, buf_s, buf_g, buf_q0, buf_oa, buf_fragments, buf_atom_species,
             buf_orb_off, buf_n_orb, buf_onsite, buf_hubbard, buf_v_asm, buf_charges_zero,
-            buf_forces, buf_pair_f, buf_gather_ptr, buf_gather_list, k_gather,
+            buf_forces, buf_pair_f, buf_pair_e, buf_e_atom, buf_gather_ptr, buf_gather_list, k_gather,
             buf_edm, buf_coords_ang, buf_coords_bohr, buf_u_hub, buf_rep_off, buf_rep_data,
             gamma_spl, buf_gamma_spl,
             k_onsite, onsite_done: false, k_gamma_f, k_gamma_build, k_rep_force, buckets, q0,
@@ -540,6 +556,8 @@ impl GpuDftb {
             coords_on_device: false,
             coords_dirty: false,
             fire_v: vec![[0.0; 3]; batch * n_atoms],
+            md_f_prev: vec![[0.0; 3]; batch * n_atoms],
+            md_armed: false,
             ones_batch: vec![1i32; batch],
             scc_ok: vec![true; batch],
             frozen: vec![false; n_atoms],
@@ -582,6 +600,16 @@ impl GpuDftb {
     /// `sync_coords_to_host()` first (this getter is &self and cannot sync).
     pub fn coords(&self) -> &[[f64; 3]] { &self.coords }
 
+    /// I10 diagnostic: per-atom band-energy decomposition written by the
+    /// force gather (onsite + ½ per incident pair); Σ_a = Tr(D·H0) = e_band.
+    /// Valid after `eval(true)`/`forces` — the pair kernel only runs on the
+    /// force path. Diagnostic readback — not a hot-loop call.
+    pub fn read_e_atom(&mut self) -> Result<Vec<f32>> {
+        let mut v = vec![0.0f32; self.n_atoms * self.batch];
+        self.rt.read_buffer(&self.buf_e_atom, &mut v)?;
+        Ok(v)
+    }
+
     /// Per-geometry update (D7): uploads coords, then everything else is
     /// device-side — pair r,l,m,n refresh, G build, H0/S assembly. The pair
     /// SET is frozen at `new` (all i<j, per template); the SK tail is ~0 for
@@ -595,6 +623,7 @@ impl GpuDftb {
         self.coords.copy_from_slice(coords);
         self.coords_on_device = false;   // host path uploads coords
         self.coords_dirty = false;
+        self.md_armed = false;           // VV acceleration state is stale
         // W6b: a host geometry change invalidates the park mask — a parked
         // replica's stale H/S MUST be rebuilt for the new coordinates (the
         // park gate skips its pair work otherwise). Re-certification happens
@@ -1057,6 +1086,8 @@ impl GpuDftb {
         }
         // W9b: per-atom gather (deterministic CSR order, sole writer of the
         // pair-force part — gamma/rep kernels atomic-add after it).
+        // I10: same pass emits e_atom = onsite + ½Σ pair_e = Tr(D·H0).
+        self.k_gather.set_arg(6u32, &self.plan.d).map_err(map_ocl_err)?;     // dm
         unsafe { self.k_gather.enq().map_err(map_ocl_err)?; }
         self.k_gamma_f.set_arg(2u32, &self.buf_coords_ang).map_err(map_ocl_err)?;
         self.k_gamma_f.set_arg(4u32, &self.plan.dq).map_err(map_ocl_err)?;
@@ -1287,10 +1318,12 @@ impl GpuDftb {
         Ok(max_f)
     }
 
-    /// One velocity-Verlet step (mass=1, same reduced units as FIRE). Call `scc` first.
-    /// Displacement capped at 0.1 Å. Returns max |F|. Caller must `scc` after this.
-    /// Host-side legacy path: v/coords are synced in from the device state and
-    /// written back through `set_coords` (md_step is diagnostic, not the hot loop).
+    /// One velocity-Verlet step (mass=1, same reduced units as FIRE).
+    ///   x += v·dt + ½·a(t)·dt²;  a(t+dt) from the new geometry;  v += ½·(a(t)+a(t+dt))·dt
+    /// `md_f_prev` carries a(t) between calls — ONE eval per step in steady
+    /// state (the first call after arming needs an extra eval for a(t)).
+    /// Displacement capped at 0.1 Å. Returns max |F| at the new geometry.
+    /// Host-side diagnostic path (v/x round-trip through host each step).
     pub fn md_step(&mut self, dt: f64) -> Result<f64> {
         if !dt.is_finite() || dt <= 0.0 {
             return Err(DftbError::InvalidInput(format!("md_step: dt={dt} must be finite and > 0")));
@@ -1302,26 +1335,39 @@ impl GpuDftb {
             for c in 0..3 { self.fire_v[i][c] = self.scratch_f[3 * i + c] as f64; }
         }
         self.sync_coords_to_host()?;
-        let ev = self.eval(true)?;
-        let f = ev.forces.as_ref().expect("eval(true) returns forces");
         let ntot = self.batch * self.n_atoms;
+        if !self.md_armed {
+            // a(t): one force eval at the current geometry, then drift+kick
+            let f0 = self.eval(true)?.forces.expect("eval(true) returns forces");
+            for i in 0..ntot {
+                for c in 0..3 { self.md_f_prev[i][c] = f0[3 * i + c] as f64; }
+            }
+        }
+        // drift with a(t), then move + evaluate a(t+dt)
+        for i in 0..ntot {
+            let (fx, fy, fz) = (self.md_f_prev[i][0], self.md_f_prev[i][1], self.md_f_prev[i][2]);
+            apply_disp(&mut self.coords[i], &self.fire_v[i], fx, fy, fz, dt);
+        }
+        let c = self.coords.clone();   // host API — not the hot loop
+        self.set_coords(&c)?;          // (disarms md_armed; re-armed below)
+        let f1 = self.eval(true)?.forces.expect("eval(true) returns forces");
         let mut max_f = 0.0f64;
         for i in 0..ntot {
-            let fx = f[3 * i] as f64; let fy = f[3 * i + 1] as f64; let fz = f[3 * i + 2] as f64;
+            let fx = f1[3 * i] as f64; let fy = f1[3 * i + 1] as f64; let fz = f1[3 * i + 2] as f64;
             max_f = max_f.max(fx.abs()).max(fy.abs()).max(fz.abs());
-            apply_disp(&mut self.coords[i], &self.fire_v[i], fx, fy, fz, dt);
-            self.fire_v[i][0] += fx * dt;
-            self.fire_v[i][1] += fy * dt;
-            self.fire_v[i][2] += fz * dt;
+            // second half-kick with ½·(a(t)+a(t+dt))
+            self.fire_v[i][0] += 0.5 * (self.md_f_prev[i][0] + fx) * dt;
+            self.fire_v[i][1] += 0.5 * (self.md_f_prev[i][1] + fy) * dt;
+            self.fire_v[i][2] += 0.5 * (self.md_f_prev[i][2] + fz) * dt;
+            self.md_f_prev[i] = [fx, fy, fz];
         }
-        // write v back to the device, coords through the host path
+        self.md_armed = true;
+        // write v back to the device
         for i in 0..self.fire_v.len() {
             for c in 0..3 { self.scratch_f[3 * i + c] = self.fire_v[i][c] as f32; }
         }
         self.rt.write_buffer(&self.v_dev, &self.scratch_f)
             .map_err(|e| DftbError::InvalidInput(format!("md_step v upload: {e}")))?;
-        let c = self.coords.clone();   // host API — not the hot loop
-        self.set_coords(&c)?;
         Ok(max_f)
     }
 

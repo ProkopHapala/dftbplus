@@ -589,6 +589,7 @@ __kernel void force_pairs_fused(
     __global const float* edm,
     __global const float* v_shift,    // [total_atoms] SCC potential per atom
     __global float* pair_f,           // W9b: [3*total_pairs_all_buckets] per-pair force out
+    __global float* pair_e,           // I10: [total_pairs] per-pair band energy 2·Σ D·H0
     const int pair_base,              // flat offset of this bucket's pairs in pair_f
     const float dr,
     const int n_grid,
@@ -642,6 +643,7 @@ __kernel void force_pairs_fused(
     float l = p.l, m = p.m, n = p.n;
     float r = p.r;
     float3 f = (float3)(0.0f, 0.0f, 0.0f);
+    float ep = 0.0f;                    // I10: Σ_{μ∈i,ν∈j} D_μν H0_μν (one block)
 
     if (block_type == 0) {
         float sk_h_val = interp_sk_1(l_sk_h, base_idx, w);
@@ -662,6 +664,7 @@ __kernel void force_pairs_fused(
         f.x = dm_val * dh_dx + scc * ds_dx;
         f.y = dm_val * dh_dy + scc * ds_dy;
         f.z = dm_val * dh_dz + scc * ds_dz;
+        ep = dm_val * h_val;
     } else if (block_type == 1) {
         float2 sk_h_val = interp_sk_2(l_sk_h, base_idx, w);
         float2 sk_s_val = interp_sk_2(l_sk_s, base_idx, w);
@@ -680,6 +683,7 @@ __kernel void force_pairs_fused(
             f.x += dm_val * dh_dx[k] + scc * ds_dx[k];
             f.y += dm_val * dh_dy[k] + scc * ds_dy[k];
             f.z += dm_val * dh_dz[k] + scc * ds_dz[k];
+            ep += dm_val * blk_h[k];
         }
     } else {
         float ps_h, ps_s;
@@ -704,6 +708,7 @@ __kernel void force_pairs_fused(
                 f.x += dm_val * dh_dx[row][col] + scc * ds_dx[row][col];
                 f.y += dm_val * dh_dy[row][col] + scc * ds_dy[row][col];
                 f.z += dm_val * dh_dz[row][col] + scc * ds_dz[row][col];
+                ep += dm_val * blk_h[row][col];
             }
         }
     }
@@ -715,6 +720,10 @@ __kernel void force_pairs_fused(
     pair_f[3 * (pair_base + gid) + 0] = f.x;
     pair_f[3 * (pair_base + gid) + 1] = f.y;
     pair_f[3 * (pair_base + gid) + 2] = f.z;
+    // I10: pair band energy — factor 2 counts the symmetric (j,i) block
+    // (dm already carries the spin factor). Onsite blocks are added by the
+    // gather (Σ_μ∈a D_μμ·H0_μμ) so Σ_a e_atom = Tr(D·H0) = E_band.
+    pair_e[pair_base + gid] = 2.0f * ep;
 }
 
 // ─── W9b: per-atom gather of pair forces (deterministic CSR order) ────
@@ -728,7 +737,14 @@ __kernel void force_gather_pairs(
     __global const int* gather_ptr,   // [total_atoms+1]
     __global const int* gather_list,  // [2*total_pairs] encoded (idx<<1)|is_j
     __global const float* pair_f,     // [3*total_pairs]
+    __global const float* pair_e,     // I10: [total_pairs] per-pair band energy
     __global float* forces,           // [total_atoms*3]
+    __global float* e_atom,           // I10: [total_atoms] band energy per atom
+    __global const float* dm,         // [batch*n²] density (onsite term)
+    __global const float* h0,         // [batch*n²] H0 (onsite term)
+    __global const int* orb_rng,      // [2*total_atoms] {local orb start, count}
+    const int n_atoms,                // atoms per replica
+    const int n_orbs,                 // orbitals per replica
     const int total_atoms
 ) {
     const int a = get_global_id(0);
@@ -736,6 +752,7 @@ __kernel void force_gather_pairs(
     const int p0 = gather_ptr[a];
     const int p1 = gather_ptr[a + 1];
     float fx = 0.0f, fy = 0.0f, fz = 0.0f;
+    float ea = 0.0f;
     for (int e = p0; e < p1; e++) {
         const int enc = gather_list[e];
         const int pi = enc >> 1;
@@ -743,10 +760,20 @@ __kernel void force_gather_pairs(
         fx += s * pair_f[3 * pi + 0];
         fy += s * pair_f[3 * pi + 1];
         fz += s * pair_f[3 * pi + 2];
+        ea += 0.5f * pair_e[pi];      // pair energy split between endpoints
+    }
+    // I10: onsite part — Σ_{μ∈a} D_μμ·H0_μμ (replica-local orbital indices)
+    const int r = a / n_atoms;
+    const int base = r * n_orbs * n_orbs;
+    const int o0 = orb_rng[2 * a], oc = orb_rng[2 * a + 1];
+    for (int k = 0; k < oc; k++) {
+        const int mu = o0 + k;
+        ea += dm[base + mu * n_orbs + mu] * h0[base + mu * n_orbs + mu];
     }
     forces[3 * a + 0] = fx;
     forces[3 * a + 1] = fy;
     forces[3 * a + 2] = fz;
+    e_atom[a] = ea;
 }
 
 // ─── Gamma derivative (SCC double-counting) force kernel (R6 component 3) ─

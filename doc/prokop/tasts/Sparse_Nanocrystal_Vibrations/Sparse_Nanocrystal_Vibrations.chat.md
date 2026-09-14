@@ -6147,3 +6147,81 @@ The experiment I would prioritize above everything else is **wide Z + narrow P +
 [3]: https://link.springer.com/article/10.1007/s11071-025-11407-6?utm_source=chatgpt.com "Barrier Lyapunov Functions and Model Reference Adaptive Control with Uncertainty in Native Spaces | Nonlinear Dynamics | Springer Nature Link"
 [4]: https://journals.aps.org/prb/abstract/10.1103/PhysRevB.50.17611?utm_source=chatgpt.com "Generalization of the density-matrix method to a nonorthogonal basis | Phys. Rev. B"
 [5]: https://journals.aps.org/prb/abstract/10.1103/PhysRevB.51.10157?utm_source=chatgpt.com "Self-consistent first-principles technique with linear scaling | Phys. Rev. B"
+
+
+
+
+
+---
+
+# SWE-2
+
+Discussion only — here are the precise answers:
+
+## 1) The two blocking reads
+
+Per TC2 iteration the host does:
+
+| read | what's read | why it exists |
+|---|---|---|
+| `trace_ks_f64` | n_atom f32 partials → host f64 sum = Tr(KS) | **the branch decision** `Tr > nocc ? squaring : complement` is made on the host every iteration — this is a hard data dependency, not a diagnostic |
+| `idempotency_to_f64` | ≤128 partials → host f64 → R_I = ‖KSK−K‖/‖K‖ | convergence/floor check (could run every k-th iter — `check_every` already exists but production passes 1) |
+
+Each `read_buffer` on an in-order queue **drains everything enqueued so far** — including the just-launched KSK product. So the reads don't just cost bandwidth; they prevent any pipelining and the host sits idle ~0.3–0.7 ms/iter waiting.
+
+**Can it be eliminated?** Yes, but it needs the branch decision on the device:
+
+- A tiny kernel after `tc2.ks` computes Tr from partials, compares to nocc, writes `branch` + `guard_alpha` (= nocc/Tr when the guard condition holds, else 1.0 — folded into the existing `tc2_dev`/`scale_dev` so the rescale is unconditional-cheap).
+- Per-iter `{Tr, R_I, branch, dev_rel}` appended to a device **log buffer**.
+- Host runs M iterations blind, then one read of the log → decide continue / stop / restore-best. R_I can still be computed on-device every iter (cheap kernel) and only *read* at check points.
+
+That's the dense side's W4 "chunked convergence" pattern transplanted to TC2. Cost: moderate refactor (decision kernel + log buffer + host checks every M iters instead of every iter). Payoff: zero pipeline drains inside the loop — products enqueue back-to-back; and the snapshot/best-K logic can trigger from the device log.
+
+## 2) Why `ksk` is ~5× `ks` — yes, sparsity of the *inner* dimension
+
+For `C_ij = Σ_k A_ik B_kj`, work per output block = number of k where **both** A_ik and B_kj exist:
+
+- `T = K·S`: inner sum over k needs `S_kj ≠ 0` → only **deg_S ≈ 56** of K's ~175 neighbors contribute.
+- `Q = T·K`: inner sum needs `K_kj ≠ 0` → **deg_K ≈ 175–330** contribute.
+
+So KSK does ~3–6× more 4×4-block multiply-adds per output block — matching the measured 4.7×/8.8×. Your intuition is right that the *output* mask is identical (M_K); the cost asymmetry is entirely in the inner overlap `|N_left(i) ∩ N_right(j)|`. K's wide neighborhood is what's expensive — S's narrowness is what makes the KS product cheap. Consequence: the K-degree reduction directly attacks the dominant kernel.
+
+## 3) Plateau waste — the honest detector
+
+The old "N non-improving checks" detector was removed because it fired during *normal descent* (non-improving iters are routine mid-transient). The safe version that can't false-fire:
+
+> Track `iter_of_best` (last time best_r_i was updated). During true descent, best updates every few iters. At the floor, it stops updating entirely. **Stop when `iter − iter_of_best > W` (~10–15) and `best_r_i < 1e-2` and trace valid → restore best K, return `NumericalFloor`.**
+
+That distinguishes "descending slowly" (best still improving) from "at the floor" (best frozen for 10+ iters) — and it can't trigger before the first snapshot exists. From the R10 traces: floor reached ~iter 44, current code detects at 53 — the windowed detector would stop at ~55→ or actually detect no-improvement around 44+12≈56… the gain is bigger on the 80-iter exhaustions (several runs burned all 80). Expected saving ~30–40% of TC2 device time.
+
+## 4) Fusing the reads / device-side reductions
+
+Right — the GPU partial-sum kernels already exist (`trace_ks_f64` does device partials → host tail; `idempotency_to_f64` same). What's missing is doing the *decision* on-device so the host doesn't need the value every iter:
+
+- **Short term (cheap):** run `check_every=4` for R_I (skip 3/4 of residual reads) — but trace read still needed every iter for the branch → saves ~half the drains. Also fuse both reductions into one kernel+one buffer+one read (they're independent, both computed post-KSK... actually trace is pre-KSK, residual is post — can't fuse into one read without moving the trace measurement to use the *previous* T or deferring the branch by one iteration — changes numerics).
+- **Right fix (the architectural one, same as Q1):** device-side decision kernel + log buffer + host checks every M iters. One read per M iters total.
+
+The two questions are really the same issue: as long as a *host* picks the branch each iteration, one drain per iteration is unavoidable. Moving the branch to device eliminates it.
+
+**Proposed order:** (a) windowed-best plateau detector — few lines, ~40% of TC2 time; (b) `check_every` + device branch+guard kernel + log — kills all mid-loop syncs; (c) then the M_TKS halo experiment for accuracy. Shall I start with (a)?
+
+---
+
+# USER
+
+OK, write these notes clearly and comprehensively (even more than here) into the report/labbook so we can discuss them in more details with the other LLM. say acatly at which line-range you added it. 
+
+---
+
+# SWE-2
+
+Added to the report at **lines 2033–2082** (`## 2026-09-14 (cont. 3) — Sync architecture & per-kernel cost analysis`).
+
+The section expands each of the four answers with exact numbers, code references, and design options:
+
+- **Q1** — the two reads (`trace_ks_f64` for the branch decision, `idempotency_to_f64` for convergence), why each is a *pipeline drain* not a bandwidth cost, and the full fix: device-side TC2 driver (branch + guard_alpha + log buffer on GPU, host supervises in chunks — the dense side's W4 pattern).
+- **Q2** — the ksk/ks asymmetry: identical output mask, but inner overlap `|N_left(i) ∩ N_right(j)|` is ~deg_S≈56 vs ~deg_K≈175–330 → measured 4.7–8.8× matches deg_K/deg_S plus locality. K's *stored* degree is the price.
+- **Q3** — the windowed-best detector design (`iter − iter_of_best > W` with trace-valid snapshot), why it's safe where the removed "N non-improving" check wasn't.
+- **Q4** — three levels: `check_every=4` now; one-drain-per-iter (numerics change, needs A/B); zero-drain device driver.
+
+Plus a closing paragraph tying it to the §15.12 ordering for the reviewing LLM. Ready to continue with the plateau detector whenever you are.

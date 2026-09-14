@@ -1221,3 +1221,49 @@ everywhere). `JACOBI_OFF_TOL` is a no-op on the warm path. The cost is
 the kernel **prologue**: V=I init (n² writes) + ‖A‖_F/off reductions
 (2×n² reads) + diag write — paid even at nsw=0. Follow-up target:
 early-out the prologue (or fuse V-write into eigh_finish when nsw=0).
+
+## 2026-09-14 (g) — Jacobi prologue fusion + e_atom + VV md_step + distinct-256
+
+**R8c (prologue fuse).** The three n² passes (V=I init, ‖A‖_F, off) +
+two barrier chains → ONE pass accumulating {fa,fo} packed into one
+reduce; cold V-init folded into the same loop (warm path skips V-init
+already, init_v=1). Success-path off-diagonal zero pass deleted — dead
+work: nothing reads hp off the diagonal (extract_diag/Fermi tail read
+gA[k·n+k] only; next GEMM overwrites hp wholesale). Residue still kept
+on failure exits for diagnosis (W1).
+
+**Measured:** warm SCC batch=256 identical-geom **2.468→1.809 ms/scc
+(−27%)**; scc.jacobi dev/call 2.71→1.84 ms (distinct-geom run below).
+At batch=19 the launch is latency-bound — the scan total is unchanged
+(1.093 s; barrier depth, not bandwidth, is the floor there). Remaining
+fixed cost ≈ Fermi tail (≤24 safeguarded-Newton iters × fused f64 WG
+reduce ≈ 9-barrier chains each) + diag write.
+
+**I10 e_atom.** `force_pairs_fused` emits `pair_e[p]=2·Σ_blk D·H0`;
+`force_gather_pairs` adds onsite `Σ_μ∈a D_μμ·H0_μμ` + ½ each incident
+pair → `e_atom`, Σ_a e_atom = Tr(D·H0). Validated:
+`test_gpu_dftb_e_atom_band_energy` — |Σe_atom − (e_band−Δq·V−q0·V)| =
+**2.4e-7 Ha** (H2O×4). NB: e_scal's e_band is the Rayleigh Tr(D·H_scc);
+the pair path is the H0 part only (SCC shift stays in the scalars).
+
+**md_step → true velocity-Verlet.** Was: full-force kick v+=F·dt (kick–
+drift, not VV). Now: drift x+=v·dt+½a(t)dt² with stored `md_f_prev`,
+eval at new x, v+=½(a(t)+a(t+dt))dt. One eval/step steady state; disarms
+on any `set_coords`/`fire_step` state change. H2O: 1-step E/dF sane.
+
+**Distinct-geometry batch=256 (the production shape).** GC replicas
+with H13 at d(N8–H)=0.8+1.6i/255 along the N–N axis — 256 DISTINCT
+geometries, kT=0.002:
+- cold SCC: 108 iters total — 1 replica failed mid-solve →
+  `warm-start replica 204 ← 203` retry → all converged; 88 transient
+  DIIS fallbacks (reason=2 nonfinite) recovered inside the solve
+- warm SCC: 8 iters, **2.32 ms/scc → 0.9 µs/iter/system**
+- forces+energy evaluated on all 256 (max|F|=2.5 Ha/B — unrelaxed)
+- jacobi-report: warm launches mean **0.0 sweeps** (p90=0), rel 4.1e-7
+- E(d) monotone across the range −44.85→−44.32 Ha
+
+Stage profile, distinct-256 (132 scc iters): jacobi **74.8%** dev
+(1.84 ms/call) · diis 7.7% · density 3.6% · eigh_finish 3.6% ·
+gemm_th+th2 4.8% · hscc 2.8%.
+
+**Tests: 46/46** (8 gpu_dftb incl. new e_atom, 22 hbond, 6 scc, 10 kern).

@@ -4698,3 +4698,69 @@ So my work order now would be:
 8. Only then touch Jacobi again.**
 
 That should push the solver toward the performance shape you expect: **diagonalization becomes the obviously dominant cost, rather than being buried under orchestration and tiny scalar work.**
+
+
+
+
+
+
+
+---
+
+# SWE-2
+
+## What landed this session
+
+| Item | Result |
+|---|---|
+| **Jacobi prologue fusion** | 3 n²-passes + 2 barrier chains → 1 pass + 1 packed reduce; dead off-diag zero pass removed (nothing reads `hp` off-diagonal). Warm SCC at batch 256: **2.47 → 1.81 ms (−27%)**; jacobi dev/call 2.71→1.84 ms |
+| **Distinct-geometry batch 256** | 256 *different* GC geometries (H13 across d=0.8–2.4 Å): cold SCC needed a warm-start retry (rep 204←203), 88 transient DIIS fallbacks recovered, all converged; warm 8 iters @ **0.9 µs/iter/system** |
+| **e_atom (I10)** | gather emits onsite+½pair band energy; `Σ e_atom` = Tr(D·H0) to **2.4e-7 Ha** (new test) |
+| **md_step → real velocity-Verlet** | was full-kick (not VV); now drift with stored a(t) + ½(a+a′) kick, one eval/step |
+
+46/46 tests pass. Scan E(r) and barrier unchanged (19.7 kcal/mol @ d=1.35).
+
+## Detailed performance (RTX 3090, evt, N=86)
+
+**19-pt relaxed scan:** 1.093 s, 57.5 ms/pt, 143 FIRE steps, 2068 syncs.
+
+| stage | dev ms/call | dev% |
+|---|---|---|
+| scc.jacobi | 0.458 | 58.6% |
+| scc.density | 0.053 | 6.0% |
+| relax.eval | 0.366 | 4.8% |
+| fire.set_geometry | 0.326 | 4.2% |
+| scc.diis | 0.034 | 3.9% |
+| fire.force_kernels | 0.301 | 3.9% |
+| gemm_th+th2 | 0.036 | 4.6% |
+| scc.eigh_finish | 0.022 | 2.5% |
+| everything else | — | <14% |
+
+At batch 19 jacobi is **latency-bound** (19 WGs don't fill the 3090; cost is barrier depth + launch). At batch ≥256 it's **bandwidth/reduction-bound** — that's where the fused prologue paid off. Remaining Jacobi fixed cost at nsw=0: the **Fermi tail** (≤24 Newton iters, each a fused f64 WG-reduce of ~9 barrier rounds). Next candidates: reduce over ⌈n⌉=128 lanes instead of 512, or subgroup/warp reductions.
+
+## Accuracy analysis — the f32 floor, explained properly
+
+The claim "energy wanders ~1e-6 Ha across tolerances" unpacks to this chain:
+
+1. **SCC sets the charge error.** δE via charges ≈ ‖∂E/∂q‖·δq. Converging rms from 1e-5→1e-7 genuinely reduces the charge-driven energy error.
+2. **But the energy is *evaluated* from f32 eigenpairs.** Even with exactly converged q, `E_band = Tr(D·H0)` is built from `c` (f32 eigenvectors, element error ~ε_f32·κ ~ 1e-7) and `D = 2Σf ccᵀ` accumulated in f32. That injects ~1e-6·|E|-scale noise **independent of how well SCC converged**.
+3. **The eigensolve itself can't do better.** Jacobi stops when off-diag ≤ ~n·eps·‖A‖ ≈ 3.5e-7 relative — the rotation arithmetic in f32 can't push below that. The measured eig residual ‖HC−SCε‖ ≈ 1e-6 is this floor.
+4. **So tightening tol below ~1e-5 reshuffles noise instead of reducing error** — observed E scatter across tol = {1e-5,1e-6,1e-7} was ~1e-6 Ha, i.e. eigen-noise dominates charge-convergence improvements.
+
+In units that matter: 1e-6 Ha = **0.0006 kcal/mol** absolute, and the error that counts for scans is the *relative* error along the coordinate — biases that are geometry-smooth largely cancel in ΔE. Force parity 5e-6 Ha/B translates to relaxed-geometry error ~1e-4 Å. For the stated target this floor is already fine.
+
+## Hybrid-precision brainstorm (not implemented)
+
+Where the ~1e-6 Ha floor actually lives, and the cheapest fixes per source:
+
+**A. `H' = BᵀH_sccB` formation in f32 (my bet for the dominant term).** Each element is an n=86 dot product accumulated in f32 → error ~ε·√n·‖H‖ ~ 1e-6·‖H‖, which lands *directly* on the eigenvalues. **Double-single (df32) accumulation** in just these two projection GEMMs — Dekker TwoSum via `fma` in the K-loop (~6–10 flops/term vs 1) — would push H' error to ~1e-9 while touching only ~5% of dev time. Highest leverage idea.
+
+**B. Eigenvalue storage in Jacobi.** Diagonal updates `a_pp += t·a_pq` round at ε·|a_pp| every rotation — keep the **diagonal in df32/f64** (n extra words/replica; each rotation touches only 2 diagonal elements → trivial cost), off-diagonal stays f32. Gets ε_k toward 1e-8.
+
+**C. One f64 Rayleigh-quotient pass at finalize.** ρ_k = cᵀHc in f64 on the n_occ occupied columns only, once per solve (not per iteration) — replaces the ε that enters the energy. Cost ~n_occ·n² f64 ≈ noticeable at 1/64 f64 rate but only once per solve; df32 variant is cheaper.
+
+**D. Compensated density build.** `D = 2Σf ccᵀ` — same df32-trick in the k-loop. D-error ~ε·n_occ feeds both energy and forces.
+
+**E. What's already covered / not worth it:** rotation-angle precision is *not* the limiter (PREC=1 A/B showed ΔE ≤ 2e-6 between f32/f64 rotations — R8a); Kahan-in-GEMM was already measured to not cut δ_CH; energy scalar tails and DIIS solve are already f64.
+
+Suggested order if you want it: **A → B → C**, each as a measured A/B against the CPU reference. Expected end state ≈ 1e-7–1e-8 Ha — roughly 10× below today's floor for maybe +10–15% dev time. Whether that's worth doing depends on whether 0.0006 kcal/mol noise is acceptable for your scan physics — for the H-bond scans shown, it already is.
