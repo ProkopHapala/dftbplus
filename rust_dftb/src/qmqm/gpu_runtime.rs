@@ -10,7 +10,8 @@
 //! `GpuRuntime` instead.
 
 use crate::core::error::{DftbError, Result};
-use ocl::{flags, Buffer, Context, Device, Platform, Program, Queue};
+use ocl::{flags, Buffer, Context, Device, Event, Platform, Program, Queue};
+use ocl::enums::{ProfilingInfo, ProfilingInfoResult};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
 use std::time::Instant;
@@ -38,12 +39,21 @@ pub struct GpuCapabilities {
 ///            HOST/enqueue time; the production sync points are unchanged.
 ///   =1|tick— each tick inserts a guarded `queue.finish()` first: per-stage
 ///            GPU-inclusive time. Off by default — benchmarking only.
+///   =evt   — mark + one marker EVENT per tick (queue created with
+///            CL_QUEUE_PROFILING_ENABLE). Timestamps are drained lazily at
+///            natural sync points (finish/read/report) — never waited on
+///            inline — giving TRUE per-stage GPU time next to host time.
 #[derive(Debug, Default)]
 pub struct Prof {
     pub enabled: bool,
     pub finish: bool,
+    pub evt: bool,
     tick: Cell<Option<Instant>>,
-    stages: RefCell<BTreeMap<&'static str, (u64, f64)>>, // name → (count, sec)
+    stages: RefCell<BTreeMap<&'static str, (u64, f64)>>, // name → (count, host sec)
+    dev: RefCell<BTreeMap<&'static str, (u64, f64)>>,    // name → (count, gpu sec)
+    marks: RefCell<Vec<(&'static str, Event)>>,          // pending stage-end markers
+    prev_end: Cell<u64>,                                 // last drained marker end (ns)
+    prev_ok: Cell<bool>,
     pub n_finish: Cell<u64>,   // queue.finish() calls (sync count)
     pub n_read: Cell<u64>,     // blocking device→host reads
 }
@@ -57,6 +67,10 @@ pub struct GpuRuntime {
     caps: GpuCapabilities,
     program_cache: HashMap<u64, Program>,
     pub prof: Prof,
+    /// W10/I3: device buffer-alloc counter (buffer_from_slice/zero_buffer/
+    /// copy_buffer/copy_into-target). Solver loops must never grow this —
+    /// tests assert alloc_count deltas are zero inside iterations.
+    pub alloc_count: std::sync::atomic::AtomicU64,
 }
 
 impl GpuRuntime {
@@ -71,7 +85,14 @@ impl GpuRuntime {
             .devices(device.clone())
             .build()
             .map_err(map_ocl_err)?;
-        let queue = Queue::new(&context, device.clone(), None).map_err(map_ocl_err)?;
+        let pv = std::env::var("RUST_DFTB_PROF").unwrap_or_default();
+        // evt mode needs CL_QUEUE_PROFILING_ENABLE at queue creation.
+        let qprops = if pv == "evt" {
+            Some(flags::CommandQueueProperties::new().profiling())
+        } else {
+            None
+        };
+        let queue = Queue::new(&context, device.clone(), qprops).map_err(map_ocl_err)?;
 
         let caps = query_capabilities(&device);
 
@@ -81,14 +102,13 @@ impl GpuRuntime {
             device,
             caps,
             program_cache: HashMap::new(),
-            prof: {
-                let v = std::env::var("RUST_DFTB_PROF").unwrap_or_default();
-                Prof {
-                    enabled: !v.is_empty() && v != "0",
-                    finish: v != "mark",
-                    tick: Cell::new(Some(Instant::now())),
-                    ..Prof::default()
-                }
+            alloc_count: std::sync::atomic::AtomicU64::new(0),
+            prof: Prof {
+                enabled: !pv.is_empty() && pv != "0",
+                finish: pv != "mark" && pv != "evt",
+                evt: pv == "evt",
+                tick: Cell::new(Some(Instant::now())),
+                ..Prof::default()
             },
         })
     }
@@ -141,6 +161,7 @@ impl GpuRuntime {
 
     /// Allocate a GPU buffer initialized from a host slice.
     pub fn buffer_from_slice<T: ocl::OclPrm>(&self, data: &[T]) -> Result<Buffer<T>> {
+        self.alloc_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Buffer::<T>::builder()
             .queue(self.queue.clone())
             .flags(flags::MEM_READ_WRITE | flags::MEM_COPY_HOST_PTR)
@@ -152,6 +173,7 @@ impl GpuRuntime {
 
     /// Allocate a zero-filled GPU buffer of the given length.
     pub fn zero_buffer<T: ocl::OclPrm + Default>(&self, len: usize) -> Result<Buffer<T>> {
+        self.alloc_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Buffer::<T>::builder()
             .queue(self.queue.clone())
             .flags(flags::MEM_READ_WRITE)
@@ -164,6 +186,7 @@ impl GpuRuntime {
     /// Device-to-device copy: allocate a new buffer and copy `src` into it.
     /// No host roundtrip — uses OpenCL `clEnqueueCopyBuffer`.
     pub fn copy_buffer<T: ocl::OclPrm>(&self, src: &Buffer<T>, len: usize) -> Result<Buffer<T>> {
+        self.alloc_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dst = Buffer::<T>::builder()
             .queue(self.queue.clone())
             .flags(flags::MEM_READ_WRITE)
@@ -194,7 +217,9 @@ impl GpuRuntime {
         self.prof.n_read.set(self.prof.n_read.get() + 1);
         buf.read(out).enq().map_err(map_ocl_err)?;
         self.prof.n_finish.set(self.prof.n_finish.get() + 1);
-        self.queue.finish().map_err(map_ocl_err)
+        let r = self.queue.finish();
+        self.prof_drain_events();
+        r.map_err(map_ocl_err)
     }
 
     /// Write host data into an existing buffer (no alloc).
@@ -206,23 +231,73 @@ impl GpuRuntime {
     /// Finish all queued operations (blocking).
     pub fn finish(&self) -> Result<()> {
         self.prof.n_finish.set(self.prof.n_finish.get() + 1);
-        self.queue.finish().map_err(map_ocl_err)
+        let r = self.queue.finish();
+        self.prof_drain_events();
+        r.map_err(map_ocl_err)
+    }
+
+    /// R3 (evt mode): drain completed marker events into the per-stage GPU
+    /// table. Called only at natural sync points (finish/read_buffer/
+    /// prof_report) — never waits on an event; incomplete markers stay
+    /// pending for the next sync.
+    fn prof_drain_events(&self) {
+        if !self.prof.evt { return; }
+        let mut mk = self.prof.marks.borrow_mut();
+        if mk.is_empty() { return; }
+        let mut prev_end = if self.prof.prev_ok.get() { Some(self.prof.prev_end.get()) } else { None };
+        let mut i = 0usize;
+        for (name, ev) in mk.iter() {
+            let end = match ev.profiling_info(ProfilingInfo::End) {
+                Ok(ProfilingInfoResult::End(t)) => t,
+                _ => break,   // marker not complete yet — in-order queue: all later ones aren't either
+            };
+            let start = match ev.profiling_info(ProfilingInfo::Start) {
+                Ok(ProfilingInfoResult::Start(t)) => t,
+                _ => end,
+            };
+            let base = prev_end.unwrap_or(start);
+            let dt = end.saturating_sub(base) as f64 * 1e-9;
+            if !name.is_empty() {
+                let mut dv = self.prof.dev.borrow_mut();
+                let e = dv.entry(*name).or_insert((0, 0.0));
+                e.0 += 1; e.1 += dt;
+            }
+            prev_end = Some(end);
+            i += 1;
+        }
+        if let Some(e) = prev_end { self.prof.prev_end.set(e); self.prof.prev_ok.set(true); }
+        if i > 0 { mk.drain(..i); }
     }
 
     /// Restart the stage clock (no sync). Call once before a measured region.
     pub fn prof_reset(&self) {
-        if self.prof.enabled { self.prof.tick.set(Some(Instant::now())); }
+        if !self.prof.enabled { return; }
+        if self.prof.evt {
+            // Baseline marker: the next stage's device time is measured
+            // from here (empty name = anchor only, not accumulated).
+            if let Ok(ev) = self.queue.enqueue_marker(None::<&Event>) {
+                self.prof.marks.borrow_mut().push(("", ev));
+            }
+        }
+        self.prof.tick.set(Some(Instant::now()));
     }
 
     /// Close a measured stage and accumulate the elapsed wall time under
     /// `name`. In `mark` mode: no sync — measures host/enqueue time only.
     /// In `tick` mode: guarded `queue.finish()` first — GPU-inclusive.
+    /// In `evt` mode: host time + a trailing marker event for GPU time.
     /// No-op when `RUST_DFTB_PROF` is unset.
     pub fn prof_tick(&self, name: &'static str) {
         if !self.prof.enabled { return; }
         if self.prof.finish {
             self.prof.n_finish.set(self.prof.n_finish.get() + 1);
             let _ = self.queue.finish();
+            self.prof_drain_events();
+        }
+        if self.prof.evt {
+            if let Ok(ev) = self.queue.enqueue_marker(None::<&Event>) {
+                self.prof.marks.borrow_mut().push((name, ev));
+            }
         }
         let dt = self.prof.tick.get().map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0);
         let mut st = self.prof.stages.borrow_mut();
@@ -232,17 +307,66 @@ impl GpuRuntime {
         self.prof.tick.set(Some(Instant::now()));
     }
 
-    /// Print the accumulated stage table (sorted by time) + sync counts.
+    /// Print the accumulated stage table + sync counts.
+    /// `evt` mode prints ONE merged table: per-stage host time (enqueue +
+    /// host work) next to TRUE device time (marker-event spans), each with
+    /// its own % column — the two sums differ because host time includes
+    /// queue-drain waits while device spans include idle gaps.
+    /// `RUST_DFTB_PROF_OUT=<path>` additionally appends the same report to
+    /// a file (A/B diffing without scraping stderr).
     pub fn prof_report(&self, title: &str) {
         if !self.prof.enabled { return; }
+        if self.prof.evt {
+            let _ = self.queue.finish();      // final drain point
+            self.prof_drain_events();
+        }
+        let mut out = String::new();
+        use std::fmt::Write;
         let st = self.prof.stages.borrow();
-        let mut rows: Vec<(&&'static str, &(u64, f64))> = st.iter().collect();
-        rows.sort_by(|a, b| b.1.1.partial_cmp(&a.1.1).unwrap_or(std::cmp::Ordering::Equal));
-        let total: f64 = rows.iter().map(|r| r.1.1).sum();
-        eprintln!("[prof] {title}: total={:.1} ms, finishes={} reads={}",
-            total * 1e3, self.prof.n_finish.get(), self.prof.n_read.get());
-        for (name, (cnt, sec)) in rows {
-            eprintln!("[prof]   {name:<28} {:9.3} ms  n={cnt}  ({:.1} ms/call)", sec * 1e3, sec * 1e3 / *cnt as f64);
+        let mut names: Vec<&'static str> = st.keys().copied().collect();
+        let dev_b = self.prof.dev.borrow();
+        for k in dev_b.keys() { if !st.contains_key(*k) { names.push(*k); } }
+        let get = |m: &BTreeMap<&'static str, (u64, f64)>, k: &str| m.get(k).copied().unwrap_or((0, 0.0));
+        let host_total: f64 = st.values().map(|v| v.1).sum();
+        let dev_total: f64 = dev_b.values().map(|v| v.1).sum();
+        names.sort_by(|a, b| {
+            let ka = get(&dev_b, a).1.max(get(&st, a).1);
+            let kb = get(&dev_b, b).1.max(get(&st, b).1);
+            kb.partial_cmp(&ka).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let _ = writeln!(out, "[prof] {title}: host={:.1} ms  dev={:.1} ms  finishes={} reads={}",
+            host_total * 1e3, dev_total * 1e3, self.prof.n_finish.get(), self.prof.n_read.get());
+        if self.prof.evt {
+            let _ = writeln!(out, "[prof]   {:<26} {:>9} {:>9} {:>9} {:>7} {:>9} {:>6}", "stage", "host ms", "dev ms", "n", "h/call", "d/call", "dev%");
+            for name in names {
+                let (h_n, h_s) = get(&st, name);
+                let (d_n, d_s) = get(&dev_b, name);
+                let n = h_n.max(d_n);
+                let _ = writeln!(out, "[prof]   {name:<26} {:9.3} {:9.3} {:>9} {:7.4} {:9.4} {:5.1}%",
+                    h_s * 1e3, d_s * 1e3, n,
+                    if n > 0 { h_s * 1e3 / n as f64 } else { 0.0 },
+                    if d_n > 0 { d_s * 1e3 / d_n as f64 } else { 0.0 },
+                    if dev_total > 0.0 { 100.0 * d_s / dev_total } else { 0.0 });
+            }
+        } else {
+            let _ = writeln!(out, "[prof]   {:<26} {:>9} {:>9} {:>7} {:>6}", "stage", "host ms", "n", "ms/call", "host%");
+            for name in names {
+                let (h_n, h_s) = get(&st, name);
+                let _ = writeln!(out, "[prof]   {name:<26} {:9.3} {:>9} {:7.4} {:5.1}%",
+                    h_s * 1e3, h_n,
+                    if h_n > 0 { h_s * 1e3 / h_n as f64 } else { 0.0 },
+                    if host_total > 0.0 { 100.0 * h_s / host_total } else { 0.0 });
+            }
+        }
+        eprint!("{out}");
+        if let Ok(path) = std::env::var("RUST_DFTB_PROF_OUT") {
+            if !path.is_empty() {
+                if let Err(e) = std::fs::OpenOptions::new().create(true).append(true).open(&path)
+                    .and_then(|mut f| std::io::Write::write_all(&mut f, out.as_bytes()))
+                {
+                    eprintln!("[prof] RUST_DFTB_PROF_OUT={path}: write failed: {e}");
+                }
+            }
         }
     }
 }

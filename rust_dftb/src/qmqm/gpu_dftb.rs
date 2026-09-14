@@ -100,6 +100,10 @@ pub struct GpuDftb {
     #[allow(dead_code)]
     buf_charges_zero: Buffer<f32>,
     buf_forces: Buffer<f32>,
+    buf_pair_f: Buffer<f32>,        // W9b: [3*total_pairs] per-pair forces (gather input)
+    buf_gather_ptr: Buffer<i32>,    // W9b: [total_atoms+1] CSR row pointer
+    buf_gather_list: Buffer<i32>,   // W9b: [2*total_pairs] CSR (flat_idx<<1|is_j)
+    k_gather: Kernel,               // W9b: force_gather_pairs (per-atom reduce)
     buf_edm: Buffer<f32>,
     buf_coords_ang: Buffer<f32>,
     buf_coords_bohr: Buffer<f32>,
@@ -113,6 +117,7 @@ pub struct GpuDftb {
     buf_gamma_spl: Buffer<f32>,
 
     k_onsite: Kernel,
+    onsite_done: bool,            // W8: onsite diagonal is geometry-independent — enqueue once
     k_gamma_f: Kernel,
     k_gamma_build: Kernel,
     k_rep_force: Kernel,
@@ -127,13 +132,13 @@ pub struct GpuDftb {
     // mask are device buffers. Host only makes the f64 adaptivity decisions.
     v_dev: Buffer<f32>,           // [batch*3n] velocities
     fire_stat: Buffer<f32>,       // [batch*4] {P=F·v, v², F², maxF(unfrozen)}
-    fire_ctl: Buffer<f32>,        // [batch*4] {dt, alpha, mode, _}
+    fire_ctl: Buffer<f32>,        // [batch*4] {dt, alpha, mode, npos} — W6: device-owned
+    park: Buffer<i32>,            // [batch] W6: 1=step, 0=parked (scc_ok mirror)
     frozen_dev: Buffer<i32>,      // [n_atoms] freeze mask (same all replicas)
     constr_d: Buffer<f32>,        // [batch] distance-constraint targets (Å)
     k_fire_reduce: Kernel,
     k_fire_apply: Kernel,
     fire_stat_h: Vec<f32>,        // [batch*4] persistent host scratch
-    fire_ctl_h: Vec<f32>,         // [batch*4] persistent host scratch
     /// Distance constraint |x_j − x_i| = constr_d[b] per replica (None = off).
     constr: Option<(usize, usize)>,
     /// Device x is authoritative: assemble() skips the host coord upload.
@@ -141,10 +146,11 @@ pub struct GpuDftb {
     /// Device x newer than host `coords` — sync before host-side use.
     coords_dirty: bool,
     fire_v: Vec<[f64; 3]>,        // host mirror of v_dev (md_step only)
-    // D12: per-replica FIRE state — batched systems adapt independently.
-    fire_dt: Vec<f64>,
-    fire_alpha: Vec<f64>,
-    fire_n_pos: Vec<usize>,
+    // W10: persistent ones vec for check_jacobi's `ran` arg — the per-call
+    // `vec![1i32; batch]` in eval/fire_step allocated every call.
+    ones_batch: Vec<i32>,
+    // D12→W6: per-replica FIRE state (dt/α/n_pos) is device-resident in
+    // fire_ctl — the old host vecs were removed (reduce tail adapts them).
     /// Replicas whose last SCC Failed — `fire_step` parks them (zero v, no
     /// integrate) rather than stepping on garbage forces. All-true until
     /// first scc.
@@ -195,8 +201,7 @@ struct PairBucket {
     buf_sk_s: Buffer<f32>,
     k_refresh: Kernel,   // D7: in-place r,l,m,n from device coords
     k_assemble: Kernel,
-    k_force: Kernel,
-    k_shift: Kernel,
+    k_fused: Kernel,     // W9a: force_pairs_fused (non-scc + scc-shift, one pass)
     dr: f32,
     n_grid: i32,
     n_sk_cols: i32,
@@ -312,6 +317,10 @@ impl GpuDftb {
         let total_atoms = gpu_batch.total_atoms;
         let n_frags = gpu_batch.n_frags as i32;
         let n_species = unique.len() as i32;
+        // W6: 1 = may step / needs geometry work, 0 = parked (uncertified SCC
+        // state). Mirrors scc_ok; declared early — gamma/assemble/force
+        // kernels gate on it (W6b).
+        let park = rt.buffer_from_slice(&vec![1i32; batch])?;
         let wg_onsite = 64.min(total_atoms.max(1));
         let g_onsite = ((total_atoms + wg_onsite - 1) / wg_onsite) * wg_onsite;
         let k_onsite = Kernel::builder()
@@ -328,7 +337,7 @@ impl GpuDftb {
             .arg(n_species)
             .arg(&buf_gamma_spl).arg(gamma_spl.nk as i32)
             .arg(gamma_spl.dr as f32).arg(gamma_spl.r_max as f32)
-            .arg(&buf_forces)
+            .arg(&buf_forces).arg(&park)                     // W6b park gate
             .build().map_err(map_ocl_err)?;
         // D7: device-resident G build — one thread per (system, upper-tri atom pair).
         let ntri = n_atoms * (n_atoms + 1) / 2;
@@ -341,7 +350,7 @@ impl GpuDftb {
             .arg(n_species)
             .arg(&buf_gamma_spl).arg(gamma_spl.nk as i32)
             .arg(gamma_spl.dr as f32).arg(gamma_spl.r_max as f32)
-            .arg(&buf_g)
+            .arg(&buf_g).arg(&park)                          // W6b park gate
             .build().map_err(map_ocl_err)?;
         let k_rep_force = Kernel::builder()
             .program(&force).name("force_repulsive_batched").queue(rt.queue().clone())
@@ -349,12 +358,17 @@ impl GpuDftb {
             .arg(n_atoms as i32).arg(batch as i32)
             .arg(&buf_coords_bohr).arg(&buf_atom_species).arg(&buf_rep_off)
             .arg(n_species).arg(&buf_rep_data).arg(&buf_forces)
+            .arg(&park)                                    // W6b park gate
             .build().map_err(map_ocl_err)?;
 
         // ── D13: device-resident FIRE — all state allocated once here. ──
         let v_dev = rt.zero_buffer::<f32>(3 * batch * n_atoms)?;
         let fire_stat = rt.zero_buffer::<f32>(4 * batch)?;
-        let fire_ctl = rt.zero_buffer::<f32>(4 * batch)?;
+        // W6: ctl {dt, alpha, mode, npos} is device-owned — initialized once
+        // (dt=1.0, alpha=0.1, normal mode) and adapted in the reduce tail.
+        let mut ctl0 = vec![0.0f32; 4 * batch];
+        for b in 0..batch { ctl0[4 * b] = 1.0; ctl0[4 * b + 1] = 0.1; }
+        let fire_ctl = rt.buffer_from_slice(&ctl0)?;
         let frozen_dev = rt.zero_buffer::<i32>(n_atoms)?;
         let constr_d = rt.zero_buffer::<f32>(batch)?;
         let k_fire_reduce = Kernel::builder()
@@ -364,6 +378,8 @@ impl GpuDftb {
             .arg(&buf_forces).arg(&v_dev).arg(&buf_coords_ang).arg(&frozen_dev)
             .arg(0i32).arg(0i32).arg(0i32)          // c_on, ci, cj — set_constraint
             .arg(&fire_stat)
+            .arg(&fire_ctl).arg(&park)
+            .arg(1e-3f32)                            // f_tol — set per fire_step
             .build().map_err(map_ocl_err)?;
         let k_fire_apply = Kernel::builder()
             .program(&force).name("fire_apply_batched").queue(rt.queue().clone())
@@ -432,11 +448,22 @@ impl GpuDftb {
             }
         }
 
+        // W9b: flat per-pair force buffer (gather kernel owns per-atom reduce).
+        let total_pairs: usize = lists.iter().map(|l| l.len()).sum();
+        let buf_pair_f = rt.zero_buffer::<f32>(3 * total_pairs.max(1))?;
         let mut buckets = Vec::with_capacity(pair_buckets.len());
+        // W9b: flat pair-force buffer + atom→pair CSR (entry = flat_idx<<1|is_j).
+        let mut gather_lists: Vec<Vec<i32>> = vec![Vec::new(); total_atoms];
+        let mut pair_base = 0i32;
         for (bi, bkt) in pair_buckets.iter().enumerate() {
             let skt = &gpu_batch.sk_tables[bkt.sk_table_idx];
             let staging = std::mem::take(&mut lists[bi]);
             let n_pairs = staging.len();
+            for (pi, p) in staging.iter().enumerate() {
+                let flat = pair_base + pi as i32;
+                gather_lists[p.replica as usize * n_atoms + p.atom_i as usize].push(flat << 1);
+                gather_lists[p.replica as usize * n_atoms + p.atom_j as usize].push((flat << 1) | 1);
+            }
             let buf_pairs = rt.buffer_from_slice(&staging)?;
             let buf_sk_h = rt.buffer_from_slice(&skt.sk_h)?;
             let buf_sk_s = rt.buffer_from_slice(&skt.sk_s)?;
@@ -448,56 +475,72 @@ impl GpuDftb {
                 .arg(n_pairs as i32).arg(n_atoms as i32)
                 .build().map_err(map_ocl_err)?;
             let k_assemble = Kernel::builder()
-                .program(&ham).name("assemble_pairs").queue(rt.queue().clone())
+                .program(&ham).name("assemble_pairs_geom").queue(rt.queue().clone())
                 .global_work_size(gws).local_work_size(PAIR_WG)
                 .arg(&buf_pairs).arg(&buf_fragments).arg(&buf_sk_h).arg(&buf_sk_s)
                 .arg(&buf_v_asm).arg(&buf_h0).arg(&buf_s)
                 .arg(skt.dr).arg(skt.n_grid as i32).arg(n_pairs as i32)
                 .arg(n_frags).arg(bkt.block_type as i32).arg(skt.n_sk_cols as i32)
+                .arg(&buf_coords_bohr).arg(n_atoms as i32).arg(&park)   // W8+W6b
                 .build().map_err(map_ocl_err)?;
-            let k_force = Kernel::builder()
-                .program(&force).name("force_pairs").queue(rt.queue().clone())
+            // W9a/b: fused pair force — one SK interp + one dS/dR serves the
+            // non-scc AND scc-shift terms; dm/edm/v_shift bound per call.
+            // W9b: writes per-pair forces to buf_pair_f (no atomics); the
+            // gather kernel reduces them per atom.
+            let k_fused = Kernel::builder()
+                .program(&force).name("force_pairs_fused").queue(rt.queue().clone())
                 .global_work_size(gws).local_work_size(PAIR_WG)
                 .arg(&buf_pairs).arg(&buf_fragments).arg(&buf_sk_h).arg(&buf_sk_s)
-                .arg(&buf_h0).arg(&buf_edm).arg(&buf_forces)
+                .arg(&buf_h0).arg(&buf_edm).arg(&buf_v_asm).arg(&buf_pair_f).arg(pair_base)
                 .arg(skt.dr).arg(skt.n_grid as i32).arg(n_pairs as i32)
                 .arg(n_frags).arg(bkt.block_type as i32).arg(skt.n_sk_cols as i32)
+                .arg(&buf_coords_bohr).arg(n_atoms as i32).arg(&park)   // W8+W6b
                 .build().map_err(map_ocl_err)?;
-            let k_shift = Kernel::builder()
-                .program(&force).name("force_pairs_scc_shift").queue(rt.queue().clone())
-                .global_work_size(gws).local_work_size(PAIR_WG)
-                .arg(&buf_pairs).arg(&buf_fragments).arg(&buf_sk_s)
-                .arg(&buf_h0).arg(&buf_v_asm).arg(&buf_forces)
-                .arg(skt.dr).arg(skt.n_grid as i32).arg(n_pairs as i32)
-                .arg(n_frags).arg(bkt.block_type as i32).arg(skt.n_sk_cols as i32)
-                .build().map_err(map_ocl_err)?;
+            pair_base += n_pairs as i32;
             buckets.push(PairBucket {
-                buf_pairs, buf_sk_h, buf_sk_s, k_refresh, k_assemble, k_force, k_shift,
+                buf_pairs, buf_sk_h, buf_sk_s, k_refresh, k_assemble, k_fused,
                 dr: skt.dr, n_grid: skt.n_grid as i32, n_sk_cols: skt.n_sk_cols as i32,
                 block_type: bkt.block_type as i32,
                 sp_i: skt.species_i as i32, sp_j: skt.species_j as i32,
                 n_live: n_pairs,
             });
         }
-        let plan = GpuSccPlan::new(&mut rt, &buf_s, n, n_atoms, batch)
+        // W9b gather CSR: ptr[total_atoms+1], list[2*total_pairs] (idx<<1|is_j).
+        let mut gather_ptr = vec![0i32; total_atoms + 1];
+        let mut gather_flat = Vec::with_capacity(2 * total_pairs);
+        for (a, l) in gather_lists.iter().enumerate() {
+            gather_flat.extend(l.iter().copied());
+            gather_ptr[a + 1] = gather_flat.len() as i32;
+        }
+        let buf_gather_ptr = rt.buffer_from_slice(&gather_ptr)?;
+        let buf_gather_list = rt.buffer_from_slice(&gather_flat)?;
+        let g_gather = ((total_atoms + 255) / 256) * 256;
+        let k_gather = Kernel::builder()
+            .program(&force).name("force_gather_pairs").queue(rt.queue().clone())
+            .global_work_size(g_gather).local_work_size(256)
+            .arg(&buf_gather_ptr).arg(&buf_gather_list).arg(&buf_pair_f)
+            .arg(&buf_forces).arg(total_atoms as i32)
+            .build().map_err(map_ocl_err)?;
+
+        let plan = GpuSccPlan::new(&mut rt, &buf_s, &buf_h0, &buf_g, &buf_q0, &buf_oa, n, n_atoms, batch)
             .map_err(|e| DftbError::InvalidInput(format!("GpuSccPlan::new (Lowdin X from S): {e}")))?;
         let mut eng = Self {
             rt, sk, sk_dir: sk_dir.to_string(), species, tmpl, gamma_tbl, n, n_atoms, n_occ, batch,
             buf_h0, buf_s, buf_g, buf_q0, buf_oa, buf_fragments, buf_atom_species,
             buf_orb_off, buf_n_orb, buf_onsite, buf_hubbard, buf_v_asm, buf_charges_zero,
-            buf_forces, buf_edm, buf_coords_ang, buf_coords_bohr, buf_u_hub, buf_rep_off, buf_rep_data,
+            buf_forces, buf_pair_f, buf_gather_ptr, buf_gather_list, k_gather,
+            buf_edm, buf_coords_ang, buf_coords_bohr, buf_u_hub, buf_rep_off, buf_rep_data,
             gamma_spl, buf_gamma_spl,
-            k_onsite, k_gamma_f, k_gamma_build, k_rep_force, buckets, q0,
+            k_onsite, onsite_done: false, k_gamma_f, k_gamma_build, k_rep_force, buckets, q0,
             u_per_atom, coords,
-            v_dev, fire_stat, fire_ctl, frozen_dev, constr_d,
+            v_dev, fire_stat, fire_ctl, park, frozen_dev, constr_d,
             k_fire_reduce, k_fire_apply,
             fire_stat_h: vec![0.0; 4 * batch],
-            fire_ctl_h: vec![0.0; 4 * batch],
             constr: None,
             coords_on_device: false,
             coords_dirty: false,
             fire_v: vec![[0.0; 3]; batch * n_atoms],
-            fire_dt: vec![1.0; batch], fire_alpha: vec![0.1; batch], fire_n_pos: vec![0; batch],
+            ones_batch: vec![1i32; batch],
             scc_ok: vec![true; batch],
             frozen: vec![false; n_atoms],
             state_fresh: false,
@@ -552,6 +595,12 @@ impl GpuDftb {
         self.coords.copy_from_slice(coords);
         self.coords_on_device = false;   // host path uploads coords
         self.coords_dirty = false;
+        // W6b: a host geometry change invalidates the park mask — a parked
+        // replica's stale H/S MUST be rebuilt for the new coordinates (the
+        // park gate skips its pair work otherwise). Re-certification happens
+        // in the next scc() as usual.
+        self.scc_ok = vec![true; self.batch];
+        self.sync_park()?;
         self.assemble()?;
         self.plan.set_geometry(&mut self.rt, &self.buf_s)?;
         self.plan.reset_diis(&self.rt)?;
@@ -591,11 +640,18 @@ impl GpuDftb {
                 .map_err(|e| DftbError::InvalidInput(format!("write coords_bohr: {e}")))?;
         }
         unsafe { self.k_gamma_build.enq().map_err(|e| DftbError::InvalidInput(format!("build_gamma: {e}")))?; }
-        for (i, slot) in self.buckets.iter().enumerate() {
-            if slot.n_live == 0 { continue; }
-            unsafe { slot.k_refresh.enq().map_err(|e| DftbError::InvalidInput(format!("refresh_pairs bucket {i}: {e}")))?; }
+        // W8: refresh_pair_geom retired — assemble_pairs/force_pairs_fused
+        // compute r,l,m,n from buf_coords_bohr directly (park-gated, W6b).
+        // The kernel stays for the GpuForceDriver/test path.
+        // for (i, slot) in self.buckets.iter().enumerate() {
+        //     if slot.n_live == 0 { continue; }
+        //     unsafe { slot.k_refresh.enq().map_err(|e| DftbError::InvalidInput(format!("refresh_pairs bucket {i}: {e}")))?; }
+        // }
+        // W8: onsite diagonal is geometry-independent — run once at init.
+        if !self.onsite_done {
+            unsafe { self.k_onsite.enq().map_err(|e| DftbError::InvalidInput(format!("onsite_diagonal: {e}")))?; }
+            self.onsite_done = true;
         }
-        unsafe { self.k_onsite.enq().map_err(|e| DftbError::InvalidInput(format!("onsite_diagonal: {e}")))?; }
         for (i, slot) in self.buckets.iter().enumerate() {
             if slot.n_live == 0 { continue; }
             unsafe { slot.k_assemble.enq().map_err(|e| DftbError::InvalidInput(format!("assemble_pairs bucket {i}: {e}")))?; }
@@ -619,16 +675,29 @@ impl GpuDftb {
     /// and merged the better status label WITHOUT restoring the matching
     /// physical state: a replica could be reported Converged while its
     /// C/D/q buffers held the failed retry state.
+    /// Honest single-shot SCC: runs `scc_mix` once and returns whatever
+    /// statuses it produced — including `Failed`. W11/I4: NO implicit
+    /// failed→nearest-replica reseed here; recovery is an explicit driver
+    /// call to `scc_retry_failed` so call sites state the fallback openly.
     pub fn scc(&mut self, max_iter: usize, rms_tol: f32) -> Result<GpuDftbScc> {
-        let s = self.scc_mix(max_iter, rms_tol, 0)?;
+        self.scc_mix(max_iter, rms_tol, 0)
+    }
+
+    /// Explicit failed-replica retry: copies converged charges from each
+    /// failed replica's nearest converged neighbor and re-solves ONLY the
+    /// failed set (masked). Converged replicas' device state is untouched;
+    /// their run-1 status is kept. Returns the merged result.
+    /// Call this from drivers that explicitly want warm-start recovery —
+    /// e.g. scans, where an adjacent geometry IS the right seed.
+    pub fn scc_retry_failed(&mut self, s: &GpuDftbScc, max_iter: usize, rms_tol: f32) -> Result<GpuDftbScc> {
         let n_fail = s.statuses.iter().filter(|st| **st == SccStatus::Failed).count();
-        if n_fail == 0 { return Ok(s); }
+        if n_fail == 0 { return Ok(s.clone()); }
         // snapshot converged charges (q_gpu = last iterate per replica)
         let na = self.n_atoms;
         let mut q = vec![0.0f32; self.batch * na];
         self.rt.read_buffer(&self.plan.q_gpu, &mut q)?;
         let ok: Vec<usize> = (0..self.batch).filter(|&b| s.statuses[b] != SccStatus::Failed).collect();
-        if ok.is_empty() { return Ok(s); }   // nothing to seed from — keep the honest failures
+        if ok.is_empty() { return Ok(s.clone()); }   // nothing to seed from — keep the honest failures
         let mut retry = vec![false; self.batch];
         for b in 0..self.batch {
             if s.statuses[b] != SccStatus::Failed { continue; }
@@ -653,7 +722,16 @@ impl GpuDftb {
         eprintln!("[GpuDftb] SCC warm-start retry: {n_fail} failed → {still} still failed");
         self.scc_ok = merged.statuses.iter().map(|st| *st != SccStatus::Failed).collect();
         self.plan.set_state_ok(&self.rt, &self.scc_ok)?;   // R1: W-build mask follows certified status
+        self.sync_park()?;                                 // W6: device FIRE park mask
         Ok(merged)
+    }
+
+    /// Production semantic: `scc` + EXPLICIT failed→nearest-converged retry.
+    /// Named so call sites openly state the fallback (W11/I4). Use `scc`
+    /// for honest one-shot behavior.
+    pub fn scc_with_retry(&mut self, max_iter: usize, rms_tol: f32) -> Result<GpuDftbScc> {
+        let s = self.scc(max_iter, rms_tol)?;
+        self.scc_retry_failed(&s, max_iter, rms_tol)
     }
 
     /// Test-only R2 hook: run the masked-retry SCC path directly —
@@ -741,18 +819,18 @@ impl GpuDftb {
             // device mask. The host syncs once per chunk to read rms+active
             // for bookkeeping (status, stagnation). Converged replicas stop
             // paying for any further work inside the chunk.
+            // R1: all kernel args bound — io bufs at construction, scalars here.
+            self.plan.bind_solve_params(self.n_occ)?;
+            self.plan.bind_mix_params(0.3, rms_tol)?;
             const CHUNK: usize = 8;
             let mut it = 0usize;
             let mut samples = vec![0usize; self.batch];
             while it < cap && n_active > 0 {
                 let step = (cap - it).min(CHUNK);
                 for _ in 0..step {
-                    self.plan.scc_step_diis_enq(
-                        &mut self.rt, &self.buf_h0, &self.buf_s, &self.buf_g, &self.buf_q0, &self.buf_oa,
-                        self.n_occ, 0.3, rms_tol,
-                    )?;
-                    self.plan.commit_q_next(&self.rt)?;
-                    self.rt.prof_tick("scc.commit");
+                    self.plan.scc_step_diis_enq(&mut self.rt)?;
+                    // R7: no commit launch — diis_step_batched writes the
+                    // mixed iterate straight into q_gpu for active replicas.
                 }
                 it += step;
                 n_iters = it;
@@ -784,18 +862,10 @@ impl GpuDftb {
         for it in 0..cap {
             n_iters = it + 1;
             rms = match mix {
-                0 => self.plan.scc_step_diis(
-                    &mut self.rt, &self.buf_h0, &self.buf_s, &self.buf_g, &self.buf_q0, &self.buf_oa,
-                    self.n_occ, 0.3, rms_tol,
-                )?,
-                1 => self.plan.scc_step(
-                    &mut self.rt, &self.buf_h0, &self.buf_s, &self.buf_g, &self.buf_q0, &self.buf_oa,
-                    self.n_occ, 0.3,
-                )?,
+                0 => self.plan.scc_step_diis(&mut self.rt, self.n_occ, 0.3, rms_tol)?,
+                1 => self.plan.scc_step(&mut self.rt, self.n_occ, 0.3)?,
                 2 => {
-                    self.plan.finalize(
-                        &mut self.rt, &self.buf_h0, &self.buf_s, &self.buf_g, &self.buf_q0, &self.buf_oa, self.n_occ,
-                    )?;
+                    self.plan.finalize(&mut self.rt, self.n_occ)?;
                     self.rt.read_buffer(&self.plan.q_gpu, &mut q_f32)?;
                     for a in 0..self.n_atoms { q_in[a] = q_f32[a] as f64; }
                     self.rt.read_buffer(&self.plan.q_new, &mut q_f32)?;
@@ -824,8 +894,11 @@ impl GpuDftb {
                 }
                 other => return Err(DftbError::InvalidInput(format!("scc_mix: mix={other} not 0/1/2"))),
             };
-            // State now consistent with q_gpu (q_next not yet committed).
-            self.state_fresh = true;
+            // mix=2 (host DIIS): q_next written but not yet committed —
+            // state consistent with q_gpu. mix∈{0,1}: scc_step* commits
+            // internally — still-active replicas already advanced q_gpu
+            // past the solved state → stale until the next finalize.
+            self.state_fresh = mix == 2;
             // per-replica convergence: done when r<tol, stagnant when the
             // last-10 window stops moving (status decided by floor at end)
             for b in 0..self.batch {
@@ -843,8 +916,13 @@ impl GpuDftb {
             if n_active == 0 { break; }
             // Commit mixed iterates for still-active replicas only; frozen
             // replicas keep q_n and their just-solved electronic state.
-            self.plan.set_active(&self.rt)?;
-            self.plan.commit_q_next(&self.rt)?;
+            // mix=0: diis_step_batched already committed in-kernel (R7) —
+            // running commit_q_next here would overwrite q_gpu with the
+            // stale q_next.
+            if mix != 0 {
+                self.plan.set_active(&self.rt)?;
+                self.plan.commit_q_next(&self.rt)?;
+            }
             self.state_fresh = false;
         }
         }
@@ -903,6 +981,7 @@ impl GpuDftb {
         // R1: k_edm (W build) gates on state_ok — certified replicas get a
         // fresh W even when they converged before the last SCC iteration.
         self.plan.set_state_ok(&self.rt, &self.scc_ok)?;
+        self.sync_park()?;                                  // W6: FIRE park mask
         Ok(GpuDftbScc { n_iters, rms, stalled, statuses })
     }
 
@@ -912,19 +991,18 @@ impl GpuDftb {
     /// or charge change.
     pub fn eval(&mut self, want_forces: bool) -> Result<GpuDftbEval> {
         if !self.state_fresh {
-            self.plan.finalize(
-                &mut self.rt, &self.buf_h0, &self.buf_s, &self.buf_g, &self.buf_q0, &self.buf_oa, self.n_occ,
-            )?;
+            self.plan.finalize(&mut self.rt, self.n_occ)?;
             self.state_fresh = true;
             // W1: certify the just-run eigensolve — one deferred diag read
             // per eval (not per SCC iteration). Uncertified replicas are
             // parked like an SCC failure, not silently consumed.
-            let j_ok = self.plan.check_jacobi(&self.rt, &vec![1i32; self.batch])?;
+            let j_ok = self.plan.check_jacobi(&self.rt, &self.ones_batch)?;
             for (b, ok) in j_ok.iter().enumerate() {
                 if !ok { self.scc_ok[b] = false; }
             }
+            self.sync_park()?;                             // W6: FIRE park mask
         }
-        let energy = self.plan.energy_from_state(&mut self.rt, &self.buf_q0)?;
+        let energy = self.plan.energy_from_state(&mut self.rt)?;
         let (q_rms, q_max) = self.charge_residual()?;
         let forces = if want_forces { Some(self.forces_from_state()?) } else { None };
         Ok(GpuDftbEval { energy, forces, q_rms, q_max })
@@ -972,13 +1050,14 @@ impl GpuDftb {
         self.buf_forces.cmd().fill(0.0f32, None).enq().map_err(map_ocl_err)?;
         for slot in &self.buckets {
             if slot.n_live == 0 { continue; }
-            slot.k_force.set_arg(4u32, &self.plan.d).map_err(map_ocl_err)?;
-            slot.k_force.set_arg(5u32, &self.buf_edm).map_err(map_ocl_err)?;
-            unsafe { slot.k_force.enq().map_err(map_ocl_err)?; }
-            slot.k_shift.set_arg(3u32, &self.plan.d).map_err(map_ocl_err)?;
-            slot.k_shift.set_arg(4u32, &self.plan.v).map_err(map_ocl_err)?;
-            unsafe { slot.k_shift.enq().map_err(map_ocl_err)?; }
+            slot.k_fused.set_arg(4u32, &self.plan.d).map_err(map_ocl_err)?;    // dm
+            slot.k_fused.set_arg(5u32, &self.buf_edm).map_err(map_ocl_err)?;   // edm
+            slot.k_fused.set_arg(6u32, &self.plan.v).map_err(map_ocl_err)?;    // v_shift
+            unsafe { slot.k_fused.enq().map_err(map_ocl_err)?; }
         }
+        // W9b: per-atom gather (deterministic CSR order, sole writer of the
+        // pair-force part — gamma/rep kernels atomic-add after it).
+        unsafe { self.k_gather.enq().map_err(map_ocl_err)?; }
         self.k_gamma_f.set_arg(2u32, &self.buf_coords_ang).map_err(map_ocl_err)?;
         self.k_gamma_f.set_arg(4u32, &self.plan.dq).map_err(map_ocl_err)?;
         unsafe { self.k_gamma_f.enq().map_err(map_ocl_err)?; }
@@ -998,9 +1077,7 @@ impl GpuDftb {
     fn eval_forces_device(&mut self) -> Result<()> {
         let mut solved = false;
         if !self.state_fresh {
-            self.plan.finalize(
-                &mut self.rt, &self.buf_h0, &self.buf_s, &self.buf_g, &self.buf_q0, &self.buf_oa, self.n_occ,
-            )?;
+            self.plan.finalize(&mut self.rt, self.n_occ)?;
             self.rt.prof_tick("fire.finalize");
             self.state_fresh = true;
             solved = true;
@@ -1011,11 +1088,12 @@ impl GpuDftb {
             // W1: certify the eigensolve AFTER the force kernels are queued —
             // the single read_buffer/finish then drains finalize+forces in
             // one sync instead of a mid-pipeline drain after finalize alone.
-            let j_ok = self.plan.check_jacobi(&self.rt, &vec![1i32; self.batch])?;
+            let j_ok = self.plan.check_jacobi(&self.rt, &self.ones_batch)?;
             self.rt.prof_tick("fire.check_jacobi");
             for (b, ok) in j_ok.iter().enumerate() {
                 if !ok { self.scc_ok[b] = false; }
             }
+            self.sync_park()?;                             // W6: FIRE park mask
         }
         Ok(())
     }
@@ -1160,14 +1238,20 @@ impl GpuDftb {
     ///   (dt/α/mode) → fire_apply updates v_dev + coords_ang/bohr in place
     ///   → assemble reads the device coords directly.
     /// Call `scc` first. Returns global max |F|.
+    /// Sync the device `park` mask from `scc_ok` — W6 gates the on-device
+    /// FIRE control on it. Called wherever scc_ok is rewritten.
+    fn sync_park(&self) -> Result<()> {
+        let v: Vec<i32> = self.scc_ok.iter().map(|&b| b as i32).collect();
+        self.rt.write_buffer(&self.park, &v)
+    }
+
     pub fn fire_step(&mut self, f_tol: f64) -> Result<f64> {
-        const N_MIN: usize = 10;
-        const F_INC: f64 = 1.1;
-        const F_DEC: f64 = 0.7;
-        const ALPHA_START: f64 = 0.1;
-        const F_ALPHA: f64 = 0.95;
+        // W6: N_MIN/F_INC/F_DEC/ALPHA_START/F_ALPHA/DT_MAX live in the
+        // reduce tail on device (constants in gpu_forces.cl) — the host
+        // only reads `stat` for the convergence test and error checks.
         self.eval_forces_device()?;                       // forces stay on device
         self.rt.prof_tick("fire.eval_forces");
+        self.k_fire_reduce.set_arg(11u32, f_tol as f32).map_err(map_ocl_err)?;
         unsafe { self.k_fire_reduce.enq().map_err(map_ocl_err)?; }
         self.rt.read_buffer(&self.fire_stat, &mut self.fire_stat_h)?;   // 4·batch floats
         self.rt.prof_tick("fire.reduce");
@@ -1185,30 +1269,9 @@ impl GpuDftb {
                 )));
             }
             max_f = max_f.max(mf);
-            let mut mode = 0.0f32;
-            if mf < f_tol || !self.scc_ok[b] {
-                mode = 1.0;                       // parked: v=0, x untouched
-                self.fire_n_pos[b] = 0;
-            } else if p > 0.0 {
-                self.fire_n_pos[b] += 1;
-                if self.fire_n_pos[b] > N_MIN {
-                    self.fire_dt[b] = (self.fire_dt[b] * F_INC).min(5.0);
-                    self.fire_alpha[b] *= F_ALPHA;
-                }
-            } else {
-                self.fire_n_pos[b] = 0;
-                self.fire_dt[b] *= F_DEC;
-                self.fire_alpha[b] = ALPHA_START;
-                mode = 2.0;                       // v-reset then normal update
-            }
-            self.fire_ctl_h[4 * b] = self.fire_dt[b] as f32;
-            // mode 2: alpha=0 so mix_s=0 — after a P≤0 v-reset the step is
-            // pure F·dt (matches the old host code where vnorm=0 → scale=0).
-            self.fire_ctl_h[4 * b + 1] = if mode == 2.0 { 0.0 } else { self.fire_alpha[b] as f32 };
-            self.fire_ctl_h[4 * b + 2] = mode;
         }
         if max_f < f_tol { return Ok(max_f); }    // all converged — nothing moves
-        self.rt.write_buffer(&self.fire_ctl, &self.fire_ctl_h)?;
+        // ctl was adapted on-device by the reduce tail — apply directly.
         unsafe { self.k_fire_apply.enq().map_err(map_ocl_err)?; }
         self.rt.prof_tick("fire.apply");
         // Positions now live on the device — assemble reads them in place.
@@ -1269,7 +1332,7 @@ impl GpuDftb {
     /// convergence; the old signature returned the INITIAL scc rms).
     pub fn relax(&mut self, max_steps: usize, f_tol: f64, scc_tol: f32) -> Result<(usize, f64, f32, bool)> {
         self.rt.prof_reset();
-        let scc0 = self.scc(SCC_MAX_ITER, scc_tol)?;
+        let scc0 = self.scc_with_retry(SCC_MAX_ITER, scc_tol)?;   // W11: explicit warm-start retry
         self.rt.prof_tick("relax.scc0");
         eprintln!("[GpuDftb] relax start rms={:.3e} iters={} stalled={}", scc0.rms, scc0.n_iters, scc0.stalled);
         let mut max_f = f64::INFINITY;
@@ -1279,7 +1342,7 @@ impl GpuDftb {
             step = s + 1;
             max_f = self.fire_step(f_tol)?;
             self.rt.prof_tick("relax.fire_step");
-            let scc = self.scc(SCC_MAX_ITER, scc_tol)?;
+            let scc = self.scc_with_retry(SCC_MAX_ITER, scc_tol)?;   // W11: explicit retry
             self.rt.prof_tick("relax.scc");
             last_rms = scc.rms;
             let e = self.eval(false)?.energy;
@@ -1337,6 +1400,13 @@ impl GpuDftb {
         self.rt.read_buffer(&self.plan.q_new, &mut self.scratch_qd)?;
         self.rt.read_buffer(&self.plan.eig_diag, &mut self.plan.eig_diag_host)?;
         self.rt.read_buffer(&self.plan.occ_mask, &mut self.plan.mask_host)?;
+        if self.plan.kT > 0.0 {
+            // R5: the integer mask is not maintained under Fermi smearing —
+            // occ_w is the occupation state; w>0.5 is the occupied subset
+            // for the residual/parity diagnostics below.
+            self.rt.read_buffer(&self.plan.occ_w, &mut self.plan.occ_w_host)?;
+            for k in 0..n { self.plan.mask_host[k] = (self.plan.occ_w_host[k] > 0.5) as i32; }
+        }
         let eig = &self.plan.eig_diag_host[..n];
         let mask = &self.plan.mask_host[..n];
         let q_in = &self.scratch_q[..n_atoms];

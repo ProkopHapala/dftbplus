@@ -571,6 +571,184 @@ __kernel void force_pairs_scc_shift(
     atomic_add_f32(&forces[fj + 2], -f.z);
 }
 
+// ─── W9a: FUSED pair force kernel — non-scc + scc-shift in one pass ────
+//
+// force_pairs and force_pairs_scc_shift re-load the same SK tables, re-read
+// the same pair geometry, and do the same dS/dR derivative work — then
+// double the atomic traffic. Physics is additive on the same stencil:
+//   F_pair = 2·ANG2BOHR · Σ_μν [ D_μν·dH_μν/dR + (½(V_i+V_j)·D_μν − W_μν)·dS_μν/dR ]
+// so one interpolation + one derivative block serves both terms; one
+// atomic add per endpoint per pair.
+// The two single-term kernels are kept for tests (component-level parity).
+__kernel void force_pairs_fused(
+    __global const PairEntry* pairs,
+    __global const Fragment* fragments,
+    __global const float* sk_h,
+    __global const float* sk_s,
+    __global const float* dm,
+    __global const float* edm,
+    __global const float* v_shift,    // [total_atoms] SCC potential per atom
+    __global float* pair_f,           // W9b: [3*total_pairs_all_buckets] per-pair force out
+    const int pair_base,              // flat offset of this bucket's pairs in pair_f
+    const float dr,
+    const int n_grid,
+    const int n_pairs,
+    const int n_frags,
+    const int block_type,
+    const int n_sk_cols,
+    __global const float* coords,   // W8: [batch][3*n_atoms] Bohr
+    const int n_atoms,
+    __global const int* park        // W6b: 0 → replica parked (no force needed)
+) {
+    const int tid = get_local_id(0);
+    const int wg  = get_local_size(0);
+    const int gid = get_global_id(0);
+
+    __local float l_sk_h[SK_GRID_MAX * N_SK_COLS];
+    __local float l_sk_s[SK_GRID_MAX * N_SK_COLS];
+    int n_sk_elements = n_grid * n_sk_cols;
+    for (int i = tid; i < n_sk_elements; i += wg) {
+        l_sk_h[i] = sk_h[i];
+        l_sk_s[i] = sk_s[i];
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    if (gid >= n_pairs) return;
+
+    PairEntry p = pairs[gid];
+    if (park[p.replica] == 0) return;   // W6b — after barrier (WG can span replicas)
+    {
+        const int cb = (int)p.replica * n_atoms * 3;
+        const float dx = coords[cb + 3*(int)p.atom_j    ] - coords[cb + 3*(int)p.atom_i    ];
+        const float dy = coords[cb + 3*(int)p.atom_j + 1] - coords[cb + 3*(int)p.atom_i + 1];
+        const float dz = coords[cb + 3*(int)p.atom_j + 2] - coords[cb + 3*(int)p.atom_i + 2];
+        const float r = sqrt(dx*dx + dy*dy + dz*dz);
+        const float inv_r = 1.0f / fmax(r, 1e-12f);
+        p.r = r; p.l = dx * inv_r; p.m = dy * inv_r; p.n = dz * inv_r;
+    }
+    const float r_tab = ((float)n_grid - 1.0f) * dr;
+    if (p.r >= r_tab || p.r < 1e-6f) return;
+    Fragment frag = fragments[p.replica];
+    int n_orbs = frag.n_orbs;
+    int atom_off = frag.atom_off;
+    int ga_i = atom_off + p.atom_i;
+    int ga_j = atom_off + p.atom_j;
+    int dm_base = p.replica * n_orbs * n_orbs;
+    float avg_shift = 0.5f * (v_shift[ga_i] + v_shift[ga_j]);
+
+    float4 w, wd;
+    int base_idx = interp_params(p.r, dr, n_grid, &w, &wd);
+    float inv_dr = 1.0f / dr;
+    float l = p.l, m = p.m, n = p.n;
+    float r = p.r;
+    float3 f = (float3)(0.0f, 0.0f, 0.0f);
+
+    if (block_type == 0) {
+        float sk_h_val = interp_sk_1(l_sk_h, base_idx, w);
+        float sk_s_val = interp_sk_1(l_sk_s, base_idx, w);
+        float dsk_h = interp_sk_1_d(l_sk_h, base_idx, wd) * inv_dr;
+        float dsk_s = interp_sk_1_d(l_sk_s, base_idx, wd) * inv_dr;
+
+        float h_val, dh_dx, dh_dy, dh_dz;
+        block_1x1_with_derivs(sk_h_val, dsk_h, l, m, n, r, &h_val, &dh_dx, &dh_dy, &dh_dz);
+        float s_val, ds_dx, ds_dy, ds_dz;
+        block_1x1_with_derivs(sk_s_val, dsk_s, l, m, n, r, &s_val, &ds_dx, &ds_dy, &ds_dz);
+
+        int dm_idx = dm_base + p.orb_j * n_orbs + p.orb_i;
+        float dm_val = dm[dm_idx];
+        float edm_val = edm[dm_idx];
+        float scc = avg_shift * dm_val - edm_val;   // combined dS coefficient
+
+        f.x = dm_val * dh_dx + scc * ds_dx;
+        f.y = dm_val * dh_dy + scc * ds_dy;
+        f.z = dm_val * dh_dz + scc * ds_dz;
+    } else if (block_type == 1) {
+        float2 sk_h_val = interp_sk_2(l_sk_h, base_idx, w);
+        float2 sk_s_val = interp_sk_2(l_sk_s, base_idx, w);
+        float2 dsk_h = interp_sk_2_d(l_sk_h, base_idx, wd) * inv_dr;
+        float2 dsk_s = interp_sk_2_d(l_sk_s, base_idx, wd) * inv_dr;
+
+        float4 blk_h, dh_dx, dh_dy, dh_dz;
+        block_1x4_with_derivs(sk_h_val, dsk_h, l, m, n, r, &blk_h, &dh_dx, &dh_dy, &dh_dz);
+        float4 blk_s, ds_dx, ds_dy, ds_dz;
+        block_1x4_with_derivs(sk_s_val, dsk_s, l, m, n, r, &blk_s, &ds_dx, &ds_dy, &ds_dz);
+
+        for (int k = 0; k < 4; k++) {
+            int dm_idx = dm_base + (p.orb_j + k) * n_orbs + p.orb_i;
+            float dm_val = dm[dm_idx];
+            float scc = avg_shift * dm_val - edm[dm_idx];
+            f.x += dm_val * dh_dx[k] + scc * ds_dx[k];
+            f.y += dm_val * dh_dy[k] + scc * ds_dy[k];
+            f.z += dm_val * dh_dz[k] + scc * ds_dz[k];
+        }
+    } else {
+        float ps_h, ps_s;
+        float4 sk_h_val = interp_sk_5(l_sk_h, base_idx, w, &ps_h);
+        float4 sk_s_val = interp_sk_5(l_sk_s, base_idx, w, &ps_s);
+        float dps_h, dps_s;
+        float4 dsk_h = interp_sk_5_d(l_sk_h, base_idx, wd, &dps_h) * inv_dr;
+        float4 dsk_s = interp_sk_5_d(l_sk_s, base_idx, wd, &dps_s) * inv_dr;
+        dps_h *= inv_dr;
+        dps_s *= inv_dr;
+
+        float4 blk_h[4], dh_dx[4], dh_dy[4], dh_dz[4];
+        block_4x4_with_derivs(sk_h_val, dsk_h, ps_h, dps_h, l, m, n, r, blk_h, dh_dx, dh_dy, dh_dz);
+        float4 blk_s[4], ds_dx[4], ds_dy[4], ds_dz[4];
+        block_4x4_with_derivs(sk_s_val, dsk_s, ps_s, dps_s, l, m, n, r, blk_s, ds_dx, ds_dy, ds_dz);
+
+        for (int row = 0; row < 4; row++) {
+            for (int col = 0; col < 4; col++) {
+                int dm_idx = dm_base + (p.orb_j + row) * n_orbs + (p.orb_i + col);
+                float dm_val = dm[dm_idx];
+                float scc = avg_shift * dm_val - edm[dm_idx];
+                f.x += dm_val * dh_dx[row][col] + scc * ds_dx[row][col];
+                f.y += dm_val * dh_dy[row][col] + scc * ds_dy[row][col];
+                f.z += dm_val * dh_dz[row][col] + scc * ds_dz[row][col];
+            }
+        }
+    }
+
+    float scale = 2.0f * ANG2BOHR_F;
+    f *= scale;
+    // W9b: own output, write once — per-pair force; the gather kernel owns
+    // the per-atom reduction. No atomics.
+    pair_f[3 * (pair_base + gid) + 0] = f.x;
+    pair_f[3 * (pair_base + gid) + 1] = f.y;
+    pair_f[3 * (pair_base + gid) + 2] = f.z;
+}
+
+// ─── W9b: per-atom gather of pair forces (deterministic CSR order) ────
+//
+// One thread per GLOBAL atom. gather_list holds 2·total_pairs entries
+// encoded (flat_pair_idx << 1) | is_j — i-endpoint gets +f, j gets −f.
+// Sole writer of the pair contribution: plain store into `forces` (the
+// buffer was zero-filled; gamma-deriv/repulsive kernels then atomic-add
+// their 1–2 terms per atom — contention gone).
+__kernel void force_gather_pairs(
+    __global const int* gather_ptr,   // [total_atoms+1]
+    __global const int* gather_list,  // [2*total_pairs] encoded (idx<<1)|is_j
+    __global const float* pair_f,     // [3*total_pairs]
+    __global float* forces,           // [total_atoms*3]
+    const int total_atoms
+) {
+    const int a = get_global_id(0);
+    if (a >= total_atoms) return;
+    const int p0 = gather_ptr[a];
+    const int p1 = gather_ptr[a + 1];
+    float fx = 0.0f, fy = 0.0f, fz = 0.0f;
+    for (int e = p0; e < p1; e++) {
+        const int enc = gather_list[e];
+        const int pi = enc >> 1;
+        const float s = (enc & 1) ? -1.0f : 1.0f;
+        fx += s * pair_f[3 * pi + 0];
+        fy += s * pair_f[3 * pi + 1];
+        fz += s * pair_f[3 * pi + 2];
+    }
+    forces[3 * a + 0] = fx;
+    forces[3 * a + 1] = fy;
+    forces[3 * a + 2] = fz;
+}
+
 // ─── Gamma derivative (SCC double-counting) force kernel (R6 component 3) ─
 //
 // Computes the SCC double-counting (Coulomb) force contribution:
@@ -746,13 +924,14 @@ __kernel void build_gamma_batched(
     const int gamma_nk,
     const float gamma_dr,
     const float gamma_rmax,
-    __global float* G)                 // [batch*n_atoms*n_atoms]
-{
+    __global float* G,                 // [batch*n_atoms*n_atoms]
+    __global const int* park           // W6b: 0 → parked replica keeps frozen-geometry G
+) {
     const int gid = get_global_id(0);
     const int ntri = n_atoms * (n_atoms + 1) / 2;
     const int sid = gid / ntri;
     const int t = gid - sid * ntri;
-    if (sid >= batch) return;
+    if (sid >= batch || park[sid] == 0) return;
     // triangle index → (a,c), a ≥ c (same decode as build_density_occ_batched)
     int a = (int)(0.5f * (sqrt(8.0f * (float)t + 1.0f) - 1.0f));
     while ((a + 1) * (a + 2) / 2 <= t) a++;
@@ -788,12 +967,13 @@ __kernel void force_gamma_deriv_batched(
     const int gamma_nk,
     const float gamma_dr,
     const float gamma_rmax,
-    __global float* forces            // [batch*n_atoms*3] Hartree/Å
+    __global float* forces,           // [batch*n_atoms*3] Hartree/Å
+    __global const int* park          // W6b: 0 → parked replica skips force work
 ) {
     const int sid = get_group_id(0);
     const int lid = get_local_id(0);
     const int lsz = get_local_size(0);
-    if (sid >= batch) return;
+    if (sid >= batch || park[sid] == 0) return;
 
     __global const float* crd = coords + (size_t)sid * n_atoms * 3;
     __global const int* spc = species_idx + (size_t)sid * n_atoms;
@@ -864,12 +1044,13 @@ __kernel void force_repulsive_batched(
     __global const int* spline_offsets,
     const int n_species,
     __global const float* spline_data,
-    __global float* forces
+    __global float* forces,
+    __global const int* park          // W6b: 0 → parked replica skips force work
 ) {
     const int sid = get_group_id(0);
     const int lid = get_local_id(0);
     const int lsz = get_local_size(0);
-    if (sid >= batch) return;
+    if (sid >= batch || park[sid] == 0) return;
 
     __global const float* crd = coords + (size_t)sid * n_atoms * 3;
     __global const int* spc = species_idx + (size_t)sid * n_atoms;
@@ -998,7 +1179,10 @@ __kernel void fire_reduce_batched(
     __global const float* Xa,       // [batch][3n] positions Å (for ∇g)
     __global const int* frozen,     // [n_atoms] 1 → pinned
     const int c_on, const int ci, const int cj,
-    __global float* stat            // [batch][4] out
+    __global float* stat,           // [batch][4] {P, v², F², maxF} out
+    __global float* ctl,            // [batch][4] {dt, alpha, mode, npos} in/out — W6: adapted on device
+    __global const int* park,       // [batch] 0 → replica parked (uncertified SCC state)
+    const float f_tol               // convergence → mode=1 (parked)
 ) {
     const int sid = get_group_id(0);
     const int lid = get_local_id(0);
@@ -1051,8 +1235,27 @@ __kernel void fire_reduce_batched(
         barrier(CLK_LOCAL_MEM_FENCE);
     }
     if (lid == 0) {
-        stat[4*sid+0] = red[0]; stat[4*sid+1] = red[lsz];
-        stat[4*sid+2] = red[2*lsz]; stat[4*sid+3] = red[3*lsz];
+        const float pp = red[0], mf = red[3*lsz];
+        stat[4*sid+0] = pp; stat[4*sid+1] = red[lsz];
+        stat[4*sid+2] = red[2*lsz]; stat[4*sid+3] = mf;
+        // W6: FIRE adaptation on device — the host no longer round-trips
+        // ctl. Constants match the CPU reference (hbond_ref.rs / the old
+        // host loop): N_MIN=10, F_INC=1.1, F_DEC=0.7, F_ALPHA=0.95,
+        // ALPHA_START=0.1, DT_MAX=5.0.
+        float dt = ctl[4*sid], alpha = ctl[4*sid+1], npos = ctl[4*sid+3];
+        float mode = 0.0f;
+        if (mf < f_tol || park[sid] == 0) {          // converged / uncertified → park
+            mode = 1.0f; npos = 0.0f;
+        } else if (pp > 0.0f) {                       // downhill
+            npos += 1.0f;
+            if (npos > 10.0f) { dt = fmin(dt * 1.1f, 5.0f); alpha *= 0.95f; }
+        } else {                                      // uphill → v-reset step
+            npos = 0.0f; dt *= 0.7f; alpha = 0.1f; mode = 2.0f;
+        }
+        ctl[4*sid]   = dt;
+        ctl[4*sid+1] = alpha;   // TRUE alpha — mode-2 masking happens in apply
+        ctl[4*sid+2] = mode;
+        ctl[4*sid+3] = npos;
     }
 }
 
@@ -1079,7 +1282,11 @@ __kernel void fire_apply_batched(
     __global float* xa = Xa + (size_t)sid * n3;
     __global float* xb = Xb + (size_t)sid * n3;
 
-    const float dt = ctl[4*sid], alpha = ctl[4*sid+1];
+    const float dt = ctl[4*sid];
+    // ctl holds TRUE alpha; a v-reset step (mode 2) uses alpha_eff=0 so the
+    // mix term vanishes — matches the old host code which uploaded 0 while
+    // keeping fire_alpha for the next step's adaptation (W6).
+    const float alpha = (ctl[4*sid+2] > 1.5f) ? 0.0f : ctl[4*sid+1];
     const int mode = (int)(ctl[4*sid+2] + 0.5f);
     if (mode == 1) {                                   // parked/converged
         for (int i = lid; i < n3; i += lsz) vb[i] = 0.0f;

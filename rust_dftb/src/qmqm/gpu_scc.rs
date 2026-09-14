@@ -255,7 +255,7 @@ pub fn gpu_solve_scc_batched(
         // 6. Extract diag(H') on GPU → read N*batch floats → sort → occ_mask → upload
         // Phase 0d: uses extract_diagonal_batched kernel instead of reading
         // the full N²*batch matrix. Reduces readback by factor of N.
-        extract_diagonal_batched(rt, &hp, &eig_diag_buf, n, batch)?;
+        extract_diagonal_batched(rt, &hp, &eig_diag_buf, n, batch, &active)?;
         rt.read_buffer(&eig_diag_buf, &mut eig_diag)?;
         for bi in 0..batch {
             let mut idxs: Vec<usize> = (0..n).collect();
@@ -280,7 +280,7 @@ pub fn gpu_solve_scc_batched(
         build_density_masked_batched(rt, &c, &occ_mask, &d, &eig_diag_buf, 0, n, batch)?;
 
         // 9. q_new = Mulliken(D, S)
-        mulliken_charges_batched(rt, &d, s_buf, &q_new, orb_atom_buf, n, n_atoms, batch)?;
+        mulliken_charges_batched(rt, &d, s_buf, &q_new, orb_atom_buf, n, n_atoms, batch, &active)?;
 
         // 10. residual + mix
         residual_and_mix_batched(
@@ -331,7 +331,7 @@ pub fn gpu_solve_scc_batched(
     rt.read_buffer(&q_bufs[q_cur], &mut charges)?;
 
     // Eigenvalues: extract diagonal on GPU and sort ascending (Phase 0d)
-    extract_diagonal_batched(rt, &hp, &eig_diag_buf, n, batch)?;
+    extract_diagonal_batched(rt, &hp, &eig_diag_buf, n, batch, &active)?;
     rt.read_buffer(&eig_diag_buf, &mut eig_diag)?;
     let mut eigenvalues = vec![0.0f32; batch * n];
     for bi in 0..batch {
@@ -464,6 +464,8 @@ pub fn gpu_solve_scc_batched_diis_warmstart(
     let eig_diag_buf = rt.zero_buffer::<f32>(batch * n)?; // Phase 0d
     (q0_host, init_q_host, q_gpu, dq, v, h_scc, temp, hp, cp, c, d, q_new, tr, dot, occ_mask, eig_diag_buf)
     });
+    // legacy path: all replicas active (extract_diagonal gates on it)
+    let active = rt.buffer_from_slice(&vec![1i32; batch])?;
 
     // Host staging buffers
     // Phase 0d: extract only the diagonal (N*batch floats) instead of
@@ -515,7 +517,7 @@ pub fn gpu_solve_scc_batched_diis_warmstart(
         // Phase 0d: uses extract_diagonal_batched kernel instead of reading
         // the full N²*batch matrix. Reduces readback by factor of N.
         timed!(tm, t_occ_sort, {
-        extract_diagonal_batched(rt, &hp, &eig_diag_buf, n, batch)?;
+        extract_diagonal_batched(rt, &hp, &eig_diag_buf, n, batch, &active)?;
         rt.read_buffer(&eig_diag_buf, &mut eig_diag)?;
         for bi in 0..batch {
             let mut idxs: Vec<usize> = (0..n).collect();
@@ -538,7 +540,7 @@ pub fn gpu_solve_scc_batched_diis_warmstart(
         timed!(tm, t_density, build_density_masked_batched(rt, &c, &occ_mask, &d, &eig_diag_buf, 0, n, batch)?);
 
         // 9. q_new = Mulliken(D, S) — device-resident
-        timed!(tm, t_mulliken, mulliken_charges_batched(rt, &d, s_buf, &q_new, orb_atom_buf, n, n_atoms, batch)?);
+        timed!(tm, t_mulliken, mulliken_charges_batched(rt, &d, s_buf, &q_new, orb_atom_buf, n, n_atoms, batch, &active)?);
 
         // 10. CPU-driven DIIS mixing
         // Phase 0e: eliminated redundant q_gpu read — q_mixed_host from the
@@ -628,7 +630,7 @@ pub fn gpu_solve_scc_batched_diis_warmstart(
         rt.read_buffer(&q_gpu, &mut charges)?;
 
         // Phase 0d: extract diagonal on GPU instead of reading full N²*batch
-        extract_diagonal_batched(rt, &hp, &eig_diag_buf, n, batch)?;
+        extract_diagonal_batched(rt, &hp, &eig_diag_buf, n, batch, &active)?;
         rt.read_buffer(&eig_diag_buf, &mut eig_diag)?;
         let mut eigenvalues = vec![0.0f32; batch * n];
         for bi in 0..batch {

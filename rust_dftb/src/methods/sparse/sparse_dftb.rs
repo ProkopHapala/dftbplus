@@ -359,7 +359,14 @@ impl SparseDftb {
         // ── Frozen topology (R3): M_HS = SK cutoff + skin; M_K/M_Z default
         // to the same support (config can shrink them). All in Å units here
         // (mask built on Å coords with an Å radius; SK eval converts to Bohr).
-        let cut_bohr = builder.sk.pairs.values().map(|t| t.cutoff()).fold(0.0_f64, f64::max);
+        // Max over pairs ACTUALLY PRESENT in the system — load_sk_folder loads
+        // the whole directory, so an unrelated long table (e.g. pbc-0-3's
+        // F-O at 620 pts = 6.6 Å) must not inflate M_K/M_Z for an Si+H system
+        // (observed: deg_k=95 instead of the true ~56 at the Si/H 5.5 Å range).
+        let cut_bohr = builder.sk.pairs.iter()
+            .filter(|((a, b), _)| species_names.iter().any(|s| s == a) && species_names.iter().any(|s| s == b))
+            .map(|(_, t)| t.cutoff())
+            .fold(0.0_f64, f64::max);
         if !(cut_bohr > 0.0) {
             return Err(DftbError::InvalidInput(format!("SparseDftb: SK cutoff {cut_bohr}")));
         }
@@ -476,11 +483,18 @@ impl SparseDftb {
         }
         let max_left = deg_hs.max(deg_k).max(deg_z).max(deg_tzs).max(16);
         let max_left_blocks = ((max_left + 15) / 16 * 16) as i32;
+        let t_init0 = std::time::Instant::now();
         let gpu = SparseBsr4Gpu::new(SparseBsr4Config { max_left_blocks, ..Default::default() })?;
+        let t_init1 = std::time::Instant::now();
         let h_bsr = Bsr4Matrix::from_structure(n_atom, m_hs.0.clone(), m_hs.1.clone())?;
         let s_bsr = Bsr4Matrix::from_structure(n_atom, m_hs.0.clone(), m_hs.1.clone())?;
         let ws = SparseSystemWorkspace::new(gpu, &h_bsr, &s_bsr, &m_k, &m_z, m_tzs.as_ref(), &atom_n_orb, nocc)?;
         let dw_ws = SparseDWWorkspace::new(ws.gpu(), ws.k_struct(), ws.hs_struct(), ws.t_zs_struct())?;
+        if std::env::var("RUST_DFTB_PROF").map(|v| !v.is_empty() && v != "0").unwrap_or(false) {
+            eprintln!("[init] gpu_new(program compile)={:.1} ms  ws_new(plans+alloc)={:.1} ms",
+                t_init1.duration_since(t_init0).as_secs_f64() * 1e3,
+                t_init1.elapsed().as_secs_f64() * 1e3);
+        }
 
         let n_pad = n_atom * BS;
         let n_scc = SparseDftbEnergy {
@@ -493,7 +507,7 @@ impl SparseDftb {
         let diis_hist = cfg.diis_hist;
         let mix_alpha = cfg.mix;
         eprintln!(
-            "[SparseDftb] n_atom={n_atom} n_orbs={n_orbs} nocc={nocc} nnz_hs={} nnz_k={} nnz_z={} full_mask={full_mask} r_hs={r_hs_ang:.3} Å taper={:?} dense_diag={dense_diag}  valence_q0={q0:?}\n             deg_hs={deg_hs}/{bud_hs} deg_k={deg_k}/{bud_k} deg_z={deg_z}/{bud_z} deg_tzs={deg_tzs} MAX_LEFT_BLOCKS={max_left_blocks} (~{:.1} KiB local/WG)",
+            "[SparseDftb] n_atom={n_atom} n_orbs={n_orbs} nocc={nocc} nnz_hs={} nnz_k={} nnz_z={} full_mask={full_mask} r_hs={r_hs_ang:.3} Å r_full={r_full_ang:.3} Å taper={:?} dense_diag={dense_diag}  valence_q0={q0:?}\n             deg_hs={deg_hs}/{bud_hs} deg_k={deg_k}/{bud_k} deg_z={deg_z}/{bud_z} deg_tzs={deg_tzs} MAX_LEFT_BLOCKS={max_left_blocks} (~{:.1} KiB local/WG)",
             m_hs.1.len(), m_k.1.len(), m_z.1.len(), hs_taper,
             max_left_blocks as f64 * 64.0 / 1024.0
         );
@@ -527,6 +541,8 @@ impl SparseDftb {
 
     pub fn n_atom(&self) -> usize { self.n_atom }
     pub fn n_orbs(&self) -> usize { self.n_orbs }
+    /// Physical orbitals per atom (before BSR4 4-lane padding).
+    pub fn atom_n_orb(&self) -> &[u8] { &self.atom_n_orb }
     /// Relative TC2 tolerance ‖KSK−K‖/‖K‖. The achieved r_I sets the Mulliken
     /// charge noise floor — SCC rms cannot converge below ~r_I (Si10H16:
     /// tc2_tol=1e-4 gives r_I~2e-5 → SCC floor ~3e-6; a 1e-6 SCC target needs
@@ -570,6 +586,23 @@ impl SparseDftb {
     /// Host copy of the device K on its BSR structure (diagnostics /
     /// mask screening — not a hot path).
     pub fn k_bsr(&self) -> Result<Bsr4Matrix> { self.ws.k().to_host(self.ws.gpu()) }
+    /// Host Z ≈ S⁻¹ (diagnostics).
+    pub fn z_bsr(&self) -> Result<Bsr4Matrix> { self.ws.z().to_host(self.ws.gpu()) }
+    /// Stage-profiler report (`RUST_DFTB_PROF` gated — no-op when unset).
+    pub fn prof_report(&self, ctx: &str) {
+        self.ws.gpu().prof_report(&format!("SparseDftb {ctx} n={}", self.n_atom));
+    }
+    /// Restart the stage clock (e.g. before a measured region).
+    pub fn prof_reset(&self) { self.ws.gpu().prof_reset(); }
+
+    /// DIAGNOSTIC: inject host K values (must match M_K structure) — for
+    /// frozen-input experiments (§15.12 A3).
+    pub fn inject_k_bsr(&mut self, k: &Bsr4Matrix) -> Result<()> { self.ws.inject_k_values(&k.values) }
+    /// DIAGNOSTIC: purify the *current* device K against the current H_scc
+    /// (no K0 rebuild). For frozen-input experiments.
+    pub fn purify_current(&mut self) -> Result<(PurifyStatus, f32, f64, usize)> {
+        self.ws.tc2_purify(self.cfg.tc2_max, self.cfg.tc2_tol, 1)
+    }
     /// Host M_K mask (row_ptr, col_idx) — pairs with `k_bsr` ordering.
     pub fn m_k(&self) -> Result<(Vec<u32>, Vec<u32>)> {
         let g = self.ws.gpu();
@@ -617,13 +650,16 @@ impl SparseDftb {
             }
         }
         self.coords.copy_from_slice(coords);
+        self.ws.gpu().prof_reset();
         // SystemContext is O(n_atom + n_species²) table construction per
         // geometry — cheap vs the O(nnz) assembly/contraction, and not
         // storable in self (borrows &'a SkData → self-referential).
         let ctx = SystemContext::from_sk_data(&self.builder.sk, &self.species)?;
         assemble_hs_bsr(&ctx, &self.coords, &self.hs_pairs, &self.hs_diag, &self.onsite_orb, self.hs_taper, &mut self.h_bsr.values, &mut self.s_bsr.values)?;
+        self.ws.gpu().prof_tick("geom.hs");
         self.ws.upload_h0(&self.h_bsr)?;
         self.ws.upload_s(&self.s_bsr)?;
+        self.ws.gpu().prof_tick("geom.ul");
         // Dense f64 γ matrix (F6/R16): O(N²), rebuilt per geometry.
         for i in 0..self.n_atom {
             self.gmat[i * self.n_atom + i] = self.gamma.u(self.species_code[i]);
@@ -637,9 +673,11 @@ impl SparseDftb {
                 self.gmat[j * self.n_atom + i] = g;
             }
         }
+        self.ws.gpu().prof_tick("geom.gamma");
         self.e_rep = repulsive_energy_cached(
             &self.coords, &self.species_code, &self.species_names, &self.repulsive, self.n_species,
         )?;
+        self.ws.gpu().prof_tick("geom.rep");
         if !self.e_rep.is_finite() {
             panic!("set_coords: non-finite E_rep={} n_atom={}", self.e_rep, self.n_atom);
         }
@@ -707,6 +745,7 @@ impl SparseDftb {
 
     fn scc_inner(&mut self, max_iter: usize, rms_tol: f64) -> Result<SparseDftbScc> {
         let cap = max_iter.min(self.cfg.max_scc).min(SCC_MAX);
+        self.ws.gpu().prof_reset();
         if !self.z_valid {
             // Warm-start NS from the previous geometry's Z when available —
             // cold fallback on stall/non-finite is built into compute_z.
@@ -715,6 +754,7 @@ impl SparseDftb {
             self.z_valid = true;
             self.z_warm = true;
         }
+        self.ws.gpu().prof_tick("ns");
         let mix = self.cfg.mix;
         let mut rms_prev = f64::INFINITY;
         let mut n_rescue = 0usize;
@@ -722,7 +762,9 @@ impl SparseDftb {
         for it in 0..cap {
             self.compute_v();
             for i in 0..self.n_atom { self.v_f32[i] = self.v[i] as f32; }
+            self.ws.gpu().prof_tick("scc.v");
             self.ws.build_hscc_from_v(&self.v_f32)?;
+            self.ws.gpu().prof_tick("scc.hscc");
             let env_flag = |name: &str| std::env::var(name).map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false);
             let use_trs = self.cfg.purifier_trs.unwrap_or_else(|| env_flag("RUST_DFTB_TRS"));
             let use_p = self.cfg.purifier_p.unwrap_or_else(|| env_flag("RUST_DFTB_P_TC2"));
@@ -733,6 +775,7 @@ impl SparseDftb {
             } else {
                 self.ws.purify_hscc(self.cfg.tc2_max, self.cfg.tc2_tol)?
             };
+            self.ws.gpu().prof_tick("scc.purify");
             if pstat == PurifyStatus::NumericalFloor && !self.cfg.accept_numerical_floor.unwrap_or(true) {
                 return Err(DftbError::InvalidInput(format!(
                     "SparseDftb SCC iter {it}: TC2 reached NumericalFloor (R_I={r_i:e} > tol={}) — energies/forces NOT validated; accept_numerical_floor=false", self.cfg.tc2_tol
@@ -745,6 +788,7 @@ impl SparseDftb {
                 )));
             }
             let q_new = self.mulliken_checked(tr, it)?;
+            self.ws.gpu().prof_tick("scc.mull");
             let mut rms = 0.0f64;
             let mut max_dq = 0.0f64;
             for a in 0..self.n_atom {
@@ -809,6 +853,7 @@ impl SparseDftb {
                     self.q[a] = (1.0 - mix) * self.q[a] + mix * q_new[a];
                 }
             }
+            self.ws.gpu().prof_tick("scc.mix");
             rms_prev = rms;
         }
         Err(DftbError::InvalidInput(format!(
@@ -825,6 +870,7 @@ impl SparseDftb {
     fn finalize_scc(&mut self, q_out: &[f64], mut info: SparseDftbScc) -> Result<SparseDftbScc> {
         // State = q_in (self.q) — K, H_scc, V all built from it this iter.
         let r_h = self.ws.rh_stationarity()?;
+        self.ws.gpu().prof_tick("scc.fin");
         if self.dense_diag {
             self.materialize_dense_diag()?;
         }
@@ -833,8 +879,8 @@ impl SparseDftb {
         self.last.r_h = r_h as f32;
         self.last.q = self.q.clone();
         eprintln!(
-            "  [SparseDftb] converged  r_scc={:.3e}  Tr(KS)={:.6}  r_I={:.3e}  R_H={:.3e}  E_tot={:.8}  (q_out len {})",
-            info.r_scc, info.tr_ks, info.r_i, r_h, self.last.e_tot, q_out.len()
+            "  [SparseDftb] converged  r_scc={:.3e}  Tr(KS)={:.6}  r_I={:.3e}  R_H={:.3e}  E_band={:.6}  E_scc={:.6}  E_rep={:.6}  E_tot={:.8}  (q_out len {})",
+            info.r_scc, info.tr_ks, info.r_i, r_h, self.last.e_h0, self.last.e_scc, self.last.e_rep, self.last.e_tot, q_out.len()
         );
         Ok(info)
     }
@@ -950,14 +996,18 @@ impl SparseDftb {
                 .unwrap_or(true)   // identity verified — on unless disabled
         });
         self.dw_ws.build_dw_into(gpu, self.ws.k(), self.ws.h_scc(), self.ws.b_zh(), w_zk)?;
+        gpu.prof_tick("f.dw");
         gpu.read_f32(&self.dw_ws.w().values, &mut self.w_vals)?;
         gpu.read_f32(&self.ws.k().values, &mut self.k_vals)?;
+        gpu.prof_tick("f.dl");
         let ctx = SystemContext::from_sk_data(&self.builder.sk, &self.species)?;
-        sparse_forces_bsr(
+        let r = sparse_forces_bsr(
             &ctx, &self.coords, &self.hs_pairs, &self.k_diag,
             &self.k_vals, &self.w_vals, &self.v, &self.q, &self.q0,
             &self.gamma, &self.repulsive, self.hs_taper,
-        )
+        );
+        gpu.prof_tick("f.contract");
+        r
     }
 
     /// One FIRE step. Call `scc` first. Returns max |F|.

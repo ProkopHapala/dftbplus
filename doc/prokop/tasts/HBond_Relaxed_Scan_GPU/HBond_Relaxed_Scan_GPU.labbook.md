@@ -1062,3 +1062,162 @@ bisection + occ_w upload entirely. `select_occupation_batched` kept
 GC relax identical: 45 steps, max|F|=8.08e-4, E=−44.9278022,
 |dE−CPU|=2.5e-6, max|ΔF|=6.4e-6. gpu_dftb 6/6, batch=4 mixed scan:
 same statuses + masked retry.
+
+## 2026-09-13 (c) — R1: zero per-iteration set_arg
+
+**Change.** Every per-iteration kernel is now fully argument-bound:
+io buffers (h0/s/g/q0/oa) bound once in `GpuSccPlan::new`; solve scalars
+(n_occ/kT-dependent use_w, n_den, occ_repair) via `bind_solve_params`;
+mixer scalars (alpha, rms_tol) via `bind_mix_params`; both called once
+per solve. Warm/cold branches use separate persistent kernel handles
+(`k_matmul_*_warm`, `k_jacobi_warm`, `k_dot`/`k_dot_q0`,
+`k_renorm_c`/`k_renorm_cp`, `k_sc_prod_c`/`k_sc_prod_cp`) — the warm
+c-bound variants exist only for n>64. Zero `set_arg` in the SCC loop.
+
+**Bugs found while reviving stale tests.** `tests/gpu_scc.rs` +
+`tests/gpu_hbond_physics.rs` predated the W4 `rms_tol` param and the
+commit-model split — they did not compile at HEAD and had silently
+skipped. Resurrected → exposed two real issues:
+- `scc_step`/`scc_step_diis` never committed q_next → q_gpu (wrappers
+  enqueued the mixer only). The synchronous single-step API now calls
+  `k_commit` itself — safe because the device `active` mask already
+  protects replicas marked done in-kernel (their q_next is stale).
+- `GpuForceDriver::gpu_gamma_deriv_force_batched` (test-only path)
+  bound only 8 of 12 kernel args — the D8 gamma-spline table args
+  (gamma_spl/nk/dr/r_max) were never added there. Fixed to match the
+  production `k_gamma_f` binding.
+
+**Measured (batch=19, N=86, mark mode, test_gpu_ptscan_gc):**
+`scc.hscc` host stage 0.68 → 0.040 ms/call (17×), all per-iteration
+stages now 3–40 µs host each; `scc.chunkend` (1123 ms/157 calls ≈
+7.2 ms/chunk ≈ 0.9 ms GPU/iter) absorbs the real device work. Scan
+physics unchanged: 19 replicas converge, E(r) barrier 16.3→6.8 kcal/mol
+descending to d=1.9 Å, max|F|=9.99e-4.
+
+**Tests:** gpu_dftb 6/6, gpu_hbond_physics 22/22 (with RUST_DFTB_SK_DIR),
+gpu_tiled_jacobi 4/4 (+2 ignored benches), gpu_scc 6/6 (SK-dir skipped
+cases vacuous).
+
+## 2026-09-13 (d) — R3: OpenCL event profiling → TRUE GPU stage times
+
+**Change.** `RUST_DFTB_PROF=evt`: queue created with
+CL_QUEUE_PROFILING_ENABLE; each prof_tick enqueues a marker event
+(in-order queue brackets all prior device work); timestamps drained
+LAZILY at natural syncs (finish/read_buffer/report — never inline-wait).
+Prints `[prof-dev]` table alongside the host table. ~1 marker/tick.
+
+**The tick-mode attribution was wrong.** GPU-truth per call (batch=19,
+N=86, ~0.95 ms GPU/iter):
+- scc.jacobi      0.636 ms  (67%) ← THE bottleneck
+- scc.fermi_occ   0.067 ms  ( 7%)
+- scc.density     0.053 ms  (5.5%)
+- scc.rayleigh    0.040 ms  ( 4%)
+- scc.diis        0.033 ms
+- gemm_th + th2   0.033 ms  (projection GEMMs are cheap)
+- scc.eigh_finish 0.021 ms
+- scc.hscc        0.014 ms  (1.5% — never the problem)
+- select_occ+extract_diag+commit+mulliken ≈ 0.02 ms combined
+
+**Consequence:** R2/R4 (hscc/GEMM fusion) deprioritized — 1.5% and 3.5%
+of iter. Wall-vs-device: 1.53 s wall vs ~1.44 s device work → ~94%
+GPU-bound; host enqueue overhead is dead (R1+R3 confirm). The remaining
+removable launches are fermi_occ+select_occ+extract_diag (R5 → fold into
+Jacobi tail, ~8% of iter) and rayleigh (R6, ~4%). Jacobi itself (0.64
+ms/call at batch=19) is the real elephant — but per §15.C the multi-WG
+question must be measured at production batch, not batch 19.
+
+## 2026-09-13 (e) — R5/R6/R7: Jacobi-tail Fermi, rayleigh out of loop, commit fused
+
+**R5.** `jacobi_cyclic_global_batched` gained a Fermi tail (fermi_tail,
+n_occ, kT, occ_w, mu args): staged spectrum → safeguarded Newton
+(2×f64 WG reductions/iter, bisection fallback, warm-started from the
+persistent mu buffer) → occ_w+mu written on exit. ~1 µs/call added to
+Jacobi (891 vs 890 ms total) — the solve is essentially free inside the
+same WG. Replaces fermi_occ (0.067 ms/call) + select_occ (0.007) +
+in-loop extract_diag (0.004). `RUST_DFTB_FERMI_REF=1` keeps the W5 chain
+as certified reference. occ_normalize_batched gained a use_w predicate
+(renorm all weighted columns — the integer mask is not maintained under
+smearing); `measure` derives its mask from occ_w>0.5 when kT>0. n≤64
+path unchanged (local Jacobi has no tail → W5 kernel still used there).
+
+**R6.** occ_rayleigh removed from the SCC loop — ρ_k is consumed only by
+energy_from_state/build_edm on the finalized state, which already runs
+it. In-loop ρ was dead weight (any committed step leaves the state
+stale → eval always re-finalizes). −0.040 ms/iter.
+
+**R7.** diis_step_batched arg6 (q_next) bound to q_gpu: the kernel now
+commits the mixed iterate in place for still-active replicas; converged/
+failed replicas return before the mix (commit semantics folded in).
+commit_q_batched deleted from the chunk loop and scc_step_diis — and the
+mix=0 reference branch skips set_active+commit (stale q_next would
+corrupt q_gpu). mix=1/2 (residual_mix / host DIIS) still use q_next.
+
+**Measured (batch=19, N=86, evt mode):** per-iter GPU 0.95 → ~0.84 ms
+(−12%); loop = 7 launches (hscc, gemm×2, jacobi, renorm, density,
+mulliken, diis). PT scan E(r) identical to W5-era within 1e-6 Ha;
+barrier peak 19.7 kcal/mol at d=1.35, converged. Remaining device work:
+jacobi 80%, density 6.5%, diis 4%, gemms 4.5%, everything else ~5%.
+The next real lever is INSIDE Jacobi (sweep count, JACOBI_PREC=0 A/B,
+warm-start quality) — launch geometry is done; hscc is 1.4% of iter.
+
+**Tests:** gpu_dftb 6/6 (+FERMI_REF A/B), gpu_hbond_physics 22/22.
+
+## 2026-09-14 (f) — W8+W6b+W9b+W13+W7+W12+R8b: architecture sweep, accuracy/perf status
+
+### Work landed this session (all verified, 45/45 GPU tests)
+
+- **W8** `assemble_pairs_geom`: pair geometry (r,l,m,n) computed in-kernel
+  from `buf_coords_bohr`; `refresh_pair_geom` launch dead; `onsite_done`
+  once-only. fire.assemble 0.14→0.10 ms/call.
+- **W6b** `park` mask gates assemble/forces/γ/repulsive; `set_coords`
+  un-parks. Parked replicas keep frozen (stale=geometry-correct) data.
+- **W9b** atomic-scatter → per-pair `pair_f` write + `force_gather_pairs`
+  CSR atom gather (deterministic, sole writer of the pair term).
+  fire.force_kernels 0.51→0.30 ms/call (−42% cumulative vs pre-fusion).
+- **W13** DIIS solve → pivoted f64 MGS-QR on residual history; dependent
+  columns dropped by pivot; Σc=1 via two κ(R) triangular solves.
+- **W7** `metric_residual_batched` → true row-sum ‖·‖∞; both Newton
+  repairs early-accept via `e₁≤¾e₀²+¼e₀³` (skips T2/G1/e1 GEMMs + one
+  read when certified). One host branch read remains per attempt.
+- **W12** `energy_reduce_batched`: f64 scalar tails (e_band, Mermin,
+  Δq·V, q0·V) → `e_scal[batch×4]`, one readback replaces six.
+- **R8b** `RUST_DFTB_JACOBI_REPORT` sweep/stop histogram +
+  `RUST_DFTB_JACOBI_OFF_TOL` env knob.
+
+### Accuracy / convergence limits (measured)
+
+Single-geometry parity vs CPU f64 (`test_gpu_dftb_gc_azaindole.rhai`,
+tol=1e-6, kT=0.002):
+
+| metric | GC (N=86) | azaindole (N=84) |
+|---|---|---|
+| SCC rms @tol=1e-6 | 9.0e-7 (16 it) | 6.5e-7 (16 it) |
+| \|ΔE GPU−CPU\| | 5.3e-7 Ha | 1.4e-6 Ha |
+| max\|ΔF\| | 4.8e-6 Ha/B | 5.7e-6 Ha/B |
+| max\|Δq\| | 3.3e-6 | 5.2e-6 |
+| ‖HC−SCε‖∞ | 1.8e-6 | 1.0e-6 |
+| ‖XᵀSX−I‖∞ | 4.5e-7 | 6.9e-7 |
+
+SCC floor probe (GC, tol sweep): 1e-5→rms 3.7e-6 · 1e-6→9.0e-7 ·
+1e-7→1.6e-8 (32 it) · 1e-8→underflow. **Energy wanders ~1e-6 Ha across
+tolerance — the f32 eigen/density floor, not SCC.** Production tol 1e-5
+is ~4× above the noise floor on rms and already at the energy floor.
+
+### Performance (RTX 3090, evt, N=86)
+
+- 19-pt relaxed GC scan: **1.09 s total, 57.5 ms/pt, 143 FIRE steps**
+- SCC warm scaling (8 iters/scc): batch 1 → 40 µs/iter/sys; 256 → 0.96;
+  512 → 1.00; **1024 → 0.87 µs/iter/system** — linear to ≥1024.
+- Stage share (relax): scc.jacobi **58.5% dev** · scc.density 6.0% ·
+  scc.diis 4.0% · gemm_th+th2 4.6% · fire.set_geometry 4.3% ·
+  fire.force_kernels 3.9% · relax.eval 4.9% · everything else <14%.
+- Readbacks per relax: 2068 (was 2788 pre-W12); finishes=reads.
+
+### R8b verdict — where the 58% Jacobi actually goes
+
+Warm-started H-Jacobi exits at **0 sweeps** (entry off/‖A‖_F≈3.5e-7,
+below every tol in {1e-4…1e-7}; cold solves take 1 sweep; stop=0
+everywhere). `JACOBI_OFF_TOL` is a no-op on the warm path. The cost is
+the kernel **prologue**: V=I init (n² writes) + ‖A‖_F/off reductions
+(2×n² reads) + diag write — paid even at nsw=0. Follow-up target:
+early-out the prologue (or fuse V-write into eigh_finish when nsw=0).

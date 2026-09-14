@@ -748,6 +748,13 @@ impl SparseBsr4Gpu {
         self.rt.queue()
     }
 
+    /// Stage profiler passthroughs (`RUST_DFTB_PROF` gated; see `GpuRuntime::Prof`).
+    pub fn prof_tick(&self, name: &'static str) { self.rt.prof_tick(name); }
+    /// Restart the stage clock (evt mode inserts a device anchor marker).
+    pub fn prof_reset(&self) { self.rt.prof_reset(); }
+    /// Print the accumulated stage table.
+    pub fn prof_report(&self, title: &str) { self.rt.prof_report(title); }
+
     // ------------------------------------------------------------------
     // Low-level kernel launches
     // ------------------------------------------------------------------

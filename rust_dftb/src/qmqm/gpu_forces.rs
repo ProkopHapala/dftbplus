@@ -312,6 +312,17 @@ impl GpuForceDriver {
             .build()
             .map_err(map_ocl_err)?;
 
+        // D8: the kernel needs the shared γ spline table (same as
+        // GpuDftb's k_gamma_f binding) — build it from the Hubbard U's.
+        let u64: Vec<f64> = u_hub.iter().map(|&u| u as f64).collect();
+        let gspl = crate::methods::dftb::gamma_spline::GammaSpline::new(
+            &u64,
+            crate::methods::dftb::gamma_spline::GAMMA_SPLINE_NK,
+            crate::methods::dftb::gamma_spline::GAMMA_SPLINE_RMAX,
+        )?;
+        let buf_gamma_spl = upload_f32(queue, &gspl.knots)?;
+        let buf_park = upload_i32(queue, &vec![1i32; batch])?;   // W6b: all live
+
         let wg = 256usize;
         let k = Kernel::builder()
             .program(&self.program)
@@ -321,7 +332,10 @@ impl GpuForceDriver {
             .local_work_size(wg)
             .arg(n_atoms as i32).arg(batch as i32)
             .arg(&buf_coords).arg(&buf_species).arg(&buf_dq).arg(&buf_u_hub)
-            .arg(n_species as i32).arg(&buf_forces)
+            .arg(n_species as i32)
+            .arg(&buf_gamma_spl).arg(gspl.nk as i32)
+            .arg(gspl.dr as f32).arg(gspl.r_max as f32)
+            .arg(&buf_forces).arg(&buf_park)
             .build()
             .map_err(map_ocl_err)?;
         unsafe { k.enq().map_err(map_ocl_err)?; }
@@ -375,6 +389,7 @@ impl GpuForceDriver {
             .build()
             .map_err(map_ocl_err)?;
 
+        let buf_park = upload_i32(&queue, &vec![1i32; batch])?;   // W6b: all live
         let wg = 256usize;
         let k = Kernel::builder()
             .program(&prog)
@@ -385,6 +400,7 @@ impl GpuForceDriver {
             .arg(n_atoms as i32).arg(batch as i32)
             .arg(&buf_coords).arg(&buf_species).arg(&buf_offsets)
             .arg(n_species as i32).arg(&buf_spline_data).arg(&buf_forces)
+            .arg(&buf_park)
             .build()
             .map_err(map_ocl_err)?;
         unsafe { k.enq().map_err(map_ocl_err)?; }

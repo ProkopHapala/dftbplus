@@ -7,6 +7,17 @@ timestamp: 2026-09-09
 
 # HBond_Relaxed_Scan_GPU — Phase 4 hand-off report
 
+> **2026-09-14 status addendum (read this first).** The P4-era blockers
+> below (1×4 crash, atomic accumulation, missing γ′/repulsive forces,
+> Neville tail) are **all stale** — the production solver is now a
+> persistent batched `GpuDftb` with device-resident SCC, DIIS, FIRE,
+> constraints, and deterministic gather-based forces. Current verified
+> state: **45/45 GPU tests**, 19-pt relaxed GC scan **1.09 s**
+> (57.5 ms/pt, 143 FIRE steps), energy parity vs CPU f64 **|ΔE| ≈ 5e-7–
+> 1.4e-6 Ha**, force parity **max|ΔF| ≈ 5e-6 Ha/B**, SCC floor
+> rms≈1.6e-8 at tol 1e-7 (16–32 iters), warm SCC **~0.9 µs/iter/system
+> at batch 1024**. See "Current state (2026-09-14)" section at the end.
+
 > **2026-09-10 addendum (read this first).** Package 2 on `GpuDftb` (NVIDIA 3090
 > `--release`) refutes “AT `|dE|~2.6e-5` = occupied-ε 2.5e-5”. Frozen-H
 > `max|δε_occ|~1e-6`; `|dE|` tracks `δ_CH` (band vs `CᵀHC`). Löwdin Newton is in;
@@ -178,6 +189,73 @@ real SK data, not the s-p logic in isolation.
    `tests/gpu_forces.rs` once the work is validated.
 
 ---
+
+---
+
+## Current state (2026-09-14)
+
+### Verified accuracy / convergence limits
+
+Measured on GC (N=86) + azaindole dimer (N=84), `mix=0`, kT=0.002 Ha,
+tol=1e-6 (`scripts/test_gpu_dftb_gc_azaindole.rhai`):
+
+- **Energy parity vs CPU f64:** |ΔE| = 5.3e-7 (GC) / 1.4e-6 Ha (aza)
+- **Force parity:** max|ΔF| = 4.8e-6 / 5.7e-6 Ha/B
+- **Charge parity:** max|Δq| = 3.3e-6 / 5.2e-6
+- **Eigenproblem:** ‖HC−SCε‖∞ ≈ 1.8e-6; ‖XᵀSX−I‖∞ ≈ 4.5e-7
+- **SCC floor:** rms reaches 1.6e-8 at tol=1e-7 (32 iters); energy
+  reproducibility across tolerance ≈ 1e-6 Ha — set by the f32
+  eigen/density floor, not by SCC convergence. Production tol=1e-5 is
+  already at the energy floor.
+
+### Verified performance (RTX 3090, `--release`, evt profiling)
+
+- **19-point relaxed GC proton-transfer scan:** 1.09 s total,
+  57.5 ms/point, 143 FIRE steps, converged max|F|≈1e-3 Ha/B.
+- **SCC throughput scales linearly to ≥1024 replicas:**
+  40 → 0.96 → 0.87 µs/iter/system at batch 1 → 256 → 1024.
+- **Stage share in relax:** scc.jacobi 58.5% dev · density 6% · diis 4% ·
+  projection GEMMs 4.6% · set_geometry 4.3% · force_kernels 3.9% ·
+  eval 4.9%.
+- **Readbacks:** 2068 per relax (one per blocking scalar decision; no
+  per-iteration sync — chunked SCC).
+
+### Architecture (all §14 invariants enforced)
+
+- No global atomics in force paths (W9b: per-pair write + CSR gather);
+  γ′/repulsive keep their 1–2 terms/atom adds.
+- Zero allocs/kernel builds in solver loops (I3 guard test).
+- Device-side convergence + active/park masks isolate finished replicas.
+- f32 bulk; f64 only on scalar tails: DIIS pivoted-QR solve (W13),
+  energy reduction (W12), Newton metric bound (W7).
+- Geometry computed in-kernel from device coords (W8); park mask gates
+  pair/γ/repulsive work (W6b); FIRE control device-resident (W6).
+
+### Distance to production for small-dense H-bond scanning
+
+**Functionally ready now** for the stated target (≈84–87 orbitals,
+hundreds–thousands of scan geometries, FIRE relaxation with distance
+constraints). Proven: batched SCC parity, analytic forces, FIRE relax
+with per-replica constraints, device-resident control, linear batch
+scaling to 1024, 19-pt relaxed scan end-to-end.
+
+Remaining before calling it production (ranked):
+
+1. **Jacobi warm-path prologue (R8b finding).** 58% of device time is
+   the kernel's fixed V-init + off-norm prologue — warm solves run 0
+   sweeps. An early-out or fused-V path could cut dev time ~2×.
+2. **Real distinct-geometry batch ≥200 run** — scaling was measured on
+   identical replicas; a production-size scan (e.g. 21×21) should
+   exercise it once.
+3. **W9b residuals:** `e_atom` emission, p–p register-spill reduction,
+   `PAIR_WG` tuning — all perf polish, none blocking.
+4. **Park-mask GEMM gating** — metric-repair GEMMs still run for parked
+   replicas (harmless, small).
+5. **`md_step` half-kick fix or rename** — not velocity-Verlet.
+
+Known non-blocking limits: energy floor ~1e-6 Ha vs f64 reference (f32
+eigen/density floor — acceptable for kcal/mol scan resolution);
+max|F| converge ~1e-3 Ha/B typical.
 
 ## Links
 

@@ -1494,6 +1494,139 @@ Parity run `debug/pbc_parity_R14/` (DFTB+ dev build, SCC, pbc-0-3):
 not yet trustworthy — 2 Ha off DFTB+. Parity must be resolved before
 pbc is the production basis.**
 
+## 2026-09-14 — parity root-caused: it's the purification floor, not an engine bug
+
+**Review correction (2026-09-14):** preserve the measurements below, but the intrinsic-f32-floor attribution and “post-hoc repair fails” conclusion are not established. Read the appended **Speed–accuracy source review** and manifest **§15.12**: production NS has a normalization defect, and the purported f64 McWeeny experiment implements a different map with f32 intermediate storage.
+
+Energy decomposition at the converged state (deg_k=95, r_k=7.6 Å):
+
+| term | Rust sparse | DFTB+ | Δ |
+|------|------------|-------|---|
+| Tr(K·H0) / "Energy H0" | −846.632 | −848.607 | **+1.975 Ha — all of it** |
+| E_scc (½ΣΔqγΔq) | +0.093 | +0.096 | ~0 |
+| E_rep | +1.4211 | +1.4211 | 0 |
+| net Δq | Si +0.0254, H −0.0523 | Si +0.0254, H −0.0529 | ~1e-3 |
+
+Charges, SCC term, and repulsive all match — the **entire 2 Ha is the
+band term Tr(K·H0)**, i.e. the purified K is not the true projector
+even though its Mulliken populations are right.
+
+Mask sweep (r_k = r_z, r_trunc=5.45 fixed, R14/pbc):
+
+| r_k (Å) | deg_k | R_I floor | E_tot | dE vs DFTB+ |
+|---------|-------|-----------|-------|--------------|
+| 7.6 | 95 | 4.2e-3 | −845.117 | +1972 mHa |
+| 9.0 | 168 | 2.4e-3 | −846.455 | +634 mHa |
+| 12.0 | 386 | 9.9e-4 | −846.939 | +151 mHa |
+
+**dE ∝ R_I²** (ratios 1.75→3.1, 2.4→4.2): the gap is the purification
+residual, which is mask-driven. Controls: (a) DFTB+ non-SCC run gives
+E_H0=−848.727 — the Rust single-purification is already ~3 Ha off, so
+this is purification of H0 alone, no SCC-state dependence; (b) pbc
+HOMO–LUMO gap is 2.43 eV — not a small-gap problem; (c) wide-Z-only
+(r_z=8, K at 7.6) did NOT help — the binding constraint is the K mask.
+
+**Consequence (sobering): the pbc DM in the K representation is not
+more local than matsci.** ~150 mHa remains at deg-386/12 Å — same as
+matsci's full-mask accuracy at the same degree. The observed "13×
+speedup" at deg-95 was bought with 2 Ha of purification error; pbc's
+real win so far is only the short H/S table (deg_hs 56 vs ~356),
+which cheapens H_scc assembly and the masked traces — not the loop
+matrix itself. Whether the occupied projector is more compressible on
+a *magnitude-selected* graph (top-k) or via LNV refinement remains the
+open question — exactly GPT-5.6's program.
+
+**Bug found & fixed — `cut_bohr` sized the "full" mask off unrelated
+SKF tables.** `load_sk_folder` loads every .skf in the directory and
+`cut_bohr` took the max over ALL of them; pbc-0-3's F-O.skf (620 pts)
+set r_full=7.59 Å for an Si+H system whose true table end is 5.5 Å
+(→6.54 Å). This fully explains the "deg 52→95" mystery: the deg-95
+mask was r=7.6 Å, not 6.5 Å — no bulk shell needed. Fixed by
+filtering `pairs` to species present in the system
+(`sparse_dftb.rs` ~line 362). NOTE: after the fix the default
+(r_k=None) pbc mask is deg~56 and **SCC fails to converge there** —
+the earlier deg-95 "converged" run was accidentally using 7.6 Å.
+matsci unaffected (uniform 20 bohr tables).
+
+**Also: the "nondeterministic" TC2 blowup is deterministic.** The same
+config diverges identically (iter 62, R_I=0.78, Tr=1508.69) whenever
+`tc2_tol` is left at the tighter default; the earlier parity script set
+`tc2_tol=1e-5` which stops TC2 at its plateau. The purifier on pbc is
+genuinely marginal — pushing past the R_I floor destabilizes it.
+
+### Follow-on experiments same day
+
+**T1 — wide Z does NOT rescue narrow K** (r_z=9 → deg_z=168 fixed,
+r_k swept): deg_k 21–52 diverge, 56 converges dirty (+2975 mHa),
+78 → +2317, 168 → +634. The K matrix itself needs the width — Z is
+not the binding constraint.
+
+**Near-complete mask is still f32-floored:** r_k=14 → deg 630/864
+converged to R_I=7.1e-4, E=−847.043 (**+46 mHa**). The R_I floor
+flattens (deg386→9.9e-4, deg630→7.1e-4) — at the wide end the residual
+is f32-SpGEMM roundoff, not mask starvation. **Consequence: mHa-accurate
+sparse energies on pbc need compensated accumulation or LNV — wider
+masks alone saturate at ~50 mHa.** (matsci deg-356 R_I=6.2e-4 → 52 mHa
+sits on the same dE≈1e8·R_I² curve — one law across basis sets.)
+
+**T4 — top-k oracle on pbc** (ref = r_k=12 deg-386, E=−846.939):
+magnitude-selected graphs beat radial ~4× per degree but the DM is
+heavy-tailed:
+
+| top-k | deg after symmetrize | dE vs deg-386 ref |
+|-------|---------------------|-------------------|
+| 32 | 63 | +1365 mHa |
+| 48 | 86 | +476 mHa |
+| 64 | 113 | +345 mHa |
+| 96 | 173 | +125 mHa |
+| 128 | 235 | +34 mHa |
+
+vs radial: deg~86 radial ≈ +1822 mHa vs top-48's +476. Top-k is the
+right direction but does NOT reach deg-64-accurate alone — the last
+mile needs LNV (variational in-mask refinement) or compensated f32.
+Caveat: symmetrization roughly doubles the per-row degree.
+
+**f32 floor confirmed — constant per atom.** R10 sphere (330 atoms,
+COMPLETE mask deg 330/330, zero truncation): R_I=4.9e-4, E=−298.1696
+vs DFTB+ −298.1869 → **+17.3 mHa = 52 μHa/atom**. R14 deg-630: 46 mHa
+/864 = 53 μHa/atom. Same per-atom purification roundoff → the f32 floor
+scales linearly with N and is INDEPENDENT of mask and basis. The 2 Ha
+"parity gap" is now fully explained: mask-driven R_I at deg-95 ≫ the
+f32 floor; the engine itself is exact (P-TC2 also converges on pbc at
+deg-168: E_P=−899.21 vs DFTB+ band −900.01; E_K identical to K-TC2).
+
+**Revised conclusion:** for ~mHa accuracy the binding constraint is no
+longer the mask — it is f32 accumulation in the purifier. The deferred
+Kahan/ACC8 work is an *accuracy* requirement, not a micro-optimization;
+alternatively LNV variational refinement on the fixed mask minimizes
+E directly and can beat the R_I² curve.
+
+**Post-hoc repair fails (decisive):** host-f64 checks on the converged
+R10 K (complete mask): device f32 trace is accurate to 8 μHa — the K
+itself is defective. f64 McWeeny iteration K←2K−KSK **diverges** from
+it (R_I 7.5e-4 → 7e-3, E drifts away) — the f32-TC2 fixed point is
+displaced in the *subspace*, not just noisy; no post-hoc polish can
+fix it. (Possibly aggravated by the trace guard's 0.987× rescale moving
+K off the purification manifold mid-run.) Remediation must live inside
+the purification loop: compensated SpGEMM accumulation or LNV.
+
+**Ruled-out cheap fixes (all measured on R10/pbc complete mask):**
+- `RUST_DFTB_SPGEMM_ACC8=1` (8-way accumulators): R_I identical —
+  accumulation ORDER is not the floor.
+- `RUST_DFTB_TC2_GUARD=0` (no trace rescale): R_I identical — the
+  26 guard fires are symptom, not cause.
+- Tighter spectral bounds: E_DUMMY=2.0→0.8 tightened Gershgorin ~3×
+  (dummy lanes ARE the emax=2.34 — physical spectrum tops at +0.24)
+  but R_I got *worse* (4.9e-4→8.4e-4) — the loose bound smooths the
+  Fermi step; bounds are NOT the floor mechanism. Also: dummy lanes
+  must stay *inside* the map — explicit emin/emax override crashed on
+  "dummy-orbital occupation 6.0" (padded lanes at ε=2.0 outside a tight
+  map get occupied). Reverted.
+- Dense-CPU cross-check unusable: `run_dftb_scc` mixer diverges on
+  R10/pbc (RMS~2.2), and `run_dftb_nonscc` counts n_electrons=330
+  (1/atom — wrong q0 parsing for this system). Dense path needs its
+  own bugfix before it can serve as reference; DFTB+ remains the truth.
+
 ## GPT-5.6 reframing (chat line 5855+): 95 is NOT a proven floor
 
 Key correction: "failure when K, Z and intermediates are all chopped by
@@ -1509,3 +1642,181 @@ semantics, not a localization length. Audit needed.
 The performance objective is NOT "every matrix ≤ 64 neighbors" — it is
 "the matrix multiplied 10–30×/SCC iter (P or K) has degree ~64". Z is
 built once per geometry; wide Z is cheap.
+
+## 2026-09-14 — Speed–accuracy source review
+
+**Scope/status:** current-working-tree source analysis and documentation only. No solver edits, GPU tests or new timings. Historical numerical results below are reported observations, not independently rerun measurements. Existing uncommitted work is preserved. New implementation tickets in manifest §15.12 remain open/unverified.
+
+**Recommendation:** keep f32 BSR4 and planned gather products. Spend accuracy on a trustworthy inverse/initial projector and final force state; spend less work in early SCC and after evidenced stagnation. Smooth energy offsets may be acceptable for scans/vibrations, but charge convergence alone cannot certify their derivatives. Do not prescribe Kahan, double-single storage, LNV or a universal degree before resolving the inexpensive diagnostic defects.
+
+### Confirmed source findings
+
+1. **NS stopping understates the residual by √N.** `sparse_system.rs::compute_z` (reviewed line 724) computes `sqrt(r2)/n_orb`; its documented contract is `sqrt(r2)/sqrt(n_orb)`. `gpu_sparse.rs::identity_residual_to_f64` and `bsr4_identity_residual_partial` confirm that r2 is the squared Frobenius sum. For R10/330 atoms and R14/864 atoms the factors are **36.33 and 58.79**, using 4 padded orbitals/atom. With `ns_tol=1e-4`, acceptance permits the documented residual up to **3.63e-3 and 5.88e-3**. These are acceptance bounds, not measurements of the returned inverse. The pbc parity script and `sparse_f64check.rs` use that tolerance.
+
+   `test_ns_device_residual_contract` compares two independently recomputed residuals using √N, but only **prints** the production `rz_reported`; it never asserts agreement with it. This permits the normalization bug to escape the test. Inaccurate Z contaminates ZH/ZHZ initialization and the default W shortcut. Its contribution to the energy error must be measured; this review does not claim it explains all 17.3 mHa.
+
+2. **The polish experiment is neither McWeeny nor an f64 iteration.** `tests/sparse_f64check.rs::f64_host_trace` repeats `K←2K−KSK`; true generalized McWeeny is `K←3KSK−2KSKSK`. For the implemented map an empty-state occupation ε becomes approximately 2ε: repeated complements amplify leakage by construction. KS and every new K are also cast back to f32. Its useful host-f64 energy contraction shows the final trace reduction is not the main error; the subsequent loop does **not** prove irreversible subspace corruption or rule out polishing. Correct algebra already exists in `gpu_sparse.rs::mcweeny_step`.
+
+3. **Complete masks do not establish an arithmetic floor.** They remove support truncation, but not inverse/stopping/initialization/SCC errors or model differences. K-TC2 normalizes R_I by the initial K0 norm; recovered P-TC2 K uses its current norm. Changing spectral bounds changes K0 and hence the reported K-TC2 residual normalization. The proposed universal `dE∝R_I²` and 52 μHa/atom laws remain correlations across confounded runs. ACC8 changes summation ordering, not precision; no improvement from ACC8 does not exclude accumulation error.
+
+4. **Overhead and acceptance are not solved.** Production `purify_hscc` passes `check_every=1`: each K-TC2 iteration reads n_atom trace partials, then up to 128 residual partials in another blocking read; guards add work. Reduction tails are **host f64**, not device f64. `rh_stationarity` downloads O(nnz) at finalization. `forces()` downloads K/W and contracts on CPU; `compute_v()` is a host O(N²) gamma matvec; `mulliken_checked()` constructs charge vectors each SCC iteration. Persistent matrix buffers are valuable progress, not a fully GPU-resident pipeline.
+
+   `tc2_purify` has `stagnant=false` and can label exhaustion a `NumericalFloor`. Snapshot eligibility uses trace/R_I, not stationarity/force quality. SCC accepts floors by default; `finalize_scc` measures R_H without gating it. P-TC2 retains P's status while returning recovered-K residuals. These labels cannot by themselves certify vibrations.
+
+### Answers to manifest §15.11
+
+**1. Mechanism:** unresolved until inverse and diagnostic corrections are isolated at fixed H,S. Polynomial purification preserves eigenspaces in exact arithmetic: true McWeeny can improve occupations near 0/1 but cannot rotate a wrong subspace toward H. Finite-precision SP2 stagnation is known; it does not establish the origin of this unusually large error. Convergence-order-based stopping is a useful reference, with validation needed for this nonorthogonal masked algebra. [Kruchinina, Rudberg & Rubensson (2016)](https://arxiv.org/abs/1507.02087).
+
+**2. Accuracy per flop:** first correct NS and certify it once per geometry, then stop wasting products at a genuine plateau. Compare repaired K/P-TC2 including recovery and force cost. Compensated-f32 endgame is conditional on measured product-accumulation error. GPU f64 products conflict with PR5; double-single storage is a last resort due to traffic/complexity. LNV is the relevant alternative if H-dependent subspace correction remains necessary; changing scalar purification polynomials alone is not that correction.
+
+**3. Variational masking:** LNV may improve the variational state, but the recoverable fraction of the deg-95 error is unknown. A sparse auxiliary L in `K(L)=3LSL−2LSLSL` can generate a wider K; equal degree of L and a stored K is not equal support/work. Projecting products changes the implemented functional, whose electronic gradient and nuclear forces must be derived consistently. Existing `bsr4_lnv_gradient` is a combination primitive, not a validated masked optimizer. Do not promise first-order recovery of missing tails or quadratic energy error for inadmissible/nonstationary states. [Nunes & Vanderbilt, nonorthogonal formulation](https://www.physics.rutgers.edu/~dhv/pubs/local_copy/rw_dms.pdf).
+
+**4. Relative energies:** measure `b(R)=E_fast−E_ref` along the stencil. For consistent gradients, force bias is `−∇b` and Hessian bias is `∇²b`. Constant offsets cancel; smooth curvature changes frequencies; deterministic discontinuities remain harmful. Freeze masks/model settings, start both signs from the same central state, reset incompatible mixer history, and test reversed order/cold starts. Fixed iteration counts or replayed branches alone do not ensure smoothness.
+
+**5. Mask choice:** retain radial as the control; “radial is dead” is unsupported. Current top-k `mask_kz` injection changes K and Z together. Separate their budgets and intermediate contribution support. Direct `|H_ij K_ji|` neglects overlap/Pulay sensitivity and indirect product paths; `|H_ij P_ji|` is not the band-energy contraction because P=KS. Compare actual executed plan terms and force accuracy, including wide-reference/oracle setup cost.
+
+**6. Dummy lanes:** structural exclusion of the decoupled dummy density subspace is a legitimate later optimization. Keep dummy S nonsingular; enforce zero dummy density from initialization through updates/recovery before excluding it from bounds. Tighter valid bounds can reduce iterations, but do not smooth the final zero-temperature projector or repair its subspace. Do not clip physical occupations.
+
+**7. Crossover/occupancy:** no defensible crossover N follows from these data. A 4×4 block triple costs approximately 128 FLOPs; count retained triples, physical orbitals, all iterations/transfers and force time. The current kernel launches one WG per atom row (330/864 WGs for R10/R14); utilization also depends on plan lengths, registers and compiled resources. Local cache is `64·MAX_LEFT_BLOCKS` bytes/WG. A 49 KiB per-WG limit does not imply a degree-380 ceiling. Wide Z/halo can enlarge the compiled cache for narrow-K products too. Benchmark matched-quality complete evaluations on the actual device, then batch displacements with shared plans and independent electronic state.
+
+**Next work:** manifest §15.12 A → B/C → evidence-selected D/E. The target is fastest accepted scans, relaxation and Hessians with measured uncertainty, not system-independent mHa total-energy parity. No production accuracy defaults or new speedup claims are established by this review.
+
+## 2026-09-14 (cont.) — §15.12-A executed: the "f32 floor" was never f32
+
+All measurements below from `tests/sparse_f64check.rs` (`frozen_input_dense_ref`, `f64_host_trace`; R10/pbc, pbc-0-3).
+
+### A1 — NS normalization bug: CONFIRMED + FIXED
+
+`compute_z` divided `||I−ZS||_F` by `n_orb` instead of `√n_orb` — understated the residual by √1320 = **36.3×** at R10. The reported `R_Z=3.75e-5` was really `1.36e-3` — a genuinely sloppy inverse feeding ZH/ZHZ/K0 and the default W. Fixed (`sparse_system.rs`); `test_ns_device_residual_contract` now **asserts** the production value against an independent host-f64 recomputation (it previously only printed). Post-fix NS honestly converges: 7 iters, true host-f64 `||ZS−I||/√N = 7.6e-6`.
+
+### A2 — true McWeeny, all-f64: CONFIRMED that post-hoc polish fails
+
+The earlier experiment ran `2K−KSK` with f32 intermediate casts — void. Corrected: true `K' = 3KSK − 2(KS)²K`, f64 throughout (on deg-175 mask): R_I oscillates ~7.5e-4, E stays ~−298.785. Post-hoc polishing cannot reach the right point — but the reason is now clear (below), not an f32 fixed-point defect.
+
+### A3 — frozen-input dense reference: engine inputs FULLY VALIDATED
+
+New test solves the **identical generalized eigenproblem** from the engine's own converged `h_scc_pad` + `s_bsr` (physical lanes, f64 Cholesky+dsyevd):
+
+```
+frozen H_scc eigh:  2Σ_occ ε = -312.6925   2Tr(P·H0) = -298.807141
+sparse device E_band (deg-175) = -298.791399
+DFTB+ R10: Energy H0 = -298.807668
+```
+
+**H0, S, H_scc, and the converged charges are all correct** (0.5 mHa vs DFTB+). The error lives entirely in the purified K.
+
+### The actual mechanism: masked-product truncation, not f32
+
+| M_K | nnz | device R_I | host-f64 R_I(sparse K) | E_band | Δ vs frozen ref |
+|---|---|---|---|---|---|
+| r_k=12 (deg~175, 53%) | 57 736 | 4.97e-4 | 7.6e-4 | −298.7914 | **+15.7 mHa** |
+| r_k=14 (deg~228) | 75 364 | 3.16e-4 | 4.8e-4 | −298.8014 | +5.5 mHa |
+| r_k=16 (deg~275) | 90 838 | 9.6e-5 | 1.5e-4 | −298.8057 | +1.2 mHa |
+| r_k=20 (deg~330, ~complete) | 108 090 | 3.27e-5 | 5.0e-5 | −298.8070 | **+23 μHa** |
+
+Error decays with the DM's physical decay length (R10 diameter ~15.5 Å → "complete" is cheap here; for 1000+ atoms the required degree is set by the decay length, not N). The truncation that matters is in the **intermediate** products: `m_t_ks = m_k` in `sparse_system.rs` — `K·S` is stored on M_K, so `KSK` on M_K loses all two-hop halo terms each iteration → biased fixed point.
+
+- The earlier "complete-mask floor" claim was wrong — r_k=12 gives only 53% pair coverage on R10.
+- Exact K injected on the mask (`purify_current` diagnostic, new `inject_k_bsr`): on the truncated mask the exact projector itself has R_I=9.4e-3 (dropped tails), and one f32 purifier step kicks it off toward the same biased point. On the ~complete mask the purifier **preserves** the injected exact K (R_I→4e-5, E unchanged to 0.03 mHa).
+- The iteration therefore converges to a *biased fixed point* when intermediate products `K·S`, `K·S·K` are truncated to M_K — lower masked R_I does not mean better energy (sparse K had R_I 7.6e-4 but was 15.7 mHa off; the masked exact K has R_I 9.4e-3 and is exact in energy).
+- My earlier `‖K_sparse−P_exact‖=15.85` "50% Frobenius error" was a factor-2 artifact of mine: engine K is the **spin-free** density `C·Cᵀ` (occupation 1, Tr(KS)=459), so the right comparison is `‖K−P/2‖`; `‖P‖/2 = 15.85` exactly — the complete-mask sparse K ≈ the exact projector.
+
+### Consequences
+
+1. **There is no significant f32 arithmetic floor.** Complete-mask f32 purifier reaches R_I~3e-5 and ~23 μHa energy error. The residual gap at truncated masks is systematic truncation of intermediate products — the quantity an expanded product support or a variational method (LNV) addresses.
+2. The `dE ∝ R_I²` / "52 μHa/atom floor" laws are retracted — they were truncation + sloppy-Z effects.
+3. Priority for production degree now: widen **intermediate product support** (T=KS onto a halo wider than M_K) and/or LNV so the fixed point is unbiased at moderate deg — this is §15.12-D's decision gate, now evidence-backed.
+4. Sparse vs DFTB+ on R10/pbc is now **0.7 mHa** at complete mask (−298.8070 vs −298.8077; residual difference is charge-state level, from f32 SCC convergence at r_scc=1e-5 — DFTB+ ran to 2.8e-8).
+
+Open: does ~deg-64–128 with a *wider intermediate* support (M_K∘M_HS halo) or LNV give acceptable energy — the deg-175→330 gap is where production speed lives.
+
+**Cost/sparsity coupling (USER note, 2026-09-14):** the DM's required support follows its own decay length, not H/S's — but the *cost* of every product still scales with operand sparsity, and the required intermediate halo is `M_K ∘ M_S` (KS must cover S's reach around each K row). Narrower H/S therefore buys twice: cheaper gathers AND a narrower halo needed for an unbiased fixed point (manifest SC8b).
+
+## 2026-09-14 (cont. 2) — Sparse-path profiling (RUST_DFTB_PROF instrumentation)
+
+New: `SparseBsr4Gpu::prof_tick/reset/report` passthroughs to `GpuRuntime::Prof`; ticks at every kernel-stage boundary in `compute_z` (ns.zs/rz/tz/upd), `tc2_purify` (tc2.ks/tr/ksk/res/upd), `scc_inner` (ns, scc.v/hscc/k0/tc2/mull/mix/fin), `set_coords` (geom.hs/ul/gamma/rep), `forces` (f.dw/dl/contract), plus `[init]` compile/plan timing. `dftb_engine` dumps the table for sparse engines too. Raw data: `debug/prof_sparse/{r10_evt,r10_mark,r10_rk12_evt,r14_rk12_evt}.txt`.
+
+**Workload:** R10/pbc-0-3 (330 at) and R14 (864 at), one SCC to r_scc~1e-5 + one eval(+forces). `evt` = host ms + true device ms per stage; `mark` = pure host enqueue (no syncs).
+
+### Per-stage device time per call (the real GPU cost)
+
+| stage (TC2 iter unless noted) | R10 deg175 | R10 deg330 | R14 deg~390 |
+|---|---|---|---|
+| `tc2.ksk` — Q=T·K → M_K | **2.64 ms** | **10.34 ms** | **6.97 ms** |
+| `tc2.ks` — T=K·S → M_K | 0.56 ms | 1.17 ms | 1.40 ms |
+| `tc2.tr` — trace partials read | 0.10 | 0.15 | 0.13 |
+| `tc2.res` — idempotency read | 0.11 | 0.18 | 0.17 |
+| `tc2.upd` — branch+symmetrize | 0.05 | 0.14 | 0.19 |
+| `scc.k0` — ZH,ZHZ,bounds (per SCC iter) | 4.08 | 14.9 | 11.4 |
+| `ns.tz` — Q=T·Z (per NS iter) | 3.92 | 17.3 | 12.3 |
+| `ns.zs` — T=Z·S (per NS iter) | 0.87 | 2.14 | 2.65 |
+| `f.contract` — host force contraction (once) | 5.4 | 5.9 | 21.2 |
+| `f.dw` — device W build (once) | 2.0 | 7.1 | 10.0 |
+| `scc.fin` — R_H stationarity (once) | 4.2 | 9.7 | 18.1 |
+| `geom.hs` — H0/S assemble (per geom) | 3.5 | 3.5 | 11.9 |
+
+### Shares and structure
+
+- **`tc2.ksk` is the hot kernel: 73–83% of device time.** Work per call ≈ nnz(M_K)×deg(operand) — going deg 175→330 costs 4× (output nnz ~2× AND inner degree ~2×). K-degree is the price; S-degree is 3–10× cheaper per call.
+- **Two blocking host reads per TC2 iter** (`tc2.tr` trace + `tc2.res` residual): `reads=1614 ≈ 2×753 iters`. The host wait lands under `tc2.res` (it drains the just-enqueued KSK). True sync overhead beyond the product itself ≈ 0.3–0.7 ms/iter (`mark` mode shows pure enqueue is only 0.02–0.06 ms/call — launch is not the problem).
+- **Plateau iters are the biggest recoverable waste:** ~30–50 of the ~55–60 TC2 iters per SCC call are spent oscillating at the floor before the 10×-growth detector fires (e.g. R10: floor reached ~iter 44, restore at 53; several runs exhausted all 80). An honest stagnation detector (§15.12-B) would cut ~40% of device time.
+- **`scc.k0` per SCC iter ≈ 4–15 ms dev** (two wide products + two bounds reads) — 12–15 calls ≈ 5–8% of the SCC total. Worth caching if H_scc changes little, or at least the bounds.
+- **Per-geometry costs** (R14): geom.hs 11.9 ms, geom.gamma 5.6 ms (O(N²) host), NS ~120 ms total (6 iters × ~15 ms), f.contract 21 ms, scc.v 0.5 ms/iter.
+- **SCC wall times:** R10 deg175: 2.7 s (13 iters); R10 deg330: 8.1 s; R14 deg390: 7.8 s (15 iters). Warm re-SCC: 0.37 s (single confirm iter).
+
+### What the profile says to do next
+
+1. **B (early stop):** kill plateau iterations — ~40% of TC2 device time.
+2. **E (syncs):** fuse the trace+residual reads into one return (one marker, one read) — saves ~0.5–1.5 ms/iter and one queue drain per iter.
+3. **D (mask halo):** cost is `nnz_out × deg_operand`; a narrow K with a wider *intermediate* halo is the production shape (SC8b) — the ksk product is what must get cheaper.
+
+## 2026-09-14 (cont. 3) — Sync architecture & per-kernel cost analysis (for review discussion)
+
+Detailed answers to four questions about the profiling results. All numbers measured on the RTX 3090 (82 CUs, 49 KiB local/WG) unless noted.
+
+### Q1 — What exactly are the "2 blocking host reads per TC2 iteration"?
+
+Per iteration of `tc2_purify` the host performs two blocking buffer reads (`GpuRuntime::read_buffer` → `clEnqueueReadBuffer` on an in-order queue, i.e. each read drains everything enqueued so far):
+
+| read | data | device-side producer | consumed by |
+|---|---|---|---|
+| `trace_ks_f64` | n_atom f32 partials → host f64 sum → **Tr(KS)** | `bsr4_mulliken_KS` diag-partial kernel on `t_ks` (K·S) | **the branch decision** `branch = (Tr > nocc) ? squaring : complement` — a hard data dependency of the *next* product, plus the trace guard and Tr reporting |
+| `idempotency_to_f64` | ≤128 f32 partials → host f64 → **R_I = ‖KSK−K‖_F/‖K‖** | `bsr4_idempotency_partial` on (Q, K) | convergence/floor/snapshot decision |
+
+Measured (R14, deg~390): `tc2.tr` host ≈ 1.68 ms/iter, `tc2.res` host ≈ 7.08 ms/iter — but note the host wait under `tc2.res` mostly *is* the KSK kernel latency (the read drains the queue that contains it). Pure enqueue overhead is tiny (`mark` mode: 0.02–0.06 ms/call). So the real cost of the reads is not bandwidth — it is that **each read forces a full pipeline drain**: the GPU finishes KSK, sits idle while the host sums 128 floats and branches, then the next iteration's products are enqueued into an empty pipe.
+
+**Can they be eliminated?** Partially trivially, fully with an architectural change:
+
+- `R_I` check can run every k-th iteration (`check_every` parameter already exists; production currently passes 1).
+- `Tr(KS)` is needed **every iteration** because the host picks the polynomial branch from it — you cannot skip the *decision*, only move it.
+- **Full fix = device-side TC2 driver:** a small kernel at the end of each iteration computes Tr from the partials, computes R_I partials after KSK, forms `branch` and `guard_alpha` on-device (`α = nocc/Tr` when the guard predicate holds, else 1.0 — folded into `tc2_dev`'s update so the rescale is unconditional and free), and appends `{Tr, R_I, dev_rel, branch, guard_fired}` to a device log buffer. The host then runs M iterations completely blind and reads the log once per chunk → decide continue / stop / restore-best-K. This is the dense side's W4 "chunked convergence" pattern transplanted to TC2. Payoff: zero mid-loop drains; products enqueue back-to-back; ~0.3–0.7 ms sync overhead per iter plus recovered overlap.
+- Cost: a decision kernel + a log buffer + chunked host supervision loop. Moderate refactor, confined to `tc2_purify` + two new small kernels.
+
+### Q2 — Why is `tc2.ksk` ~5× more expensive than `tc2.ks`?
+
+Both products write the **same output mask** M_K — identical nnz_out. The difference is the **inner dimension**: for `C_ij = Σ_k A_ik·B_kj` the retained work per output block is `|N_left(i) ∩ N_right(j)|`.
+
+- `T = K·S` (`tc2.ks`): needs `S_kj ≠ 0` → only **deg_S ≈ 56** of row i's K-neighbors contribute.
+- `Q = T·K` (`tc2.ksk`): needs `K_kj ≠ 0` → **deg_K ≈ 175–330** contribute.
+
+Measured ratio 4.7× (deg 175) / 8.8× (deg 330) ≈ deg_K/deg_S (3.1×/5.9×) plus worse locality of the wider operand rows. **The price is set by K's degree, not by the output mask size.** This is the quantitative form of the user's sparsity-cost coupling: narrowing S (SC6) directly discounts the ks product, but the ksk product only gets cheaper if K's *stored* neighborhood shrinks — regardless of where results land.
+
+### Q3 — The ~40% plateau waste: concrete detector design
+
+Observed pattern (deg-175 R10): R_I descends to ~5e-4 by iter ~44, then oscillates for 9+ iterations, trace guard fires repeatedly, and the run ends either by the `ri > 10·best` blowup detector (iter ~53) or by exhausting all 80 iters — several SCC calls burned the full 80. The previously-removed "N consecutive non-improving checks" detector false-fired during normal descent because *single* non-improving iters are routine during the TC2 transient.
+
+**Safe criterion — windowed-best:** stop iff `iter − iter_of_best > W` (W≈10–15) AND `best_r_i < 1e-2` AND the snapshot's trace is valid. During true descent `best_r_i` is updated every few iterations even when individual iters oscillate; at the floor it stops updating entirely. Cannot fire before a snapshot exists. Expected saving ~30–40% of TC2 device time on truncated-mask runs; nothing to save when converged cleanly.
+
+### Q4 — Do the reductions need the host every cycle?
+
+No. The GPU partial-sum kernels already exist — what forces the drain is that the *decisions* live on the host. Three levels:
+
+1. **Cheap now:** `check_every=4` for R_I (skips 3/4 of residual reads). Trace read still needed every iter → saves ~half the drains.
+2. **One-drain-per-iter:** the trace read (pre-KSK) and residual read (post-KSK) cannot trivially share one read — the trace feeds the branch *before* KSK. Fusing them into one return would defer the branch by a full iteration (uses T from the previous K) — a numerics change, needs A/B testing.
+3. **Zero-drain (the Q1 fix):** device branch+guard+log, host reads once per M-iter chunk. Combined with (1)'s cadence this reduces host syncs to ~1 per chunk plus the final state read.
+
+### Implications for §15.12 ordering
+
+- **B** (early stop) becomes: windowed-best detector + honest status labels — no algorithm change, big win.
+- **E** first real item: device-side TC2 driver (branch/guard/log on GPU) — eliminates the only per-iter data dependency the host has inside purification.
+- The **mask-halo** question (D) is now measurable in isolation: `tc2.ksk` is the single kernel to make cheaper; a stored-narrow-K + wide-intermediate experiment changes exactly this kernel's cost.

@@ -483,13 +483,13 @@ fn plan_scc(rt: &mut GpuRuntime, sk: &SkData, species: &[String], coords: &[[f64
     let q0f: Vec<f32> = scc.q0.iter().map(|&q| q as f32).collect();
     let q0 = rt.buffer_from_slice(&q0f).unwrap();
     let oa = rt.buffer_from_slice(&orb_atom_map(&tmpl.atom_orb_off, n)).unwrap();
-    let mut plan = GpuSccPlan::new(rt, &s, n, n_atoms, 1).expect("GpuSccPlan::new");
+    let mut plan = GpuSccPlan::new(rt, &s, &h0, &g, &q0, &oa, n, n_atoms, 1).expect("GpuSccPlan::new");
     plan.set_initial_charges(rt, &q0f).unwrap();
     let mut rms = f32::INFINITY;
     let mut n_iters = 0;
     for iter in 0..SCC_MAX_ITER {
         n_iters = iter + 1;
-        rms = plan.scc_step_diis(rt, &h0, &s, &g, &q0, &oa, n_occ, 0.3).expect("scc_step_diis");
+        rms = plan.scc_step_diis(rt, n_occ, 0.3, 1e-6).expect("scc_step_diis");
         if rms < 1e-6 { break; }
     }
     assert!(rms < 1e-6, "GPU SCC did not converge: rms={rms:.3e} after {n_iters} iters (cap {SCC_MAX_ITER}; more iters will not help)");
@@ -682,7 +682,7 @@ fn test_e_rep_in_scc_energy_h2o() {
     let (mut plan, h0, s, g, q0, oa) = plan_scc(&mut rt, &sk, &sp, &xyz, &scc);
     plan.set_repulsive_splines(&mut rt, &crd, &species_idx(&sp, &unique), &off, &data, unique.len(), max_int)
         .unwrap_or_else(|e| panic!("set_repulsive_splines failed: {e}"));
-    let e_gpu = plan.compute_energy(&mut rt, &h0, &s, &g, &q0, &oa, n_occ).unwrap()[0] as f64;
+    let e_gpu = plan.compute_energy(&mut rt, n_occ).unwrap()[0] as f64;
     eprintln!("H2O energy: E_el_cpu={:.8} E_rep={:.8} E_tot_cpu={:.8} E_gpu={:.8}", scc.energy, e_rep, e_tot_cpu, e_gpu);
     eprintln!("  |E_gpu - E_el|={:.3e}  |E_gpu - E_tot|={:.3e}", (e_gpu - scc.energy).abs(), (e_gpu - e_tot_cpu).abs());
     assert!((e_gpu - e_tot_cpu).abs() < E_EL_TOL.max(E_REP_TOL),
@@ -908,7 +908,7 @@ fn test_gpu_energy_gradient_h2o() {
         let crd: Vec<f32> = coords.iter().flat_map(|c| c.iter().map(|&x| (x * ANG2BOHR) as f32)).collect();
         let (mut plan, h0, s, g, q0, oa) = plan_scc(rt, &sk, &sp, coords, &scc);
         plan.set_repulsive_splines(rt, &crd, &species_idx(&sp, &unique), &off, &data, unique.len(), max_int).unwrap();
-        plan.compute_energy(rt, &h0, &s, &g, &q0, &oa, n_occ).unwrap()[0] as f64
+        plan.compute_energy(rt, n_occ).unwrap()[0] as f64
     };
 
     let scc0 = scc_cpu(&sk, &sp, &xyz);
@@ -1006,14 +1006,14 @@ fn run_full_chain_scc(label: &str, sk: &SkData, sp: &[String], xyz: &[[f64; 3]],
     let q0f: Vec<f32> = scc.q0.iter().map(|&q| q as f32).collect();
     let q0 = rt.buffer_from_slice(&q0f).unwrap();
     let oa = rt.buffer_from_slice(&orb_atom_map(&tmpl.atom_orb_off, n)).unwrap();
-    let mut plan = GpuSccPlan::new(&mut rt, &s, n, n_atoms, 1).unwrap();
+    let mut plan = GpuSccPlan::new(&mut rt, &s, &h0, &g, &q0, &oa, n, n_atoms, 1).unwrap();
     plan.set_initial_charges(&rt, &q0f).unwrap();
     let mut rms = f32::INFINITY;
     let mut n_iters = 0;
     let mut rms_hist = [f32::INFINITY; 10];
     for iter in 0..SCC_MAX_ITER {
         n_iters = iter + 1;
-        rms = plan.scc_step_diis(&mut rt, &h0, &s, &g, &q0, &oa, n_occ, 0.3)
+        rms = plan.scc_step_diis(&mut rt, n_occ, 0.3, 1e-6)
             .unwrap_or_else(|e| panic!("{label} scc_step_diis failed at iter {n_iters}: {e}"));
         rms_hist[n_iters % 10] = rms;
         if n_iters <= 3 || n_iters == 10 || n_iters % 10 == 0 {
@@ -1030,7 +1030,7 @@ fn run_full_chain_scc(label: &str, sk: &SkData, sp: &[String], xyz: &[[f64; 3]],
     if n_iters == SCC_MAX_ITER && rms >= 1e-6 {
         eprintln!("  gpu scc hit SCC_MAX_ITER={SCC_MAX_ITER} with rms={rms:.3e} — treating as floor/mixer, not iterating further");
     }
-    let e_gpu = plan.compute_energy(&mut rt, &h0, &s, &g, &q0, &oa, n_occ).unwrap()[0] as f64;
+    let e_gpu = plan.compute_energy(&mut rt, n_occ).unwrap()[0] as f64;
     let q_gpu = plan.read_charges(&rt).unwrap();
     let dq = q_gpu.iter().zip(scc.charges.iter()).map(|(a, b)| (*a as f64 - b).abs()).fold(0.0, f64::max);
     let de = (e_gpu - scc.energy).abs();
@@ -1226,15 +1226,15 @@ fn test_full_chain_gpu_p_then_forces_h2o() {
     let q0f: Vec<f32> = scc.q0.iter().map(|&q| q as f32).collect();
     let q0 = rt.buffer_from_slice(&q0f).unwrap();
     let oa = rt.buffer_from_slice(&orb_atom_map(&tmpl.atom_orb_off, n)).unwrap();
-    let mut plan = GpuSccPlan::new(&mut rt, &s, n, n_atoms, 1).unwrap();
+    let mut plan = GpuSccPlan::new(&mut rt, &s, &h0, &g, &q0, &oa, n, n_atoms, 1).unwrap();
     plan.set_initial_charges(&rt, &q0f).unwrap();
     let mut rms = f32::INFINITY;
     for _ in 0..SCC_MAX_ITER {
-        rms = plan.scc_step_diis(&mut rt, &h0, &s, &g, &q0, &oa, n_occ, 0.3).unwrap();
+        rms = plan.scc_step_diis(&mut rt, n_occ, 0.3, 1e-6).unwrap();
         if rms < 1e-6 { break; }
     }
     assert!(rms < 1e-6, "H2O SCC for force chain did not converge: rms={rms:.3e} (cap {SCC_MAX_ITER})");
-    let _e = plan.compute_energy(&mut rt, &h0, &s, &g, &q0, &oa, n_occ).unwrap();
+    let _e = plan.compute_energy(&mut rt, n_occ).unwrap();
     let mut p = vec![0.0f32; n * n];
     let mut c = vec![0.0f32; n * n];
     let mut eps = vec![0.0f32; n];
@@ -1284,7 +1284,7 @@ fn test_scc_electronic_parity_tight_h2o_cpu_fed() {
     let scc = scc_cpu(&sk, &sp, &xyz);
     let n_occ = (scc.q0.iter().sum::<f64>() / 2.0).round() as usize;
     let (mut plan, h0, s, g, q0, oa) = plan_scc(&mut rt, &sk, &sp, &xyz, &scc);
-    let e = plan.compute_energy(&mut rt, &h0, &s, &g, &q0, &oa, n_occ).unwrap()[0] as f64;
+    let e = plan.compute_energy(&mut rt, n_occ).unwrap()[0] as f64;
     let q = plan.read_charges(&rt).unwrap();
     let de = (e - scc.energy).abs();
     let dq = q.iter().zip(scc.charges.iter()).map(|(a, b)| (*a as f64 - b).abs()).fold(0.0, f64::max);

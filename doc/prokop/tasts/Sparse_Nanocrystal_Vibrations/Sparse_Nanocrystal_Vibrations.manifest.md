@@ -2455,6 +2455,7 @@ These can follow the baseline contract fixes and be measured independently of sc
 - [ ] **SC6. Shrink H/S aggressively AND shrink the 1 Å skin.** Si–Si coupling is ~1e-4 Ha by ~7 Å; the 10.6 Å table end is not physics. Frozen-topology Hessians use ±0.02 Å displacements → required skin is far below 1 Å (skin counts toward structural degree and plan work even where values are zero). Geometry optimization may rebuild masks at explicit checkpoints instead of carrying a large skin forever.
 - [*] **SC7. Fixed halo only where algebra requires an intermediate.** **DONE 2026-09-13:** `SparseSystemWorkspace::new` takes an explicit `tzs_mask`; `SparseDftbConfig.r_zs_halo_ang` (default 0 → `M_TZS = M_Z`, legacy behaviour) builds `M_TZS = geometric(r_z + halo)`. It is degree-measured and budget-checked under the M_Z ceiling (`deg_tzs` in the init line) and feeds `MAX_LEFT_BLOCKS` sizing. `plan_zs`/`plan_zh` write on `M_TZS`; `plan_tz`/`plan_bz` read `M_TZS` as the left operand and truncate results to `M_Z`/`M_K` — result projection is preserved, no unrestricted product support anywhere.
 - [ ] **SC8. Codified warning — do NOT assume K is more local than H.** DM decay length is set by the electronic gap and basis and can exceed the Hamiltonian's range (SP2 literature reports DMs several times denser than H). K/P mask sizes are a *measured* approximation: smallest degree meeting the energy/force/frequency error target, not an assumption about decay.
+- [ ] **SC8b. Cost coupling — DM support is NOT set by H/S, but product cost IS.** (USER 2026-09-14, confirmed by §15.12-A measurements.) The final density's required support follows its own decay length (R10: deg~275 for ~1 mHa, ~330/complete for 23 μHa) — far beyond deg_hs~60. Yet every iterative product's work still scales with the *operand* degrees: `K·S` gathers deg_S blocks per output, `K·S·K` another deg_K; and the truncation bias fixed in §15.12-A lives in the intermediate support — `T=KS` must cover the S-halo around each M_K row, so **shrinking H/S (SC6) shrinks both per-product cost AND the unbiased-iteration halo**. Sparsity levers: (a) H/S narrow → cheaper intermediates + narrower required halo; (b) K stored narrow but iterated with an intermediate halo (`M_TKS ⊋ M_K`, like the existing `r_zs_halo` mechanism for ZS) — the on-mask fixed point then approximates `P_exact|M_K`, which is energy-exact (only H0-support blocks are sampled).
 
 #### PR — Selective precision (extends S6; order matters)
 
@@ -2519,17 +2520,119 @@ These can follow the baseline contract fixes and be measured independently of sc
 
 ### 15.10b — GPT-5.6 reframing + open parity problem (chat line 5855+, 2026-09-13 evening)
 
-**OPEN PROBLEM — pbc parity:** DFTB+ gives E=−847.0896 Ha on R14/pbc; the sparse engine gives −845.1152 Ha (**+1.97 Ha**, all in the SCC electronic term). SiH4 controls are exact (matsci 1e-7, pbc 34 μHa), matsci R14 is at truncation level (+78 mHa). Taper and Hubbard-U parsing ruled out. Suspects: converged charge-state difference at scale (282 surface H), or a pbc-specific SCC convention the sparse path misses. **Must resolve before pbc is trusted.** Also: a rerun of the *identical* pbc config diverged (TC2 R_I=0.78, Tr(KS)=1508 @iter 62) after converging cleanly earlier — nondeterministic blowup to reproduce/investigate.
+**PARITY ROOT-CAUSED (2026-09-14):** the 2 Ha gap is the **purification floor**, not an engine bug. Decomposition: Tr(K·H0) is the only off term (+1.975 Ha; E_scc/E_rep/Δq all match DFTB+ to ~mHa). Mask sweep: dE ∝ R_I² — deg95→+1972mHa, deg168→+634mHa, deg386→+151mHa. DFTB+ non-SCC E_H0=−848.727 vs Rust single-purification ~3 Ha off → purifier on H0 alone, no SCC-state dependence. **The pbc K-DM is NOT more local than matsci** — the deg-95 "13×" run was just a dirty purifier. pbc's real win: deg_hs=56 vs 356 (cheap H_scc/traces), NOT a narrower loop matrix. Dense-CPU cross-check still running.
+
+**BUG FIXED — `cut_bohr` sized "full" masks off unrelated SKF tables** (pbc-0-3's F-O 620pt table set r_full=7.59 Å for Si+H whose true end is 5.5 Å). Now filtered to system species → pbc r_full=6.54 Å (deg~56). This resolved the "deg 52→95 jump" (T3) — it was never a physical shell. **Side effect: the default pbc mask (deg~56) no longer converges SCC** — the old deg-95 run was accidentally wide. Explicit r_k/r_z now required for pbc.
+
+**TC2 blowup is deterministic, not random** — identical divergence (iter 62, R_I=0.78) whenever tc2_tol is tighter than the plateau; pbc purification is marginal.
 
 **GPT-5.6 reframing — "95 neighbors is the floor" is NOT proven.** The sweep chopped K, Z and all intermediates by the SAME radius; that proves only that this combined truncated algebra fails. The 6.5 Å "full" mask includes a 1 Å structural skin — Z legitimately extends past the 5.5 Å H/S range. Objective ≠ "every matrix ≤64" — it is **"the matrix multiplied 10–30× per SCC iter (P/K) has degree ~64; Z built once/geometry may stay wide".**
 
 **Tomorrow's plan (priority order):**
-- [ ] **T0a. Resolve the pbc parity gap (2 Ha).** Decompose Rust E into band/SCC/repulsive vs DFTB+ detailed.out; compare Mulliken charge distributions; check n_occ/filling identical; check whether DFTB+ applies anything pbc-specific (e.g. different gamma convention). Without parity, all pbc numbers are unverified.
-- [ ] **T0b. Reproduce the nondeterministic pbc TC2 blowup** (same config converged then diverged). If real: pbc's narrow range makes bounds/NS fragile — needs a stable path (maybe tied to P-TC2 failing on pbc too).
-- [ ] **T1. Separate P/K from Z — the key experiment.** Keep M_Z, M_TZS at full (~6.5–7 Å; Z built once/geometry so wide is cheap) and sweep ONLY M_P (=M_K) narrow: `sparse_new(name, sk, 5.45, 0.3, r_k, 0.0, 512)` — r_z=0 already means full. Blocker: P-TC2 fails on pbc (r_I floor 1.5e-2 even at full mask) → either fix that first, or run narrow-M_K with K-TC2 + wide Z (K-TC2 works on pbc).
-- [ ] **T2. Measure P locality before K recovery** — `sparse_eval_p` (=2Tr(P·ZH)) already exists; on matsci it showed P is NOT more local. Repeat on pbc once T1 runs (needs working P-TC2 on pbc, or accept K-path numbers).
-- [ ] **T3. Audit the deg 52→95 jump over 6.2→6.5 Å.** No bulk-Si shell exists between 5.92–6.65 Å → print per-species degree stats (Si vs H neighbors separately), distance histogram, avg/p95/max per mask (M_HS, M_K, M_Z, M_TZS). Probably surface-H/skin semantics — verify, don't assume.
-- [ ] **T4. Oracle top-k on pbc** (GPT's stronger L4). `build_topk_mask` + `mask_kz` + `tests/sparse_topk.rs` exist — rerun against the **pbc** wide reference with ‖P_ij‖ (and ‖K_ij‖) norms, self-consistent SCC on the frozen mask (not just truncation). If top-64 works while radial-64 fails → magnitude-aware graph selection is the production answer (freeze once per geometry for Hessians).
+- [x] **T0a. pbc parity gap → purification floor.** dE ∝ R_I² across mask widths; only Tr(K·H0) off; charges match DFTB+. Still pending: dense-CPU cross-check to confirm E→−847.09 at wide mask.
+- [x] **T0b. "Nondeterministic" TC2 blowup = deterministic** — tighter tc2_tol pushes past the R_I floor into runaway. pbc TC2 is marginal; needs the trace guard / plateau logic to be robust.
+- [x] **T1. Wide Z does NOT rescue narrow K** (r_z=9/deg-168 fixed, r_k swept): deg_k 21–52 diverge; 56 dirty +2975 mHa; up through deg-386 +151 mHa. K itself needs the width.
+- [x] **T2. P-TC2 works on pbc at deg-168** (14 iters, E_P=−899.21 vs DFTB+ band −900.01; E_K identical to K-TC2 −846.455). Cross-validates both representations.
+- [x] **T3. deg 52→95 jump SOLVED — cut_bohr bug** (unrelated F-O table inflated r_full to 7.59 Å; the 95-mask was really 7.6 Å). No physical shell. Per-species stats at honest 6.5 Å: avg 42, max 55 (Si rows avg 45.5/max 55, H rows avg 34.4/max 41).
+- [x] **T4. Top-k oracle on pbc done** — ~4× better than radial per degree but heavy-tailed: deg-113→+345 mHa, deg-235→+34 mHa vs deg-386 ref. Not deg-64-accurate alone.
+- [x] **f32 floor measured: ~52 μHa/atom, linear in N** (R10 complete-mask deg-330: +17.3 mHa; R14 deg-630: +46 mHa). The purifier's f32 SpGEMM roundoff — NOT mask, NOT basis — sets the accuracy ceiling at ~50–150 mHa for 300–3000 atoms.
+
+**REVISED priority (post root-cause):** the mask story is understood — radial fails, top-k helps ~4×, but everything saturates at the f32 floor. **Cheap levers all falsified** (R10/pbc complete mask): ACC8 accumulation → R_I identical; guard-off → identical; tight bounds (E_DUMMY 2.0→0.8) → *worse*; host-f64 McWeeny polish → diverges (the fixed point is subspace-defective, not noisy). The ~5e-4 R_I floor is intrinsic f32 TC2 iteration dynamics (~250× above naive f32 storage noise).
+- [ ] **A1. Rethink: compensated *summation* likely insufficient** — the floor is in the iterate dynamics, not sum order. Candidate real fixes: (a) f64 or f32-pair K storage inside the TC2 loop only (mask stays, values get extra mantissa); (b) a different local iteration with a stable f32 fixed point (steepest-descent/LNV-style update that *minimizes* rather than iterates to a polynomial fixed point).
+- [ ] **A2. LNV variational refinement on the fixed mask** — the strongest combined lever: minimizes E on the mask so in-mask elements compensate the tail AND replaces the unstable polynomial fixed point with a descent method.
+- [ ] **A3. Decision point after A1/A2:** if f32 floor is beaten, re-run the deg sweep — the true DM locality curve may sit below the current measurements.
+- [ ] **A4. Fix dense-CPU reference path for pbc** — `run_dftb_scc` mixer diverges on R10/pbc and `run_dftb_nonscc` counts 1 electron/atom (wrong q0). Needed for cross-checks at scale.
 - [ ] **T5. Wendland C² taper on K** (w=(1−x)⁴(1+4x), compactly supported PSD → W∘K stays PSD by Schur) — as a stability/localization aid feeding LNV, not a cure.
-- [ ] **T6. LNV variational refinement on the fixed mask** (K(L)=3LSL−2LSLSL — needs S, never S⁻¹): P-TC2 → localized init → 5–15 refinement steps letting in-mask elements compensate the missing tail.
-- [ ] **NOT now:** Kahan/ACC8/SpGEMM micro-optimization — representation, not f32, dominates.
+
+### 15.11 — Briefing for the next review LLM (2026-09-14, post-parity root-cause)
+
+**Superseded where corrected by §15.12 and the report's appended Speed–accuracy source review.** Preserve measurements; “intrinsic f32 floor confirmed,” “f64 McWeeny,” and “overhead solved” are not established conclusions.
+
+**Read first:** report `2026-09-14` section (parity root-cause + falsified fixes). All numbers below are measured, not hypothesized.
+
+#### What is already solved (do not re-litigate)
+
+- **Harness overhead:** fully GPU-resident workspace; persistent buffers/kernel handles; 2 SpGEMMs per TC2 iter (from 5); zero matrix host transfers per iter; 1 scalar read per iter; plans precomputed once per geometry (no per-iter intersection); band energy evaluated only at convergence.
+- **Local memory / workgroups:** MAX_LEFT_BLOCKS compiled from measured mask degree; BSR4 4×4 blocks gathered to `__local`; plan-driven gather (no atomics, write-once outputs); degree budgets SC1–SC8 hard-fail on overflow.
+- **f32 where it works:** device f64 reduction tails for O(N) scalar decisions (Tr(KS), R_I, R_Z, band energy); endgame trace guard with lock conditions (fixed the 1648-atom runaway); plateau-restore best-K.
+- **Correctness:** SiH4 parity 1e-7 (matsci) / 34 μHa (pbc); energy decomposition exposes E_band/E_scc/E_rep separately; cut_bohr now filters to species actually present.
+- **Diagnostics:** top-k mask oracle (`tests/sparse_topk.rs`), host-f64 K readback + McWeeny (`tests/sparse_f64check.rs`), mask-degree statistics, `RUST_DFTB_EMIN/EMAX` bounds override.
+
+#### Open problems — specific questions
+
+1. **f32 TC2 floor mechanism.** Complete-mask (deg = n_atom, zero truncation) R_I ≈ 5e-4 — ~250× above f32 storage noise. ACC8 (8 accumulators) doesn't move it; disabling the trace guard doesn't move it; f64 McWeeny iterates *diverge* from the converged K (R_I grows 7.5e-4→7e-3) — the fixed point is defective in the *subspace*, not just non-idempotent. What mechanism produces a biased fixed point rather than a noise ball? Branch-alternation limit cycle? Quantization of the polynomial step? Is this a known failure mode of TC2/SP2 in f32?
+2. **Best accuracy-per-flop fix.** Options: (a) f32-pair (double-single) storage of K inside the purifier only; (b) f64 accumulation in the SpGEMM inner loop with f32 storage (≈ACC8 didn't help → summation order isn't it); (c) a *descent* method (LNV/minimization) whose fixed point is variational, not polynomial; (d) monotonic purification (no branch flips — e.g., canonical purification or sign-iteration). Which addresses a *subspace* defect, not just idempotency?
+3. **Variational masking.** On a truncated mask the purified K is not the best in-mask projector — a variational minimum on the same support could be strictly better in exact arithmetic. Quantify: how much of the 2 Ha at deg-95 is "mask too small" vs "wrong in-mask point"? Does LNV recover the missing-tail energy to first order?
+4. **Relative-energy error cancellation.** The product is energy *differences* along geometry scans with a frozen mask. If the purifier defect is smooth in geometry, ΔE error ≪ absolute error. Is there a way to make the defect deterministic-in-geometry (same fixed point bias) so differences cancel? Any literature on systematic vs random purification error?
+5. **Mask for production.** Radial is dead; top-k ‖K_ij‖ gives ~4×/degree but still heavy-tailed (deg-113 → +345 mHa). Better proxy for the production mask: ‖P_ij‖ (bond order, AO basis — asymmetric but physical), H/S-derived connectivity, or iteration history? Should the mask be chosen by *energy* sensitivity (∂E/∂mask-entry ∝ |H_ij·P_ji|) rather than |P| or |K| alone?
+6. **Dummy-lane spectral design.** BSR4 pads H to 4 lanes/atom with E_DUMMY=2.0, which IS the Gershgorin emax (physical top +0.24). Tight bounds need dummies outside the map, but outside-map lanes get occupied. Worth pinning dummy K-lanes to 0 each iteration + excluding them from bounds — or irrelevant since bounds tightening didn't help?
+7. **Performance model.** If accuracy ultimately needs deg~150–250 for the loop matrix, at what N does planned-SpGEMM sparse beat dense diagonalization on a 3090 — and is there a degree/workgroup assignment that keeps 82 CUs saturated at deg~200 (local-mem 49 KiB → ~deg-380 cap with current kernel)? Is the purifier or the eigensolver the long pole at production sizes?
+
+### 15.12 — Speed–accuracy work order (2026-09-14; source review only)
+
+**Authority/status:** supersedes conflicting causal claims and next-step ordering above. Read the appended report review for evidence and answers to §15.11. All tickets below are **open/unverified**; no code or new numerical experiments were produced by this review. Preserve existing uncommitted work; sparse agents must not edit the parallel dense/H-bond work.
+
+**Objective:** minimize time to an accepted observable. Modest measured energy/force bias is allowed; divergence, history-dependent force jumps and unsupported convergence labels are not accuracy compromises. Keep f32 bulk, gather ownership, persistent buffers/plans and explicit failure. pbc remains the preferred candidate; compare solver accuracy within the same parameterization and assess physical suitability separately from timing.
+
+#### A — Correct the diagnostic baseline first (numerical agent)
+
+**Files:** `sparse_system.rs`, its existing NS tests, `tests/sparse_f64check.rs`, existing diagnostic helpers. Do not rewrite the solver or launch a broad sweep.
+
+- [x] **A1: NS normalization.** DONE 2026-09-14: `compute_z` divided by `n_orb` instead of `√n_orb` (36.3× understatement at R10; reported 3.75e-5 was really 1.36e-3). Fixed; `test_ns_device_residual_contract` now asserts reported vs independently recomputed f64. Post-fix true `||ZS−I||/√N = 7.6e-6`.
+- [x] **A2: polish diagnostic.** DONE: true `3KSK−2KSKSK`, f64 throughout. On truncated mask oscillates ~7.5e-4 — post-hoc polish cannot repair, but cause is masked-fixed-point bias (below), not f32.
+- [x] **A3: frozen-input separation.** DONE (`sparse_f64check.rs::frozen_input_dense_ref`): f64 Cholesky+dsyevd of the engine's own converged H_scc+S → `2Tr(P·H0) = −298.807141` vs DFTB+ −298.807668 (0.5 mHa). **All sparse inputs correct; error lives solely in purified K.**
+
+**A-exit result (2026-09-14):** the "f32 floor" is retracted. At ~complete mask (deg~330) the f32 purifier reaches R_I 3.3e-5 and **23 μHa** vs the frozen reference, and *preserves* an injected exact K. At deg-175 (53% pairs) products `K·S`/`KSK` truncated to M_K bias the fixed point → +15.7 mHa. NS fix alone recovered ~2.5 mHa. **Dominant error = intermediate-product truncation.** Production decision pivots to §D "Masks": widen the KS/KSK intermediate support beyond M_K and/or LNV.
+
+#### B — Stop early when justified; accept the actual returned state (state agent, after A)
+
+- [ ] Distinguish reached tolerance, evidenced stagnation, exhaustion and failure. `stagnant=false`, 10× growth restoration and cap-based `NumericalFloor` are not an ordinary plateau detector. Use branch-aware histories and observed loss of convergence order; validate conditioning versus stagnation for the actual nonorthogonal/masked polynomial sequence. Do not revive “N non-improving checks” during normal TC2 conditioning. [Stopping-criterion reference](https://arxiv.org/abs/1507.02087).
+- [ ] Stop at the first state satisfying the requested calibrated budget or an evidenced floor. Calibrate early-SCC electronic accuracy against its induced charge error relative to current SCC residual; tighten for final acceptance. Reset incompatible DIIS history when the map/accuracy changes. An inaccurate final solve must not inherit acceptance from an earlier cheap state.
+- [ ] Revalidate restored/recovered state provenance, trace, dummy occupancy, idempotency and stationarity; classify P status against recovered K. A printed R_H without an acceptance check is only a diagnostic. Trace rescaling does not guarantee a valid spectrum or ground-state occupancy.
+- [ ] Make floor permission explicit in run policy. A certified floor may eventually serve vibrations if it passes C; neither a status name nor `accept_numerical_floor=false` establishes quality. Until calibration use strict floor rejection for vibrational acceptance. Do not silently loosen thresholds or switch algorithms. Document existing automatic NS cold retry/SCC mixer rescue and expose recovery as an explicit configured driver policy when modifying that contract.
+
+**Exit:** bounded cold/warm histories, no exhaustion mislabeled as a floor, matching diagnostics for returned states and unchanged/improved force repeatability. Count saved products and wall time, not only iterations.
+
+#### C — Calibrate derivatives and mode stability (physics agent, after A)
+
+Reuse Gates E–H and existing Rhai/force/Hessian machinery. Start with a small full Hessian and selected R10/R14 columns or Hessian-vector probes. Probes can reject a poor policy cheaply but cannot certify stability in unprobed directions.
+
+| Quantity | Required evidence |
+|---|---|
+| Energy | Separate absolute bias from changes of that bias along scans; no system-independent 1 mHa total target for vibrations. |
+| Force | Same-geometry reference bias and own-energy gradient consistency, including W/Pulay and taper derivatives. |
+| Repeatability | Max/RMS force spread from cold, central-warm, perturbed-charge and reversed displacement-order solves, separate from bias. |
+| Hessian | Existing h sweep: 0.01, 0.02, 0.05, 0.10 Å; raw asymmetry, rigid-mode leakage and sensitivity to electronic accuracy. |
+| Frequencies | Relative errors for ordinary modes; absolute errors and uncertainty for soft modes. Derive limits from the application and measured floors. |
+| Robustness/time | Every sampled failure/retry plus total time to accepted output; no cherry-picked successes. |
+
+For a central-force Hessian, `δH[:,a]=−(δF(+h)−δF(−h))/(2h)`. If each nonsmooth force error has norm ≤ε_F, column error is ≤ε_F/h; independent random component errors give RMS σ_F/(√2 h). Smooth force bias must be differentiated separately. Balance nonsmooth error against O(h²) FD truncation using the measured plateau.
+
+For `D=M^(−1/2)HM^(−1/2)`, a bound `||δD||2≤ε_D` gives eigenvalue uncertainty ≤ε_D. Internal eigenvalues exceeding that uncertainty have a defensible positive sign. Variation across h/tolerances gives an empirical uncertainty estimate, not automatically a rigorous bound. For ordinary modes `δω/ω≈δλ/(2λ)`; soft modes need special attention.
+
+**No artificial positivity:** relax at the accepted method's own stationary minimum. Investigate significant negative internal modes using h variation, tighter solves and an energy scan along the mode. Preserve genuine instabilities. Report raw results before symmetry/rigid-motion projection; never clip eigenvalues, shift the Hessian diagonal or project away an internal instability. Tiny rigid-mode signs compatible with uncertainty are not evidence of a physical saddle.
+
+Freeze support/plans/model settings and calibrated final accuracy policy across the stencil. Restore the same central seed for each sign; do not chain `+h→−h`. Compare default `W=2(ZH)K`, legacy `2KHK` and reference EDM contractions on **identical approximate operands**; neither shortcut identity validates arbitrary nonstationary/truncated K. Check cutoff smoothness wherever the stencil crosses a taper boundary.
+
+**Output:** a small Pareto table of wall time versus relative-energy, force and frequency errors. Select explicit screening/relaxation/vibration policies from evidence, not guessed defaults. A coarse relaxation must be re-relaxed and checked under the final vibration policy.
+
+#### D — Select one justified numerical improvement after A–C
+
+- [ ] **P-TC2:** compare after inverse certification, including recovery/trace restoration/diagnostics and total SCC/force time at equal quality.
+- [ ] **Compensated f32:** only if identical-input diagnostics implicate dot accumulation; benchmark an opt-in endgame variant against 4-accumulator/ACC8. Check compiler reassociation and register cost. Keep PR5: no GPU f64 matrix arithmetic. Host-f64 small reference experiments remain diagnostics. Late compensation cannot undo bad upstream Z/K0. Double-single storage requires separate evidence that storage rounding dominates.
+- [ ] **LNV:** only if H-dependent subspace error or poor masked stationarity remains limiting. Inventory/reuse `bsr4_lnv_gradient`; define L support, actual K(L), every projection, electron-count constraint and safeguarded descent. Differentiate the **implemented masked functional**, verify its electronic gradient by finite differences, then derive/check nuclear forces. The untruncated combination kernel is not proof for arbitrary masked products. Count line-search products; lower energy outside admissible occupation/charge constraints is not improvement. No guaranteed recovery fraction or “first-order tail repair.” [Nonorthogonal LNV reference](https://www.physics.rutgers.edu/~dhv/pubs/local_copy/rw_dms.pdf).
+- [ ] **Masks:** separate K/P and Z injection (current top-k couples them). Keep radial control; compare symmetric magnitude selection and omitted-product bounds at equal executed work. Independently audit the KS intermediate: the ZS halo does not fix `T=KS` projected onto M_K. Use expanded diagnostic support before designing a bounded production contribution schedule. Freeze selection across ±h and include oracle/setup cost.
+- [ ] **Dummies:** later test structural zero dummy density throughout initialization/update/recovery, retaining nonsingular dummy S. Only then exclude dummy spectrum from bounds; fuse enforcement into existing writes and measure products saved. Do not modify physical occupations.
+
+Do not develop every branch speculatively. Change one structural feature, remeasure C, and retain only a demonstrated accuracy/time benefit. Electronic smearing changes the target energy/free-energy and force convention; it is deferred rather than introduced as a free numerical accuracy knob.
+
+#### E — Remove measured throughput costs (performance agent, after an accepted scalar policy)
+
+- [~] Profile release builds on the actual NVIDIA GPU: **DONE 2026-09-14 (instrumentation + first data).** `SparseBsr4Gpu::prof_*` passthroughs + ticks at every stage boundary (tc2.ks/tr/ksk/res/upd, ns.*, scc.*, geom.*, f.*); `RUST_DFTB_PROF=evt|mark`, `dftb_engine` dumps sparse tables. Raw data `debug/prof_sparse/*.txt`, summary in report §"profiling". **Findings:** `tc2.ksk` = 73–83% of device time (cost ∝ nnz_out × deg_operand — K-degree is the price); 2 blocking reads/TC2 iter; ~40% of iters wasted at the oscillation plateau (→§B early-stop); `scc.k0` ≈ 5–8% per-SCC-iter. Remaining: combine trace+residual into one read; batch decisions; init/gamma/W share on bigger systems.
+- [ ] Preallocate SCC charge staging; reduce stationarity to device partials instead of downloading O(nnz). Move sparse force contractions to pair ownership/atom gather when their measured share justifies it. Respect the dense agent's ownership; no global atomics or per-step kernel/buffer builds.
+- [ ] For product p count `T_p=Σ_output_blocks number_of_retained_k_terms`; about `128·T_p` FLOPs. Model full evaluation as geometry + NS + all SCC initialization/products/reductions/mixing + W/forces. Measure bytes, metadata and launches too. Degree alone is not a cost model.
+- [ ] Cache size is `64·MAX_LEFT_BLOCKS` bytes/WG. A wide Z/halo can inflate resource reservation in narrow-K products. Consider per-product specialization/buckets or §15.5's exact global-gather route only with profiling evidence. Query compiled local/private memory and residency limits; do not infer a degree-380 cap from 49 KiB.
+- [ ] Benchmark a small matched size series with physical orbital counts and equal accepted E/F quality. Separate setup from repeated evaluation/Hessian throughput. Report dense crossover only after matching parameterization, accuracy, hardware and outputs; the broken dense SCC harness cannot supply a trusted comparison.
+- [ ] Batch independent ±h states sharing topology/plans, with independent q/Z/K/scratch/status. Choose batch size from measured memory/occupancy; output must not depend on batch order. Include failures/retries and amortize setup over the real workload.
+
+**Agent handoff:** source changes, unfiltered diagnostics under `debug/`, accepted/rejected settings with actual values, wall-time impact and remaining uncertainty. Update this report and the roadmap when implementation status changes. No completion claim without user acceptance.

@@ -163,6 +163,11 @@ pub fn render_tiled_source(b: usize, wg: usize, prec: u32) -> String {
         .replace("#define MAX_SWEEPS 50", &format!("#define MAX_SWEEPS {}", jacobi_sweeps(TILED_MAX_SWEEPS)))
         .replace("#define MAX_CSWEEPS 40", &format!("#define MAX_CSWEEPS {}", jacobi_sweeps(40)))
         .replace("#define JACOBI_PREC 2", &format!("#define JACOBI_PREC {}", prec))
+        // R8b: env-tunable off-norm exit threshold for sweep/tolerance sweeps.
+        .replace("#ifndef JACOBI_OFF_TOL\n#define JACOBI_OFF_TOL 1.0e-6f    // off/‖A‖_F exit threshold\n#endif",
+                 &format!("#define JACOBI_OFF_TOL {:.3e}f",
+                     std::env::var("RUST_DFTB_JACOBI_OFF_TOL").ok()
+                         .and_then(|v| v.parse::<f32>().ok()).unwrap_or(1.0e-6)))
 }
 
 /// Production direct cyclic Jacobi for 64 < N ≤ 256 — the same
@@ -194,11 +199,16 @@ pub fn direct_jacobi_batched(
     let program = rt.build_program(&source)?;
     let ones = rt.buffer_from_slice(&vec![1i32; batch])?;
     let diag = rt.zero_buffer::<f32>(4 * batch)?;
+    // R5 tail args — disabled (fermi_tail=0); occ_w/mu are bound dummies.
+    let occ_w = rt.zero_buffer::<f32>(batch * n)?;
+    let mu = rt.zero_buffer::<f32>(batch)?;
     let kernel = Kernel::builder()
         .program(&program).name("jacobi_cyclic_global_batched").queue(rt.queue().clone())
         .global_work_size(batch * wg).local_work_size(wg)
         .arg(a_buf).arg(v_buf).arg(n as i32).arg(batch as i32).arg(0i32)
         .arg(&ones).arg(&diag)
+        .arg(0i32).arg(0i32).arg(0.0f32)
+        .arg(&occ_w).arg(&mu)
         .build().map_err(map_ocl_err)?;
     unsafe { kernel.enq().map_err(map_ocl_err)?; }
     let mut d = vec![0.0f32; 4 * batch];

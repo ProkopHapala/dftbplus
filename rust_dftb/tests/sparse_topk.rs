@@ -29,9 +29,17 @@ fn topk_mask_sweep_r14() {
     let sk = load_sk_for_species(&sk_dir, &mol.species)
         .unwrap_or_else(|e| panic!("load_sk_for_species: {e}"));
 
-    // Wide reference: full K/Z radius, r_trunc=8, K-TC2.
+    // Wide reference: full K/Z radius (or env override for short-range SK
+    // sets like pbc-0-3 where the default is narrower than the DM support).
+    // Env: RUST_DFTB_SK_DIR selects the SK set; TOPK_R_TRUNC (default 8.0)
+    // and TOPK_R_REF (default 0 = full) adapt to pbc.
+    let envf = |name: &str, dflt: f64| std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(dflt);
+    let r_trunc = envf("TOPK_R_TRUNC", 8.0);
+    let r_ref = envf("TOPK_R_REF", 0.0);
     let mut cfg = SparseDftbConfig {
-        r_trunc_ang: Some(8.0), taper_w_ang: 1.0,
+        r_trunc_ang: Some(r_trunc), taper_w_ang: if r_trunc < 8.0 { 0.3 } else { 1.0 },
+        r_k_ang: if r_ref > 0.0 { Some(r_ref) } else { None },
+        r_z_ang: if r_ref > 0.0 { Some(r_ref) } else { None },
         max_deg_hs: Some(512), max_deg_k: Some(512), max_deg_z: Some(512),
         tc2_tol: 1e-5, ns_tol: 1e-4, purifier_p: Some(false),
         ..Default::default()

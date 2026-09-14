@@ -302,3 +302,27 @@ fn check_edm_fresh(kt: f32) {
     eprintln!("[R1 kT={kt}] worst replica {worst}: max|ΔF|={max_df:.3e} Ha/Å");
     assert!(max_df < 1e-3, "kT={kt}: batched vs solo force mismatch {max_df:.3e} Ha/Å at replica {worst} — stale/zero W in early-converged replicas (R1)");
 }
+
+/// W10/I3 regression: zero device-buffer allocations inside solver loops.
+/// The runtime counts every buffer_from_slice/zero_buffer/copy_buffer call.
+/// After GpuDftb::new (construction allocs are legal), scc → eval →
+/// fire_step → scc → eval must add exactly ZERO to the counter — a nonzero
+/// delta means a device alloc crept into a hot loop.
+#[test]
+fn test_gpu_dftb_no_loop_allocs() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let dir = sk_dir();
+    let (sp, xyz) = h2o();
+    let sk = load_sk_for_species(&dir, &sp).unwrap();
+    let mut eng = GpuDftb::new(sk, &dir, sp, xyz, 1).unwrap();
+    eng.set_smearing(0.002); // smeared production path — exercises occ tail
+    let a0 = eng.rt.alloc_count.load(Relaxed);
+    eng.scc(50, 1e-6).unwrap();
+    eng.eval(true).unwrap();
+    eng.fire_step(0.0).unwrap();
+    eng.scc(50, 1e-6).unwrap();
+    eng.eval(true).unwrap();
+    let a1 = eng.rt.alloc_count.load(Relaxed);
+    eprintln!("[W10] alloc_count {a0} → {a1} (delta {} across scc+eval+fire+scc+eval)", a1 - a0);
+    assert_eq!(a1, a0, "device buffer allocations inside solver loops: +{}", a1 - a0);
+}

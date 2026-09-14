@@ -21,6 +21,11 @@ use crate::methods::sparse::sparse_forces::sparse_analytic_forces;
 use crate::qmqm::shifts::compute_intra_shifts;
 
 /// Dummy onsite (Hartree) for padded H 2p slots. Same as Gate D.
+/// Dummy-lane onsite energy — parked above the physical spectrum so
+/// purification keeps dummy occupations at 0. NOTE (2026-09-14): lowering
+/// to 0.8 tightened the Gershgorin bounds ~3× but R_I got *worse*
+/// (4.9e-4→8.4e-4 on R10/pbc) — the loose bound smooths the Fermi step;
+/// bounds are NOT the f32-floor mechanism.
 pub const E_DUMMY: f32 = 2.0;
 
 #[derive(Debug, Clone)]

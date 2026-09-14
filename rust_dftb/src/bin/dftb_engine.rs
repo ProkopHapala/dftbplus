@@ -1541,7 +1541,7 @@ fn rhai_gpu_new(name: &str, sk_dir: &str, batch: INT) -> INT {
 fn rhai_gpu_scc(name: &str, max_iter: INT, tol: f64) -> f64 {
     with_gpu(|g| {
         let h = g.get_mut(name).unwrap_or_else(|| panic!("gpu_scc '{name}': no engine — gpu_new first"));
-        let scc = h.eng.scc(max_iter as usize, tol as f32)
+        let scc = h.eng.scc_with_retry(max_iter as usize, tol as f32)   // W11: explicit warm-start retry
             .unwrap_or_else(|e| panic!("gpu_scc '{name}': {e}"));
         h.last_rms = scc.rms;
         h.last_iters = scc.n_iters as i64;
@@ -2146,6 +2146,9 @@ fn main() {
     if std::env::var("RUST_DFTB_PROF").map(|v| v != "0").unwrap_or(false) {
         with_gpu(|g| {
             for (name, h) in g.iter() { h.eng.prof_report(&format!("'{name}' (script total)")); }
+        });
+        with_sparse(|g| {
+            for (name, h) in g.iter() { h.eng.prof_report(&format!("'{name}' (sparse script total)")); }
         });
     }
 

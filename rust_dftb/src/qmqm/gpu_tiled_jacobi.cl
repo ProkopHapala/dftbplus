@@ -145,9 +145,16 @@ __kernel void jacobi_cyclic_global_batched(
     const int batch,
     const int init_v,
     __global const int* active,     // [batch] 0 → replica frozen, early-out
-    __global float* diag            // [batch][4] out: {off, off/‖A‖_F, stop, sweeps}
+    __global float* diag,           // [batch][4] out: {off, off/‖A‖_F, stop, sweeps}
                                     // stop: 0 converged · 1 stagnation ·
                                     //       2 MAX_CSWEEPS · 3 n>capacity · 4 non-finite
+    // R5 tail: Fermi smearing on the just-solved spectrum — replaces the
+    // separate extract_diag + fermi_occ launches on the production path.
+    const int fermi_tail,           // 1 → solve Σ f_k(μ)=n_occ and write occ_w+mu
+    const int n_occ_fermi,
+    const float kT,
+    __global float* occ_w,          // [batch*n] out: Fermi weights f_k
+    __global float* mu              // [batch] in/out: μ warm-start in, result out
 ) {
     const int gid = get_group_id(0);
     const int lid = get_local_id(0);
@@ -164,6 +171,11 @@ __kernel void jacobi_cyclic_global_batched(
     __local int    rot_q[128];
     __local volatile int l_nrot;  // live (non-skipped) rotations this round
     __local float  reduce[WG];
+    // R5 Fermi tail scratch (used only when fermi_tail=1)
+    __local float  le[256];       // staged eigenvalues (diag of A)
+    __local double dred[WG];      // f64 reductions: sum
+    __local double dred2[WG];     // f64 reductions: derivative
+    __local double lmu[4];        // {lo, hi, μ, done} — bracket state
 
     // R5: defensive capacity guard — rot_*[] hold jpair ≤ 128 → jn ≤ 256.
     // The host rejects n>256 at plan build; if it ever reaches the kernel,
@@ -180,35 +192,29 @@ __kernel void jacobi_cyclic_global_batched(
     __global float* gV = V + (size_t)gid * n * n;
     const int nn = n * n;
 
-    // ---- V init ----
-    if (init_v == 0) {
-        for (int idx = lid; idx < nn; idx += lsz) {
-            int r = idx / n;
-            gV[idx] = (r == idx - r * n) ? 1.0f : 0.0f;
-        }
-    }
-
-    // ---- ‖A‖_F once (Jacobi similarity preserves it) + initial off ----
+    // ---- fused prologue: V=I init + ‖A‖_F + initial off in ONE pass ----
+    // R8b: the warm path exits at ~0 sweeps — this prologue IS the kernel
+    // cost, so the three nn-passes and two barrier chains are fused into
+    // one pass + one packed reduce. ‖A‖_F is invariant under Jacobi
+    // similarity → computed once at entry; the exit test does not get
+    // harder on warm-started (near-diagonal) A.
     float fa = 0.0f, fo = 0.0f;
     for (int idx = lid; idx < nn; idx += lsz) {
+        int r = idx / n;
         float v = gA[idx];
         fa += v * v;
-        int r = idx / n;
         if (r != idx - r * n) fo += v * v;
+        if (init_v == 0) gV[idx] = (r == idx - r * n) ? 1.0f : 0.0f;
     }
-    reduce[lid] = fa;  barrier(CLK_LOCAL_MEM_FENCE);
+    reduce[lid] = fa;
+    dred[lid] = (double)fo;              // second column of the packed reduce
+    barrier(CLK_LOCAL_MEM_FENCE);
     for (int off = lsz >> 1; off > 0; off >>= 1) {
-        if (lid < off) reduce[lid] += reduce[lid + off];
+        if (lid < off) { reduce[lid] += reduce[lid + off]; dred[lid] += dred[lid + off]; }
         barrier(CLK_LOCAL_MEM_FENCE);
     }
     const float frob = sqrt(fmax(reduce[0], 1.0e-30f));
-    barrier(CLK_LOCAL_MEM_FENCE);
-    reduce[lid] = fo;  barrier(CLK_LOCAL_MEM_FENCE);
-    for (int off = lsz >> 1; off > 0; off >>= 1) {
-        if (lid < off) reduce[lid] += reduce[lid + off];
-        barrier(CLK_LOCAL_MEM_FENCE);
-    }
-    float off_cur = sqrt(reduce[0]);
+    float off_cur = sqrt(fmax((float)dred[0], 0.0f));
     barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
 
     const float off_exit = JACOBI_OFF_TOL * frob;
@@ -334,16 +340,92 @@ __kernel void jacobi_cyclic_global_batched(
         diag[4*gid+3] = (float)nsw;
     }
 
-    // ---- Eigenvalues on the diagonal; zero the off-diagonal residue ----
-    // W1 (manifest §14): only on a converged exit — on stall/max-sweeps the
-    // residue is the diagnostic record of WHERE the solver stopped (read it
-    // back when debugging a bad replica); zeroing it on bad exits destroyed
-    // exactly the information needed. Downstream reads only the diagonal
-    // (extract_diag), so residue left on failure is safe.
-    if (stop == 0) {
-        for (int idx = lid; idx < nn; idx += lsz) {
-            int r = idx / n;
-            if (r != idx - r * n) gA[idx] = 0.0f;
+    // ---- Eigenvalues on the diagonal ----
+    // R8b: the old success-path pass that zeroed the off-diagonal residue
+    // was dead work — nothing reads hp off the diagonal (extract_diag and
+    // the Fermi tail read gA[k*n+k] only; the next GEMM overwrites hp
+    // wholesale). On failure the residue stays: it is the diagnostic
+    // record of WHERE the solver stopped (W1).
+
+    // ---- R5 tail: Fermi μ + occ_w on the just-solved spectrum ----
+    // Safeguarded Newton (bisection fallback) solving Σ f_k(μ) = n_occ,
+    // warm-started from mu[sid] of the previous solve. f64 for the
+    // sum/decision (discrete-decision rule); f_k stored f32.
+    // Only on a converged eigensolve — a failed replica keeps its last
+    // occ_w and is parked as Failed downstream.
+    if (fermi_tail != 0 && stop == 0) {
+        const double kt = (double)kT;
+        const double want = (double)n_occ_fermi;
+        for (int k = lid; k < n; k += lsz) le[k] = gA[k * n + k];
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        // bracket [emin−32kT, emax+32kT] — same guaranteed bracket as
+        // fermi_occ_batched (s(μ) increasing in μ; s(lo)<n_occ<s(hi))
+        double elo = 1.0e300, ehi = -1.0e300;
+        for (int k = lid; k < n; k += lsz) {
+            const double e = (double)le[k];
+            elo = fmin(elo, e); ehi = fmax(ehi, e);
+        }
+        dred[lid] = elo;
+        barrier(CLK_LOCAL_MEM_FENCE);
+        for (int o = lsz >> 1; o > 0; o >>= 1) {
+            if (lid < o) dred[lid] = fmin(dred[lid], dred[lid + o]);
+            barrier(CLK_LOCAL_MEM_FENCE);
+        }
+        elo = dred[0] - 32.0 * kt;
+        barrier(CLK_LOCAL_MEM_FENCE);
+        dred[lid] = ehi;
+        barrier(CLK_LOCAL_MEM_FENCE);
+        for (int o = lsz >> 1; o > 0; o >>= 1) {
+            if (lid < o) dred[lid] = fmax(dred[lid], dred[lid + o]);
+            barrier(CLK_LOCAL_MEM_FENCE);
+        }
+        ehi = dred[0] + 32.0 * kt;
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        if (lid == 0) {
+            const double mp = (double)mu[gid];
+            lmu[0] = elo; lmu[1] = ehi;
+            lmu[2] = (mp > elo && mp < ehi) ? mp : 0.5 * (elo + ehi);
+            lmu[3] = 0.0;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        for (int it = 0; it < 24; ++it) {
+            const double m = lmu[2];
+            double s = 0.0, ds = 0.0;
+            for (int k = lid; k < n; k += lsz) {
+                const double x = ((double)le[k] - m) / kt;
+                const double f = (x > 40.0) ? 0.0 : ((x < -40.0) ? 1.0 : 1.0 / (1.0 + exp(x)));
+                s += f;
+                ds += (x > 40.0 || x < -40.0) ? 0.0 : f * (1.0 - f);
+            }
+            dred[lid] = s; dred2[lid] = ds;
+            barrier(CLK_LOCAL_MEM_FENCE);
+            for (int o = lsz >> 1; o > 0; o >>= 1) {
+                if (lid < o) { dred[lid] += dred[lid + o]; dred2[lid] += dred2[lid + o]; }
+                barrier(CLK_LOCAL_MEM_FENCE);
+            }
+            if (lid == 0) {
+                const double g = dred[0] - want;
+                if (fabs(g) < 1.0e-7 * fmax(want, 1.0)) {
+                    lmu[3] = 1.0;
+                } else {
+                    if (dred[0] > want) lmu[1] = fmin(lmu[1], m); else lmu[0] = fmax(lmu[0], m);
+                    double mn = m;
+                    if (dred2[0] > 0.0) mn = m - g * kt / dred2[0];   // ds/dμ = Σf(1−f)/kT
+                    if (!(mn > lmu[0] && mn < lmu[1])) mn = 0.5 * (lmu[0] + lmu[1]);
+                    lmu[2] = mn;
+                }
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
+            if (lmu[3] > 0.5) break;
+        }
+        const double muf = lmu[2];
+        if (lid == 0) mu[gid] = (float)muf;
+        for (int k = lid; k < n; k += lsz) {
+            const double x = ((double)le[k] - muf) / kt;
+            occ_w[(size_t)gid * n + k] = (float)((x > 40.0) ? 0.0 : ((x < -40.0) ? 1.0 : 1.0 / (1.0 + exp(x))));
         }
     }
 }

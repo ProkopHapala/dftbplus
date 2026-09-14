@@ -1611,8 +1611,9 @@ __kernel void diis_step_batched(
     __global const float* q_new, // [batch*n_atoms]
     __global const float* q_old, // [batch*n_atoms] — current input (read-only)
     __global const float* q0,    // [batch*n_atoms] neutral reference (Δq anchor)
-    __global float* q_next,      // [batch*n_atoms] mixed next iterate (commit model:
-                                 //   host commits q_next→q only for still-active replicas)
+    __global float* q_next,      // [batch*n_atoms] mixed next iterate — R7: bound to
+                                 //   q_gpu so the kernel commits in place (converged/
+                                 //   invalid replicas return before the mix → keep q_n)
     __global float* dq_hist,     // [batch*DIIS_MAX_HIST*n_atoms]
     __global float* r_hist,      // [batch*DIIS_MAX_HIST*n_atoms]
     __global int* buf_idx,       // [batch]
@@ -1625,14 +1626,13 @@ __kernel void diis_step_batched(
                                  // rms < rms_tol or non-finite → active = 0 (device-side
                                  // convergence so the host can run chunked iterations)
     const float rms_tol,         // SCC convergence tolerance (f32 copy of the host tol)
-    __local float* scratch       // workgroup scratch (≥ lsz)
+    __local float* scratch,      // workgroup scratch (≥ lsz)
+    __global double* diis_work   // [batch*DIIS_MAX_HIST*n_atoms] W13: f64 QR working columns
 ) {
     const int sid = get_group_id(0);
     const int lid = get_local_id(0);
     const int lsz = get_local_size(0);
     __local int l_diis_ok;
-    __local int l_ne;     // effective history count after drop-oldest retry
-    __local int l_skip;   // slot dropped this step (-1 = none)
     if (sid >= batch || active[sid] == 0) return;
 
     __global const float* qn = q_new + (size_t)sid * n_atoms;
@@ -1683,124 +1683,119 @@ __kernel void diis_step_batched(
         return;
     }
 
-    // Oldest ring slot: when full it is the next write position (buf_idx was
-    // already advanced); otherwise writes started at slot 0.
-    const int oldest = (nf >= DIIS_MAX_HIST) ? buf_idx[sid] : 0;
-
     if (lid == 0) {
-        double Bd[DIIS_NP1 * DIIS_NP1];
-        double bd[DIIS_NP1];
-        int ok = 0;
-        int reason = 1;
-        int skip = -1;
-        int ne = n;
-        // D9: on rank failure drop the oldest history vector and retry once.
-        for (int attempt = 0; attempt < 2 && !ok; attempt++) {
-            ne = n - (skip >= 0 ? 1 : 0);
-            if (ne < 2) { reason = 1; break; }
-            const int np1 = ne + 1;
-            ok = 1;
-            double scale = 0.0;
-            for (int i = 0; i < ne; i++) {
-                const int si = (skip >= 0 && i >= skip) ? i + 1 : i;
-                for (int j = 0; j < ne; j++) {
-                    const int sj = (skip >= 0 && j >= skip) ? j + 1 : j;
-                    double dot = 0.0;
-                    __global float* ri = rh + si * n_atoms;
-                    __global float* rj = rh + sj * n_atoms;
-                    for (int a = 0; a < n_atoms; a++) {
-                        dot += (double)ri[a] * (double)rj[a];
-                    }
-                    Bd[i * np1 + j] = dot;
-                    scale = fmax(scale, fabs(dot));
-                }
-            }
-            if (!isfinite(scale) || scale < 1.0e-30) {
-                ok = 0; reason = 1;
-            } else {
-                for (int i = 0; i < ne; i++) {
-                    for (int j = 0; j < ne; j++) Bd[i * np1 + j] /= scale;
-                    Bd[i * np1 + ne] = 1.0;
-                    Bd[ne * np1 + i] = 1.0;
-                }
-                Bd[ne * np1 + ne] = 0.0;
-                for (int i = 0; i < np1; i++) bd[i] = 0.0;
-                bd[ne] = 1.0;
+        // W13: pivoted f64 QR on the residual-history matrix — replaces the
+        // Gram+GE solve. κ(R) instead of κ²(RᵀR); dependent history columns
+        // drop INDIVIDUALLY by pivot magnitude (no drop-oldest retry — that
+        // was the blunt instrument this replaces). The Σc=1-constrained
+        // min-norm solve reduces to two triangular solves at κ(R):
+        //   c ∝ R_S⁻¹ R_S⁻ᵀ 1  over the surviving columns.
+        // Working columns live in `diis_work` (f64 global scratch).
+        double* W = diis_work + (size_t)sid * DIIS_MAX_HIST * n_atoms;
+        double Rq[DIIS_MAX_HIST * DIIS_MAX_HIST];  // Rq[i][j] = q_iᵀ r_j  (physical col j)
+        double Rs[DIIS_MAX_HIST * DIIS_MAX_HIST];  // triangular R in survivor order
+        double diag[DIIS_MAX_HIST];                // pre-normalization pivot norms
+        double cx[DIIS_MAX_HIST];                  // unnormalized coeffs (survivor order)
+        double yy[DIIS_MAX_HIST];
+        double nrm2[DIIS_MAX_HIST];                // −1 = consumed
+        int    order[DIIS_MAX_HIST];               // survivor k → physical slot
+        int ok = 1; int reason = 1; int nq = 0;
 
-                for (int k = 0; k < np1 && ok; k++) {
-                    int max_row = k;
-                    double max_val = fabs(Bd[k * np1 + k]);
-                    for (int i = k + 1; i < np1; i++) {
-                        double v = fabs(Bd[i * np1 + k]);
-                        if (v > max_val) { max_val = v; max_row = i; }
-                    }
-                    if (max_row != k) {
-                        for (int j = k; j < np1; j++) {
-                            double tmp = Bd[k * np1 + j];
-                            Bd[k * np1 + j] = Bd[max_row * np1 + j];
-                            Bd[max_row * np1 + j] = tmp;
-                        }
-                        double tmp = bd[k]; bd[k] = bd[max_row]; bd[max_row] = tmp;
-                    }
-                    if (!isfinite(max_val) || max_val < 1.0e-12) {
-                        ok = 0; reason = 1;
-                        break;
-                    }
-                    double piv = Bd[k * np1 + k];
-                    for (int i = k + 1; i < np1; i++) {
-                        double factor = Bd[i * np1 + k] / piv;
-                        Bd[i * np1 + k] = 0.0;
-                        for (int j = k + 1; j < np1; j++) {
-                            Bd[i * np1 + j] -= factor * Bd[k * np1 + j];
-                        }
-                        bd[i] -= factor * bd[k];
-                    }
+        for (int j = 0; j < n; j++) {
+            __global const float* rj = rh + (size_t)j * n_atoms;
+            double s = 0.0;
+            for (int a = 0; a < n_atoms; a++) {
+                double x = (double)rj[a];
+                W[j * n_atoms + a] = x;
+                s += x * x;
+            }
+            nrm2[j] = s;
+        }
+        double nrm_max = 0.0;
+        for (int j = 0; j < n; j++) nrm_max = fmax(nrm_max, nrm2[j]);
+        if (!isfinite(nrm_max) || nrm_max < 1.0e-40) { ok = 0; reason = 1; }
+
+        for (int k = 0; k < n && ok; k++) {
+            int jstar = -1; double best = 0.0;
+            for (int j = 0; j < n; j++) {
+                if (nrm2[j] > best) { best = nrm2[j]; jstar = j; }
+            }
+            // dependent: surviving norm below rel tol → drop this column and
+            // (loop continues) all remaining dependent ones
+            if (jstar < 0 || best < 1.0e-24 * nrm_max) break;
+            order[nq] = jstar;
+            diag[nq] = sqrt(best);
+            double inv = 1.0 / diag[nq];
+            for (int a = 0; a < n_atoms; a++) W[jstar * n_atoms + a] *= inv;
+            nrm2[jstar] = -1.0;
+            nq++;
+            for (int j = 0; j < n; j++) {
+                if (nrm2[j] < 0.0) continue;
+                double rij = 0.0;
+                for (int a = 0; a < n_atoms; a++) rij += W[jstar * n_atoms + a] * W[j * n_atoms + a];
+                Rq[(nq - 1) * DIIS_MAX_HIST + j] = rij;
+                for (int a = 0; a < n_atoms; a++) W[j * n_atoms + a] -= rij * W[jstar * n_atoms + a];
+                nrm2[j] -= rij * rij;
+            }
+        }
+        if (nq < 2) { ok = 0; reason = 1; }   // no useful DIIS span → α-mix
+
+        if (ok) {
+            // Assemble Rs = R_Sᵀ (LOWER-triangular in row-major): stored
+            // element (k,i), i≤k, equals R_S[i][k] = q_iᵀ r_{order[k]} for
+            // i<k and the pivot norm on the diagonal.
+            for (int kp = 0; kp < nq; kp++) {
+                const int jp = order[kp];
+                for (int ip = 0; ip < kp; ip++) Rs[kp * DIIS_MAX_HIST + ip] = Rq[ip * DIIS_MAX_HIST + jp];
+                Rs[kp * DIIS_MAX_HIST + kp] = diag[kp];
+            }
+            // R_Sᵀ y = 1 — forward substitution straight down the stored
+            // lower triangle. Then R_S x = y — back-substitution over the
+            // transpose of the stored triangle. c = x/Σx → Σc=1 exact.
+            for (int k = 0; k < nq && ok; k++) {
+                double s = 1.0;
+                for (int i = 0; i < k; i++) s -= Rs[k * DIIS_MAX_HIST + i] * yy[i];
+                const double piv = Rs[k * DIIS_MAX_HIST + k];
+                if (!isfinite(piv) || fabs(piv) < 1.0e-30) { ok = 0; reason = 2; break; }
+                yy[k] = s / piv;
+            }
+            if (ok) {
+                double xsum = 0.0;
+                for (int k = nq - 1; k >= 0; k--) {
+                    double s = yy[k];
+                    for (int i = k + 1; i < nq; i++) s -= Rs[i * DIIS_MAX_HIST + k] * cx[i];
+                    const double piv = Rs[k * DIIS_MAX_HIST + k];
+                    if (!isfinite(piv) || fabs(piv) < 1.0e-30 || !isfinite(s)) { ok = 0; reason = 2; break; }
+                    cx[k] = s / piv;
+                    xsum += cx[k];
                 }
+                if (ok && (!isfinite(xsum) || fabs(xsum) < 1.0e-30)) { ok = 0; reason = 2; }
                 if (ok) {
-                    for (int i = np1 - 1; i >= 0; i--) {
-                        double sum = bd[i];
-                        for (int j = i + 1; j < np1; j++) sum -= Bd[i * np1 + j] * bd[j];
-                        double piv = Bd[i * np1 + i];
-                        if (!isfinite(piv) || fabs(piv) < 1.0e-12 || !isfinite(sum)) {
-                            ok = 0; reason = 2;
-                            break;
-                        }
-                        bd[i] = sum / piv;
+                    for (int i = 0; i < n; i++) c[i] = 0.0f;
+                    for (int k = 0; k < nq && ok; k++) {
+                        const double ck = cx[k] / xsum;
+                        if (!isfinite(ck) || fabs(ck) > 10.0) { ok = 0; reason = 2; break; }
+                        c[order[k]] = (float)ck;
                     }
-                }
-                if (ok) {
-                    double csum = 0.0;
-                    for (int i = 0; i < ne; i++) {
-                        if (!isfinite(bd[i]) || fabs(bd[i]) > 10.0) { ok = 0; reason = 2; break; }
-                        csum += bd[i];
-                    }
-                    if (ok && fabs(csum - 1.0) > 1.0e-4) { ok = 0; reason = 3; }
                 }
             }
-            if (!ok && skip < 0) { skip = oldest; continue; }  // drop-oldest retry
-            break;
         }
-        if (ok) {
-            for (int i = 0; i < ne; i++) c[i] = (float)bd[i];
-        } else {
+        if (!ok) {
             // Structured status, no printf (D9): counter + last reason.
             diis_flag[sid] += 1;
             diis_reason[sid] = reason;
         }
         l_diis_ok = ok;
-        l_ne = ne;
-        l_skip = ok ? skip : -1;
     }
     barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
 
-    const int ne2 = l_ne;
-    const int skip2 = l_skip;
     if (l_diis_ok) {
+        // c[] is indexed by physical slot (0 for dropped columns) — the mix
+        // just sums all filled history.
         for (int a = lid; a < n_atoms; a += lsz) {
             float sum = 0.0f;
-            for (int i = 0; i < ne2; i++) {
-                const int s = (skip2 >= 0 && i >= skip2) ? i + 1 : i;
-                sum += c[i] * (qh[s * n_atoms + a] + rh[s * n_atoms + a]);
+            for (int i = 0; i < n; i++) {
+                sum += c[i] * (qh[i * n_atoms + a] + rh[i * n_atoms + a]);
             }
             qn2[a] = q0s[a] + sum;   // Δq-space mix: Σc=1 exactly preserves q0
         }
@@ -1808,6 +1803,76 @@ __kernel void diis_step_batched(
         for (int a = lid; a < n_atoms; a += lsz) {
             qn2[a] = alpha * qn[a] + (1.0f - alpha) * qo[a];
         }
+    }
+}
+
+// ------------------------------------------------------------------
+// energy_reduce_batched — W12
+//
+// One WG per replica; f64 accumulation; ONE readback replaces the six
+// separate scalar tails in energy_from_state. Output scalars[b*4]:
+//   [0] e_band = 2 Σ_k f_k·ρ_k        (use_w) or 2 Σ_{occ_mask} eig
+//   [1] mts    = Σ f·ln f + (1−f)·ln(1−f)   (use_w; else 0)
+//   [2] dqv    = Δq·V      [3] q0v = q0·V
+// ------------------------------------------------------------------
+__kernel void energy_reduce_batched(
+    const int n,
+    const int n_atoms,
+    const int batch,
+    __global const float* eig_rho,
+    __global const float* eig_diag,
+    __global const float* occ_w,
+    __global const int*   occ_mask,
+    __global const float* dq,
+    __global const float* q0,
+    __global const float* v,
+    const int use_w,
+    const int occ_repair,
+    __global double* out,           // [batch*4]
+    __local double* scratch         // [lsz]
+) {
+    const int sid = get_group_id(0);
+    if (sid >= batch) return;
+    const int lid = get_local_id(0);
+    const int lsz = get_local_size(0);
+    const int bn = sid * n;
+    const int ba = sid * n_atoms;
+
+    for (int c = 0; c < 4; c++) {
+        double acc = 0.0;
+        if (c == 0) {
+            if (use_w != 0) {
+                for (int k = lid; k < n; k += lsz)
+                    acc += 2.0 * (double)occ_w[bn + k] * (double)eig_rho[bn + k];
+            } else {
+                for (int k = lid; k < n; k += lsz)
+                    if (occ_mask[bn + k] != 0)
+                        acc += 2.0 * (double)(occ_repair ? eig_rho[bn + k] : eig_diag[bn + k]);
+            }
+        } else if (c == 1) {
+            if (use_w != 0) {
+                for (int k = lid; k < n; k += lsz) {
+                    const double f = (double)occ_w[bn + k];
+                    const double g = 1.0 - f;
+                    if (f > 1e-300) acc += f * log(f);
+                    if (g > 1e-300) acc += g * log(g);
+                }
+            }
+        } else if (c == 2) {
+            for (int a = lid; a < n_atoms; a += lsz)
+                acc += (double)dq[ba + a] * (double)v[ba + a];
+        } else {
+            for (int a = lid; a < n_atoms; a += lsz)
+                acc += (double)q0[ba + a] * (double)v[ba + a];
+        }
+        scratch[lid] = acc;
+        barrier(CLK_LOCAL_MEM_FENCE);
+        for (int off = lsz >> 1; off > 0; off >>= 1) {
+            if (lid < off) scratch[lid] += scratch[lid + off];
+            barrier(CLK_LOCAL_MEM_FENCE);
+        }
+        if (lid == 0) out[sid * 4 + c] = scratch[0];
+        barrier(CLK_LOCAL_MEM_FENCE);
     }
 }
 
@@ -1826,7 +1891,9 @@ __kernel void occ_normalize_batched(
     __global const int* occ_mask,
     __global float* Cp,
     __local float* scratch,
-    __global const int* active      // [batch] 0 → replica frozen, early-out
+    __global const int* active,     // [batch] 0 → replica frozen, early-out
+    __global const float* occ_w,    // [batch*n] Fermi weights (use_w=1)
+    const int use_w                 // 1 → renorm every column with occ_w[k]>0
 ) {
     const int gid = get_group_id(0);
     const int sid = gid / n;
@@ -1834,7 +1901,7 @@ __kernel void occ_normalize_batched(
     const int lid = get_local_id(0);
     const int lsz = get_local_size(0);
     if (sid >= batch || active[sid] == 0) return;
-    if (occ_mask[sid * n + k] == 0) return;
+    if (occ_mask[sid * n + k] == 0 && !(use_w != 0 && occ_w[sid * n + k] > 1.0e-30f)) return;
     __global float* col = Cp + (size_t)sid * n * n + k;
     float acc = 0.0f;
     for (int r = lid; r < n; r += lsz) {
@@ -2003,6 +2070,9 @@ __kernel void lowdin_q_from_m_batched(
 }
 
 // res[sid] = max |M − I| — first-order metric defect of X (Löwdin residual).
+// W7: row-sum ‖M−I‖∞ — elementwise max does NOT bound the eigen-residual
+// (‖·‖₂ ≤ ‖·‖∞ row-sum, not ≤ max|entry|). The Newton bound
+// e1 ≤ ¾e0² + ¼e0³ (per-eigenvalue) is only rigorous under this norm.
 __kernel void metric_residual_batched(
     const int n,
     const int batch,
@@ -2016,10 +2086,12 @@ __kernel void metric_residual_batched(
     const int lsz = get_local_size(0);
     __global const float* Mb = M + (size_t)sid * n * n;
     float mx = 0.0f;
-    for (int idx = lid; idx < n * n; idx += lsz) {
-        const int r = idx / n;
-        const int c = idx - r * n;
-        mx = fmax(mx, fabs(Mb[idx] - (r == c ? 1.0f : 0.0f)));
+    for (int r = lid; r < n; r += lsz) {
+        float row = 0.0f;
+        for (int c = 0; c < n; c++) {
+            row += fabs(Mb[r * n + c] - (r == c ? 1.0f : 0.0f));
+        }
+        mx = fmax(mx, row);
     }
     scratch[lid] = mx;
     barrier(CLK_LOCAL_MEM_FENCE);

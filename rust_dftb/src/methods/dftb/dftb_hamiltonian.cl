@@ -453,46 +453,20 @@ __kernel void onsite_and_va(
 // ------------------------------------------------------------------
 // Kernel 2: pairwise assembly (H0 + H1 + S)
 // ------------------------------------------------------------------
-// Launched per species-pair bucket. All threads in workgroup process
-// the same block type (uniform branch).
-__kernel void assemble_pairs(
-    __global const PairEntry* pairs,       // [n_pairs] for this bucket
-    __global const Fragment* fragments,    // [n_frags]  per-fragment metadata
-    __global const float*   sk_h,          // compact SK table [n_grid * n_sk_cols]
-    __global const float*   sk_s,
-    __global const float*   V_a,           // [total_atoms]
-    __global float*         H_out,         // flat [total_H_elements]
-    __global float*         S_out,
-    const float dr,
-    const int n_grid,
-    const int n_pairs,
-    const int n_frags,
-    const int block_type,      // 0=1x1, 1=1x4, 2=4x4  (uniform for whole launch)
-    const int n_sk_cols        // actual columns in this SK table (1, 2, or 4)
+// Shared pair-block writer: `p` must already carry r,l,m,n (either the
+// host-baked fields — `assemble_pairs` — or in-kernel from coords —
+// `assemble_pairs_geom`, W8).
+inline void assemble_pair_body(
+    PairEntry p,
+    __global const Fragment* fragments,
+    const __local float* l_sk_h,
+    const __local float* l_sk_s,
+    __global const float* V_a,
+    __global float* H_out,
+    __global float* S_out,
+    const float dr, const int n_grid, const int block_type
 )
 {
-    const int tid = get_local_id(0);
-    const int wg  = get_local_size(0);
-    const int gid = get_global_id(0);
-
-    // --- CACHE SK TABLE INTO __local (1 float per node, B-spline stencil) ---
-    // Local memory is sized for the worst case (N_SK_COLS=5); actual copy uses
-    // n_sk_cols which may be 1, 2, or 4 depending on block_type.
-    __local float l_sk_h[SK_GRID_MAX * N_SK_COLS];
-    __local float l_sk_s[SK_GRID_MAX * N_SK_COLS];
-
-    int n_sk_elements = n_grid * n_sk_cols;
-    for (int i = tid; i < n_sk_elements; i += wg) {
-        l_sk_h[i] = sk_h[i];
-        l_sk_s[i] = sk_s[i];
-    }
-
-    barrier(CLK_LOCAL_MEM_FENCE);
-
-    if (gid >= n_pairs) return;
-
-    PairEntry p = pairs[gid];
-
     // Global fragment lookup — do not cache a 128-cap local copy (batch is 200–1000).
     Fragment frag = fragments[p.replica];
     int n_orbs  = frag.n_orbs;
@@ -551,4 +525,100 @@ __kernel void assemble_pairs(
         rotate_4x4(p.l, p.m, p.n, sk_h + h1_factor * sk_s, ps_h + h1_factor * ps_s, blk);
         write_symmetric_4x4(H_out, n_orbs, base, p.orb_i, p.orb_j, blk);
     }
+}
+
+// Launched per species-pair bucket. All threads in workgroup process
+// the same block type (uniform branch). Legacy/test path: r,l,m,n come
+// from PairEntry (host-baked at prep or refresh_pair_geom).
+__kernel void assemble_pairs(
+    __global const PairEntry* pairs,       // [n_pairs] for this bucket
+    __global const Fragment* fragments,    // [n_frags]  per-fragment metadata
+    __global const float*   sk_h,          // compact SK table [n_grid * n_sk_cols]
+    __global const float*   sk_s,
+    __global const float*   V_a,           // [total_atoms]
+    __global float*         H_out,         // flat [total_H_elements]
+    __global float*         S_out,
+    const float dr,
+    const int n_grid,
+    const int n_pairs,
+    const int n_frags,
+    const int block_type,      // 0=1x1, 1=1x4, 2=4x4  (uniform for whole launch)
+    const int n_sk_cols        // actual columns in this SK table (1, 2, or 4)
+)
+{
+    const int tid = get_local_id(0);
+    const int wg  = get_local_size(0);
+    const int gid = get_global_id(0);
+
+    // --- CACHE SK TABLE INTO __local (1 float per node, B-spline stencil) ---
+    __local float l_sk_h[SK_GRID_MAX * N_SK_COLS];
+    __local float l_sk_s[SK_GRID_MAX * N_SK_COLS];
+
+    int n_sk_elements = n_grid * n_sk_cols;
+    for (int i = tid; i < n_sk_elements; i += wg) {
+        l_sk_h[i] = sk_h[i];
+        l_sk_s[i] = sk_s[i];
+    }
+
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    if (gid >= n_pairs) return;
+
+    assemble_pair_body(pairs[gid], fragments, l_sk_h, l_sk_s, V_a,
+                       H_out, S_out, dr, n_grid, block_type);
+}
+
+// W8 production variant: geometry computed in-kernel from `coords`
+// (Bohr) — no refresh_pair_geom launch, no dynamic PairEntry write/read.
+// W6b: `park[sid]==0` replicas keep their frozen-geometry H/S (gate is
+// AFTER the barrier — a workgroup can span replicas).
+__kernel void assemble_pairs_geom(
+    __global const PairEntry* pairs,
+    __global const Fragment* fragments,
+    __global const float*   sk_h,
+    __global const float*   sk_s,
+    __global const float*   V_a,
+    __global float*         H_out,
+    __global float*         S_out,
+    const float dr,
+    const int n_grid,
+    const int n_pairs,
+    const int n_frags,
+    const int block_type,
+    const int n_sk_cols,
+    __global const float*   coords,      // [batch][3*n_atoms] Bohr
+    const int n_atoms,
+    __global const int*     park
+)
+{
+    const int tid = get_local_id(0);
+    const int wg  = get_local_size(0);
+    const int gid = get_global_id(0);
+
+    __local float l_sk_h[SK_GRID_MAX * N_SK_COLS];
+    __local float l_sk_s[SK_GRID_MAX * N_SK_COLS];
+
+    int n_sk_elements = n_grid * n_sk_cols;
+    for (int i = tid; i < n_sk_elements; i += wg) {
+        l_sk_h[i] = sk_h[i];
+        l_sk_s[i] = sk_s[i];
+    }
+
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    if (gid >= n_pairs) return;
+
+    PairEntry p = pairs[gid];
+    if (park[p.replica] == 0) return;
+    {
+        const int cb = (int)p.replica * n_atoms * 3;
+        const float dx = coords[cb + 3*(int)p.atom_j    ] - coords[cb + 3*(int)p.atom_i    ];
+        const float dy = coords[cb + 3*(int)p.atom_j + 1] - coords[cb + 3*(int)p.atom_i + 1];
+        const float dz = coords[cb + 3*(int)p.atom_j + 2] - coords[cb + 3*(int)p.atom_i + 2];
+        const float r = sqrt(dx*dx + dy*dy + dz*dz);
+        const float inv_r = 1.0f / fmax(r, 1e-12f);
+        p.r = r; p.l = dx * inv_r; p.m = dy * inv_r; p.n = dz * inv_r;
+    }
+    assemble_pair_body(p, fragments, l_sk_h, l_sk_s, V_a,
+                       H_out, S_out, dr, n_grid, block_type);
 }

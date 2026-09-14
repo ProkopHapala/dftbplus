@@ -70,10 +70,14 @@ fn eigen_render_source(n: usize) -> String {
 /// §12 D2: tiled-Jacobi arithmetic precision. 0 = pure FP32-FMA,
 /// 1 = FP64 scalar rotation construction only, 2 = broad FP64 (reference).
 /// Set before `GpuSccPlan::new` (construction-time knob for A/B runs).
-/// Default 1 — measured (RTX 3090, tests/gpu_tiled_jacobi.rs jacobi_prec_bench,
-/// N=87): prec0 residual 4.8e-5 (too coarse), prec1 2.1e-6 at 82 ms,
-/// prec2 1.2e-6 at 243 ms → prec1 ≈ prec2 accuracy at ~3× speed.
-pub static JACOBI_PREC: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+/// Default 0 — measured 2026-09-13 (GC PT scan, batch=19, N=86, RTX 3090,
+/// evt mode): prec0 gives 0.450 vs 0.655 ms/call (−31% Jacobi) with
+/// ΔE ≤ 2e-6 Ha over all 19 points — the in-loop residual is absorbed by
+/// the renorm + Rayleigh-quotient repair and warm-start self-correction.
+/// The older standalone-solve concern (prec0 residual 4.8e-5) does not
+/// survive into production accuracy. prec1/2 remain as certified
+/// references: `RUST_DFTB_JACOBI_PREC=1` / `gpu_jacobi_prec(1)`.
+pub static JACOBI_PREC: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 pub fn set_jacobi_prec(p: u32) {
     assert!(p <= 2, "JACOBI_PREC must be 0,1,2 — got {p}");
@@ -172,12 +176,14 @@ pub struct GpuSccPlan {
     pub diis_coeffs: Buffer<f32>,     // [batch*max_hist] coefficients
     pub diis_flag: Buffer<i32>,       // [batch] fallback counter (D9: no printf)
     pub diis_reason: Buffer<i32>,     // [batch] last fallback reason
+    pub diis_work: Buffer<f64>,       // [batch*max_hist*n_atoms] W13: f64 QR columns
     pub diis_max_hist: usize,          // max history length (typically 10)
 
     // Host staging buffers (reused, not re-allocated)
     pub eig_diag_host: Vec<f32>,  // [batch*n]
     pub eig_rho_host: Vec<f32>,   // [batch*n] occupied Rayleigh quotients
     pub mask_host: Vec<i32>,      // [batch*n]
+    pub e_scal_host: Vec<f64>,    // [batch*4] W12 energy scalar readback
     pub rms_host: Vec<f32>,       // [batch]
     pub active_host: Vec<i32>,    // [batch] staging for `active` mask
     state_ok_host: Vec<i32>,      // [batch] staging for `state_ok` mask
@@ -189,11 +195,16 @@ pub struct GpuSccPlan {
     // Pre-built kernels (R8: no Kernel::builder() in hot loops)
     // SCC step kernels:
     k_dq_v_hscc: Kernel,      // fused_dq_v_hscc_batched (D10/R18)
-    k_matmul_xh: Kernel,      // Xᵀ · H_scc → temp (via x_t; D6)
-    k_matmul_tx: Kernel,      // temp · X → hp
-    k_matmul_xc: Kernel,      // X · cp → c
+    k_matmul_xh: Kernel,      // Xᵀ · H_scc → temp (via x_t; D6) — cold path
+    k_matmul_tx: Kernel,      // temp · X → hp — cold path
+    k_matmul_xc: Kernel,      // X · cp → c — cold path
+    // R1: warm-path handles bound to c instead of x_t/x_buf (n>64 only) —
+    // zero per-iteration set_arg; warm/cold never share a handle.
+    k_matmul_xh_warm: Option<Kernel>,  // cᵀ · H_scc → temp (trans_a=1)
+    k_matmul_tx_warm: Option<Kernel>,  // temp · c → hp
     k_transpose: Kernel,      // transpose_batched — x_t ← x_bufᵀ (D6)
-    k_jacobi: Kernel,         // jacobi (full-local or tiled)
+    k_jacobi: Kernel,         // jacobi, cold: a=hp v=cp init_v=0
+    k_jacobi_warm: Option<Kernel>,  // jacobi, warm: a=hp v=c init_v=1 (n>64)
     k_extract_diag: Kernel,   // extract_diagonal_batched
     k_select_occ: Kernel,     // select_occupation_batched (R9: GPU-side occ selection)
     k_fermi_occ: Kernel,      // fermi_occ_batched (W5: device μ bisection + occ_w)
@@ -208,7 +219,8 @@ pub struct GpuSccPlan {
     k_commit: Kernel,          // commit_q_batched (q ← q_next for active replicas)
     // Energy kernels:
     k_frobenius_trace: Kernel, // frobenius_trace_batched
-    k_dot: Kernel,             // dot_batched
+    k_dot: Kernel,             // dot_batched (dq·v → dot)
+    k_dot_q0: Kernel,          // dot_batched (q0·v → tr)
 
     // Matmul arg layout: for N≤64, buffer args are at [2,3,4]; for N>64, at [6,7,8].
     matmul_buf_base: u32,
@@ -216,10 +228,15 @@ pub struct GpuSccPlan {
     // n_occ for the occupation kernel (set once per solve, not per iteration)
     n_occ: usize,
     /// Fermi smearing kT (Hartree). 0 → integer occupation (default).
-    /// >0 → per-orbital weights occ_w = f(ε,μ,kT), μ per replica via host
-    /// bisection on eig_diag (tiny readback, ~KB/iter).
+    /// >0 → per-orbital weights occ_w = f(ε,μ,kT), μ solved on device in
+    /// the Jacobi tail (R5); `RUST_DFTB_FERMI_REF=1` reverts to the W5
+    /// standalone kernel for A/B.
     pub kT: f32,
-    occ_w_host: Vec<f32>,   // [batch*n] weights, reused as scratch + energy readback
+    /// R5 reference mode: keep the standalone `fermi_occ_batched` +
+    /// select_occ/extract_diag chain under smearing instead of the
+    /// Jacobi-tail μ solve.
+    pub fermi_ref: bool,
+    pub occ_w_host: Vec<f32>,   // [batch*n] weights, reused as scratch + energy readback
 
     /// §12 D3/D4: renormalize occupied C′ columns in `finalize` and use
     /// Rayleigh quotients ρ_k (not the drifted Jacobi diagonal ε_k) for
@@ -262,6 +279,8 @@ pub struct GpuSccPlan {
     k_lowdin_acc_c: Kernel,           // lowdin_accept_batched bound to `c` (B-repair)
 
     // R5: Repulsive spline energy (optional — set via set_repulsive_splines)
+    k_energy_reduce: Kernel,              // W12: energy_reduce_batched (f64 scalar tails)
+    e_scal: Buffer<f64>,                  // [batch*4] e_band, mts, dq·v, q0·v
     k_rep_energy: Option<Kernel>,         // repulsive_energy_batched
     rep_coords: Option<Buffer<f32>>,        // [batch*n_atoms*3] coordinates (Bohr)
     rep_species_idx: Option<Buffer<i32>>,    // [batch*n_atoms] species index per atom
@@ -278,9 +297,19 @@ impl GpuSccPlan {
     /// `s_buf` is `[batch][n*n]` overlap matrices. The plan stores its own
     /// copy of `X = S^{-1/2}`; call `set_geometry` to update it when the
     /// geometry changes.
+    ///
+    /// R1: `h0/g/q0/orb_atom` are the GpuDftb-owned geometry buffers — their
+    /// `cl_mem` handles are stable for the plan's lifetime (set_geometry
+    /// rewrites contents, never recreates buffers), so every io arg is bound
+    /// ONCE here. Per-iteration `set_arg` traffic is zero; only per-solve
+    /// scalars are bound via `bind_solve_params`/`bind_mix_params`.
     pub fn new(
         rt: &mut GpuRuntime,
         s_buf: &Buffer<f32>,
+        h0_buf: &Buffer<f32>,
+        g_buf: &Buffer<f32>,
+        q0_buf: &Buffer<f32>,
+        orb_atom_buf: &Buffer<i32>,
         n: usize,
         n_atoms: usize,
         batch: usize,
@@ -338,6 +367,9 @@ impl GpuSccPlan {
         let diis_buf_idx = rt.zero_buffer::<i32>(batch)?;
         let diis_n_filled = rt.zero_buffer::<i32>(batch)?;
         let diis_coeffs = rt.zero_buffer::<f32>(batch * diis_max_hist)?;
+        // W13: f64 QR working columns for the DIIS solve (global scratch —
+        // private/local f64 arrays of hist×n_atoms would spill registers).
+        let diis_work = rt.zero_buffer::<f64>(batch * diis_max_hist * n_atoms)?;
         let diis_flag = rt.zero_buffer::<i32>(batch)?;
         let diis_reason = rt.zero_buffer::<i32>(batch)?;
         eprintln!("[GpuSccPlan] DIIS hist={diis_max_hist} (min(10,n_atoms={n_atoms})) N={n} batch={batch}");
@@ -356,8 +388,8 @@ impl GpuSccPlan {
             .program(&mat_prog).name("fused_dq_v_hscc_batched").queue(rt.queue().clone())
             .global_work_size(batch * wg_fuse).local_work_size(wg_fuse)
             .arg(n as i32).arg(n_atoms as i32).arg(batch as i32)
-            .arg(&q_gpu).arg(&q_gpu).arg(&v)              // q/q0/g placeholders, set per-call
-            .arg(&h_scc).arg(&h_scc).arg(&occ_mask)      // h0/s/orb_atom placeholders
+            .arg(&q_gpu).arg(q0_buf).arg(g_buf)          // R1: io bufs bound once
+            .arg(h0_buf).arg(s_buf).arg(orb_atom_buf)
             .arg(&dq).arg(&v).arg(&h_scc)
             .arg_local::<f32>(n_atoms).arg_local::<f32>(n_atoms)
             .arg(&active)                                // [14] active mask
@@ -366,7 +398,7 @@ impl GpuSccPlan {
         // 4-6. Three matmul kernels (Xᵀ·H_scc→temp via x_t, temp·X→hp, X·cp→c).
         // D6: A-operand is x_t, NOT x_buf — Newton-reused X is S^{-1/2}·U
         // (non-symmetric gauge); X·H·X would be the wrong eigenproblem.
-        let (matmul_buf_base, k_matmul_xh, k_matmul_tx, k_matmul_xc) =
+        let (matmul_buf_base, k_matmul_xh, k_matmul_tx, k_matmul_xc, k_matmul_xh_warm, k_matmul_tx_warm) =
             build_matmul_kernels(rt, &mat_prog, n, batch, &x_t, &x_buf, &h_scc, &temp, &hp, &cp, &c, &active)?;
 
         // transpose_batched: args [0]=n [1]=batch [2]=a [3]=at — binds
@@ -379,9 +411,19 @@ impl GpuSccPlan {
             .arg(&x_buf).arg(&x_t)
             .build().map_err(map_ocl_err)?;
 
-        // 7. Jacobi eigensolver — gated on `active` so done replicas' WGs exit
-        let jacobi_prec = JACOBI_PREC.load(std::sync::atomic::Ordering::Relaxed);
-        let k_jacobi = build_jacobi_kernel(rt, n, batch, &hp, &cp, &active, jacobi_prec, &jacobi_diag)?;
+        // 7. Jacobi eigensolver — gated on `active` so done replicas' WGs exit.
+        //    R1: two prebound handles — cold writes V←I into cp (init_v=0),
+        //    warm rotates c in place (init_v=1). Warm exists only for n>64.
+        // R8: env override for A/B sweeps (test processes can't call
+        // set_jacobi_prec before a plan is built inside a helper).
+        let jacobi_prec = std::env::var("RUST_DFTB_JACOBI_PREC").ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .map(|p| { assert!(p <= 2, "RUST_DFTB_JACOBI_PREC must be 0,1,2 — got {p}"); p })
+            .unwrap_or_else(|| JACOBI_PREC.load(std::sync::atomic::Ordering::Relaxed));
+        let k_jacobi = build_jacobi_kernel(rt, n, batch, &hp, &cp, &active, jacobi_prec, &jacobi_diag, 0, &occ_w, &mu_out)?;
+        let k_jacobi_warm = if n > 64 {
+            Some(build_jacobi_kernel(rt, n, batch, &hp, &c, &active, jacobi_prec, &jacobi_diag, 1, &occ_w, &mu_out)?)
+        } else { None };
 
         // 8. extract_diagonal_batched: args [0]=n, [1]=batch, [2]=a, [3]=diag
         let total_diag = n * batch;
@@ -455,6 +497,8 @@ impl GpuSccPlan {
             .build().map_err(map_ocl_err)?;
 
         // 9b. occ_normalize_batched: args [0]=n [1]=batch [2]=occ_mask [3]=cp [4]=local(wg)
+        //     [5]=active [6]=occ_w [7]=use_w — under Fermi every weighted
+        //     column is renormed (the integer mask is not maintained then).
         //     One WG per (system, column); unoccupied early-exit.
         let wg_on = 128usize;
         let k_occ_renorm = Kernel::builder()
@@ -464,6 +508,7 @@ impl GpuSccPlan {
             .arg(&occ_mask).arg(&cp)
             .arg_local::<f32>(wg_on)
             .arg(&active)                                // [5] active mask
+            .arg(&occ_w).arg(0i32)                       // [6]=occ_w [7]=use_w (bind_solve_params)
             .build().map_err(map_ocl_err)?;
 
         // 9b2. snormalize_batched: args [0]=n [1]=batch [2]=c [3]=s [4]=local(n+wg)
@@ -473,7 +518,7 @@ impl GpuSccPlan {
             .program(&mat_prog).name("snormalize_batched").queue(rt.queue().clone())
             .global_work_size(batch * n * wg_sn).local_work_size(wg_sn)
             .arg(n as i32).arg(batch as i32)
-            .arg(&c).arg(&h_scc)  // arg3 = s_buf, set per-call
+            .arg(&c).arg(s_buf)
             .arg_local::<f32>(n + wg_sn)
             .arg(&active)                                // [5] active mask
             .build().map_err(map_ocl_err)?;
@@ -485,7 +530,7 @@ impl GpuSccPlan {
             .program(&mat_prog).name("occ_rayleigh_batched").queue(rt.queue().clone())
             .global_work_size(batch * n * wg_or).local_work_size(wg_or)
             .arg(n as i32).arg(batch as i32)
-            .arg(&occ_mask).arg(&c).arg(&h_scc).arg(&h_scc).arg(&eig_rho)  // arg5=s set per-call
+            .arg(&occ_mask).arg(&c).arg(&h_scc).arg(s_buf).arg(&eig_rho)
             .arg_local::<f32>(2 * n + 2 * wg_or)
             .arg(&active)                                // [8] active mask
             .arg(&occ_w).arg(0i32)                       // [9]=occ_w [10]=use_w set per-call
@@ -497,7 +542,7 @@ impl GpuSccPlan {
             .program(&mat_prog).name("mulliken_charges_batched").queue(rt.queue().clone())
             .global_work_size(batch * wg_mull).local_work_size(wg_mull)
             .arg(n as i32).arg(n_atoms as i32).arg(batch as i32)
-            .arg(&d).arg(&h_scc).arg(&occ_mask).arg(&q_new)  // dummy s/orb_atom, set per-call
+            .arg(&d).arg(s_buf).arg(orb_atom_buf).arg(&q_new)
             .arg_local::<f32>(n)
             .arg(&active)                                // [8] active mask
             .build().map_err(map_ocl_err)?;
@@ -539,11 +584,16 @@ impl GpuSccPlan {
         //       [6]q_next [7]dq_hist [8]r_hist [9]buf_idx [10]n_filled
         //       [11]coeffs [12]diis_flag [13]diis_reason [14]rms [15]active
         //       [16]rms_tol (W4: device-side convergence mark) [17]scratch(local)
+        // R7: q_next arg bound to q_gpu — the kernel commits the mixed
+        // iterate in-place for still-active replicas (converged/failed
+        // replicas return before the mix, keeping q_n — the commit-model
+        // semantics folded into the DIIS launch; commit_q_batched is not
+        // needed on this path and must NOT follow it).
         let k_diis = Kernel::builder()
             .program(&diis_prog).name("diis_step_batched").queue(rt.queue().clone())
             .global_work_size(batch * wg_diis).local_work_size(wg_diis)
             .arg(n_atoms as i32).arg(batch as i32).arg(0.3f32)
-            .arg(&q_new).arg(&q_gpu).arg(&q_gpu).arg(&q_next)  // q0 set per-call
+            .arg(&q_new).arg(&q_gpu).arg(q0_buf).arg(&q_gpu)
             .arg(&diis_q_hist).arg(&diis_r_hist)
             .arg(&diis_buf_idx).arg(&diis_n_filled)
             .arg(&diis_coeffs)
@@ -551,6 +601,7 @@ impl GpuSccPlan {
             .arg(&rms).arg(&active)
             .arg(0.0f32)  // rms_tol — set per call in scc_step_diis*
             .arg_local::<f32>(wg_diis)
+            .arg(&diis_work)                                // [18] W13: f64 QR scratch
             .build().map_err(map_ocl_err)?;
 
         // 12. frobenius_trace_batched: args [0]=n, [1]=batch, [2]=a, [3]=b, [4]=tr, [5]=local(wg)
@@ -564,6 +615,7 @@ impl GpuSccPlan {
             .build().map_err(map_ocl_err)?;
 
         // 13. dot_batched: args [0]=n, [1]=batch, [2]=x, [3]=y, [4]=dot, [5]=local(wg)
+        //     Two bound handles (R1): dq·v→dot and q0·v→tr.
         let wg_dot = 256usize;
         let k_dot = Kernel::builder()
             .program(&mat_prog).name("dot_batched").queue(rt.queue().clone())
@@ -572,8 +624,30 @@ impl GpuSccPlan {
             .arg(&dq).arg(&v).arg(&dot)
             .arg_local::<f32>(wg_dot)
             .build().map_err(map_ocl_err)?;
+        let k_dot_q0 = Kernel::builder()
+            .program(&mat_prog).name("dot_batched").queue(rt.queue().clone())
+            .global_work_size(batch * wg_dot).local_work_size(wg_dot)
+            .arg(n_atoms as i32).arg(batch as i32)
+            .arg(q0_buf).arg(&v).arg(&tr)
+            .arg_local::<f32>(wg_dot)
+            .build().map_err(map_ocl_err)?;
 
-        let k_s_jacobi = build_jacobi_kernel(rt, n, batch, &s_work, &s_v, &ones, jacobi_prec, &jacobi_diag)?;
+        // W12. energy_reduce_batched — f64 scalar tails, one readback.
+        // [10]=use_w [11]=occ_repair set per call (kT/occ_repair changeable).
+        let wg_ered = 128usize;
+        let e_scal = rt.zero_buffer::<f64>(batch * 4)?;
+        let k_energy_reduce = Kernel::builder()
+            .program(&mat_prog).name("energy_reduce_batched").queue(rt.queue().clone())
+            .global_work_size(batch * wg_ered).local_work_size(wg_ered)
+            .arg(n as i32).arg(n_atoms as i32).arg(batch as i32)
+            .arg(&eig_rho).arg(&eig_diag).arg(&occ_w).arg(&occ_mask)
+            .arg(&dq).arg(q0_buf).arg(&v)
+            .arg(0i32).arg(0i32)
+            .arg(&e_scal)
+            .arg_local::<f64>(wg_ered)
+            .build().map_err(map_ocl_err)?;
+
+        let k_s_jacobi = build_jacobi_kernel(rt, n, batch, &s_work, &s_v, &ones, jacobi_prec, &jacobi_diag, 0, &occ_w, &mu_out)?;
         let (k_s_invsqrt, k_s_scale, k_s_xgemm) = build_sinv_kernels(
             rt, &mat_prog, n, batch, &s_work, &s_v, &s_v_scaled, &x_buf, &lambda_min,
         )?;
@@ -635,10 +709,11 @@ impl GpuSccPlan {
             q_gpu, dq, v, h_scc, temp, hp, cp, c, d, q_new, q_next, active, state_ok, ones, tr, dot, rms, occ_mask, occ_idx, occ_w, mu_out, eig_diag, eig_rho,
             x_buf, x_t, s_work, s_v, s_v_scaled, lambda_min, jacobi_diag,
             diis_q_hist, diis_r_hist, diis_buf_idx, diis_n_filled,
-            diis_coeffs, diis_flag, diis_reason, diis_max_hist,
+            diis_coeffs, diis_flag, diis_reason, diis_work, diis_max_hist,
             eig_diag_host: vec![0.0; batch * n],
             eig_rho_host: vec![0.0; batch * n],
             mask_host: vec![0; batch * n],
+            e_scal_host: vec![0.0; batch * 4],
             rms_host: vec![0.0; batch],
             active_host: vec![1; batch],
             state_ok_host: vec![1; batch],
@@ -647,12 +722,13 @@ impl GpuSccPlan {
             lowdin_e0_host: vec![0.0; batch],
             lowdin_e1_host: vec![0.0; batch],
             k_dq_v_hscc,
-            k_matmul_xh, k_matmul_tx, k_matmul_xc, k_transpose,
-            k_jacobi, k_extract_diag, k_select_occ, k_fermi_occ, k_density, k_edm, k_occ_renorm, k_occ_snorm, k_occ_rayleigh, k_mulliken, k_residual_mix,
-            k_diis, k_commit, k_frobenius_trace, k_dot,
+            k_matmul_xh, k_matmul_tx, k_matmul_xc, k_matmul_xh_warm, k_matmul_tx_warm, k_transpose,
+            k_jacobi, k_jacobi_warm, k_extract_diag, k_select_occ, k_fermi_occ, k_density, k_edm, k_occ_renorm, k_occ_snorm, k_occ_rayleigh, k_mulliken, k_residual_mix,
+            k_diis, k_commit, k_frobenius_trace, k_dot, k_dot_q0,
             matmul_buf_base,
             n_occ: 0,
             kT: 0.0,
+            fermi_ref: std::env::var("RUST_DFTB_FERMI_REF").ok().as_deref() == Some("1"),
             occ_w_host: vec![0.0; batch * n],
             occ_repair: true,
             occ_repair_scc: true,
@@ -662,6 +738,7 @@ impl GpuSccPlan {
             k_s_jacobi, k_s_invsqrt, k_s_scale, k_s_xgemm,
             lowdin_t, lowdin_m, lowdin_q, lowdin_e0, lowdin_e1,
             k_lowdin_gemm, k_lowdin_qf, k_metric, k_lowdin_acc, k_lowdin_acc_c,
+            k_energy_reduce, e_scal,
             k_rep_energy: None,
             rep_coords: None,
             rep_species_idx: None,
@@ -675,25 +752,52 @@ impl GpuSccPlan {
         Ok(plan)
     }
 
+    /// R1: bind the per-solve scalars — n_occ/kT-derived args (occupation,
+    /// density, Rayleigh weight flag). Called once per solve entry
+    /// (scc_mix top / scc_step* wrappers / finalize), never per iteration.
+    /// Reads `self.kT`, so it must run AFTER smearing is set.
+    pub fn bind_solve_params(&mut self, n_occ: usize) -> Result<()> {
+        let use_w = (self.kT > 0.0) as i32;
+        let n_den = if self.kT > 0.0 { self.n as i32 } else { n_occ as i32 };
+        // R5: Jacobi tail runs the μ solve only on the n>64 kernel (the
+        // n≤64 local kernel has no tail — fermi_occ covers that path).
+        let fermi_tail = (self.kT > 0.0 && !self.fermi_ref && self.n > 64) as i32;
+        self.k_select_occ.set_arg(1u32, n_occ as i32).map_err(map_ocl_err)?;
+        self.k_fermi_occ.set_arg(2u32, n_occ as i32).map_err(map_ocl_err)?;
+        self.k_fermi_occ.set_arg(3u32, self.kT).map_err(map_ocl_err)?;
+        self.k_density.set_arg(2u32, n_den).map_err(map_ocl_err)?;
+        self.k_density.set_arg(8u32, use_w).map_err(map_ocl_err)?;
+        self.k_occ_rayleigh.set_arg(10u32, use_w).map_err(map_ocl_err)?;
+        self.k_occ_renorm.set_arg(7u32, use_w).map_err(map_ocl_err)?;
+        if self.n > 64 {
+            self.k_jacobi.set_arg(7u32, fermi_tail).map_err(map_ocl_err)?;
+            self.k_jacobi.set_arg(8u32, n_occ as i32).map_err(map_ocl_err)?;
+            self.k_jacobi.set_arg(9u32, self.kT).map_err(map_ocl_err)?;
+            if let Some(k) = self.k_jacobi_warm.as_mut() {
+                k.set_arg(7u32, fermi_tail).map_err(map_ocl_err)?;
+                k.set_arg(8u32, n_occ as i32).map_err(map_ocl_err)?;
+                k.set_arg(9u32, self.kT).map_err(map_ocl_err)?;
+            }
+        }
+        self.n_occ = n_occ;
+        Ok(())
+    }
+
+    /// R1: bind the mixer scalars — alpha + device convergence tolerance.
+    /// Separate from bind_solve_params so eval-time finalize can't leave a
+    /// stale rms_tol on the DIIS handle.
+    pub fn bind_mix_params(&mut self, alpha: f32, rms_tol: f32) -> Result<()> {
+        self.k_diis.set_arg(2u32, alpha).map_err(map_ocl_err)?;
+        self.k_diis.set_arg(16u32, rms_tol).map_err(map_ocl_err)?;
+        self.k_residual_mix.set_arg(2u32, alpha).map_err(map_ocl_err)?;
+        Ok(())
+    }
+
     /// D10/R18: one fused launch for Δq → V=γΔq → H_scc. Replaces the
     /// delta_q + gamma_matvec + h_scc_update sequence (3 launches, and the
-    /// dq/v global round-trip between them).
-    fn enq_dq_v_hscc(
-        &mut self,
-        h0_buf: &Buffer<f32>,
-        s_buf: &Buffer<f32>,
-        g_buf: &Buffer<f32>,
-        q0_buf: &Buffer<f32>,
-        orb_atom_buf: &Buffer<i32>,
-    ) -> Result<()> {
-        self.k_dq_v_hscc.set_arg(3u32, &self.q_gpu).map_err(map_ocl_err)?;
-        self.k_dq_v_hscc.set_arg(4u32, q0_buf).map_err(map_ocl_err)?;
-        self.k_dq_v_hscc.set_arg(5u32, g_buf).map_err(map_ocl_err)?;
-        self.k_dq_v_hscc.set_arg(6u32, h0_buf).map_err(map_ocl_err)?;
-        self.k_dq_v_hscc.set_arg(7u32, s_buf).map_err(map_ocl_err)?;
-        self.k_dq_v_hscc.set_arg(8u32, orb_atom_buf).map_err(map_ocl_err)?;
-        unsafe { self.k_dq_v_hscc.enq().map_err(map_ocl_err)?; }
-        Ok(())
+    /// dq/v global round-trip between them). All args bound at construction.
+    fn enq_dq_v_hscc(&mut self) -> Result<()> {
+        unsafe { self.k_dq_v_hscc.enq().map_err(map_ocl_err) }
     }
 
     /// Eigenproblem solve: h_scc → rotated matrix in `hp` (eigenvalues on
@@ -705,48 +809,46 @@ impl GpuSccPlan {
     /// in place (init_v=1): on exit c IS the new eigenvector matrix —
     /// no X·C′ back-transform GEMM at all.
     /// Cold path: A = Xᵀ·H_scc·X, Jacobi with V=I into cp.
-    fn eigh_solve(&mut self, rt: &GpuRuntime) -> Result<()> {
-        let b = self.matmul_buf_base;
+    /// R1: all kernels fully bound at construction — warm path uses the
+    /// c-bound handle variants (k_*_warm), cold the x-bound ones. Zero
+    /// per-iteration set_arg.
+    /// `want_eig`: also run extract_diag → eig_diag (finalize/eval need
+    /// it; in-loop the production smeared path doesn't — the Jacobi tail
+    /// reads the spectrum straight off hp's diagonal).
+    fn eigh_solve(&mut self, rt: &GpuRuntime, want_eig: bool) -> Result<()> {
         if self.b_warm && self.n > 64 {
-            set_lowdin_gemm(&self.k_matmul_xh, 1, 0, &self.c, &self.h_scc, &self.temp)?;   // temp = cᵀ·H_scc
-            unsafe { self.k_matmul_xh.enq().map_err(map_ocl_err)?; }
+            let k_xh = self.k_matmul_xh_warm.as_ref()
+                .ok_or_else(|| DftbError::InvalidInput("warm GEMM handle missing for n>64".into()))?;
+            let k_tx = self.k_matmul_tx_warm.as_ref()
+                .ok_or_else(|| DftbError::InvalidInput("warm GEMM handle missing for n>64".into()))?;
+            let k_j = self.k_jacobi_warm.as_ref()
+                .ok_or_else(|| DftbError::InvalidInput("warm Jacobi handle missing for n>64".into()))?;
+            unsafe { k_xh.enq().map_err(map_ocl_err)?; }   // temp = cᵀ·H_scc
             rt.prof_tick("scc.gemm_th");
-            set_matmul_args(&self.k_matmul_tx, b, &self.temp, &self.c, &self.hp)?;        // hp = temp·c
-            unsafe { self.k_matmul_tx.enq().map_err(map_ocl_err)?; }
+            unsafe { k_tx.enq().map_err(map_ocl_err)?; }   // hp = temp·c
             rt.prof_tick("scc.gemm_th2");
-            self.k_jacobi.set_arg(0u32, &self.hp).map_err(map_ocl_err)?;
-            self.k_jacobi.set_arg(1u32, &self.c).map_err(map_ocl_err)?;
-            self.k_jacobi.set_arg(4u32, 1i32).map_err(map_ocl_err)?;
-            unsafe { self.k_jacobi.enq().map_err(map_ocl_err)?; }
+            unsafe { k_j.enq().map_err(map_ocl_err)?; }    // rotate c in place
             rt.prof_tick("scc.jacobi");
             // W1 (§14): NO report_jacobi here — read_buffer → queue.finish()
             // drained the whole pipeline mid-iteration, once per SCC iter.
             // Diag stays on device; the host certifies once at solve end
             // via check_jacobi().
         } else {
-            if self.n > 64 {
-                // tiled batched_gemm — trans args exist; restore trans_a=0
-                // (a previous warm iteration may have left it at 1)
-                set_lowdin_gemm(&self.k_matmul_xh, 0, 0, &self.x_t, &self.h_scc, &self.temp)?;
-            } else {
-                // matmul_full_local_batched has no trans args (x_t pretransposed)
-                set_matmul_args(&self.k_matmul_xh, b, &self.x_t, &self.h_scc, &self.temp)?;
-            }
-            unsafe { self.k_matmul_xh.enq().map_err(map_ocl_err)?; }
+            unsafe { self.k_matmul_xh.enq().map_err(map_ocl_err)?; }   // temp = Xᵀ·H_scc
             rt.prof_tick("scc.gemm_th");
-            set_matmul_args(&self.k_matmul_tx, b, &self.temp, &self.x_buf, &self.hp)?;
-            unsafe { self.k_matmul_tx.enq().map_err(map_ocl_err)?; }
+            unsafe { self.k_matmul_tx.enq().map_err(map_ocl_err)?; }   // hp = temp·X
             rt.prof_tick("scc.gemm_th2");
-            self.k_jacobi.set_arg(0u32, &self.hp).map_err(map_ocl_err)?;
-            self.k_jacobi.set_arg(1u32, &self.cp).map_err(map_ocl_err)?;
-            if self.n > 64 { self.k_jacobi.set_arg(4u32, 0i32).map_err(map_ocl_err)?; }
-            unsafe { self.k_jacobi.enq().map_err(map_ocl_err)?; }
+            unsafe { self.k_jacobi.enq().map_err(map_ocl_err)?; }      // V=I → cp
             rt.prof_tick("scc.jacobi");
             // W1: deferred to check_jacobi() at solve end (see above).
         }
-        self.k_extract_diag.set_arg(2u32, &self.hp).map_err(map_ocl_err)?;
-        self.k_extract_diag.set_arg(3u32, &self.eig_diag).map_err(map_ocl_err)?;
-        unsafe { self.k_extract_diag.enq().map_err(map_ocl_err)?; }
+        // R5: eig_diag needed only by select_occ (integer occ), the
+        // fermi_ref fallback, or the finalize/eval readback — skip the
+        // launch on the production smeared path (occ_w comes from the
+        // Jacobi tail).
+        if want_eig || self.kT <= 0.0 || self.fermi_ref {
+            unsafe { self.k_extract_diag.enq().map_err(map_ocl_err)?; }
+        }
         rt.prof_tick("scc.extract_diag");
         Ok(())
     }
@@ -755,19 +857,16 @@ impl GpuSccPlan {
     /// already the eigenbasis — S-metric column renorm arrests f32 drift.
     /// Cold: renorm occupied C′ columns then c = X·C′; marks b_warm so the
     /// next solve at the same geometry can take the warm path.
-    fn eigh_finish(&mut self, rt: &GpuRuntime, s_buf: &Buffer<f32>, renorm: bool) -> Result<()> {
-        let b = self.matmul_buf_base;
+    fn eigh_finish(&mut self, _rt: &GpuRuntime, renorm: bool) -> Result<()> {
         if self.b_warm && self.n > 64 {
             if renorm {
-                self.k_occ_snorm.set_arg(3u32, s_buf).map_err(map_ocl_err)?;
                 unsafe { self.k_occ_snorm.enq().map_err(map_ocl_err)?; }
             }
         } else {
             if renorm {
                 unsafe { self.k_occ_renorm.enq().map_err(map_ocl_err)?; }
             }
-            set_matmul_args(&self.k_matmul_xc, b, &self.x_buf, &self.cp, &self.c)?;
-            unsafe { self.k_matmul_xc.enq().map_err(map_ocl_err)?; }
+            unsafe { self.k_matmul_xc.enq().map_err(map_ocl_err)?; }   // c = X·cp
             self.b_warm = self.n > 64;
         }
         Ok(())
@@ -778,6 +877,12 @@ impl GpuSccPlan {
     /// looped up to LOWDIN_REUSE_MAX times (quadratic convergence: a
     /// metric defect ~0.3 needs all 3 steps to reach 1e-5).
     /// Returns max ‖BᵀSB−I‖∞ after the accepted steps.
+    /// Newton residual bound: for the inverse-sqrt map g→(3g−g²)/2 the
+    /// per-eigenvalue residual contracts as |r'| = r²(3+r)/4 ≤ ¾e²+¼e³ with
+    /// e = ‖G−I‖∞ (row-sum ≥ ‖·‖₂). Rigorous certification of a step
+    /// WITHOUT computing G1 (W7/I13).
+    fn newton_bound(e: f32) -> f32 { 0.75 * e * e + 0.25 * e * e * e }
+
     fn repair_basis_c(&mut self, rt: &GpuRuntime, s_buf: &Buffer<f32>) -> Result<f32> {
         let mut e1m = 0.0f32;
         for _ in 0..Self::LOWDIN_REUSE_MAX {
@@ -787,19 +892,43 @@ impl GpuSccPlan {
                 set_lowdin_gemm(&self.k_lowdin_gemm, 0, 0, &self.lowdin_t, &self.c, &self.lowdin_m)?;   // G = T·B
                 self.k_lowdin_gemm.enq().map_err(map_ocl_err)?;
                 self.k_metric.set_arg(3u32, &self.lowdin_e0).map_err(map_ocl_err)?;
-                self.k_metric.enq().map_err(map_ocl_err)?;                                            // e0 = max|G−I|
+                self.k_metric.enq().map_err(map_ocl_err)?;                                            // e0 = ‖G−I‖∞ (row-sum)
                 self.k_lowdin_qf.enq().map_err(map_ocl_err)?;                                         // Q = (3I−G)/2
                 set_lowdin_gemm(&self.k_lowdin_gemm, 0, 0, &self.c, &self.lowdin_q, &self.lowdin_t)?;   // B1 = B·Q
                 self.k_lowdin_gemm.enq().map_err(map_ocl_err)?;
+            }
+            // W7: ONE readback per attempt. If the Newton bound certifies
+            // EVERY replica (bound < tol), the step is applied unconditionally
+            // — T2/G1/e1/accept and the second readback are provable dead work.
+            rt.read_buffer(&self.lowdin_e0, &mut self.lowdin_e0_host)?;
+            let mut e0m = 0.0f32;
+            let mut all_cert = true;
+            for b in 0..self.batch {
+                let e0 = self.lowdin_e0_host[b];
+                if !e0.is_finite() {
+                    return Err(DftbError::InvalidInput(format!("warm-basis repair replica {b}: e0={e0} non-finite")));
+                }
+                e0m = e0m.max(e0);
+                if Self::newton_bound(e0) >= Self::LOWDIN_REUSE_TOL { all_cert = false; }
+            }
+            if all_cert {
+                let len = self.batch * self.n * self.n;
+                unsafe {
+                    self.lowdin_t.cmd().queue(rt.queue()).copy(&self.c, None, Some(len)).enq()
+                        .map_err(map_ocl_err)?;
+                }
+                return Ok(Self::newton_bound(e0m));   // certified upper bound on true e1
+            }
+            // Uncertified replicas → measured verification + guarded accept.
+            unsafe {
                 set_lowdin_gemm(&self.k_lowdin_gemm, 1, 0, &self.lowdin_t, s_buf, &self.lowdin_q)?;     // T2 = B1ᵀS
                 self.k_lowdin_gemm.enq().map_err(map_ocl_err)?;
                 set_lowdin_gemm(&self.k_lowdin_gemm, 0, 0, &self.lowdin_q, &self.lowdin_t, &self.lowdin_m)?; // G1 = T2·B1
                 self.k_lowdin_gemm.enq().map_err(map_ocl_err)?;
                 self.k_metric.set_arg(3u32, &self.lowdin_e1).map_err(map_ocl_err)?;
-                self.k_metric.enq().map_err(map_ocl_err)?;                                            // e1 = max|G1−I|
+                self.k_metric.enq().map_err(map_ocl_err)?;                                            // e1 = ‖G1−I‖∞
                 self.k_lowdin_acc_c.enq().map_err(map_ocl_err)?;                                      // B ← B1 if e1<e0
             }
-            rt.read_buffer(&self.lowdin_e0, &mut self.lowdin_e0_host)?;
             rt.read_buffer(&self.lowdin_e1, &mut self.lowdin_e1_host)?;
             e1m = 0.0;
             for b in 0..self.batch {
@@ -893,35 +1022,59 @@ impl GpuSccPlan {
             set_lowdin_gemm(&self.k_lowdin_gemm, 0, 0, &self.lowdin_t, &self.x_buf, &self.lowdin_m)?;  // M = T1·X
             self.k_lowdin_gemm.enq().map_err(map_ocl_err)?;
             self.k_metric.set_arg(3u32, &self.lowdin_e0).map_err(map_ocl_err)?;
-            self.k_metric.enq().map_err(map_ocl_err)?;                                       // e0 = max|M−I|
+            self.k_metric.enq().map_err(map_ocl_err)?;                                       // e0 = ‖M−I‖∞ (row-sum)
             self.k_lowdin_qf.enq().map_err(map_ocl_err)?;                                    // Q = (3I−M)/2
             set_lowdin_gemm(&self.k_lowdin_gemm, 0, 0, &self.x_buf, &self.lowdin_q, &self.lowdin_t)?;  // X1 = X·Q
             self.k_lowdin_gemm.enq().map_err(map_ocl_err)?;
+        }
+        // W7: one readback; if the Newton bound ¾e0²+¼e0³ certifies EVERY
+        // replica, apply X1 unconditionally — T2/M1/e1/accept are dead work.
+        rt.read_buffer(&self.lowdin_e0, &mut self.lowdin_e0_host)?;
+        let mut e0m = 0.0f32;
+        let mut all_cert = true;
+        for b in 0..self.batch {
+            let e0 = self.lowdin_e0_host[b];
+            if !e0.is_finite() {
+                return Err(DftbError::InvalidInput(format!(
+                    "Löwdin Newton replica {b}: residual non-finite e0={e0}"
+                )));
+            }
+            e0m = e0m.max(e0);
+            if Self::newton_bound(e0) >= Self::LOWDIN_REUSE_TOL { all_cert = false; }
+        }
+        if all_cert {
+            let len = self.batch * self.n * self.n;
+            unsafe {
+                self.lowdin_t.cmd().queue(rt.queue()).copy(&self.x_buf, None, Some(len)).enq()
+                    .map_err(map_ocl_err)?;
+            }
+            eprintln!("[GpuSccPlan] Löwdin Newton max||XᵀSX−I||∞ {e0m:.3e} → bound {:.3e} (certified, skipped e1)",
+                Self::newton_bound(e0m));
+            return Ok(Self::newton_bound(e0m));
+        }
+        unsafe {
             set_lowdin_gemm(&self.k_lowdin_gemm, 1, 0, &self.lowdin_t, s_buf, &self.lowdin_q)?;        // T2 = X1ᵀS
             self.k_lowdin_gemm.enq().map_err(map_ocl_err)?;
             set_lowdin_gemm(&self.k_lowdin_gemm, 0, 0, &self.lowdin_q, &self.lowdin_t, &self.lowdin_m)?; // M1 = T2·X1
             self.k_lowdin_gemm.enq().map_err(map_ocl_err)?;
             self.k_metric.set_arg(3u32, &self.lowdin_e1).map_err(map_ocl_err)?;
-            self.k_metric.enq().map_err(map_ocl_err)?;                                       // e1 = max|M1−I|
+            self.k_metric.enq().map_err(map_ocl_err)?;                                       // e1 = ‖M1−I‖∞
             self.k_lowdin_acc.enq().map_err(map_ocl_err)?;                                   // X ← X1 if e1<e0
         }
-        rt.read_buffer(&self.lowdin_e0, &mut self.lowdin_e0_host)?;
         rt.read_buffer(&self.lowdin_e1, &mut self.lowdin_e1_host)?;
-        let mut e0m = 0.0f32;
         let mut e1m = 0.0f32;
         let mut nskip = 0usize;
         for b in 0..self.batch {
             let (e0, e1) = (self.lowdin_e0_host[b], self.lowdin_e1_host[b]);
-            if !e0.is_finite() || !e1.is_finite() {
+            if !e1.is_finite() {
                 return Err(DftbError::InvalidInput(format!(
-                    "Löwdin Newton replica {b}: residual non-finite e0={e0} e1={e1}"
+                    "Löwdin Newton replica {b}: residual non-finite e1={e1}"
                 )));
             }
-            e0m = e0m.max(e0);
             e1m = e1m.max(e1);
             if !(e1 < e0) { nskip += 1; }
         }
-        eprintln!("[GpuSccPlan] Löwdin Newton max||XᵀSX−I|| {e0m:.3e} → {e1m:.3e} wrote={} skipped={nskip}", nskip < self.batch);
+        eprintln!("[GpuSccPlan] Löwdin Newton max||XᵀSX−I||∞ {e0m:.3e} → {e1m:.3e} wrote={} skipped={nskip}", nskip < self.batch);
         Ok(if nskip < self.batch { e1m } else { e0m })
     }
 
@@ -1034,87 +1187,64 @@ impl GpuSccPlan {
     pub fn scc_step(
         &mut self,
         rt: &mut GpuRuntime,
-        h0_buf: &Buffer<f32>,
-        s_buf: &Buffer<f32>,
-        g_buf: &Buffer<f32>,
-        q0_buf: &Buffer<f32>,
-        orb_atom_buf: &Buffer<i32>,
         n_occ: usize,
         alpha: f32,
     ) -> Result<f32> {
+        // R1: bind solve scalars once per call (this is the reference path —
+        // the chunked hot loop binds once per solve instead).
+        self.bind_solve_params(n_occ)?;
+        self.bind_mix_params(alpha, 0.0)?;
+
         // 1-3. Δq → V=γΔq → H_scc = H0+½S(V_A+V_B) — one fused launch (D10/R18)
-        self.enq_dq_v_hscc(h0_buf, s_buf, g_buf, q0_buf, orb_atom_buf)?;
+        self.enq_dq_v_hscc()?;
 
         // 4-6. Eigenproblem: warm A=cᵀH_scc c + in-place Jacobi, or cold
         //      A=XᵀH_sccX + Jacobi(V=I) → cp. Eigenvalues on diag(hp).
-        self.eigh_solve(rt)?;
-        let n_den = self.occupation(rt, n_occ)?;
+        self.eigh_solve(rt, false)?;
+        self.occupation(rt)?;
 
         // 6b-7. Column renorm (S-metric on c warm / plain on cp cold) and
         //       cold-path c = X·cp.
-        self.eigh_finish(rt, s_buf, self.occ_repair_scc)?;
+        self.eigh_finish(rt, self.occ_repair_scc)?;
 
         // 8. D = 2·Σ_{k∈occ} C[:,k]·C[:,k]^T  (D10: occ_idx + triangle)
-        self.k_density.set_arg(2u32, n_den).map_err(map_ocl_err)?;
-        self.k_density.set_arg(3u32, &self.c).map_err(map_ocl_err)?;
-        self.k_density.set_arg(5u32, &self.d).map_err(map_ocl_err)?;
-        self.k_density.set_arg(6u32, 0i32).map_err(map_ocl_err)?;
         unsafe { self.k_density.enq().map_err(map_ocl_err)?; }
 
         // 9. q_new = Mulliken(D, S)
-        self.k_mulliken.set_arg(3u32, &self.d).map_err(map_ocl_err)?;
-        self.k_mulliken.set_arg(4u32, s_buf).map_err(map_ocl_err)?;
-        self.k_mulliken.set_arg(5u32, orb_atom_buf).map_err(map_ocl_err)?;
-        self.k_mulliken.set_arg(6u32, &self.q_new).map_err(map_ocl_err)?;
         unsafe { self.k_mulliken.enq().map_err(map_ocl_err)?; }
 
-        // §12 D4 + B1: ρ on the just-solved state so the A1 cached-state
-        // energy is correct without a second eigensolve. Smeared runs need
-        // ρ on every weighted column (use_w).
-        if self.occ_repair || self.kT > 0.0 {
-            self.k_occ_rayleigh.set_arg(5u32, s_buf).map_err(map_ocl_err)?;
-            self.k_occ_rayleigh.set_arg(10u32, (self.kT > 0.0) as i32).map_err(map_ocl_err)?;
-            unsafe { self.k_occ_rayleigh.enq().map_err(map_ocl_err)?; }
-        }
+        // R6: no in-loop occ_rayleigh — ρ_k feeds only E_band/W, both
+        // computed on the certified finalize state. A committed step leaves
+        // the state stale anyway (state_fresh=false → eval re-finalizes).
 
         // 10. residual + mix → q_next (host commits to q_gpu only for active replicas)
-        self.k_residual_mix.set_arg(2u32, alpha).map_err(map_ocl_err)?;
-        self.k_residual_mix.set_arg(3u32, &self.q_new).map_err(map_ocl_err)?;
-        self.k_residual_mix.set_arg(4u32, &self.q_gpu).map_err(map_ocl_err)?;
-        self.k_residual_mix.set_arg(5u32, &self.q_next).map_err(map_ocl_err)?;
-        self.k_residual_mix.set_arg(6u32, &self.rms).map_err(map_ocl_err)?;
         unsafe { self.k_residual_mix.enq().map_err(map_ocl_err)?; }
+        // Synchronous single-step API commits the mixed iterate — the
+        // chunked hot loop is the only path that defers commits.
+        unsafe { self.k_commit.enq().map_err(map_ocl_err)?; }
 
         // Read RMS and return max
         rt.read_buffer(&self.rms, &mut self.rms_host)?;
         max_finite_f32(&self.rms_host, "SCC rms")
     }
 
-    /// Occupation selection after `extract_diag`: integer sort by default,
-    /// or Fermi smearing (kT>0): per-replica chemical potential via host
-    /// bisection on eig_diag (Σ_k f_k = n_occ), weights uploaded to occ_w.
-    /// Returns the density-kernel loop bound (n_occ, or n when smeared —
-    /// all orbitals enter with their Fermi weight).
-    fn occupation(&mut self, rt: &mut GpuRuntime, n_occ: usize) -> Result<i32> {
-        self.k_select_occ.set_arg(1u32, n_occ as i32).map_err(map_ocl_err)?;
-        self.k_select_occ.set_arg(3u32, &self.eig_diag).map_err(map_ocl_err)?;
-        self.k_select_occ.set_arg(4u32, &self.occ_mask).map_err(map_ocl_err)?;
+    /// Occupation selection after `eigh_solve`: integer sort by default.
+    /// Under smearing the production path needs NOTHING here — the Jacobi
+    /// tail already wrote occ_w+mu (R5). `fermi_ref` reverts to the W5
+    /// standalone kernel + integer mask for A/B.
+    fn occupation(&mut self, rt: &mut GpuRuntime) -> Result<()> {
+        if self.kT > 0.0 && !self.fermi_ref && self.n > 64 {
+            return Ok(());   // R5: Jacobi tail wrote occ_w+mu on device
+        }
         unsafe { self.k_select_occ.enq().map_err(map_ocl_err)?; }
         rt.prof_tick("scc.select_occ");
-        if self.kT <= 0.0 {
-            self.k_density.set_arg(8u32, 0i32).map_err(map_ocl_err)?;
-            return Ok(n_occ as i32);
-        }
-        // W5 smearing: fermi_occ_batched solves μ per replica on device
-        // (f64 bracketed bisection on eig_diag) and writes occ_w directly —
-        // the per-iteration eig readback + host bisection + occ_w upload
-        // (~0.7 ms/iter at batch=19, RTX 3090) is gone; no host sync.
-        self.k_fermi_occ.set_arg(2u32, n_occ as i32).map_err(map_ocl_err)?;
-        self.k_fermi_occ.set_arg(3u32, self.kT).map_err(map_ocl_err)?;
+        if self.kT <= 0.0 { return Ok(()); }
+        // W5 smearing (reference mode / n≤64): fermi_occ_batched solves μ
+        // per replica on device (f64 bracketed bisection on eig_diag) and
+        // writes occ_w — no host sync.
         unsafe { self.k_fermi_occ.enq().map_err(map_ocl_err)?; }
         rt.prof_tick("scc.fermi_occ");
-        self.k_density.set_arg(8u32, 1i32).map_err(map_ocl_err)?;
-        Ok(self.n as i32)
+        Ok(())
     }
 
     /// One SCC step with GPU DIIS. Returns max residual RMS (√(Σres²/n_atoms)).
@@ -1127,16 +1257,15 @@ impl GpuSccPlan {
     pub fn scc_step_diis(
         &mut self,
         rt: &mut GpuRuntime,
-        h0_buf: &Buffer<f32>,
-        s_buf: &Buffer<f32>,
-        g_buf: &Buffer<f32>,
-        q0_buf: &Buffer<f32>,
-        orb_atom_buf: &Buffer<i32>,
         n_occ: usize,
         alpha: f32,
         rms_tol: f32,
     ) -> Result<f32> {
-        self.scc_step_diis_enq(rt, h0_buf, s_buf, g_buf, q0_buf, orb_atom_buf, n_occ, alpha, rms_tol)?;
+        self.bind_solve_params(n_occ)?;
+        self.bind_mix_params(alpha, rms_tol)?;
+        self.scc_step_diis_enq(rt)?;
+        // R7: diis_step_batched commits its own mixed iterate into q_gpu —
+        // no separate commit launch (and q_next is not written on this path).
         // Read RMS and return max (only scalar readback)
         rt.read_buffer(&self.rms, &mut self.rms_host)?;
         max_finite_f32(&self.rms_host, "DIIS rms")
@@ -1147,58 +1276,31 @@ impl GpuSccPlan {
     /// when rms < `rms_tol` (or nonfinite); `commit_q_batched` and all
     /// per-iteration kernels gate on the same device mask, so a chunk of
     /// these can run without any host sync.
-    pub fn scc_step_diis_enq(
-        &mut self,
-        rt: &mut GpuRuntime,
-        h0_buf: &Buffer<f32>,
-        s_buf: &Buffer<f32>,
-        g_buf: &Buffer<f32>,
-        q0_buf: &Buffer<f32>,
-        orb_atom_buf: &Buffer<i32>,
-        n_occ: usize,
-        alpha: f32,
-        rms_tol: f32,
-    ) -> Result<()> {
+    ///
+    /// R1: requires `bind_solve_params` + `bind_mix_params` to have run —
+    /// `scc_step_diis` and the chunked `scc_mix` loop both bind first.
+    pub fn scc_step_diis_enq(&mut self, rt: &mut GpuRuntime) -> Result<()> {
         // Steps 1-9: same as scc_step (Δq → V → H_scc → eigh → occ → C → D → q_new)
-        self.enq_dq_v_hscc(h0_buf, s_buf, g_buf, q0_buf, orb_atom_buf)?;
+        self.enq_dq_v_hscc()?;
         rt.prof_tick("scc.hscc");
 
-        self.eigh_solve(rt)?;
+        self.eigh_solve(rt, false)?;
         rt.prof_tick("scc.eigh");
-        let n_den = self.occupation(rt, n_occ)?;
+        self.occupation(rt)?;
         rt.prof_tick("scc.occ");
-        self.eigh_finish(rt, s_buf, self.occ_repair_scc)?;
+        self.eigh_finish(rt, self.occ_repair_scc)?;
         rt.prof_tick("scc.eigh_finish");
 
-        self.k_density.set_arg(2u32, n_den).map_err(map_ocl_err)?;
-        self.k_density.set_arg(3u32, &self.c).map_err(map_ocl_err)?;
-        self.k_density.set_arg(5u32, &self.d).map_err(map_ocl_err)?;
-        self.k_density.set_arg(6u32, 0i32).map_err(map_ocl_err)?;
         unsafe { self.k_density.enq().map_err(map_ocl_err)?; }
         rt.prof_tick("scc.density");
 
-        self.k_mulliken.set_arg(3u32, &self.d).map_err(map_ocl_err)?;
-        self.k_mulliken.set_arg(4u32, s_buf).map_err(map_ocl_err)?;
-        self.k_mulliken.set_arg(5u32, orb_atom_buf).map_err(map_ocl_err)?;
-        self.k_mulliken.set_arg(6u32, &self.q_new).map_err(map_ocl_err)?;
         unsafe { self.k_mulliken.enq().map_err(map_ocl_err)?; }
         rt.prof_tick("scc.mulliken");
 
-        // §12 D4 + B1: ρ on the just-solved state (see scc_step).
-        if self.occ_repair || self.kT > 0.0 {
-            self.k_occ_rayleigh.set_arg(5u32, s_buf).map_err(map_ocl_err)?;
-            self.k_occ_rayleigh.set_arg(10u32, (self.kT > 0.0) as i32).map_err(map_ocl_err)?;
-            unsafe { self.k_occ_rayleigh.enq().map_err(map_ocl_err)?; }
-            rt.prof_tick("scc.rayleigh");
-        }
+        // R6: in-loop occ_rayleigh removed — ρ_k is consumed only by
+        // energy_from_state / build_edm, both on the finalized state.
 
         // 10. GPU-side DIIS mixing (R9b + D9: Δq-anchored, drop-oldest retry)
-        self.k_diis.set_arg(2u32, alpha).map_err(map_ocl_err)?;
-        self.k_diis.set_arg(3u32, &self.q_new).map_err(map_ocl_err)?;
-        self.k_diis.set_arg(4u32, &self.q_gpu).map_err(map_ocl_err)?;
-        self.k_diis.set_arg(5u32, q0_buf).map_err(map_ocl_err)?;
-        self.k_diis.set_arg(16u32, rms_tol).map_err(map_ocl_err)?;
-        // History buffers and workspace already bound at construction
         unsafe { self.k_diis.enq().map_err(map_ocl_err)?; }
         rt.prof_tick("scc.diis");
         Ok(())
@@ -1281,22 +1383,17 @@ impl GpuSccPlan {
     pub fn compute_energy(
         &mut self,
         rt: &mut GpuRuntime,
-        h0_buf: &Buffer<f32>,
-        s_buf: &Buffer<f32>,
-        g_buf: &Buffer<f32>,
-        q0_buf: &Buffer<f32>,
-        orb_atom_buf: &Buffer<i32>,
         n_occ: usize,
     ) -> Result<Vec<f64>> {
         // R7: Finalize — re-solve electronics with current q_gpu so D, Δq, V
         // all correspond to the same charge state.
-        self.finalize(rt, h0_buf, s_buf, g_buf, q0_buf, orb_atom_buf, n_occ)?;
-        self.energy_from_state(rt, q0_buf)
+        self.finalize(rt, n_occ)?;
+        self.energy_from_state(rt)
     }
 
     /// Band + repulsive energy from the current finalized state. Does **not** re-solve.
     /// Caller must have called `finalize` (or `eval`).
-    pub fn energy_from_state(&mut self, rt: &mut GpuRuntime, q0_buf: &Buffer<f32>) -> Result<Vec<f64>> {
+    pub fn energy_from_state(&mut self, rt: &mut GpuRuntime) -> Result<Vec<f64>> {
         // E = Tr(D H0) + ½ Δq·V.  On the CPU this is identical to
         //   2 Σ_{k occ} ε_k − ½ Δq·V − q0·V
         // (AT identity holds to 5e-10).  Tr(D H0) in f32 for N=87 was 7e-5 Ha
@@ -1305,57 +1402,19 @@ impl GpuSccPlan {
         // the renormalized vectors (eig_rho), not the drifted Jacobi diagonal.
         // SSOT: doc/prokop/topical_audit/f32_floor_dense_hbond.md
         let batch = self.batch;
-        let n = self.n;
-        self.k_dot.set_arg(2u32, &self.dq).map_err(map_ocl_err)?;
-        self.k_dot.set_arg(3u32, &self.v).map_err(map_ocl_err)?;
-        self.k_dot.set_arg(4u32, &self.dot).map_err(map_ocl_err)?;
-        unsafe { self.k_dot.enq().map_err(map_ocl_err)?; }
-        self.k_dot.set_arg(2u32, q0_buf).map_err(map_ocl_err)?;
-        self.k_dot.set_arg(3u32, &self.v).map_err(map_ocl_err)?;
-        self.k_dot.set_arg(4u32, &self.tr).map_err(map_ocl_err)?;
-        unsafe { self.k_dot.enq().map_err(map_ocl_err)?; }
-
-        rt.read_buffer(&self.eig_diag, &mut self.eig_diag_host)?;
-        rt.read_buffer(&self.eig_rho, &mut self.eig_rho_host)?;
-        rt.read_buffer(&self.occ_mask, &mut self.mask_host)?;
-        if self.kT > 0.0 {
-            // W5: occ_w lives on device (fermi_occ_batched) — one eval-time
-            // readback for the f64 band/Mermin energy. Not in the SCC loop.
-            rt.read_buffer(&self.occ_w, &mut self.occ_w_host)?;
-        }
-        let mut dqv = vec![0.0f32; batch];
-        let mut q0v = vec![0.0f32; batch];
-        rt.read_buffer(&self.dot, &mut dqv)?;
-        rt.read_buffer(&self.tr, &mut q0v)?;
+        // W12: all scalar tails in one f64 device reduction + one readback.
+        self.k_energy_reduce.set_arg(10u32, (self.kT > 0.0) as i32).map_err(map_ocl_err)?;
+        self.k_energy_reduce.set_arg(11u32, self.occ_repair as i32).map_err(map_ocl_err)?;
+        unsafe { self.k_energy_reduce.enq().map_err(map_ocl_err)?; }
+        rt.read_buffer(&self.e_scal, &mut self.e_scal_host)?;
 
         let mut e = vec![0.0f64; batch];
         let kt = self.kT as f64;
         for bi in 0..batch {
-            let mut e_band = 0.0f64;
-            let mut mts = 0.0f64;   // −T·S Mermin term = 2kT·Σ[f ln f + (1−f)ln(1−f)] ≤ 0
-            let base = bi * n;
-            if self.kT > 0.0 {
-                // Fermi smearing: F = E_band − TS. Weights f_k and Rayleigh
-                // quotients ρ_k cover ALL orbitals (fractional frontier too).
-                for k in 0..n {
-                    let f = self.occ_w_host[base + k] as f64;
-                    let rho = self.eig_rho_host[base + k] as f64;
-                    e_band += 2.0 * f * rho;
-                    let g = 1.0 - f;
-                    if f > 1e-300 { mts += f * f.ln(); }
-                    if g > 1e-300 { mts += g * g.ln(); }
-                }
-                e[bi] = e_band + 2.0 * kt * mts - 0.5 * dqv[bi] as f64 - q0v[bi] as f64;
-            } else {
-                for k in 0..n {
-                    if self.mask_host[base + k] != 0 {
-                        e_band += 2.0 * (if self.occ_repair { self.eig_rho_host[base + k] } else { self.eig_diag_host[base + k] }) as f64;
-                    }
-                }
-                e[bi] = e_band - 0.5 * dqv[bi] as f64 - q0v[bi] as f64;
-            }
+            let (e_band, mts, dqv, q0v) = (self.e_scal_host[4*bi], self.e_scal_host[4*bi+1], self.e_scal_host[4*bi+2], self.e_scal_host[4*bi+3]);
+            e[bi] = e_band + if self.kT > 0.0 { 2.0 * kt * mts } else { 0.0 } - 0.5 * dqv - q0v;
             if !e[bi].is_finite() {
-                return Err(DftbError::InvalidInput(format!("energy_from_state: E[{bi}]={} band={e_band} −TS={} Δq·V={} q0·V={}", e[bi], 2.0 * kt * mts, dqv[bi], q0v[bi])));
+                return Err(DftbError::InvalidInput(format!("energy_from_state: E[{bi}]={} band={e_band} −TS={} Δq·V={} q0·V={}", e[bi], 2.0 * kt * mts, dqv, q0v)));
             }
         }
 
@@ -1386,51 +1445,37 @@ impl GpuSccPlan {
     pub fn finalize(
         &mut self,
         rt: &mut GpuRuntime,
-        h0_buf: &Buffer<f32>,
-        s_buf: &Buffer<f32>,
-        g_buf: &Buffer<f32>,
-        q0_buf: &Buffer<f32>,
-        orb_atom_buf: &Buffer<i32>,
         n_occ: usize,
     ) -> Result<()> {
         // Finalize runs OUTSIDE the SCC loop — all replicas must be solved
         // at their q_gpu, including ones that were frozen at loop exit.
         self.activate_all(rt)?;
+        self.bind_solve_params(n_occ)?;   // occ/density/Rayleigh scalars
 
         // 1-3. Δq → V=γΔq → H_scc — one fused launch (D10/R18)
-        self.enq_dq_v_hscc(h0_buf, s_buf, g_buf, q0_buf, orb_atom_buf)?;
+        self.enq_dq_v_hscc()?;
 
         // 4-6. Eigenproblem (warm cᵀHc or cold XᵀHX) → eigenvalues on
         //      diag(hp), eigenvectors in c (warm, in place) or cp (cold).
-        self.eigh_solve(rt)?;
-        let n_den = self.occupation(rt, n_occ)?;
+        self.eigh_solve(rt, true)?;   // want eig_diag for eval/measure
+        self.occupation(rt)?;
 
         // 6b-7. §12 D3: column renorm — S-metric on c (warm) or plain on
         //       C′ (cold, then c = X·C′). Repairs the Jacobi normality loss.
-        self.eigh_finish(rt, s_buf, self.occ_repair)?;
+        self.eigh_finish(rt, self.occ_repair)?;
 
         // 7b. §12 D4: ρ_k = cᵀH_scc c_k / cᵀSc_k on the renormalized AO
         //     eigenvectors — replaces the drifted Jacobi diagonal ε_k as the
         //     weight in E_band and W. Under Fermi smearing ρ is needed for
         //     ALL fractionally-weighted orbitals, not only the integer-occ set.
         if self.occ_repair || self.kT > 0.0 {
-            self.k_occ_rayleigh.set_arg(5u32, s_buf).map_err(map_ocl_err)?;
-            self.k_occ_rayleigh.set_arg(10u32, (self.kT > 0.0) as i32).map_err(map_ocl_err)?;
             unsafe { self.k_occ_rayleigh.enq().map_err(map_ocl_err)?; }
         }
 
         // 8. D = 2·Σ_{k∈occ} C[:,k]·C[:,k]^T  (D10: occ_idx + triangle)
-        self.k_density.set_arg(2u32, n_den).map_err(map_ocl_err)?;
-        self.k_density.set_arg(3u32, &self.c).map_err(map_ocl_err)?;
-        self.k_density.set_arg(5u32, &self.d).map_err(map_ocl_err)?;
-        self.k_density.set_arg(6u32, 0i32).map_err(map_ocl_err)?;
         unsafe { self.k_density.enq().map_err(map_ocl_err)?; }
 
         // q_D from this D (q_gpu is still q_in). Do not mix.
-        self.k_mulliken.set_arg(3u32, &self.d).map_err(map_ocl_err)?;
-        self.k_mulliken.set_arg(4u32, s_buf).map_err(map_ocl_err)?;
-        self.k_mulliken.set_arg(5u32, orb_atom_buf).map_err(map_ocl_err)?;
-        self.k_mulliken.set_arg(6u32, &self.q_new).map_err(map_ocl_err)?;
         unsafe { self.k_mulliken.enq().map_err(map_ocl_err)?; }
 
         Ok(())
@@ -1473,6 +1518,26 @@ impl GpuSccPlan {
         let mut ok = vec![true; self.batch];
         if self.n <= 64 { return Ok(ok); }   // full-local kernel has no diag
         rt.read_buffer(&self.jacobi_diag, &mut self.jacobi_diag_h)?;
+        // R8b: env-gated sweep/stop distribution report (diagnostic only).
+        if std::env::var_os("RUST_DFTB_JACOBI_REPORT").is_some() {
+            let mut nsw = Vec::with_capacity(self.batch);
+            let mut stops = [0usize; 5];
+            let mut rel_sum = 0.0f64;
+            for b in 0..self.batch {
+                if ran.get(b).copied().unwrap_or(0) == 0 { continue; }
+                let s = self.jacobi_diag_h[4 * b + 2] as usize;
+                stops[s.min(4)] += 1;
+                nsw.push(self.jacobi_diag_h[4 * b + 3]);
+                rel_sum += self.jacobi_diag_h[4 * b + 1] as f64;
+            }
+            nsw.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            if !nsw.is_empty() {
+                let mean = nsw.iter().map(|&x| x as f64).sum::<f64>() / nsw.len() as f64;
+                eprintln!("[jacobi-report] n={} sweeps mean={:.1} p50={:.0} p90={:.0} max={:.0} rel={:.2e} stops=[{},{},{},{},{}]",
+                    nsw.len(), mean, nsw[nsw.len()/2], nsw[(nsw.len()*9)/10], nsw[nsw.len()-1],
+                    rel_sum / nsw.len() as f64, stops[0], stops[1], stops[2], stops[3], stops[4]);
+            }
+        }
         for b in 0..self.batch {
             if ran.get(b).copied().unwrap_or(0) == 0 { continue; }
             let stop = self.jacobi_diag_h[4 * b + 2] as i32;
@@ -1532,8 +1597,6 @@ impl GpuSccPlan {
     pub fn read_eigenvalues(&mut self, rt: &mut GpuRuntime) -> Result<Vec<f32>> {
         let n = self.n;
         let batch = self.batch;
-        self.k_extract_diag.set_arg(2u32, &self.hp).map_err(map_ocl_err)?;
-        self.k_extract_diag.set_arg(3u32, &self.eig_diag).map_err(map_ocl_err)?;
         unsafe { self.k_extract_diag.enq().map_err(map_ocl_err)?; }
         rt.read_buffer(&self.eig_diag, &mut self.eig_diag_host)?;
         let mut eigenvalues = vec![0.0f32; batch * n];
@@ -1556,6 +1619,9 @@ impl GpuSccPlan {
 /// Set matmul buffer arguments at the correct indices.
 /// For N≤64 (full-local): a=[2], b=[3], c=[4].
 /// For N>64 (tiled):      a=[6], b=[7], c=[8].
+/// R1: unused since the SCC GEMMs moved to fully-bound per-variant handles —
+/// retained for one-shot rebinds (e.g. future diagnostics).
+#[allow(dead_code)]
 fn set_matmul_args(k: &Kernel, base: u32, a: &Buffer<f32>, b: &Buffer<f32>, c: &Buffer<f32>) -> Result<()> {
     k.set_arg(base, a).map_err(map_ocl_err)?;
     k.set_arg(base + 1, b).map_err(map_ocl_err)?;
@@ -1563,8 +1629,10 @@ fn set_matmul_args(k: &Kernel, base: u32, a: &Buffer<f32>, b: &Buffer<f32>, c: &
     Ok(())
 }
 
-/// Build the three matmul kernels needed by the SCC step.
-/// Returns (buf_base, k_xh, k_tx, k_xc) where buf_base is the index of the first buffer arg.
+/// Build the matmul kernels needed by the SCC step.
+/// Returns (buf_base, k_xh, k_tx, k_xc, k_xh_warm, k_tx_warm) — the *_warm
+/// handles are Some only for n>64 (the warm path rotates the previous
+/// eigenbasis c; n≤64 always runs cold).
 /// W4: the tiled path uses `batched_gemm_active` — a replica that converged
 /// (or failed) inside an un-interrupted chunk exits before any tile work.
 fn build_matmul_kernels(
@@ -1580,7 +1648,7 @@ fn build_matmul_kernels(
     cp: &Buffer<f32>,
     c: &Buffer<f32>,
     active: &Buffer<i32>,
-) -> Result<(u32, Kernel, Kernel, Kernel)> {
+) -> Result<(u32, Kernel, Kernel, Kernel, Option<Kernel>, Option<Kernel>)> {
     if n <= 64 {
         // Full-local matmul: args [0]=n, [1]=batch, [2]=a, [3]=b, [4]=c
         let wg = full_local_wg(n);
@@ -1604,7 +1672,7 @@ fn build_matmul_kernels(
             .arg(n as i32).arg(batch as i32)
             .arg(x_buf).arg(cp).arg(c)
             .build().map_err(map_ocl_err)?;
-        Ok((2, k_xh, k_tx, k_xc))
+        Ok((2, k_xh, k_tx, k_xc, None, None))
     } else {
         // Tiled GEMM: args [0]=n, [1]=batch, [2]=trans_a, [3]=trans_b, [4]=alpha, [5]=beta, [6]=a, [7]=b, [8]=c, [9]=local_a, [10]=local_b
         const TILE_M: usize = 16;
@@ -1637,14 +1705,34 @@ fn build_matmul_kernels(
             .build().map_err(map_ocl_err)?;
         let k_xc = Kernel::builder()
             .program(mat_prog).name("batched_gemm_active").queue(rt.queue().clone())
-            .global_work_size(gws).local_work_size(lws)
+            .global_work_size(gws.clone()).local_work_size(lws.clone())
             .arg(n as i32).arg(batch as i32)
             .arg(0i32).arg(0i32).arg(1.0f32).arg(0.0f32)
             .arg(x_buf).arg(cp).arg(c)
             .arg_local::<f32>(a_local).arg_local::<f32>(b_local)
             .arg(active)
             .build().map_err(map_ocl_err)?;
-        Ok((6, k_xh, k_tx, k_xc))
+        // R1 warm variants (c is the previous S-orthonormal eigenbasis):
+        // temp = cᵀ·H_scc (trans_a=1), hp = temp·c.
+        let k_xh_warm = Kernel::builder()
+            .program(mat_prog).name("batched_gemm_active").queue(rt.queue().clone())
+            .global_work_size(gws.clone()).local_work_size(lws.clone())
+            .arg(n as i32).arg(batch as i32)
+            .arg(1i32).arg(0i32).arg(1.0f32).arg(0.0f32)
+            .arg(c).arg(h_scc).arg(temp)
+            .arg_local::<f32>(a_local).arg_local::<f32>(b_local)
+            .arg(active)
+            .build().map_err(map_ocl_err)?;
+        let k_tx_warm = Kernel::builder()
+            .program(mat_prog).name("batched_gemm_active").queue(rt.queue().clone())
+            .global_work_size(gws).local_work_size(lws)
+            .arg(n as i32).arg(batch as i32)
+            .arg(0i32).arg(0i32).arg(1.0f32).arg(0.0f32)
+            .arg(temp).arg(c).arg(hp)
+            .arg_local::<f32>(a_local).arg_local::<f32>(b_local)
+            .arg(active)
+            .build().map_err(map_ocl_err)?;
+        Ok((6, k_xh, k_tx, k_xc, Some(k_xh_warm), Some(k_tx_warm)))
     }
 }
 
@@ -1661,6 +1749,9 @@ fn build_jacobi_kernel(
     act_buf: &Buffer<i32>,
     prec: u32,
     diag: &Buffer<f32>,
+    init_v: i32,   // R1: baked at build — separate cold/warm handles
+    occ_w: &Buffer<f32>,    // R5: Fermi tail outputs (n>64 kernel only)
+    mu: &Buffer<f32>,
 ) -> Result<Kernel> {
     if n <= 64 {
         let (_, _, _, _, wg) = eigen_spec_params(n);
@@ -1689,11 +1780,15 @@ fn build_jacobi_kernel(
         // args: [0]=A [1]=V [2]=n [3]=batch [4]=init_v (0=V←I cold, 1=warm)
         // [5]=active mask — done replicas' WGs exit immediately
         // [6]=diag — [batch][4] {off, off/‖A‖_F, stop, sweeps} (R5)
+        // [7]=fermi_tail [8]=n_occ_fermi [9]=kT [10]=occ_w [11]=mu —
+        //     scalars set by bind_solve_params (R5: μ+occ_w in the tail)
         Kernel::builder()
             .program(&program).name("jacobi_cyclic_global_batched").queue(rt.queue().clone())
             .global_work_size(batch * wg).local_work_size(wg)
-            .arg(a_buf).arg(v_buf).arg(n as i32).arg(batch as i32).arg(0i32)
+            .arg(a_buf).arg(v_buf).arg(n as i32).arg(batch as i32).arg(init_v)
             .arg(act_buf).arg(diag)
+            .arg(0i32).arg(0i32).arg(0.0f32)
+            .arg(occ_w).arg(mu)
             .build().map_err(map_ocl_err)
     }
 }

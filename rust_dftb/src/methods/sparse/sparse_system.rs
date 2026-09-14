@@ -462,6 +462,8 @@ impl SparseSystemWorkspace {
 
     /// Current device K matrix (for `SparseDWWorkspace::build_dw_into`).
     pub fn k(&self) -> &GpuBsrMatrix { &self.k }
+    /// Current device Z ≈ S⁻¹ (diagnostics).
+    pub fn z(&self) -> &GpuBsrMatrix { &self.z }
     /// Current device H_scc (for `SparseDWWorkspace::build_dw_into`).
     pub fn h_scc(&self) -> &GpuBsrMatrix { &self.h_scc }
     /// Current device B = Z·H_scc on M_TZS (for the `W=2(ZH)K` force path).
@@ -708,12 +710,14 @@ impl SparseSystemWorkspace {
             let mut stall_count = 0;
             let mut rz = f32::INFINITY;
             let mut restart = false;
+            self.gpu.prof_tick("ns.z0");
             for iter in 0..max_iter {
                 // T = Z·S (planned; S symmetric)
                 match &self.plan_zs {
                     Some(plan) => self.gpu.spgemm_plan_bsym_dev(&self.z, &self.s, plan, &self.t_zs)?,
                     None => self.gpu.spgemm_bsym_dev(&self.z, &self.s, &self.t_zs)?,
                 }
+                self.gpu.prof_tick("ns.zs");
                 // ||I−T||² → f32 partials + host-f64 tail (PR3) — the
                 // residual drives the NS accept decision; sqrt + normalize
                 // in f64 on host.
@@ -721,7 +725,12 @@ impl SparseSystemWorkspace {
                     &self.t_zs_struct, &self.t_zs.values,
                     &self.reduce_partial, &self.reduce_a, &self.reduce_b, &mut self.reduce_tail_host,
                 )?;
-                rz = (r2.sqrt() / n_orb as f64) as f32;
+                self.gpu.prof_tick("ns.rz");
+                // Contract: R_Z = ||I−ZS||_F / √N_orb(padded). Was erroneously
+                // /n_orb — understated the true residual by √N (36× on R10,
+                // 59× on R14) so reported 3.7e-5 was really ~1.4e-3.
+                let n_dim = (n_orb as f64).sqrt();
+                rz = (r2.sqrt() / n_dim) as f32;
                 if crate::methods::sparse::gpu_sparse::algebra_verbose() {
                     eprintln!("  Newton-Schulz (workspace) iter {iter}: R_Z = {rz:e}  (device ||I−T||_F/√N)");
                 }
@@ -749,9 +758,11 @@ impl SparseSystemWorkspace {
                     Some(plan) => self.gpu.spgemm_plan_bsym_dev(&self.t_zs, &self.z, plan, &self.qz)?,
                     None => self.gpu.spgemm_bsym_dev(&self.t_zs, &self.z, &self.qz)?,
                 }
+                self.gpu.prof_tick("ns.tz");
                 self.gpu.axpby_dev(nblock, 2.0, &self.z.values, -1.0, &self.qz.values, &self.znew.values)?;
                 self.gpu.symmetrize_dev(nblock, &self.z_struct.transpose_block(), &self.znew.values)?;
                 std::mem::swap(&mut self.z.values, &mut self.znew.values);
+                self.gpu.prof_tick("ns.upd");
             }
             if restart && !cold {
                 eprintln!("  compute_z: warm start failed ({last_err}) — restarting cold from αI");
@@ -792,6 +803,14 @@ impl SparseSystemWorkspace {
         self.gpu.read_f32(&self.emin_buf, &mut lo)?;
         self.gpu.read_f32(&self.emax_buf, &mut hi)?;
         let (mut emin, mut emax) = (lo[0], hi[0]);
+        // DIAGNOSTIC ONLY: RUST_DFTB_EMIN/EMAX override the Gershgorin bounds
+        // (e.g. with true eigenvalues) to test whether loose bounds cause the
+        // f32 TC2 floor. Never set in production.
+        if let (Ok(a), Ok(b)) = (std::env::var("RUST_DFTB_EMIN"), std::env::var("RUST_DFTB_EMAX")) {
+            emin = a.parse::<f32>().unwrap_or(emin);
+            emax = b.parse::<f32>().unwrap_or(emax);
+            eprintln!("  [bounds OVERRIDE] emin={emin} emax={emax}");
+        }
         let span = (emax - emin).abs() * padding;
         emin -= span;
         emax += span;
@@ -852,6 +871,7 @@ impl SparseSystemWorkspace {
             &self.reduce_partial, &self.reduce_a, &self.reduce_b, &mut self.reduce_tail_host,
         )?;
         let k_norm = (ksq.sqrt() as f32).max(1e-30);
+        self.gpu.prof_tick("tc2.knorm");
 
         let nocc64 = self.nocc as f64;
         let tol_tr = crate::methods::sparse::gpu_sparse::tc2_trace_tol(nocc64);
@@ -874,6 +894,7 @@ impl SparseSystemWorkspace {
                 Some(plan) => self.gpu.spgemm_plan_bsym_dev(&self.k, &self.s, plan, &self.t_ks)?,
                 None => self.gpu.spgemm_bsym_dev(&self.k, &self.s, &self.t_ks)?,
             }
+            self.gpu.prof_tick("tc2.ks");
             // Per-atom partials → host f64 sum (GPT-5.6 item 2): the trace
             // feeds a discrete branch where an f32-comparison flip is
             // catastrophic. N_atom floats of readback on an existing sync.
@@ -881,6 +902,7 @@ impl SparseSystemWorkspace {
                 &self.t_ks_struct, &self.t_ks.values, &self.n_orb_buf,
                 &self.trace_atom, &mut self.trace_atom_host,
             )?;
+            self.gpu.prof_tick("tc2.tr");
             if !tr_now.is_finite() {
                 return Err(DftbError::InvalidInput(format!(
                     "TC2 trace non-finite at iter {iter}: Tr(KS)={tr_now}"
@@ -955,11 +977,13 @@ impl SparseSystemWorkspace {
                 Some(plan) => self.gpu.spgemm_plan_bsym_dev(&self.t_ks, &self.k, plan, &self.q)?,
                 None => self.gpu.spgemm_bsym_dev(&self.t_ks, &self.k, &self.q)?,
             }
+            self.gpu.prof_tick("tc2.ksk");
             if do_check {
                 let ri_sq = self.gpu.idempotency_to_f64(
                     self.k.struct_.nblock, &self.q.values, &self.k.values,
                     &self.reduce_partial, &self.reduce_a, &self.reduce_b, &mut self.reduce_tail_host,
                 )?;
+                self.gpu.prof_tick("tc2.res");
                 let tr = tr_eff;
                 let ri = (ri_sq.sqrt() as f32) / k_norm;
                 if !ri.is_finite() {
@@ -1041,6 +1065,7 @@ impl SparseSystemWorkspace {
             )?;
             self.gpu.symmetrize_dev(nblock, &self.k_struct.transpose_block(), &self.knew.values)?;
             std::mem::swap(&mut self.k.values, &mut self.knew.values);
+            self.gpu.prof_tick("tc2.upd");
         }
 
         if crate::methods::sparse::gpu_sparse::tc2_plateau_enabled()
@@ -1452,10 +1477,12 @@ impl SparseSystemWorkspace {
     /// P0 + TRS4 on the current device H_scc; K = P·Z recovered after.
     pub fn purify_hscc_trs(&mut self, tc2_max: usize, tc2_tol: f32) -> Result<(PurifyStatus, f32, f64, usize)> {
         let (emin, emax) = self.compute_p0_from_hscc(0.1)?;
+        self.gpu.prof_tick("scc.k0");
         if crate::methods::sparse::gpu_sparse::algebra_verbose() {
             eprintln!("  bounds (ZH Gershgorin, H_scc): emin={emin:.4} emax={emax:.4}  [TRS4]");
         }
         let out = self.trs_purify_p(tc2_max, tc2_tol, 1)?;
+        self.gpu.prof_tick("scc.tc2");
         self.recover_k_from_p()?;   // leaves fresh t_ks (t_ks_valid)
         self.p_valid = true;
         let (r_i_k, tr_ks) = self.recovered_k_diagnostics()?;
@@ -1512,10 +1539,12 @@ impl SparseSystemWorkspace {
     /// the state that feeds charges and the energy, not the P iterate).
     pub fn purify_hscc_p(&mut self, tc2_max: usize, tc2_tol: f32) -> Result<(PurifyStatus, f32, f64, usize)> {
         let (emin, emax) = self.compute_p0_from_hscc(0.1)?;
+        self.gpu.prof_tick("scc.k0");
         if crate::methods::sparse::gpu_sparse::algebra_verbose() {
             eprintln!("  bounds (ZH Gershgorin, H_scc): emin={emin:.4} emax={emax:.4}");
         }
         let out = self.tc2_purify_p(tc2_max, tc2_tol, 1)?;
+        self.gpu.prof_tick("scc.tc2");
         // Consistent finalization: the reported (K,q) state must come from
         // the SAME matrix or the SCC energy is evaluated off-stationarity —
         // q from P while K=PZ leaves an O(ZS−I) inconsistency that leaks
@@ -1570,10 +1599,22 @@ impl SparseSystemWorkspace {
     /// Returns (status, r_I, Tr[KS] as f64, tc2_iters) — see `PurifyStatus`.
     pub fn purify_hscc(&mut self, tc2_max: usize, tc2_tol: f32) -> Result<(PurifyStatus, f32, f64, usize)> {
         let (emin, emax) = self.compute_k0_from_hscc(0.1)?;
+        self.gpu.prof_tick("scc.k0");
         if crate::methods::sparse::gpu_sparse::algebra_verbose() {
             eprintln!("  bounds (ZH Gershgorin, H_scc): emin={emin:.4} emax={emax:.4}");
         }
-        self.tc2_purify(tc2_max, tc2_tol, 1)
+        let r = self.tc2_purify(tc2_max, tc2_tol, 1);
+        self.gpu.prof_tick("scc.tc2");
+        r
+    }
+
+    /// DIAGNOSTIC (frozen-input experiments): upload host K values on the
+    /// existing M_K structure; invalidate cached T=K·S so the next purifier
+    /// call re-forms it.
+    pub fn inject_k_values(&mut self, vals: &[f32]) -> Result<()> {
+        self.k.upload_values(&self.gpu, vals)?;
+        self.t_ks_valid = false;
+        Ok(())
     }
 
     /// Download K values into persistent `k_host` (no extra alloc).
@@ -1858,6 +1899,12 @@ mod tests {
         assert!(
             (rz_dev - rz_host).abs() < 0.1 * scale + 1e-7,
             "device residual {rz_dev:e} disagrees with host {rz_host:e} — contract bug (N4 class)"
+        );
+        // The production-reported residual must agree with the independent
+        // recomputation — this is what the normalization bug escaped.
+        assert!(
+            (rz_reported - rz_host).abs() < 0.1 * scale + 1e-7,
+            "compute_z reported R_Z={rz_reported:e} but true residual is {rz_host:e}"
         );
         assert!(rz_host < 1e-3, "Z is not a converged inverse: host R_Z={rz_host:e}");
     }

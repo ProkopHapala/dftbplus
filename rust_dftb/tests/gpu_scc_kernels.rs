@@ -340,7 +340,8 @@ fn test_mulliken_charges_h2o() {
     let s_buf = rt.buffer_from_slice(&s_flat).unwrap();
     let oa_buf = rt.buffer_from_slice(&orb_atom).unwrap();
     let q_buf = rt.zero_buffer::<f32>(n_atoms).unwrap();
-    mulliken_charges_batched(&mut rt, &d_buf, &s_buf, &q_buf, &oa_buf, n, n_atoms, 1).unwrap();
+    let ones = rt.buffer_from_slice(&[1i32]).unwrap();
+    mulliken_charges_batched(&mut rt, &d_buf, &s_buf, &q_buf, &oa_buf, n, n_atoms, 1, &ones).unwrap();
     rt.finish().unwrap();
 
     let mut q_gpu = vec![0.0f32; n_atoms];
@@ -541,7 +542,8 @@ fn test_batched_scc_kernels() {
     }
     let d_buf = rt.buffer_from_slice(&all_d).unwrap();
     let q_buf = rt.zero_buffer::<f32>(batch * n_atoms).unwrap();
-    mulliken_charges_batched(&mut rt, &d_buf, &s_buf, &q_buf, &oa_buf, n, n_atoms, batch).unwrap();
+    let ones = rt.buffer_from_slice(&vec![1i32; batch]).unwrap();
+    mulliken_charges_batched(&mut rt, &d_buf, &s_buf, &q_buf, &oa_buf, n, n_atoms, batch, &ones).unwrap();
     rt.finish().unwrap();
     let mut q_gpu = vec![0.0f32; batch * n_atoms];
     rt.read_buffer(&q_buf, &mut q_gpu).unwrap();

@@ -354,7 +354,7 @@ fn test_gpu_scc_plan_parity_h2o() {
     let oa_buf = rt.buffer_from_slice(&cpu.orb_atom).unwrap();
 
     // Run with the persistent plan
-    let mut plan = GpuSccPlan::new(&mut rt, &s_buf, cpu.n, cpu.n_atoms, batch)
+    let mut plan = GpuSccPlan::new(&mut rt, &s_buf, &h0_buf, &g_buf, &q0_buf, &oa_buf, cpu.n, cpu.n_atoms, batch)
         .expect("GpuSccPlan::new must succeed");
     plan.set_initial_charges(&rt, &cpu.q0).unwrap();
 
@@ -362,13 +362,13 @@ fn test_gpu_scc_plan_parity_h2o() {
     let mut n_iters = 0;
     for iter in 0..500 {
         n_iters = iter + 1;
-        max_rms = plan.scc_step(&mut rt, &h0_buf, &s_buf, &g_buf, &q0_buf, &oa_buf, cpu.n_occ, 0.3)
+        max_rms = plan.scc_step(&mut rt, cpu.n_occ, 0.3)
             .expect("scc_step must succeed");
         if max_rms < 1e-5 { break; }
     }
     assert!(max_rms < 1e-5, "GpuSccPlan did not converge in {n_iters} iters (max_rms={max_rms:.3e})");
 
-    let energies = plan.compute_energy(&mut rt, &h0_buf, &s_buf, &g_buf, &q0_buf, &oa_buf, cpu.n_occ).unwrap();
+    let energies = plan.compute_energy(&mut rt, cpu.n_occ).unwrap();
     let charges = plan.read_charges(&rt).unwrap();
     let eigenvalues = plan.read_eigenvalues(&mut rt).unwrap();
 
@@ -419,7 +419,7 @@ fn test_gpu_scc_plan_diis_parity_h2o() {
     let q0_buf = rt.buffer_from_slice(&cpu.q0).unwrap();
     let oa_buf = rt.buffer_from_slice(&cpu.orb_atom).unwrap();
 
-    let mut plan = GpuSccPlan::new(&mut rt, &s_buf, cpu.n, cpu.n_atoms, batch)
+    let mut plan = GpuSccPlan::new(&mut rt, &s_buf, &h0_buf, &g_buf, &q0_buf, &oa_buf, cpu.n, cpu.n_atoms, batch)
         .expect("GpuSccPlan::new must succeed");
     plan.set_initial_charges(&rt, &cpu.q0).unwrap();
     plan.reset_diis(&rt).unwrap();
@@ -428,13 +428,13 @@ fn test_gpu_scc_plan_diis_parity_h2o() {
     let mut n_iters = 0;
     for iter in 0..500 {
         n_iters = iter + 1;
-        max_rms = plan.scc_step_diis(&mut rt, &h0_buf, &s_buf, &g_buf, &q0_buf, &oa_buf, cpu.n_occ, 0.3)
+        max_rms = plan.scc_step_diis(&mut rt, cpu.n_occ, 0.3, 1e-5)
             .expect("scc_step_diis must succeed");
         if max_rms < 1e-5 { break; }
     }
     assert!(max_rms < 1e-5, "GpuSccPlan DIIS did not converge in {n_iters} iters (max_rms={max_rms:.3e})");
 
-    let energies = plan.compute_energy(&mut rt, &h0_buf, &s_buf, &g_buf, &q0_buf, &oa_buf, cpu.n_occ).unwrap();
+    let energies = plan.compute_energy(&mut rt, cpu.n_occ).unwrap();
     let charges = plan.read_charges(&rt).unwrap();
 
     let de = (energies[0] as f64 - cpu.energy).abs();

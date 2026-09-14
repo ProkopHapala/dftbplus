@@ -851,6 +851,7 @@ pub fn mulliken_charges_batched(
     n: usize,
     n_atoms: usize,
     batch: usize,
+    active: &Buffer<i32>,
 ) -> Result<()> {
     if n == 0 || batch == 0 {
         return Ok(());
@@ -874,6 +875,7 @@ pub fn mulliken_charges_batched(
         .arg(orb_atom_buf)
         .arg(q_buf)
         .arg_local::<f32>(n)
+        .arg(active)
         .build()
         .map_err(map_ocl_err)?;
     unsafe { kernel.enq().map_err(map_ocl_err)?; }
@@ -1032,6 +1034,7 @@ pub fn extract_diagonal_batched(
     diag_buf: &Buffer<f32>,
     n: usize,
     batch: usize,
+    active: &Buffer<i32>,
 ) -> Result<()> {
     if n == 0 || batch == 0 { return Ok(()); }
     let total = n * batch;
@@ -1043,7 +1046,7 @@ pub fn extract_diagonal_batched(
         .program(&program).name("extract_diagonal_batched").queue(rt.queue().clone())
         .global_work_size(gws).local_work_size(64)
         .arg(n as i32).arg(batch as i32)
-        .arg(a_buf).arg(diag_buf)
+        .arg(a_buf).arg(diag_buf).arg(active)
         .build().map_err(map_ocl_err)?;
     unsafe { kernel.enq().map_err(map_ocl_err)?; }
     Ok(())

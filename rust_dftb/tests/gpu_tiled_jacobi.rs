@@ -291,11 +291,16 @@ fn direct_jacobi_bench() {
                         Ok(p) => p,
                         Err(e) => { eprintln!("direct prec={prec} wg={wg}: build failed {e}"); continue; }
                     };
+                    // R5 tail args — disabled (fermi_tail=0); bound dummies.
+                    let occ_w = rt.zero_buffer::<f32>(batch * n).expect("occ_w bench buf");
+                    let mu = rt.zero_buffer::<f32>(batch).expect("mu bench buf");
                     let kernel = match Kernel::builder()
                         .program(&program).name("jacobi_cyclic_global_batched").queue(queue.clone())
                         .global_work_size(batch * wg).local_work_size(wg)
                         .arg(&a_buf).arg(&v_buf).arg(n as i32).arg(batch as i32).arg(0i32)
                         .arg(&ones).arg(&diag_buf)
+                        .arg(0i32).arg(0i32).arg(0.0f32)
+                        .arg(&occ_w).arg(&mu)
                         .build()
                     {
                         Ok(k) => k,
