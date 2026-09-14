@@ -132,6 +132,12 @@ pub struct SparseSystemWorkspace {
     /// downloaded once, summed in f64. Persistent — no per-iter alloc.
     reduce_tail_host: Vec<f32>,
 
+    /// Kernel-event timing (RUST_DFTB_KTIME=1): true START/END events for
+    /// the two TC2 SpGEMMs — unlike marker-elapsed, this is kernel exec.
+    ktime_on: bool,
+    ev_ks: Vec<ocl::Event>,
+    ev_ksk: Vec<ocl::Event>,
+
     // Host scratch for K download (`k_values_host`, force/energy diagnostics).
     k_host: Vec<f32>,
     a_ht_host: Vec<f32>,      // R_H download scratch (once per SCC)
@@ -428,6 +434,9 @@ impl SparseSystemWorkspace {
             s_inf,
             nocc,
             t_ks_valid: false,
+            ktime_on: std::env::var("RUST_DFTB_KTIME").map(|v| v != "0" && !v.is_empty()).unwrap_or(false),
+            ev_ks: Vec::new(),
+            ev_ksk: Vec::new(),
             guard_fires: 0,
             m_p,
             p_struct,
@@ -541,7 +550,7 @@ impl SparseSystemWorkspace {
     /// f64 norms. Once per SCC finalization — not in the inner loop.
     pub fn rh_stationarity(&mut self) -> Result<f64> {
         if !self.t_ks_valid {
-            self.spgemm_ks();
+            self.spgemm_ks()?;
             self.t_ks_valid = true;
         }
         // A = H_scc·T on M_HT — generic planned SpGEMM (T non-symmetric).
@@ -590,7 +599,7 @@ impl SparseSystemWorkspace {
                 &self.p_struct, &self.p.values, &self.n_orb_buf, &self.qpack_buf,
             )?;
         } else {
-            self.spgemm_ks();
+            self.spgemm_ks()?;
             self.t_ks_valid = true;
             self.gpu.mulliken_to_dev(
                 &self.t_ks_struct, &self.t_ks.values, &self.n_orb_buf, &self.qpack_buf,
@@ -667,11 +676,53 @@ impl SparseSystemWorkspace {
     // ── SpGEMM helpers (use plans when available) ──
 
     /// T = K·S using plan or intersection kernel.
-    fn spgemm_ks(&mut self) {
+    fn spgemm_ks(&mut self) -> Result<()> {
         match &self.plan_ks {
-            Some(plan) => self.gpu.spgemm_plan_bsym_dev(&self.k, &self.s, plan, &self.t_ks),
-            None => self.gpu.spgemm_bsym_dev(&self.k, &self.s, &self.t_ks),
-        }.expect("spgemm_ks failed");
+            Some(plan) if self.ktime_on => {
+                let mut ev = ocl::Event::empty();
+                self.gpu.spgemm_plan_bsym_dev_ev(&self.k, &self.s, plan, &self.t_ks, &mut ev)?;
+                self.ev_ks.push(ev);
+            }
+            Some(plan) => self.gpu.spgemm_plan_bsym_dev(&self.k, &self.s, plan, &self.t_ks)?,
+            None => self.gpu.spgemm_bsym_dev(&self.k, &self.s, &self.t_ks)?,
+        }
+        Ok(())
+    }
+
+    /// Q = T·K (the dominant TC2 product); same plan/fallback policy.
+    fn spgemm_ksk(&mut self) -> Result<()> {
+        match &self.plan_tk {
+            Some(plan) if self.ktime_on => {
+                let mut ev = ocl::Event::empty();
+                self.gpu.spgemm_plan_bsym_dev_ev(&self.t_ks, &self.k, plan, &self.q, &mut ev)?;
+                self.ev_ksk.push(ev);
+            }
+            Some(plan) => self.gpu.spgemm_plan_bsym_dev(&self.t_ks, &self.k, plan, &self.q)?,
+            None => self.gpu.spgemm_bsym_dev(&self.t_ks, &self.k, &self.q)?,
+        }
+        Ok(())
+    }
+
+    /// Sum kernel-event START→END for the recorded TC2 product events and
+    /// report TRUE kernel execution time (not marker-elapsed spans).
+    /// Drains both buffers. Env-gated by RUST_DFTB_KTIME.
+    pub fn kern_time_report(&mut self) {
+        if !self.ktime_on { return; }
+        use ocl::enums::{ProfilingInfo, ProfilingInfoResult};
+        let mut drain = |evs: &mut Vec<ocl::Event>, name: &'static str| {
+            let n = evs.len();
+            let mut ms = 0.0f64;
+            for ev in evs.drain(..) {
+                let _ = ev.wait_for();
+                if let (Ok(ProfilingInfoResult::Start(s)), Ok(ProfilingInfoResult::End(e))) =
+                    (ev.profiling_info(ProfilingInfo::Start), ev.profiling_info(ProfilingInfo::End)) {
+                    ms += (e - s) as f64 * 1e-6;
+                }
+            }
+            if n > 0 { eprintln!("[ktime] {name}: {n} launches, {ms:.1} ms kernel-exec, {:.3} ms/launch", ms / n as f64); }
+        };
+        drain(&mut self.ev_ks, "tc2.ks");
+        drain(&mut self.ev_ksk, "tc2.ksk");
     }
 
     // ── Newton-Schulz inverse (device-resident) ──
@@ -881,28 +932,73 @@ impl SparseSystemWorkspace {
         let mut last_tr = 0.0f64;
         let mut last_r_i = f32::INFINITY;
         let mut n_stagnant = 0usize;
+        let mut iter_best = 0usize;    // iter of last absolute-best snapshot (restore target)
+        let _ = iter_best;
+        // §15.12-B replay-validated (hist_{r10_rk12,r10_rk20,r14_rk12,sih4}):
+        // stagnation = the trace-gated absolute best improved <5% over the
+        // last W=28 checked iters. Shorter windows fire on real mid-descent
+        // stalls (R14 has genuine ~20-iter stalls before a 44% breakthrough —
+        // live W=8 diverged). W=28: +16% iters saved on deg330, zero quality
+        // loss and zero false-fires on all four saved histories.
+        let mut best_hist: std::collections::VecDeque<(usize, f32)> = std::collections::VecDeque::new();
         let mut trace_locked = false;
         let mut dev_prev = f64::MAX;   // previous |Tr−Nocc|/Nocc — growth detector
         let mut dev_run = 0usize;      // consecutive exponentially-growing deviations
         self.t_ks_valid = false;
+        // §15.12-B replay: per-iter history for offline stopping-rule
+        // evaluation. Env-gated; CSV: iter,branch,tr,dev_rel,guard,r_i,
+        // best_r_i,snapshotted + '# call/end' markers. Never in hot path
+        // unless explicitly enabled.
+        let hist_path = std::env::var("RUST_DFTB_TC2_HIST").ok().filter(|p| !p.is_empty());
+        if let Some(p) = &hist_path {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+                let _ = writeln!(f, "# call ts_ms={} max_iter={max_iter} tol={tol:e} nocc={nocc64}",
+                    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0));
+            }
+        }
+        let hist_rec = |f: &mut std::fs::File, iter: usize, branch: u32, tr: f64, dev_rel: f64, guard: bool, ri: f32, best: f32, snap: bool| {
+            let _ = std::io::Write::write_fmt(f, format_args!("{iter},{branch},{tr:.6e},{dev_rel:.3e},{},{ri:.6e},{best:.6e},{}\n", guard as u8, snap as u8));
+        };
+        let hist_end = |reason: &str| {
+            if let Some(p) = &hist_path {
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+                    let _ = writeln!(f, "# end {reason}");
+                }
+            }
+        };
 
         for iter in 0..max_iter {
             let do_check = (iter % check_every == 0) || (iter == max_iter - 1);
 
             // T = K·S, Q = T·K, trace = Tr(T), optionally R_I = ||Q-K||.
-            match &self.plan_ks {
-                Some(plan) => self.gpu.spgemm_plan_bsym_dev(&self.k, &self.s, plan, &self.t_ks)?,
-                None => self.gpu.spgemm_bsym_dev(&self.k, &self.s, &self.t_ks)?,
-            }
+            self.spgemm_ks()?;
             self.gpu.prof_tick("tc2.ks");
-            // Per-atom partials → host f64 sum (GPT-5.6 item 2): the trace
-            // feeds a discrete branch where an f32-comparison flip is
-            // catastrophic. N_atom floats of readback on an existing sync.
-            let tr_now: f64 = self.gpu.trace_ks_f64(
-                &self.t_ks_struct, &self.t_ks.values, &self.n_orb_buf,
-                &self.trace_atom, &mut self.trace_atom_host,
+            // §15.12-3 ONE-READ PATH: enqueue the per-atom trace partials,
+            // then Q=T·K and the residual partials SPECULATIVELY — all on
+            // the in-order queue, before the single blocking trace read.
+            // The branch decision does NOT gate Q (both TC2 branches use
+            // it); the only pre-KSK dependency is the trace guard, which
+            // fires on ~2-6% of iters — those recompute Q + resid after the
+            // rescale (corrected state, identical semantics to the old
+            // read-then-compute order).
+            self.gpu.trace_atom_dev(
+                self.t_ks_struct.n_atom, &self.t_ks_struct.diag_block(),
+                &self.t_ks.values, &self.n_orb_buf, &self.trace_atom,
             )?;
+            self.spgemm_ksk()?;
+            self.gpu.prof_tick("tc2.ksk");
+            if do_check {
+                self.gpu.idempotency_partial_dev(
+                    self.k.struct_.nblock, &self.q.values, &self.k.values, &self.reduce_partial,
+                )?;
+            }
+            // The ONE blocking read — the queue drains T→tr→Q→resid while
+            // the host sleeps once instead of twice.
+            self.gpu.read_f32(&self.trace_atom, &mut self.trace_atom_host)?;
             self.gpu.prof_tick("tc2.tr");
+            let tr_now: f64 = self.trace_atom_host.iter().map(|&x| x as f64).sum();
             if !tr_now.is_finite() {
                 return Err(DftbError::InvalidInput(format!(
                     "TC2 trace non-finite at iter {iter}: Tr(KS)={tr_now}"
@@ -951,6 +1047,15 @@ impl SparseSystemWorkspace {
                         "    TC2 trace guard @iter {iter}: Tr={tr_now:.6} (dev_rel={dev_rel:.2e}) → rescaled K by {alpha:.8}"
                     );
                 }
+                // The speculative Q/resid used the PRE-rescale T — stale.
+                // Recompute from the corrected state (~2-6% of iters; keeps
+                // the old read-then-compute semantics exactly).
+                self.spgemm_ksk()?;
+                if do_check {
+                    self.gpu.idempotency_partial_dev(
+                        self.k.struct_.nblock, &self.q.values, &self.k.values, &self.reduce_partial,
+                    )?;
+                }
                 let tr2: f64 = self.gpu.trace_ks_f64(
                     &self.t_ks_struct, &self.t_ks.values, &self.n_orb_buf,
                     &self.trace_atom, &mut self.trace_atom_host,
@@ -973,14 +1078,13 @@ impl SparseSystemWorkspace {
             // as a limit cycle with the excess doubling each iteration and
             // the R_I floor degrading to 7e-4.
             let branch: u32 = if guard { 1 } else { (tr_now > nocc64) as u32 };
-            match &self.plan_tk {
-                Some(plan) => self.gpu.spgemm_plan_bsym_dev(&self.t_ks, &self.k, plan, &self.q)?,
-                None => self.gpu.spgemm_bsym_dev(&self.t_ks, &self.k, &self.q)?,
-            }
-            self.gpu.prof_tick("tc2.ksk");
+            let mut ri_now = f32::NAN;   // filled only on check iters
             if do_check {
-                let ri_sq = self.gpu.idempotency_to_f64(
-                    self.k.struct_.nblock, &self.q.values, &self.k.values,
+                // Residual partials were enqueued behind Q (or recomputed
+                // on the guard path); only the reduce+read remains — the
+                // queue is already drained so this returns immediately.
+                let ri_sq = self.gpu.idempotency_finish_f64(
+                    self.k.struct_.nblock,
                     &self.reduce_partial, &self.reduce_a, &self.reduce_b, &mut self.reduce_tail_host,
                 )?;
                 self.gpu.prof_tick("tc2.res");
@@ -993,6 +1097,7 @@ impl SparseSystemWorkspace {
                 }
                 last_tr = tr;
                 last_r_i = ri;
+                ri_now = ri;
                 // JOINT snapshot criterion: min R_I among iterates whose trace
                 // is ALSO valid. Selecting on R_I alone once captured an
                 // iterate that was already mid-runaway (best R_I at the same
@@ -1001,12 +1106,14 @@ impl SparseSystemWorkspace {
                 if ri < best_r_i && (tr - nocc64).abs() <= tol_tr {
                     best_r_i = ri;
                     best_tr = tr;
+                    iter_best = iter;
                     self.gpu.copy_f32(&self.k.values, &self.k_best, self.k.struct_.nblock * BS2)?;
                     best_snapshotted = true;
                     n_stagnant = 0;
                 } else {
                     n_stagnant += 1;
                 }
+                best_hist.push_back((iter, best_r_i));
                 if crate::methods::sparse::gpu_sparse::algebra_verbose() {
                     eprintln!("    TC2 iter {iter:3}  R_I={ri:.4e}  Tr(KS)={tr:.6}");
                 }
@@ -1016,6 +1123,7 @@ impl SparseSystemWorkspace {
                         // Converged: K was not updated after this T — t_ks
                         // still holds K·S for the returned K (R8a reuse).
                         self.t_ks_valid = true;
+                        hist_end("converged");
                         return Ok((PurifyStatus::Converged, ri, tr, iter + 1));
                     }
                     if crate::methods::sparse::gpu_sparse::algebra_verbose() {
@@ -1047,14 +1155,38 @@ impl SparseSystemWorkspace {
                             if stagnant { "stagnant" } else { "oscillating" }
                         );
                         self.gpu.copy_f32(&self.k_best, &mut self.k.values, self.k.struct_.nblock * BS2)?;
-                        self.spgemm_ks();            // T consistent with restored K
+                        self.spgemm_ks()?;            // T consistent with restored K
                         self.t_ks_valid = true;
+                        hist_end(&format!("plateau_restore iter={iter}"));
                         return Ok((PurifyStatus::NumericalFloor, best_r_i, best_tr, iter + 1));
                     }
+                    hist_end(&format!("diverged iter={iter}"));
                     return Err(DftbError::InvalidInput(format!(
                         "TC2 diverged at iter {iter}, R_I={ri:e}, best={best_r_i:e}"
                     )));
                 }
+                // §15.12-B candidate (env-gated; 0/absent = off): stop when
+                // the trace-gated best improved <5% over the last W checked
+                // iters (endgame: dev_rel < 5e-4, valid snapshot). Same
+                // restore path + NumericalFloor status as the 10× detector.
+                let stop_w: usize = std::env::var("RUST_DFTB_TC2_STOP_W")
+                    .ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+                if stop_w > 0 && best_hist.len() > stop_w {
+                    let (i_prev, b_prev) = best_hist[best_hist.len() - 1 - stop_w];
+                    let _ = i_prev;
+                    if best_r_i > b_prev * 0.95
+                        && dev_rel < 5.0e-4
+                        && best_snapshotted && (best_tr - nocc64).abs() <= tol_tr && best_r_i < 1e-2 {
+                    eprintln!(
+                        "  TC2 stagnation stop @iter {iter} (best improved <5% over last {stop_w} iters: {b_prev:e}→{best_r_i:e}): restore best K (Tr={best_tr})",
+                    );
+                    self.gpu.copy_f32(&self.k_best, &mut self.k.values, self.k.struct_.nblock * BS2)?;
+                    self.spgemm_ks()?;
+                    self.t_ks_valid = true;
+                    hist_end(&format!("windowed_best iter={iter}"));
+                    return Ok((PurifyStatus::NumericalFloor, best_r_i, best_tr, iter + 1));
+                }
+            }
             }
 
             // Update K: Knew = TC2_branch(K, Q, branch), symmetrize, swap.
@@ -1066,6 +1198,11 @@ impl SparseSystemWorkspace {
             self.gpu.symmetrize_dev(nblock, &self.k_struct.transpose_block(), &self.knew.values)?;
             std::mem::swap(&mut self.k.values, &mut self.knew.values);
             self.gpu.prof_tick("tc2.upd");
+            if let Some(p) = &hist_path {
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+                    hist_rec(&mut f, iter, branch, tr_eff, dev_rel, guard, ri_now, best_r_i, best_snapshotted);
+                }
+            }
         }
 
         if crate::methods::sparse::gpu_sparse::tc2_plateau_enabled()
@@ -1074,10 +1211,12 @@ impl SparseSystemWorkspace {
                 "  TC2 exhausted {max_iter} iters — restoring best K at floor (R_I={best_r_i:e} < tol={tol:e} not reached, Tr(KS)={best_tr})"
             );
             self.gpu.copy_f32(&self.k_best, &mut self.k.values, self.k.struct_.nblock * BS2)?;
-            self.spgemm_ks();
+            self.spgemm_ks()?;
             self.t_ks_valid = true;
+            hist_end("exhausted_restore");
             return Ok((PurifyStatus::NumericalFloor, best_r_i, best_tr, max_iter));
         }
+        hist_end("exhausted");
         Err(DftbError::InvalidInput(format!(
             "TC2 exhausted {max_iter} iters, final r_I={last_r_i:e} Tr(KS)={last_tr} (rel. tol={tol:e} Nocc={})",
             self.nocc
@@ -1505,7 +1644,7 @@ impl SparseSystemWorkspace {
             None => self.gpu.spgemm_bsym_dev(&self.p, &self.z, &self.k)?,
         }
         self.gpu.symmetrize_dev(self.k_struct.nblock, &self.k_struct.transpose_block(), &self.k.values)?;
-        self.spgemm_ks();
+        self.spgemm_ks()?;
         let tr = self.gpu.trace_ks_f64(
             &self.t_ks_struct, &self.t_ks.values, &self.n_orb_buf,
             &self.trace_atom, &mut self.trace_atom_host,
@@ -2053,7 +2192,7 @@ mod tests {
         // Recovery contract: returned diagnostics must describe the
         // recovered K — recompute Tr(KS) and ‖KSK−K‖/‖K‖ in host f64.
         ws.recover_k_from_p().unwrap();
-        ws.spgemm_ks();
+        ws.spgemm_ks().unwrap();
         ws.t_ks_valid = true;
         let (r_i_k, tr_ks) = ws.recovered_k_diagnostics().unwrap();
         let k_host = ws.k_to_host().unwrap();

@@ -1267,3 +1267,57 @@ Stage profile, distinct-256 (132 scc iters): jacobi **74.8%** dev
 gemm_th+th2 4.8% · hscc 2.8%.
 
 **Tests: 46/46** (8 gpu_dftb incl. new e_atom, 22 hbond, 6 scc, 10 kern).
+
+## 2026-09-14 (h) — 2D double-proton-transfer scans (batch=400, distinct)
+
+Three systems scanned (SCC only, 20x20=400 distinct geometries each,
+d_i = r(donor-H_i) moved along donor->acceptor axis on the relaxed
+donor-form scaffold; `scripts/scan2d_{azaindol,pyridone,dzp}.rhai`).
+
+- **azaindol dimer** (N9-H20..N23 / N30-H41..N2): all 400 converged,
+  cold 24 it / 176 ms, warm 8 it / **3.2 ms** (1.0 µs/it/sys).
+  min (1.05,1.05); span 63 kcal. E(d1,d2)=E(d2,d1) to ~2e-4 Ha
+  (matches 0.008 Å N..N asymmetry of input).
+- **pyridone dimer** (N16-H20..O6 / N5-H23..O17, lactam scaffold):
+  cold 16 it / 50 ms, warm **1.74 ms**. min (1.04,1.04); lactim-like
+  shoulder ~(1.76,1.76) ~17 kcal up on the frozen scaffold; span 42.
+  Endpoints relaxed separately: lactam −32.35907, lactim −32.36804
+  (lactim 5.6 kcal/mol LOWER once the scaffold relaxes).
+- **diazaphenalene dimer** (N9-H20..N23 / N30-H41..N2, N=120):
+  cold 56 it / 901 ms (61 transient DIIS fallbacks, all recovered,
+  all 400 converged), warm **8.0 ms** (~2.5 µs/it/sys). Clear double
+  well: donor min (1.05,1.05), transferred corner ~(1.99,1.99) ~15
+  kcal up on the frozen scaffold; central barrier dome ~52 kcal —
+  sequential path visibly cheaper than synchronous. Relaxed
+  transferred tautomer (constructed by placing protons 1.0 Å from
+  acceptors) is a REAL minimum: relaxes to E=−53.41984, degenerate
+  with donor form −53.41990 (Δ=0.04 kcal/mol).
+
+Artifacts: `data/xyz/{azaindol,pyridone,dzp}_2d_scan_20x20.xyz`
+(400-frame movies), `debug/*_2d_scan_Emap.png`,
+`debug/{azaindol_2d_scan_dofs,dimers_endpoints,dimers_relaxed}.png`,
+`data/xyz/{pylac,pyiso,dzp,dzpT}_relaxed.xyz`.
+Generators: `scripts/make_{dimers_2d_scan,dimers_endpoints,
+dimers_movies}.py`, `plot_scan2d.py`, `plot_dimers_relaxed.py`.
+
+**Symmetry variants (dzp).** The raw relaxed scaffold broke d1<->d2
+symmetry by up to 1.9 mHa (input rNN 3.042 vs 3.034 A; halves up to
+0.079 A off inversion). Two fixes:
+- `dzp_relaxed_sym.xyz` — inversion-symmetrized donor scaffold:
+  d1<->d2 asym to 0.003 mHa; but transferred corner still +11.4 kcal
+  (frozen-scaffold penalty — relaxed transferred scaffold differs
+  from donor's by <=0.057 A near junctions, worth ~11 kcal).
+- `dzp_relaxed_mid.xyz` — midpoint of donor/transferred scaffolds +
+  inversion symmetrized: **double-well with degenerate minima**
+  (donor (1.05,1.05) vs transferred (1.99,1.99), dE=0.56 kcal);
+  single-transfer intermediate +30 kcal (mixed tautomer unstable,
+  transfer is cooperative); synchronous barrier ~46 kcal vs stepwise
+  ~30 kcal. Map `debug/dzp_2d_scan_Emap_mid.png` — this is the
+  symmetric test case to keep.
+- `scan2d_dzp_interp.rhai` — **interpolated scaffold**: heavy atoms
+  blend between relaxed donor and relaxed transferred by mean transfer
+  progress s = clamp((d1+d2-2.1)/1.9). Wells degenerate to **0.15
+  kcal** AND land within ~0.5 kcal of the fully relaxed endpoints
+  (−53.41927 / −53.41903 vs relaxed −53.41990 / −53.41984) — the
+  frozen-scaffold penalty is essentially removed. Cheap stand-in for
+  the relaxed scan. Map `debug/dzp_2d_scan_Emap_interp.png`.

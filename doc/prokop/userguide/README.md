@@ -2,3 +2,5 @@ User-facing documentation for the Rust DFTB engine. Write these as if a person w
 
 - [dftb_engine.md](dftb_engine.md) — the CLI: one binary, input scripts, dense GPU DFTB (`gpu_*`).
 - [sparse_dftb.md](sparse_dftb.md) — the same CLI for sparse BSR4 DFTB (`sparse_*`).
+- [sparse_vibrations.md](sparse_vibrations.md) — vibrational frequencies of passivated nanocrystals: FD Hessian, settings, speed, and the math behind it.
+- [hbond_2d_scans.md](hbond_2d_scans.md) — didactic guide to 2-D proton-transfer scans: junction identification, endpoint relaxation, scaffold choice, batched SCC, energy maps, and the GPU numerics behind it.

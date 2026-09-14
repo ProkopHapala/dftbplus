@@ -1,0 +1,252 @@
+# Vibrational frequencies of nanocrystals — tutorial
+
+How to compute a **full vibrational spectrum** of a hydrogen-passivated
+nanocrystal (Si–H on silicon, C–H on diamond, or any geometry you have)
+with the sparse GPU engine, and how the numbers are produced so you can
+judge them yourself. Same program as in [sparse_dftb.md](sparse_dftb.md):
+one binary, one Rhai script.
+
+```text
+dftb_engine --script my_vib.rhai --sk-dir /path/to/matsci-0-3
+```
+
+Ready-made scripts: `rust_dftb/scripts/sparse_vibrations_si10h16.rhai`
+(26 atoms) and `sparse_vibrations_cube_si65.rhai` (65 atoms, has a full
+DFTB+ reference).
+
+---
+
+## 1. What you are actually computing (the math, gently)
+
+### 1.1 The potential-energy surface and the Hessian
+
+In the Born–Oppenheimer picture the nuclei move on a potential-energy
+surface `E(R)` — the electronic energy of the system when the atoms are
+frozen at positions `R`. Near a local minimum `R₀` the surface is, to
+second order, a multidimensional parabola:
+
+```text
+E(R₀ + Δx)  ≈  E₀  +  ½ Δxᵀ H Δx      (gradient is zero at a minimum)
+```
+
+The matrix `H` is the **Hessian**: `H_ij = ∂²E / ∂x_i ∂x_j` over all `3N`
+Cartesian coordinates. Since forces are `F = −∇E`, the Hessian is also
+the **negative Jacobian of the forces**:
+
+```text
+H_ij  =  −∂F_j / ∂x_i
+```
+
+That second form is what we compute: we do not differentiate the energy
+twice, we differentiate the (already analytic) force once.
+
+### 1.2 From Hessian to frequencies
+
+A small displacement `u` oscillates according to `m_i ü_i = −Σ_j H_ij u_j`.
+Absorbing the masses gives the **mass-weighted Hessian (dynamical
+matrix)**
+
+```text
+D_ij = H_ij / √(m_i m_j)
+```
+
+whose eigenproblem `D v = λ v` gives the normal modes. With `λ` in
+Hartree/Bohr²/amu the angular frequency converts to a spectroscopic
+wavenumber via
+
+```text
+ν [cm⁻¹] = √λ · 5140.487        (imaginary modes: ν < 0 by convention)
+```
+
+so stiff bonds on light atoms (Si–H stretch ≈ 2100–2300 cm⁻¹,
+C–H stretch ≈ 2900–3100 cm⁻¹) sit at the top of the spectrum, heavy-atom
+framework modes (Si–Si ≈ 60–700 cm⁻¹) at the bottom.
+
+### 1.3 The rigid modes — your built-in correctness check
+
+3 translations + 3 rotations of the whole crystal cost no energy, so a
+nonlinear molecule/cluster always has **6 modes at ν = 0**. They are not
+input to the calculation — they *emerge*. If your lowest 6 modes are not
+≈ 0 you did not relax enough or your forces are noisy. In practice, FD
+noise puts them at |ν| ≲ 15–20 cm⁻¹; treat those as zero and treat the
+**first internal mode** as the one above that band. `n_imag` in the
+summary counts negative eigenvalues: 4–6 small negatives are the
+rigid-mode noise band, a large negative (< −50 cm⁻¹) is a real
+structural instability, not noise.
+
+### 1.4 Central differences and why we SCC at every displacement
+
+We compute each Hessian column by displacing coordinate `i` by `±h` and
+differencing the forces:
+
+```text
+H_:,i  =  −( F(x₀ + h·e_i) − F(x₀ − h·e_i) ) / (2h)      error O(h²)
+```
+
+Every displaced geometry is a **new electronic problem**: the charges
+must be re-self-consistenced (new `H_scc`, new density matrix `K`,
+new forces). That is `3N` columns × 2 displacements = **6N full SCC+
+force evaluations** per Hessian — the dominant cost of the whole
+procedure, and the reason warm starts matter (§4).
+
+The central difference error is `O(h²)` in `h`, but the *force noise*
+`σ_F` enters the column as `σ_F/h`. There is a sweet spot: too large `h`
+truncates, too small amplifies SCC noise. For this engine `h = 0.02 Å`
+is the calibrated choice (the routine guards `h < skin/2`).
+
+---
+
+## 2. Running it — arbitrary geometry
+
+### 2.1 Minimal script
+
+```rhai
+const sk_dir = SK_DIR;
+const scc_tol_hess = 1.0e-5;      // see §3.2 — tighten to 1e-6 on small systems
+const fd_h = 0.02;                // Å, calibrated plateau
+
+load_xyz("nc", REPO_ROOT + "/data/xyz/my_nanocrystal.xyz");   // or make_geom(...)
+let n_orbs = sparse_new("nc", sk_dir, 0.0, 0.0, 0.0, 0.0, 512.0);
+sparse_tc2_tol("nc", 1.0e-6);     // below the measured f32 floor it bounces — see §3.3
+print("n_atoms=" + itos(sparse_n_atoms("nc")));
+
+// 1. Relax to THIS model's own minimum (frequencies are only meaningful
+//    at a stationary point of the same PES).
+sparse_relax("nc", 400, 1.0e-4, 1.0e-5);
+sparse_scc("nc", 100, scc_tol_hess);
+let e = sparse_eval("nc", true);
+print("relaxed: E=" + ftos(e) + " Ha  max|F|=" + ftos(sparse_max_force("nc")));
+save_xyz("nc", REPO_ROOT + "/debug/my_nc_relaxed.xyz");
+
+// 2. FD Hessian + eigenvalues + modes (writes debug/my_nc_freq.txt).
+print("vibrations: " + sparse_vibrations("nc", fd_h, scc_tol_hess,
+                                       REPO_ROOT + "/debug/my_nc_freq.txt"));
+```
+
+```bash
+cargo run --release -p rust_dftb --bin dftb_engine -- \
+    --script rust_dftb/scripts/my_vib.rhai --sk-dir "$RUST_DFTB_SK_DIR"
+```
+
+Works for **Si–H/Si nanocrystals and C–H/diamond** alike — `matsci-0-3`
+contains `Si-Si`, `Si-H`, `C-C`, `C-H`, `C-Si`, `H-H` (check your pack
+has *every* species pair present; `sparse_new` fails loudly otherwise).
+Nothing in the script is Si-specific — the physics branches only on the
+SK tables and masses.
+
+### 2.2 Output format
+
+`my_nc_freq.txt`: header line (`n_atom`, `h`, `scc_tol`, `max_asym`),
+then `idx freq_cm-1` for all `3N` modes sorted ascending, then `mode k`
+blocks with the unit-normed Cartesian displacement pattern per atom —
+enough to animate modes in any viewer. Console prints `n_imag`,
+`freq_min`, `freq_max`, and the **Hessian max asymmetry** (numerical
+symmetry check — symmetrization is applied but reported, not hidden).
+
+### 2.3 Plot the spectrum
+
+```bash
+python3 rust_dftb/scripts/plot_vib_spectrum.py debug/my_nc_freq.txt \
+    --out debug/my_nc_spectrum.png                    # stick spectrum
+
+python3 rust_dftb/scripts/plot_vib_spectrum.py debug/my_nc_freq.txt \
+    --ref /path/to/DFTB+_job/vibrations.tag           # + reference panel
+```
+
+---
+
+## 3. Settings that matter
+
+### 3.1 Masks: `sparse_new(name, sk_dir, r_trunc, taper_w, r_k, r_z, max_deg)`
+
+All radii `≤ 0` = defaults (full SK radius + skin) — the *permissive
+wide-mask regime*, fine for first runs and small systems. For >64 atoms
+the mask becomes geometric: `r_k` sets the stored density-matrix support
+and is the **accuracy knob** (the map itself needs the DM tails —
+deg~275 ≈ 1 mHa on R10-class systems, ~full for ~20 µHa). For a first
+spectrum just use defaults and `max_deg` comfortably above the expected
+degree (512 covers ~300 nbr/atom systems); sweep masks afterwards.
+
+### 3.2 Tolerances
+
+| Setting | Suggested | Why |
+|---------|-----------|-----|
+| `sparse_tc2_tol` | `1e-6` (large) … `1e-7` (small) | f32 TC2 floor ~`1e-7·(N/150)`; asking below the floor makes iterations bounce, not converge |
+| `scc_tol` (relax) | `1e-5` | relaxation does not need tighter |
+| `scc_tol` (Hessian) | `1e-5`–`1e-6` | sets force noise `σ_F` → Hessian noise `σ_F/h` |
+| `sparse_scc` cap | `80`–`100` | non-convergence fails loudly |
+| `fd_h` | `0.02 Å` | calibrated plateau; must be `< skin/2` |
+
+### 3.3 The f32 floor
+
+GPU algebra is f32 by design. There is a residual floor `R_I` below
+which TC2 purification cannot descend — tolerance requests below it
+waste iterations. The engine reports `R_I` per SCC; set `tc2_tol` one
+decade *above* the measured floor, not below it.
+
+---
+
+## 4. Making it fast
+
+The Hessian costs `6N` force evaluations — this is where all the time
+goes, so optimize the per-evaluation cost:
+
+1. **Warm starts are automatic and are the single biggest speedup.** Each
+   displaced geometry inherits charges `q`, `Z`, and `K` from the previous
+   one — typically 3–8 SCC iterations vs ~15+ cold. Do not recreate the
+   engine (`sparse_new`) between displacements; `sparse_vibrations`
+   reuses the same engine throughout (and restores the original geometry
+   afterwards).
+2. **Freeze topology once.** `sparse_new` builds the sparse mask +
+   SpGEMM plans once; the whole Hessian shares them. `h` must be small
+   enough that no new neighbor crosses the mask skin (guard enforces
+   `h < skin/2`) — that is *why* `h` should stay small.
+3. **Fewer neighbors = faster.** Every SpGEMM's work scales with the
+   operand degrees (`K·S·K` ≈ 85% of device time). A narrower `r_k` is
+   cheaper per iteration *but* raises the accuracy floor — the measured
+   trade: deg175→16 mHa bias, deg275→1.2 mHa, deg330→0.02 mHa on the
+   R10-class crystal. Pick the narrowest mask whose bias you can live
+   with, and keep it **identical across the whole Hessian**.
+4. **Looser SCC during relax, tighter only for the Hessian** (§3.2).
+5. **Watch where the time goes** — `RUST_DFTB_PROF=mark` prints a stage
+   table (`tc2.ksk`, `tc2.ks`, reads, mixing); `RUST_DFTB_KTIME=1` gives
+   true kernel-exec times for the two SpGEMMs (~16% instrumentation
+   overhead itself). `RUST_DFTB_TC2_STOP_W=28` enables the
+   replay-validated floor detector: ~15–30% fewer iterations on
+   plateaued runs, bit-identical energies on tested workloads.
+6. **Big crystals are serial today.** The planned remedy is
+   **batch-parallel ±h displacements** sharing topology/plans — until
+   then, run big Hessians overnight or validate on a smaller crystal
+   first.
+
+### 4.1 Measured wall times (RTX 3090, `--release`, warm starts on)
+
+| System | N | mask | evals (6N) | per-eval | relax | Hessian | total |
+|--------|---|------|-----------|----------|-------|---------|-------|
+| Si10H16 | 26 | complete | 312 | ~0.15 s | ~20 s | ~1 min | ~1.5 min |
+| cube_Si65 | 65 | complete | 780 | ~0.4 s | ~1 min | ~3 min | ~4 min |
+| si_sphere_R10 | 330 | deg~175/330 | 1980 | ~1–2 s | ~1 min | ~30–60 min | ~1 h |
+
+Per-eval cost is ~one warm SCC + one force contract, and grows with the
+stored-K degree (the dominant `K·S·K` SpGEMM is ~85% of device time —
+2.7 ms/launch at deg~175 vs 12.3 ms at deg~330 on R10). Extrapolate:
+R14-class (864 atoms, ~5200 evals) is an overnight serial job — exactly
+the regime where the batch-parallel ±h design pays off.
+
+---
+
+## 5. Reading the result honestly
+
+- **Rigid modes ≈ 0** (|ν| ≲ 15–20 cm⁻¹): required sanity check.
+- **Degeneracies**: symmetric crystals (cubes, spheres) show
+  doublets/triplets — a smooth continuum instead means trouble.
+- **Expected bands**: Si–Si framework 60–700, Si–H bend ~600–950,
+  Si–H stretch 2100–2300; C–C frame up to ~1300, C–H stretch ~2900–3100
+  cm⁻¹.
+- **`max_asym`** is the FD+truncation asymmetry — ~1e-3 is normal at
+  `scc_tol=1e-5`.
+- **Known caveat (2026-09):** vs the DFTB+ reference on cube_Si65 the
+  spectrum is qualitatively correct but systematically **stiff by
+  ~5–15%** (mean |Δ| = 74 cm⁻¹) — traced to a ~1 Ha energy-parity gap,
+  under investigation, not mask/f32 noise. Treat absolute values as
+  method-level estimates, not benchmark-grade, until that gap closes.

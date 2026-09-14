@@ -150,6 +150,8 @@ Geometry first, then the engine. Geometry helpers are shared with dense DFTB.
 | `sparse_fire_step(name, f_tol)` | max \|F\| | One FIRE displacement, then H0/S refresh. Call `sparse_scc` after. |
 | `sparse_md_step(name, dt)` | max \|F\| | One velocity-Verlet step (mass = 1, disp capped at 0.1 Å). Call `sparse_scc` after. |
 | `sparse_relax(name, max_steps, f_tol, scc_tol)` | max \|F\| | SCC + FIRE loop until max\|F\| < `f_tol` or `max_steps`. |
+| `sparse_tc2_tol(name, tol)` | — | Purification residual target; set one decade above the measured f32 `R_I` floor. |
+| `sparse_vibrations(name, h_ang, scc_tol, out_path)` | summary | Central-difference Hessian of the analytic forces → mass-weighted eigen → cm⁻¹ + mode vectors. See [sparse_vibrations.md](sparse_vibrations.md). |
 | `sparse_n_atoms` / `sparse_n_orbs` / `sparse_scc_iters` | int | |
 | `sparse_tr_ks(name)` | Tr(KS) | Occupied trace after the last SCC (SiH₄ target = 4). |
 | `sparse_charges(name)` | csv | Mulliken populations after the last SCC. |

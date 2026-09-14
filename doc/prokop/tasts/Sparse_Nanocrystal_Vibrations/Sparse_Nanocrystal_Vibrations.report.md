@@ -2183,3 +2183,67 @@ This follows directly from retaining T[i,l] only if some requested Q[i,j] has K[
 5. **Tune heavy-product layout or batch independent displacements** once the accepted scalar policy exists. Defer a full device driver, LNV, compensation and CPU-force port unless the revised profile/error decomposition justifies them. Cache topology/plans/Z as already allowed; do not reuse stale K0 just because H changes little. Bounds reuse needs a valid perturbation bound, and density reuse needs an H-dependent stationarity correction.
 
 **Handoff evidence:** exact configuration/mask statistics, failures and guard counts, stopping histories, actual E/F/Hessian errors, profiler-off timing and kernel execution timing. Document observed versus inferred causes separately. No new speedup or physical-acceptance claim is established by this review alone.
+
+## 2026-09-14 (cont. 5) — §15.12-B/C executed: stagnation detector + the REAL mechanism
+
+### §15.12-1 — Diagnostic contracts fixed (done)
+
+- `sparse_f64check`: factor-2 comparison fixed (`‖2K−D_exact‖`, was `‖K−D‖`), masked-vs-full R_I labeled, "COMPLETE" claim corrected (r_k=20 = 108090/108900 = 99.3%).
+- `inject_k_bsr` verifies the full CSR (n_atom + row_ptr + col_idx) and **invalidates `last`**; `purify_current` invalidates too (mutated K ⇒ stale E/q/H).
+- `RUST_DFTB_TC2_HIST=<csv>` per-iter history (iter,branch,tr,dev_rel,guard,r_i,best,snap) for offline stopping-rule replay.
+
+### §15.12-2 — Stagnation detector: replay-validated, env-gated
+
+Rule: **stop when the trace-gated absolute best improved <5% over the last W checked iters** (endgame: dev_rel<5e-4, valid snapshot, best<1e-2) → restore best-K, `NumericalFloor`. Replay on 4 saved histories (R10 deg175, R10 deg330, R14 deg386, SiH4):
+
+- **W=8 fails**: fires inside R14's genuine 15–20-iter mid-descent stalls → live divergence (returned R_I 1.2–6e-3 vs achievable 9e-4).
+- **W=28 safe**: fires only in deg330's ≥34-iter flat tails. Live A/B: R10 deg330 wall **8.1→6.9 s (−15%)**, energy bit-identical (−298.18619690); R14/SiH4/deg175 **zero fires** (their floors creep — the 10× blowup detector remains the backstop there). `RUST_DFTB_TC2_STOP_W=28`, off by default.
+
+### §15.12-2′ — Intermediate-loss diagnostic: the halo hypothesis is REFUTED
+
+`intermediate_loss_diag` test (host f64, R10 deg175, frozen operands):
+
+| quantity | value |
+|---|---|
+| ‖P_M(P_M(KS)K) − P_M((KS)K)‖ (intermediate loss) | **0.0119 (0.075% rel)** |
+| ‖P_M((K_c·S)K_c) − P_M(K_ref S K_ref)‖ (K-truncation loss) | **0.2257 (19×)** |
+| masked-f64 TC2 from K_ref\|M_K, iter 0 | R_I jumps ~0 → **9.6e-3** |
+| …same, iter 15 | ‖K−K_ref‖ 0.15→0.22 (same ~1e-3 limit cycle as f32) |
+
+**Mechanism (final):** the masked map `K′=P_M((K·S)·K)` has **no stable fixed point at K_ref|M_K** — each map step needs K's *own* halo entries, which are structurally zero. In exact f64 arithmetic the iteration walks off the exact state immediately; f32 noise is irrelevant to the floor (f64 shows the identical limit cycle). The KS-intermediate halo (M_T_needed) would recover only the 0.075% product loss — **work-order item 4 is deprioritized**.
+
+**Consequence for the "fewest neighbors" objective:** the DM's own tails are needed *by the map itself* — stored-K degree is the accuracy knob (deg175→16mHa, deg275→1.2mHa, deg330→0.02mHa; scales with DM decay length, not N). Remaining routes to fewer neighbors: (a) accept the decay-length degree, (b) top-k/magnitude masks (~4× efficiency vs radial), (c) LNV — a narrower auxiliary L generating a wider effective K (variational, needs its own mask/gradient work).
+
+### §15.12-3 — Common-path one-read TC2 (implemented, semantics preserved)
+
+Restructured `tc2_purify`: enqueue `T=K·S` → trace partials → **speculative `Q=T·K`** → residual partials (check iters) → ONE blocking read → host f64 guard/branch → K update. The trace guard is the only pre-KSK dependency; on guard fires (~1.8% of iters, measured via event counts) the speculative Q/resid are discarded and recomputed from the rescaled state — identical semantics to the old read-then-compute order.
+
+- Energies **bit-identical** on all three workloads (deg175 −298.17071484, deg330 −298.18619690, R14 −846.95945817); R14 exercises the guard-recompute path.
+- Wall time ~neutral (±5% run noise) — the old read-then-enqueue gap was ~0.2ms/iter vs ~3ms device work; the structural benefit is one consolidated stall and no mid-iteration queue idle.
+
+### §15.12-4 — True kernel-event timing (RUST_DFTB_KTIME=1)
+
+Kernel START/END events on the two TC2 SpGEMMs (plan path only), drained per SCC finalize; `reduce_partials_f64`/`idempotency_partial_dev`/`trace_atom_dev` split so partials can be enqueued ahead of the blocking read. Measured:
+
+| kernel | marker-elapsed (old est.) | TRUE kernel-exec | launches |
+|---|---|---|---|
+| R10 deg175 `tc2.ks` | 0.56 ms | 0.564 ms | 766 |
+| R10 deg175 `tc2.ksk` | 2.64 ms | **2.73 ms** | 780 (14 guard re-fires) |
+| R10 deg330 `tc2.ks` | 1.17 ms | 1.17 ms | 661 |
+| R10 deg330 `tc2.ksk` | 10.34 ms | **12.33 ms** | 650 |
+
+**Markers undercounted ksk by ~16%** on deg330. Kernel products are ~86–88% of wall (deg175: 2.56s/2.99s; deg330: 8.8s/8.6s prof-off baseline — KTIME instrumentation costs ~16% wall itself). Pre-existing test failure noted: `spline_resample::test_resample_bspline_sin` (unrelated, file unmodified).
+
+### §15.13 — First end-to-end vibrations (2026-09-14)
+
+`sparse_vibrations` (FD Hessian of analytic sparse forces, h=0.02 Å, mass-weighted eigen) run on two crystals:
+
+**Si10H16** (26 atoms, matsci, deg=26 complete): relax→Hessian in ~1 min. Rigid modes 0–5 at −16.2..+0.3 cm⁻¹ (FD/asymmetry noise band, max asym 6.4e-3); first real mode 101 cm⁻¹; Si–H stretches 2220–2257 cm⁻¹. `debug/sparse_vib_si10h16_freq.txt`.
+
+**cube_Si65** (65 atoms, matsci, deg=65 complete — geometric mask path exercised): relax→195-col Hessian in ~4 min. max asym 1.0e-3. Rigid modes −14.0..−0.06 cm⁻¹. **vs DFTB+ L1 reference** (`vibrations.tag` ×219474.63):
+
+- Spectrum structure correct: same band organization, degeneracies preserved (e.g., 83.9 triplet, 225.1 doublet), Si–H block 2084–2250 vs ref 1922–2143.
+- Deviations are **systematically positive and sizeable**: internal mean |Δ|=74 cm⁻¹, max 162 cm⁻¹; typical +5–15% mid-range, Si–H block +5%.
+- Geometry confound is small: sparse min is 0.024 Å RMS from DFTB+ min; Hessian at own min vs ref's own min.
+- Contributing causes (unresolved): the ~0.99 Ha energy offset at identical geometry means a real model-parity gap (full mask, r_I~1e-7 — NOT a mask/f32 issue); FD noise ±~10 cm⁻¹ on the softest modes; index-matching ambiguity inside dense degenerate clusters (e.g., mode 59: 561→519 may be reordering).
+- Verdict: **pipeline functional and honest; frequencies qualitatively right, quantitatively ~5–15% soft-stiff vs DFTB+** — consistent with a systematic force-model bias, not noise. Needs the parity-gap investigation before quantitative frequency claims on large systems.

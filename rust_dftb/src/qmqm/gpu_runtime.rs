@@ -86,8 +86,10 @@ impl GpuRuntime {
             .build()
             .map_err(map_ocl_err)?;
         let pv = std::env::var("RUST_DFTB_PROF").unwrap_or_default();
-        // evt mode needs CL_QUEUE_PROFILING_ENABLE at queue creation.
-        let qprops = if pv == "evt" {
+        let ktime = std::env::var("RUST_DFTB_KTIME").map(|v| v != "0" && !v.is_empty()).unwrap_or(false);
+        // evt mode needs CL_QUEUE_PROFILING_ENABLE at queue creation; the
+        // KTIME mode needs it for per-kernel START/END events.
+        let qprops = if pv == "evt" || ktime {
             Some(flags::CommandQueueProperties::new().profiling())
         } else {
             None

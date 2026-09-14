@@ -1891,6 +1891,42 @@ impl SparseBsr4Gpu {
         Ok(())
     }
 
+    /// Same planned b-symmetric SpGEMM but creates a kernel EVENT so the
+    /// caller can read CL_PROFILING_COMMAND_{START,END} — TRUE kernel
+    /// execution time, unlike marker-elapsed spans (queue created with
+    /// profiling when RUST_DFTB_KTIME=1 or PROF=evt).
+    pub fn spgemm_plan_bsym_dev_ev(
+        &self,
+        a: &GpuBsrMatrix,
+        b: &GpuBsrMatrix,
+        plan: &SpgemmPlanGpu,
+        c: &GpuBsrMatrix,
+        ev: &mut ocl::Event,
+    ) -> Result<()> {
+        self.check_left_degree(a)?;
+        let nrow = a.struct_.n_atom;
+        let gws = nrow * self.config.wg as usize;
+        let k = &self.k_spgemm_plan_bsym;
+        k.set_arg(0, nrow as u32).map_err(map_ocl_err)?;
+        k.set_arg(1, &a.struct_.row_ptr).map_err(map_ocl_err)?;
+        k.set_arg(2, &a.values).map_err(map_ocl_err)?;
+        k.set_arg(3, &b.values).map_err(map_ocl_err)?;
+        k.set_arg(4, &plan.plan_ptr).map_err(map_ocl_err)?;
+        k.set_arg(5, &plan.plan_a_idx).map_err(map_ocl_err)?;
+        k.set_arg(6, &plan.plan_b_idx).map_err(map_ocl_err)?;
+        k.set_arg(7, &c.struct_.row_ptr).map_err(map_ocl_err)?;
+        k.set_arg(8, &c.values).map_err(map_ocl_err)?;
+        unsafe {
+            k.cmd()
+                .global_work_size(gws)
+                .local_work_size(self.config.wg as usize)
+                .enew(ev)
+                .enq()
+                .map_err(map_ocl_err)?;
+        }
+        Ok(())
+    }
+
     /// Generic planned SpGEMM `C = P_M(A·B)` — no symmetry assumed on B
     /// (GPT-5.6 item 4). The plan's `plan_b_idx` indexes `B_kj` directly.
     /// No host transfer, no `finish()`.
@@ -2420,7 +2456,9 @@ impl SparseBsr4Gpu {
     /// Reduce device `partial[0..n]` to a host f64: shrink on GPU until
     /// ≤ `tail.len()` entries remain, then download and sum in f64.
     /// `tail` is caller-provided staging (resized once to REDUCE_TAIL).
-    fn reduce_partials_f64(
+    /// Public so callers can enqueue partial kernels + OTHER work before
+    /// the single blocking reduce+read (TC2 one-read path).
+    pub fn reduce_partials_f64(
         &self,
         mut n: usize,
         input: &Buffer<f32>,
@@ -2500,6 +2538,21 @@ impl SparseBsr4Gpu {
                 .enq()
                 .map_err(map_ocl_err)?;
         }
+        self.reduce_partials_f64(n_groups, partial, scratch_a, scratch_b, tail)
+    }
+
+    /// Reduce + read for residual partials enqueued EARLIER by
+    /// `idempotency_partial_dev` (TC2 one-read path: the partial kernel
+    /// is enqueued behind other work, the blocking read comes later).
+    pub fn idempotency_finish_f64(
+        &self,
+        nblock: usize,
+        partial: &Buffer<f32>,
+        scratch_a: &Buffer<f32>,
+        scratch_b: &Buffer<f32>,
+        tail: &mut Vec<f32>,
+    ) -> Result<f64> {
+        let n_groups = div_ceil(nblock * BS2, self.config.reduce_wg as usize);
         self.reduce_partials_f64(n_groups, partial, scratch_a, scratch_b, tail)
     }
 

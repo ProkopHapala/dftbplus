@@ -595,12 +595,28 @@ impl SparseDftb {
     /// Restart the stage clock (e.g. before a measured region).
     pub fn prof_reset(&self) { self.ws.gpu().prof_reset(); }
 
-    /// DIAGNOSTIC: inject host K values (must match M_K structure) — for
-    /// frozen-input experiments (§15.12 A3).
-    pub fn inject_k_bsr(&mut self, k: &Bsr4Matrix) -> Result<()> { self.ws.inject_k_values(&k.values) }
-    /// DIAGNOSTIC: purify the *current* device K against the current H_scc
-    /// (no K0 rebuild). For frozen-input experiments.
+    /// DIAGNOSTIC: inject host K values (structure must be exactly M_K) —
+    /// for frozen-input experiments (§15.12 A3). Mutating K invalidates the
+    /// accepted `last` state: energy()/forces() refuse until a fresh scc().
+    pub fn inject_k_bsr(&mut self, k: &Bsr4Matrix) -> Result<()> {
+        let (rp, ci) = self.m_k()?;
+        if k.n_atom != self.n_atom || k.row_ptr != rp || k.col_idx != ci {
+            return Err(DftbError::InvalidInput(format!(
+                "inject_k_bsr: supplied structure (n_atom={} nnz={}) != M_K (n_atom={} nnz={}) — injection must carry the exact CSR",
+                k.n_atom, k.col_idx.len(), self.n_atom, ci.len()
+            )));
+        }
+        self.last.n_scc = 0;
+        self.last.purify_status = PurifyStatus::Failed;
+        self.ws.inject_k_values(&k.values)
+    }
+    /// DIAGNOSTIC: run the masked TC2 fixed-point iteration on the *current*
+    /// device K (no K0 rebuild; the map uses K,S only — no H-dependent
+    /// correction). For frozen-input experiments. K mutates → the accepted
+    /// `last` state is invalidated; a failed purify also leaves no state.
     pub fn purify_current(&mut self) -> Result<(PurifyStatus, f32, f64, usize)> {
+        self.last.n_scc = 0;
+        self.last.purify_status = PurifyStatus::Failed;
         self.ws.tc2_purify(self.cfg.tc2_max, self.cfg.tc2_tol, 1)
     }
     /// Host M_K mask (row_ptr, col_idx) — pairs with `k_bsr` ordering.
@@ -882,6 +898,7 @@ impl SparseDftb {
             "  [SparseDftb] converged  r_scc={:.3e}  Tr(KS)={:.6}  r_I={:.3e}  R_H={:.3e}  E_band={:.6}  E_scc={:.6}  E_rep={:.6}  E_tot={:.8}  (q_out len {})",
             info.r_scc, info.tr_ks, info.r_i, r_h, self.last.e_h0, self.last.e_scc, self.last.e_rep, self.last.e_tot, q_out.len()
         );
+        self.ws.kern_time_report();   // no-op unless RUST_DFTB_KTIME
         Ok(info)
     }
 
