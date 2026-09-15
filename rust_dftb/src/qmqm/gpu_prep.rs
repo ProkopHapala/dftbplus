@@ -228,7 +228,9 @@ fn build_global_species(
 /// Must be ≤ SK_GRID_MAX (256).
 const SK_RESAMPLE_N: usize = 256;
 
-fn pack_sk_tables(
+/// pub(crate): also used by the PBC driver (gpu_pbc.rs) — same compact
+/// SK-table packing, its pair slots differ but the tables are identical.
+pub(crate) fn pack_sk_tables(
     sk_data: &SkData,
     global_species: &[String],
     species_to_global: &HashMap<String, u8>,
@@ -435,7 +437,7 @@ fn n_orb_from_ang(ang: &[i32]) -> usize {
     sum
 }
 
-fn determine_block_type(ang_i: &[i32], ang_j: &[i32]) -> u8 {
+pub(crate) fn determine_block_type(ang_i: &[i32], ang_j: &[i32]) -> u8 {
     let n_orb_i = n_orb_from_ang(ang_i);
     let n_orb_j = n_orb_from_ang(ang_j);
     match (n_orb_i, n_orb_j) {

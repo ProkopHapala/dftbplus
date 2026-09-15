@@ -544,6 +544,32 @@ pub fn dense_matmul(n: usize, a: &[f32], b: &[f32]) -> Vec<f32> {
     c
 }
 
+/// Host f64 matmul C = A·B, row-major n×n, ikj order (sequential B-row
+/// access, auto-vectorizes) + scoped threads over row chunks. Diagnostic
+/// use only (F64-MCW / FF32 tests) — O(n³) host, never a hot path.
+pub fn matmul_f64_mt(n: usize, a: &[f64], b: &[f64]) -> Vec<f64> {
+    let nt = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4).min(32);
+    let chunk = n.div_ceil(nt);
+    let mut c = vec![0.0f64; n * n];
+    std::thread::scope(|sc| {
+        for (t, ct) in c.chunks_mut(chunk * n).enumerate() {
+            let i0 = t * chunk;
+            let (a, b) = (a, b);
+            sc.spawn(move || {
+                for (i, row) in ct.chunks_mut(n).enumerate() {
+                    let i = i0 + i;
+                    for k in 0..n {
+                        let aik = a[i * n + k];
+                        let bk = &b[k * n..k * n + n];
+                        for j in 0..n { row[j] += aik * bk[j]; }
+                    }
+                }
+            });
+        }
+    });
+    c
+}
+
 /// Frobenius norm of the difference of two dense matrices.
 pub fn dense_max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
     a.iter()

@@ -1142,6 +1142,66 @@ pub fn repulsive_energy_cached(
     Ok(e_rep)
 }
 
+/// Periodic repulsive energy per cell: E = ½ Σ_i Σ_R Σ_j V(|r_j + R − r_i|)
+/// over lattice images R ∈ {−1,0,1}³ (spline cutoffs are ≪ the cell).
+/// Same splines as `repulsive_energy_cached`; fails loud on missing
+/// tables or overlapping atoms.
+pub fn repulsive_energy_pbc(
+    coords: &[[f64; 3]],
+    species_code: &[u8],
+    species_names: &[String],
+    repulsive: &[Option<RepulsiveSpline>],
+    n_species: usize,
+    lat: &[[f64; 3]; 3],
+) -> Result<f64> {
+    let n = coords.len();
+    assert_eq!(species_code.len(), n, "repulsive_energy_pbc: len mismatch");
+    let mut e_rep = 0.0f64;
+    for rx in -1i32..=1 {
+        for ry in -1i32..=1 {
+            for rz in -1i32..=1 {
+                let shift = [
+                    rx as f64 * lat[0][0] + ry as f64 * lat[1][0] + rz as f64 * lat[2][0],
+                    rx as f64 * lat[0][1] + ry as f64 * lat[1][1] + rz as f64 * lat[2][1],
+                    rx as f64 * lat[0][2] + ry as f64 * lat[1][2] + rz as f64 * lat[2][2],
+                ];
+                let central = rx == 0 && ry == 0 && rz == 0;
+                // count each pair once: R=0 → i<j; R≠0 → lex-positive half-space
+                let keep = if central { true } else { rx > 0 || (rx == 0 && ry > 0) || (rx == 0 && ry == 0 && rz > 0) };
+                if !keep { continue; }
+                for i in 0..n {
+                    let si = species_code[i] as usize;
+                    for j in 0..n {
+                        if central && j <= i { continue; }
+                        let sj = species_code[j] as usize;
+                        let spline = repulsive[si * n_species + sj].as_ref()
+                            .or(repulsive[sj * n_species + si].as_ref())
+                            .ok_or_else(|| DftbError::InvalidInput(format!(
+                                "repulsive_energy_pbc: no repulsive Spline for {}-{}",
+                                species_names[si], species_names[sj]
+                            )))?;
+                        let dx = coords[j][0] + shift[0] - coords[i][0];
+                        let dy = coords[j][1] + shift[1] - coords[i][1];
+                        let dz = coords[j][2] + shift[2] - coords[i][2];
+                        let r2 = dx * dx + dy * dy + dz * dz;
+                        if r2 < MIN_NEIGH_DIST * MIN_NEIGH_DIST {
+                            return Err(DftbError::InvalidInput(format!(
+                                "repulsive_energy_pbc: atoms {i}-{j} (image {rx},{ry},{rz}) on top of each other, |r|={:.3e} Å", r2.sqrt()
+                            )));
+                        }
+                        let (e, _) = spline.eval(r2.sqrt() * ANG2BOHR);
+                        if !e.is_finite() {
+                            panic!("repulsive_energy_pbc: non-finite E_rep for {}-{} at r={:.4} Å: {e}", species_names[si], species_names[sj], r2.sqrt());
+                        }
+                        e_rep += e;
+                    }
+                }
+            }
+        }
+    }
+    Ok(e_rep)
+}
+
 /// Sanity check: assert no NaN/Inf in the force array (fail-loud).
 pub fn check_finite(forces: &[[f64; 3]], label: &str) {
     for (i, f) in forces.iter().enumerate() {

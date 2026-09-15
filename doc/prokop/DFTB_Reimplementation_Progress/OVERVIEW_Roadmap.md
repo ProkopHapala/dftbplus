@@ -484,6 +484,39 @@ Device NS stays red. Do not chase G3.4 rel 1e-3 at h=1e-3 Å. Do not time
 
 ---
 
+## 7.7 Constrained DFT (CDFT) — Dense_Multi_CDFT  ✅ M1–M6 done 2026-09-15
+
+> **Spec:** `tasts/HBond_Relaxed_Scan_GPU/Dense_Multi_CDFT.spec.md`
+> **Design:** `tasts/HBond_Relaxed_Scan_GPU/Dense_Multi_CDFT.chat.md`
+> **Topical audit:** `topical_audit/cdft_constraints.md`
+> **User guide:** `userguide/cdft.md` · **Test:** `tests/gpu_cdft.rs`
+
+Fragment Mulliken-charge constraints on the dense `GpuDftb` solver for
+charge-localized diabatic states (PCET/ET surfaces). The constraint
+`Q_F = Σ_{A∈F} Δq_A` enters `h_scc` as `½λ_F·S·(w_μ+w_ν)` — a pure
+on-site shift — so it is one extra kernel launch per h_scc rebuild plus a
+host-side f64 λ-secant loop. Per-replica targets → diabatic ladder in one
+batch. Constrained-surface forces come free via the shifted h_scc.
+
+- [*] `gpu_cdft.cl::cdft_hscc_shift_batched` + `gpu_cdft.rs::GpuCdft` (M1/M2)
+- [*] `plan.cdft` hook in `enq_dq_v_hscc` — `None` = zero cost (M3)
+- [*] `GpuDftb::{set_cdft, clear_cdft, cdft_scc, cdft_qfrag, cdft_energies}` (M4)
+- [*] Rhai `gpu_cdft*` bindings (M5)
+- [*] `tests/gpu_cdft.rs` — H2O {O} −0.20 e: λ=0.334 Ha, E=E₀+0.131 Ha;
+      batch=8 ladder all converged; clear restores E₀ to 3e-9 (M6)
+- [*] **real-system demo** `scripts/scan2d_pyridone_cdft.rhai` — 20×20 PT
+      grid × 3 maps (neutral, Q₁=±1 e), 385/400 & 371/400 converged; CT⁻
+      pulls the proton onto the oxidized monomer's O (PCET coupling).
+      Energy fix: shift couples to Q_gross → subtract λ·(Q_F+Q0_F).
+      Convergence machinery: target ramp + damped secant + basin reset +
+      best-λ restore (audit `topical_audit/cdft_constraints.md`).
+- [ ] Spin-polarized DFTB (needed for odd-electron D⁺A⁻ states)
+- [ ] ΔSCF occupation constraints (occ_w machinery exists; needs state tracking)
+- [ ] CDFT-CI coupling between diabatic states (needs state overlaps)
+- [ ] PBC/k-point CDFT (lands with `gpu_pbc_plan.rs`)
+
+---
+
 ## 8. I/O, Tooling & Test Infrastructure
 
 ### 8.1 I/O

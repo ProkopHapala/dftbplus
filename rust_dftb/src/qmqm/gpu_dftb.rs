@@ -1408,6 +1408,283 @@ impl GpuDftb {
 
     /// Print the env-gated (`RUST_DFTB_PROF=1`) stage-timer table for this
     /// engine and reset it — called by `relax` and at script end.
+    // ── Dense_Multi_CDFT: fragment Mulliken-charge constraints ──────
+    // Q_F = Σ_{A∈F} Δq_A = Q_F^target via a per-fragment multiplier
+    // λ_F that enters h_scc as ½λ_F·S·(w_μ+w_ν) — injected inside
+    // enq_dq_v_hscc (see plan.cdft). Energies from eval() then contain
+    // +Σλ_F·Q_gross(F); cdft_energies() removes it → E_DFTB(constrained).
+
+    /// Attach a fragment-charge constraint set. `frag` is [n_atoms]:
+    /// −1 = unconstrained, else fragment id 0..nfrag−1 (template level,
+    /// same for all replicas). `targets` is [batch*nfrag] target excess
+    /// charge in e — per-replica targets make one batch a diabatic-state
+    /// ladder. λ starts at 0. Returns nfrag.
+    pub fn set_cdft(&mut self, frag: &[i32], targets: &[f64]) -> Result<usize> {
+        let mut cdft = crate::qmqm::gpu_cdft::GpuCdft::new(
+            &mut self.rt, self.n, self.n_atoms, self.batch,
+            frag, targets, &self.buf_s, &self.buf_oa,
+            &self.plan.h_scc, &self.plan.active,
+        )?;
+        // fragment reference populations Q0_F = Σ_{A∈F} q0_A — needed by
+        // cdft_energies (the h_scc shift picks up λ·Q_gross, not λ·Δq).
+        for (a, &f) in frag.iter().enumerate() {
+            if f >= 0 { cdft.q0_frag[f as usize] += self.q0[a] as f64; }
+        }
+        let nfrag = cdft.nfrag;
+        self.plan.cdft = Some(cdft);
+        self.state_fresh = false;   // h_scc on device predates the constraint
+        Ok(nfrag)
+    }
+
+    /// Drop the constraint set — h_scc is rebuilt without the shift at
+    /// the next scc/eval (it is reconstructed from H0 every iteration).
+    pub fn clear_cdft(&mut self) {
+        self.plan.cdft = None;
+        self.state_fresh = false;
+    }
+
+    /// Manually set λ[b][f] (Ha) and upload — for response scans
+    /// Q_F(λ) diagnostics. Resets the secant/bracket state so a later
+    /// cdft_scc starts clean from this λ.
+    pub fn cdft_set_lam(&mut self, b: usize, f: usize, val: f64) -> Result<()> {
+        let c = self.plan.cdft.as_mut()
+            .ok_or_else(|| DftbError::InvalidInput("cdft_set_lam: no constraint set".into()))?;
+        let i = b * c.nfrag + f;
+        if i >= c.lam.len() {
+            return Err(DftbError::InvalidInput(format!("cdft_set_lam: (b={b},f={f}) out of range")));
+        }
+        c.lam[i] = val;
+        c.clear_search(i);
+        c.upload_lam(&self.rt)?;
+        self.state_fresh = false;
+        Ok(())
+    }
+
+    /// Outer-λ constrained solve. Each outer iteration runs a full SCC
+    /// at fixed λ (warm-started on the previous state), reads the
+    /// converged fragment charges, and updates λ by a safeguarded
+    /// secant until |Q_F − Q_F^target| ≤ q_tol for all (b,f).
+    pub fn cdft_scc(&mut self, max_outer: usize, scc_iter: usize, rms_tol: f32, q_tol: f64) -> Result<crate::qmqm::gpu_cdft::CdftReport> {
+        if self.plan.cdft.is_none() {
+            return Err(DftbError::InvalidInput("cdft_scc: no constraint set — call set_cdft first".into()));
+        }
+        let (batch, na) = (self.batch, self.n_atoms);
+        let nfrag = self.plan.cdft.as_ref().unwrap().nfrag;
+        // κ0 per fragment: |dQ_F/dλ| ≈ n_f/Ū_f → κ0 = Ū_f/n_f (Ha per e).
+        let mut kappa0 = vec![0.05f64; nfrag];
+        {
+            let c = self.plan.cdft.as_ref().unwrap();
+            for f in 0..nfrag {
+                let (mut su, mut nf) = (0.0f64, 0usize);
+                for (a, &fa) in c.frag.iter().enumerate() {
+                    if fa as usize == f { su += self.u_per_atom[a]; nf += 1; }
+                }
+                if nf > 0 && su > 0.0 { kappa0[f] = (su / nf as f64) / nf as f64; }
+            }
+        }
+        let mut dq_host = vec![0.0f32; batch * na];
+        let mut qfrag = vec![0.0f64; batch * nfrag];
+        let mut qnat = vec![0.0f64; batch * nfrag];   // natural Q_F at λ=0
+        let mut qerr = vec![0.0f64; batch * nfrag];   // vs FINAL target
+        let mut qerr_eff = vec![0.0f64; batch * nfrag]; // vs ramped target
+        let mut converged = vec![false; batch];
+        let mut scc_ok_last = vec![false; batch];
+        let mut outer_done = 0usize;
+        // Stall recovery: at a level crossing Q(λ) is discontinuous AND
+        // the SCC can sit in the wrong metastable basin — λ stops moving
+        // while err stays > tol. After 3 stalled outer iters, cold-restart
+        // that replica's charges (q→q0) so the SCC can land in the basin
+        // on the other side of the crossing.
+        let mut qerr_prev = vec![f64::NAN; batch * nfrag];
+        let mut stall_ct = vec![0u32; batch * nfrag];
+        let mut restarted = vec![false; batch];
+        // Best-effort bookkeeping: metastable SCC basins mean the target
+        // may be unreachable on some branches — always remember the best
+        // |err| λ seen and restore it at the end, so unconverged replicas
+        // still report their closest-achievable constrained state.
+        let mut best_err = vec![f64::INFINITY; batch * nfrag];
+        let mut best_lam = vec![0.0f64; batch * nfrag];
+        const RAMP: usize = 8;   // continuation steps natural→target
+        for outer in 0..max_outer {
+            outer_done = outer + 1;
+            let s = self.scc(scc_iter, rms_tol)?;
+            for (b, st) in s.statuses.iter().enumerate() {
+                scc_ok_last[b] = !matches!(st, SccStatus::Failed);
+            }
+            self.rt.read_buffer(&self.plan.dq, &mut dq_host)?;
+            // Continuation (target ramp): jumping straight to a far target
+            // lands SCC in a random metastable basin — Q(λ) then looks
+            // discontinuous and no λ reaches the target. Ramping the
+            // effective target from the natural charge keeps each replica
+            // tracking one basin adiabatically. ramp=1 at outer≥RAMP.
+            let ramp = ((outer + 1).min(RAMP) as f64) / RAMP as f64;
+            {
+                let c = self.plan.cdft.as_ref().unwrap();
+                qfrag = c.qfrag_from_dq(&dq_host, batch, na);
+                if outer == 0 { qnat.copy_from_slice(&qfrag); }
+                for i in 0..batch * nfrag {
+                    let t_eff = qnat[i] + (c.target[i] - qnat[i]) * ramp;
+                    qerr[i] = qfrag[i] - c.target[i];
+                    qerr_eff[i] = qfrag[i] - t_eff;
+                }
+            }
+            let ramp_done = outer + 1 >= RAMP;
+            let mut all_ok = true;
+            for b in 0..batch {
+                let mut ok = scc_ok_last[b];
+                for f in 0..nfrag {
+                    if qerr[b * nfrag + f].abs() > q_tol { ok = false; }
+                }
+                converged[b] = ok;   // hitting the FINAL target mid-ramp counts
+                if !ok { all_ok = false; }
+            }
+            // record best-λ so far (only once the ramp is complete and SCC ok)
+            if ramp_done {
+                let c = self.plan.cdft.as_ref().unwrap();
+                for b in 0..batch {
+                    if !scc_ok_last[b] { continue; }
+                    for f in 0..nfrag {
+                        let i = b * nfrag + f;
+                        if qerr[i].abs() < best_err[i] {
+                            best_err[i] = qerr[i].abs();
+                            best_lam[i] = c.lam[i];
+                        }
+                    }
+                }
+            }
+            let q_err_max = qerr.iter().fold(0.0f64, |a, &x| a.max(x.abs()));
+            eprintln!("[cdft] outer={} q_err_max={:.3e} conv={}/{}", outer_done,
+                q_err_max, converged.iter().filter(|&&x| x).count(), batch);
+            // stall diagnostic: worst replica's λ, err, bracket width,
+            // SCC status — distinguishes a collapsed bracket (hysteresis
+            // or discontinuity in Q(λ)) from a still-shrinking search.
+            if !all_ok && (outer < 4 || outer_done % 5 == 0) {
+                let c2 = self.plan.cdft.as_ref().unwrap();
+                let (mut bw, mut be) = (0usize, 0.0f64);
+                for i in 0..batch * nfrag {
+                    if qerr[i].abs() > be { be = qerr[i].abs(); bw = i; }
+                }
+                let (b, f) = (bw / nfrag, bw % nfrag);
+                eprintln!("[cdft]   worst b={b} f={f}: lam={:.5} err={:.4e} br=[{:.5},{:.5}] scc_ok={} lam_prev={:.5} err_prev={:.4e}",
+                    c2.lam[bw], qerr[bw], c2.debug_br(bw).0, c2.debug_br(bw).1,
+                    scc_ok_last[b], c2.lam_prev(bw), c2.err_prev(bw));
+            }
+            if all_ok { break; }
+            // stall bookkeeping + basin reset before updating λ
+            for b in 0..batch {
+                let mut stalled_rep = false;
+                for f in 0..nfrag {
+                    let i = b * nfrag + f;
+                    if qerr[i].abs() <= q_tol { stall_ct[i] = 0; continue; }
+                    if qerr_prev[i].is_finite() && (qerr[i] - qerr_prev[i]).abs() < 1e-6 {
+                        stall_ct[i] += 1;
+                    } else { stall_ct[i] = 0; }
+                    if stall_ct[i] >= 3 {
+                        stalled_rep = true;
+                        let c = self.plan.cdft.as_mut().unwrap();
+                        c.clear_search(i);
+                        c.lam[i] = 0.0;   // re-approach from the neutral-connected branch
+                        stall_ct[i] = 0;
+                    }
+                }
+                if stalled_rep {
+                    let mut q = vec![0.0f32; batch * na];
+                    self.rt.read_buffer(&self.plan.q_gpu, &mut q)?;
+                    q[b * na..(b + 1) * na].copy_from_slice(&self.q0[b * na..(b + 1) * na]);
+                    self.rt.write_buffer(&self.plan.q_gpu, &q)?;
+                    restarted[b] = true;
+                    self.state_fresh = false;
+                    eprintln!("[cdft]   replica {b}: SCC basin reset (q→q0) after stall");
+                }
+            }
+            qerr_prev.copy_from_slice(&qerr);
+            {
+                let c = self.plan.cdft.as_mut().unwrap();
+                for b in 0..batch {
+                    for f in 0..nfrag {
+                        let i = b * nfrag + f;
+                        if qerr[i].abs() <= q_tol { continue; }   // final target already hit — freeze
+                        if qerr_eff[i].abs() > q_tol {
+                            if !ramp_done { c.clear_search(i); }   // moving target: no valid bracket
+                            c.update_lam(b, f, qerr_eff[i], kappa0[f], 0.5);
+                        }
+                    }
+                }
+                c.upload_lam(&self.rt)?;
+            }
+        }
+        // Restore best-λ for replicas that never hit the target, then one
+        // final SCC so every reported state is the closest-achievable
+        // constrained solution (not whatever the last bounce produced).
+        let mut restored = false;
+        {
+            let c = self.plan.cdft.as_mut().unwrap();
+            for i in 0..batch * nfrag {
+                if qerr[i].abs() > q_tol && best_err[i].is_finite() && best_lam[i] != c.lam[i] {
+                    c.lam[i] = best_lam[i];
+                    restored = true;
+                }
+            }
+            if restored { c.upload_lam(&self.rt)?; }
+        }
+        if restored {
+            let s = self.scc(scc_iter, rms_tol)?;
+            for (b, st) in s.statuses.iter().enumerate() {
+                scc_ok_last[b] = !matches!(st, SccStatus::Failed);
+            }
+            self.rt.read_buffer(&self.plan.dq, &mut dq_host)?;
+            let c = self.plan.cdft.as_ref().unwrap();
+            qfrag = c.qfrag_from_dq(&dq_host, batch, na);
+            for i in 0..batch * nfrag { qerr[i] = qfrag[i] - c.target[i]; }
+            for b in 0..batch {
+                let mut ok = scc_ok_last[b];
+                for f in 0..nfrag {
+                    if qerr[b * nfrag + f].abs() > q_tol { ok = false; }
+                }
+                converged[b] = ok;
+            }
+        }
+        let lam = self.plan.cdft.as_ref().unwrap().lam.clone();
+        Ok(crate::qmqm::gpu_cdft::CdftReport {
+            outer_iters: outer_done,
+            q_err_max: qerr.iter().fold(0.0f64, |a, &x| a.max(x.abs())),
+            converged, qfrag, lam,
+        })
+    }
+
+    /// Fragment excess charges Q_F[b][f] from the current device dq —
+    /// [batch*nfrag], f64. Requires an attached constraint set.
+    pub fn cdft_qfrag(&mut self) -> Result<Vec<f64>> {
+        if self.plan.cdft.is_none() {
+            return Err(DftbError::InvalidInput("cdft_qfrag: no constraint set".into()));
+        }
+        let mut dq = vec![0.0f32; self.batch * self.n_atoms];
+        self.rt.read_buffer(&self.plan.dq, &mut dq)?;
+        Ok(self.plan.cdft.as_ref().unwrap().qfrag_from_dq(&dq, self.batch, self.n_atoms))
+    }
+
+    /// Constrained-state DFTB energies: eval() reports E_band built
+    /// from the shifted h_scc = E_DFTB + Σ_F λ_F·Q_gross(F) — the shift
+    /// acts on the GROSS Mulliken population (q0+Δq), so subtract
+    /// Σ_F λ_F·(Q_F + Q0_F). Runs an eval (energy only) — call after
+    /// cdft_scc converged.
+    pub fn cdft_energies(&mut self) -> Result<Vec<f64>> {
+        let e = self.eval(false)?.energy;
+        let qf = self.cdft_qfrag()?;
+        let c = self.plan.cdft.as_ref().unwrap();
+        let mut out = e;
+        for b in 0..self.batch {
+            let mut s = 0.0f64;
+            for f in 0..c.nfrag {
+                // shift contributes λ·Q_gross to e_band — remove it fully
+                let i = b * c.nfrag + f;
+                s += c.lam[i] * (qf[i] + c.q0_frag[f]);
+            }
+            out[b] -= s;
+        }
+        Ok(out)
+    }
+
     pub fn prof_report(&self, ctx: &str) {
         self.rt.prof_report(&format!("GpuDftb {ctx} batch={} n={}", self.batch, self.n));
     }

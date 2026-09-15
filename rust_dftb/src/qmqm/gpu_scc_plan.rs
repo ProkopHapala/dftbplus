@@ -192,6 +192,11 @@ pub struct GpuSccPlan {
     lowdin_e0_host: Vec<f32>,     // [batch] ‖XᵀSX−I‖∞ before/after repair
     lowdin_e1_host: Vec<f32>,
 
+    /// Dense_Multi_CDFT: optional fragment-charge constraint set. When
+    /// attached, `enq_dq_v_hscc` enqueues `cdft_hscc_shift_batched`
+    /// after every h_scc rebuild. `None` → literally zero cost.
+    pub cdft: Option<crate::qmqm::gpu_cdft::GpuCdft>,
+
     // Pre-built kernels (R8: no Kernel::builder() in hot loops)
     // SCC step kernels:
     k_dq_v_hscc: Kernel,      // fused_dq_v_hscc_batched (D10/R18)
@@ -746,6 +751,7 @@ impl GpuSccPlan {
             rep_spline_data: None,
             rep_e_rep: None,
             rep_n_species: 0,
+            cdft: None,
         };
         plan.set_geometry(rt, s_buf)
             .map_err(|e| DftbError::InvalidInput(format!("GpuSccPlan::new initial S^{{-1/2}}+repair: {e}")))?;
@@ -797,7 +803,11 @@ impl GpuSccPlan {
     /// delta_q + gamma_matvec + h_scc_update sequence (3 launches, and the
     /// dq/v global round-trip between them). All args bound at construction.
     fn enq_dq_v_hscc(&mut self) -> Result<()> {
-        unsafe { self.k_dq_v_hscc.enq().map_err(map_ocl_err) }
+        unsafe { self.k_dq_v_hscc.enq().map_err(map_ocl_err)?; }
+        // Dense_Multi_CDFT: λ_F·½S(w_μ+w_ν) constraint shift on top of the
+        // freshly built H_scc — every rebuild (SCC iter, finalize, eval).
+        if let Some(c) = &self.cdft { c.enq_shift()?; }
+        Ok(())
     }
 
     /// Eigenproblem solve: h_scc → rotated matrix in `hp` (eigenvalues on

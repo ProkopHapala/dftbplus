@@ -1230,6 +1230,329 @@ Optional later experiments:
 
 Neither is required before the baseline is correct.
 
+#### 4.12.0 Measurement policy — NEVER run a full Hessian to measure it
+
+A displaced-eval experiment must answer "per-eval cost + iteration
+counts", not produce a Hessian. Rules:
+
+- **HARD BOUND — `timeout 30` on EVERY engine invocation, no
+  exceptions.** Not for "production" runs, not for "it's almost done",
+  not for final artifacts. I violated this once with `timeout 1500` on
+  a "production" Hessian — exactly the bug this rule prevents. If a run
+  cannot finish in 30 s, bound its *work* (fewer columns/steps), never
+  extend the timeout.
+- **`RUST_DFTB_VIB_MAXCOL=n`** — bounds the FD columns (e.g. 4–8 columns
+  = 8–16 evals); per-column phase times (`rst+geom`, `solve+f`) and the
+  purify/SCC iteration counts are always printed, so ~8 columns
+  extrapolate to 6N exactly. A bounded run exits before the eigensolve.
+- **A full Hessian is a user-launched artifact only** (e.g. an overnight
+  batch the USER starts) — never an agent-launched unbounded loop.
+- Same discipline for relax/scan scripts: bound the step count or time
+  before launching.
+
+#### 4.12.1 Measured status (2026-09-15) — per-eval bottleneck analysis
+
+Micro-benchmark (`scripts/bench_eval_r10.rhai`, R10 = 330 Si, ±0.02 Å on
+atom 0, `RUST_DFTB_PROF=mark`; full detail in
+`doc/prokop/topical_audit/hessian_eval_bottleneck.md`):
+
+- [*] Per-phase breakdown measured: `set_coords` ≈ **5 ms** (CPU H0/S
+  assembly 3.4 + dense f64 γ O(N²) 0.9 + repulsive 0.3 + uploads),
+  `scc` ≈ **3.4–7.3 s**, `forces` ≈ **7 ms**. SCC is >98% of an eval.
+- [*] Structure of the waste measured: ~9–17 DIIS mix iters × ~41–55 TC2
+  iters ≈ 450–900 SpGEMM iterations per displaced eval. Every mix iter
+  rebuilds `K0/P0 = f(Z·H_scc)` from scratch (`compute_k0_from_hscc` /
+  `compute_p0_from_hscc`) — the converged projector is never reused.
+- [*] `tc2.tr` = 87–95% of host time is the one blocking read per TC2
+  iteration draining the queued K·S·K — per-iteration serialization.
+- [*] **Mode A (frozen DM) implemented** — `forces_frozen()` +
+  `RUST_DFTB_VIB_FROZEN`: R10 Hessian = **23 s** (12 ms/eval, 1980
+  evals). Accuracy on si10h16: framework modes ±1–9 cm⁻¹ of full SCC,
+  but Si–H stretches **~240 cm⁻¹ soft** (charge response stiffens the
+  top modes). Preview/framework tool, not quantitative.
+- [*] **Warm-seeded TC2 implemented and REFUTED** —
+  `purify_hscc_warm()` + `RUST_DFTB_WARM_K`: seeding stored converged K
+  walks away from the fixed point (r_I doubles every eval, nonsense
+  self-consistent charge state reached). Consistent with this section's
+  warning: pure polynomial purification cannot rotate the occupied
+  subspace. A Hamiltonian-aware update is required.
+- [*] **Central-state snapshot/restore DONE** —
+  `snapshot_electronic_state` / `restore_central_state` on `SparseDftb`
+  (stores q, K, Z, K0; resets DIIS fully per column). Every ±h column
+  now starts from the identical central state — implemented in
+  `rhai_sparse_vibrations`.
+- [*] **Mode B (fixed-q) DONE and validated** — `scc_fixedq()`: NS warm
+  (2 iters) + ONE cold purify, no DIIS. si10h16 vs full SCC:
+  **rms 6.1 cm⁻¹ / max 10.7** (frozen-DM was 162/344). R10 per eval:
+  ~0.36–1.0 s (one purify).
+- [*] **Mode C attempt #1 REFUTED with diagnosis** — δK0 seed
+  `K_conv + (K0_new − K0_center)` (`k_seed_shift` + `RUST_DFTB_VIB_DMUPD`)
+  lands at R_I~1e-3 (300× closer than cold K0) but is *repelled* by TC2
+  (diverges 1.35e-3→2.2e-2). Adding McWeeny polish (`mcweeny_polish`,
+  contracting 3KSK−2KSKSK) makes it converge in ~7 iters — **but to a
+  wrong-subspace projector**: idempotent yet R_H=1.4e-3 vs cold ~4e-7
+  (si10h16 spectrum off ~300 cm⁻¹). Conclusion: purification can only
+  enforce idempotency + trace, never the occupied-subspace *selection* —
+  that information comes only from the H-containing K0 basin. A correct
+  warm update must minimize ‖[K,H]‖ (LNV/DMM commutator descent), not
+  polish idempotency. R_H gate (`rh_stationarity`, default 5e-4) now
+  validates warm results and cold-restarts on failure.
+- [*] **Floor-stop wins measured** — `RUST_DFTB_VIB_TC2TOL=5e-5` (above
+  the deg330 floor 4.1e-5): purify converges at **25 iters** instead of
+  plateau-churning to 80. Same Hessian accuracy (si10h16 rms 6.3 vs
+  6.1 cm⁻¹). R10 fixq eval: **~355 ms** → full Hessian ≈ 12 min.
+- [*] **`RUST_DFTB_VIB_MAXCOL` + per-column phase timing** — bounded
+  measurement (8 cols ≈ 6–14 s) replaces full-Hessian measurement runs.
+- [ ] **SCC ≤ ~3–5 mix iters for displaced evals** — investigate why
+  DIIS needs 9–17 at h=0.02 Å (floor noise vs genuine sloshing; measure
+  on complete-mask reference).
+- [ ] **Purify stops at its measured floor** — never iterate to
+  `tc2_max` on a plateau (W=28 detector exists, env-gated; wire it into
+  the Hessian path default).
+- [ ] **Per-TC2-iter host sync elimination** — device-side branch or
+  fused multi-step; only after iteration counts are cut.
+- [ ] **GPU H0/S + γ assembly** (B2/B3 below) — deferred until SCC is
+  cheap; ~5 ms/eval at N=330, matters at N≳2000.
+- [ ] **Batch ±h columns** — independent engines sharing frozen
+  topology/plans; the product-level fix for 6N serial evals.
+- [ ] **Validate the mode ladder A<B<C<D on cube65** — force and
+  frequency error vs cold-SCC reference before any mode becomes default.
+- [ ] Performance target (GPT-5.6 review): frozen ~5–20 ms, fixed-q
+  ~10–50 ms, warm-SCC ~20–100 ms per eval at N=330.
+
+#### 4.12.2 TC2 numerical-floor study (2026-09-15) — measured + GPT-5.6 directives
+
+Controlled experiment (`scripts/tc2_conv_study.rhai` +
+`plot_tc2_convergence.py`, `RUST_DFTB_TC2_HIST` CSV): ONE cold
+`purify_now` (K0 rebuilt from a fixed near-converged H_scc) on R10
+(330 Si, deg_k=deg_z=330 — full atom support, so mask truncation is NOT
+the floor here). `debug/tc2_conv_r10.png`.
+
+**Measured floor ladder** (tol=1e-9 → runs until a stop identifier cuts):
+
+| variant | min R_I | iters | note |
+|---|---|---|---|
+| ACC4 (default) | 1.78e-5 | 150 (max) | period-2 sawtooth at floor |
+| ACC8 | 1.75e-5 | 119 | same sawtooth |
+| ACC16 (new) | 1.32e-5 | 81 | same sawtooth; ~2× faster/iter (6.2 vs 12.4 ms — ILP) |
+| Kahan f32 | 9.7e-6 | 39 | floor barely moves; trace runaway → abort |
+| McWeeny endgame | 5.4e-6 | 150 | smooth monotone — but GLACIAL |
+| Kahan+McW | 5.4e-6 | 150 | identical (see directive 3 — expected, not evidence) |
+
+**GPT-5.6 analysis (chat.md L7875+) — reflection:**
+
+- The sawtooth is **intrinsic to trace-correcting TC2 at finite
+  precision**: near the fixed point the two branches apply
+  δ→2δ / ε→ε² vs δ→δ² / ε→2ε — a finite error η cycles as
+  η→2η→η. No accumulator scheme can cure it; ACC4→16→Kahan only
+  shifted η (1.8e-5→1.3e-5→9.7e-6). **ACC studies closed**; keep ACC16
+  only if its ~2×/iter speed reproduces.
+- **Correct production form:** TC2 to ~R_I 1e-3–1e-4 (rank+trace
+  locked), then McWeeny `K' = 3KSK − 2KSKSK` for the endgame — contracts
+  BOTH subspaces (ε'≈3ε², δ'≈3δ²), no branch saddle. TC2 must never
+  enter the 1e-5 sawtooth in production.
+- **The measured McWeeny descent is ANOMALOUS**: quadratic convergence
+  should do 1e-5→~1e-10 in ~1 step; observed ~5e-6 after >100 iters
+  means each step INJECTS ~1e-6–1e-5 error. Prime suspect: the extra
+  products (Q·S, U·K) run on the *masked* bsym kernel — the least
+  accurate multiply in the solver, no ACC/Kahan. Kahan+McW identical is
+  therefore EXPECTED, not evidence Kahan is irrelevant.
+- **"Residual measurement is fine" was too strong**: the f64 host finish
+  is exact, but Q=KSK is f32-produced — measured R_I conflates state
+  error with product error. One-shot CPU-f64 residual of saved best-K is
+  still owed.
+- **Dummy-orbital clue**: a prior Hessian run reported
+  `dummy |D_ii| sum = 2.4e-5` — same scale as the floor. Decompose R_I
+  into physical vs dummy lanes; if the floor lives in dummy lanes this
+  is a padding-contamination BUG, not precision.
+- McWeeny trace drift ~1e-6 is also consistent with inaccurate products;
+  do NOT rescale K per McW step (α-scale destroys idempotency by
+  O(|α−1|) and can set a new floor).
+- **Production endgame may be P-space McWeeny**: with P=KS locked,
+  P' = 3P² − 2P³ is only 2 SpGEMMs/iter (plan_pp exists), then K=PZ
+  once for forces. Debug K-McWeeny first (directly comparable), then
+  switch if it works.
+- **Disagreement logged**: "needs f64 state" is NOT established. Find
+  the per-iteration error injection before paying for f64.
+
+**Ordered action list (GPT-5.6) — results 2026-09-15:**
+
+- [x] Stop ACC studies — floor is map-intrinsic (ACC16 kept for speed only).
+- [x] **F64-DIAG** (`sparse_ri_f64`, dense f64 ‖KSK−K‖/‖K‖ of the
+  device K): K-TC2 measured 1.78e-5 → **true 4.1e-5** (measurement
+  UNDRESTIMATES ~2.3×, not over — GPT's Case B: the state is at the
+  floor, not the residual kernel). K+McWeeny measured 5.35e-6 → true
+  1.42e-5 (best state). Trace exact (459.000025).
+- [x] **DUMMY-DECOMP**: dummy-lane contribution **exactly 0.0** — the
+  floor is 100% physical lanes; no padding contamination (the 2.4e-5
+  dummy-occupancy abort was a different bug).
+- [x] **MCW-PLAN**: McWeeny products routed through plan_ks/plan_tk
+  (also fixed: U=Q·S was truncated onto M_K, now on M_TKS — trace drift
+  4.4e-7→7e-8 fixed). Floor unchanged: 5.35e-6; +Kahan identical →
+  product accuracy is NOT the limiter either.
+- [x] **MCW-SHORT**: the per-iter history IS the plot — McWeeny descent
+  is smooth but asymptotic (1e-5→5.4e-6 over 120 iters, still
+  descending), not quadratic.
+- [x] **P-space purifiers measured**: P-TC2 floors at R_I(P)=5.6e-6 and
+  TRS4 at 6.0e-6 — BUT the recovered K=PZ is 7–8e-5 (Z recovery +
+  truncation loses it). P-McWeeny actually DRIFTS UP (1.2e-5→1e-4 over
+  100 iters — P is non-normal; the symmetric-map assumption fails).
+- [ ] **F64-ENDGAME**: see the mechanism below before deciding.
+- [ ] **P-MCW**: P-space McWeeny REJECTED (non-normal iterate drifts).
+
+**Mechanism — CORRECTED (GPT-5.6, chat.md L8397+):** my earlier claim
+"the floor is occ↔unocc rotation error that only H-aware descent fixes"
+was WRONG. A rotated projector still satisfies P²=P exactly — the
+idempotency-defect linearization (PE+EP−E) cancels E_ou at first order.
+Subspace rotation produces NO first-order R_I; **stationarity error and
+idempotency error are different problems** (R_H vs R_I — report BOTH).
+The corrected reading: TRS4 arriving at the same ~1e-5 wall by a very
+different trajectory, plus f64-measured 1.4e-5 on the stored state, plus
+zero dummy contribution, plus insensitivity to product accuracy — all
+point to a genuine **f32 representation floor** for this matrix.
+
+**Ordered action list, round 2 (GPT-5.6):**
+
+- [x] **F64-MCW** (`sparse_mcw_f64`, `matmul_f64_mt` host f64 dense):
+  **quadratic collapse confirmed** — stored best K (true R_I=1.42e-5)
+  → 4.0e-9 → 2.2e-15 → machine eps in 3 steps. **f32 precision IS the
+  cold-purifier floor**; the map is healthy, no algebra bug.
+- [x] **A/B storage-vs-arithmetic**: variant A (f32 storage, f64
+  products) stalls at **1.3e-8** — f32 storage quantization. Variant B
+  (all-f64) → 8e-16. Read: the ~1e-5 f32 floor is accumulated PRODUCT
+  ARITHMETIC noise (one f64 step collapses it); f32 STORAGE alone
+  supports ~1e-8. **Production polish = f32-state + 1–2 high-precision
+  products → ~1e-8, ~1000× below the floor.** All-f64 only needed below
+  ~1e-8.
+- [x] **R_H reported alongside R_I**: mcw_f64 prints both per step
+  (CSV col 3). On THIS run R_H=9.2e-2 — but H_scc came from only 4 SCC
+  mixers (rms 5e-2), so the subspace leg is unmeasured; redo on a
+  converged H_scc before warm-DM work.
+- [ ] **TRS4 as fast-approach solver**: reaches the wall in fewer iters;
+  compare by SpGEMM count/wall time, not iters (2 products vs 1 per
+  iter). Candidate production form: TRS4 approach → precision endgame.
+- [ ] **Force-noise-vs-polish study**: measure max|ΔF| on the SAME
+  geometry for K polished to R_I ~ 3e-5 / 1e-5 / 1e-6 / 1e-8 — the
+  Hessian needs δF/h, not small R_I per se. The 1e-5 floor may already
+  be sufficient; the hour-long Hessian was mostly REFUSING TO STOP at
+  the floor.
+- [x] **FF32-POLISH (chosen design, chat L9436+) — IMPLEMENTED +
+  VALIDATED 2026-09-17**: emulated float-float (`float2(hi,lo)` ≈
+  40–48 bit) McWeeny polish, all FP32/FMA. Results (R10): products
+  verified 7e-15–9.7e-14 vs masked-f64; r_k=40 Å → R_I 2.7e-7→
+  **1.8e-8** (f32-storage fixed point ~1.4e-8); r_k=20 Å → ~3e-5
+  (M_K storage tail 5.3e-6 dominates — arithmetic CANNOT beat mask).
+  Cost ~44 ms/step ≈ **3 f32 iters** (spec target was ≤8). In-loop
+  trigger `RUST_DFTB_TC2_FF=1` + `FF_SWITCH`/`FF_STEPS` (terminal —
+  returning to f32 re-pollutes). Bug found: fused product+combine
+  kernel lost compensation to OpenCL compiler reassociation of the
+  TwoSum chain (1.7e-7); split path + explicit-fma combine is bitwise
+  = host emulation. Details: report §15.14.
+- [ ] LNV/commutator (‖[K,H]‖) descent remains REQUIRED — but for the
+  warm-DM subspace-rotation problem (G3), not for this floor.
+
+**FF32-POLISH spec (GPT-5.6, chat L9520–9776):**
+
+- TwoSum/TwoProd via f32 FMA (`p=a*b; pe=fma(a,b,-p)`); NO
+  -cl-fast-relaxed-math / reassociation on these kernels (current
+  program has no fast flags — keep it that way).
+- Only `f32×f32→ff` and `ff×f32→ff` products needed (right operand is
+  always f32 K or S); never `ff×ff`.
+- Dataflow per polish step, reusing existing plans:
+  `T_ff=K·S (plan_ks)`, `Q_ff=T_ff·K (plan_tk)`, `U_ff=Q_ff·S (plan_ks)`,
+  fused final `Knew=f32(3Q_ff−2(U_ff·K)) (plan_tk)` — V never stored.
+- Only TWO new persistent buffers: `ff_t_lo` on M_TKS, `ff_q_lo` on
+  M_K — the hi parts reuse `t_ks.values`/`q.values`.
+- Cheaper accumulate allowed: TwoProd + TwoSum per term into
+  (hi,lo_running-error) — renormalize only at output; optimize after
+  correctness (target ≈3–8× a plain f32 product, ≈8 f32-iter-equiv per
+  polish — NOT 50).
+- Integration: f32 TC2/TRS4 to a switch threshold (test 1e-2…1e-5),
+  then ONE FF-McWeeny step; maybe a second. Stop f32 floor-dancing.
+- Acceptance gate: R10 f32 input R_I~1e-4..1e-5 → after one FF-McW
+  the CPU-f64 `sparse_ri_f64` must read ≲1e-7 (ideally ~1e-8). Then
+  benchmark polish wall-time vs f32 iter cost.
+
+**Production purification policy — CONSOLIDATED (2026-09-15; GPT-5.6
+review chat L10089–10604 + Devin analysis). AGREED DESIGN, not yet
+coded. The current in-loop `use_ff` branch is study harness.**
+
+Two separate phases — FF is a *terminal* phase, never a branch inside
+the TC2 loop (each in-loop FF iteration currently wastes one full f32
+diagnostic iteration T=KS,Q=KSK,tr,res ≈14.5 ms before the next FF
+step):
+
+```text
+PHASE A — f32 TC2, hard budget ~30 iters
+  exit Converged     : R_I < tol (1e-5 fast / 1e-6 default) && trace ok
+  floor anticipation : trace_locked && best_ri < ~1e-3 && stalled
+                       (best improved <5% over ~5 checks — the ri<1e-3
+                       gate makes a short window safe; mid-descent
+                       stalls live at R_I >> 1e-2)
+                       → restore k_best → Phase B gate / NumericalFloor
+  budget exhausted   : if NOT (trace_locked && best_ri < ~1e-3)
+                       → FAIL LOUD / robust path — not an arithmetic-
+                       floor problem, do NOT polish garbage.
+PHASE B — terminal FF32 McWeeny (accurate mode only)
+  restore best valid K. Per step: FF-McW + cheap R_I re-measure
+  (Q=KSK already in buffer → one reduce ≈0.2 ms) + k_best snapshot.
+  early exit: R_I < target OR step gain < ~2×;  hard cap 5
+  (measured: 2.7e-7 → 4e-8 → 2e-8 — 1 step normal, 2 strict; after
+  step 2 it is polishing the f32-storage floor ~1.3e-8).
+  Then recompute T=K·S once, measure trace once → return PolishedFF.
+```
+
+Production-hygiene deltas vs the study code:
+
+- Resolve the purification policy ONCE into a struct
+  (mode/tc2_budget/ff_switch/ff_steps/tol) — no `std::env::var` in the
+  hot loop.
+- New `PurifyStatus::PolishedFF` (≠ NumericalFloor — a successful
+  polish is not a failed convergence); post-FF R_I must be MEASURED on
+  the returned state (current code returns the stale pre-FF `last_r_i`).
+- FF entry threshold is chosen by COST, not aesthetics: calibrate
+  R_switch ∈ {1e-2, 3e-3, 1e-3, 3e-4, 1e-4, 3e-5} — TC2 to switch +
+  exactly ONE FF step → true R_I; take the EARLIEST switch landing
+  under target (1 FF step ≈ 3 f32 iters, so never buy the last f32
+  decade an FF step delivers anyway). Initial default 1e-3.
+- Floor accounting: `R_obs ≈ max(R_arith, R_mask)`. FF sets R_arith→0
+  and thereby makes R_mask cleanly measurable. Optional M_K-tail probe
+  (one product, once per geometry/mask) predicts the mask floor
+  a-priori → `tol_eff = max(tol, ~5·tail)` or skip FF when it cannot
+  help — this is the "anticipate" half of the contract.
+
+FF-kernel optimization order — **corrected baseline**: the 44 ms/step
+benchmark ran with ACC16 OFF; best f32 iter is ~6–7 ms (ACC16), not
+14.5 ms → the honest ratio is ~6×/step, ~3×/product, not 3×/step.
+Both baselines must use the best f32 kernel.
+
+1. Split the generic kernel: `f32×f32→ff` with NO `lA_lo` tile and no
+   `a_has_lo` branch — the generic kernel statically allocates
+   2×21 KiB local = ~42 KiB → 1 WG/SM vs 2 for f32 (occupancy is the
+   suspected source of the +50% over f32 on the same plan).
+2. hi-local / lo-global A/B for the `ff×f32` kernel: A_lo reuse is
+   ~330× per row so L2 should absorb it; frees 21 KiB → 2 WG/SM on the
+   three expensive products. Measure, don't theorize.
+3. 2-way alternating ff accumulators per m (break the serial TwoSum
+   chain — the FF analogue of ACC16; watch register pressure, don't
+   go 4-way).
+4. **V = T·Q reformulation → 3 products, not 4**: V = KSKSK is
+   symmetric and T·Q = KS·KSK = V exactly; plan_tk reusable verbatim.
+   REQUIRES streaming B_lo (right operand is f32-only today; dropping
+   Q_lo injects ~1e-7 and defeats the purpose). The kernel is
+   latency- not bandwidth-bound, so the extra B stream may be nearly
+   free. NOTE: this falsifies the "2× hard floor" claim — that floor
+   assumed 4 products; 3 products → ~1.5–2× TC2-iter per step.
+5. FF-TC2 experiment (2 products → ~1.5×/step): the branch-saddle
+   limit cycle was f32-noise-driven; with ~1e-13 products plain TC2
+   may collapse to the f32-storage floor directly. Numerically risky —
+   McWeeny stays the proven fallback.
+6. Fused V+combine retry — LAST and smallest win; verify bitwise vs
+   host emulation (compiler reassociation already broke it once).
+
+Guideline: deterministic stop + never re-entering f32 matter more than
+squeezing the step cost; the endgame runs once per converged SCC.
+
 ### 4.13 Hessian inspection and negative-mode diagnosis
 
 Always preserve `H_raw`.

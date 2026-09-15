@@ -20,3 +20,23 @@ cargo run --release --bin dftb_engine -- --script scripts/<file>.rhai --sk-dir <
   `/doc/prokop/reports/2025-09-05_scc_charges_davidson_parity.md`.
 - **test_graphene_sparse.rhai** — earlier sparse purification test on graphene
   flakes.
+- **scan2d_pyridone.rhai** — pyridone-dimer 20×20 double-proton-transfer scan
+  (fixed scaffold, batch=400, neutral ground state).
+- **scan2d_pyridone_cdft.rhai** — same grid × 3 electronic states: neutral,
+  Q₁=−1 e (M1⁺M2⁻), Q₁=+1 e (M1⁻M2⁺) via `gpu_cdft*`. The CDFT worked
+  example — see `doc/prokop/userguide/cdft.md` and
+  `doc/prokop/topical_audit/cdft_constraints.md`.
+- **plot_scan2d_cdft.py** — renders multi-`MAP` blocks from a scan log into
+  a side-by-side PNG (per-map contours + CT−neutral excitation panels),
+  e.g. `debug/pyridone_2d_scan_cdft.png`.
+- **make_qxhq_chain.py** — builds the periodic quinoxaline/
+  dihydroquinoxaline (QX/HQ) chain cell from ASCII art (SPAMMM
+  `ascii_art_heterocycle`): herringbone tilt about the N–N spine, wraps
+  y into [0, Ly), exports `data/xyz/qxhq_chain_cell.xyz` + `.gen`, plots
+  `debug/qxhq_chain.png`.
+- **scan2d_qxhq_pbc.rhai** — periodic 2-D proton-transfer scan on that
+  cell via the `pbc_*` engine functions (`GpuPbc`, nk=4 along y): J1 is
+  intracell, J2's acceptor is in the next cell. 20×20 grid, batch=400.
+  See `doc/prokop/userguide/hbond_pbc_scans.md`.
+- **plot_scan2d_pbc.py** — renders the PBC scan log's `ENERGY MAP` block
+  into `debug/qxhq_pbc_Emap.png`.

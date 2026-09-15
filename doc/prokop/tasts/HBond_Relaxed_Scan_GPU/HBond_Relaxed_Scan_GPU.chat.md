@@ -4764,3 +4764,4 @@ Where the ~1e-6 Ha floor actually lives, and the cheapest fixes per source:
 **E. What's already covered / not worth it:** rotation-angle precision is *not* the limiter (PREC=1 A/B showed ΔE ≤ 2e-6 between f32/f64 rotations — R8a); Kahan-in-GEMM was already measured to not cut δ_CH; energy scalar tails and DIIS solve are already f64.
 
 Suggested order if you want it: **A → B → C**, each as a measured A/B against the CPU reference. Expected end state ≈ 1e-7–1e-8 Ha — roughly 10× below today's floor for maybe +10–15% dev time. Whether that's worth doing depends on whether 0.0006 kcal/mol noise is acceptable for your scan physics — for the H-bond scans shown, it already is.
+

@@ -1047,6 +1047,31 @@ where F: FnOnce(&mut HashMap<String, SparseHandle>) -> R {
     SPARSE.with(|g| f(&mut g.borrow_mut()))
 }
 
+// ─── GpuPbc (persistent periodic dense engine; n_rep replicas share one cell) ──
+
+struct PbcHandle {
+    eng: rust_dftb::qmqm::gpu_pbc::GpuPbc,
+    lat: [[f64; 3]; 3],
+    /// per-replica coordinates [n_rep*n_atoms] — needed for the host-side
+    /// repulsive energy (compute_energy is band+SCC only).
+    coords: Vec<[f64; 3]>,
+    repulsive: Vec<Option<rust_dftb::methods::dftb::forces::RepulsiveSpline>>,
+    species_names: Vec<String>,
+    species_code: Vec<u8>,
+    last_e: Vec<f64>,
+    last_rms: f32,
+    last_iters: i64,
+}
+
+thread_local! {
+    static PBC: RefCell<HashMap<String, PbcHandle>> = RefCell::new(HashMap::new());
+}
+
+fn with_pbc<F, R>(f: F) -> R
+where F: FnOnce(&mut HashMap<String, PbcHandle>) -> R {
+    PBC.with(|g| f(&mut g.borrow_mut()))
+}
+
 fn geom_species_coords(name: &str, ctx: &str) -> (Vec<String>, Vec<[f64; 3]>) {
     with_state(|s| {
         let st = s.geometries.get(name).unwrap_or_else(|| panic!("{ctx} '{name}': no geometry — load_xyz/make_geom first"));
@@ -1149,6 +1174,86 @@ fn rhai_sparse_scc_try(name: &str, max_iter: INT, tol: f64) -> f64 {
                 f64::NAN
             }
         }
+    })
+}
+
+/// sparse_purify_now(name, max_iter, tol) — TC2 convergence study: rebuild
+/// K0 from the CURRENT H_scc (identical cold seed per call) and run one
+/// tc2_purify. Pair with RUST_DFTB_TC2_HIST=<csv> to record per-iter
+/// (R_I, Tr, branch) for variant comparison. Returns iters (negative = failed).
+fn rhai_sparse_purify_now(name: &str, max_iter: INT, tol: f64) -> INT {
+    with_sparse(|g| {
+        let h = g.get_mut(name).unwrap_or_else(|| panic!("sparse_purify_now '{name}': no engine — sparse_new first"));
+        match h.eng.purify_cold(max_iter as usize, tol as f32) {
+            Ok((status, r_i, tr, iters)) => {
+                eprintln!("[sparse] purify_now '{name}' status={status:?} iters={iters} R_I={r_i:.3e} Tr(KS)={tr:.6}");
+                iters as INT
+            }
+            Err(e) => {
+                eprintln!("[sparse] purify_now '{name}' FAILED: {e}");
+                -1
+            }
+        }
+    })
+}
+
+/// sparse_ri_f64(name) — F64-DIAG/DUMMY-DECOMP: dense f64
+/// ‖KSK−K‖/‖K‖ of the current device K, split into physical vs
+/// dummy-lane parts. Prints all four numbers, returns r_i_f64.
+fn rhai_sparse_ri_f64(name: &str) -> f64 {
+    with_sparse(|g| {
+        let h = g.get_mut(name).unwrap_or_else(|| panic!("sparse_ri_f64 '{name}': no engine"));
+        let (r, rp, rd, tr) = h.eng.ri_f64_diag()
+            .unwrap_or_else(|e| panic!("sparse_ri_f64 '{name}': {e}"));
+        eprintln!("[sparse] ri_f64 '{name}': R_I={r:.3e}  phys={rp:.3e}  dummy={rd:.3e}  Tr(KS)={tr:.6}");
+        r
+    })
+}
+
+/// sparse_mcw_f64(name, n_steps, store_f32) — F64-MCW decisive test
+/// (manifest §4.12.2 round 2): all-f64 McWeeny on the stored device K,
+/// reporting (R_I⁶⁴, R_H⁶⁴, Tr) per step. store_f32=0 → variant B
+/// (all-f64); store_f32=1 → variant A (f32 storage). CSV to
+/// RUST_DFTB_MCW_F64_HIST when set.
+fn rhai_sparse_mcw_f64(name: &str, n_steps: INT, store_f32: bool) {
+    with_sparse(|g| {
+        let h = g.get_mut(name).unwrap_or_else(|| panic!("sparse_mcw_f64 '{name}': no engine"));
+        h.eng.mcw_f64_diag(n_steps as usize, store_f32)
+            .unwrap_or_else(|e| panic!("sparse_mcw_f64 '{name}': {e}"));
+    })
+}
+
+/// sparse_mcw_ff(name, n) — FF32-POLISH: n float-float McWeeny steps on
+/// the current device K (all-f32 FMA, ~46-bit intermediates). Pair with
+/// sparse_ri_f64 to verify the true residual drop.
+fn rhai_sparse_mcw_ff(name: &str, n: INT) {
+    with_sparse(|g| {
+        let h = g.get_mut(name).unwrap_or_else(|| panic!("sparse_mcw_ff '{name}': no engine"));
+        h.eng.mcw_ff(n as usize)
+            .unwrap_or_else(|e| panic!("sparse_mcw_ff '{name}': {e}"));
+    })
+}
+
+/// sparse_sync(name) — block until the sparse engine's in-order queue
+/// drains. For honest wall-clock timing of enqueue-only paths
+/// (sparse_mcw_ff et al.): time (work; sparse_sync) not work alone.
+fn rhai_sparse_sync(name: &str) {
+    with_sparse(|g| {
+        let h = g.get_mut(name).unwrap_or_else(|| panic!("sparse_sync '{name}': no engine"));
+        h.eng.gpu().finish()
+            .unwrap_or_else(|e| panic!("sparse_sync '{name}': {e}"));
+    })
+}
+
+/// sparse_ff_test(name) — FF32-POLISH unit check: ONE ff product
+/// T_ff = K·S vs host-f64 dense reference; prints rel.err of the hi
+/// part alone vs (hi+lo). hi≈f32-level, ff should be ~1e-13.
+fn rhai_sparse_ff_test(name: &str) {
+    with_sparse(|g| {
+        let h = g.get_mut(name).unwrap_or_else(|| panic!("sparse_ff_test '{name}': no engine"));
+        let (e1h, e1f, e2h, e2f) = h.eng.ws_ff_test_ks()
+            .unwrap_or_else(|e| panic!("sparse_ff_test '{name}': {e}"));
+        eprintln!("[ff_test] '{name}': KS err(hi)={e1h:.3e} err(ff)={e1f:.3e} | (KS)K err(hi)={e2h:.3e} err(ff)={e2f:.3e}");
     })
 }
 
@@ -1362,20 +1467,59 @@ fn rhai_sparse_vibrations(name: &str, h: f64, scc_tol: f64, path: &str) -> Strin
 
         let mut hess = vec![0.0f64; n3 * n3];
         let mut work = x0.clone();
-        eprintln!("[sparse] vibrations '{name}': {n3} columns, h={h} Å, scc_tol={scc_tol:e}");
-        for i in 0..n_atom {
+        let env_on = |name: &str| std::env::var(name)
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let frozen = env_on("RUST_DFTB_VIB_FROZEN");
+        let fixq = env_on("RUST_DFTB_VIB_FIXQ") && !frozen;
+        // Central electronic state (manifest §4.12 / Phase G1): every ±h
+        // column restores it — identical solver history, no FD asymmetry
+        // from a chained previous column.
+        eng.snapshot_electronic_state()
+            .unwrap_or_else(|e| panic!("vibrations '{name}' snapshot: {e}"));
+        // Policy (manifest §4.12.1): never measure a full Hessian —
+        // RUST_DFTB_VIB_MAXCOL bounds the column count; per-column phase
+        // timings are always printed so a handful of columns suffices to
+        // extrapolate. A bounded run exits before the eigensolve.
+        let maxcol = std::env::var("RUST_DFTB_VIB_MAXCOL")
+            .ok().and_then(|v| v.parse::<usize>().ok());
+        eprintln!("[sparse] vibrations '{name}': {n3} columns, h={h} Å, scc_tol={scc_tol:e} frozen={frozen} fixq={fixq} maxcol={maxcol:?}");
+        let t_vib0 = std::time::Instant::now();
+        'cols: for i in 0..n_atom {
             for a in 0..3 {
                 let col = 3 * i + a;
-                let (f_plus, f_minus);
-                work[i][a] = x0[i][a] + h;
-                eng.set_coords(&work).unwrap_or_else(|e| panic!("vibrations '{name}' col {col} +h set_coords: {e}"));
-                eng.scc(80, scc_tol).unwrap_or_else(|e| panic!("vibrations '{name}' col {col} +h scc: {e}"));
-                f_plus = eng.forces().unwrap_or_else(|e| panic!("vibrations '{name}' col {col} +h forces: {e}")).forces;
-                work[i][a] = x0[i][a] - h;
-                eng.set_coords(&work).unwrap_or_else(|e| panic!("vibrations '{name}' col {col} -h set_coords: {e}"));
-                eng.scc(80, scc_tol).unwrap_or_else(|e| panic!("vibrations '{name}' col {col} -h scc: {e}"));
-                f_minus = eng.forces().unwrap_or_else(|e| panic!("vibrations '{name}' col {col} -h forces: {e}")).forces;
+                if let Some(mc) = maxcol { if col >= mc { break 'cols; } }
+                let mut f_plus = None;
+                let mut f_minus = None;
+                let mut ms = [0.0f64; 6];   // [+h: rst,set,f] [-h: rst,set,f]
+                for (si, sign) in [1.0f64, -1.0].iter().enumerate() {
+                    let sign = *sign;
+                    let t0 = std::time::Instant::now();
+                    eng.restore_central_state()
+                        .unwrap_or_else(|e| panic!("vibrations '{name}' col {col} restore: {e}"));
+                    work[i][a] = x0[i][a] + sign * h;
+                    eng.set_coords(&work).unwrap_or_else(|e| panic!("vibrations '{name}' col {col} {sign:+}h set_coords: {e}"));
+                    let t1 = std::time::Instant::now();
+                    let f = if frozen {
+                        eng.forces_frozen().unwrap_or_else(|e| panic!("vibrations '{name}' col {col} {sign:+}h forces_frozen: {e}")).forces
+                    } else if fixq {
+                        eng.scc_fixedq().unwrap_or_else(|e| panic!("vibrations '{name}' col {col} {sign:+}h scc_fixedq: {e}"));
+                        eng.forces().unwrap_or_else(|e| panic!("vibrations '{name}' col {col} {sign:+}h forces: {e}")).forces
+                    } else {
+                        eng.scc(80, scc_tol).unwrap_or_else(|e| panic!("vibrations '{name}' col {col} {sign:+}h scc: {e}"));
+                        eng.forces().unwrap_or_else(|e| panic!("vibrations '{name}' col {col} {sign:+}h forces: {e}")).forces
+                    };
+                    let t2 = std::time::Instant::now();
+                    ms[3 * si] = (t1 - t0).as_secs_f64() * 1e3;
+                    ms[3 * si + 1] = 0.0;
+                    ms[3 * si + 2] = (t2 - t1).as_secs_f64() * 1e3;
+                    if sign > 0.0 { f_plus = Some(f); } else { f_minus = Some(f); }
+                }
+                eprintln!("[sparse] vib col {col}/{n3}: +h rst+geom={:.1}ms solve+f={:.1}ms | -h rst+geom={:.1}ms solve+f={:.1}ms",
+                    ms[0], ms[2], ms[3], ms[5]);
                 work[i][a] = x0[i][a];
+                let f_plus = f_plus.unwrap();
+                let f_minus = f_minus.unwrap();
                 for j in 0..n_atom {
                     for b in 0..3 {
                         hess[(3 * j + b) * n3 + col] = -(f_plus[j][b] - f_minus[j][b]) / (2.0 * h);
@@ -1383,6 +1527,11 @@ fn rhai_sparse_vibrations(name: &str, h: f64, scc_tol: f64, path: &str) -> Strin
                 }
                 if col % 6 == 0 { eprintln!("[sparse] vibrations '{name}': col {col}/{n3}"); }
             }
+        }
+        if let Some(mc) = maxcol {
+            let mc = mc.min(n3);
+            return format!("vibrations '{name}': PARTIAL {mc} columns in {:.1}s — measurement run, no eigensolve",
+                t_vib0.elapsed().as_secs_f64());
         }
         // Restore input geometry + reconverge so the engine's state is consistent.
         eng.set_coords(&x0).unwrap_or_else(|e| panic!("vibrations '{name}' restore set_coords: {e}"));
@@ -1591,6 +1740,139 @@ fn rhai_gpu_energy_i(name: &str, i: INT) -> f64 {
     })
 }
 
+// ─── GpuPbc rhai bindings: periodic batched engine (replicas share one cell) ──
+
+/// pbc_new(name, sk_dir, lat9, kpts_flat, kw, batch) -> n_orbs
+/// lat9 = 3 lattice vectors flattened row-major [Ax,Ay,Az,Bx,By,Bz,Cx,Cy,Cz] (Å);
+/// kpts_flat = [kx,ky,kz, ...] fractional; kw = weights (Σ=1).
+/// `batch` replicas of the loaded geometry share the cell — per-replica
+/// coordinates are set by pbc_set_coords.
+fn rhai_pbc_new(name: &str, sk_dir: &str, lat: Array, kpts: Array, kw: Array, batch: INT) -> INT {
+    use rust_dftb::methods::dftb::forces::parse_all_repulsive;
+    let batch = batch as usize;
+    if batch == 0 { panic!("pbc_new '{name}': batch=0"); }
+    let (species, xyz0) = geom_species_coords(name, "pbc_new");
+    let n_atoms = species.len();
+    let mut coords = Vec::with_capacity(batch * n_atoms);
+    for _ in 0..batch { coords.extend_from_slice(&xyz0); }
+    if lat.len() != 9 { panic!("pbc_new '{name}': lat needs 9 numbers, got {}", lat.len()); }
+    let mut latm = [[0.0f64; 3]; 3];
+    for i in 0..9 { latm[i / 3][i % 3] = dyn_f64(&lat[i], "pbc_new lat"); }
+    let nk = kw.len();
+    if nk == 0 || kpts.len() != 3 * nk {
+        panic!("pbc_new '{name}': nk={nk} vs kpts len {}", kpts.len());
+    }
+    let mut k_frac = Vec::with_capacity(nk);
+    for k in 0..nk {
+        k_frac.push([dyn_f64(&kpts[3 * k], "pbc_new kx"), dyn_f64(&kpts[3 * k + 1], "pbc_new ky"), dyn_f64(&kpts[3 * k + 2], "pbc_new kz")]);
+    }
+    let kwv: Vec<f32> = kw.iter().map(|d| dyn_f64(d, "pbc_new kw") as f32).collect();
+    let wsum: f32 = kwv.iter().sum();
+    if (wsum - 1.0).abs() > 1e-3 { panic!("pbc_new '{name}': k weights sum {wsum} != 1"); }
+    eprintln!("[pbc] pbc_new '{name}' n_atoms={n_atoms} batch={batch} nk={nk} lat={latm:?} sk={sk_dir}");
+    let sk = load_sk_for_species(sk_dir, &species).unwrap_or_else(|e| panic!("pbc_new '{name}' load SK from {sk_dir}: {e}"));
+    let eng = rust_dftb::qmqm::gpu_pbc::GpuPbc::new(sk, species.clone(), coords.clone(), latm, &k_frac, &kwv, None)
+        .unwrap_or_else(|e| panic!("pbc_new '{name}' GpuPbc::new: {e}"));
+    let n_orbs = eng.dims().0 as INT;
+    eprintln!("[pbc] pbc_new '{name}' N={n_orbs} device={}", eng.rt.caps().name);
+    // repulsive splines + species codes for host-side E_rep in pbc_eval
+    let mut names: Vec<String> = Vec::new();
+    for s in &species { if !names.iter().any(|n| n == s) { names.push(s.clone()); } }
+    let repulsive = parse_all_repulsive(sk_dir, &names, names.len())
+        .unwrap_or_else(|e| panic!("pbc_new '{name}' repulsive tables: {e}"));
+    let species_code: Vec<u8> = species.iter().map(|s| names.iter().position(|n| n == s).unwrap() as u8).collect();
+    with_pbc(|g| {
+        g.insert(name.to_string(), PbcHandle {
+            eng, lat: latm, coords, repulsive, species_names: names, species_code,
+            last_e: Vec::new(), last_rms: f32::NAN, last_iters: 0,
+        });
+    });
+    n_orbs
+}
+
+/// pbc_set_coords(name, xyz_flat) -> n_atoms — upload per-replica
+/// geometries (n_rep*n_atoms*3), rebuild H0(k)/S(k)/γ + Löwdin prep.
+fn rhai_pbc_set_coords(name: &str, xyz: Array) -> INT {
+    let (batch, n_atoms) = with_pbc(|g| {
+        let h = g.get(name).unwrap_or_else(|| panic!("pbc_set_coords '{name}': no engine — pbc_new first"));
+        let (_, n_atoms, n_rep, _) = h.eng.dims();
+        (n_rep, n_atoms)
+    });
+    let need = 3 * batch * n_atoms;
+    if xyz.len() != need {
+        panic!("pbc_set_coords '{name}': xyz len {} != 3*batch*n_atoms = 3*{batch}*{n_atoms} = {need}", xyz.len());
+    }
+    let mut coords: Vec<[f64; 3]> = Vec::with_capacity(batch * n_atoms);
+    for i in 0..batch * n_atoms {
+        coords.push([dyn_f64(&xyz[3 * i], "pbc_set_coords x"), dyn_f64(&xyz[3 * i + 1], "pbc_set_coords y"), dyn_f64(&xyz[3 * i + 2], "pbc_set_coords z")]);
+    }
+    with_pbc(|g| {
+        let h = g.get_mut(name).unwrap_or_else(|| panic!("pbc_set_coords '{name}': no engine"));
+        h.eng.set_geometry(&coords).unwrap_or_else(|e| panic!("pbc_set_coords '{name}': {e}"));
+        h.coords = coords;
+        h.last_e.clear();
+    });
+    n_atoms as INT
+}
+
+/// pbc_scc(name, max_iter, tol) -> rms — one batched DIIS-mixed SCC
+/// (alpha=0.3, the tested value). Resets to neutral charges each call.
+fn rhai_pbc_scc(name: &str, max_iter: INT, tol: f64) -> f64 {
+    with_pbc(|g| {
+        let h = g.get_mut(name).unwrap_or_else(|| panic!("pbc_scc '{name}': no engine — pbc_new first"));
+        let (ok, hist) = h.eng.scc(0.3, tol as f32, max_iter as usize)
+            .unwrap_or_else(|e| panic!("pbc_scc '{name}': {e}"));
+        h.last_rms = hist.last().copied().unwrap_or(f32::NAN);
+        h.last_iters = hist.len() as i64;
+        let n_bad = ok.iter().filter(|&&b| !b).count();
+        eprintln!("[pbc] pbc_scc '{name}' rms={:.3e} iters={} uncertified={}", h.last_rms, h.last_iters, n_bad);
+        h.last_rms as f64
+    })
+}
+
+/// pbc_smearing(name, kT_Ha) — Fermi smearing for occupations.
+fn rhai_pbc_smearing(name: &str, kT: f64) {
+    with_pbc(|g| {
+        let h = g.get_mut(name).unwrap_or_else(|| panic!("pbc_smearing '{name}': no engine"));
+        h.eng.plan.kT = kT as f32;
+        eprintln!("[pbc] pbc_smearing '{name}' kT={kT}");
+    })
+}
+
+/// pbc_eval(name) -> E[0] — finalize + energy per replica
+/// (band + SCC + repulsive). Stores into last_e for pbc_energy_i.
+fn rhai_pbc_eval(name: &str) -> f64 {
+    with_pbc(|g| {
+        let h = g.get_mut(name).unwrap_or_else(|| panic!("pbc_eval '{name}': no engine — pbc_new first"));
+        let n_occ = h.eng.n_occ();
+        let e_el = h.eng.plan.compute_energy(&mut h.eng.rt, n_occ)
+            .unwrap_or_else(|e| panic!("pbc_eval '{name}': {e}"));
+        let (_, n_atoms, n_rep, _) = h.eng.dims();
+        let mut e_tot = vec![0.0f64; n_rep];
+        for r in 0..n_rep {
+            let rc = &h.coords[r * n_atoms..(r + 1) * n_atoms];
+            let e_rep = rust_dftb::methods::dftb::forces::repulsive_energy_pbc(
+                rc, &h.species_code, &h.species_names, &h.repulsive, h.species_names.len(), &h.lat)
+                .unwrap_or_else(|e| panic!("pbc_eval '{name}' E_rep[{r}]: {e}"));
+            e_tot[r] = e_el[r] + e_rep;
+            if !e_tot[r].is_finite() { panic!("pbc_eval '{name}': E[{r}]={} non-finite (el={} rep={e_rep})", e_tot[r], e_el[r]); }
+        }
+        h.last_e = e_tot;
+        eprintln!("[pbc] pbc_eval '{name}' n_rep={n_rep} E[0]={:.12} Ha", h.last_e[0]);
+        h.last_e[0]
+    })
+}
+
+fn rhai_pbc_energy_i(name: &str, i: INT) -> f64 {
+    with_pbc(|g| {
+        let h = g.get(name).unwrap_or_else(|| panic!("pbc_energy_i '{name}': no engine"));
+        let i = i as usize;
+        if h.last_e.is_empty() { panic!("pbc_energy_i '{name}': call pbc_eval first"); }
+        if i >= h.last_e.len() { panic!("pbc_energy_i '{name}': i={i} >= batch {}", h.last_e.len()); }
+        h.last_e[i]
+    })
+}
+
 /// gpu_fire_step(name, f_tol) -> max|F| — one FIRE step on all replicas;
 /// the engine's SCC state is consumed internally (call after gpu_scc or
 /// standalone — it runs its own eval).
@@ -1683,6 +1965,105 @@ fn rhai_gpu_clear_constraint(name: &str) {
         let h = g.get_mut(name).unwrap_or_else(|| panic!("gpu_clear_constraint '{name}': no engine"));
         h.eng.clear_constraint().unwrap_or_else(|e| panic!("gpu_clear_constraint '{name}': {e}"));
     });
+}
+
+/// gpu_cdft(name, frag, targets) — attach fragment Mulliken-charge
+/// constraints (Dense_Multi_CDFT). `frag` = per-template-atom fragment
+/// id (−1 = unconstrained); `targets` = flat [batch*nfrag] excess-charge
+/// targets in e, or [nfrag] broadcast to all replicas. Per-replica
+/// targets turn one batch into a diabatic-state ladder (PCET scans).
+/// Returns nfrag.
+fn rhai_gpu_cdft(name: &str, frag: Array, targets: Array) -> INT {
+    let fm: Vec<i32> = frag.iter()
+        .map(|d| dyn_f64(d, &format!("gpu_cdft '{name}' frag")) as i32)
+        .collect();
+    let mut tg: Vec<f64> = targets.iter()
+        .map(|d| dyn_f64(d, &format!("gpu_cdft '{name}' targets")))
+        .collect();
+    with_gpu(|g| {
+        let h = g.get_mut(name).unwrap_or_else(|| panic!("gpu_cdft '{name}': no engine"));
+        let batch = h.eng.batch();
+        if fm.len() != h.eng.n_atoms() {
+            panic!("gpu_cdft '{name}': frag.len()={} != n_atoms={}", fm.len(), h.eng.n_atoms());
+        }
+        let nfrag = fm.iter().copied().max().unwrap_or(-1) + 1;
+        if nfrag <= 0 { panic!("gpu_cdft '{name}': no atom in any fragment"); }
+        let nfrag = nfrag as usize;
+        if tg.len() == nfrag { tg = tg.repeat(batch); }   // broadcast
+        let got = h.eng.set_cdft(&fm, &tg).unwrap_or_else(|e| panic!("gpu_cdft '{name}': {e}"));
+        eprintln!("[gpu] gpu_cdft '{name}' nfrag={got} batch={batch}");
+        got as INT
+    })
+}
+
+/// gpu_cdft_clear(name) — drop the constraint set; the next scc/eval
+/// rebuilds h_scc without the λ shift.
+fn rhai_gpu_cdft_clear(name: &str) {
+    with_gpu(|g| {
+        let h = g.get_mut(name).unwrap_or_else(|| panic!("gpu_cdft_clear '{name}': no engine"));
+        h.eng.clear_cdft();
+    });
+}
+
+/// gpu_cdft_scc(name, max_outer, scc_iter, rms_tol, q_tol) — outer-λ
+/// constrained solve: SCC at fixed λ, then secant update on
+/// Q_F − Q_F^target until |err| ≤ q_tol for all (b,f). Returns
+/// max |Q_F − target| at exit (e). Energies after this call:
+/// gpu_eval gives E_DFTB + Σλ·Q_F; use gpu_cdft_energies for E_DFTB.
+fn rhai_gpu_cdft_scc(name: &str, max_outer: INT, scc_iter: INT, rms_tol: f64, q_tol: f64) -> f64 {
+    with_gpu(|g| {
+        let h = g.get_mut(name).unwrap_or_else(|| panic!("gpu_cdft_scc '{name}': no engine"));
+        let r = h.eng.cdft_scc(max_outer as usize, scc_iter as usize, rms_tol as f32, q_tol)
+            .unwrap_or_else(|e| panic!("gpu_cdft_scc '{name}': {e}"));
+        eprintln!("[gpu] gpu_cdft_scc '{name}' outer={} q_err_max={:.3e} conv={}/{}",
+            r.outer_iters, r.q_err_max, r.converged.iter().filter(|&&x| x).count(), r.converged.len());
+        r.q_err_max
+    })
+}
+
+/// gpu_cdft_qf(name, b, f) — fragment excess charge Q_F of replica b.
+fn rhai_gpu_cdft_qf(name: &str, b: INT, f: INT) -> f64 {
+    with_gpu(|g| {
+        let h = g.get_mut(name).unwrap_or_else(|| panic!("gpu_cdft_qf '{name}': no engine"));
+        let qf = h.eng.cdft_qfrag().unwrap_or_else(|e| panic!("gpu_cdft_qf '{name}': {e}"));
+        let nfrag = qf.len() / h.eng.batch();
+        let i = b as usize * nfrag + f as usize;
+        if i >= qf.len() { panic!("gpu_cdft_qf '{name}': (b={b},f={f}) out of range nfrag={nfrag}"); }
+        qf[i]
+    })
+}
+
+/// gpu_cdft_lam(name, b, f) — current Lagrange multiplier λ_F (Ha).
+fn rhai_gpu_cdft_lam(name: &str, b: INT, f: INT) -> f64 {
+    with_gpu(|g| {
+        let h = g.get(name).unwrap_or_else(|| panic!("gpu_cdft_lam '{name}': no engine"));
+        let c = h.eng.plan.cdft.as_ref().unwrap_or_else(|| panic!("gpu_cdft_lam '{name}': no constraint set"));
+        let i = b as usize * c.nfrag + f as usize;
+        if i >= c.lam.len() { panic!("gpu_cdft_lam '{name}': (b={b},f={f}) out of range"); }
+        c.lam[i]
+    })
+}
+
+/// gpu_cdft_set_lam(name, b, f, lam) — set λ manually (Ha) for a
+/// response scan: set λ → gpu_scc → gpu_cdft_qf reads Q_F(λ).
+fn rhai_gpu_cdft_set_lam(name: &str, b: INT, f: INT, lam: f64) {
+    with_gpu(|g| {
+        let h = g.get_mut(name).unwrap_or_else(|| panic!("gpu_cdft_set_lam '{name}': no engine"));
+        h.eng.cdft_set_lam(b as usize, f as usize, lam)
+            .unwrap_or_else(|e| panic!("gpu_cdft_set_lam '{name}': {e}"));
+    });
+}
+
+/// gpu_cdft_energies(name) — eval + subtract Σλ·Q_F → E_DFTB of the
+/// constrained states; stores into last_e for gpu_energy_i. Returns
+/// replica-0 energy.
+fn rhai_gpu_cdft_energies(name: &str) -> f64 {
+    with_gpu(|g| {
+        let h = g.get_mut(name).unwrap_or_else(|| panic!("gpu_cdft_energies '{name}': no engine"));
+        let e = h.eng.cdft_energies().unwrap_or_else(|e| panic!("gpu_cdft_energies '{name}': {e}"));
+        h.last_e = e.clone();
+        e[0]
+    })
 }
 
 fn rhai_gpu_max_force(name: &str) -> f64 {
@@ -2051,6 +2432,12 @@ fn main() {
     engine.register_fn("gpu_measure", rhai_gpu_measure);
     engine.register_fn("gpu_cpu_energy", rhai_gpu_cpu_energy);
     engine.register_fn("gpu_energy_i", rhai_gpu_energy_i);
+    engine.register_fn("pbc_new", rhai_pbc_new);
+    engine.register_fn("pbc_set_coords", rhai_pbc_set_coords);
+    engine.register_fn("pbc_scc", rhai_pbc_scc);
+    engine.register_fn("pbc_smearing", rhai_pbc_smearing);
+    engine.register_fn("pbc_eval", rhai_pbc_eval);
+    engine.register_fn("pbc_energy_i", rhai_pbc_energy_i);
     engine.register_fn("gpu_max_force", rhai_gpu_max_force);
     engine.register_fn("gpu_bench", rhai_gpu_bench);
     engine.register_fn("gpu_fire_step", rhai_gpu_fire_step);
@@ -2058,6 +2445,13 @@ fn main() {
     engine.register_fn("gpu_freeze_atoms", rhai_gpu_freeze_atoms);
     engine.register_fn("gpu_set_constraint", rhai_gpu_set_constraint);
     engine.register_fn("gpu_clear_constraint", rhai_gpu_clear_constraint);
+    engine.register_fn("gpu_cdft", rhai_gpu_cdft);
+    engine.register_fn("gpu_cdft_clear", rhai_gpu_cdft_clear);
+    engine.register_fn("gpu_cdft_scc", rhai_gpu_cdft_scc);
+    engine.register_fn("gpu_cdft_qf", rhai_gpu_cdft_qf);
+    engine.register_fn("gpu_cdft_lam", rhai_gpu_cdft_lam);
+    engine.register_fn("gpu_cdft_set_lam", rhai_gpu_cdft_set_lam);
+    engine.register_fn("gpu_cdft_energies", rhai_gpu_cdft_energies);
     engine.register_fn("gpu_smearing", rhai_gpu_smearing);
     engine.register_fn("gpu_n_batch", rhai_gpu_n_batch);
     engine.register_fn("gpu_n_orbs", rhai_gpu_n_orbs);
@@ -2076,6 +2470,12 @@ fn main() {
     engine.register_fn("sparse_new", rhai_sparse_new_budget);
     engine.register_fn("sparse_scc", rhai_sparse_scc);
     engine.register_fn("sparse_scc_try", rhai_sparse_scc_try);
+    engine.register_fn("sparse_purify_now", rhai_sparse_purify_now);
+    engine.register_fn("sparse_ri_f64", rhai_sparse_ri_f64);
+    engine.register_fn("sparse_mcw_f64", rhai_sparse_mcw_f64);
+    engine.register_fn("sparse_mcw_ff", rhai_sparse_mcw_ff);
+    engine.register_fn("sparse_sync", rhai_sparse_sync);
+    engine.register_fn("sparse_ff_test", rhai_sparse_ff_test);
     engine.register_fn("sparse_eval", rhai_sparse_eval);
     engine.register_fn("sparse_max_force", rhai_sparse_max_force);
     engine.register_fn("sparse_force_at", rhai_sparse_force_at);
@@ -2106,6 +2506,7 @@ fn main() {
     engine.register_fn("get_n_atoms", rhai_get_n_atoms);
     engine.register_fn("ftos", rhai_ftos);
     engine.register_fn("clock", rhai_clock);
+    engine.register_fn("env", |name: &str| std::env::var(name).unwrap_or_default());
     engine.register_fn("itos", rhai_itos);
     engine.register_fn("save_convergence", rhai_save_convergence);
     engine.register_fn("get_charges", rhai_get_charges);

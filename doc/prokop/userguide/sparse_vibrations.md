@@ -221,17 +221,53 @@ goes, so optimize the per-evaluation cost:
 
 ### 4.1 Measured wall times (RTX 3090, `--release`, warm starts on)
 
-| System | N | mask | evals (6N) | per-eval | relax | Hessian | total |
-|--------|---|------|-----------|----------|-------|---------|-------|
-| Si10H16 | 26 | complete | 312 | ~0.15 s | ~20 s | ~1 min | ~1.5 min |
-| cube_Si65 | 65 | complete | 780 | ~0.4 s | ~1 min | ~3 min | ~4 min |
-| si_sphere_R10 | 330 | deg~175/330 | 1980 | ~1–2 s | ~1 min | ~30–60 min | ~1 h |
+| System | N | mask | evals (6N) | per-eval | relax | Hessian |
+|--------|---|------|-----------|----------|-------|---------|
+| Si10H16 | 26 | complete | 156 | ~0.5 s | ~30 s | ~1.5 min |
+| cube_Si65 | 65 | complete | 390 | ~0.46 s | ~1 min | ~3 min |
+| si_sphere_R10 | 330 | deg~175 | 1980 | ~3.5 s | ~5 min | ~1.9 h (extrap.) |
+| si_sphere_R10 | 330 | deg~330 | 1980 | ~4.3–7.3 s | ~10 s* | ~2.5–4 h (extrap.) |
+| si_sphere_R10 | 330 | deg~330, `RUST_DFTB_VIB_FROZEN` | 1980 | **12 ms** | ~10 s* | **23 s measured** |
 
-Per-eval cost is ~one warm SCC + one force contract, and grows with the
-stored-K degree (the dominant `K·S·K` SpGEMM is ~85% of device time —
-2.7 ms/launch at deg~175 vs 12.3 ms at deg~330 on R10). Extrapolate:
-R14-class (864 atoms, ~5200 evals) is an overnight serial job — exactly
-the regime where the batch-parallel ±h design pays off.
+\* R10 relax numbers are from the pre-relaxed geometry; a cold relax was
+~5 min (75 FIRE steps) at deg175.
+
+Two important things this table exposes:
+
+- **A displaced eval is 98%+ SCC.** Measured split at N=330:
+  `set_coords` (H0/S + γ + uploads, CPU) ≈ 5 ms, `scc` ≈ 3.4–7.3 s,
+  `forces` ≈ 7 ms. Each SCC = 9–17 DIIS iters × a full ~40–55-iter TC2
+  purify — the purifier always restarts from K0/P0; the previous
+  converged K is not reused (a warm-start variant exists but is
+  *refuted*: the truncated-map fixed point repels a warm seed).
+  Counterintuitively deg330 is *slower* per eval than deg175 — 12 ms vs
+  2.7 ms per K·S·K — and deg175's purifier floor-churns anyway.
+- **`RUST_DFTB_VIB_FROZEN=1`** computes the FD Hessian with a **frozen
+  density matrix** (V rebuilt from the minimum's charges, no SCC at
+  displaced geometries): ~12 ms/eval → R10 in 23 s. **Accuracy warning
+  (measured on si10h16):** framework modes within ~1–9 cm⁻¹ of full SCC,
+  but Si–H stretches ~240 cm⁻¹ (10%) too soft — the charge response
+  stiffens the highest modes. Use for previews/framework bands, not for
+  quantitative stretch frequencies.
+- **`RUST_DFTB_VIB_FIXQ=1`** (recommended production mode) freezes the
+  SCC *charges* at the minimum but still solves the density matrix for
+  each displaced `H_scc` (one purify, no DIIS loop): si10h16 matches
+  full SCC to rms 6.1 cm⁻¹. With **`RUST_DFTB_VIB_TC2TOL=5e-5`** (just
+  above the measured purification floor) each displaced eval is ~0.36 s
+  on R10 → full Hessian ≈ 12 min.
+- **`RUST_DFTB_VIB_MAXCOL=n`** bounds the FD columns and prints
+  per-column phase timings — use it to measure/extrapolate instead of
+  waiting for a full Hessian (8 columns ≈ 10 s).
+- Every ±h column now restores a snapshot of the central converged
+  state (`snapshot_electronic_state`) — identical solver history per
+  column, no FD asymmetry from chained solves.
+- `RUST_DFTB_VIB_DMUPD` (δK0 warm seed + McWeeny polish) exists but is
+  **refuted**: it converges to a projector that is idempotent yet not
+  stationary w.r.t. H (R_H~1e-3 vs cold ~1e-7–1e-4) — si10h16 spectrum
+  off ~300 cm⁻¹. Guarded by an R_H check with cold fallback.
+
+Full bottleneck analysis + recommendations:
+`doc/prokop/topical_audit/hessian_eval_bottleneck.md`.
 
 ---
 

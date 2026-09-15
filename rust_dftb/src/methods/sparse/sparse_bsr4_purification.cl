@@ -481,11 +481,71 @@ __kernel void bsr4_spgemm_plan_Bsym(
 
         // Independent FMA accumulators — break the serial dependency chain
         // across plan terms (F7 = 4-way; PR1 ACC8 = 8-way, two quads
-        // alternating over terms — halves the chain again).
+        // alternating over terms — halves the chain again; ACC16 = four
+        // quads, chain quartered — targets the deg·eps_f32 residual floor;
+        // KAHAN = compensated summation, error ~eps independent of length).
         float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
         bool bad = false;
 
-#if ACC8
+#if KAHAN
+        float c0 = 0.0f, c1 = 0.0f, c2 = 0.0f, c3 = 0.0f;
+        for(uint t=t0; t<t1; ++t){
+            const uint ia = plan_a_idx[t];
+            const uint bb = plan_b_idx[t];
+            if(ia >= na){ bad = true; break; }
+            __local const float* Ab = lA + ia*BS2;
+            __global const float* Bjk = B + bb*BS2;
+            // C_ij[r,c] += sum_m A_ik[r,m] * B_jk[c,m]  (B_kj = B_jk^T)
+            const float p0 = Ab[4*r+0]*Bjk[4*c+0];
+            const float p1 = Ab[4*r+1]*Bjk[4*c+1];
+            const float p2 = Ab[4*r+2]*Bjk[4*c+2];
+            const float p3 = Ab[4*r+3]*Bjk[4*c+3];
+            { const float y=p0-c0, u=s0+y; c0=(u-s0)-y; s0=u; }
+            { const float y=p1-c1, u=s1+y; c1=(u-s1)-y; s1=u; }
+            { const float y=p2-c2, u=s2+y; c2=(u-s2)-y; s2=u; }
+            { const float y=p3-c3, u=s3+y; c3=(u-s3)-y; s3=u; }
+        }
+#elif ACC16
+        float q0 = 0.0f, q1 = 0.0f, q2 = 0.0f, q3 = 0.0f;
+        float u0 = 0.0f, u1 = 0.0f, u2 = 0.0f, u3 = 0.0f;
+        float v0 = 0.0f, v1 = 0.0f, v2 = 0.0f, v3 = 0.0f;
+        uint t = t0;
+        for(; t+3<t1; t+=4){
+            const uint ia0 = plan_a_idx[t];   const uint bb0 = plan_b_idx[t];
+            const uint ia1 = plan_a_idx[t+1]; const uint bb1 = plan_b_idx[t+1];
+            const uint ia2 = plan_a_idx[t+2]; const uint bb2 = plan_b_idx[t+2];
+            const uint ia3 = plan_a_idx[t+3]; const uint bb3 = plan_b_idx[t+3];
+            if(ia0 >= na || ia1 >= na || ia2 >= na || ia3 >= na){ bad = true; break; }
+            __local const float* A0 = lA + ia0*BS2;
+            __global const float* B0 = B + bb0*BS2;
+            __local const float* A1 = lA + ia1*BS2;
+            __global const float* B1 = B + bb1*BS2;
+            __local const float* A2 = lA + ia2*BS2;
+            __global const float* B2 = B + bb2*BS2;
+            __local const float* A3 = lA + ia3*BS2;
+            __global const float* B3 = B + bb3*BS2;
+            s0 = fma(A0[4*r+0], B0[4*c+0], s0);   q0 = fma(A1[4*r+0], B1[4*c+0], q0);
+            s1 = fma(A0[4*r+1], B0[4*c+1], s1);   q1 = fma(A1[4*r+1], B1[4*c+1], q1);
+            s2 = fma(A0[4*r+2], B0[4*c+2], s2);   q2 = fma(A1[4*r+2], B1[4*c+2], q2);
+            s3 = fma(A0[4*r+3], B0[4*c+3], s3);   q3 = fma(A1[4*r+3], B1[4*c+3], q3);
+            u0 = fma(A2[4*r+0], B2[4*c+0], u0);   v0 = fma(A3[4*r+0], B3[4*c+0], v0);
+            u1 = fma(A2[4*r+1], B2[4*c+1], u1);   v1 = fma(A3[4*r+1], B3[4*c+1], v1);
+            u2 = fma(A2[4*r+2], B2[4*c+2], u2);   v2 = fma(A3[4*r+2], B3[4*c+2], v2);
+            u3 = fma(A2[4*r+3], B2[4*c+3], u3);   v3 = fma(A3[4*r+3], B3[4*c+3], v3);
+        }
+        for(; t<t1; ++t){   // leftover terms (<4) into the s-quad
+            const uint ia = plan_a_idx[t];
+            const uint bb = plan_b_idx[t];
+            if(ia >= na){ bad = true; break; }
+            __local const float* Ab = lA + ia*BS2;
+            __global const float* Bjk = B + bb*BS2;
+            s0 = fma(Ab[4*r+0], Bjk[4*c+0], s0);
+            s1 = fma(Ab[4*r+1], Bjk[4*c+1], s1);
+            s2 = fma(Ab[4*r+2], Bjk[4*c+2], s2);
+            s3 = fma(Ab[4*r+3], Bjk[4*c+3], s3);
+        }
+        s0 += q0 + u0 + v0; s1 += q1 + u1 + v1; s2 += q2 + u2 + v2; s3 += q3 + u3 + v3;
+#elif ACC8
         float q0 = 0.0f, q1 = 0.0f, q2 = 0.0f, q3 = 0.0f;
         uint t = t0;
         for(; t+1<t1; t+=2){
@@ -602,7 +662,66 @@ __kernel void bsr4_spgemm_plan(
         float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
         bool bad = false;
 
-#if ACC8
+#if KAHAN
+        float c0 = 0.0f, c1 = 0.0f, c2 = 0.0f, c3 = 0.0f;
+        for(uint t=t0; t<t1; ++t){
+            const uint ia = plan_a_idx[t];
+            const uint bb = plan_b_idx[t];
+            if(ia >= na){ bad = true; break; }
+            __local const float* Ab  = lA + ia*BS2;
+            __global const float* Bkj = B + bb*BS2;
+            // C_ij[r,c] += sum_m A_ik[r,m] * B_kj[m,c]  (direct, no transpose)
+            const float p0 = Ab[4*r+0]*Bkj[4*0+c];
+            const float p1 = Ab[4*r+1]*Bkj[4*1+c];
+            const float p2 = Ab[4*r+2]*Bkj[4*2+c];
+            const float p3 = Ab[4*r+3]*Bkj[4*3+c];
+            { const float y=p0-c0, u=s0+y; c0=(u-s0)-y; s0=u; }
+            { const float y=p1-c1, u=s1+y; c1=(u-s1)-y; s1=u; }
+            { const float y=p2-c2, u=s2+y; c2=(u-s2)-y; s2=u; }
+            { const float y=p3-c3, u=s3+y; c3=(u-s3)-y; s3=u; }
+        }
+#elif ACC16
+        float q0 = 0.0f, q1 = 0.0f, q2 = 0.0f, q3 = 0.0f;
+        float u0 = 0.0f, u1 = 0.0f, u2 = 0.0f, u3 = 0.0f;
+        float v0 = 0.0f, v1 = 0.0f, v2 = 0.0f, v3 = 0.0f;
+        uint t = t0;
+        for(; t+3<t1; t+=4){
+            const uint ia0 = plan_a_idx[t];   const uint bb0 = plan_b_idx[t];
+            const uint ia1 = plan_a_idx[t+1]; const uint bb1 = plan_b_idx[t+1];
+            const uint ia2 = plan_a_idx[t+2]; const uint bb2 = plan_b_idx[t+2];
+            const uint ia3 = plan_a_idx[t+3]; const uint bb3 = plan_b_idx[t+3];
+            if(ia0 >= na || ia1 >= na || ia2 >= na || ia3 >= na){ bad = true; break; }
+            __local const float* A0 = lA + ia0*BS2;
+            __global const float* B0 = B + bb0*BS2;
+            __local const float* A1 = lA + ia1*BS2;
+            __global const float* B1 = B + bb1*BS2;
+            __local const float* A2 = lA + ia2*BS2;
+            __global const float* B2 = B + bb2*BS2;
+            __local const float* A3 = lA + ia3*BS2;
+            __global const float* B3 = B + bb3*BS2;
+            // C_ij[r,c] += sum_m A_ik[r,m] * B_kj[m,c]  (direct, no transpose)
+            s0 = fma(A0[4*r+0], B0[4*0+c], s0);   q0 = fma(A1[4*r+0], B1[4*0+c], q0);
+            s1 = fma(A0[4*r+1], B0[4*1+c], s1);   q1 = fma(A1[4*r+1], B1[4*1+c], q1);
+            s2 = fma(A0[4*r+2], B0[4*2+c], s2);   q2 = fma(A1[4*r+2], B1[4*2+c], q2);
+            s3 = fma(A0[4*r+3], B0[4*3+c], s3);   q3 = fma(A1[4*r+3], B1[4*3+c], q3);
+            u0 = fma(A2[4*r+0], B2[4*0+c], u0);   v0 = fma(A3[4*r+0], B3[4*0+c], v0);
+            u1 = fma(A2[4*r+1], B2[4*1+c], u1);   v1 = fma(A3[4*r+1], B3[4*1+c], v1);
+            u2 = fma(A2[4*r+2], B2[4*2+c], u2);   v2 = fma(A3[4*r+2], B3[4*2+c], v2);
+            u3 = fma(A2[4*r+3], B2[4*3+c], u3);   v3 = fma(A3[4*r+3], B3[4*3+c], v3);
+        }
+        for(; t<t1; ++t){   // leftover terms (<4) into the s-quad
+            const uint ia = plan_a_idx[t];
+            const uint bb = plan_b_idx[t];
+            if(ia >= na){ bad = true; break; }
+            __local const float* Ab  = lA + ia*BS2;
+            __global const float* Bkj = B + bb*BS2;
+            s0 = fma(Ab[4*r+0], Bkj[4*0+c], s0);
+            s1 = fma(Ab[4*r+1], Bkj[4*1+c], s1);
+            s2 = fma(Ab[4*r+2], Bkj[4*2+c], s2);
+            s3 = fma(Ab[4*r+3], Bkj[4*3+c], s3);
+        }
+        s0 += q0 + u0 + v0; s1 += q1 + u1 + v1; s2 += q2 + u2 + v2; s3 += q3 + u3 + v3;
+#elif ACC8
         float q0 = 0.0f, q1 = 0.0f, q2 = 0.0f, q3 = 0.0f;
         uint t = t0;
         for(; t+1<t1; t+=2){
@@ -657,6 +776,483 @@ __kernel void bsr4_spgemm_plan(
 
         C[cb*BS2 + lane] = bad ? NAN : (s0 + s1) + (s2 + s3);
     }
+}
+
+
+// ============================================================================
+// FLOAT-FLOAT (double-single) PLANNED SPGEMM — polish-only path
+// (manifest §4.12.2 round 2, GPT-5.6 chat L9520+)
+//
+// The F64-MCW decisive test proved: f32 STORAGE supports R_I~1e-8; the
+// ~1e-5 floor is accumulated f32 product-arithmetic noise. Kahan cannot
+// fix this — it re-quantizes intermediates to f32. Float-float carries
+// (hi,lo) through ALL McWeeny intermediates using ONLY f32/FMA — no
+// native f64 (RTX 3090 fp64 is ~1/64 rate — "50 years on Earth").
+//
+// REQUIREMENTS: no -cl-fast-relaxed-math / reassociation on this
+// program — TwoSum/TwoProd error recovery is destroyed by contraction.
+//
+// Accumulator scheme (per lane, per plan term): TwoProd(a,b) +
+// error-free TwoSum into (hi,lo_err) — the lo term accumulates
+// residuals in plain f32; its own rounding is second-order (~n·eps²).
+// Final cross-accumulator combine uses full ff_add. Effective
+// precision ~44-48 bits — vastly above the 1e-8 target.
+// ============================================================================
+
+// Error-free a+b = s+e (branch-free TwoSum, valid for all inputs).
+static inline float2 ff_two_sum(float a, float b){
+    float s  = a + b;
+    float bp = s - a;
+    float e  = (a - (s - bp)) + (b - bp);
+    return (float2)(s, e);
+}
+
+// Full float-float add a+b (used only for final accumulator combine).
+static inline float2 ff_add(float2 a, float2 b){
+    float2 s = ff_two_sum(a.x, b.x);
+    float2 t = ff_two_sum(a.y, b.y);
+    float2 u = ff_two_sum(s.x, s.y + t.x);
+    float2 v = ff_two_sum(u.x, u.y + t.y);
+    return v;
+}
+
+// float-float × exact small scalar (3.0, -2.0): TwoProd on hi part.
+static inline float2 ff_scale(float2 a, float c){
+    float p  = a.x * c;
+    float pe = fma(a.x, c, -p);
+    return ff_two_sum(p, pe + a.y * c);
+}
+
+// Accumulate term (a_hi+a_lo)*b into ff accumulator (hi,lo):
+//   p  = a_hi*b;  pe = err(a_hi*b) + a_lo*b
+//   TwoSum(hi, p) → hi' + e;  lo += e + pe
+// ~11 f32 ops/term vs 4 FMA baseline; lo rounding is second-order.
+// FFA: a_lo term; FFB: a_lo and b_lo terms (ff×ff).
+#define FF_ACCUM0(hi, lo, ahi, bv)                        \
+    {                                                    \
+        float p_  = (ahi) * (bv);                        \
+        float pe_ = fma((ahi), (bv), -p_);               \
+        float s_  = hi + p_;                             \
+        float bp_ = s_ - hi;                             \
+        float e_  = (hi - (s_ - bp_)) + (p_ - bp_);      \
+        hi = s_;                                         \
+        lo += e_ + pe_;                                  \
+    }
+#define FF_ACCUM(hi, lo, ahi, alo, bv)                    \
+    {                                                    \
+        float p_  = (ahi) * (bv);                        \
+        float pe_ = fma((ahi), (bv), -p_);               \
+        pe_ = fma((alo), (bv), pe_);                     \
+        float s_  = hi + p_;                             \
+        float bp_ = s_ - hi;                             \
+        float e_  = (hi - (s_ - bp_)) + (p_ - bp_);      \
+        hi = s_;                                         \
+        lo += e_ + pe_;                                  \
+    }
+#define FF_ACCUMB(hi, lo, ahi, alo, bv, bvlo)             \
+    {                                                    \
+        float p_  = (ahi) * (bv);                        \
+        float pe_ = fma((ahi), (bv), -p_);               \
+        pe_ = fma((alo), (bv), pe_);                     \
+        pe_ = fma((ahi), (bvlo), pe_);                   \
+        float s_  = hi + p_;                             \
+        float bp_ = s_ - hi;                             \
+        float e_  = (hi - (s_ - bp_)) + (p_ - bp_);      \
+        hi = s_;                                         \
+        lo += e_ + pe_;                                  \
+    }
+
+#ifndef FFLO_GLOBAL
+#define FFLO_GLOBAL 0   // 1: read A_lo from global (L2) instead of a local tile
+#endif
+#ifndef FFACC2
+#define FFACC2 0        // 1: two alternating ff accumulator sets per lane (ILP)
+#endif
+
+// A_lo element source: local tile or L2-cached global stream (a0+ia is the
+// global block index of A row i's ia-th block).
+#if FFLO_GLOBAL
+#define ALO_EL(A_lo, a0, ia, off)  (A_lo)[((a0)+(ia))*BS2 + (off)]
+#define DECL_LALO
+#define FILL_LALO(A_lo, a0, na)
+#else
+#define ALO_EL(A_lo, a0, ia, off)  lA_lo[(ia)*BS2 + (off)]
+#define DECL_LALO  __local float lA_lo[MAX_LEFT_BLOCKS*BS2];
+#define FILL_LALO(A_lo, a0, na)    for(uint t=lid; t<(na)*BS2; t+=WG){ lA_lo[t] = (A_lo)[(a0)*BS2+t]; }
+#endif
+
+// C_ff = P_M(A·B), B symmetric. A may be plain f32 (a_has_lo=0, A_lo
+// ignored — pass any valid buffer) or float-float (a_has_lo=1).
+// C_hi/C_lo are separate f32 buffers on the C structure.
+// Kept for ff_test A/B (a_has_lo) diagnostics; the production chain uses
+// the specialized ff0/ff kernels below.
+__attribute__((reqd_work_group_size(WG,1,1)))
+__kernel void bsr4_spgemm_plan_Bsym_ff(
+    const uint nrow,
+
+    __global const uint*  A_row,
+    __global const float* A_hi,
+    __global const float* A_lo,
+    const uint a_has_lo,
+
+    __global const float* B,
+    __global const uint*  plan_ptr,
+    __global const uint*  plan_a_idx,
+    __global const uint*  plan_b_idx,
+
+    __global const uint*  C_row,
+    __global float*       C_hi,
+    __global float*       C_lo
+){
+    const uint i   = get_group_id(0);
+    const uint lid = get_local_id(0);
+
+    if(i >= nrow) return;
+
+    const uint a0 = A_row[i];
+    const uint a1 = A_row[i+1];
+    const uint na = a1-a0;
+
+    if(na > MAX_LEFT_BLOCKS) return;
+
+    __local float lA_hi[MAX_LEFT_BLOCKS*BS2];
+    DECL_LALO
+
+    for(uint t=lid; t<na*BS2; t+=WG){
+        lA_hi[t] = A_hi[a0*BS2+t];
+    }
+    if(a_has_lo){ FILL_LALO(A_lo, a0, na) }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    const uint team = lid >> 4;
+    const uint lane = lid & 15;
+    const uint r = lane >> 2;
+    const uint c = lane & 3;
+
+    const uint c0 = C_row[i];
+    const uint c1 = C_row[i+1];
+
+    for(uint cb=c0+team; cb<c1; cb+=NTEAM){
+
+        const uint t0 = plan_ptr[cb];
+        const uint t1 = plan_ptr[cb+1];
+
+        // 4 ff accumulators (hi,lo) — one per m index of the 4x4 dot.
+        float h0=0.0f, h1=0.0f, h2=0.0f, h3=0.0f;
+        float l0=0.0f, l1=0.0f, l2=0.0f, l3=0.0f;
+#if FFACC2
+        float h0b=0.0f, h1b=0.0f, h2b=0.0f, h3b=0.0f;
+        float l0b=0.0f, l1b=0.0f, l2b=0.0f, l3b=0.0f;
+#endif
+        bool bad = false;
+
+#if FFACC2
+        uint t = t0;
+        for(; t+1<t1; t+=2){
+            const uint iaA = plan_a_idx[t];   const uint bbA = plan_b_idx[t];
+            const uint iaB = plan_a_idx[t+1]; const uint bbB = plan_b_idx[t+1];
+            if(iaA >= na || iaB >= na){ bad = true; break; }
+            __local const float* Ah = lA_hi + iaA*BS2;
+            __global const float* Bjk = B + bbA*BS2;
+            __local const float* Bh = lA_hi + iaB*BS2;
+            __global const float* Bjb = B + bbB*BS2;
+            if(a_has_lo){
+                FF_ACCUM(h0, l0, Ah[4*r+0], ALO_EL(A_lo,a0,iaA,4*r+0), Bjk[4*c+0]);
+                FF_ACCUM(h1, l1, Ah[4*r+1], ALO_EL(A_lo,a0,iaA,4*r+1), Bjk[4*c+1]);
+                FF_ACCUM(h2, l2, Ah[4*r+2], ALO_EL(A_lo,a0,iaA,4*r+2), Bjk[4*c+2]);
+                FF_ACCUM(h3, l3, Ah[4*r+3], ALO_EL(A_lo,a0,iaA,4*r+3), Bjk[4*c+3]);
+                FF_ACCUM(h0b, l0b, Bh[4*r+0], ALO_EL(A_lo,a0,iaB,4*r+0), Bjb[4*c+0]);
+                FF_ACCUM(h1b, l1b, Bh[4*r+1], ALO_EL(A_lo,a0,iaB,4*r+1), Bjb[4*c+1]);
+                FF_ACCUM(h2b, l2b, Bh[4*r+2], ALO_EL(A_lo,a0,iaB,4*r+2), Bjb[4*c+2]);
+                FF_ACCUM(h3b, l3b, Bh[4*r+3], ALO_EL(A_lo,a0,iaB,4*r+3), Bjb[4*c+3]);
+            } else {
+                FF_ACCUM0(h0, l0, Ah[4*r+0], Bjk[4*c+0]);
+                FF_ACCUM0(h1, l1, Ah[4*r+1], Bjk[4*c+1]);
+                FF_ACCUM0(h2, l2, Ah[4*r+2], Bjk[4*c+2]);
+                FF_ACCUM0(h3, l3, Ah[4*r+3], Bjk[4*c+3]);
+                FF_ACCUM0(h0b, l0b, Bh[4*r+0], Bjb[4*c+0]);
+                FF_ACCUM0(h1b, l1b, Bh[4*r+1], Bjb[4*c+1]);
+                FF_ACCUM0(h2b, l2b, Bh[4*r+2], Bjb[4*c+2]);
+                FF_ACCUM0(h3b, l3b, Bh[4*r+3], Bjb[4*c+3]);
+            }
+        }
+        if(t<t1){
+            const uint ia = plan_a_idx[t];
+            const uint bb = plan_b_idx[t];
+            if(ia >= na){ bad = true; }
+            else{
+                __local const float* Ah = lA_hi + ia*BS2;
+                __global const float* Bjk = B + bb*BS2;
+                if(a_has_lo){
+                    FF_ACCUM(h0, l0, Ah[4*r+0], ALO_EL(A_lo,a0,ia,4*r+0), Bjk[4*c+0]);
+                    FF_ACCUM(h1, l1, Ah[4*r+1], ALO_EL(A_lo,a0,ia,4*r+1), Bjk[4*c+1]);
+                    FF_ACCUM(h2, l2, Ah[4*r+2], ALO_EL(A_lo,a0,ia,4*r+2), Bjk[4*c+2]);
+                    FF_ACCUM(h3, l3, Ah[4*r+3], ALO_EL(A_lo,a0,ia,4*r+3), Bjk[4*c+3]);
+                } else {
+                    FF_ACCUM0(h0, l0, Ah[4*r+0], Bjk[4*c+0]);
+                    FF_ACCUM0(h1, l1, Ah[4*r+1], Bjk[4*c+1]);
+                    FF_ACCUM0(h2, l2, Ah[4*r+2], Bjk[4*c+2]);
+                    FF_ACCUM0(h3, l3, Ah[4*r+3], Bjk[4*c+3]);
+                }
+            }
+        }
+        {   // fold the b-set into the a-set
+            float2 f;
+            f = ff_add((float2)(h0,l0), (float2)(h0b,l0b)); h0=f.x; l0=f.y;
+            f = ff_add((float2)(h1,l1), (float2)(h1b,l1b)); h1=f.x; l1=f.y;
+            f = ff_add((float2)(h2,l2), (float2)(h2b,l2b)); h2=f.x; l2=f.y;
+            f = ff_add((float2)(h3,l3), (float2)(h3b,l3b)); h3=f.x; l3=f.y;
+        }
+#else
+        for(uint t=t0; t<t1; ++t){
+            const uint ia = plan_a_idx[t];
+            const uint bb = plan_b_idx[t];
+            if(ia >= na){ bad = true; break; }
+            __local const float* Ah = lA_hi + ia*BS2;
+            __global const float* Bjk = B + bb*BS2;
+            // C_ij[r,c] += sum_m A_ik[r,m] * B_jk[c,m]  (B_kj = B_jk^T)
+            if(a_has_lo){
+                FF_ACCUM(h0, l0, Ah[4*r+0], ALO_EL(A_lo,a0,ia,4*r+0), Bjk[4*c+0]);
+                FF_ACCUM(h1, l1, Ah[4*r+1], ALO_EL(A_lo,a0,ia,4*r+1), Bjk[4*c+1]);
+                FF_ACCUM(h2, l2, Ah[4*r+2], ALO_EL(A_lo,a0,ia,4*r+2), Bjk[4*c+2]);
+                FF_ACCUM(h3, l3, Ah[4*r+3], ALO_EL(A_lo,a0,ia,4*r+3), Bjk[4*c+3]);
+            } else {
+                FF_ACCUM0(h0, l0, Ah[4*r+0], Bjk[4*c+0]);
+                FF_ACCUM0(h1, l1, Ah[4*r+1], Bjk[4*c+1]);
+                FF_ACCUM0(h2, l2, Ah[4*r+2], Bjk[4*c+2]);
+                FF_ACCUM0(h3, l3, Ah[4*r+3], Bjk[4*c+3]);
+            }
+        }
+#endif
+
+        float2 x01 = ff_add((float2)(h0,l0), (float2)(h1,l1));
+        float2 x23 = ff_add((float2)(h2,l2), (float2)(h3,l3));
+        float2 x   = ff_add(x01, x23);
+        C_hi[cb*BS2 + lane] = bad ? NAN : x.x;
+        C_lo[cb*BS2 + lane] = bad ? NAN : x.y;
+    }
+}
+
+
+// C_ff = P_M(A·B) with plain-f32 A (product 1 of the McWeeny chain,
+// T = K·S — no lo input exists). No lA_lo tile → half the local memory
+// of the generic ff kernel → 2 workgroups/SM occupancy.
+__attribute__((reqd_work_group_size(WG,1,1)))
+__kernel void bsr4_spgemm_plan_Bsym_ff0(
+    const uint nrow,
+
+    __global const uint*  A_row,
+    __global const float* A,
+
+    __global const float* B,
+    __global const uint*  plan_ptr,
+    __global const uint*  plan_a_idx,
+    __global const uint*  plan_b_idx,
+
+    __global const uint*  C_row,
+    __global float*       C_hi,
+    __global float*       C_lo
+){
+    const uint i   = get_group_id(0);
+    const uint lid = get_local_id(0);
+
+    if(i >= nrow) return;
+
+    const uint a0 = A_row[i];
+    const uint a1 = A_row[i+1];
+    const uint na = a1-a0;
+
+    if(na > MAX_LEFT_BLOCKS) return;
+
+    __local float lA[MAX_LEFT_BLOCKS*BS2];
+
+    for(uint t=lid; t<na*BS2; t+=WG){
+        lA[t] = A[a0*BS2+t];
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    const uint team = lid >> 4;
+    const uint lane = lid & 15;
+    const uint r = lane >> 2;
+    const uint c = lane & 3;
+
+    const uint c0 = C_row[i];
+    const uint c1 = C_row[i+1];
+
+    for(uint cb=c0+team; cb<c1; cb+=NTEAM){
+
+        const uint t0 = plan_ptr[cb];
+        const uint t1 = plan_ptr[cb+1];
+
+        float h0=0.0f, h1=0.0f, h2=0.0f, h3=0.0f;
+        float l0=0.0f, l1=0.0f, l2=0.0f, l3=0.0f;
+#if FFACC2
+        float h0b=0.0f, h1b=0.0f, h2b=0.0f, h3b=0.0f;
+        float l0b=0.0f, l1b=0.0f, l2b=0.0f, l3b=0.0f;
+#endif
+        bool bad = false;
+
+#if FFACC2
+        uint t = t0;
+        for(; t+1<t1; t+=2){
+            const uint iaA = plan_a_idx[t];   const uint bbA = plan_b_idx[t];
+            const uint iaB = plan_a_idx[t+1]; const uint bbB = plan_b_idx[t+1];
+            if(iaA >= na || iaB >= na){ bad = true; break; }
+            __local const float* Ah = lA + iaA*BS2;
+            __global const float* Bjk = B + bbA*BS2;
+            __local const float* Bh = lA + iaB*BS2;
+            __global const float* Bjb = B + bbB*BS2;
+            FF_ACCUM0(h0, l0, Ah[4*r+0], Bjk[4*c+0]);
+            FF_ACCUM0(h1, l1, Ah[4*r+1], Bjk[4*c+1]);
+            FF_ACCUM0(h2, l2, Ah[4*r+2], Bjk[4*c+2]);
+            FF_ACCUM0(h3, l3, Ah[4*r+3], Bjk[4*c+3]);
+            FF_ACCUM0(h0b, l0b, Bh[4*r+0], Bjb[4*c+0]);
+            FF_ACCUM0(h1b, l1b, Bh[4*r+1], Bjb[4*c+1]);
+            FF_ACCUM0(h2b, l2b, Bh[4*r+2], Bjb[4*c+2]);
+            FF_ACCUM0(h3b, l3b, Bh[4*r+3], Bjb[4*c+3]);
+        }
+        if(t<t1){
+            const uint ia = plan_a_idx[t];
+            const uint bb = plan_b_idx[t];
+            if(ia >= na){ bad = true; }
+            else{
+                __local const float* Ah = lA + ia*BS2;
+                __global const float* Bjk = B + bb*BS2;
+                FF_ACCUM0(h0, l0, Ah[4*r+0], Bjk[4*c+0]);
+                FF_ACCUM0(h1, l1, Ah[4*r+1], Bjk[4*c+1]);
+                FF_ACCUM0(h2, l2, Ah[4*r+2], Bjk[4*c+2]);
+                FF_ACCUM0(h3, l3, Ah[4*r+3], Bjk[4*c+3]);
+            }
+        }
+        {
+            float2 f;
+            f = ff_add((float2)(h0,l0), (float2)(h0b,l0b)); h0=f.x; l0=f.y;
+            f = ff_add((float2)(h1,l1), (float2)(h1b,l1b)); h1=f.x; l1=f.y;
+            f = ff_add((float2)(h2,l2), (float2)(h2b,l2b)); h2=f.x; l2=f.y;
+            f = ff_add((float2)(h3,l3), (float2)(h3b,l3b)); h3=f.x; l3=f.y;
+        }
+#else
+        for(uint t=t0; t<t1; ++t){
+            const uint ia = plan_a_idx[t];
+            const uint bb = plan_b_idx[t];
+            if(ia >= na){ bad = true; break; }
+            __local const float* Ah = lA + ia*BS2;
+            __global const float* Bjk = B + bb*BS2;
+            FF_ACCUM0(h0, l0, Ah[4*r+0], Bjk[4*c+0]);
+            FF_ACCUM0(h1, l1, Ah[4*r+1], Bjk[4*c+1]);
+            FF_ACCUM0(h2, l2, Ah[4*r+2], Bjk[4*c+2]);
+            FF_ACCUM0(h3, l3, Ah[4*r+3], Bjk[4*c+3]);
+        }
+#endif
+
+        float2 x01 = ff_add((float2)(h0,l0), (float2)(h1,l1));
+        float2 x23 = ff_add((float2)(h2,l2), (float2)(h3,l3));
+        float2 x   = ff_add(x01, x23);
+        C_hi[cb*BS2 + lane] = bad ? NAN : x.x;
+        C_lo[cb*BS2 + lane] = bad ? NAN : x.y;
+    }
+}
+
+
+// C_ff = P_M(A_ff·B_ff) — BOTH operands carry lo parts (V = T·Q path:
+// V=KSKSK is symmetric and T·Q = KS·KSK = V, so product 4 can be one
+// product instead of U=Q·S then V=U·K — provided B's lo is not dropped).
+// B_lo is streamed from global (same access as B_hi). plan must be built
+// for (supp A)×(supp B)→supp C — plan_tk serves verbatim.
+__attribute__((reqd_work_group_size(WG,1,1)))
+__kernel void bsr4_spgemm_plan_Bsym_ffb(
+    const uint nrow,
+
+    __global const uint*  A_row,
+    __global const float* A_hi,
+    __global const float* A_lo,
+
+    __global const float* B_hi,
+    __global const float* B_lo,
+    __global const uint*  plan_ptr,
+    __global const uint*  plan_a_idx,
+    __global const uint*  plan_b_idx,
+
+    __global const uint*  C_row,
+    __global float*       C_hi,
+    __global float*       C_lo
+){
+    const uint i   = get_group_id(0);
+    const uint lid = get_local_id(0);
+
+    if(i >= nrow) return;
+
+    const uint a0 = A_row[i];
+    const uint a1 = A_row[i+1];
+    const uint na = a1-a0;
+
+    if(na > MAX_LEFT_BLOCKS) return;
+
+    __local float lA_hi[MAX_LEFT_BLOCKS*BS2];
+    DECL_LALO
+
+    for(uint t=lid; t<na*BS2; t+=WG){
+        lA_hi[t] = A_hi[a0*BS2+t];
+    }
+    FILL_LALO(A_lo, a0, na)
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    const uint team = lid >> 4;
+    const uint lane = lid & 15;
+    const uint r = lane >> 2;
+    const uint c = lane & 3;
+
+    const uint c0 = C_row[i];
+    const uint c1 = C_row[i+1];
+
+    for(uint cb=c0+team; cb<c1; cb+=NTEAM){
+
+        const uint t0 = plan_ptr[cb];
+        const uint t1 = plan_ptr[cb+1];
+
+        float h0=0.0f, h1=0.0f, h2=0.0f, h3=0.0f;
+        float l0=0.0f, l1=0.0f, l2=0.0f, l3=0.0f;
+        bool bad = false;
+
+        for(uint t=t0; t<t1; ++t){
+            const uint ia = plan_a_idx[t];
+            const uint bb = plan_b_idx[t];
+            if(ia >= na){ bad = true; break; }
+            __local const float* Ah  = lA_hi + ia*BS2;
+            __global const float* Bh = B_hi + bb*BS2;
+            __global const float* Bl = B_lo + bb*BS2;
+            FF_ACCUMB(h0, l0, Ah[4*r+0], ALO_EL(A_lo,a0,ia,4*r+0), Bh[4*c+0], Bl[4*c+0]);
+            FF_ACCUMB(h1, l1, Ah[4*r+1], ALO_EL(A_lo,a0,ia,4*r+1), Bh[4*c+1], Bl[4*c+1]);
+            FF_ACCUMB(h2, l2, Ah[4*r+2], ALO_EL(A_lo,a0,ia,4*r+2), Bh[4*c+2], Bl[4*c+2]);
+            FF_ACCUMB(h3, l3, Ah[4*r+3], ALO_EL(A_lo,a0,ia,4*r+3), Bh[4*c+3], Bl[4*c+3]);
+        }
+
+        float2 x01 = ff_add((float2)(h0,l0), (float2)(h1,l1));
+        float2 x23 = ff_add((float2)(h2,l2), (float2)(h3,l3));
+        float2 x   = ff_add(x01, x23);
+        C_hi[cb*BS2 + lane] = bad ? NAN : x.x;
+        C_lo[cb*BS2 + lane] = bad ? NAN : x.y;
+    }
+}
+
+
+// Elementwise McWeeny combine:
+//   Knew = 3·(Q_hi+Q_lo) − 2·(V_hi+V_lo)
+// The lo parts are ~1e-8 corrections — a single explicit-fma chain is
+// accurate to ~1 ulp of the RESULT and contains no contractible pattern
+// (the earlier ff-helpers version lost ~1.7e-7 to compiler reassociation
+// of the TwoSum chain on this platform).
+__kernel void bsr4_mcw_ff_combine(
+    const uint nblock,
+    __global const float* Q_hi,
+    __global const float* Q_lo,
+    __global const float* V_hi,
+    __global const float* V_lo,
+    __global float*       Knew
+){
+    const uint i = get_global_id(0);
+    if(i >= nblock*BS2) return;
+    Knew[i] = fma(3.0f, Q_hi[i], fma(-2.0f, V_hi[i], fma(3.0f, Q_lo[i], -2.0f*V_lo[i])));
 }
 
 

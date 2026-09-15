@@ -6225,3 +6225,4380 @@ The section expands each of the four answers with exact numbers, code references
 - **Q4** — three levels: `check_every=4` now; one-drain-per-iter (numerics change, needs A/B); zero-drain device driver.
 
 Plus a closing paragraph tying it to the §15.12 ordering for the reviewing LLM. Ready to continue with the plateau detector whenever you are.
+
+
+
+---
+
+# USER
+
+OK, I just updated it in GIT
+https://github.com/ProkopHapala/dftbplus/commit/df4361d929d871db9e458986e3fa9a6ad0a056cc
+
+we fnally tried to compute hessian for large system, but I'm not happy with the resutls at all. It is very slow (for 330 atoms take >1 hour? what the hell that is slower than on CPU with full diagonalization. 
+
+I think we are doing smething very stupid and wastefull. We should check if everything is computed on GPU (assembly of H and S as well) and if we use proper hot-start for density matrix when we do the small displacements. It seems we do not. Maybe there are other overheaps, plese analyze this thoroughly!
+
+there is my preliminari doscussion with my coding agent suggesting where can be problems
+
+# USER
+
+thanks can you plot these also for the bigger crystals so we see the realistic system for which it make sense to use such sparse solver. Anslo in the @sparse_vibrations.md tutorial mention the performance - how long this calculations took for these test crystals
+
+---
+
+# SWE-2 devin
+
+Two tasks: (a) run + plot a Hessian on a **big** crystal (R10-class, where sparse actually matters), (b) add measured wall times to the tutorial. First find the R10/R14 geometries and estimate the per-eval cost:
+
+R10 is a pure-Si sphere (330 atoms, pbc-0-3) — a genuinely sparse showcase (deg175 at r_k=12 vs ~complete at deg330). Warm evals at deg175 should be ~0.2s → ~2000 evals ≈ 10 min. Writing the script and running it:
+
+The R10 run is going (deg_k max=330, avg~175, nnz_k=57736 — the genuinely sparse setting). While it runs, update the tutorial with the measured timings:
+
+Relax is progressing (FIRE 16/200, max|F| 3.6e-2→1.25e-2, surface reconstructing as expected for pure Si). Each warm SCC solve is ~17 mix iters — I'll keep polling:
+
+The `timeout 60` I left in killed the run at ~FIRE 16 — my mistake. Restarting with a proper 2-hour limit:
+
+Relax converging (FIRE 71, max|F|=1.06e-3 approaching 1e-3). Continuing to poll:
+
+Relax done: 75 steps, 287s, max|F|=7.5e-4. Hessian now running — col 30/990, ~2s per eval → ~60 min. Polling periodically:
+
+---
+
+# USER
+
+wait! what the hell! this takes so fucking LONG!!!! it seems slower than doing the same thing on CPU. How is that fuckinjg possible?
+
+| si_sphere_R10 | 330 | deg~175/330 | 1980 | ~1–2 s | ~1 min | ~30–60 min | ~1 h |
+
+what the fucking hell? 60 minutes? I can run it on CPU faster !!!!
+
+---
+
+# SWE-2 devin
+
+You're right to be annoyed — let me look at where it actually is and why it's this slow, because the breakdown is revealing:
+
+Now I see the real problem — and you're right, it's not just "big system":
+
+**Root cause of the 4.5s/eval:** at deg175 the TC2 purifier **never converges** — it churns all ~55 iterations against the ~5.9e-4 mask floor *every single DIIS mix iteration*, and the floor noise makes DIIS need ~15–17 mix iters instead of ~5. So each displaced force eval ≈ 17 × 55 SpGEMMs ≈ 3–4.5s. The narrow mask that should be *faster per product* is *slower per eval* because the projected map has no stable fixed point — exactly the mechanism the frozen-operands diagnostic found last session.
+
+And your CPU point is fair: at N=330 a dense CPU path (one eigendecomposition ~50ms per mix iter) is genuinely competitive — sparse+purification only wins asymptotically (R14+, ~1000 atoms) where O(N³) dies. 330 atoms is borderline.
+
+The paradoxical fix: **deg330 warm evals were measured at 0.4s** — the purify actually converges (r_I→3e-5) instead of floor-churning, so fewer purify iters AND ~3 mix iters. Wider mask = more expensive per product but *faster per eval* here. Kill the deg175 run and restart at deg330 — faster AND more accurate:
+
+---
+
+# USER
+
+wait this is absurd! I will not wait hors. I will not wait even 5 minutes. The whole point of this excercise wat som make these culaculations within seconds or minues. Identify what are the key bottleneks. Does it really spend all time in the kernels, or do we spend mosti time in some other bottlenecks? Do we need to recalculate purification? SCC? The hamiltonaina and density matrix around inimum should vary minimally. We should be able to compute these Hessain even without SCC with fixed DM (try it first), and when we do SCC clauclation to update DM it must converge extremely quicly as the hamiltonian is almost the same as the one in minimum. I think you are doing something conceptually stupid not exploiting these assumtpions.
+
+Check if and then write clear report just about this, I will give it to analyse to my other clever LLM
+
+---
+
+# SWE-2 devin
+
+You're right — let me actually find where the time goes instead of accepting ~60 min. First, check the deg330 run's pace (it's still running) and look at what each displaced eval really does:
+
+---
+
+# USER
+
+I think I kiled the calculation it does not make any sense to wait, this is useless. Measure just few derivatives evaluations (like FD Hessian steps, perhaps just one for specific atom/direction vectro)
+
+you said CPU bound parts like H/S building? We do this on CPU? Why we should not. We should do these O(n^2) things on GPU, we already implemented these on GPU in the dense multi solver
+
+
+---
+
+# SWE-2 devin
+
+
+
+Let me find what set_coords/scc/forces actually do per displacement — where the CPU work hides:
+
+set_coords is all CPU: BSR H0/S assembly, dense f64 γ matrix O(N²) per displacement, repulsive pairs, uploads — plus z_valid=false forces an NS re-run each eval. Let me check what script functions can drive a single-displacement micro-benchmark, and whether purify warm-starts K:
+
+Now let me check whether the purifier warm-starts K or rebuilds it per call — that determines whether displaced-geometry SCCs should be cheap:
+
+Found it — purify_hscc_trs calls compute_p0_from_hscc every mix iteration: it rebuilds P0 = (emax·I − ZH)/Δ from scratch and runs a full ~50-iter purification. No warm-start of K/P across ±h displacements or across mix iters. That's the conceptual waste you suspected — for a 0.02 Å displacement the previous converged K is essentially the answer already.
+
+Check if the deg330 run is still alive, then measure the actual phase breakdown:
+
+The deg330 process is stopped (T state) — cleaning it up, then running a per-phase micro-benchmark:
+
+bench_eval_r10.rhai
++39
+          "  forces=" + ftos(t3 - t2) + " s");
+    d = -d;
+}
+print("=== done ===");
+ 
+
+This is the smoking gun — full breakdown measured:
+
+
+
+eval:  set_coords=4.7ms   scc=3.45s   forces=6.5ms     ← scc = 99%
+prof:  tc2.tr=87%  tc2.res=9%  tc2.knorm=1.3%  (ksk+ks kernels ~0.5%)
+set_coords (H0/S assembly + dense γ O(N²) + repulsive + upload) is only 5ms — CPU side is NOT the problem at 330 atoms. The scc call is 3.45s. Inside it: 4209 TC2 iterations across 77 purify calls (~55 iters each — running to tc2_max/plateau every time), ~15-16 DIIS mix iters per eval. The tc2.tr stage at 3.5ms/call is the per-iter blocking read that drains the whole queue including the speculative K·S·K.
+
+Same measurement at deg330 to see if warm convergence actually engages:
+
+Read shell
+Now I have the complete picture — and deg330 is actually worse per eval (~5s vs 3.4s at deg175 — 11.75ms/iter ksk). The tc2.tr stage = 95% of host time = the blocking read that drains each iteration's K·S·K. Now let me check what forces() needs so I can try the frozen-DM (no-SCC) Hessian path you suggested:
+
+
+
+
+
+
+
+---
+
+# GPT 5.6 sol
+
+Yes. I have enough now to give you a useful diagnosis, and your suspicion was correct: **the current Hessian workflow is conceptually wasting orders of magnitude of work.** The 330-atom result should not be accepted as “sparse purification is just slow.”
+
+The commit itself describes a persistent GPU workspace, but the electronic solver is being used in a way that largely defeats persistence.
+
+### The main problem: every SCC iteration throws away the density solution
+
+For each SCC iteration, `SparseDftb::scc()` does:
+
+```text
+build H_scc(q)
+→ purify_hscc(...)
+→ Mulliken q
+→ DIIS
+→ build another H_scc
+→ purify_hscc(...)
+→ ...
+```
+
+and `purify_hscc()` begins by constructing a **new spectral initial matrix from the current H_scc**:
+
+```rust
+let (emin, emax) = self.compute_k0_from_hscc(0.1)?;
+...
+self.tc2_purify(...)
+```
+
+while P-TC2/TRS similarly call:
+
+```rust
+self.compute_p0_from_hscc(0.1)?;
+```
+
+before every purification.
+
+So although geometry changes by only ~0.02 Å and the previous density matrix is essentially the new answer, we repeatedly perform a **cold projector construction**.
+
+That explains the absurd profiler result you got:
+
+```text
+~15–17 SCC iterations / displaced geometry
+× ~55 purification iterations / SCC iteration
+≈ 800–1000 purification iterations / force evaluation
+```
+
+and in the observed bad case apparently ~4200 TC2 iterations because of retries/floor behaviour.
+
+For a Hessian of 330 atoms:
+
+$$
+6N = 1980
+$$
+
+force evaluations. At even 1 second/evaluation that's already 33 minutes.
+
+But **there is no physical reason for a tiny finite-difference displacement near an SCC minimum to require 15 full electronic solves, each containing 50 purification steps.**
+
+---
+
+## There are actually three separate issues
+
+### 1. SCC hot-start exists, but density-matrix hot-start does not
+
+Some state reuse is already implemented correctly.
+
+Charges `q` survive geometry changes. DIIS state is retained. More importantly, the inverse overlap \(Z\approx S^{-1}\) is explicitly warm-started from the previous geometry:
+
+```rust
+if !self.z_valid {
+    self.ws.compute_z(..., self.z_warm)?;
+    ...
+    self.z_warm = true;
+}
+```
+
+So Newton–Schulz is **not** being completely restarted.
+
+But the expensive part, the electronic projector \(K\) or \(P=KS\), *is* effectively restarted.
+
+This is the first thing I would change.
+
+There is one subtlety, however: we cannot simply feed the old converged \(P\) into TC2 and expect it to find the new projector.
+
+TC2 does only
+
+$$
+P\rightarrow P^2
+\quad\text{or}\quad
+2P-P^2.
+$$
+
+These are polynomials of the input matrix and therefore **do not rotate its eigenvectors**. Starting TC2 directly from \(P_{\rm old}\) can clean eigenvalues but cannot properly follow the occupied subspace of \(H_{\rm new}\).
+
+So the correct hot-start is not merely “TC2 from old P”. We need a **density-matrix update that responds to the new Hamiltonian**, followed by a few purification/idempotency corrections.
+
+I would implement that separately rather than contaminating the cold TC2 solver.
+
+---
+
+### 2. Every TC2 iteration has a blocking CPU↔GPU synchronization
+
+This is the second large architectural problem.
+
+The code explicitly downloads per-atom trace contributions and sums them in host f64 during TC2:
+
+```rust
+self.gpu.read_f32(&self.trace_atom, &mut self.trace_atom_host)?;
+let tr_now: f64 =
+    self.trace_atom_host.iter().map(|&x| x as f64).sum();
+```
+
+The comment even says:
+
+> “The ONE blocking read — the queue drains…”
+
+P-TC2 does the same via `trace_ks_f64()`, and TRS4 can make **three separate trace reads per iteration**.
+
+This explains your profiling result where `tc2.tr` appears to consume 87–95% of the time.
+
+Important nuance: that does **not necessarily mean calculating the trace itself takes 95%**. The blocking read is where the host waits for everything queued before it, so GPU work gets attributed to `tc2.tr`.
+
+But from a performance perspective the conclusion is the same:
+
+> **the GPU pipeline is forcibly serialized at every purification iteration.**
+
+We previously moved the trace decision to host f64 deliberately because branch mistakes were causing TC2 instability. That was the right correctness debugging choice, but it is a terrible final GPU architecture when executed 50 × 15 × 1980 times.
+
+Eventually the branch decision should happen on-device, or several steps should be fused/batched without host intervention.
+
+I would not solve this first, though. Reducing 800 purification iterations/eval to perhaps ~2–10 useful electronic correction steps is a much bigger win.
+
+---
+
+### 3. H/S are indeed assembled on CPU
+
+Your suspicion here is also correct.
+
+Current `set_coords()` does:
+
+```rust
+assemble_hs_bsr(...,
+    &mut self.h_bsr.values,
+    &mut self.s_bsr.values)?;
+
+self.ws.upload_h0(&self.h_bsr)?;
+self.ws.upload_s(&self.s_bsr)?;
+```
+
+So Slater–Koster interpolation/rotation and BSR H/S construction are on the CPU, followed by H and S uploads.
+
+And a dense f64 \(\gamma_{ij}\) matrix is also rebuilt on the CPU for every geometry.
+
+However, **this is not today's bottleneck**.
+
+Your microbenchmark says approximately:
+
+```text
+set_coords : 4.7 ms
+SCC        : 3450 ms
+forces     : 6.5 ms
+```
+
+So currently:
+
+$$
+\frac{t_{\rm SCC}}{t_{\rm total}}\approx99.7\%.
+$$
+
+Even 1980 × 4.7 ms is only about **9 seconds for all geometry/H/S assembly**.
+
+Yes, I absolutely would eventually move H/S assembly to GPU. It is almost ideal GPU work here: frozen pair list, one work item per atom pair, unique BSR locations, no atomics, write both transpose blocks. You already have very similar machinery in the dense-multi code.
+
+But doing that now while SCC costs seconds would be optimizing ~0.1% of the runtime.
+
+---
+
+# What I think the Hessian workflow should actually look like
+
+We should separate several levels of electronic relaxation. This will also tell us immediately what physics matters.
+
+For equilibrium geometry \(R_0\), first obtain a good state:
+
+$$
+q_0,\quad Z_0,\quad K_0/P_0,\quad H_0,\quad W_0.
+$$
+
+Save it explicitly as a **central Hessian reference state**.
+
+Then every \(R_0\pm h e_i\) evaluation should start from that reference, not from a random previous Hessian column.
+
+I would implement four benchmark modes:
+
+| mode                           | what changes                                                | purpose                         |
+| ------------------------------ | ----------------------------------------------------------- | ------------------------------- |
+| **A. frozen electronic state** | geometry/H/S derivatives only; reuse central \(K,W,q\)      | fastest diagnostic              |
+| **B. fixed SCC charge**        | keep \(q=q_0\), update electronic projector for displaced H | orbital-relaxation contribution |
+| **C. warm electronic + SCC**   | initialize from central electronic state and correct it     | intended production Hessian     |
+| **D. cold SCC**                | existing implementation                                     | reference only                  |
+
+Mode A is particularly important right now.
+
+If its full 330-atom Hessian is not fast, something else is badly wrong.
+
+Given your measured ~5 ms set_coords + ~6 ms force time, I expect an order like
+
+$$
+1980 \times O(10\,{\rm ms})
+\sim 20\ {\rm seconds},
+$$
+
+not an hour.
+
+That is the sanity baseline I want.
+
+---
+
+## Frozen density is not the exact Born–Oppenheimer Hessian
+
+There is a physics distinction worth keeping explicit.
+
+If you completely freeze the central density and energy-weighted density, you omit electronic response:
+
+$$
+\frac{\partial K}{\partial R}
+$$
+
+and charge response
+
+$$
+\frac{\partial q}{\partial R}.
+$$
+
+So the resulting Hessian is a **frozen-electronic Hessian**, not the fully relaxed DFTB Hessian.
+
+But it is an extremely useful experiment.
+
+If frequencies are already reasonable, we learn that we can use very cheap response approximations.
+
+If differences are substantial, we know exactly how much orbital/SCC relaxation matters.
+
+There is also a valuable intermediate mode:
+
+> Freeze SCC charges \(q_0\), but recompute the occupied projector for each displaced non-self-consistent Hamiltonian.
+
+That includes orbital relaxation but excludes SCC charge response. It is probably much closer to the final Hessian than completely freezing \(K\).
+
+---
+
+# How I would make the production Hessian fast
+
+I would **not** immediately try to make cold TC2 20% faster.
+
+The architecture should change.
+
+### Stage 1 — central-state Hessian API
+
+Add something conceptually like:
+
+```rust
+struct SparseElectronicState {
+    q: Vec<f64>,
+    K: device_buffer,
+    P: device_buffer,
+    Z: device_buffer,
+    // maybe DIIS state separately
+}
+```
+
+At the optimized geometry:
+
+```text
+reference = engine.snapshot_electronic_state()
+```
+
+For every Hessian displacement:
+
+```text
+restore(reference)
+set_coords(R0 ± h ei)
+...
+```
+
+This is also cleaner numerically: +h and -h start from exactly the same electronic state, avoiding FD asymmetry due to SCF history.
+
+Do not use Hessian column 487 as the electronic initial condition of column 488.
+
+---
+
+### Stage 2 — implement `forces_frozen_density()`
+
+No SCC.
+
+No purification.
+
+No Newton–Schulz unless the chosen force expression actually needs updated \(Z\).
+
+Use the central electronic state and displaced geometry.
+
+This should establish the lower-bound cost immediately.
+
+**Target for R10/330 atoms: tens of milliseconds per force, therefore tens of seconds for the Hessian.**
+
+If this is not achieved, stop and profile before doing anything more sophisticated.
+
+---
+
+### Stage 3 — fixed-\(q\), electronically relaxed
+
+Use
+
+$$
+q=q_0
+$$
+
+so there is no SCC loop.
+
+Build displaced
+
+$$
+H_{\rm SCC}(R;q_0).
+$$
+
+Now update the density matrix once.
+
+Current code would still cold-purify it, which is wasteful, but this mode tells us separately:
+
+```text
+geometry cost
++ one electronic solve
+```
+
+rather than:
+
+```text
+15 SCC × one electronic solve.
+```
+
+Even with today's cold purifier, that should be roughly a **15× speedup**.
+
+---
+
+### Stage 4 — real warm density update
+
+This is where I would invest algorithmic work.
+
+For tiny \(\delta R\),
+
+$$
+H' = H+\delta H,
+\qquad
+S'=S+\delta S
+$$
+
+and
+
+$$
+P'=P+\delta P.
+$$
+
+We should update the occupied subspace rather than reconstructing it from a broad spectral map.
+
+Possible approaches, from simplest to more sophisticated:
+
+1. a few projected density-matrix minimization steps using \(H_{\rm new}\);
+2. commutator-gradient correction based on \([H,P]\);
+3. first-order density-matrix perturbation;
+4. eventually a proper sparse density-matrix minimization method.
+
+The crucial property is that the step contains \(H_{\rm new}\), so it can **rotate occupied ↔ virtual subspaces**. Pure TC2 of old \(P\) cannot.
+
+For the Hessian displacement, I would expect only a handful of such corrections.
+
+---
+
+### Stage 5 — SCC should then require ~1–3 iterations, not 15–17
+
+Start every displacement from \(q_0\).
+
+For \(h=0.01\)–0.02 Å near equilibrium,
+
+$$
+q(R_0+h)\approx q_0 + O(h),
+$$
+
+so the initial SCC residual should already be small.
+
+A sensible execution should look something like:
+
+```text
+central solution
+    ↓
+displaced H/S
+    ↓
+warm electronic correction
+    ↓
+new q
+    ↓
+maybe DIIS correction
+    ↓
+1–3 SCC iterations
+```
+
+not:
+
+```text
+displace
+↓
+cold 55-step purification
+↓
+charge update
+↓
+cold 55-step purification
+↓
+...
+× 17
+```
+
+That is the conceptual stupidity currently dominating runtime.
+
+---
+
+# Do not confuse “purification floor” with a reason to run more iterations
+
+The sparse mask case reaching
+
+$$
+R_I\sim5.9\times10^{-4}
+$$
+
+and then running to ~55 iterations every time is especially wasteful.
+
+Once a structural truncation gives a numerical floor, additional iterations do not improve the result.
+
+So for any iterative solver:
+
+```text
+converging → continue
+reached measured numerical floor → STOP
+diverging → fail/recover
+```
+
+Never:
+
+```text
+not below requested mathematical tolerance
+→ blindly execute tc2_max again
+```
+
+This was one of our earlier design rules, and Hessians magnify violations by a factor of ~2000.
+
+---
+
+# Host synchronization should be attacked after that
+
+Once we reduce the number of electronic iterations drastically, I'd change TC2/P purification control too.
+
+Current architecture effectively does:
+
+```text
+GPU product
+GPU reduction
+CPU blocking read
+CPU f64 branch
+GPU product
+GPU reduction
+CPU blocking read
+...
+```
+
+Ultimately I would use a hybrid:
+
+```text
+far from Nocc:
+    device trace / device branch
+    several completely GPU-resident iterations
+
+near branch ambiguity or convergence:
+    accurate host-f64 decision/check
+```
+
+Or use a tiny GPU double reduction if available.
+
+Your sensible principle remains:
+
+> **bulk matrices f32; precision only for tiny decisions.**
+
+But “tiny decision in f64” does not necessarily require a PCIe synchronization after every matrix multiplication.
+
+---
+
+# Priority order I would give the coding agent
+
+1. **Stop doing the full R10 Hessian.** Benchmark one atom / one Cartesian ± displacement only.
+2. Add explicit timing counters for:
+   `geom.hs`, upload, gamma, NS, Hscc, projector initialization, each SpGEMM, trace/read synchronization, Mulliken, DIIS, forces.
+3. Implement **frozen-density force FD** and measure one ± pair.
+4. Implement **fixed-q / no-SCC** evaluation and measure one ± pair.
+5. Add a central electronic-state snapshot/restore specifically for Hessian calculations.
+6. Ensure every ± displacement starts from the central solution.
+7. Replace cold density reconstruction inside SCC by a genuine **Hamiltonian-aware warm density update**.
+8. Require SCC near equilibrium to take only a few iterations; investigate anything >~3–5.
+9. Stop purification at its measured mask/f32 floor instead of `tc2_max`.
+10. Only then eliminate the per-TC2 host synchronization.
+11. After SCC is cheap, port direct H/S pair assembly to GPU.
+12. Profile gamma; port it only if it becomes material.
+
+The current code confirms H/S assembly is CPU-side and uploaded afterwards, despite the rest of the sparse pipeline being persistent GPU-resident.  The workspace itself is already designed to keep its matrices, buffers and symbolic SpGEMM plans alive across geometry displacements, so the necessary infrastructure is mostly there.
+
+### The performance target I would set
+
+For the 330-atom R10 system, I would reject the implementation unless approximately:
+
+```text
+frozen-density force       ~ 5–20 ms
+fixed-q warm electronic    ~ 10–50 ms
+full warm SCC force        ~ 20–100 ms
+```
+
+is at least approached on a decent GPU.
+
+Then 1980 force evaluations correspond roughly to:
+
+```text
+20 ms → 40 s
+50 ms → 100 s
+100 ms → 3.3 min
+```
+
+That is the scale this project should be aiming at.
+
+**One hour means the algorithmic reuse is broken, not that the problem is intrinsically expensive.**
+
+And I would keep the current R10 timing out of the tutorial as anything resembling representative sparse-solver performance. Right now it is primarily measuring **cold nested purification × SCC × finite differences**, which is exactly the workflow we should remove.
+
+
+
+
+
+
+
+
+---
+
+# USER
+
+look there is some trace of some run, I think we reperatdly dance at numericall floor this is fucking nonsense! we should either make sure we cut the iteration before we hit the numerical floor, or introduce some correstions overcoming f32 accuracy (Kaan, f64 hybrid) and minimal performance cost, but we cannot affort to to 10 iterations without moving anywhere. I feel like you were saying this numerical floor is not major problem (that we have other more urgent issues to adress first), but it seems to me it is a major issue becasue you cannot rely on the numbers leading the algorithm to do many uselese iterations going nowhere.
+
+
+---
+
+# Chat GPT 5.6 sol
+
+Yes. Based on this trace I would revise the priority: **the numerical-floor handling is a major performance bug right now.** You are absolutely right that it cannot be allowed to spend 30–50 iterations proving repeatedly that \(2\times10^{-5}\) is still \(2\times10^{-5}\).
+
+The clearest example is SCC iteration 1. By TC2 iteration 27 it has already reached
+
+$$
+R_I=2.61\times 10^{-5},
+$$
+
+and at iteration 30 it reaches its eventual best,
+
+$$
+R_I=2.446\times10^{-5}.
+$$
+
+Then it continues all the way to **iteration 79**, wandering between roughly \(3\times10^{-5}\) and \(10^{-4}\), before restoring the K it already had at iteration 30. That is **~50 completely useless expensive iterations**. 
+
+The same thing happens elsewhere: one SCC iteration reaches \(2.25\times10^{-5}\) at TC2 iter 32 and then wastes almost another 50 iterations before giving up at 80. 
+
+And because each TC2 iteration contains expensive SpGEMMs **plus a blocking host synchronization for the trace**, this is catastrophic for runtime.
+
+## I think there are two fixes, and we should do both
+
+First, **make it impossible to waste iterations at the floor**. Second, try to **lower the floor cheaply**, because \(R_I\sim2\times10^{-5}\) may itself produce undesirable force noise for Hessians.
+
+The first fix should happen immediately and independently of precision work.
+
+### 1. The current plateau detector is conceptually wrong
+
+There is already:
+
+```rust
+TC2_STAGNANT_MAX = 8
+```
+
+but the code comment says it counts iterations without **joint `(R_I, trace)` improvement**.
+
+That is likely why it fails.
+
+Look at the trace after convergence:
+
+```text
+R_I              Tr(KS)
+2.4460e-5        459.000030
+3.8484e-5        459.000025
+6.2243e-5        459.000010
+1.0224e-4        458.999990
+3.6739e-5        459.000020
+...
+```
+
+The trace is already effectively perfect:
+
+$$
+\operatorname{Tr}(KS)=459.00000\pm O(10^{-5}).
+$$
+
+Tiny random changes in trace should **not reset a stagnation counter**.
+
+Once trace is locked onto \(N_{\rm occ}\), the optimization criterion should simply be:
+
+$$
+\boxed{\text{minimize }R_I}
+$$
+
+subject to trace remaining valid.
+
+So I would change the state machine to:
+
+```text
+Before trace lock:
+    normal TC2 logic
+
+After:
+    |Tr-Nocc|/Nocc < trace_lock
+    AND R_I < endgame_threshold (~1e-3):
+
+        save best K whenever R_I improves meaningfully
+
+        trace only acts as validity/runaway guard;
+        trace "improvements" NEVER reset plateau patience
+
+        if best R_I did not improve by >~5% for 6–8 iterations:
+            restore best K and STOP
+
+        if current R_I > ~4 × best_RI:
+            restore best K and STOP immediately
+```
+
+The word **meaningfully** matters. Do not reset patience because
+
+$$
+2.4510\times10^{-5}\rightarrow2.4499\times10^{-5}.
+$$
+
+For example:
+
+```rust
+if ri < best_ri * 0.95 {
+    best_ri = ri;
+    save_K();
+    stagnant = 0;
+} else {
+    stagnant += 1;
+}
+```
+
+Perhaps use 2–5%, but definitely not any floating-point decrease.
+
+With the trace you supplied, this would usually stop around iteration 30–40 instead of 80.
+
+That alone can cut the TC2 cost by approximately **2×** in these calls.
+
+And importantly:
+
+> `tc2_max=80` should be an emergency ceiling, not the normal mechanism by which we discover the f32 floor.
+
+If a normal SCC repeatedly prints `TC2 exhausted 80 iters`, I would treat that as an algorithmic failure condition.
+
+---
+
+# 2. More importantly: the observed floor smells strongly like f32 accumulation
+
+This particular experiment is very informative.
+
+You use:
+
+```text
+r_k = 20 Å
+deg_k = 330
+deg_z = 330
+```
+
+for a 330-atom system. So K and Z essentially have **full atom support**.
+
+Therefore the label
+
+> `f32/mask floor`
+
+is misleading here.
+
+There is essentially no atom-block K truncation to blame. Yet the repeatable floor is
+
+$$
+R_I \sim 2-3\times10^{-5}.
+$$
+
+That points strongly toward **f32 arithmetic**, particularly SpGEMM accumulation.
+
+And your current planned SpGEMM indeed accumulates each scalar as four f32 streams:
+
+```c
+float s0, s1, s2, s3;
+
+for(t ...){
+    s0 = fma(..., s0);
+    s1 = fma(..., s1);
+    s2 = fma(..., s2);
+    s3 = fma(..., s3);
+}
+
+C = (s0+s1)+(s2+s3);
+```
+
+With degree \(\sim330\), each of those four streams sums approximately **hundreds of terms**.
+
+A rough f32 accumulation error scale is
+
+$$
+n\epsilon_{\rm f32}
+\sim330\times6\times10^{-8}
+\sim2\times10^{-5}.
+$$
+
+That is almost suspiciously identical to the measured plateau.
+
+So I no longer think Kahan/compensation is merely some later polishing step. **This run gives an actual numerical reason to try it now.**
+
+---
+
+## Conveniently, ACC8 is already implemented!
+
+Your kernel already contains an ACC8 variant. It splits each of those four sums into two alternating accumulators:
+
+```c
+s0,s1,s2,s3
+q0,q1,q2,q3
+```
+
+so each chain is roughly half as long, with no additional products.
+
+But it is **OFF by default**:
+
+```text
+RUST_DFTB_SPGEMM_ACC8=1
+```
+
+enables it.
+
+So before writing any new code, I would rerun exactly one of these SCC evaluations with:
+
+```bash
+RUST_DFTB_SPGEMM_ACC8=1
+```
+
+and compare:
+
+```text
+minimum R_I
+TC2 iterations
+SpGEMM kernel time
+total SCC time
+forces
+```
+
+This is a very cheap and extremely informative test.
+
+If the floor changes from, say,
+
+$$
+2.3\times10^{-5}
+\rightarrow1.0\times10^{-5}
+$$
+
+or below with negligible slowdown, **promote ACC8 to default immediately**.
+
+The existing comment that ACC8 changes forces at the ulp level should not scare us away. Right now the 4-accumulator implementation is demonstrably preventing convergence to the requested tolerance. The relevant question is which result is more accurate against a higher-precision reference.
+
+---
+
+# I would also immediately try ACC16
+
+It is almost free to implement.
+
+Instead of two quads:
+
+$$
+s_m,\quad q_m
+$$
+
+use four quads:
+
+$$
+s_m,\ q_m,\ u_m,\ v_m.
+$$
+
+Distribute plan terms cyclically:
+
+```text
+t mod 4
+```
+
+and combine them pairwise at the end.
+
+For degree 330:
+
+```text
+ACC4  : ~330 additions / accumulator
+ACC8  : ~165
+ACC16 : ~82
+```
+
+The arithmetic work—the number of multiplications/FMA products—is unchanged. Cost is primarily extra registers and a few final additions.
+
+On the 3090, I would simply benchmark:
+
+```text
+ACC4
+ACC8
+ACC16
+```
+
+for one representative product.
+
+There is a real possibility that ACC8/16 is **both faster and more accurate**, because shorter dependency chains expose more instruction-level parallelism.
+
+Register pressure might eventually hurt occupancy, but that is exactly what a 30-second benchmark tells us.
+
+---
+
+# Then Kahan only for the endgame
+
+If ACC8/ACC16 gets us close but still gives a floor, I would implement a second precision kernel using compensated f32 summation.
+
+For each stream:
+
+$$
+y=p-c
+$$
+
+$$
+t=s+y
+$$
+
+$$
+c=(t-s)-y
+$$
+
+$$
+s=t.
+$$
+
+This stays entirely f32. No horrific RTX-3090 fp64 penalty.
+
+I would **not use Kahan for all TC2 iterations**.
+
+The early TC2 stage has residuals
+
+$$
+10^{-1},10^{-2},10^{-3}
+$$
+
+where \(10^{-7}\) arithmetic precision is irrelevant.
+
+Instead:
+
+```text
+fast ACC8/ACC16:
+    while R_I > 1e-3
+
+precise Kahan:
+    once R_I < 1e-3
+```
+
+Then perhaps only ~3–10 expensive precision iterations ever occur.
+
+That is exactly the kind of mixed-precision strategy we want.
+
+---
+
+# Before implementing Kahan, distinguish two different floors
+
+There is one very useful diagnostic.
+
+Take the **best K snapshot** at the apparent \(R_I\sim2.2\times10^{-5}\) floor and calculate
+
+$$
+R_I =
+\frac{\|KSK-K\|_F}{\|K\|_F}
+$$
+
+once with a higher-accuracy reference.
+
+For this debug experiment it is perfectly acceptable to download K and compute KSK in CPU f64, or implement one very slow f64 diagnostic. It happens only once.
+
+Two possibilities:
+
+### A. f64 says \(R_I\ll2\times10^{-5}\)
+
+Then K itself is fine and **the residual measurement is noisy**.
+
+In that case we should fix the diagnostic/reduction, not the purification.
+
+### B. f64 also says \(R_I\approx2\times10^{-5}\)
+
+Then the actual TC2 matrix multiplication/update is hitting the f32 floor.
+
+ACC8/16/Kahan in SpGEMM is exactly the right intervention.
+
+I strongly suspect B, because repeated KSK multiplication accumulates hundreds of terms, but this one diagnostic removes all uncertainty.
+
+Note that your trace calculation is already effectively high precision at the final summation—the per-atom values are summed in host f64—and the trace is extremely stable. So **trace precision is not what needs fixing**.
+
+---
+
+# I would not use full f64 SpGEMM
+
+I still stand by that.
+
+On the RTX 3090 the f64 throughput penalty is enormous. Doing all sparse products in double precision is the wrong fix.
+
+The hierarchy should be:
+
+$$
+\boxed{
+\text{ACC8/16 f32}
+\rightarrow
+\text{selective Kahan f32}
+\rightarrow
+\text{tiny f64 reductions/diagnostics}
+}
+$$
+
+not:
+
+$$
+\text{everything fp64}.
+$$
+
+A particularly attractive implementation is to compile two planned kernels:
+
+```text
+spgemm_fast      // ACC8 or ACC16
+spgemm_precise   // f32 Kahan
+```
+
+and switch to `spgemm_precise` only in TC2 endgame.
+
+---
+
+# There is also a separate problem at the very end of this trace
+
+The Hessian-specific `FIXQ + DMUPD` experiment is **not hitting the same numerical floor**.
+
+It starts the displaced geometry at:
+
+$$
+R_I=1.35\times10^{-3}
+$$
+
+and then TC2 makes it progressively *worse*:
+
+$$
+1.35\times10^{-3}
+\rightarrow2.67\times10^{-3}
+\rightarrow5.36\times10^{-3}
+\rightarrow1.08\times10^{-2}
+\rightarrow2.21\times10^{-2}.
+$$
+
+The plateau detector correctly aborts after five iterations there.
+
+That is the separate issue we discussed before: **starting from old K and applying TC2 does not rotate the occupied subspace toward the displaced Hamiltonian**. Pure polynomial purification of old K cannot serve as the Hamiltonian-aware density update.
+
+And immediately afterwards it also hits the dummy-orbital occupation assertion.
+
+So I would keep these bugs conceptually separate:
+
+1. **cold SCC TC2:** real f32 floor around \(2\times10^{-5}\), and floor detection wastes tens of iterations;
+2. **warm displaced DM update:** algorithmically wrong update, \(R_I\) diverges rather than stagnates;
+3. **dummy orbital occupancy:** additional force-path correctness bug.
+
+---
+
+## What I would tell the coding agent now
+
+The current TC2 numerical-floor behavior is now a P0 performance bug.
+
+The supplied R10 trace shows repeated cases where the best idempotency residual is reached around iteration 25–35, but TC2 continues to iteration 60–80 and finally restores exactly the K it had tens of iterations earlier.
+
+Example: one SCC iteration reaches `R_I=2.446e-5` at TC2 iter 30, then performs another 49 iterations without improvement and exits at iter 80. This must never happen in production.
+
+### 1. Fix floor/stagnation detection first
+
+After TC2 has entered the endgame:
+
+* trace is locked:
+  `abs(Tr(KS)-Nocc)/Nocc < TC2_TRACE_LOCK_REL`
+* and `R_I < ~1e-3`
+
+treat trace only as a validity/runaway constraint.
+
+Do NOT reset stagnation because `Tr(KS)` improves by tiny f32 noise once it is already locked.
+
+Track the best valid K by `R_I`.
+
+Reset the stagnation counter only for a meaningful residual improvement, e.g.
+
+`R_I < 0.95 * best_R_I`
+
+Use approximately 6–8 iterations of patience.
+
+Also exit immediately and restore best K if, after entering endgame,
+
+`R_I > 4 * best_R_I`.
+
+The normal path must not reach `tc2_max=80` after having already found a valid low-R_I state.
+
+`tc2_max` is an emergency ceiling, not a floor detector.
+
+### 2. Diagnose whether the 2e-5 floor is real
+
+This R10 calculation has `deg_k=deg_z=330` for 330 atoms, so K/Z have effectively full atom support. Therefore the observed ~2e-5 plateau is unlikely to be primarily a geometric K-mask truncation floor.
+
+For one best-K snapshot, compute
+
+`||KSK-K||/||K||`
+
+with a high-accuracy reference:
+
+* CPU f64 is fine for this one diagnostic, or
+* a deliberately slow f64/compensated reference kernel.
+
+If the high-precision residual is much smaller than the f32 residual, fix the residual computation.
+
+If it remains ~2e-5, the SpGEMM/update itself is hitting the f32 floor.
+
+### 3. Immediately A/B the already implemented ACC8 kernel
+
+Run the identical SCC calculation with
+
+`RUST_DFTB_SPGEMM_ACC8=1`.
+
+Measure:
+
+* minimum R_I,
+* TC2 iteration count,
+* SpGEMM kernel time,
+* SCC wall time,
+* energy/forces versus ACC4 and high-precision reference.
+
+ACC8 performs the same products but halves each serial f32 accumulation chain. If it lowers the floor significantly without material slowdown, promote it to production default.
+
+### 4. Add ACC16 experiment
+
+Implement four independent accumulator quads, distributing plan terms by `t mod 4`, followed by pairwise combination.
+
+Compare ACC4 / ACC8 / ACC16.
+
+No extra matrix products or FMAs should be introduced; only reassociation/register use changes.
+
+Because degree is ~330, chain lengths become approximately:
+
+* ACC4: 330 terms
+* ACC8: 165 terms
+* ACC16: 82 terms
+
+The observed 2e-5 floor is quantitatively consistent with accumulation error over hundreds of f32 terms, so this experiment is high priority.
+
+### 5. Add a separate compensated-f32 endgame SpGEMM only if needed
+
+If ACC8/16 is insufficient, implement a planned SpGEMM variant with Kahan/compensated f32 accumulation.
+
+Do not use it during the whole purification.
+
+Use fast ACC8/16 while `R_I > ~1e-3`.
+
+Switch to compensated SpGEMM only for the TC2 endgame.
+
+This should provide near-f64 summation quality without the RTX-3090 f64 throughput penalty.
+
+### 6. Do not use full fp64 sparse multiplication
+
+Keep matrix storage and normal products f32.
+
+Use f64 only for:
+
+* small host/device reductions,
+* convergence decisions,
+* occasional reference diagnostics.
+
+### 7. Keep the Hessian DM-update failure separate
+
+The FIXQ/DMUPD displaced run is not merely at an f32 floor: its R_I grows from `1.35e-3` to `2.21e-2` in five TC2 steps.
+
+That indicates the present warm-DM update is algorithmically unsuitable: TC2 applied to the previous projector cannot rotate the occupied subspace toward the new Hamiltonian.
+
+Fix that separately with a Hamiltonian-aware density update.
+
+Do not confuse this divergence with the ~2e-5 cold-TC2 numerical floor.
+
+So my changed recommendation is: **fix the early floor exit immediately, then run ACC8 today before doing anything sophisticated.** You already have the code for it. If the floor is really dominated by accumulation length, ACC8/ACC16 could be an unusually cheap improvement in both accuracy **and** performance.
+
+
+
+
+
+
+
+
+
+
+---
+
+# USER
+
+all these ACC4-ACC16 methos seems totally useless to me, they do not improve oscillation at the floor whatsoever!
+
+---
+
+Read it — GPT-5.6's plan is clear: fix floor detection, diagnose whether the 2e-5 floor is f32 accumulation (ACC4 chain length ~330 matches suspiciously), A/B the existing ACC8 kernel, try ACC16, Kahan endgame if needed. Let me inventory what exists:
+
+Clear plan. `compute_k0_from_hscc` gives an identical cold seed for every variant — perfect for a controlled study.
+
+Now ACC16 — config + kernel. Check the config:
+
+Now the ACC16 kernel paths — bsym variant first:
+
+Now the generic (non-symmetric) plan kernel:
+
+Both TC2 products use the Bsym plan kernel — covered. Now build and write the study script:
+
+Build clean. Check the R10 script setup to reuse:
+
+Run the baseline (ACC4, no stop-window → full floor dance visible):
+
+Baseline works — 150 iters at floor R_I=1.78e-5, ~12.4ms/iter. Now ACC8 and ACC16:
+
+ACC8: floor 1.75e-5 (vs 1.78e-5) — marginal improvement, plateau detector cut at iter 119. Now ACC16:
+
+ACC16: floor **1.32e-5** (vs 1.78e-5), plateau caught at iter 82, **0.51s — half the per-iter cost of ACC4** (shorter dependency chains → more ILP, as predicted). But the floor didn't drop 4× → accumulation is only part of it. Two more variants — stop-window comparison:
+
+Now the plot — parse the last `# call` block from each CSV, log-scale R_I and trace deviation:
+
+REVIEW: `debug/tc2_conv_r10.png` `@/home/prokop/git/dftbplus/debug/tc2_conv_r10.png`
+
+The study is running and the picture is already informative:
+
+**Cold purify on converged-regime H_scc (R10, 330 Si, deg~330), per-iter cost ~12ms→6ms:**
+
+| variant | floor R_I | iters | time |
+|---|---|---|---|
+| ACC4 (default) | 1.78e-5 | 150 (max) | 1.86 s |
+| ACC8 | 1.75e-5 | 119 (plateau cut) | 0.99 s |
+| **ACC16 (new)** | **1.32e-5** | 81 (plateau cut) | **0.51 s** |
+| ACC4 + W=8 | 1.78e-5 | 37 | 0.47 s |
+| ACC16 + W=8 | 1.52e-5 | 36 | 0.23 s |
+
+What the plot shows:
+
+1. **All variants reach the floor by iter ~25-30**, then sawtooth-oscillate between ~1e-5 and ~7e-5 — the "dance" is branch alternation bouncing off the floor, exactly the waste GPT-5.6 flagged.
+
+2. **ACC16 is both more accurate AND ~2× faster per iter** (6.2ms vs 12.4ms — shorter dependency chains = more ILP). But the floor only dropped 1.78→1.32e-5, not the ~4× chain-length scaling would predict → **f32 accumulation is only part of the floor**; ~1e-5 sits elsewhere (state truncation/K storage/residual measurement).
+
+3. Trace locks at ~1e-8 by iter ~25 and never degrades — trace is not the problem; R_I oscillation is.
+
+Next diagnostics queued by the notes: (a) f64 reference residual of best-K to separate "state at floor" vs "measurement noise", (b) McWeeny-endgame hybrid switch, (c) Kahan compensated SpGEMM for the endgame. Want me to continue with the McWeeny/static-switch hybrid variant next, or the f64 residual diagnostic?
+
+
+---
+
+
+
+
+
+
+# Chat GTP 5.6 sol
+
+Yes — I agree with you. **ACC4/8/16 is basically a dead end as a cure for the floor oscillation.** ACC16 is worth keeping only because it is faster per iteration on this GPU, not because it fixes convergence.
+
+The plot says something much more specific: all variants follow essentially the same trajectory until \(R_I\sim10^{-5}\), then enter the same sawtooth. Changing accumulation order shifts the minimum from roughly \(1.8\times10^{-5}\) to \(1.3\times10^{-5}\), but does not change the qualitative behavior at all. So the dominant problem is not summation-chain error.
+
+What you are seeing is actually very characteristic of **TC2 near a finite numerical floor**.
+
+For an occupied eigenvalue write
+
+$$
+\lambda_o=1-\delta,
+$$
+
+and for an unoccupied one
+
+$$
+\lambda_u=\epsilon.
+$$
+
+The two TC2 branches do opposite things:
+
+$$
+X\rightarrow X^2:
+\qquad
+\delta\rightarrow 2\delta,\qquad
+\epsilon\rightarrow\epsilon^2
+$$
+
+while
+
+$$
+X\rightarrow2X-X^2:
+\qquad
+\delta\rightarrow\delta^2,\qquad
+\epsilon\rightarrow2\epsilon.
+$$
+
+So one branch fixes the empty states while making the occupied-state error about twice as large; the other fixes occupied states while doubling the small empty-state error.
+
+Far above machine/truncation noise, alternating these branches works beautifully because over two steps both errors become quadratic.
+
+But once every multiplication injects some floor \(\eta\), you get roughly:
+
+$$
+\eta \rightarrow 2\eta \rightarrow \eta \rightarrow2\eta\ldots
+$$
+
+That is almost exactly the sawtooth in your figure.
+
+So **the oscillation is an intrinsic failure mode of trace-correcting TC2 at finite precision**. Making the product slightly more accurate merely changes \(\eta\). It does not remove the oscillatory mechanism.
+
+This also explains why the trace plot looks absurdly good while \(R_I\) dances: the trace is already locked to \(N_{\rm occ}\) at \(10^{-8}\)-relative accuracy, yet TC2 keeps choosing branches whose only remaining effect is to move numerical error between occupied and empty subspaces.
+
+## Therefore I would change the strategy
+
+Once
+
+$$
+|\mathrm{Tr}(KS)-N_{\rm occ}|/N_{\rm occ}
+$$
+
+is tiny and
+
+$$
+R_I\lesssim10^{-3}
+$$
+
+or perhaps \(10^{-4}\), **TC2 has finished its job**. It has established the correct rank and brought the spectrum close to \(\{0,1\}\).
+
+At that point stop using the trace-correcting polynomial.
+
+Switch to a polynomial that contracts **both sides simultaneously**.
+
+The obvious one is McWeeny:
+
+$$
+P' = 3P^2-2P^3.
+$$
+
+Near 0:
+
+$$
+\epsilon' \approx 3\epsilon^2,
+$$
+
+and near 1:
+
+$$
+\delta' \approx 3\delta^2.
+$$
+
+So there is no alternating “fix occupied / damage empty / fix empty / damage occupied” behavior.
+
+For your nonorthogonal K representation the corresponding expression is
+
+$$
+\boxed{
+K' = 3KSK - 2KSKSK
+}
+$$
+
+because multiplying by \(S\) gives the ordinary McWeeny polynomial for \(P=KS\).
+
+That is exactly what I would test next.
+
+And since it is only an **endgame correction**, I don't care if one McWeeny iteration costs twice as much as one TC2 iteration. Compare:
+
+```text
+current:
+25 useful TC2
++ 30–100 useless TC2
+
+proposed:
+25 useful TC2
++ perhaps 1–4 McWeeny
+```
+
+That is clearly preferable.
+
+---
+
+There are actually two separate performance fixes I would make now.
+
+**First: floor exit must become aggressive even without McWeeny.**
+
+The current W=8 detector is still too timid conceptually. Once trace is locked, I would track the sequence of local minima of \(R_I\). Your plot shows an obvious two/three-step periodic pattern. If, after entering the endgame, two or three branch cycles fail to improve the best residual substantially, restore the best K and quit.
+
+Something like:
+
+```text
+trace locked
+R_I < 1e-3
+
+best = current R_I
+
+for each next iteration:
+    if R_I < 0.9 * best:
+        best = R_I
+        save K
+        n_cycle_no_improve = 0
+
+    detect TC2 branch cycle
+
+    if 2–3 complete branch cycles without 10% improvement:
+        restore best K
+        NumericalFloor
+        STOP
+```
+
+I would prefer counting **complete TC2 branch cycles**, rather than arbitrary “8 iterations”.
+
+With the curves in your plot, TC2 should terminate around iteration ~30–35, not 80 or 150.
+
+**Second: switch to McWeeny instead of declaring the floor immediately.**
+
+For example:
+
+```text
+TC2 until:
+    trace locked
+    R_I < 1e-3
+
+then McWeeny:
+    max 3–5 iterations
+
+if McWeeny lowers R_I:
+    continue until improvement stalls
+
+otherwise:
+    restore best state and stop
+```
+
+This is much more physically/mathematically sensible.
+
+---
+
+### I would do the f64 diagnostic before Kahan
+
+The agent asked “McWeeny or f64 residual diagnostic?”
+
+I would do the **f64 diagnostic first, but only as a very quick diagnostic**, then immediately test McWeeny.
+
+Take the best ACC16 K around its \(1.3\times10^{-5}\) minimum and evaluate
+
+$$
+R_I=\frac{\|KSK-K\|}{\|K\|}
+$$
+
+once in CPU f64.
+
+That tells us whether:
+
+1. the **actual K** has residual \(1.3\times10^{-5}\), or
+2. K is considerably better and the f32 evaluation of \(KSK-K\) itself produces an artificial \(10^{-5}\) floor.
+
+This is worth knowing before implementing Kahan.
+
+If f64 gives, say,
+
+$$
+R_I^{64}\sim10^{-7},
+$$
+
+then there is almost nothing wrong with K: the residual diagnostic is lying at the f32 floor. Then definitely do **not** spend time making purification more accurate.
+
+If it gives
+
+$$
+R_I^{64}\sim10^{-5},
+$$
+
+then the state itself is at that floor, and McWeeny/Kahan/endgame precision can genuinely improve it.
+
+This should be a single diagnostic calculation, not a new production pathway.
+
+---
+
+## I would not implement Kahan yet
+
+ACC16 already provides an important clue.
+
+If simple summation error were dominant, cutting the accumulator chain from ~330 to ~82 terms should have produced a much larger improvement than
+
+$$
+1.78\times10^{-5}
+\rightarrow1.32\times10^{-5}.
+$$
+
+It didn't.
+
+Therefore Kahan might improve the last factor 1.5–3, but **it probably will not remove the TC2 oscillation**, because the polynomial itself creates it.
+
+So my current ordering is:
+
+1. **f64 residual of one saved best-K** — establish what the real floor is.
+2. **TC2→McWeeny hybrid** — this is the most important experiment.
+3. **aggressive cycle-aware floor termination** regardless of precision.
+4. Keep **ACC16** if its ~2× speedup is reproducible.
+5. Only then test **Kahan endgame** if McWeeny still hits an unacceptably high true residual.
+
+There is another diagnostic I would add almost for free: for the alternating endgame states, measure not only \(R_I\), but
+
+$$
+\Delta K_n =
+\frac{\|K_{n+1}-K_n\|}{\|K_n\|},
+$$
+
+and especially the actual observables:
+
+$$
+\Delta E,\qquad
+\Delta q_{\max},\qquad
+\Delta F_{\max}.
+$$
+
+Because for the Hessian, **force stability is ultimately what matters**, not whether an abstract idempotency metric is \(1.3\times10^{-5}\) or \(3\times10^{-6}\).
+
+If the force difference between the best TC2 states at iterations 28, 30, 32 is, say,
+
+$$
+10^{-7}\ {\rm Ha/\AA},
+$$
+
+then simply stopping at \(R_I\simeq1.5\times10^{-5}\) is entirely fine.
+
+If it is
+
+$$
+10^{-4}\ {\rm Ha/\AA},
+$$
+
+then the floor really matters for vibrations and we need to lower it.
+
+So I would tell the agent:
+
+> **Stop exploring ACC variants. Keep ACC16 only as a performance optimization. Run one f64 best-K residual check, then implement a TC2→McWeeny endgame switch and measure \(R_I\), \(\Delta K\), energy and force stability. TC2 must never spend tens of iterations in the sawtooth.**
+
+That is now much more strongly justified by your plot than Kahan is.
+
+
+
+
+---
+
+# USER
+
+OK, now sure I quite understand this results:
+
+---
+
+# SWE-2
+
+Fair — ACC8/16 moved the floor only ~25%, nowhere near useful. And you're right, I skipped Kahan which was the actual suggestion for the endgame. Let me answer the termination question, check the residual kernel's own accumulation, then implement Kahan.
+
+Why ACC16 stopped earlier: the plateau detector fires when `r_i > 10×best`. The sawtooth spikes are ~1e-4 absolute on all variants, but ACC16's *best* dips lower (1.3e-5) → the spike ratio crosses 10× sooner. ACC4's best stays ~1.7e-5 so the same spikes are only ~4× — it never trips and burns to iter 150.
+
+Check the residual-measurement kernel first — if it accumulates in plain f32, the *measured* floor is its own artifact:
+
+Residual kernel is a strided partial + f64 host finish — the measurement is fine; the floor lives in the f32 products themselves. Implementing Kahan-compensated accumulation in both plan kernels (the real GPT suggestion I skipped):
+
+Now the config flag:
+
+Kahan: floor **9.7e-6** — only ~1.8× better, not 2 orders. Important negative result: accumulation length is NOT the dominant floor source. Let me check the curve shape and the last-call data:
+
+The decisive facts now: Kahan cut the floor only 1.78e-5→9.7e-6 (~2×) — accumulation is a minor contributor. The remaining floor is the **TC2 map itself**: a period-2 limit cycle (sawtooth dips/spikes), i.e. a saddle the iteration can't sit on. That means the fix isn't more summation precision — it's a different endgame map. McWeeny is attracting rather than alternating, and `mcweeny_polish` already exists — let me wire a measure-and-polish path into the study.
+
+Now add the McWeeny-endgame hybrid inside `tc2_purify` — env-gated switch once trace-locked:
+
+REVIEW: `debug/tc2_conv_r10.png` `@/home/prokop/git/dftbplus/debug/tc2_conv_r10.png`
+
+Full variant ladder (cold purify, same H_scc, deg~330):
+
+| variant | min R_I | iters | character |
+|---|---|---|---|
+| ACC4 | 1.78e-5 | 150 | sawtooth dance |
+| ACC8 | 1.75e-5 | 119 | sawtooth |
+| ACC16 | 1.32e-5 | 81 | sawtooth, 2× faster/iter |
+| Kahan | 9.7e-6 | 39 | floor + trace runaway → abort |
+| **McWeeny endgame** | **5.4e-6** | 150 | **smooth monotone descent, no sawtooth** |
+| Kahan+McW | 5.4e-6 | 150 | identical |
+| ACC16+W8 | 1.52e-5 | 36 | early stop |
+
+Honest conclusions:
+
+1. **You're right — nothing here gives 2 orders.** The floor is ~5e-6–2e-5 regardless of summation scheme. Kahan proved it: near-exact products barely moved the floor → **the floor is a property of the map/state, not accumulation noise.**
+
+2. **Why ACC16 stopped earlier**: the plateau detector fires at `R_I > 10×best`. Spikes are ~1e-4 absolute on all variants; ACC16's best dips lower (1.3e-5) so the ratio crosses 10× sooner. ACC4's shallower best never trips it → burns to iter 150. The detector measures ratios, not the floor.
+
+3. **McWeeny endgame is qualitatively different**: once trace-locked, it descends monotonically (still slowly falling at 150 — hasn't converged, may reach ~4e-6). But its extra products use the *masked* kernel (no ACC/Kahan) and it doesn't conserve trace (flat ~2.5e-6 dev).
+
+4. To actually reach ~1e-7 the iteration needs f64 in the state (K in f64 for the last few steps) or a different fixed-point entirely — not better f32 summation. The residual measurement itself is honest (f64 host finish).
+
+Want me to (a) try an f64-state endgame on best-K (a few McWeeny/TC2 steps with K in f64 — diagnostic, RTX3090 f64 is slow but it's 3-5 iters), or (b) accept the ~5e-6 McWeeny floor and move back to the loop-level work?
+
+
+
+
+
+---
+
+# Chat GPT 5.6 sol
+
+Yes. The plot is useful, but I think the agent’s interpretation mixes together several different things. In particular, I **do not agree with the conclusion that “to get \(10^{-7}\) we need f64 state.”** The data do not establish that yet.
+
+The main message of the figure is simpler:
+
+$$
+\boxed{\text{TC2 is excellent for getting close to the projector, but bad as an endgame iteration in f32.}}
+$$
+
+And McWeeny looks like the right endgame map — but the McWeeny implementation/result is itself suspicious and needs one more diagnostic.
+
+### What the curves actually say
+
+Up to roughly iteration 22–24, every curve is almost identical. That is expected: TC2 is reducing a large spectral error from \(10^{-1}\) down toward \(10^{-4}\), and floating-point details are irrelevant there.
+
+Then TC2 reaches the regime where
+
+$$
+\operatorname{Tr}(KS)\approx N_{\rm occ}
+$$
+
+essentially perfectly. From this point the branch alternates between
+
+$$
+K\rightarrow KSK
+$$
+
+and
+
+$$
+K\rightarrow2K-KSK.
+$$
+
+Near an ideal projector, write occupied eigenvalues as \(1-\delta\) and empty ones as \(\epsilon\). The two branches behave approximately as
+
+$$
+KSK:\qquad
+\delta\rightarrow2\delta,\quad
+\epsilon\rightarrow\epsilon^2,
+$$
+
+and
+
+$$
+2K-KSK:\qquad
+\delta\rightarrow\delta^2,\quad
+\epsilon\rightarrow2\epsilon.
+$$
+
+So once you have a finite arithmetic error \(\eta\), the endgame naturally becomes something like
+
+$$
+\eta \rightarrow 2\eta \rightarrow \eta \rightarrow2\eta\ldots
+$$
+
+That is your sawtooth.
+
+So ACC4/8/16/Kahan cannot fundamentally fix this. They only change the size of \(\eta\).
+
+That is exactly what the plot shows:
+
+$$
+1.8\times10^{-5}
+\rightarrow1.3\times10^{-5}
+\rightarrow9.7\times10^{-6}
+$$
+
+as summation gets better, **but the TC2 sawtooth survives**.
+
+Therefore I agree with you: further ACC variants are not interesting for convergence. ACC16 may still be worth keeping because it happens to be faster, but that is a separate performance optimization.
+
+---
+
+## McWeeny is the genuinely interesting result
+
+The brown/purple McWeeny curves behave qualitatively differently:
+
+$$
+R_I \text{ decreases monotonically}
+$$
+
+instead of oscillating.
+
+That is precisely what we expected from
+
+$$
+K' = 3KSK-2KSKSK.
+$$
+
+Equivalently, for \(P=KS\),
+
+$$
+P'=3P^2-2P^3.
+$$
+
+Near 0 or 1 both errors are contracted simultaneously:
+
+$$
+\epsilon' \approx 3\epsilon^2,
+\qquad
+\delta' \approx3\delta^2.
+$$
+
+No trace-dependent branch alternation.
+
+So I would now regard the intended algorithm as
+
+$$
+\boxed{
+\text{TC2 for global spectral/rank convergence}
+\quad\longrightarrow\quad
+\text{McWeeny for the endgame}.
+}
+$$
+
+TC2 should probably stop somewhere around \(R_I=10^{-3}\)–\(10^{-4}\), once trace/rank are firmly locked. It should **never enter that long \(10^{-5}\) sawtooth in production**.
+
+---
+
+# But there is something wrong with the McWeeny result too
+
+This is the part I think the agent missed.
+
+Look at McWeeny after the switch. It goes roughly
+
+$$
+10^{-5}\rightarrow8\times10^{-6}\rightarrow7\times10^{-6}\rightarrow\cdots
+\rightarrow5\times10^{-6}
+$$
+
+over **more than 100 iterations**.
+
+That is absolutely not what I would expect from an accurate McWeeny iteration.
+
+If the projector error really were \(10^{-5}\), quadratic convergence should give approximately
+
+$$
+10^{-5}
+\rightarrow
+O(10^{-10})
+$$
+
+in one iteration, and then essentially machine precision.
+
+Obviously the matrix residual isn't literally a single eigenvalue error, but the difference is much too large to explain the observed glacial convergence.
+
+So:
+
+> **McWeeny has removed the TC2 limit cycle, but each McWeeny step is apparently injecting a new error of order \(10^{-6}\)–\(10^{-5}\).**
+
+We need to identify that error. I would not accept the \(5\times10^{-6}\) line as a fundamental f32-state floor.
+
+---
+
+## And I see a very plausible reason in the implementation you attached
+
+Your new planned SpGEMM kernels have the ACC16/Kahan machinery.
+
+But the McWeeny kernel itself is merely:
+
+```c
+Knew = 3*Q - 2*V;
+```
+
+with
+
+$$
+Q=KSK,\qquad V=KSKSK.
+$$
+
+So the precision is determined by **how Q and V are constructed**, not by `bsr4_mcweeny()`.
+
+According to the agent's own report:
+
+> “its extra products use the masked kernel (no ACC/Kahan)”
+
+That means `Kahan+McW` being identical to `McW` is basically guaranteed!
+
+It does **not** demonstrate that Kahan is irrelevant to McWeeny.
+
+Your older masked Bsym SpGEMM uses a single accumulator:
+
+```c
+float sum = 0;
+
+while (...) {
+    sum = fma(..., sum);
+    sum = fma(..., sum);
+    sum = fma(..., sum);
+    sum = fma(..., sum);
+}
+```
+
+whereas your planned kernel has the 4/8/16/Kahan summation machinery.
+
+So McWeeny may currently be doing its endgame through the **least accurate multiplication implementation in the whole solver**.
+
+That is the first thing I would fix.
+
+You already have the required plans:
+
+$$
+K S \rightarrow T,
+$$
+
+$$
+T K \rightarrow Q,
+$$
+
+then exactly the same structural operations for
+
+$$
+Q S \rightarrow T_2,
+$$
+
+$$
+T_2 K\rightarrow V.
+$$
+
+The same `plan_ks` / `plan_tk` type machinery can be reused.
+
+Then test:
+
+```text
+McW + planned ACC16
+McW + planned Kahan
+```
+
+for perhaps only 5–10 iterations.
+
+If McWeeny is working properly, I would expect a dramatic drop within the first few steps, not 150 iterations.
+
+---
+
+# The statement “residual measurement is fine” is also too strong
+
+The agent says:
+
+> “Residual kernel is a strided partial + f64 host finish — the measurement is fine.”
+
+Only the **final summation of the norm** is high accuracy.
+
+To calculate
+
+$$
+R_I =
+\frac{\|KSK-K\|}{\|K\|}
+$$
+
+you first need \(KSK\).
+
+If \(KSK\) was generated by an f32 SpGEMM, then the residual contains the numerical error of that multiplication before the f64 reduction even begins.
+
+A perfect f64 summation of inaccurate f32 terms does not tell you the true residual of the stored K.
+
+So I still strongly want the one-off CPU-f64 check:
+
+$$
+K_{\rm f32}
+\overset{\text{download}}{\longrightarrow}
+(KSK-K)_{\rm CPU,f64}.
+$$
+
+No need for a production f64 solver. Just one diagnostic.
+
+Suppose the GPU reports
+
+$$
+R_I^{GPU}=5\times10^{-6}.
+$$
+
+If CPU f64 says
+
+$$
+R_I^{64}=3\times10^{-7},
+$$
+
+the state is already good and we're mostly measuring SpGEMM noise.
+
+If instead CPU f64 also gives
+
+$$
+R_I^{64}\approx5\times10^{-6},
+$$
+
+then the stored state itself contains that error.
+
+That distinction is still unresolved.
+
+---
+
+# There is another suspicious clue: the dummy orbitals
+
+I would definitely investigate this before reaching any conclusion about an f32 floor.
+
+Your previous Hessian run ended with:
+
+> `dummy |D_ii| sum=2.396e-5`
+
+and aborted because dummy padded orbitals were getting occupied.
+
+Notice the scale:
+
+$$
+2.4\times10^{-5}.
+$$
+
+That is remarkably close to the TC2 floor we have been arguing about.
+
+Also, the earlier R10 log had 330 atoms but only 918 physical orbitals, so the plot title “330 Si” is misleading — this system contains hydrogen and therefore many padded dummy BSR4 lanes.
+
+I would compute the idempotency residual decomposed into:
+
+$$
+R_I^{\rm physical}
+$$
+
+using only physical orbital lanes, and
+
+$$
+R_I^{\rm dummy}
+$$
+
+or simply the Frobenius contribution involving any dummy orbital.
+
+If most of the \(10^{-5}\) floor lives in dummy lanes, then neither Kahan nor f64 is the fundamental problem. We have a **padding/algebra contamination bug**.
+
+Given that the force code already detected dummy occupancy at essentially exactly this scale, this is now a high-priority diagnostic.
+
+---
+
+## The McWeeny trace drift is another clue
+
+The lower panel shows that McWeeny develops approximately
+
+$$
+\frac{|\operatorname{Tr}P-N_{\rm occ}|}{N_{\rm occ}}
+\sim10^{-6}.
+$$
+
+The agent treats that as “McWeeny doesn't conserve trace”.
+
+Formally true, but near an already excellent projector the trace change of exact McWeeny should be second order.
+
+Starting around \(R_I\sim10^{-5}\), I would expect much less than \(10^{-6}\) systematic drift unless numerical errors are being injected by the products.
+
+So the trace plateau is another reason I think the present McWeeny multiplication is limiting the result.
+
+Do **not** blindly rescale K every McWeeny step either. If
+
+$$
+K\rightarrow\alpha K
+$$
+
+to restore trace, that itself destroys exact idempotency by \(O(|\alpha-1|)\) and can establish a new floor.
+
+For now just monitor trace and tolerate a tiny drift.
+
+---
+
+# There is an even cleaner production variant: McWeeny in P-space
+
+Because you already implemented \(P=KS\), I think the final production form might be even cheaper.
+
+Once TC2 has locked the occupation, you already have
+
+$$
+P=KS.
+$$
+
+Then McWeeny is simply
+
+$$
+Q=P^2,
+$$
+
+$$
+R=QP=P^3,
+$$
+
+$$
+\boxed{P_{\rm new}=3Q-2R}.
+$$
+
+That is only **two SpGEMMs per McWeeny step**, rather than the K-space form:
+
+$$
+KS,\quad(KS)K,\quad(KSK)S,\quad(KSKS)K
+$$
+
+which needs four.
+
+And no metric algebra is inside the polynomial anymore.
+
+After two or three P-McWeeny iterations:
+
+$$
+K=PZ
+$$
+
+once, for forces.
+
+You already have the generic `plan_pp` infrastructure for P², so this is not a completely new solver.
+
+I would probably first debug the existing K-McWeeny because it is easier to compare directly. But if it works, **P-space McWeeny is likely the better production endgame**.
+
+---
+
+## So I would interpret the table like this
+
+| variant                                | what it actually tells us                                                                                     |
+| -------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| ACC4/8/16                              | summation reassociation slightly changes the f32 error, but **does not cure TC2 endgame oscillation**         |
+| Kahan                                  | f32 accumulation contributes perhaps a factor ~2, but is **not the main TC2 pathology**                       |
+| McWeeny                                | **correct conceptual solution to TC2 sawtooth**                                                               |
+| Kahan+McW identical                    | currently almost meaningless if McW products bypass the Kahan planned kernel                                  |
+| McW slowly reaching \(5\times10^{-6}\) | **not satisfactory and not evidence of a fundamental f32 limit**; something injects error every McW iteration |
+
+And I would give the agent this immediate order:
+
+1. **Stop ACC studies.** Keep ACC16 only if its performance advantage is reproducible.
+2. Run the one-shot **CPU-f64 residual of saved K**.
+3. Decompose \(R_I\) into **physical and dummy-orbital contributions**.
+4. Make McWeeny use the **planned SpGEMM path**, first ACC16 and then Kahan.
+5. Run only ~5–10 McWeeny steps and plot each one.
+6. If accurate McWeeny still decreases only linearly from \(10^{-5}\), there is an algebra/implementation bug; do not hide it by running 150 iterations.
+7. Only after that decide whether any f64 endgame is needed.
+8. If McWeeny works, consider the cheaper **P-space McWeeny** with two products/iteration.
+
+The most important disagreement I have with the agent is therefore this sentence:
+
+> “To actually reach ~1e-7 the iteration needs f64 in the state.”
+
+**No — that is not established.** Proper McWeeny should converge much more aggressively than this. Before paying for f64, I would find out why your supposedly quadratically convergent endgame is crawling from \(10^{-5}\) to \(5\times10^{-6}\) over 100 iterations. That is the anomaly in this new plot.
+
+
+
+---
+
+# USER
+
+the AI implemented what you said but perhaps badly TRS4 converge faster (less iterrations) to 1e-5 but never get significantly better.
+
+Seems like there it no way aroun numerical accuracy 
+
+
+Proceeding with the ordered list — F64-DIAG and DUMMY-DECOMP first (both cheap and decisive).
+
+(Those were completed — the list now tracks remaining work.) Find how per-atom orbital counts are stored:
+
+`atom_n_orb` is on the engine. Check `bsr_values_to_dense` signature, then write the diagnostic:
+
+Add the call to the study script and rebuild:
+
+Decisive result:
+
+- **f64 true residual: 4.15e-5** — the stored state is ~2.3× *worse* than the f32 measurement showed (GPT's Case B: state at floor, not measurement noise).
+- **dummy lanes: exactly 0.000e0** — no padding contamination; the floor is entirely physical.
+- Trace exact: 459.000025.
+
+So K can genuinely improve ~2 orders — the iterate noise is real and removable by a better map. Next: MCW-PLAN — the McWeeny products currently run on the masked kernel (no ACC/Kahan). `Q·S` and `(QS)·K` are structurally identical to `K·S` and `T·K` — the existing plans can be reused. Check the workspace structures/buffers:
+
+The structures line up perfectly: `plan_ks` (M_K × S → M_TKS) applies to `Q·S`, `plan_tk` (M_TKS × M_K → M_K) applies to `U·K`. Even better — the current McWeeny truncates `Q·S` into an M_K buffer (`z_on_k`), which is wrong-shaped; using `t_ks` (M_TKS) is correct. Rewire the endgame branch:
+
+Planned McWeeny fixed the trace drift (459.00003 vs 459.0004 — the M_K truncation of U was real) but R_I floor unchanged at 5.4e-6. Now planned + Kahan:
+
+Planned + Kahan McWeeny: identical 5.35e-6 floor, f64 residual 1.42e-5. So GPT's masked-kernel hypothesis is also refuted — the glacial descent isn't product accuracy. 
+
+There's a deeper explanation worth noting: **a polynomial of K can never rotate K's eigenbasis** — `K'=f(K)` preserves eigenvectors exactly. The residual floor is dominated by subspace-rotation error (off-diagonal occ↔unocc blocks), where the McWeeny linearization `E→P*E+EP*−2P*EP*` leaves E_ou/E_uo **unchanged** at linear order — marginal, contracting only through higher-order terms. That predicts exactly the observed glacial asymptote.
+
+The last cheap variant is P-space McWeeny (`P'=3P²−2P³` via `plan_pp`). Check the P-purifier:
+
+P-space purifier already exists with `plan_pp`, `q_p2`, `r_p4` buffers — P-McWeeny is a small addition. Check the P0 entry point:
+
+Adding the same endgame switch + history recording to `tc2_purify_p` (P-space):
+
+`ri_now` doesn't exist in the P variant — add it:
+
+Make `purify_cold` dispatch on the purifier mode so the study covers P-space and TRS4 too:
+
+TRS4 is also worth overlaying — check its loop for where to add hist recording:
+
+Add history recording to TRS4 too:
+
+P-space reaches R_I(P)=5.6e-6 but the **recovered K is 7e-5** — K=PZ recovery via approximate Z adds error. Now P+McWeeny and TRS4:
+
+All variants collected. Regenerate the plot including P-space and TRS4:
+
+The complete picture is now in. Update the docs with the results and the real mechanism, then report:
+
+Done — the study is complete and the docs reflect it. Final plot: `@/home/prokop/git/dftbplus/debug/tc2_conv_r10.png`
+
+**Results of the ordered list:**
+
+| diagnostic | result |
+|---|---|
+| F64-DIAG | True K residual **4.1e-5** (TC2) / **1.4e-5** (K+McW) — f32 measurement *underestimates* 2.6×; state is genuinely at the floor |
+| DUMMY-DECOMP | dummy lanes **exactly 0** — floor is 100% physical, no padding bug |
+| MCW-PLAN | Products rerouted to planned kernels; **found+fixed a real bug**: U=Q·S was truncated onto M_K (now M_TKS) — trace drift 4.4e-7→7e-8. Floor unchanged → product accuracy isn't the limiter |
+| P-space | P-TC2/TRS4 reach ~6e-6 on P, but **K=PZ recovery loses it** (7–8e-5). P-McWeeny drifts *upward* (non-normal iterate) — rejected |
+
+**The mechanism (why nothing reaches 1e-7):** every polynomial purifier is *marginally stable in the occ↔unocc mixing direction* — linearizing at the target projector, E_ou satisfies L(E_ou)=E_ou exactly for both TC2 branches AND McWeeny. It contracts only through O(E²) coupling → the glacial tail. This is the same root cause as the failed warm-DM: **no polynomial of K can rotate the occupied subspace.**
+
+So the options converge:
+
+- **(a)** Accept the floor (~5e-6 measured / 1.4e-5 true) — physics cost already bounded at ~6 cm⁻¹ rms (fixq-vs-SCC), and return to loop-level work (batching, per-eval speed).
+- **(b)** Implement the H-aware endgame — LNV/commutator descent minimizing ‖[K,H]‖. This is the *only* lever on E_ou and it's the same missing piece as G3 warm-DM — one design fixes both.
+
+My recommendation: (b) is where both threads meet — a commutator-minimizing polish would fix the floor *and* enable the warm path. Want me to pursue it?
+
+
+---
+
+
+
+
+
+# Chat GPT 5.6 sol
+
+Yes — this new result makes me much more willing to say that **there really is a numerical-precision floor in the current f32 representation**. TRS4 reaching essentially the same \(10^{-5}\)-class floor by a very different trajectory is strong evidence: changing the polynomial changes how quickly you arrive, but not where you end up.
+
+However, I disagree with one important part of the agent’s explanation:
+
+> “the remaining floor is occ↔unocc subspace-rotation error, and therefore H-aware commutator descent is the only fix”
+
+That does **not** follow from these results, and mathematically it is suspicious.
+
+For a projector \(P\), an infinitesimal occupied↔unoccupied rotation is a tangent motion along the manifold of projectors. A rotated projector can still satisfy
+
+$$
+P^2=P
+$$
+
+exactly. Linearizing the idempotency defect,
+
+$$
+(P+E)^2-(P+E)
+\simeq PE+EP-E,
+$$
+
+an occ↔unocc block \(E_{ou}\) actually cancels at first order. So subspace rotation is exactly the kind of error that McWeeny does **not** correct — but it is also not what should produce a first-order idempotency residual.
+
+In other words:
+
+$$
+\boxed{\text{stationarity error and idempotency error are different problems.}}
+$$
+
+An H-aware commutator/LNV update is absolutely needed for the **warm-DM problem**, because the old projector must rotate toward the eigenspace of the new displaced Hamiltonian. But it has not yet been demonstrated to be the cure for this cold-purification \(R_I\sim10^{-5}\) floor.
+
+### What the new tests really establish
+
+You now have several quite independent algorithms:
+
+* TC2: sawtooth at the floor.
+* TRS4: arrives faster, same floor.
+* McWeeny: removes the sawtooth, but settles/crawls at roughly the same scale.
+* ACC16: changes floor modestly.
+* Kahan: changes floor only roughly another factor of two.
+* Planned McWeeny / corrected intermediate support: fixes a real trace bug, but not the floor.
+* CPU-f64 evaluation says the **stored f32 K itself** has a true residual \(1.4\times10^{-5}\) after McWeeny, not \(10^{-7}\).
+* Dummy lanes contribute zero.
+
+Taken together, I think the simplest hypothesis is now:
+
+$$
+\boxed{\text{the f32 matrix state + repeated f32 matrix algebra impose a }10^{-5}\text{-class floor for this large matrix.}}
+$$
+
+That is much more plausible now than it was two experiments ago.
+
+And there is a very clean experiment that will settle it conclusively.
+
+## Do one f64-state McWeeny diagnostic now
+
+Take exactly the best stored f32 \(K\), convert it once to f64, use the same \(S\) values converted to f64, and perform:
+
+$$
+Q=KSK,
+$$
+
+$$
+V=QSK,
+$$
+
+$$
+K'=3Q-2V
+$$
+
+**entirely in f64**, including storing the new K in f64.
+
+Do 3–5 iterations. No H, no SCC, no GPU optimization. CPU dense is perfectly fine for this diagnostic at 918 orbitals.
+
+Plot the true f64
+
+$$
+R_I^{64}
+$$
+
+after each step.
+
+There are only two interesting outcomes.
+
+If you get something like
+
+$$
+1.4\times10^{-5}
+\rightarrow10^{-9}
+\rightarrow10^{-14},
+$$
+
+then the case is closed: **f32 precision is the floor**. No commutator descent is needed to explain cold purification.
+
+If instead you get
+
+$$
+1.4\times10^{-5}
+\rightarrow1.1\times10^{-5}
+\rightarrow9\times10^{-6}\ldots
+$$
+
+then something much deeper is wrong with the algebra/matrix representation, because exact McWeeny should not behave like that on an ordinary near-projector.
+
+I expect the first outcome.
+
+---
+
+### I would also measure \(R_H\) separately
+
+You already have the stationarity diagnostic roughly of the form
+
+$$
+R_H=
+\frac{\|HKS-SKH\|}{2\|HKS\|}.
+$$
+
+This is precisely the quantity that detects the occupied-subspace orientation relative to H.
+
+So instead of trying to infer everything from \(R_I\), report both:
+
+$$
+R_I=\frac{\|KSK-K\|}{\|K\|},
+\qquad
+R_H=\frac{\|HKS-SKH\|}{\ldots}.
+$$
+
+Then the interpretation is clean:
+
+| result                    | diagnosis                                         |
+| ------------------------- | ------------------------------------------------- |
+| \(R_I\) bad, \(R_H\) good | precision/idempotency problem                     |
+| \(R_I\) good, \(R_H\) bad | wrong occupied subspace → H-aware rotation needed |
+| both bad                  | both problems                                     |
+| both good                 | stop iterating                                    |
+
+This is especially important for the Hessian warm-start work.
+
+---
+
+## TRS4 may nevertheless be useful
+
+The pink TRS4 curve is actually interesting. It gets from the initial state to the \(10^{-5}\) region much faster in terms of **iteration count** than TC2.
+
+But don't compare iteration counts. Compare:
+
+$$
+\text{number of SpGEMMs}
+$$
+
+and actual GPU wall time.
+
+If one TRS4 iteration costs two matrix products while TC2 costs one, then 12 TRS4 iterations versus 24 TC2 iterations may be a wash.
+
+If it is still faster in wall time, then a sensible cold solver might simply be:
+
+$$
+\boxed{\text{TRS4 fast approach} \rightarrow \text{precision endgame}}
+$$
+
+rather than TC2 at all.
+
+The important observation from the plot is that there is no reason to run **any** f32 polynomial purifier beyond approximately where TRS4 reaches its minimum. They all hit the same wall.
+
+---
+
+# If f64 is necessary, we still absolutely should not make the whole solver f64
+
+This is the engineering point I would emphasize.
+
+Suppose the diagnostic confirms that f32 bottoms out at \(10^{-5}\). That does **not** imply:
+
+> convert sparse DFTB to double precision.
+
+Instead use mixed precision in phases:
+
+$$
+\text{f32 fast purification}
+\rightarrow
+R_I\sim10^{-4}\text{--}10^{-5}
+\rightarrow
+\text{1--3 high-precision polish steps}.
+$$
+
+The expensive precision should only touch the last few matrix products.
+
+On the RTX 3090 native fp64 is horrible, yes. But compare the costs correctly.
+
+Current pathological solver:
+
+$$
+50\text{--}150
+$$
+
+f32 purification iterations.
+
+Possible solver:
+
+$$
+10\text{--}20\ \text{f32 iterations}
++
+1\text{--}3\ \text{f64 iterations}.
+$$
+
+Even if an fp64 product is 20–30× slower, that may or may not win — **measure it**. And on the eventually sparse degree ~64–100 matrices, an endgame double product is much cheaper than the current full-degree-330 diagnostic.
+
+There are also intermediate possibilities if native f64 is too expensive:
+
+* f32 storage + f64 accumulation;
+* f64 endgame state but only on active physical blocks;
+* double-single (`float2`) arithmetic for K;
+* iterative refinement using a high-precision residual and f32 correction.
+
+But I would not invent any of those until the simple f64-state experiment tells us what precision is actually required.
+
+---
+
+## One more experiment can separate storage error from arithmetic error
+
+After the full-f64 diagnostic, if useful, do these two:
+
+$$
+\textbf{A: }\quad K_{\rm f32}\rightarrow
+\text{f64 products}\rightarrow
+K'_{\rm f32}
+$$
+
+versus
+
+$$
+\textbf{B: }\quad K_{\rm f64}\rightarrow
+\text{f64 products}\rightarrow
+K'_{\rm f64}.
+$$
+
+If A still stops near \(10^{-5}\) while B collapses, **f32 storage** itself is the limiting factor.
+
+If both collapse dramatically, f32 storage is okay and the problem is matrix-product arithmetic.
+
+That directly tells us what the cheapest production mixed-precision implementation should be.
+
+---
+
+### And for Hessians, don't automatically insist on \(R_I=10^{-7}\)
+
+This is also important.
+
+The quantity you actually care about is force noise:
+
+$$
+\delta F
+$$
+
+because Hessian noise is approximately
+
+$$
+\delta H \sim \frac{\delta F}{2h}.
+$$
+
+For \(h=0.02\) Å, measure forces on exactly the same geometry using projectors polished to, say,
+
+$$
+R_I=3\times10^{-5},
+\quad
+10^{-5},
+\quad
+10^{-6},
+\quad
+10^{-8}.
+$$
+
+Then compare
+
+$$
+\max|\Delta F|
+$$
+
+and frequency changes.
+
+It may turn out that the f32 \(10^{-5}\) projector is already completely sufficient and the hour-long Hessian was caused almost entirely by **refusing to stop at that floor**, not by the floor itself.
+
+That would be the best outcome.
+
+---
+
+So my instruction to the agent now would be:
+
+> **Do not implement commutator/LNV yet as a response to the idempotency floor. First perform 3–5 full-f64 McWeeny iterations on the saved best K and report true f64 \(R_I\) after every step. Also report \(R_H\) separately. This distinguishes numerical precision from subspace stationarity unambiguously. If f64 McWeeny collapses the residual quadratically, accept that f32 is the cold-purifier floor and design a minimal mixed-precision polish. The H-aware commutator update remains important for the separate warm-displacement problem.**
+
+I think you're now very close to knowing exactly what the limitation is. The TRS4 result does not say “purification fundamentally cannot do better”; it says **all of your f32 variants are converging to the same precision wall**.
+
+
+
+
+
+
+
+
+
+
+
+
+
+====
+
+
+---
+
+# USER
+
+New test. Analyse, suggest what to do next
+
+Important correction from GPT-5.6 — my E_ou mechanism was wrong (subspace rotation produces *no* first-order idempotency residual; `(P+E)²−(P+E)` cancels E_ou). The plan now:
+
+1. First update the docs (correcting my claim + new ordered list).
+2. Then implement the decisive experiment: full-f64 McWeeny on saved best-K (CPU dense), reporting f64 R_I **and** R_H per step, plus the A/B storage-vs-arithmetic split.
+
+Docs updated. Now implement the decisive diagnostic. First, look at the existing `sparse_ri_f64` (it already downloads K/S and does dense f64 products) and find an H_scc host-download path for R_H:
+
+`ri_f64_diag` exists with the dense-f64 machinery. Now check how to download the device `h_scc` values for the R_H diagnostic:
+
+Now let me check how the TC2 history CSV gets written and where `purify_now` lives, so the new diagnostic fits the existing pattern:
+
+Now I'll write the diagnostic. First check whether rayon (or a host matmul helper) is available — dense 1320³ f64 needs to be fast enough to stay under the 30 s cap:
+
+`ri_f64_diag` gives me the pattern. Check the rhai wrapper style and `ws.gpu()` accessor signature:
+
+Add the `mcw_f64_diag` diagnostic after `ri_f64_diag`:
+
+Now add the `matmul_f64_mt` helper — put it near other free functions in the file:
+
+Now the rhai wrapper + registration:
+
+Now build:
+
+Build clean. Now look at the study script to wire the diagnostic after the McWeeny run (whose best-K is the stored state):
+
+McWeeny endgame is `RUST_DFTB_TC2_MCW=1`. Now update the script — to stay under the 30 s cap I'll gate variants B/A on an env var so each invocation is bounded:
+
+No env/args in rhai — simplest is both variants in the script with n_steps=4; each should be ~10 s threaded. Update the script:
+
+Run the study with McWeeny endgame active (stored K = the best ~1.4e-5 state) and the f64 hist CSV:
+
+**Decisive result — case closed:**
+
+```
+variant B (all-f64):  1.419e-5 → 4.00e-9 → 2.2e-15 → 8e-16   (quadratic collapse to machine eps)
+variant A (f32 store, f64 products):  1.419e-5 → 2.0e-8 → 1.5e-8 → 1.3e-8  (stalls at f32 storage quantization)
+```
+
+This is exactly GPT's predicted outcome #1: **f32 precision is the floor** — the map is fine, McWeeny converges quadratically once arithmetic is clean. And the A/B split shows the stored-state floor (~1.4e-5) is *product-arithmetic* noise: with f64 products, f32 storage alone reaches 1.3e-8 — **~1000× below the current floor with just 1–2 polished products**. R_H=9.2e-2 is large but this H_scc only saw 4 SCC mixers (rms 5e-2) — subspace orientation can't be judged from this run.
+
+Let me check the CSV and update the plot:
+
+Add an optional third panel for the f64-MCW decisive test:
+
+All CSVs are in /tmp. Regenerate the plot with the f64 panel:
+
+The plot is decisive. Update the manifest/tasks with the measured results:
+
+Merge the now-answered duplicate item:
+
+Done. The decisive test answered the question GPT-5.6 posed — and it changes the plan slightly: **LNV/commutator descent is NOT the fix for this floor** (subspace rotation produces no first-order R_I — my earlier mechanism was wrong, corrected in the manifest). It's still needed for warm-DM, but the floor itself is pure f32 arithmetic.
+
+**F64-MCW decisive test results** (`sparse_mcw_f64`, host f64 dense, stored best-K):
+
+| step | B: all-f64 R_I | A: f32-store R_I |
+|---|---|---|
+| 0 | 1.42e-5 | 1.42e-5 |
+| 1 | **4.0e-9** | 2.0e-8 |
+| 2 | **2.2e-15** | 1.5e-8 |
+| 4 | 7.9e-16 | 1.3e-8 |
+
+REVIEW: `debug/tc2_conv_r10.png` (3rd panel) `@/home/prokop/git/dftbplus/debug/tc2_conv_r10.png`
+
+**What this proves:**
+
+1. **f32 precision IS the floor** — all-f64 McWeeny collapses quadratically to machine eps in 2 steps. The map and algebra are healthy; no bug.
+2. **A/B split**: f32 storage alone supports ~1.3e-8 — the observed ~1e-5 floor is accumulated *product-arithmetic* noise, killed by ONE f64 product.
+3. **Production implication**: `f32 purify to ~1e-5 → 1–2 high-precision-product McWeeny steps (keep f32 storage) → ~1e-8` — ~1000× improvement for the cost of a few endgame products. GPU-f64 or double-single (f32x2) accumulation in the planned kernel are the candidate implementations.
+4. R_H=9.2e-2 here is meaningless for the subspace question — that H_scc had only 4 unconverged SCC mixers; needs a converged H_scc rerun before warm-DM work.
+
+Docs updated: manifest §4.12.2 round-2 checklist + G6 tasks. New open items: MIXED-POLISH implementation, R_H on converged H_scc, TRS4-vs-TC2 cost, and the force-noise-vs-polish study (which may show 1e-5 already suffices for Hessians).
+
+Next step candidates, your call: (a) implement the double-single/f64-product polish path, or (b) force-noise study first to decide if we even need it.
+
+---
+
+# Chat GPT 5.6 sol
+
+This is now a genuinely decisive result. The third panel answers the precision question much more cleanly than all the ACC/Kahan/TRS4 experiments.
+
+The key observation is:
+
+$$
+R_I:1.42\times10^{-5}
+\overset{\rm all\ f64}{\longrightarrow}
+4.0\times10^{-9}
+\longrightarrow2\times10^{-15},
+$$
+
+whereas with **f32 storage but f64 products**
+
+$$
+1.42\times10^{-5}
+\rightarrow2.0\times10^{-8}
+\rightarrow1.3\times10^{-8}.
+$$
+
+So the diagnosis is:
+
+$$
+\boxed{\text{f32 storage is fine; ordinary f32 matrix products are the problem.}}
+$$
+
+That is actually an excellent outcome. We do **not** need an f64 density matrix, and we do not need to redesign the purification mathematics. One high-precision McWeeny step already buys almost three orders of magnitude.
+
+There are two important caveats before implementing anything large.
+
+First, this decisive experiment was deliberately done at **deg ≈ 330, essentially full support**. That isolates arithmetic very nicely, but it is not the solver we ultimately want. The next absolutely critical experiment is the same test on the real sparse pbc mask, around degree 64–100. There the result could instead be
+
+$$
+10^{-5}\rightarrow10^{-5}
+$$
+
+even in f64 because the **mask**, rather than arithmetic, has become the floor. We must distinguish these before spending effort on a mixed-precision GPU kernel.
+
+Second, the large \(R_H\sim 0.09\) in this plot tells us nothing yet because, as the agent notes, this \(H_{\rm SCC}\) was not actually converged. Idempotency and Hamiltonian stationarity remain two separate issues.
+
+## What I would do next
+
+1. **Repeat the f64-McWeeny A/B experiment at the actual production sparsity.** Use pbc with the intended \(M_K\), e.g. degree ~95 and then perhaps ~64 if you are still pursuing that. This experiment should use exactly the same sparse mask in the CPU-f64 products, i.e. product → projection to \(M_K\) at every stage, so it measures the true sparse algebra rather than a dense reference. If it still gives \(10^{-5}\rightarrow10^{-8}\), mixed precision is unquestionably worth implementing. If it stalls around \(10^{-5}\), the remaining error is structural truncation and no amount of arithmetic precision will fix it.
+
+2. **Before implementing a production GPU precision kernel, do the force-noise test with the existing CPU-f64 polish.** This is much more important than making \(R_I\) pretty. On one fully SCC-converged geometry, and then on perhaps 3–6 representative \(+h/-h\) displacements, compare forces from:
+
+   * normal f32 state at \(R_I\sim10^{-5}\);
+   * one f64-product/f32-store McWeeny polish, \(R_I\sim10^{-8}\);
+   * optionally all-f64 polished reference.
+
+   Compare
+
+   $$
+   \Delta F = F_{\rm polished}-F_{\rm f32}
+   $$
+
+   and, more importantly,
+
+   $$
+   \Delta H_i=
+   -\frac{\Delta F(+h)-\Delta F(-h)}{2h}.
+   $$
+
+   Use one bulk Si, one surface Si, and one H if applicable. This tells us directly whether the \(10^{-5}\) projector floor matters for vibrations.
+
+3. **If polishing matters, implement the simplest mixed-precision kernel first: f32 storage/input, f64 accumulation, f32 output.** Do not implement full-f64 matrices. Since every f32 number is represented exactly in f64 and a product of two f32 significands fits within f64 precision, this gets almost exactly the arithmetic used by your successful “A” diagnostic:
+
+   ```c
+   double s0=0, s1=0, s2=0, s3=0;
+   s0 = fma((double)a0, (double)b0, s0);
+   ...
+   C[...] = (float)((s0+s1)+(s2+s3));
+   ```
+
+   Compile it as a separate **polish-only** planned SpGEMM kernel.
+
+4. **Do not use that kernel throughout TC2/SCC.** The correct production scheme is roughly
+
+   $$
+   \text{fast f32 TRS4/TC2}
+   \rightarrow R_I\sim10^{-4}\text{--}10^{-5}
+   \rightarrow
+   \boxed{\text{one mixed-precision McWeeny polish}}
+   $$
+
+   at the final electronic state. Your experiment says one polish may already be enough:
+
+   $$
+   1.4\times10^{-5}\rightarrow2\times10^{-8}.
+   $$
+
+   A second polish gives almost nothing because f32 storage then becomes the \(10^{-8}\) floor.
+
+5. **Only if native fp64 accumulation is too slow on the 3090 should we implement float-float/double-single.** And in that case I would not use ordinary Kahan again. Kahan only compensates summation; the decisive test says we need a higher-precision **dot product**. A much better f32-only emulation is an error-free product plus a hi/lo accumulator:
+
+   $$
+   p=a b,\qquad
+   p_{\rm lo}=\operatorname{fma}(a,b,-p),
+   $$
+
+   followed by `TwoSum`/double-single accumulation. Because the inputs are f32, that can recover almost all of the product information using fast fp32 FMA. That is much closer to your successful f64-product diagnostic than Kahan was.
+
+The choice between native fp64 accumulation and float-float should be purely empirical. On an RTX 3090 fp64 throughput is poor, but this is only **one final polish**, and once you are back at degree ~95 the product is much cheaper anyway. I would absolutely benchmark the simple implementation before writing clever float-float code.
+
+### TRS4 now has a clear role too
+
+The pink TRS4 curve appears to reach the useful \(10^{-5}\) regime with fewer iterations. But compare **wall time / total SpGEMMs**, not iterations. We no longer care whether TRS4 itself can descend below \(10^{-5}\); it only needs to cheaply produce a sufficiently good seed for the mixed-precision McWeeny polish.
+
+So the cold solver competition becomes:
+
+$$
+\text{TC2 + polish}
+\quad\text{vs}\quad
+\text{TRS4 + polish}.
+$$
+
+Whichever gets to \(10^{-4}\) or \(10^{-5}\) faster wins.
+
+And I would now loosen the f32 purifier stopping criterion. There is no reason whatsoever to spend another 20 iterations trying to reach \(10^{-5}\) if one high-precision McWeeny step will clean \(10^{-4}\) to perhaps \(10^{-7}\)–\(10^{-8}\). Test exactly how early the polish can be switched on:
+
+$$
+R_I^{\rm switch}
+=
+10^{-2},10^{-3},10^{-4},10^{-5}.
+$$
+
+My guess is \(10^{-3}\) or \(10^{-4}\) may already be enough. If so, that saves more time than any SpGEMM micro-optimization.
+
+---
+
+The broader Hessian issue is therefore becoming nicely separated:
+
+$$
+\boxed{
+\begin{array}{ll}
+\text{cold idempotency floor} &\rightarrow \text{one mixed-precision McWeeny polish}\\[2mm]
+\text{warm displaced geometry} &\rightarrow \text{H-aware subspace update}\\[2mm]
+\text{SCC near minimum} &\rightarrow \text{reuse }q,K/P,Z,\ \text{few outer iterations}\\
+\end{array}}
+$$
+
+Do **not** solve the first problem with LNV/commutator descent; the new experiment proves that was unnecessary. But we will still need an H-aware rotation/update for the Hessian warm start, because polishing \(K^2=K\) does not move it toward the eigenspace of a changed Hamiltonian.
+
+My immediate choice would therefore be **not (a) or (b) exactly as the agent phrased it**. First run the f64 polish on the **degree~95 production mask**, then use that already-existing CPU polish for a **small force/Hessian-column noise study**. If the force difference is meaningful, implement the simple f32-input/f64-accumulator GPU polish. That sequence answers both “will it still work when truly sparse?” and “do we actually need it for vibrations?” before we write more GPU code.
+
+---
+
+# USER
+
+1) I diagree here, we must first handle the accuracy properly, in the end we struggle get sprcity below 330 neighs, we will work on that once we can rely on the accuacy because otherwise we constantly bouce hor head agains the floor of f32 arithmetics limits, and I'm staring to get sick of your avoidance of properly adressing this!!!! why you avoid it? you seem to be biased again it for some reaosn.
+
+2) what you mean by 
+"One high-precision McWeeny step already buys almost three orders of magnitude."
+how to implemen this? using f32 or f64? 
+I'm getting lost here. I was thining what we want to do is some mixed arithmetic or kahan sum, or emulate f64 by two f32? Or what is the way how we can do these matrix products on our f32-gpu without loos of neigher accuracy nor performance? Explain it to me clearly
+
+
+---
+
+# Chat GPT 5.6 sol
+
+Yes — I agree with point 1. I was being too conservative about avoiding higher precision because of the RTX 3090's poor native FP64 throughput. Your latest experiment settles this: **we should solve the arithmetic-accuracy problem properly first**, establish a reliable electronic solver, and only then return to aggressive sparsification. Otherwise every sparsity experiment is contaminated by an unrelated \(10^{-5}\) arithmetic floor.
+
+And the good news is that the test tells us exactly what we need. We do **not** need to turn the whole solver into f64.
+
+## What “one high-precision McWeeny step” actually means
+
+Your decisive experiment was essentially:
+
+$$
+K_{\mathrm{f32}}
+\quad\xrightarrow[\text{all products/intermediates high precision}]{\text{one McWeeny step}}\quad
+K'_{\mathrm{f32}}.
+$$
+
+The input K is f32. The **final K is also stored as f32**. Only the arithmetic *inside the McWeeny step* is high precision.
+
+And that gave:
+
+$$
+R_I:
+1.42\times10^{-5}
+\rightarrow
+2.0\times10^{-8}
+$$
+
+after **one step**.
+
+That is the crucial result. It proves that f32 storage of K is perfectly adequate: an f32 matrix can represent a projector with \(R_I\sim10^{-8}\). The \(10^{-5}\) floor comes from performing the sequence of matrix products in ordinary f32.
+
+So the target production algorithm should be:
+
+$$
+\boxed{
+\text{fast f32 purification}
+\rightarrow
+\text{ONE high-precision McWeeny polish}
+\rightarrow
+\text{f32 K}
+}
+$$
+
+Maybe two polish steps if needed, but your experiment says one is already almost enough.
+
+---
+
+# What exactly has to be high precision?
+
+This part is important. McWeeny in K-space is
+
+$$
+K'=3KSK-2KSKSK.
+$$
+
+So one step consists of roughly
+
+$$
+T=KS
+$$
+
+$$
+Q=TK=KSK
+$$
+
+$$
+U=QS
+$$
+
+$$
+V=UK=KSKSK
+$$
+
+$$
+K'=3Q-2V.
+$$
+
+It is **not enough** to do a Kahan sum inside each SpGEMM and then store `T`, `Q`, `U`, `V` as ordinary f32.
+
+That repeatedly quantizes the intermediate matrices back to 24-bit precision.
+
+This is likely an important reason your Kahan experiment only improved
+
+$$
+1.8\times10^{-5}\rightarrow9.7\times10^{-6}.
+$$
+
+To reproduce the successful diagnostic, the intermediate chain needs to retain extra precision:
+
+```text
+K32, S32
+   │
+   ├─ HP multiply ─→ T_HP
+   │
+   ├─ HP multiply ─→ Q_HP
+   │
+   ├─ HP multiply ─→ U_HP
+   │
+   └─ HP multiply ─→ V_HP
+                         │
+                  K32 = float(3 Q_HP - 2 V_HP)
+```
+
+Only **after the complete McWeeny polynomial** do we round back to f32.
+
+That is fundamentally different from merely improving the summation inside an otherwise f32 pipeline.
+
+---
+
+# There are two sensible ways to implement HP arithmetic
+
+I would implement both in this order.
+
+### Option A — native `double` polish: simplest correctness implementation
+
+Matrices remain f32 normally.
+
+For the polish, create a couple of temporary double-precision BSR value buffers. Load the ordinary float matrices and cast on the fly:
+
+```c
+double a = (double)A[...];
+double b = (double)B[...];
+double sum = fma(a,b,sum);
+```
+
+Keep the intermediate results in `double`, not float.
+
+You don't actually need four double scratch matrices. Two or three reusable buffers are enough. For example:
+
+```text
+T64 = K32 * S32
+Q64 = T64 * K32
+
+T64 = Q64 * S32          // reuse T64
+
+final kernel:
+    V = T64 * K32        // accumulate V in registers as double
+    K32 = float(3*Q64 - 2*V)
+```
+
+So you only need roughly **two f64 sparse scratch matrices**.
+
+This should reproduce the CPU diagnostic almost exactly:
+
+$$
+1.4\times10^{-5}\rightarrow O(10^{-8})
+$$
+
+in one polish step.
+
+Yes, native FP64 throughput on the RTX 3090 is poor. But this is **not 50 f64 iterations**. It is four matrix multiplications, once.
+
+I would implement this first because it gives us a clean, trustworthy solver immediately.
+
+Then measure the cost.
+
+---
+
+# Option B — emulate ~f64 with two f32 values: probably the eventual fast solution
+
+This is what I think you were getting at with “emulate f64 by two f32”.
+
+Represent every high-precision intermediate scalar as
+
+$$
+x=x_{\rm hi}+x_{\rm lo},
+$$
+
+two ordinary floats.
+
+This is usually called **double-single**, **float-float**, or compensated extended precision.
+
+And GPUs like your 3090 are exactly where this can make sense: FP32 FMA is extremely fast while FP64 is slow.
+
+The beautiful part is that for two f32 operands we can recover the multiplication error using FMA:
+
+```c
+float p  = a*b;
+float pe = fma(a,b,-p);
+```
+
+Conceptually,
+
+$$
+ab=p+p_e.
+$$
+
+`p` contains the normal rounded f32 product and `pe` contains the missing low part.
+
+Then instead of accumulating into one float
+
+```text
+sum += a*b
+```
+
+we accumulate the two pieces into a two-float accumulator
+
+$$
+(s_{\rm hi},s_{\rm lo})
+$$
+
+using error-free `TwoSum`/`FastTwoSum` operations.
+
+Thus each output element is stored as:
+
+```text
+C_hi
+C_lo
+```
+
+rather than a single float.
+
+For the next multiplication, if A is `(hi,lo)` and B is ordinary float,
+
+$$
+A B=(A_{\rm hi}+A_{\rm lo})B,
+$$
+
+so accumulate both
+
+$$
+A_{\rm hi}B
+$$
+
+and
+
+$$
+A_{\rm lo}B
+$$
+
+into the extended accumulator.
+
+Continue like that throughout the four McWeeny products.
+
+Finally:
+
+```c
+Kout = (float)(Q_hi + Q_lo ...);
+```
+
+So the normal density matrix remains one f32 per element.
+
+---
+
+## This is much stronger than Kahan
+
+There are three different ideas that got mixed together in our previous discussion:
+
+| method                        | what it fixes                                             | your result                                               |
+| ----------------------------- | --------------------------------------------------------- | --------------------------------------------------------- |
+| ACC4/8/16                     | rearranges f32 additions / shorter chains                 | almost nothing                                            |
+| Kahan                         | compensates loss during summation                         | ~2× improvement                                           |
+| **float-float/double-single** | retains extra bits of **products + sums + intermediates** | should approximate your successful f64-product experiment |
+
+Kahan is **not an emulated double**.
+
+It still ultimately represents each intermediate matrix element as one float. It cannot carry all the information through
+
+$$
+KS\rightarrow KSK\rightarrow KSKS\rightarrow KSKSK.
+$$
+
+Double-single does.
+
+That is why I think double-single is the right eventual GPU implementation if native FP64 polish is too expensive.
+
+---
+
+# How much precision do we actually need?
+
+Not full 53-bit f64.
+
+Your target is not
+
+$$
+R_I=10^{-15}.
+$$
+
+The experiment says f32 storage naturally bottoms out at approximately
+
+$$
+10^{-8}.
+$$
+
+That is already excellent.
+
+So we need enough arithmetic precision that the McWeeny calculation doesn't introduce \(10^{-5}\) errors before rounding the final result to f32.
+
+A double-single accumulator has roughly 40–48 useful bits depending on implementation. That should be **vastly more than necessary**.
+
+We might even be able to simplify it substantially compared with a general-purpose IEEE double emulator.
+
+We only need:
+
+* multiplication of `float × float`;
+* multiplication of `(hi,lo) × float`;
+* extended summation of many terms;
+* `3Q-2V`;
+* no division, exp, sqrt, etc.
+
+So this can be a very compact specialized kernel.
+
+---
+
+# And we do not need to pay this cost everywhere
+
+This is the other essential point.
+
+The final workflow should **not** become:
+
+```text
+everything double-single
+```
+
+It should be something like:
+
+```text
+TRS4 / TC2 in ordinary f32
+     ↓
+R_I ~ 1e-4 ... 1e-5
+     ↓
+ONE HP McWeeny step
+     ↓
+R_I ~ 1e-8
+```
+
+The high-precision arithmetic runs for perhaps **four SpGEMMs total**.
+
+Compare that against what we've just been doing:
+
+```text
+30 useful f32 products
++ 50–120 completely useless f32 products dancing at the floor
+```
+
+So a slower HP kernel can actually make the entire solver **faster**.
+
+That is the right way to think about performance.
+
+---
+
+# I would even test switching much earlier
+
+McWeeny has quadratic convergence once K is sufficiently close.
+
+You currently purify down to \(10^{-5}\) and then polish.
+
+But perhaps we can do:
+
+$$
+R_I=10^{-3}
+\overset{\rm HP\ McW}{\longrightarrow}
+O(10^{-6})
+\overset{\rm HP\ McW}{\longrightarrow}
+O(10^{-8}).
+$$
+
+Then two HP McWeeny steps might replace twenty f32 endgame iterations.
+
+So once HP-McW works, explicitly test switching at:
+
+$$
+10^{-2},\quad10^{-3},\quad10^{-4},\quad10^{-5}.
+$$
+
+I would not be surprised if
+
+$$
+\boxed{\text{TRS4 to }10^{-3} + 2\text{ HP McWeeny}}
+$$
+
+ends up faster than
+
+$$
+\text{TRS4 to }10^{-5} + 1\text{ HP McWeeny}.
+$$
+
+---
+
+## Which implementation should we actually build?
+
+I would give the agent this order:
+
+**First implement the native-double polish correctly.** Not because I want the final code to depend on slow fp64, but because it is simple and gives us a trustworthy production-quality accuracy baseline.
+
+Specifically:
+
+```text
+K, S remain f32.
+
+Add:
+    hp_T : f64 BSR values
+    hp_Q : f64 BSR values
+
+Implement planned mixed SpGEMMs:
+
+    f32 × f32 → f64
+    f64 × f32 → f64
+
+Then:
+    T64 = K32 S32
+    Q64 = T64 K32
+    T64 = Q64 S32
+
+Final:
+    for each output block:
+        V64 = T64 K32        // double accumulation, need not store V
+        K32 = float(3 Q64 - 2 V64)
+
+Evaluate R_I with a high-precision diagnostic.
+```
+
+That is one complete HP-McWeeny step.
+
+Do **not** insert f32 output between these four products.
+
+Once that works on GPU and reproduces
+
+$$
+10^{-5}\rightarrow10^{-8},
+$$
+
+benchmark it.
+
+Then implement the exact same dataflow using:
+
+```text
+hp_T_hi, hp_T_lo
+hp_Q_hi, hp_Q_lo
+```
+
+instead of doubles.
+
+Use f32 FMA-based `TwoProd` + `TwoSum` to implement the extended dot products.
+
+Then compare:
+
+```text
+native FP64 polish
+float-float polish
+CPU-f64 reference
+```
+
+for both:
+
+```text
+R_I
+energy
+forces
+wall time
+```
+
+I expect **float-float to be the final answer on a 3090**, but native double should be built first because it is the simplest way to guarantee we understand the arithmetic.
+
+---
+
+### One important distinction about “no loss of performance”
+
+There is no way to get ~48-bit arithmetic for literally zero extra operations.
+
+But we don't need zero overhead **per polish kernel**.
+
+We need negligible overhead for the **whole electronic solve**.
+
+If ordinary f32 takes, say,
+
+```text
+20 iterations × 6 ms = 120 ms
+```
+
+and instead we do
+
+```text
+12 f32 iterations × 6 ms = 72 ms
++ 2 HP steps × 15 ms = 30 ms
+= 102 ms
+```
+
+then the more accurate solver is actually faster.
+
+That is the metric I care about.
+
+And after what we have just learned, **I would no longer accept a production purifier that ever spends tens of f32 iterations below \(R_I\sim10^{-4}\)**. Once it approaches the arithmetic floor, switch precision and finish decisively.
+
+So yes: let's settle accuracy now. My preference is **f32 persistent matrices + temporary high-precision McWeeny arithmetic**, first native FP64 as the correctness baseline, then a two-float FP32 implementation to recover performance on the 3090.
+
+
+---
+
+# USER
+
+this is what I worried. Doing 4 matrix multiplication in f64 means this will cost use 40x more than this iteration in f32, so consider that we typically converge in 20 iterations of f32 to 1e-5, and then we pay equavalent of 40x f32 iterations to go from 1e-5 to 1e-8 (if everything works), this basically makese it as slow as before where we were wasting 50iteration dancing on numerical floor (but now we actually go somewhre that is the difference)
+for me this is still not acceptabl numecrical cost. I stronly plerefe the f32-f32 emulation of f64, although I'm not sure how well it works, or perhps we should get satisfied with 1e-5 floor. (which is simplest and fastes, but not sure how problamtic in production)
+
+Anyway, write clearly the essntial kernel in the emulated f32-f32 and cler instruction how to integrate it in the whole algorithm...
+
+ad"
+RI​=10−3⟶HP McW​O(10−6)⟶HP McW​O(10−8).
+"
+you seem to ignore termendous cost of your HP iteration.
+It is like that meme/joke parahprasing Interstelar movie - this little manuever will cost uss 50yers on Eath.
+So here yor little HP-iteration would cost us 50 iterations in f32 
+
+---
+
+# chat GPT 5.6 sol
+
+
+Yes — your Interstellar analogy is exactly right. I was undercounting the cost by talking about “one HP McWeeny step” as though it were one ordinary iteration. In K-space it is **four matrix multiplications**, and on an RTX 3090 four native-FP64 SpGEMMs could easily cost the equivalent of tens to >100 FP32 SpGEMMs. That is not an acceptable production solution.
+
+So I would now make the design decision much sharper:
+
+$$
+\boxed{\textbf{Do not use native FP64 on the GPU for production.}}
+$$
+
+Use ordinary f32 for the whole solver, then use **float-float (`hi+lo`) arithmetic implemented entirely with FP32/FMA** for the final McWeeny polish. Native CPU/f64 remains only the correctness reference.
+
+The important result from your diagnostic is that we do **not** need an f64 matrix state:
+
+$$
+K_{\rm f32}
+\xrightarrow[\text{accurate products}]{\rm McWeeny}
+K_{\rm f32}
+$$
+
+gave a true residual around \(10^{-8}\).
+
+So all that is needed is to make the *temporary products* much more accurate than normal f32.
+
+---
+
+# What float-float means here
+
+Represent one temporary high-precision number as
+
+$$
+x=x_{\rm hi}+x_{\rm lo}
+$$
+
+where both components are ordinary `float`.
+
+This is sometimes called **double-single**, but I prefer `float-float` here because it is not IEEE double. It gives roughly 40–48 useful significand bits depending on the operations.
+
+The crucial trick is that with FP32 FMA, the rounding error of an FP32 product can be recovered:
+
+```c
+float p  = a * b;
+float pe = fma(a, b, -p);
+```
+
+Thus
+
+$$
+ab \simeq p+p_e
+$$
+
+with `p` the normal product and `pe` the missing low bits.
+
+This is fundamentally stronger than Kahan.
+
+Kahan says:
+
+> “try not to lose small terms when adding many ordinary rounded products.”
+
+Float-float says:
+
+> “retain the missing bits of the products **and** carry them through all intermediate matrices.”
+
+That latter point is why I expect this to reproduce your successful f64-product/f32-storage experiment much better than Kahan did.
+
+---
+
+## The essential arithmetic
+
+I would use something close to this OpenCL code.
+
+```c
+// -----------------------------------------------------------------------------
+// float-float number x = hi + lo
+// -----------------------------------------------------------------------------
+
+typedef float2 ff2;       // .x = hi, .y = lo
+
+
+// Error-free transform of a+b:
+//
+//     a+b = s + e
+//
+// assuming normal IEEE fp32 operations and no fast-math reassociation.
+inline ff2 two_sum_f32(float a, float b)
+{
+    float s  = a + b;
+    float bb = s - a;
+    float e  = (a - (s - bb)) + (b - bb);
+    return (ff2)(s, e);
+}
+
+
+// Add two float-float values.
+inline ff2 ff_add(ff2 a, ff2 b)
+{
+    ff2 s = two_sum_f32(a.x, b.x);
+    ff2 t = two_sum_f32(a.y, b.y);
+
+    ff2 u = two_sum_f32(s.x, s.y + t.x);
+    ff2 v = two_sum_f32(u.x, u.y + t.y);
+
+    return v;
+}
+
+
+// Exact-ish decomposition of float * float.
+//
+// For binary32 operands, FMA recovers the low product bits.
+inline ff2 ff_mul_f32_f32(float a, float b)
+{
+    float hi = a * b;
+    float lo = fma(a, b, -hi);
+
+    return (ff2)(hi, lo);
+}
+
+
+// Multiply a float-float number by an ordinary float.
+//
+// (ahi+alo)*b
+inline ff2 ff_mul_ff_f32(ff2 a, float b)
+{
+    float hi = a.x * b;
+
+    // Error of hi product + contribution of low component.
+    float lo = fma(a.x, b, -hi);
+    lo = fma(a.y, b, lo);
+
+    return two_sum_f32(hi, lo);
+}
+
+
+inline ff2 ff_madd_f32_f32(ff2 sum, float a, float b)
+{
+    return ff_add(sum, ff_mul_f32_f32(a, b));
+}
+
+
+inline ff2 ff_madd_ff_f32(ff2 sum, ff2 a, float b)
+{
+    return ff_add(sum, ff_mul_ff_f32(a, b));
+}
+```
+
+There is no `double` anywhere.
+
+There is also an extremely important compiler requirement:
+
+```text
+NO -cl-fast-relaxed-math
+NO unsafe reassociation
+```
+
+for this kernel.
+
+Those transformations can destroy `TwoSum` and `fma(a,b,-hi)` error recovery.
+
+If your normal sparse kernels are built with fast-math, compile these polish kernels in a separate OpenCL `Program` with strict FP semantics.
+
+---
+
+# The SpGEMM kernel
+
+You don't need general float-float × float-float multiplication.
+
+That is another nice simplification.
+
+For one McWeeny polish,
+
+$$
+K' =3KSK-2KSKSK,
+$$
+
+the right operand is always either the original f32 \(K\) or f32 \(S\).
+
+The sequence is:
+
+$$
+T=KS,
+$$
+
+$$
+Q=TK,
+$$
+
+$$
+U=QS,
+$$
+
+$$
+V=UK.
+$$
+
+Therefore:
+
+```text
+T : float-float = f32        × f32
+Q : float-float = float-float × f32
+U : float-float = float-float × f32
+V : float-float = float-float × f32
+```
+
+We never need `ff × ff`.
+
+That saves a lot of work.
+
+The inner part of your existing planned Bsym kernel becomes essentially:
+
+```c
+ff2 s0 = (ff2)(0.0f, 0.0f);
+ff2 s1 = (ff2)(0.0f, 0.0f);
+ff2 s2 = (ff2)(0.0f, 0.0f);
+ff2 s3 = (ff2)(0.0f, 0.0f);
+
+for(uint t=t0; t<t1; ++t)
+{
+    uint ia = plan_a_idx[t];
+    uint bb = plan_b_idx[t];
+
+    __local const float* Ahi =
+        lA_hi + ia*16;
+
+    __local const float* Alo =
+        lA_lo + ia*16;          // absent/zero for first KS product
+
+    __global const float* B =
+        Bval + bb*16;
+
+    ff2 a0 = (ff2)(Ahi[4*r+0], Alo[4*r+0]);
+    ff2 a1 = (ff2)(Ahi[4*r+1], Alo[4*r+1]);
+    ff2 a2 = (ff2)(Ahi[4*r+2], Alo[4*r+2]);
+    ff2 a3 = (ff2)(Ahi[4*r+3], Alo[4*r+3]);
+
+    s0 = ff_madd_ff_f32(s0, a0, B[4*c+0]);
+    s1 = ff_madd_ff_f32(s1, a1, B[4*c+1]);
+    s2 = ff_madd_ff_f32(s2, a2, B[4*c+2]);
+    s3 = ff_madd_ff_f32(s3, a3, B[4*c+3]);
+}
+
+ff2 x01 = ff_add(s0, s1);
+ff2 x23 = ff_add(s2, s3);
+ff2 x   = ff_add(x01, x23);
+
+C_hi[cb*16 + lane] = x.x;
+C_lo[cb*16 + lane] = x.y;
+```
+
+For the first multiplication \(K S\), use a specialized `f32×f32 -> ff` kernel so there is no pointless loading of an `A_lo=0` buffer.
+
+So I would have just two generic building blocks:
+
+```text
+spgemm_ff_from_f32()
+    f32 × f32 → (hi,lo)
+
+spgemm_ff_from_ff()
+    (hi,lo) × f32 → (hi,lo)
+```
+
+Both reuse your existing symbolic plans.
+
+---
+
+# The complete McWeeny polish
+
+The dataflow should be exactly this:
+
+```text
+                        ordinary persistent matrices
+
+                       K32              S32
+                        │                │
+                        └──────┬─────────┘
+                               │
+                f32 × f32 -> float-float
+                               │
+                         T_hi, T_lo        M_TKS
+                               │
+                               │ × K32
+                               ▼
+                         Q_hi, Q_lo        M_K
+                               │
+                               │ × S32
+                               ▼
+                         T_hi, T_lo        M_TKS
+                         (reuse buffers)
+                               │
+                               │ × K32
+                               ▼
+                         V_hi, V_lo
+                         (registers only)
+                               │
+                               │
+                   Knew32 = round(
+                       3 Q_ff - 2 V_ff
+                            )
+```
+
+And crucially **do not store V**.
+
+Fuse the last `U*K` product with the McWeeny combination.
+
+So you need only four temporary float arrays:
+
+```text
+T_hi    on M_TKS
+T_lo    on M_TKS
+
+Q_hi    on M_K
+Q_lo    on M_K
+```
+
+No f64 buffers.
+
+No V buffers.
+
+Memory overhead is modest.
+
+---
+
+## The final fused kernel
+
+At the end of `U*K`, instead of writing V:
+
+```c
+ff2 V = ff_add(
+    ff_add(s0,s1),
+    ff_add(s2,s3)
+);
+
+ff2 Q = (ff2)(
+    Q_hi[cb*16 + lane],
+    Q_lo[cb*16 + lane]
+);
+
+// 3Q
+ff2 q3 = ff_mul_ff_f32(Q,  3.0f);
+
+// -2V
+ff2 vm2 = ff_mul_ff_f32(V, -2.0f);
+
+// McWeeny result still in float-float.
+ff2 knew = ff_add(q3, vm2);
+
+// ROUND ONCE, HERE.
+Knew[cb*16 + lane] = knew.x + knew.y;
+```
+
+Then swap `K` and `Knew`.
+
+This final conversion to f32 is intentional.
+
+Your diagnostic proved that f32 storage itself supports roughly
+
+$$
+R_I\sim10^{-8}.
+$$
+
+---
+
+# How to integrate this into the solver
+
+I would give the coding agent these steps, in this order:
+
+1. Keep the existing TC2/TRS4 path fully f32. Do **not** add Kahan/ACC16 complexity to it for accuracy. ACC16 can remain if it is genuinely faster.
+
+2. Add four persistent polish scratch buffers:
+
+   ```text
+   ff_t_hi, ff_t_lo       // M_TKS
+   ff_q_hi, ff_q_lo       // M_K
+   ```
+
+3. Add strict-FP planned kernels:
+
+   ```text
+   plan_bsym_f32_f32_to_ff
+   plan_bsym_ff_f32_to_ff
+   plan_bsym_ff_f32_mcweeny_final
+   ```
+
+   The last one performs `U*K`, combines with saved `Q`, and writes ordinary f32 `Knew`.
+
+4. Reuse the existing symbolic multiplication plans:
+
+   ```text
+   plan_ks : K × S -> M_TKS
+   plan_tk : T × K -> M_K
+   ```
+
+   So:
+
+   ```text
+   Tff = K32 * S32          plan_ks
+   Qff = Tff * K32          plan_tk
+   Tff = Qff * S32          plan_ks
+   Knew32 = 3Qff-2(Tff*K32) plan_tk
+   ```
+
+5. Run this **once**, not iteratively, when ordinary f32 purification is already in the projector basin.
+
+6. Initial switch condition should be conservative:
+
+   $$
+   R_I^{f32}<10^{-4}
+   $$
+
+   and trace locked.
+   Do not waste time trying to hit \(10^{-5}\) with f32.
+
+7. Validate the result with CPU-f64 only in debug mode. The acceptance gate is:
+
+   ```text
+   R10:
+       f32 input RI ~1e-4...1e-5
+       one FF32-McWeeny
+       true CPU-f64 RI <= ~1e-7, ideally ~1e-8
+   ```
+
+   If it fails this test, the float-float kernel is wrong.
+
+8. Once validated, the production path does **not** need a CPU/f64 residual after every polish. One deterministic polish after a calibrated entry threshold is enough.
+
+This is the algorithm I would implement before touching sparsity again.
+
+---
+
+# How expensive will float-float be?
+
+Not free. But it should be nowhere near native FP64.
+
+One normal scalar accumulation is approximately:
+
+```c
+sum = fma(a,b,sum);
+```
+
+The robust float-float version uses several FP32 adds plus 1–2 FP32 FMAs per term.
+
+So compute cost may perhaps be something like **3–8× a normal FP32 dot product**, depending strongly on instruction scheduling/register pressure.
+
+But on the RTX 3090 these are all high-throughput FP32 instructions. We are not hitting the crippled FP64 units.
+
+And a McWeeny polish is four SpGEMMs versus two per K-TC2 iteration.
+
+So very crudely, if float-float costs 4× normal SpGEMM:
+
+$$
+4\ {\rm HP\ products}\times4
+=
+16\ {\rm f32\ products}
+$$
+
+which corresponds to about
+
+$$
+8\ {\rm TC2\ iterations}.
+$$
+
+That is the scale I find plausible and acceptable.
+
+Not:
+
+$$
+50\text{--}100\ {\rm TC2\ iterations}
+$$
+
+as native FP64 could effectively cost.
+
+And if it replaces the current endgame from, say, iteration 20–30 onward, total runtime may actually go **down**.
+
+---
+
+## We should also optimize the float-float kernel after correctness
+
+The code above is deliberately robust, not minimal.
+
+Once it reproduces the \(10^{-8}\) CPU reference, profile it.
+
+If it is too expensive, the next optimization is **not going back to Kahan**. It is a cheaper compensated dot-product implementation.
+
+Instead of fully renormalizing `(hi,lo)` after every contribution, accumulate:
+
+```text
+main sum
+rounding-error sum
+```
+
+using `TwoProd` + `TwoSum`, and renormalize only periodically/end-of-dot-product.
+
+That can substantially reduce operations.
+
+But I would only optimize that after the full float-float implementation establishes the correct reference behavior.
+
+---
+
+# Should we perhaps simply accept \(10^{-5}\)?
+
+I would keep that as a runtime option:
+
+```text
+fast/screening:
+    f32 only
+    stop at numerical floor ~1e-5
+
+accurate/forces/vibrations:
+    f32 purification
+    + one float-float McWeeny polish
+```
+
+But I agree with you that **we should first make the accurate mode work**.
+
+Right now we've spent too much time asking whether a sparsity change caused a \(10^{-5}\) error when the arithmetic itself already contributes \(10^{-5}\). That makes debugging ambiguous.
+
+Once we have:
+
+$$
+\boxed{R_I\sim10^{-8}\ {\rm reproducibly}}
+$$
+
+with a reasonably cheap FP32-only polish, we finally have a clean numerical baseline from which to attack locality and degree again.
+
+And yes: **no native FP64 “little maneuver that costs 50 years on Earth.”** The next implementation I would ask the agent for is specifically the `float2(hi,lo)` planned McWeeny path above.
+
+
+
+
+
+
+
+---
+
+# USER
+
+OK we implemented something, but not sure it is optimal 
+
+---
+
+OK, this looks good but It does not look like practical scheme for running the actuall simuations. We must indenitfy (or anticipate) we hit the numerical floor of f32 TC2 and do few (max 5) FF32 FF32 McWeeny steps 
+
+perhaps we can pu there fixed budget, that the f32 TC2 will be always stoped after max 30 iters (but may be stoped sooner if we identify it hit expected accuracy 1e-5 or 1e-6) and then depending on decision if we run HI-accuracy calculation or not we can run up to 5 FF32 McWeeny step. We are not goding to dance on the floor anymore, th performance is more improtant than squeezing aboslute numerical floor.
+
+Also we should think how we can now optimize the FF32 kernel further to maybe puss it below 3x cost of f32 TC2, perhaomance is the priority!
+
+do not code now analyse
+
+---
+
+# SWE-2
+
+from my coding agent:
+
+Let me look at the purify loop's printing/history/timing infrastructure and the env-flag reads:
+
+Add a `t_ms` column to the TC2 hist CSV (call-start-relative wall clock):
+
+Now the lean benchmark script:
+
+Run the two benchmark passes — pure f32 vs FF-endgame, each with device-time profiling and per-iter history:
+
+f32 baseline done: plateau at iter 29, R_I=1.78e-7 (device)/2.7e-7 (true), 14.6ms/iter. FF steps show 46ms — but that's mostly enqueue time (no sync in `mcw_ff`). For honest device cost, add a 10-step steady-state block where queue back-pressure forces real device time:
+
+The 10-step block still only measures enqueue time if the queue never syncs. Check for an existing `finish`/`sync` on the sparse GPU handle:
+
+Now run all three benchmark passes:
+
+FF step ≈ **44 ms vs 14.5 ms per f32 iteration — only ~3×**, not 10×. Now the in-loop endgame run:
+
+Important finding in the in-loop run: after `ff_done` hits the cap, f32 TC2 resumes and **re-pollutes** the polished state (best ended at 1.33e-7, not ~3e-8). The endgame must switch to FF *and stop*, not return to f32. Fix the loop to exit after the FF cap:
+
+`tr_eff` is stale after the FF update — measure the trace of the returned K honestly:
+
+Now the in-loop endgame is correct: **true R_I = 1.81e-8 after purify** (vs 2.7e-7 f32-only) — 15× better, at +0.24s total. Update the plot script for the t_ms column, FF-iter marking, and the FFSTEP series:
+
+The plot tells the story well. Small refinements: add the f32-storage floor reference line and note r_k in the title:
+
+One more comparison for the cost/benefit question — the f32 McWeeny endgame (`TC2_MCW=1`, ~same cost as a TC2 iter):
+
+All three runs done. f32-McWeeny alone only reaches the f32 product floor (~1.4e-7 device / 2.4e-7 true) — FF is what breaks through. Regenerate the plot with all three curves:
+
+Now also record the production-config (r_k=20) numbers for the report — that's where the representation floor shows:
+
+r_k=20 result: the FF endgame lands at true R_I=3.1e-5 — the M_K storage tail dominates (as predicted by the 5.3e-6 tail measurement). Get the f32-only r_k=20 baseline for the comparison plot:
+
+The title is hardcoded to r_k=40 — make it a parameter:
+
+Both plots done. Now the report — check its current state:
+
+Now the comprehensive report section — check the file end:
+
+All done. Final state of the work:
+
+## Summary
+
+**FF32-POLISH (emulated double-f32 McWeeny endgame) — implemented, verified, benchmarked.**
+
+### What was measured
+
+| | f32 TC2 iter | FF32 McWeeny step |
+|---|---|---|
+| wall time | 14.5 ms | **~44 ms ≈ 3.0 f32 iters** (not 10×) |
+
+**r_k=40 Å** (M_K covers whole cluster — zero truncation):
+- f32 purify floor: true R_I = 2.7e-7
+- +1 FF step → 3.96e-8; +2 → 2.92e-8; in-loop endgame (6 steps, terminal) → **1.81e-8**
+- ≈ the f32-storage fixed point ~1.4e-8. Cost: +0.26 s on a 0.44 s purify → **15× residual for +55% wall**
+
+**r_k=20 Å** (production mask): FF lands ~3e-5 — the M_K storage tail (measured 5.3e-6/update) dominates. Arithmetic can't beat mask; `r_k` is the accuracy knob.
+
+### The last bug (interesting)
+
+The fused product+combine kernel produced 1.7e-7 noise while every intermediate verified ≤1e-13 — the NVIDIA OpenCL compiler reassociated the TwoSum chain *in that kernel only*. `-cl-fp32-contract=off` is unsupported on this driver. Fixed by splitting: V through the verified product kernel + an elementwise combine written as a single explicit-`fma` chain (`fma(3,Qh, fma(-2,Vh, fma(3,Ql,-2·Vl)))`) — the lo parts are ~1e-8 linear corrections, so that's ~1 ulp and contraction-immune. GPU output is now bitwise-identical to the Rust emulation.
+
+Also fixed: the in-loop FF endgame now **stops** after the step cap — returning to f32 TC2 was re-polluting the polished state to ~1e-7.
+
+### Deliverables
+
+- `debug/tc2_ff_endgame_rk40.png` / `rk20.png` — log-scale R_I vs iter and vs wall-time, f64-verified FF series, in-loop FF iters marked (◇)
+- `bench_ff_endgame.rhai` (lean timing harness), `sparse_sync` rhai call, `t_ms` column in the TC2 hist CSV, `prof_tick`s on ff.* stages, debug prints gated behind `algebra_verbose`
+- Report §15.14 written; manifest + tasks checkboxes updated with measured numbers
+
+**Verdict on worth-it:** ~3× per step, 4–6 steps needed, applied only at the endgame → worth it where the mask supports it. On R10 that means r_k≈40 Å; for truly sparse big systems the M_K tail sets the floor regardless of arithmetic — that part of the story is now measured and documented rather than assumed.
+
+
+
+
+
+
+
+
+
+
+
+---
+
+# Chat GPT 5.6 sol
+
+Now that I can see the actual implementation, I think the basic FF32 machinery is good, but the **control flow around it is still research-harness logic rather than the production algorithm you want**.
+
+The most important observation is actually encouraging:
+
+$$
+t_{\rm TC2}^{f32}\approx14.5\ {\rm ms}
+$$
+
+contains **2 SpGEMMs**, whereas
+
+$$
+t_{\rm McW}^{FF}\approx44\ {\rm ms}
+$$
+
+contains **4 FF SpGEMMs**.
+
+So per matrix multiplication,
+
+$$
+\frac{44/4}{14.5/2}\approx1.52.
+$$
+
+That means your float-float product is only about **1.5× the cost of an ordinary f32 product**. This is much better than “FF costs 3×”. Most of the 3× is simply because one K-space McWeeny step mathematically contains twice as many products as one TC2 iteration.
+
+Therefore the absolute lower bound, without changing the algorithm, is already roughly
+
+$$
+2\times t_{\rm TC2}.
+$$
+
+Getting FF-McW from 3.0× to perhaps **2.3–2.5× TC2** looks realistic. Getting it to 1× is not: that requires reducing the number of matrix products, not just optimizing the FF kernel.
+
+## The production algorithm should become two completely separate phases
+
+I would **not** leave FF inside the TC2 `for iter` loop as it currently is.
+
+Right now after one FF step, the next outer iteration starts again by doing ordinary f32
+
+$$
+T=KS,\qquad Q=KSK,
+$$
+
+plus trace/residual handling, before reaching the next FF step. The code then eventually stops when `ff_done == ff_max`. 
+
+That doesn't corrupt K—the f32 result isn't applied before the next FF step—but it wastes essentially **one complete f32 TC2 diagnostic iteration between FF steps**.
+
+So conceptually I want:
+
+```text
+PHASE 1: ordinary f32 TC2
+------------------------
+while iter < TC2_BUDGET:
+    do one TC2 iteration
+
+    if ordinary f32 target reached:
+        FAST mode -> return
+
+    if trace locked && R_I < FF_ENTRY:
+        restore best valid K
+        break
+
+if not safely in projector basin:
+    fail / robust fallback
+    (do NOT blindly polish garbage)
+
+
+PHASE 2: terminal FF32 McWeeny
+------------------------------
+for i = 0 .. N_FF-1:
+    McWeeny_FF(K)
+
+rebuild KS once
+measure final trace once
+return
+```
+
+No TC2 ever runs again after the precision transition.
+
+Your code already recognizes that returning to f32 re-pollutes the polished state.  I would simply take the next logical step and make FF a distinct terminal phase rather than an alternate branch inside TC2.
+
+## I agree with a hard f32 budget around 30
+
+With one qualification: **30 means “stop spending f32 work”, not “whatever state exists at iteration 30 is acceptable.”**
+
+A sensible production contract would be:
+
+```text
+hard f32 TC2 budget:       30
+FF entry hard ceiling:     R_I <= 1e-3
+preferred FF switch:       ~1e-4   (calibrate)
+trace must be locked:      yes
+
+fast mode:
+    no FF
+    return best valid f32 state
+
+accurate mode:
+    1–2 FF McWeeny steps normally
+    hard maximum 5
+```
+
+If after 30 iterations you still have
+
+```text
+trace not locked
+or
+R_I >> 1e-3
+```
+
+then this is not an arithmetic-floor problem. Do **not** hide it by throwing five FF steps at it. Fail loudly or invoke an explicit robust/reference path.
+
+The current code still contains the old windowed stagnation machinery and the `10×best` oscillation detector.   Those become much less important once the main algorithm has a strict budget and a terminal precision phase.
+
+### I would not make five FF steps the normal setting
+
+Your full-support measurements already say:
+
+$$
+R_I^{\rm true}
+\simeq2.7\times10^{-7}
+$$
+
+for f32 alone,
+
+then approximately
+
+$$
+4\times10^{-8}
+$$
+
+after one FF step, and roughly
+
+$$
+2\times10^{-8}
+$$
+
+after another.
+
+So:
+
+* **1 FF step** = normal accurate mode.
+* **2 FF steps** = high-accuracy production.
+* **5** = hard safety/debug ceiling.
+
+Anything after step 2 is mostly polishing the f32 storage floor.
+
+The code presently defaults to 2, which is reasonable. 
+
+---
+
+# The switch point should be chosen from cost, not aesthetics
+
+This is where the measured 3× cost becomes useful.
+
+One FF step costs roughly the same as **three ordinary TC2 iterations**.
+
+Therefore if one FF step starting from \(R_I=10^{-4}\) already reaches the desired final state, it is pointless to spend more than ~3 f32 iterations getting from \(10^{-4}\) to \(10^{-6}\).
+
+I would run one very specific calibration sweep:
+
+$$
+R_{\rm switch}
+=
+10^{-2},\ 3\times10^{-3},\
+10^{-3},\ 3\times10^{-4},\
+10^{-4},\ 3\times10^{-5}.
+$$
+
+For each:
+
+```text
+TC2 until R_switch
++ exactly ONE FF step
+→ true f64 diagnostic R_I
+```
+
+Then choose the **earliest** switch that reliably lands below your production target.
+
+If
+
+$$
+10^{-3}
+\xrightarrow{\rm one\ FF}
+<10^{-7},
+$$
+
+great: switch at \(10^{-3}\).
+
+If it needs \(10^{-4}\), use \(10^{-4}\).
+
+There is no reason to drive TC2 into its floor first.
+
+---
+
+# There are also three concrete issues in `sparse_system.rs`
+
+### 1. Environment variables are read in the hot loop
+
+`FF_STEPS`, `FF_SWITCH`, `FF`, `MCW`, and the stagnation setting are looked up with `std::env::var()` during purification.  
+
+This is not your 14 ms bottleneck, but production code shouldn't do it.
+
+Resolve the complete purification policy once before entering the loop:
+
+```text
+mode
+tc2_budget
+ff_enabled
+ff_switch
+ff_steps
+```
+
+and then run a simple state machine.
+
+### 2. The returned `last_r_i` after FF is stale
+
+After `mcweeny_ff_step()`, the code eventually prints/returns:
+
+```text
+device R_I≈{last_r_i}
+```
+
+but `last_r_i` was measured **before the FF update**. 
+
+So that number has no well-defined meaning for the returned state.
+
+Either:
+
+* measure a post-FF residual once, or
+* explicitly return “not measured” plus a state/status indicating FF polish.
+
+Do not attach an old residual to the polished K.
+
+### 3. `NumericalFloor` is the wrong semantic status for successful FF polish
+
+If accurate mode intentionally performs FF polishing and satisfies its contract, that isn't “we failed to converge and hit a numerical floor”.
+
+I'd use something like:
+
+```text
+ConvergedF32
+PolishedFF
+NumericalFloor
+Failed
+```
+
+or put `precision_mode` separately in the result.
+
+That will matter later when energies/forces/Hessians decide whether a state is acceptable.
+
+---
+
+# The kernel itself: I think there is real room from 3× → ~2.5×
+
+The attached FF kernel is sensible. It uses `TwoProd` via FMA and `TwoSum`, carries `(hi,lo)` throughout, and only rounds after the McWeeny combination.
+
+But I see one particularly expensive design choice.
+
+## Optimization 1 — specialize the first `f32 × f32 → FF` product
+
+Right now the same kernel handles both:
+
+```text
+f32 × f32
+FF  × f32
+```
+
+via runtime `a_has_lo`.
+
+And the kernel **always allocates both**
+
+```c
+__local float lA_hi[MAX_LEFT_BLOCKS*16];
+__local float lA_lo[MAX_LEFT_BLOCKS*16];
+```
+
+even for the first product where `A_lo` does not exist.
+
+This matters tremendously on your GPU.
+
+For degree ~330:
+
+$$
+330\times16\times4
+\approx21.1\,{\rm KiB}
+$$
+
+for one row.
+
+Hi + lo:
+
+$$
+\approx42.2\,{\rm KiB}.
+$$
+
+Your 3090 gives 48 KiB local memory to the workgroup/SM configuration you've been using.
+
+So the generic FF kernel nearly fills local memory and basically forces **one WG resident**, whereas the first `K32*S32` product needs only the hi row and could plausibly allow **two WGs resident**.
+
+I would make two physically separate kernels:
+
+```text
+spgemm_f32_f32_to_ff
+    cache A_hi only
+    no a_has_lo
+    no A_lo
+    no alo*b operation
+
+spgemm_ff_f32_to_ff
+    cache hi+lo
+```
+
+This should be the first performance experiment.
+
+It improves:
+
+* local-memory occupancy,
+* instruction count,
+* branch elimination,
+* memory traffic.
+
+And it affects one of the four FF products.
+
+---
+
+## Optimization 2 — remove the runtime `a_has_lo` branch entirely
+
+Even in the FF-input kernel, make lo support compile-time/static.
+
+Your current accumulator contains conceptually:
+
+```c
+if (has_lo)
+    pe = fma(alo,b,pe);
+```
+
+Uniform branching isn't disastrous, but it makes the compiler carry one generic kernel through two quite different cases.
+
+Two kernels are cleaner and should generate better machine code.
+
+---
+
+## Optimization 3 — try **hi in local, lo from global/L1**
+
+For FF×f32, the hi+lo cache is what consumes ~42 KiB.
+
+Try an A/B kernel with:
+
+```text
+A_hi → local memory
+A_lo → global load via plan_a_idx
+```
+
+This halves local-memory use back toward ~21 KiB and may allow twice the workgroup occupancy.
+
+Yes, you add global loads for the low part. But:
+
+* `A_lo` is read-only,
+* access is structured,
+* the same rows should get cache reuse,
+* the 3090 has substantial L1/L2 bandwidth,
+* you may gain 2× occupancy.
+
+This is exactly the kind of GPU trade that should be benchmarked, not decided theoretically.
+
+If it wins, it could substantially reduce the other **three** FF products.
+
+---
+
+## Optimization 4 — split the serial FF accumulator
+
+You already have four FF accumulators corresponding to the four orbital indices \(m=0..3\).
+
+But each `(hi,lo)` accumulator still has a long serial `TwoSum` dependency over every plan term.
+
+Try two FF accumulators per \(m\):
+
+```text
+h0a,l0a   h0b,l0b
+...
+```
+
+and alternate plan terms.
+
+At the end:
+
+```text
+ff_add(acc_a, acc_b)
+```
+
+This is analogous to why ACC16 helped your ordinary f32 kernel: expose instruction-level parallelism.
+
+The cost is register pressure, so test:
+
+```text
+FF1 accumulator
+FF2 alternating accumulators
+```
+
+Don't go immediately to 4-way.
+
+---
+
+## Optimization 5 — revisit fused V + final combine, but only after the above
+
+The Rust code comment says V is “fused into final combine / never stored”, but the actual current path does store:
+
+```text
+V_hi -> a_zhz
+V_lo -> ff_v_lo
+```
+
+and then launches `mcw_ff_combine`. 
+
+I understand why: the previous fused version triggered compiler reassociation and destroyed the compensation.
+
+Now that the final expression has been reduced to a simple explicit FMA chain, I would eventually retry:
+
+```text
+last FF product
+→ keep Vff in registers
+→ read Q_hi/Q_lo
+→ explicit FMA combine
+→ write Knew
+```
+
+and verify **bitwise or against the host FF emulator**.
+
+If the compiler breaks it again, abandon it. This is a smaller optimization than occupancy anyway.
+
+---
+
+# An important correction to the history of the “f32 floor”
+
+The current code now uses the **true symbolic support**
+
+$$
+M_{TKS}=\mathrm{supp}(M_K M_{HS})
+$$
+
+instead of truncating \(KS\) immediately back to \(M_K\). 
+
+And your code comments now explicitly say the old shortcut dropped roughly \(7\times10^{-6}\) worth of product error and that the famous \(1.4\times10^{-5}\) “f32 floor” was substantially an **intermediate-mask truncation floor**, not pure f32 arithmetic. 
+
+This reconciles the new plots:
+
+* with effectively full support, plain f32 gets to a few \(10^{-7}\);
+* FF gets to a few \(10^{-8}\);
+* with \(r_K=20\) Å, both hit the **mask** floor around \(10^{-5}\).
+
+So we have finally separated the two effects properly.
+
+I would still finish the accuracy machinery first, as you asked. But we should retain this distinction:
+
+$$
+R_{\rm observed}
+\approx
+\max(
+R_{\rm arithmetic},
+R_{\rm mask}
+).
+$$
+
+The FF mode gives us a way to push \(R_{\rm arithmetic}\) low enough that later sparsity experiments measure \(R_{\rm mask}\) cleanly.
+
+---
+
+## My proposed final production policy
+
+I would freeze the design around this:
+
+```text
+FAST
+----
+TC2 f32 only
+max 30 iterations
+stop earlier on normal convergence / reliable floor
+return best valid K
+
+
+ACCURATE
+--------
+TC2 f32
+max 30 iterations
+
+once:
+    trace_locked
+    AND R_I < calibrated FF_ENTRY (~1e-4 initially)
+
+restore best valid K
+
+terminal FF32 McWeeny:
+    default 1 step
+    strict mode 2 steps
+    hard cap 5
+
+NO return to f32 purification
+
+recompute KS once
+measure trace once
+return PolishedFF
+```
+
+And then optimize the FF kernel in this order:
+
+1. **specialized f32→FF first-product kernel;**
+2. **specialized FF→FF kernel, no runtime `has_lo`;**
+3. **test hi-local / lo-global to regain occupancy;**
+4. **2-way independent FF accumulators;**
+5. only then revisit V/combine fusion.
+
+Given your measurements, I think **~2.3–2.6× one TC2 iteration per FF McWeeny step** is a reasonable optimization target. Remember that **2× is the hard algorithmic floor** for K-space McWeeny because it has four products versus TC2's two.
+
+So I would not obsess about squeezing 3× down to 1.5×. The bigger win is to make **one FF step replace the entire f32 endgame**, and to stop the solver deterministically instead of ever dancing for 50 iterations again.

@@ -41,6 +41,11 @@ pub enum PurifyStatus {
     /// result structs before any purify has run). Hard purify failures
     /// still propagate as `Err`.
     Failed,
+    /// Terminal FF32 McWeeny polish applied on a converged/floor f32
+    /// state and the returned K's residual was MEASURED on it. A
+    /// successful high-accuracy outcome — stronger than `Converged`,
+    /// not a `NumericalFloor` (which means "could not reach tol").
+    PolishedFF,
 }
 
 /// Size-scaled trace acceptance: `max(2e-5·Nocc, 1e-4)` electrons.
@@ -224,6 +229,29 @@ pub struct SparseBsr4Config {
     /// via `RUST_DFTB_SPGEMM_ACC8=1` for perf measurement; promote to
     /// default only if it actually wins.
     pub spgemm_acc8: bool,
+    /// ACC16 (GPT-5.6 study): four quads (16 accumulators) cycling over
+    /// plan terms t+=4 — quarter-length f32 accumulation chains. Targets
+    /// the measured R_I~2e-5 floor ≈ deg·ε_f32 at deg~330. Enable via
+    /// `RUST_DFTB_SPGEMM_ACC16=1` (takes precedence over ACC8).
+    pub spgemm_acc16: bool,
+    /// Kahan-compensated f32 accumulation in the plan SpGEMMs (GPT-5.6):
+    /// each accumulator carries a compensation term — summation error
+    /// ~ε_f32 independent of chain length (~4× the flops of ACC4, so an
+    /// endgame/diagnostic variant, not the always-on default). Enable via
+    /// `RUST_DFTB_SPGEMM_KAHAN=1` (takes precedence over ACC8/ACC16).
+    pub spgemm_kahan: bool,
+    /// FF32-POLISH (manifest §4.12.2 consolidated): read the A_lo tile
+    /// from global memory (L2-cached, ~300× reuse/row) instead of a second
+    /// `__local` tile — halves the ff kernel's local footprint and
+    /// restores 2 WG/SM occupancy. Default ON (measured 44→38 ms/step,
+    /// numerics identical); `RUST_DFTB_FF_LO_GLOBAL=0` opts out.
+    pub ff_lo_global: bool,
+    /// FF32-POLISH: two alternating (hi,lo) accumulator sets per lane
+    /// in the ff product kernels — halves the serial TwoSum dependency
+    /// chain (the ff analogue of ACC8). Default ON (measured 38→28
+    /// ms/step, trajectory unchanged to ~6 digits);
+    /// `RUST_DFTB_FF_ACC2=0` opts out.
+    pub ff_acc2: bool,
 }
 
 impl Default for SparseBsr4Config {
@@ -233,6 +261,10 @@ impl Default for SparseBsr4Config {
             max_left_blocks: 512,
             reduce_wg: 256,
             spgemm_acc8: matches!(std::env::var("RUST_DFTB_SPGEMM_ACC8"), Ok(v) if v == "1" || v.eq_ignore_ascii_case("true")),
+            spgemm_acc16: matches!(std::env::var("RUST_DFTB_SPGEMM_ACC16"), Ok(v) if v == "1" || v.eq_ignore_ascii_case("true")),
+            spgemm_kahan: matches!(std::env::var("RUST_DFTB_SPGEMM_KAHAN"), Ok(v) if v == "1" || v.eq_ignore_ascii_case("true")),
+            ff_lo_global: !matches!(std::env::var("RUST_DFTB_FF_LO_GLOBAL"), Ok(v) if v == "0" || v.eq_ignore_ascii_case("false")),
+            ff_acc2: !matches!(std::env::var("RUST_DFTB_FF_ACC2"), Ok(v) if v == "0" || v.eq_ignore_ascii_case("false")),
         }
     }
 }
@@ -288,6 +320,18 @@ pub struct SparseBsr4Gpu {
     // GPT-5.6 item 4: generic planned SpGEMM (no symmetry — for P² with
     // non-symmetric P = KS).
     k_spgemm_plan: Kernel,
+    // FF32-POLISH (manifest §4.12.2 r2): float-float (hi+lo) planned
+    // SpGEMM + elementwise 3Q−2V McWeeny combine. Emulated ~46-bit
+    // arithmetic using only f32 FMA — no native fp64 (RTX 3090 fp64 is
+    // ~1/64). (The fused product+combine variant lost its compensation
+    // under compiler scheduling — split path verified 9.7e-14.)
+    k_spgemm_plan_bsym_ff: Kernel,
+    // Specialized variants (manifest §4.12.2 consolidated): ff0 = plain
+    // f32 A (no lA_lo tile — half the local memory); ffb = ff B operand
+    // too (V = T·Q 3-product path).
+    k_spgemm_plan_bsym_ff0: Kernel,
+    k_spgemm_plan_bsym_ffb: Kernel,
+    k_mcw_ff_combine: Kernel,
     // GPT-5.6 #9: device-side inf_norm, identity, scale for NS Z0 init
     k_row_abs_sum: Kernel,
     k_reduce_max: Kernel,
@@ -336,6 +380,10 @@ impl SparseBsr4Gpu {
         builder.cmplr_def("MAX_LEFT_BLOCKS", config.max_left_blocks);
         builder.cmplr_def("REDUCE_WG", config.reduce_wg);
         builder.cmplr_def("ACC8", config.spgemm_acc8 as i32);
+        builder.cmplr_def("ACC16", config.spgemm_acc16 as i32);
+        builder.cmplr_def("KAHAN", config.spgemm_kahan as i32);
+        builder.cmplr_def("FFLO_GLOBAL", config.ff_lo_global as i32);
+        builder.cmplr_def("FFACC2", config.ff_acc2 as i32);
         let program = builder.build(&context).map_err(map_ocl_err)?;
 
         // Touch the program cache so the runtime is aware (no-op effectively,
@@ -511,6 +559,56 @@ impl SparseBsr4Gpu {
             b.arg(&dummy_u32); b.arg(&dummy_f32); // C_row, C
             b.build().map_err(map_ocl_err)?
         };
+        // bsr4_spgemm_plan_Bsym_ff (FF32-POLISH): nrow, A_row, A_hi,
+        //   A_lo, a_has_lo, B, plan_ptr, plan_a_idx, plan_b_idx, C_row,
+        //   C_hi, C_lo -> 2 u32 scalars, 4 u32 bufs, 5 f32 bufs
+        let k_spgemm_plan_bsym_ff = {
+            let mut b = Kernel::builder();
+            b.program(&program).name("bsr4_spgemm_plan_Bsym_ff").queue(queue.clone());
+            b.arg(0u32); // nrow
+            b.arg(&dummy_u32); b.arg(&dummy_f32); b.arg(&dummy_f32); // A_row, A_hi, A_lo
+            b.arg(0u32); // a_has_lo
+            b.arg(&dummy_f32); // B
+            b.arg(&dummy_u32); b.arg(&dummy_u32); b.arg(&dummy_u32); // plan
+            b.arg(&dummy_u32); b.arg(&dummy_f32); b.arg(&dummy_f32); // C_row, C_hi, C_lo
+            b.build().map_err(map_ocl_err)?
+        };
+        // bsr4_spgemm_plan_Bsym_ff0: nrow, A_row, A, B, plan_ptr,
+        //   plan_a_idx, plan_b_idx, C_row, C_hi, C_lo
+        //   -> 1 u32 scalar, 4 u32 bufs, 4 f32 bufs
+        let k_spgemm_plan_bsym_ff0 = {
+            let mut b = Kernel::builder();
+            b.program(&program).name("bsr4_spgemm_plan_Bsym_ff0").queue(queue.clone());
+            b.arg(0u32); // nrow
+            b.arg(&dummy_u32); b.arg(&dummy_f32); // A_row, A
+            b.arg(&dummy_f32); // B
+            b.arg(&dummy_u32); b.arg(&dummy_u32); b.arg(&dummy_u32); // plan
+            b.arg(&dummy_u32); b.arg(&dummy_f32); b.arg(&dummy_f32); // C_row, C_hi, C_lo
+            b.build().map_err(map_ocl_err)?
+        };
+        // bsr4_spgemm_plan_Bsym_ffb: nrow, A_row, A_hi, A_lo, B_hi, B_lo,
+        //   plan_ptr, plan_a_idx, plan_b_idx, C_row, C_hi, C_lo
+        //   -> 1 u32 scalar, 4 u32 bufs, 6 f32 bufs
+        let k_spgemm_plan_bsym_ffb = {
+            let mut b = Kernel::builder();
+            b.program(&program).name("bsr4_spgemm_plan_Bsym_ffb").queue(queue.clone());
+            b.arg(0u32); // nrow
+            b.arg(&dummy_u32); b.arg(&dummy_f32); b.arg(&dummy_f32); // A_row, A_hi, A_lo
+            b.arg(&dummy_f32); b.arg(&dummy_f32); // B_hi, B_lo
+            b.arg(&dummy_u32); b.arg(&dummy_u32); b.arg(&dummy_u32); // plan
+            b.arg(&dummy_u32); b.arg(&dummy_f32); b.arg(&dummy_f32); // C_row, C_hi, C_lo
+            b.build().map_err(map_ocl_err)?
+        };
+        // bsr4_mcw_ff_combine (FF32-POLISH): nblock, Q_hi, Q_lo, V_hi,
+        //   V_lo, Knew -> 1 u32 scalar, 5 f32 bufs (elementwise)
+        let k_mcw_ff_combine = {
+            let mut b = Kernel::builder();
+            b.program(&program).name("bsr4_mcw_ff_combine").queue(queue.clone());
+            b.arg(0u32); // nblock
+            b.arg(&dummy_f32); b.arg(&dummy_f32); b.arg(&dummy_f32); b.arg(&dummy_f32); // Q,V hi/lo
+            b.arg(&dummy_f32); // Knew
+            b.build().map_err(map_ocl_err)?
+        };
         // GPT-5.6 #9: device-side inf_norm, identity, scale
         // bsr4_row_abs_sum: n_atom, row_ptr, col_idx, values, row_sums
         //   -> 1 u32 scalar, 2 u32 bufs, 2 f32 bufs
@@ -615,6 +713,8 @@ impl SparseBsr4Gpu {
             k_identity_residual,
             k_idempotency,
             k_spgemm_plan_bsym, k_spgemm_plan,
+            k_spgemm_plan_bsym_ff, k_spgemm_plan_bsym_ff0, k_spgemm_plan_bsym_ffb,
+            k_mcw_ff_combine,
             k_row_abs_sum, k_reduce_max, k_build_identity, k_scale,
             k_gershgorin_partial, k_reduce_min,
             k_build_hscc, k_trace_hk, k_frob_sq, k_restrict, k_trace_atom,
@@ -747,6 +847,9 @@ impl SparseBsr4Gpu {
     fn queue(&self) -> &ocl::Queue {
         self.rt.queue()
     }
+
+    /// Block until the in-order queue drains (benchmarks/diagnostics).
+    pub fn finish(&self) -> Result<()> { self.rt.finish() }
 
     /// Stage profiler passthroughs (`RUST_DFTB_PROF` gated; see `GpuRuntime::Prof`).
     pub fn prof_tick(&self, name: &'static str) { self.rt.prof_tick(name); }
@@ -1957,6 +2060,147 @@ impl SparseBsr4Gpu {
                 .enq()
                 .map_err(map_ocl_err)?;
         }
+        Ok(())
+    }
+
+    /// FF32-POLISH (manifest §4.12.2 r2): planned b-symmetric SpGEMM with
+    /// float-float output `C = (C_hi, C_lo)` = P_M(A·B). `a` supplies the
+    /// row structure + hi part; `a_lo` is the low part (any valid buffer
+    /// when `a_has_lo` is false — it is never read). All-f32 arithmetic
+    /// (TwoProd+TwoSum via FMA) — ~46 effective bits, no native fp64.
+    /// No host transfer, no `finish()`.
+    pub fn spgemm_plan_bsym_ff_dev(
+        &self,
+        a: &GpuBsrMatrix,
+        a_lo: &Buffer<f32>,
+        a_has_lo: bool,
+        b: &GpuBsrMatrix,
+        plan: &SpgemmPlanGpu,
+        c: &GpuBsrMatrix,
+        c_lo: &Buffer<f32>,
+    ) -> Result<()> {
+        self.check_left_degree(a)?;
+        let nrow = a.struct_.n_atom;
+        let gws = nrow * self.config.wg as usize;
+        let k = &self.k_spgemm_plan_bsym_ff;
+        k.set_arg(0, nrow as u32).map_err(map_ocl_err)?;
+        k.set_arg(1, &a.struct_.row_ptr).map_err(map_ocl_err)?;
+        k.set_arg(2, &a.values).map_err(map_ocl_err)?;
+        k.set_arg(3, a_lo).map_err(map_ocl_err)?;
+        k.set_arg(4, a_has_lo as u32).map_err(map_ocl_err)?;
+        k.set_arg(5, &b.values).map_err(map_ocl_err)?;
+        k.set_arg(6, &plan.plan_ptr).map_err(map_ocl_err)?;
+        k.set_arg(7, &plan.plan_a_idx).map_err(map_ocl_err)?;
+        k.set_arg(8, &plan.plan_b_idx).map_err(map_ocl_err)?;
+        k.set_arg(9, &c.struct_.row_ptr).map_err(map_ocl_err)?;
+        k.set_arg(10, &c.values).map_err(map_ocl_err)?;
+        k.set_arg(11, c_lo).map_err(map_ocl_err)?;
+        unsafe {
+            k.cmd()
+                .global_work_size(gws)
+                .local_work_size(self.config.wg as usize)
+                .enq()
+                .map_err(map_ocl_err)?;
+        }
+        Ok(())
+    }
+
+    /// FF product with a plain-f32 left operand (`bsr4_spgemm_plan_Bsym_ff0`
+    /// — no lo tile, half the local footprint). For T = K·S where K is
+    /// stored f32. No host transfer, no `finish()`.
+    pub fn spgemm_plan_bsym_ff0_dev(
+        &self,
+        a: &GpuBsrMatrix,
+        b: &GpuBsrMatrix,
+        plan: &SpgemmPlanGpu,
+        c: &GpuBsrMatrix,
+        c_lo: &Buffer<f32>,
+    ) -> Result<()> {
+        self.check_left_degree(a)?;
+        let nrow = a.struct_.n_atom;
+        let gws = nrow * self.config.wg as usize;
+        let k = &self.k_spgemm_plan_bsym_ff0;
+        k.set_arg(0, nrow as u32).map_err(map_ocl_err)?;
+        k.set_arg(1, &a.struct_.row_ptr).map_err(map_ocl_err)?;
+        k.set_arg(2, &a.values).map_err(map_ocl_err)?;
+        k.set_arg(3, &b.values).map_err(map_ocl_err)?;
+        k.set_arg(4, &plan.plan_ptr).map_err(map_ocl_err)?;
+        k.set_arg(5, &plan.plan_a_idx).map_err(map_ocl_err)?;
+        k.set_arg(6, &plan.plan_b_idx).map_err(map_ocl_err)?;
+        k.set_arg(7, &c.struct_.row_ptr).map_err(map_ocl_err)?;
+        k.set_arg(8, &c.values).map_err(map_ocl_err)?;
+        k.set_arg(9, c_lo).map_err(map_ocl_err)?;
+        unsafe {
+            k.cmd()
+                .global_work_size(gws)
+                .local_work_size(self.config.wg as usize)
+                .enq()
+                .map_err(map_ocl_err)?;
+        }
+        Ok(())
+    }
+
+    /// FF product with BOTH operands carrying lo parts
+    /// (`bsr4_spgemm_plan_Bsym_ffb`): A = (a.values, a_lo),
+    /// B = (b.values, b_lo). For V = T_ff·Q_ff (the 3-product McWeeny
+    /// path). No host transfer, no `finish()`.
+    pub fn spgemm_plan_bsym_ffb_dev(
+        &self,
+        a: &GpuBsrMatrix,
+        a_lo: &Buffer<f32>,
+        b: &GpuBsrMatrix,
+        b_lo: &Buffer<f32>,
+        plan: &SpgemmPlanGpu,
+        c: &GpuBsrMatrix,
+        c_lo: &Buffer<f32>,
+    ) -> Result<()> {
+        self.check_left_degree(a)?;
+        let nrow = a.struct_.n_atom;
+        let gws = nrow * self.config.wg as usize;
+        let k = &self.k_spgemm_plan_bsym_ffb;
+        k.set_arg(0, nrow as u32).map_err(map_ocl_err)?;
+        k.set_arg(1, &a.struct_.row_ptr).map_err(map_ocl_err)?;
+        k.set_arg(2, &a.values).map_err(map_ocl_err)?;
+        k.set_arg(3, a_lo).map_err(map_ocl_err)?;
+        k.set_arg(4, &b.values).map_err(map_ocl_err)?;
+        k.set_arg(5, b_lo).map_err(map_ocl_err)?;
+        k.set_arg(6, &plan.plan_ptr).map_err(map_ocl_err)?;
+        k.set_arg(7, &plan.plan_a_idx).map_err(map_ocl_err)?;
+        k.set_arg(8, &plan.plan_b_idx).map_err(map_ocl_err)?;
+        k.set_arg(9, &c.struct_.row_ptr).map_err(map_ocl_err)?;
+        k.set_arg(10, &c.values).map_err(map_ocl_err)?;
+        k.set_arg(11, c_lo).map_err(map_ocl_err)?;
+        unsafe {
+            k.cmd()
+                .global_work_size(gws)
+                .local_work_size(self.config.wg as usize)
+                .enq()
+                .map_err(map_ocl_err)?;
+        }
+        Ok(())
+    }
+
+    /// Elementwise float-float McWeeny combine:
+    /// `Knew = round_f32(3·Q_ff − 2·V_ff)` on M_K (all buffers same
+    /// structure). No host transfer, no `finish()`.
+    pub fn mcw_ff_combine_dev(
+        &self,
+        nblock: usize,
+        q: &Buffer<f32>,
+        q_lo: &Buffer<f32>,
+        v: &Buffer<f32>,
+        v_lo: &Buffer<f32>,
+        knew: &Buffer<f32>,
+    ) -> Result<()> {
+        let gws = nblock * BS2;
+        let k = &self.k_mcw_ff_combine;
+        k.set_arg(0, nblock as u32).map_err(map_ocl_err)?;
+        k.set_arg(1, q).map_err(map_ocl_err)?;
+        k.set_arg(2, q_lo).map_err(map_ocl_err)?;
+        k.set_arg(3, v).map_err(map_ocl_err)?;
+        k.set_arg(4, v_lo).map_err(map_ocl_err)?;
+        k.set_arg(5, knew).map_err(map_ocl_err)?;
+        unsafe { k.cmd().global_work_size(gws).enq().map_err(map_ocl_err)?; }
         Ok(())
     }
 

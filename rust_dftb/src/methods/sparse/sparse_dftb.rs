@@ -88,6 +88,20 @@ pub struct SparseDftbScc {
     pub purify_status: PurifyStatus,
 }
 
+/// Converged electronic state at one geometry — the Hessian "central
+/// state" every ±h FD column restores before solving (manifest §4.12,
+/// tasks Phase G1). Host copies of `q` and the device `K`/`Z`/`K0`
+/// value arrays; `h_scc`/`b_zh` are NOT snapshotted — they are rebuilt
+/// per displacement from the restored state. `k0` = the cold-start
+/// matrix (emax·Z − ZHZ)/Δ at the center — enables the δK0 first-order
+/// subspace-rotation seed `K_conv + (K0_new − K0_center)` (Phase G3).
+pub struct SparseElectronicState {
+    pub q: Vec<f64>,
+    pub k: Vec<f32>,
+    pub z: Vec<f32>,
+    pub k0: Vec<f32>,
+}
+
 /// Tunables. `new` uses `Default`. Changing n_atom or mask requires a new engine.
 #[derive(Debug, Clone)]
 pub struct SparseDftbConfig {
@@ -170,13 +184,20 @@ pub struct SparseDftbConfig {
     /// reference run). Skips the geometric build; still validated for
     /// diagonals/symmetry and measured against the degree budgets.
     pub mask_kz: Option<(Vec<u32>, Vec<u32>)>,
+    /// Production hi-accuracy purification (manifest §4.12.2
+    /// consolidated): after the f32 TC2 phase, run the terminal FF32
+    /// McWeeny polish (1–5 steps, residual-gated early exit). `None` →
+    /// false; `RUST_DFTB_TC2_FF=1` still force-enables for studies.
+    pub tc2_hiacc: Option<bool>,
 }
 
 impl Default for SparseDftbConfig {
     fn default() -> Self {
         Self {
             mix: 0.5, scc_tol: 1e-5, max_scc: 80,
-            ns_max: 50, ns_tol: 1e-5, tc2_max: 80, tc2_tol: 1e-4,
+            // tc2_max=30: the production f32 budget (manifest §4.12.2
+            // consolidated) — floor-stop/hiacc make more iters useless.
+            ns_max: 50, ns_tol: 1e-5, tc2_max: 30, tc2_tol: 1e-4,
             full_mask: None, r_skin_ang: 1.0,
             r_k_ang: None, r_z_ang: None, r_trunc_ang: None, taper_w_ang: 1.0,
             dense_diag: None,
@@ -188,6 +209,7 @@ impl Default for SparseDftbConfig {
             max_deg_hs: None, max_deg_k: None, max_deg_z: None,
             r_zs_halo_ang: 0.0,
             mask_kz: None,
+            tc2_hiacc: None,
         }
     }
 }
@@ -279,6 +301,16 @@ pub struct SparseDftb {
     /// The Z buffer holds a usable inverse from a *previous* geometry —
     /// warm-start NS with cold fallback (R6 physics: Z changes slowly).
     z_warm: bool,
+    /// The device K buffer holds a converged projector from a previous
+    /// purify (earlier mix iter or earlier ±h geometry). Enables the
+    /// `RUST_DFTB_WARM_K` path: TC2 tightens the stored K instead of
+    /// rebuilding K0 = (emax·Z − ZHZ)/Δε and re-descending ~50 iters.
+    /// False until the first successful K-path purify.
+    k_warm: bool,
+    /// Central electronic state snapshot (Phase G1) — set by
+    /// `snapshot_electronic_state`, used by `restore_central_state` and
+    /// the δK0 seed in `scc_fixedq`/`scc` (Phase G3).
+    central: Option<SparseElectronicState>,
     dense_diag: bool,
 
     fire_v: Vec<[f64; 3]>,
@@ -530,7 +562,7 @@ impl SparseDftb {
             } else { None },
             q_res: vec![0.0; n_atom],
             q_snap: vec![0.0; n_atom], res_snap: vec![0.0; n_atom],
-            e_rep: 0.0, last: n_scc, z_valid: false, z_warm: false, dense_diag,
+            e_rep: 0.0, last: n_scc, z_valid: false, z_warm: false, k_warm: false, central: None, dense_diag,
             fire_v: vec![[0.0; 3]; n_atom], fire_dt: 0.1, fire_alpha: 0.1, fire_n_pos: 0,
         };
         eng.k_vals = vec![0.0; eng.ws.k_struct().nblock * BS2];
@@ -617,7 +649,204 @@ impl SparseDftb {
     pub fn purify_current(&mut self) -> Result<(PurifyStatus, f32, f64, usize)> {
         self.last.n_scc = 0;
         self.last.purify_status = PurifyStatus::Failed;
+        self.ws.set_tc2_hiacc(self.cfg.tc2_hiacc.unwrap_or(false));
         self.ws.tc2_purify(self.cfg.tc2_max, self.cfg.tc2_tol, 1)
+    }
+    /// DIAGNOSTIC (TC2 convergence study): rebuild K0/P0 from the CURRENT
+    /// H_scc (identical cold seed every call — Z is reused, H_scc is not
+    /// touched) and run one purify in the SELECTED mode (sparse_purifier
+    /// "k"|"p"|"trs" — defaults to "k"). Used to A/B purifier variants
+    /// (ACC4/8/16/Kahan, McWeeny endgame, stopping rules) on exactly the
+    /// same input.
+    pub fn purify_cold(&mut self, max_iter: usize, tol: f32) -> Result<(PurifyStatus, f32, f64, usize)> {
+        self.last.n_scc = 0;
+        self.last.purify_status = PurifyStatus::Failed;
+        let env_flag = |name: &str| std::env::var(name).map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false);
+        let use_trs = self.cfg.purifier_trs.unwrap_or_else(|| env_flag("RUST_DFTB_TRS"));
+        let use_p = self.cfg.purifier_p.unwrap_or_else(|| env_flag("RUST_DFTB_P_TC2"));
+        self.ws.set_tc2_hiacc(self.cfg.tc2_hiacc.unwrap_or(false));
+        if use_trs {
+            self.ws.purify_hscc_trs(max_iter, tol)
+        } else if use_p {
+            self.ws.purify_hscc_p(max_iter, tol)
+        } else {
+            self.ws.compute_k0_from_hscc(0.1)?;
+            self.ws.tc2_purify(max_iter, tol, 1)
+        }
+    }
+    /// F64-DIAG + DUMMY-DECOMP (manifest §4.12.2): download the device K
+    /// and host S, compute R_I = ‖KSK−K‖_F/‖K‖_F in dense f64 — separates
+    /// "the stored state is at the floor" from "the f32 product noise is
+    /// being measured". Decomposes ‖KSK−K‖² into physical-lane vs
+    /// dummy-lane contributions (R14: padding contamination vs genuine
+    /// floor). Returns (r_i_f64, r_i_phys, r_i_dummy, tr_ks_f64).
+    /// One-shot diagnostic only — O(n³) host f64, never in a hot path.
+    pub fn ri_f64_diag(&mut self) -> Result<(f64, f64, f64, f64)> {
+        use nalgebra::DMatrix;
+        let n4 = self.n_atom * 4;
+        let mut kd = vec![0.0f32; n4 * n4];
+        self.ws.k_to_dense_into(&mut kd)?;
+        let mut sd = vec![0.0f32; n4 * n4];
+        crate::methods::sparse::bsr4::bsr_values_to_dense(
+            self.n_atom, &self.s_bsr.row_ptr, &self.s_bsr.col_idx, &self.s_bsr.values, &mut sd,
+        );
+        let k = DMatrix::<f64>::from_fn(n4, n4, |i, j| kd[i * n4 + j] as f64);
+        let s = DMatrix::<f64>::from_fn(n4, n4, |i, j| sd[i * n4 + j] as f64);
+        let ks = &k * &s;
+        let ksk = &ks * &k;
+        let r = &ksk - &k;
+        let mut num = 0.0f64;
+        let mut num_pp = 0.0f64;   // physical×physical block
+        let mut num_dx = 0.0f64;   // any dummy lane involved
+        let mut den = 0.0f64;
+        for a in 0..n4 {
+            let pa = (a % 4) < self.atom_n_orb[a / 4] as usize;
+            for b in 0..n4 {
+                let pb = (b % 4) < self.atom_n_orb[b / 4] as usize;
+                let v = r[(a, b)];
+                num += v * v;
+                if pa && pb { num_pp += v * v; } else { num_dx += v * v; }
+                den += k[(a, b)] * k[(a, b)];
+            }
+        }
+        let kn = den.sqrt().max(1e-30);
+        let tr: f64 = (0..n4).map(|a| ks[(a, a)]).sum();
+        Ok((num.sqrt() / kn, num_pp.sqrt() / kn, num_dx.sqrt() / kn, tr))
+    }
+    /// FF32-POLISH (manifest §4.12.2 r2): `n` float-float McWeeny steps
+    /// on the CURRENT device K — all-f32 FMA, ~46-bit intermediates.
+    /// Expect ~1e-5 → ~1e-8 per step on a trace-locked state.
+    pub fn mcw_ff(&mut self, n: usize) -> Result<()> {
+        for _ in 0..n { self.ws.mcweeny_ff_step()?; }
+        // Debug probe (verbose only — it costs a host round-trip): are
+        // the float-float LO parts live? ‖lo‖ ~ eps·‖hi‖ (~1e-7 rel);
+        // all-zero means the compensation was optimized away.
+        if crate::methods::sparse::gpu_sparse::algebra_verbose() {
+            let (lq, lt) = self.ws.ff_lo_norms()?;
+            eprintln!("[mcw_ff] ff_lo norms: ‖U_lo‖={lt:.3e}  ‖Q_lo‖={lq:.3e}");
+        }
+        Ok(())
+    }
+    /// FF32 unit check: ff K·S and ff×f32 (KS)·K products vs host-f64
+    /// dense references. Returns (e1_hi, e1_ff, e2_hi, e2_ff).
+    pub fn ws_ff_test_ks(&mut self) -> Result<(f64, f64, f64, f64)> { self.ws.ff_test_ks() }
+    /// F64-MCW decisive test + A/B storage split (manifest §4.12.2 round
+    /// 2, GPT-5.6): downloads the stored device K once, then runs
+    /// `n_steps` McWeeny iterations ENTIRELY in host f64:
+    ///   Q = K·S·K,  V = Q·S·K,  K' = 3Q − 2V
+    /// reporting (R_I⁶⁴, R_H⁶⁴, Tr(KS)) per step.
+    ///   store_f32=false → variant B (all-f64 state): quadratic collapse
+    ///     (1e-5→1e-9→1e-14) means f32 precision IS the floor — design a
+    ///     minimal mixed-precision polish, not a new map.
+    ///   store_f32=true  → variant A (f32 STORAGE, f64 products): K'
+    ///     rounded to f32 each step. A stalling ~1e-5 while B collapses
+    ///     ⇒ f32 storage is the limiter; both collapsing ⇒ product
+    ///     arithmetic was the limiter. Picks the cheapest production form.
+    /// R_H⁶⁴ = ‖H·KS − KS·H‖/(2‖H·KS‖) is the subspace-stationarity leg
+    /// of the R_I/R_H 2×2 diagnosis — needed for the warm-DM question.
+    /// Rows are appended to RUST_DFTB_MCW_F64_HIST (csv) when set.
+    /// Diagnostic only: O(n³) host f64, never in a hot path.
+    pub fn mcw_f64_diag(&mut self, n_steps: usize, store_f32: bool) -> Result<()> {
+        let n4 = self.n_atom * 4;
+        let mut kd = vec![0.0f32; n4 * n4];
+        self.ws.k_to_dense_into(&mut kd)?;
+        let mut sd = vec![0.0f32; n4 * n4];
+        crate::methods::sparse::bsr4::bsr_values_to_dense(
+            self.n_atom, &self.s_bsr.row_ptr, &self.s_bsr.col_idx, &self.s_bsr.values, &mut sd,
+        );
+        let h_bsr = self.ws.h_scc().to_host(self.ws.gpu())?;
+        let mut hd = vec![0.0f32; n4 * n4];
+        crate::methods::sparse::bsr4::bsr_values_to_dense(
+            self.n_atom, &h_bsr.row_ptr, &h_bsr.col_idx, &h_bsr.values, &mut hd,
+        );
+        let k: Vec<f64> = kd.iter().map(|&x| x as f64).collect();
+        let s: Vec<f64> = sd.iter().map(|&x| x as f64).collect();
+        let h: Vec<f64> = hd.iter().map(|&x| x as f64).collect();
+        let nocc64 = self.nocc as f64;
+
+        let hist_path = std::env::var("RUST_DFTB_MCW_F64_HIST").ok().filter(|p| !p.is_empty());
+        if let Some(p) = &hist_path {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+                let _ = writeln!(f, "# call variant={} n_steps={n_steps} nocc={nocc64}", if store_f32 { "A_f32store" } else { "B_allf64" });
+            }
+        }
+        let hist_rec = |step: isize, r_i: f64, r_h: f64, tr: f64| {
+            if let Some(p) = &hist_path {
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+                    let _ = writeln!(f, "{step},{r_i:.6e},{r_h:.6e},{:.6e}", (tr - nocc64).abs() / nocc64);
+                }
+            }
+        };
+
+        // Report (R_I, R_H, Tr) of a state k; R_I reuses the caller's
+        // Q=KSK when Some — returns the reused products so the caller
+        // needn't recompute. matmuls: KS, KSK, H·KS, KS·H.
+        let eval = |k: &[f64]| -> (f64, f64, f64, Vec<f64>, Vec<f64>) {
+            let t = crate::methods::sparse::bsr4::matmul_f64_mt(n4, k, &s);
+            let q = crate::methods::sparse::bsr4::matmul_f64_mt(n4, &t, k);
+            let ht = crate::methods::sparse::bsr4::matmul_f64_mt(n4, &h, &t);
+            let th = crate::methods::sparse::bsr4::matmul_f64_mt(n4, &t, &h);
+            let mut num = 0.0f64; let mut den = 0.0f64;
+            let mut num_h = 0.0f64; let mut den_h = 0.0f64;
+            for i in 0..n4 * n4 {
+                let r = q[i] - k[i];
+                num += r * r; den += k[i] * k[i];
+                let c = ht[i] - th[i];
+                num_h += c * c; den_h += ht[i] * ht[i];
+            }
+            let tr: f64 = (0..n4).map(|a| t[a * n4 + a]).sum();
+            (num.sqrt() / den.sqrt().max(1e-30), num_h.sqrt() / (2.0 * den_h.sqrt().max(1e-30)), tr, t, q)
+        };
+
+        let mut k = k;
+        for step in 0..n_steps {
+            let (r_i, r_h, tr, _t, q) = eval(&k);
+            eprintln!("[mcw_f64] variant={} step {step}: R_I={r_i:.3e} R_H={r_h:.3e} Tr(KS)={tr:.6}",
+                if store_f32 { "A_f32store" } else { "B_allf64" });
+            hist_rec(step as isize, r_i, r_h, tr);
+            // V = Q·S·K, K' = 3Q − 2V  (2 matmuls)
+            let u = crate::methods::sparse::bsr4::matmul_f64_mt(n4, &q, &s);
+            let v = crate::methods::sparse::bsr4::matmul_f64_mt(n4, &u, &k);
+            let mut kn = vec![0.0f64; n4 * n4];
+            for i in 0..n4 * n4 { kn[i] = 3.0 * q[i] - 2.0 * v[i]; }
+            if store_f32 { for x in kn.iter_mut() { *x = *x as f32 as f64; } }
+            // FF32-POLISH r3: how much of the exact McWeeny update lives
+            // OUTSIDE M_K? That's the storage-truncation floor for any
+            // M_K-resident K (device ff path can never beat it).
+            if step == 0 {
+                let (mk_rp, mk_ci) = self.m_k()?;
+                let mut in_mk = vec![false; self.n_atom * self.n_atom];
+                for i in 0..self.n_atom {
+                    for b in mk_rp[i] as usize..mk_rp[i + 1] as usize {
+                        in_mk[i * self.n_atom + mk_ci[b] as usize] = true;
+                    }
+                }
+                let mut tail = 0.0f64; let mut tot = 0.0f64;
+                for i in 0..self.n_atom { for j in 0..self.n_atom {
+                    let m = !in_mk[i * self.n_atom + j];
+                    for r in 0..4 { for c in 0..4 {
+                        let x = kn[(i * 4 + r) * n4 + j * 4 + c];
+                        tot += x * x;
+                        if m { tail += x * x; }
+                    }}
+                }}
+                eprintln!("[mcw_f64]   K' tail OUTSIDE M_K: ‖tail‖/‖K'‖={:.3e}", tail.sqrt() / tot.sqrt().max(1e-30));
+            }
+            k = kn;
+        }
+        let (r_i, r_h, tr, _t, _q) = eval(&k);
+        eprintln!("[mcw_f64] variant={} FINAL: R_I={r_i:.3e} R_H={r_h:.3e} Tr(KS)={tr:.6}",
+            if store_f32 { "A_f32store" } else { "B_allf64" });
+        hist_rec(n_steps as isize, r_i, r_h, tr);
+        if let Some(p) = &hist_path {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+                let _ = writeln!(f, "# end");
+            }
+        }
+        Ok(())
     }
     /// Host M_K mask (row_ptr, col_idx) — pairs with `k_bsr` ordering.
     pub fn m_k(&self) -> Result<(Vec<u32>, Vec<u32>)> {
@@ -784,13 +1013,26 @@ impl SparseDftb {
             let env_flag = |name: &str| std::env::var(name).map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false);
             let use_trs = self.cfg.purifier_trs.unwrap_or_else(|| env_flag("RUST_DFTB_TRS"));
             let use_p = self.cfg.purifier_p.unwrap_or_else(|| env_flag("RUST_DFTB_P_TC2"));
-            let (pstat, r_i, tr, tc2_iters) = if use_trs {
-                self.ws.purify_hscc_trs(self.cfg.tc2_max, self.cfg.tc2_tol)?
+            // Warm-K TC2 (K path only): the stored K is the converged
+            // projector of the previous mix iter / ±h geometry. Opt-in —
+            // convergence of a seeded projector is only sound near the
+            // fixed point; on any Err fall back to the cold K0 path.
+            let warm = env_flag("RUST_DFTB_WARM_K") && self.k_warm && !use_trs && !use_p;
+            self.ws.set_tc2_hiacc(self.cfg.tc2_hiacc.unwrap_or(false));
+            let r = if warm {
+                self.ws.purify_hscc_warm(self.cfg.tc2_max, self.cfg.tc2_tol)
+                    .or_else(|_| self.ws.purify_hscc(self.cfg.tc2_max, self.cfg.tc2_tol))
+            } else if use_trs {
+                self.ws.purify_hscc_trs(self.cfg.tc2_max, self.cfg.tc2_tol)
             } else if use_p {
-                self.ws.purify_hscc_p(self.cfg.tc2_max, self.cfg.tc2_tol)?
+                self.ws.purify_hscc_p(self.cfg.tc2_max, self.cfg.tc2_tol)
             } else {
-                self.ws.purify_hscc(self.cfg.tc2_max, self.cfg.tc2_tol)?
+                self.ws.purify_hscc(self.cfg.tc2_max, self.cfg.tc2_tol)
             };
+            let (pstat, r_i, tr, tc2_iters) = r?;
+            if pstat != PurifyStatus::Failed {
+                self.k_warm = true;   // device K is a usable warm-start seed
+            }
             self.ws.gpu().prof_tick("scc.purify");
             if pstat == PurifyStatus::NumericalFloor && !self.cfg.accept_numerical_floor.unwrap_or(true) {
                 return Err(DftbError::InvalidInput(format!(
@@ -1002,6 +1244,161 @@ impl SparseDftb {
     /// `W=2·T·K` on M_HS via `SparseDWWorkspace`, download only `W[M_HS]` +
     /// `K[M_K]`, then a CPU pair contraction (`sparse_forces_bsr`). No dense
     /// orbital matrices, no O(N³) dense product.
+    /// Frozen-density force evaluation — the cheap FD-Hessian path.
+    /// Rebuilds V = γ·Δq at the CURRENT geometry with the EXISTING
+    /// (frozen) charges, rebuilds H_scc on device, then runs the usual
+    /// force contract with the stored K. No NS, no purify, no mixing —
+    /// physics = response of the energy at fixed density matrix, i.e.
+    /// charge redistribution upon displacement is neglected. Deliberately
+    /// bypasses the `last.n_scc` state gate by marking a frozen state.
+    pub fn forces_frozen(&mut self) -> Result<Forces> {
+        self.compute_v();
+        for i in 0..self.n_atom {
+            self.v_f32[i] = self.v[i] as f32;
+        }
+        self.ws.build_hscc_from_v(&self.v_f32)?;
+        // Mark a usable (frozen) state so forces() doesn't refuse.
+        self.last.n_scc = 1;
+        self.last.purify_status = PurifyStatus::Converged;
+        self.forces()
+    }
+
+    /// Snapshot the converged electronic state (q, K, Z, K0) into
+    /// `self.central` — the Hessian central-state reference of manifest
+    /// §4.12. Call AFTER `scc` has converged at the reference geometry.
+    /// Side effect: briefly rebuilds K0 in the device `k` buffer to
+    /// capture it, then restores the converged K.
+    pub fn snapshot_electronic_state(&mut self) -> Result<()> {
+        let nb_k = self.ws.k().struct_.nblock * BS2;
+        let mut k = vec![0.0f32; nb_k];
+        self.ws.gpu().read_f32(&self.ws.k().values, &mut k)?;
+        let mut z = vec![0.0f32; self.ws.z().struct_.nblock * BS2];
+        self.ws.gpu().read_f32(&self.ws.z().values, &mut z)?;
+        // K0_center = f(Z_center, H_scc_center) — rebuild in `k`, read
+        // to host, restore the converged K.
+        self.ws.compute_k0_from_hscc(0.1)?;
+        let mut k0 = vec![0.0f32; nb_k];
+        self.ws.gpu().read_f32(&self.ws.k().values, &mut k0)?;
+        self.ws.inject_k_values(&k)?;
+        self.central = Some(SparseElectronicState { q: self.q.clone(), k, z, k0 });
+        Ok(())
+    }
+
+    /// Restore the stored central state as the seed for the NEXT solve
+    /// at a NEW geometry. Every ±h Hessian column starts from the same
+    /// central state instead of inheriting the previous column's solver
+    /// history (manifest §4.12). Z is invalidated for the new S but kept
+    /// as the NS warm seed; K stays the central projector; the DIIS
+    /// history is fully reset so columns are interchangeable.
+    pub fn restore_central_state(&mut self) -> Result<()> {
+        let s = self.central.as_ref().ok_or_else(|| DftbError::InvalidInput(
+            "restore_central_state: no snapshot — call snapshot_electronic_state first".into()))?;
+        if s.q.len() != self.n_atom {
+            return Err(DftbError::InvalidInput(format!(
+                "restore_central_state: q len {} != n_atom {}", s.q.len(), self.n_atom
+            )));
+        }
+        self.q.copy_from_slice(&s.q);
+        self.ws.k().upload_values(self.ws.gpu(), &s.k)?;
+        self.ws.z().upload_values(self.ws.gpu(), &s.z)?;
+        self.ws.invalidate_ks();
+        self.z_valid = false;   // Z was built for the old S — re-NS warm
+        self.z_warm = true;
+        self.k_warm = true;     // device K is a converged projector seed
+        self.last.n_scc = 0;
+        self.last.purify_status = PurifyStatus::Failed;
+        if let Some(m) = &mut self.mixer {
+            m.reset();          // identical DIIS start for every column
+        }
+        Ok(())
+    }
+
+    /// Mode-B displaced solve (manifest §4.12.1 / tasks G2): charges
+    /// FROZEN at their current values (restore the central snapshot
+    /// first), one cold purify of H_scc(R; q_frozen), then `forces()`.
+    /// Includes orbital (projector) relaxation, excludes charge
+    /// response. No DIIS loop — ~1 purify instead of 9–17.
+    pub fn scc_fixedq(&mut self) -> Result<SparseDftbScc> {
+        if !self.z_valid {
+            let (rz, z_iters) = self.ws.compute_z(self.cfg.ns_max, self.cfg.ns_tol, 5, self.z_warm)?;
+            eprintln!("  [SparseDftb] NS (fixedq, warm={}): {z_iters} iters, R_Z={rz:.3e}", self.z_warm);
+            self.z_valid = true;
+            self.z_warm = true;
+        }
+        self.compute_v();
+        for i in 0..self.n_atom {
+            self.v_f32[i] = self.v[i] as f32;
+        }
+        self.ws.build_hscc_from_v(&self.v_f32)?;
+        // Phase G3 δK0 seed: K_seed = K_conv + (K0_new − K0_center)
+        // rotates the occupied subspace to first order; TC2 only
+        // polishes. Opt-in via RUST_DFTB_VIB_DMUPD; needs the central
+        // snapshot. Falls back to the cold purify on any failure.
+        let dmupd = std::env::var("RUST_DFTB_VIB_DMUPD")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        // tc2_tol override: at the measured mask floor (r_I~2.2e-5 on
+        // R10/deg330), tol=1e-5 is unreachable and every purify churns
+        // to the cap/plateau. Setting tol just above the floor (e.g.
+        // 5e-5) converges at ~30 iters — the accepted residual anyway.
+        let tc2_tol = std::env::var("RUST_DFTB_VIB_TC2TOL").ok()
+            .and_then(|v| v.parse::<f32>().ok()).unwrap_or(self.cfg.tc2_tol);
+        self.ws.set_tc2_hiacc(self.cfg.tc2_hiacc.unwrap_or(false));
+        let r = if dmupd && self.central.is_some() {
+            let (k0c, kc) = {
+                let s = self.central.as_ref().unwrap();
+                (s.k0.clone(), s.k.clone())
+            };
+            // δK0 seed lands at R_I~1e-3; McWeeny polish contracts it
+            // (TC2 repels a warm seed — the masked-map saddle), then TC2
+            // walks the floor / fixes trace drift.
+            let n_mcw = std::env::var("RUST_DFTB_VIB_MCPOL").ok()
+                .and_then(|v| v.parse::<usize>().ok()).unwrap_or(4);
+            self.ws.compute_k0_from_hscc(0.1)
+                .and_then(|_| self.ws.k_seed_shift(&k0c, &kc))
+                .and_then(|_| self.ws.mcweeny_polish(n_mcw))
+                .and_then(|_| self.ws.tc2_purify(self.cfg.tc2_max, tc2_tol, 1))
+        } else {
+            self.ws.purify_hscc(self.cfg.tc2_max, tc2_tol)
+        };
+        let (pstat, r_i, tr, tc2_iters) = r?;
+        if pstat == PurifyStatus::NumericalFloor && !self.cfg.accept_numerical_floor.unwrap_or(true) {
+            return Err(DftbError::InvalidInput(format!(
+                "scc_fixedq: TC2 NumericalFloor (R_I={r_i:e} > tol={}) — forces not validated",
+                tc2_tol
+            )));
+        }
+        let tol_tr = tc2_trace_tol(self.nocc as f64);
+        if (tr - self.nocc as f64).abs() > tol_tr {
+            return Err(DftbError::InvalidInput(format!(
+                "scc_fixedq: Tr(KS)={tr} far from Nocc={} (tol={tol_tr})", self.nocc
+            )));
+        }
+        // R_H gate: a warm seed can produce an idempotent matrix that is
+        // NOT the occupied projector of H_scc (wrong subspace — measured
+        // on si10h16: r_I fine, R_H wrong, spectrum shifted ~300 cm⁻¹).
+        // Gate on stationarity ‖HKS−SKH‖/(2‖HKS‖); cold restart on fail.
+        let rh_gate = std::env::var("RUST_DFTB_VIB_RHGATE").ok()
+            .and_then(|v| v.parse::<f64>().ok()).unwrap_or(5e-4);
+        let mut r_h = self.ws.rh_stationarity()?;
+        let (mut pstat, mut r_i, mut tr, mut tc2_iters) = (pstat, r_i, tr, tc2_iters);
+        if r_h > rh_gate {
+            eprintln!("  [SparseDftb] fixedq warm-seed rejected: R_H={r_h:.3e} > {rh_gate:e} — cold purify");
+            let (p, ri2, tr2, ti2) = self.ws.purify_hscc(self.cfg.tc2_max, tc2_tol)?;
+            pstat = p; r_i = ri2; tr = tr2; tc2_iters = ti2;
+            r_h = self.ws.rh_stationarity()?;
+            if r_h > rh_gate {
+                return Err(DftbError::InvalidInput(format!(
+                    "scc_fixedq: R_H={r_h:e} > {rh_gate:e} even after cold purify"
+                )));
+            }
+        }
+        self.store_energy(tr, r_i, 1, tc2_iters, 0.0, r_h as f32, pstat)?;
+        self.k_warm = true;
+        eprintln!("  [SparseDftb] fixedq  Tr(KS)={tr:.6}  r_I={r_i:.3e}  R_H={r_h:.3e}  tc2_iters={tc2_iters}");
+        Ok(SparseDftbScc { n_iters: 1, rms: 0.0, r_scc: 0.0, tr_ks: tr as f32, r_i, r_h: r_h as f32, purify_status: pstat })
+    }
+
     pub fn forces(&mut self) -> Result<Forces> {
         if self.last.n_scc == 0 {
             return Err(DftbError::InvalidInput("forces: no SCC yet — call scc first".into()));

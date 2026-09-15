@@ -429,3 +429,12 @@ on the hardest asymmetric replicas, all recovered), warm ~8 ms.
 Relaxed endpoints: pyridone lactam −32.35907 / lactim −32.36804
 (lactim lower by 5.6 kcal); dzp donor −53.41990 / transferred −53.41984
 (degenerate).
+
+## 11. Periodic chains — the same scan with `pbc_*`
+
+The identical recipe runs on a periodic H-bond wire via `GpuPbc`
+(complex k-points, Ewald γ): ASCII-art chain builder, one junction that
+crosses the cell boundary, nk=4 along the chain, degenerate endpoints
+that a finite dimer cannot produce. See
+[hbond_pbc_scans.md](hbond_pbc_scans.md) and the worked script
+`rust_dftb/scripts/scan2d_qxhq_pbc.rhai`.

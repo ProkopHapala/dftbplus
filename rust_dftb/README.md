@@ -68,16 +68,22 @@ RUST_DFTB_SCC_VERBOSE=1 cargo run --example hbond_ref -- ...
   `doc/prokop/topical_audit/sparse_nanocrystal_vibrations.md` for the Si/H
   nanocrystal vibrations task (Gates C–E pass, Gate F blocked on sparse
   analytic force bridge).
-- `src/qmqm/` — multi-fragment QM/QM solver + GPU runtime, including
-  `gpu_forces.rs`/`.cl` (Phase 4 analytic non-SCC GPU forces; currently
-  blocked on real-SK 1×4 bucket crash).
+- `src/qmqm/` — multi-fragment QM/QM solver + GPU runtime. Production
+  engine `gpu_dftb.rs` (`GpuDftb`: persistent buffers, batched SCC/FIRE/MD,
+  analytic forces via `gpu_forces.rs`/`.cl`). Extensions: `gpu_cdft.rs`/`.cl`
+  (constrained DFT fragment-charge constraints → diabatic states; worked
+  example `scripts/scan2d_pyridone_cdft.rhai` + `scripts/plot_scan2d_cdft.py`,
+  guide `doc/prokop/userguide/cdft.md`), `gpu_hermitian.rs`/`gpu_pbc_plan.rs`
+  (experimental complex k-point/PBC path).
 - `src/bin/` — executables (`dftb_engine`, `graphene_build`)
 - `examples/` — `hbond_ref`, `scan`, `neb`, `test_h2`, `debug_sk`
 - `tests/` — parity tests vs Fortran DFTB+, GPU tests, integration tests.
   Key GPU tests: `gpu_scc.rs` (H2O/N2 parity), `hbond_gpu_scc.rs` (formic dimer
   1D scan), `formic_scan_plots.rs` (1D+2D scan with plots, `--ignored`),
   `gpu_scc_bench.rs` (timing benchmarks, `--ignored`), `gpu_forces.rs`
-  (Phase 4 analytic force parity, synthetic H2/sp3 pass, real-SK H2O blocked).
+  (Phase 4 analytic force parity, synthetic H2/sp3 pass, real-SK H2O blocked),
+  `gpu_cdft.rs` (CDFT fragment-charge constraints: H2O {O} target + 8-replica
+  ladder, asserts constrained E ≥ E₀).
   Sparse nanocrystal tests: `sih_padded_basis.rs` (Gate D), `locality_sweep.rs`
   (Gate C), `spgemm_plan.rs` (P4), `gate_e_determinism.rs` (Gate E). See
   `doc/prokop/tasts/Sparse_Nanocrystal_Vibrations/Sparse_Nanocrystal_Vibrations.report.md`.

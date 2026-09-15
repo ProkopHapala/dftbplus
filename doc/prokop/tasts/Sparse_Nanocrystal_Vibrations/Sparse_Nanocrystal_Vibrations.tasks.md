@@ -997,6 +997,159 @@ by USER.
 
 ---
 
+## Phase G — Hessian-eval efficiency (2026-09-15, post §4.12.1 measurement)
+
+**Measurement policy (manifest §4.12.0):** never run a full Hessian to
+measure it — `RUST_DFTB_VIB_MAXCOL=8` + per-column phase timing +
+per-eval iteration counts, extrapolate to 6N. All runs `timeout ≤ 120 s`.
+
+A displaced ±h force eval costs **~3.5–7.3 s at N=330**, of which SCC is
+>98%: ~9–17 DIIS iters × a full ~41–55-iter cold purify each. The stored
+converged projector is thrown away every iteration. The design in
+manifest §4.12 already prescribed central-state reuse; the
+implementation never did it. GPT-5.6 review + our two measurements
+below converge on the same mode ladder.
+
+### G0 — measured (done, recorded in manifest §4.12.1)
+
+- [x] Per-phase profile: set_coords 5 ms / scc 3.4–7.3 s / forces 7 ms
+  (`scripts/bench_eval_r10.rhai`, `RUST_DFTB_PROF=mark`).
+- [x] `forces_frozen()` + `RUST_DFTB_VIB_FROZEN` (mode A): 12 ms/eval,
+  R10 Hessian 23 s. Framework modes good, stretches ~240 cm⁻¹ soft →
+  preview only.
+- [x] `purify_hscc_warm()` + `RUST_DFTB_WARM_K` (naive TC2 seed):
+  **refuted** — repelling fixed point, r_I doubles per eval.
+
+### G1 — central-state snapshot/restore (correctness + perf) — DONE
+
+- [x] `snapshot_electronic_state()` / `restore_central_state()`: q, Z,
+  K, K0 stored engine-side; DIIS fully reset per column.
+- [x] `sparse_vibrations` restores the central state before every ±h
+  eval — identical solver history per column.
+- [ ] Quantify FD asymmetry change on a measured pair (Hessian
+  `max_asym` before/after — si10h16: 8.3e-3 with restore; compare vs
+  chained-history baseline later).
+
+### G2 — mode B: fixed-q electronic solve — DONE, validated
+
+- [x] `scc_fixedq()`: NS warm + ONE purify, no DIIS. `RUST_DFTB_VIB_FIXQ`.
+- [x] si10h16 vs full SCC: rms 6.1 cm⁻¹, max 10.7 (frozen-DM: 162/344 —
+  charge response is ~5 cm⁻¹-scale, orbital relaxation is the
+  dominant physics).
+- [x] R10 per-eval ~0.36 s at tol 5e-5 → Hessian ≈ 12 min.
+
+### G3 — mode C: warm DM update — attempt #1 REFUTED, needs DMM
+
+- [x] δK0 seed + McWeeny polish + TC2 (`RUST_DFTB_VIB_DMUPD`,
+  `k_seed_shift`, `mcweeny_polish`): converges in ~7 iters BUT to a
+  wrong-subspace projector — R_H=1.4e-3 vs cold 4e-7, si10h16 spectrum
+  off ~300 cm⁻¹. Purification can only enforce idempotency+trace; the
+  occupied-subspace selection comes only from the H-containing K0
+  basin. Kept env-gated; `R_H` gate (5e-4) cold-restarts on failure.
+- [ ] Correct warm update must minimize ‖[K,H]‖: LNV/DMM commutator
+  descent (e.g. K ← K − η·Sym[(I−KS)Z·H·K + h.c.]) before polish.
+  Deferred — measure whether fixq-with-floor-tol already suffices.
+
+### G4 — iteration-count discipline — partially done
+
+- [x] Floor-aware tol: `RUST_DFTB_VIB_TC2TOL=5e-5` converges at 25 iters
+  (vs 80-cap churn); Hessian accuracy unchanged (rms 6.3 vs 6.1).
+- [ ] Wire floor-stop (W=28 or tol-above-floor) into the DEFAULT Hessian
+  path, not just env.
+- [ ] SCC displaced evals converge in ≤ ~5 mix iters or get a warning;
+  investigate floor-noise-vs-sloshing on a complete-mask reference.
+- [ ] Optional looser `scc_tol` for Hessian columns with an FD-noise
+  study (σ_F/h trade-off).
+
+### G5 — structural (after G1–G4 verified)
+
+- [ ] Device-side TC2 branch / fused iterations — remove the per-iter
+  blocking read once iteration counts are small.
+- [ ] Batch ±h columns: N engines sharing topology/plans (product goal:
+  parallel Hessian).
+- [ ] GPU H0/S + γ assembly (existing B2/B3 items) — only when SCC is
+  cheap enough that ~5 ms/eval CPU geometry work matters, N≳2000.
+- [ ] Long-term: coupled-perturbed SCC (analytic linear-response
+  Hessian) instead of 6N displaced solves.
+
+### G6 — TC2 endgame / numerical floor (2026-09-15, manifest §4.12.2)
+
+Measured on R10 (deg~330, full support): all f32 variants floor at
+~5e-6–2e-5; the sawtooth is the TC2 branch saddle (η→2η→η), not
+accumulation. Harness: `tc2_conv_study.rhai` + `plot_tc2_convergence.py`
++ `sparse_purify_now` + `RUST_DFTB_TC2_HIST`.
+
+- [x] ACC4/8/16 + Kahan measured — 1.78e-5 / 1.75e-5 / 1.32e-5 /
+  9.7e-6. **ACC studies closed** (map-intrinsic floor).
+- [x] `RUST_DFTB_SPGEMM_ACC16` implemented (~2× faster/iter — keep for
+  speed if it reproduces, not for accuracy).
+- [x] `RUST_DFTB_SPGEMM_KAHAN` implemented (endgame/diagnostic variant).
+- [x] `RUST_DFTB_TC2_MCW` McWeeny-endgame switch — smooth monotone
+  descent to 5.4e-6 BUT glacial (>100 iters): each step injects
+  ~1e-6–1e-5. ANOMALOUS vs expected quadratic drop.
+- [x] F64-DIAG (`sparse_ri_f64`): true K residual 4.1e-5 (K-TC2) /
+  1.4e-5 (K+McW) — f32 GPU measurement UNDERESTIMATES ~2.6×; state is
+  at the floor, not the residual kernel.
+- [x] DUMMY-DECOMP: dummy-lane residual exactly 0 — all physical.
+- [x] MCW-PLAN: McWeeny via planned kernels (+fixed U=Q·S truncated to
+  M_K → now M_TKS; trace drift 4.4e-7→7e-8). Floor unchanged → product
+  accuracy is not the limiter.
+- [x] MCW-SHORT: descent is smooth but asymptotic, not quadratic —
+  mechanism identified: ALL polynomial purifiers are marginally stable
+  in the occ↔unocc (subspace-rotation) direction; L(E_ou)=E_ou at
+  linear order. Same root cause as the G3 warm-DM failure.
+- [x] P-space measured: P-TC2 5.6e-6 / TRS4 6.0e-6 on P, but recovered
+  K=PZ = 7–8e-5 (recovery loses it); P-McWeeny drifts UP (non-normal
+  iterate) — REJECTED.
+- [x] Mechanism CORRECTED (GPT-5.6): subspace rotation produces NO
+  first-order R_I (PE+EP−E cancels E_ou) — idempotency ≠ stationarity;
+  all f32 variants hitting the same wall ⇒ likely f32 representation
+  floor, not a map defect.
+- [x] F64-MCW decisive test (`sparse_mcw_f64`): stored best K 1.42e-5
+  → 4.0e-9 → 2.2e-15 → eps — **quadratic collapse; f32 precision IS
+  the floor**, map healthy. Plot: debug/tc2_conv_r10.png panel 3.
+- [x] A/B: f32-store+f64-products stalls at 1.3e-8 (storage
+  quantization), all-f64 → 8e-16 → the ~1e-5 floor is product
+  ARITHMETIC noise; f32 storage alone supports ~1e-8.
+- [x] R_H reported with R_I in mcw_f64 (9.2e-2 here, but H_scc was
+  4-mixer unconverged — subspace leg unmeasured; needs converged H_scc).
+- [x] FF32-POLISH impl (chosen path, manifest §4.12.2 r2): float-float
+  (hi+lo, f32 FMA only) McWeeny polish on GPU —
+  kernel `bsr4_spgemm_plan_Bsym_ff` (f32/ff × f32 → hi+lo, flag
+  a_has_lo) + `bsr4_mcw_ff_combine` (elementwise fma-chain 3Q−2V→f32;
+  the FUSED product+combine variant was found to lose compensation to
+  compiler reassociation — measured 1.7e-7 vs 9.7e-14 — and was
+  replaced), buffers ff_t_lo/ff_q_lo/ff_v_lo, `ws.mcweeny_ff_step()`,
+  rhai `sparse_mcw_ff` + `sparse_sync`. NO native f64 on GPU.
+- [x] FF32-POLISH validate: R10 r_k=40 — f32 purify to R_I=2.7e-7
+  (true), one FF-McW → **3.96e-8**, 2nd → 2.92e-8, 6 in-loop steps →
+  **1.81e-8** (≈f32-storage fixed point 1.4e-8). Gate PASSED.
+  r_k=20: floor ~3e-5 — M_K tail truncation dominates.
+- [x] FF32-POLISH perf: **~44 ms/step ≈ 3.0× f32-iter** (14.5 ms),
+  target ≤8 — PASSED. In-loop endgame adds ~0.26 s to a 0.44 s purify.
+  Product error vs masked-f64: T/Q/U/V all 5e-14..9.7e-14; mask
+  truncation 0 at r_k=40 (5.3e-6 storage tail at r_k=20).
+- [ ] R_H on a CONVERGED H_scc: rerun mcw_f64 after a real SCC to get
+  the subspace-stationarity leg for the warm-DM design.
+- [ ] TRS4-vs-TC2 cost comparison by SpGEMM count / wall time (TRS4
+  reaches the wall faster; 2 products/iter) — candidate fast approach.
+- [ ] Force-noise-vs-polish: max|ΔF| on same geometry at
+  R_I ∈ {3e-5,1e-5,1e-6,1e-8} — the Hessian needs δF/h; 1e-5 may
+  already suffice (hour-Hessian was mostly refusing to stop).
+- [x] Mixed-precision endgame design: DECIDED by A/B — f32 storage +
+  f64 products suffices for ~1e-8 (all-f64 only below that); see
+  MIXED-POLISH above.
+- [ ] LNV/commutator descent — still needed for G3 warm-DM
+  (subspace rotation), not for this floor.
+- [ ] Accept floor ~5e-6 measured (1.4e-5 true, all physical) for now —
+  physics cost already bounded: fixq-vs-SCC rms 6 cm⁻¹.
+
+**Gate:** no mode becomes default without the A<B<C<D validation ladder
+on si10h16/cube65 (frequencies + forces vs cold-SCC reference).
+Target: full-SCC displaced eval ~20–100 ms at N=330.
+
+---
+
 ## Dependency graph
 
 ```

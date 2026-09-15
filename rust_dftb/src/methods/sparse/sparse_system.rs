@@ -26,7 +26,7 @@
 
 use crate::core::error::{DftbError, Result};
 use crate::methods::sparse::bsr4::{
-    build_spgemm_plan_bsym, inf_norm, Bsr4Matrix, BS, BS2,
+    build_product_mask, build_spgemm_plan_bsym, inf_norm, Bsr4Matrix, BS, BS2,
 };
 use crate::methods::sparse::gpu_sparse::{
     GpuBsrMatrix, GpuBsrStructure, PurifyStatus, SparseBsr4Gpu, SpgemmPlanGpu,
@@ -174,6 +174,20 @@ pub struct SparseSystemWorkspace {
     p_t: Buffer<i32>,                 // L3: M_P block (i,j) → M_P block (j,i) — for Tr(P·ZH)
     /// True when `p` holds the converged P = K·S (P-purifier path).
     p_valid: bool,
+
+    // ── FF32-POLISH (manifest §4.12.2 r2): float-float (hi+lo) McWeeny
+    // polish — f32 FMA only, ~46-bit effective, no native fp64. The hi
+    // parts reuse `t_ks.values`/`q.values`; only the LO parts are new
+    // persistent buffers.
+    ff_t_lo: Buffer<f32>,   // lo part of T_ff/U_ff on M_TKS
+    ff_q_lo: Buffer<f32>,   // lo part of Q_ff on M_K
+    ff_v_lo: Buffer<f32>,   // lo part of V_ff on M_K (hi reuses a_zhz)
+
+    /// Production hi-accuracy switch (manifest §4.12.2 consolidated):
+    /// when set, tc2_purify runs the terminal FF32 Phase B after the
+    /// f32 phase. Env `RUST_DFTB_TC2_FF=1` still force-enables for
+    /// studies.
+    tc2_hiacc: bool,
 }
 
 impl SparseSystemWorkspace {
@@ -224,13 +238,15 @@ impl SparseSystemWorkspace {
         let m_hs = (h0.row_ptr.clone(), h0.col_idx.clone());
         let m_k = k_mask.clone();
         let m_z = z_mask.clone();
-        // Multiply-truncate (standard SP2 idiom): intermediates live on the
-        // PRESCRIBED masks, not the symbolic product — product(M_K,M_HS)
-        // reaches r_k+r_hs (~19 Å → ~500 blocks/row, exceeds the SpGEMM
-        // local-mem cap). T=K·S on M_K: Tr(KS) and Mulliken need only the
-        // diagonal blocks (always in-mask), and the dropped off-diagonal
-        // terms are bounded by the same K-decay that justifies M_K itself.
-        let m_t_ks = m_k.clone();
+        // M_TKS = supp(M_K ∘ M_HS) — the TRUE symbolic product support.
+        // FF32-POLISH measurement (§4.12.2 r3, masked-vs-dense f64 split)
+        // proved the old M_TKS=M_K shortcut dropped real K·S tail terms
+        // worth ~7e-6/product → THE 1.4e-5 R_I floor was mask truncation,
+        // not f32 arithmetic (the dense-f64 decisive test could not see
+        // it). Cost: left-operand degree grows toward r_k+r_hs reach —
+        // check_left_degree fails loud if it exceeds MAX_LEFT_BLOCKS
+        // (then the plan kernel needs left-row chunking — future work).
+        let m_t_ks = build_product_mask(n_atom, &m_k, &m_hs);
         let m_t_zs = tzs_mask.cloned().unwrap_or_else(|| m_z.clone());
         // A = H·(KS) for the stationarity residual R_H (R11) — evaluated on
         // M_K, consistent with R_I (M_K) and R_Z (M_Z): the residual is
@@ -258,6 +274,10 @@ impl SparseSystemWorkspace {
         let k = GpuBsrMatrix::zero(&gpu, &k_struct)?;
         let knew = GpuBsrMatrix::zero(&gpu, &k_struct)?;
         let k_best = gpu.zero_f32(k_struct.nblock * BS2)?;   // best-K snapshot for TC2 plateau
+        // FF32-POLISH: lo parts of the float-float intermediates.
+        let ff_t_lo = gpu.zero_f32(t_ks_struct.nblock * BS2)?;
+        let ff_q_lo = gpu.zero_f32(k_struct.nblock * BS2)?;
+        let ff_v_lo = gpu.zero_f32(k_struct.nblock * BS2)?;
         let q = GpuBsrMatrix::zero(&gpu, &k_struct)?;
         let a_zhz = GpuBsrMatrix::zero(&gpu, &k_struct)?;
         let z_on_k = GpuBsrMatrix::zero(&gpu, &k_struct)?;
@@ -451,8 +471,17 @@ impl SparseSystemWorkspace {
             p_to_tzs,
             p_t,
             p_valid: false,
+            ff_t_lo,
+            ff_q_lo,
+            ff_v_lo,
+            tc2_hiacc: false,
         })
     }
+
+    /// Enable/disable the terminal FF32 polish phase in `tc2_purify`
+    /// (production hi-accuracy mode). `SparseDftb` drives this from
+    /// `SparseDftbConfig::tc2_hiacc`.
+    pub fn set_tc2_hiacc(&mut self, on: bool) { self.tc2_hiacc = on; }
 
     // ── Accessors ──
 
@@ -957,8 +986,9 @@ impl SparseSystemWorkspace {
                     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0));
             }
         }
+        let t_call = std::time::Instant::now();   // for the t_ms column
         let hist_rec = |f: &mut std::fs::File, iter: usize, branch: u32, tr: f64, dev_rel: f64, guard: bool, ri: f32, best: f32, snap: bool| {
-            let _ = std::io::Write::write_fmt(f, format_args!("{iter},{branch},{tr:.6e},{dev_rel:.3e},{},{ri:.6e},{best:.6e},{}\n", guard as u8, snap as u8));
+            let _ = std::io::Write::write_fmt(f, format_args!("{iter},{branch},{tr:.6e},{dev_rel:.3e},{},{ri:.6e},{best:.6e},{},{:.3}\n", guard as u8, snap as u8, t_call.elapsed().as_secs_f64() * 1e3));
         };
         let hist_end = |reason: &str| {
             if let Some(p) = &hist_path {
@@ -969,8 +999,39 @@ impl SparseSystemWorkspace {
             }
         };
 
-        for iter in 0..max_iter {
-            let do_check = (iter % check_every == 0) || (iter == max_iter - 1);
+        // ── Production purification policy (manifest §4.12.2
+        // consolidated, 2026-09-15) — resolved ONCE; no env reads inside
+        // the loop. Phase A = f32 TC2 with a hard budget; Phase B =
+        // terminal FF32 McWeeny polish (accurate mode only). ──
+        let env_flag = |n: &str| std::env::var(n)
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false);
+        let env_usz = |n: &str, d: usize| std::env::var(n)
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+        let env_f32 = |n: &str, d: f32| std::env::var(n)
+            .ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+        // Caller's max_iter IS the f32 budget — the production "30" lives
+        // in SparseDftbConfig::tc2_max; env only lowers it (study scripts
+        // pass big max_iter deliberately to observe the floor).
+        let budget   = max_iter.min(env_usz("RUST_DFTB_TC2_BUDGET", usize::MAX));
+        let ff_on    = self.tc2_hiacc || env_flag("RUST_DFTB_TC2_FF");
+        let ff_switch= env_f32("RUST_DFTB_TC2_FF_SWITCH", 1e-3);
+        let ff_steps = env_usz("RUST_DFTB_TC2_FF_STEPS", 5);
+        // Below this the polish is only refining f32-storage quantization
+        // (measured fixed point ~1.3e-8 on R10); default a decade above.
+        let ff_target= env_f32("RUST_DFTB_TC2_FF_TARGET", 1e-7);
+        // 3-product V=T·Q path (ff×ff kernel) instead of 4-product U,V.
+        let ff_vtq   = env_flag("RUST_DFTB_TC2_FF_VTQ");
+        let mcw_end  = env_flag("RUST_DFTB_TC2_MCW");
+        let stop_w   = env_usz("RUST_DFTB_TC2_STOP_W", 0);
+        // Floor-stop window in CHECKED iters — only armed below
+        // ff_switch, where genuine mid-descent stalls cannot live.
+        const FLOOR_W: usize = 5;
+        let mut ff_entry: Option<f32> = None;   // Some(entry_ri) → Phase B
+        let mut n_iter = 0usize;
+
+        for iter in 0..budget {
+            n_iter = iter + 1;
+            let do_check = (iter % check_every == 0) || (iter == budget - 1);
 
             // T = K·S, Q = T·K, trace = Tr(T), optionally R_I = ||Q-K||.
             self.spgemm_ks()?;
@@ -1120,6 +1181,12 @@ impl SparseSystemWorkspace {
 
                 if ri < tol {
                     if (tr - nocc64).abs() <= tol_tr {
+                        if ff_on {
+                            // Phase B gate: converged at f32 accuracy —
+                            // polish it in the terminal FF phase.
+                            ff_entry = Some(ri);
+                            break;
+                        }
                         // Converged: K was not updated after this T — t_ks
                         // still holds K·S for the returned K (R8a reuse).
                         self.t_ks_valid = true;
@@ -1129,6 +1196,30 @@ impl SparseSystemWorkspace {
                     if crate::methods::sparse::gpu_sparse::algebra_verbose() {
                         eprintln!("  TC2 R_I={ri:e} < tol but Tr(KS)={tr} != Nocc={nocc64} (wrong-rank projector not accepted)");
                     }
+                }
+                // Production floor-stop (manifest §4.12.2 consolidated):
+                // trace-locked AND already inside the projector basin
+                // (best < ff_switch) AND the trace-gated best improved <5%
+                // over the last FLOOR_W checks → this IS the f32/mask
+                // floor; continuing is floor-dancing. The ri<ff_switch
+                // gate is what makes the short window safe — genuine
+                // mid-descent stalls (R14: ~20 iters at R_I~1e-2..1e-1)
+                // cannot satisfy it.
+                if trace_locked
+                    && best_snapshotted && (best_tr - nocc64).abs() <= tol_tr
+                    && best_r_i < ff_switch
+                    && best_hist.len() > FLOOR_W
+                    && best_r_i > best_hist[best_hist.len() - 1 - FLOOR_W].1 * 0.95
+                {
+                    eprintln!(
+                        "  TC2 floor-stop @iter {iter} (best improved <5% over last {FLOOR_W} checks at R_I={best_r_i:e} < switch={ff_switch:e}): restore best K (Tr={best_tr})",
+                    );
+                    self.gpu.copy_f32(&self.k_best, &mut self.k.values, self.k.struct_.nblock * BS2)?;
+                    self.spgemm_ks()?;
+                    self.t_ks_valid = true;
+                    if ff_on { ff_entry = Some(best_r_i); break; }
+                    hist_end(&format!("floor_stop iter={iter}"));
+                    return Ok((PurifyStatus::NumericalFloor, best_r_i, best_tr, iter + 1));
                 }
                 // NOTE (tried and REVERTED): a "stagnation break" that exits
                 // after N non-improving checks. It fired during the NORMAL
@@ -1157,6 +1248,7 @@ impl SparseSystemWorkspace {
                         self.gpu.copy_f32(&self.k_best, &mut self.k.values, self.k.struct_.nblock * BS2)?;
                         self.spgemm_ks()?;            // T consistent with restored K
                         self.t_ks_valid = true;
+                        if ff_on && best_r_i < ff_switch { ff_entry = Some(best_r_i); break; }
                         hist_end(&format!("plateau_restore iter={iter}"));
                         return Ok((PurifyStatus::NumericalFloor, best_r_i, best_tr, iter + 1));
                     }
@@ -1169,8 +1261,7 @@ impl SparseSystemWorkspace {
                 // the trace-gated best improved <5% over the last W checked
                 // iters (endgame: dev_rel < 5e-4, valid snapshot). Same
                 // restore path + NumericalFloor status as the 10× detector.
-                let stop_w: usize = std::env::var("RUST_DFTB_TC2_STOP_W")
-                    .ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+                // (stop_w resolved once in the policy block above.)
                 if stop_w > 0 && best_hist.len() > stop_w {
                     let (i_prev, b_prev) = best_hist[best_hist.len() - 1 - stop_w];
                     let _ = i_prev;
@@ -1183,6 +1274,7 @@ impl SparseSystemWorkspace {
                     self.gpu.copy_f32(&self.k_best, &mut self.k.values, self.k.struct_.nblock * BS2)?;
                     self.spgemm_ks()?;
                     self.t_ks_valid = true;
+                    if ff_on && best_r_i < ff_switch { ff_entry = Some(best_r_i); break; }
                     hist_end(&format!("windowed_best iter={iter}"));
                     return Ok((PurifyStatus::NumericalFloor, best_r_i, best_tr, iter + 1));
                 }
@@ -1192,12 +1284,36 @@ impl SparseSystemWorkspace {
             // Update K: Knew = TC2_branch(K, Q, branch), symmetrize, swap.
             // `branch` is the host f64 decision (GPT-5.6 item 2).
             let nblock = self.k.struct_.nblock;
-            self.gpu.tc2_dev(
-                nblock, &self.k.values, &self.q.values, branch, &self.knew.values,
-            )?;
+            // McWeeny endgame (env-gated STUDY path): once trace-locked AND
+            // below the TC2 floor zone, switch to the CONTRACTING McWeeny
+            // map K ← 3Q − 2·(Q·S·K). Kept for A/B — the production
+            // high-accuracy endgame is the terminal FF32 Phase B below.
+            let use_mcw = mcw_end && trace_locked && last_r_i < 1e-3;
+            if use_mcw {
+                // MCW-PLAN (§4.12.2): U = Q·S is the SAME structural product
+                // as K·S → plan_ks; V = U·K same as T·K → plan_tk. This
+                // routes McWeeny through the ACC/Kahan-capable planned
+                // kernels instead of the single-accumulator masked bsym —
+                // and writes U on the correct M_TKS structure (the masked
+                // path truncated it to M_K).
+                match &self.plan_ks {
+                    Some(plan) => self.gpu.spgemm_plan_bsym_dev(&self.q, &self.s, plan, &self.t_ks)?,
+                    None => self.gpu.spgemm_bsym_dev(&self.q, &self.s, &self.t_ks)?,
+                }
+                match &self.plan_tk {
+                    Some(plan) => self.gpu.spgemm_plan_bsym_dev(&self.t_ks, &self.k, plan, &self.a_zhz)?,
+                    None => self.gpu.spgemm_bsym_dev(&self.t_ks, &self.k, &self.a_zhz)?,
+                }
+                self.gpu.mcweeny(nblock, &self.q.values, &self.a_zhz.values, &self.knew.values)?;
+            } else {
+                self.gpu.tc2_dev(
+                    nblock, &self.k.values, &self.q.values, branch, &self.knew.values,
+                )?;
+            }
             self.gpu.symmetrize_dev(nblock, &self.k_struct.transpose_block(), &self.knew.values)?;
             std::mem::swap(&mut self.k.values, &mut self.knew.values);
             self.gpu.prof_tick("tc2.upd");
+            let branch = if use_mcw { 9 } else { branch };   // hist: 9=McWeeny (FF is Phase B, branch=8 rows written there)
             if let Some(p) = &hist_path {
                 if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
                     hist_rec(&mut f, iter, branch, tr_eff, dev_rel, guard, ri_now, best_r_i, best_snapshotted);
@@ -1205,22 +1321,92 @@ impl SparseSystemWorkspace {
             }
         }
 
-        if crate::methods::sparse::gpu_sparse::tc2_plateau_enabled()
-            && best_snapshotted && (best_tr - nocc64).abs() <= tol_tr && best_r_i < 1e-2 {
-            eprintln!(
-                "  TC2 exhausted {max_iter} iters — restoring best K at floor (R_I={best_r_i:e} < tol={tol:e} not reached, Tr(KS)={best_tr})"
-            );
-            self.gpu.copy_f32(&self.k_best, &mut self.k.values, self.k.struct_.nblock * BS2)?;
-            self.spgemm_ks()?;
-            self.t_ks_valid = true;
-            hist_end("exhausted_restore");
-            return Ok((PurifyStatus::NumericalFloor, best_r_i, best_tr, max_iter));
+        // ── end of Phase A ──
+        // Budget exhausted: restore the best valid iterate. Whether that
+        // is a usable floor state or a hard failure depends on the
+        // projector-basin gate — a budget that ends with an unlocked
+        // trace or a large residual is NOT an arithmetic-floor problem.
+        if ff_entry.is_none() {
+            if crate::methods::sparse::gpu_sparse::tc2_plateau_enabled()
+                && best_snapshotted && (best_tr - nocc64).abs() <= tol_tr && best_r_i < 1e-2 {
+                eprintln!(
+                    "  TC2 exhausted {budget} iters — restoring best K at floor (R_I={best_r_i:e} < tol={tol:e} not reached, Tr(KS)={best_tr})"
+                );
+                self.gpu.copy_f32(&self.k_best, &mut self.k.values, self.k.struct_.nblock * BS2)?;
+                self.spgemm_ks()?;
+                self.t_ks_valid = true;
+                if ff_on && best_r_i < ff_switch { ff_entry = Some(best_r_i); }
+                else {
+                    hist_end("exhausted_restore");
+                    return Ok((PurifyStatus::NumericalFloor, best_r_i, best_tr, budget));
+                }
+            } else {
+                hist_end("exhausted");
+                return Err(DftbError::InvalidInput(format!(
+                    "TC2 exhausted {budget} iters, final r_I={last_r_i:e} Tr(KS)={last_tr} (rel. tol={tol:e} Nocc={})",
+                    self.nocc
+                )));
+            }
         }
-        hist_end("exhausted");
-        Err(DftbError::InvalidInput(format!(
-            "TC2 exhausted {max_iter} iters, final r_I={last_r_i:e} Tr(KS)={last_tr} (rel. tol={tol:e} Nocc={})",
-            self.nocc
-        )))
+
+        // ── Phase B — terminal FF32 McWeeny polish ──
+        // The loop measures the CURRENT K's residual via its first two
+        // products (Q_ff = KSK is needed anyway), so the early exit never
+        // spends the U,V products on a state that is already good — and
+        // the returned R_I is measured on the RETURNED state.
+        let entry_ri = ff_entry.unwrap();
+        let nblock = self.k_struct.nblock;
+        // k_best := entry state — the Phase-B best tracker is consistent
+        // with what is actually stored (Phase A may have left an earlier
+        // iterate in k_best).
+        self.gpu.copy_f32(&self.k.values, &self.k_best, nblock * BS2)?;
+        let mut ri = entry_ri;
+        let mut prev_ri = f32::INFINITY;
+        let mut best_ff = entry_ri;
+        let mut nsteps = 0usize;
+        loop {
+            self.ff_prod_tq()?;   // T_ff, Q_ff = products of current K
+            self.gpu.idempotency_partial_dev(
+                nblock, &self.q.values, &self.k.values, &self.reduce_partial,
+            )?;
+            let ri_sq = self.gpu.idempotency_finish_f64(
+                nblock, &self.reduce_partial, &self.reduce_a, &self.reduce_b,
+                &mut self.reduce_tail_host,
+            )?;
+            let ri_now = (ri_sq.sqrt() as f32) / k_norm;
+            if ri_now < best_ff {
+                best_ff = ri_now;
+                self.gpu.copy_f32(&self.k.values, &self.k_best, nblock * BS2)?;
+            }
+            let stalled = nsteps > 0 && ri_now > prev_ri * 0.7;
+            if let Some(p) = &hist_path {
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+                    hist_rec(&mut f, n_iter + nsteps, 8, f64::NAN, 0.0, false, ri_now, best_ff, true);
+                }
+            }
+            if ri_now < ff_target || stalled || nsteps >= ff_steps {
+                ri = ri_now;
+                break;
+            }
+            prev_ri = ri_now;
+            self.ff_prod_uv(ff_vtq)?;
+            nsteps += 1;
+        }
+        if best_ff < ri {   // a later step regressed — return the best
+            self.gpu.copy_f32(&self.k_best, &mut self.k.values, nblock * BS2)?;
+            ri = best_ff;
+        }
+        self.spgemm_ks()?;            // T consistent with returned K
+        let tr_ret = self.gpu.trace_ks_f64(
+            &self.t_ks_struct, &self.t_ks.values, &self.n_orb_buf,
+            &self.trace_atom, &mut self.trace_atom_host,
+        )?;
+        self.t_ks_valid = true;
+        eprintln!(
+            "  TC2 Phase-B FF32 polish: {nsteps} McWeeny step(s) after {n_iter} f32 iters — R_I={ri:e} (entry {entry_ri:e}), Tr(KS)={tr_ret}"
+        );
+        hist_end(&format!("ff_polish steps={nsteps}"));
+        Ok((PurifyStatus::PolishedFF, ri, tr_ret, n_iter + nsteps))
     }
 
     // ── P = K·S purifier (GPT-5.6 item 4) ──
@@ -1304,6 +1490,27 @@ impl SparseSystemWorkspace {
         let mut dev_run = 0usize;
         self.p_valid = false;
         self.t_ks_valid = false;
+        // §study: per-iter history (same CSV schema as tc2_purify).
+        let hist_path = std::env::var("RUST_DFTB_TC2_HIST").ok().filter(|p| !p.is_empty());
+        if let Some(p) = &hist_path {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+                let _ = writeln!(f, "# call ts_ms={} max_iter={max_iter} tol={tol:e} nocc={nocc64} space=P",
+                    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0));
+            }
+        }
+        let t_call = std::time::Instant::now();   // for the t_ms column
+        let hist_rec = |f: &mut std::fs::File, iter: usize, branch: u32, tr: f64, dev_rel: f64, guard: bool, ri: f32, best: f32, snap: bool| {
+            let _ = std::io::Write::write_fmt(f, format_args!("{iter},{branch},{tr:.6e},{dev_rel:.3e},{},{ri:.6e},{best:.6e},{},{:.3}\n", guard as u8, snap as u8, t_call.elapsed().as_secs_f64() * 1e3));
+        };
+        let hist_end = |reason: &str| {
+            if let Some(p) = &hist_path {
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+                    let _ = writeln!(f, "# end {reason}");
+                }
+            }
+        };
 
         for iter in 0..max_iter {
             let do_check = (iter % check_every == 0) || (iter == max_iter - 1);
@@ -1367,6 +1574,7 @@ impl SparseSystemWorkspace {
                 None => self.gpu.spgemm_masked_dev(&self.p, &self.p, &self.q_p2)?,
             }
 
+            let mut ri_now = f32::NAN;   // filled only on check iters
             if do_check {
                 let ri_sq = self.gpu.idempotency_to_f64(
                     self.p_struct.nblock, &self.q_p2.values, &self.p.values,
@@ -1381,6 +1589,7 @@ impl SparseSystemWorkspace {
                 }
                 last_tr = tr;
                 last_r_i = ri;
+                ri_now = ri;
                 if ri < best_r_i && (tr - nocc64).abs() <= tol_tr {
                     best_r_i = ri;
                     best_tr = tr;
@@ -1394,6 +1603,7 @@ impl SparseSystemWorkspace {
                 if ri < tol {
                     if (tr - nocc64).abs() <= tol_tr {
                         self.p_valid = true;
+                        hist_end("converged");
                         return Ok((PurifyStatus::Converged, ri, tr, iter + 1));
                     }
                     if crate::methods::sparse::gpu_sparse::algebra_verbose() {
@@ -1408,8 +1618,10 @@ impl SparseSystemWorkspace {
                         );
                         self.gpu.copy_f32(&self.p_best, &mut self.p.values, self.p_struct.nblock * BS2)?;
                         self.p_valid = true;
+                        hist_end(&format!("plateau_restore iter={iter}"));
                         return Ok((PurifyStatus::NumericalFloor, best_r_i, best_tr, iter + 1));
                     }
+                    hist_end(&format!("diverged iter={iter}"));
                     return Err(DftbError::InvalidInput(format!(
                         "P-TC2 diverged at iter {iter}, R_I={ri:e}, best={best_r_i:e}"
                     )));
@@ -1419,10 +1631,30 @@ impl SparseSystemWorkspace {
             // Update P: Pnew = TC2_branch(P, P², branch). NO symmetrize —
             // P = KS is genuinely non-symmetric.
             let nblock = self.p_struct.nblock;
-            self.gpu.tc2_dev(
-                nblock, &self.p.values, &self.q_p2.values, branch, &self.pnew.values,
-            )?;
+            // P-McWeeny endgame (§4.12.2, env-gated): once trace-locked and
+            // below the sawtooth zone, P' = 3P² − 2P³ — the contracting map.
+            // r_p4 = Q·P = P³ via the SAME plan_pp (Q and P share M_P).
+            let mcw_end = std::env::var("RUST_DFTB_TC2_MCW")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false);
+            let use_mcw = mcw_end && trace_locked && last_r_i < 1e-3;
+            if use_mcw {
+                match &self.plan_pp {
+                    Some(plan) => self.gpu.spgemm_plan_dev(&self.q_p2, &self.p, plan, &self.r_p4)?,
+                    None => self.gpu.spgemm_masked_dev(&self.q_p2, &self.p, &self.r_p4)?,
+                }
+                self.gpu.mcweeny(nblock, &self.q_p2.values, &self.r_p4.values, &self.pnew.values)?;
+            } else {
+                self.gpu.tc2_dev(
+                    nblock, &self.p.values, &self.q_p2.values, branch, &self.pnew.values,
+                )?;
+            }
             std::mem::swap(&mut self.p.values, &mut self.pnew.values);
+            let branch = if use_mcw { 9 } else { branch };   // hist: 9 = McWeeny
+            if let Some(p) = &hist_path {
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+                    hist_rec(&mut f, iter, branch, tr_eff, dev_rel, guard, ri_now, best_r_i, best_snapshotted);
+                }
+            }
         }
 
         if crate::methods::sparse::gpu_sparse::tc2_plateau_enabled()
@@ -1432,8 +1664,10 @@ impl SparseSystemWorkspace {
             );
             self.gpu.copy_f32(&self.p_best, &mut self.p.values, self.p_struct.nblock * BS2)?;
             self.p_valid = true;
+            hist_end("exhausted_restore");
             return Ok((PurifyStatus::NumericalFloor, best_r_i, best_tr, max_iter));
         }
+        hist_end("exhausted_fail");
         Err(DftbError::InvalidInput(format!(
             "P-TC2 exhausted {max_iter} iters, final r_I={last_r_i:e} Tr(P)={last_tr} (rel. tol={tol:e} Nocc={})",
             self.nocc
@@ -1475,6 +1709,27 @@ impl SparseSystemWorkspace {
         let nblock = self.p_struct.nblock;
         self.p_valid = false;
         self.t_ks_valid = false;
+        // Same per-iter history as tc2_purify (study overlay).
+        let hist_path = std::env::var("RUST_DFTB_TC2_HIST").ok().filter(|p| !p.is_empty());
+        if let Some(p) = &hist_path {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+                let _ = writeln!(f, "# call ts_ms={} max_iter={max_iter} tol={tol:e} nocc={nocc64} space=TRS4",
+                    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0));
+            }
+        }
+        let t_call = std::time::Instant::now();   // for the t_ms column
+        let hist_rec = |f: &mut std::fs::File, iter: usize, branch: u32, tr: f64, dev_rel: f64, guard: bool, ri: f32, best: f32, snap: bool| {
+            let _ = std::io::Write::write_fmt(f, format_args!("{iter},{branch},{tr:.6e},{dev_rel:.3e},{},{ri:.6e},{best:.6e},{},{:.3}\n", guard as u8, snap as u8, t_call.elapsed().as_secs_f64() * 1e3));
+        };
+        let hist_end = |reason: &str| {
+            if let Some(p) = &hist_path {
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+                    let _ = writeln!(f, "# end {reason}");
+                }
+            }
+        };
 
         for iter in 0..max_iter {
             let do_check = (iter % check_every == 0) || (iter == max_iter - 1);
@@ -1528,6 +1783,7 @@ impl SparseSystemWorkspace {
                 TrsUpd::Complement
             };
 
+            let mut ri_now = f32::NAN;   // filled only on check iters
             if do_check {
                 let ri_sq = self.gpu.idempotency_to_f64(
                     nblock, &self.q_p2.values, &self.p.values,
@@ -1544,6 +1800,7 @@ impl SparseSystemWorkspace {
                 let tr = tr_p;
                 last_tr = tr;
                 last_r_i = ri;
+                ri_now = ri;
                 if ri < best_r_i && (tr - nocc64).abs() <= tol_tr {
                     best_r_i = ri;
                     best_tr = tr;
@@ -1560,6 +1817,7 @@ impl SparseSystemWorkspace {
                 if ri < tol {
                     if (tr - nocc64).abs() <= tol_tr {
                         self.p_valid = true;
+                        hist_end("converged");
                         return Ok((PurifyStatus::Converged, ri, tr, iter + 1));
                     }
                     if crate::methods::sparse::gpu_sparse::algebra_verbose() {
@@ -1574,8 +1832,10 @@ impl SparseSystemWorkspace {
                         );
                         self.gpu.copy_f32(&self.p_best, &mut self.p.values, nblock * BS2)?;
                         self.p_valid = true;
+                        hist_end(&format!("plateau_restore iter={iter}"));
                         return Ok((PurifyStatus::NumericalFloor, best_r_i, best_tr, iter + 1));
                     }
+                    hist_end(&format!("diverged iter={iter}"));
                     return Err(DftbError::InvalidInput(format!(
                         "TRS4 diverged at iter {iter}, R_I={ri:e}, best={best_r_i:e}"
                     )));
@@ -1596,6 +1856,12 @@ impl SparseSystemWorkspace {
                 }
             }
             std::mem::swap(&mut self.p.values, &mut self.pnew.values);
+            if let Some(p) = &hist_path {
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+                    let dev_rel = ((tr_p - nocc64) / nocc64.max(1.0)).abs();
+                    hist_rec(&mut f, iter, 7, tr_p, dev_rel, false, ri_now, best_r_i, best_snapshotted);
+                }
+            }
         }
 
         if crate::methods::sparse::gpu_sparse::tc2_plateau_enabled()
@@ -1605,8 +1871,10 @@ impl SparseSystemWorkspace {
             );
             self.gpu.copy_f32(&self.p_best, &mut self.p.values, nblock * BS2)?;
             self.p_valid = true;
+            hist_end("exhausted_restore");
             return Ok((PurifyStatus::NumericalFloor, best_r_i, best_tr, max_iter));
         }
+        hist_end("exhausted_fail");
         Err(DftbError::InvalidInput(format!(
             "TRS4 exhausted {max_iter} iters, final r_I={last_r_i:e} Tr(P)={last_tr} (rel. tol={tol:e} Nocc={})",
             self.nocc
@@ -1747,6 +2015,26 @@ impl SparseSystemWorkspace {
         r
     }
 
+    /// Warm-start TC2 (env `RUST_DFTB_WARM_K`): keep the stored K — the
+    /// converged projector of the previous mix iter / previous ±h
+    /// geometry — and tighten it for the new H_scc. Skips the K0 build
+    /// (B=Z·H Gershgorin + ZHZ + axpby) EXCEPT that B=Z·H_scc must be
+    /// refreshed: `forces()` consumes `b_zh` for the W build. For a
+    /// 0.02 Å FD displacement K changes by ~1e-3 — TC2 should converge
+    /// in ~O(5) iters instead of ~50. Caller falls back to
+    /// `purify_hscc` on Err (non-finite / trace-guard paths).
+    pub fn purify_hscc_warm(&mut self, tc2_max: usize, tc2_tol: f32) -> Result<(PurifyStatus, f32, f64, usize)> {
+        // B = Z·H_scc on M_TZS — same product as in compute_k0_impl.
+        match &self.plan_zh {
+            Some(plan) => self.gpu.spgemm_plan_bsym_dev(&self.z, &self.h_scc, plan, &self.b_zh)?,
+            None => self.gpu.spgemm_bsym_dev(&self.z, &self.h_scc, &self.b_zh)?,
+        }
+        self.gpu.prof_tick("scc.k0");
+        let r = self.tc2_purify(tc2_max, tc2_tol, 1);
+        self.gpu.prof_tick("scc.tc2");
+        r
+    }
+
     /// DIAGNOSTIC (frozen-input experiments): upload host K values on the
     /// existing M_K structure; invalidate cached T=K·S so the next purifier
     /// call re-forms it.
@@ -1754,6 +2042,408 @@ impl SparseSystemWorkspace {
         self.k.upload_values(&self.gpu, vals)?;
         self.t_ks_valid = false;
         Ok(())
+    }
+
+    /// Invalidate the cached T=K·S after an external K/Z upload
+    /// (electronic-state restore).
+    pub fn invalidate_ks(&mut self) {
+        self.t_ks_valid = false;
+    }
+
+    /// δK0 warm seed (Phase G3): `k` must currently hold K0_new =
+    /// (emax·Z−ZHZ)/Δ for the displaced geometry (call
+    /// `compute_k0_from_hscc` first — it also refreshes `b_zh` for
+    /// forces). This transforms k in place:
+    ///   K_seed = K_conv_center + (K0_new − K0_center)
+    /// The shift is the first-order occupied-subspace rotation that a
+    /// bare TC2-on-old-K cannot express (polynomials can't rotate
+    /// eigenvectors — RUST_DFTB_WARM_K refuted it). TC2 then polishes
+    /// from inside the attracting basin.
+    pub fn k_seed_shift(&mut self, k0_center: &[f32], k_conv: &[f32]) -> Result<()> {
+        self.a_zhz.upload_values(&self.gpu, k0_center)?;
+        self.z_on_k.upload_values(&self.gpu, k_conv)?;
+        let nb = self.k_struct.nblock;
+        // elementwise — in-place out==x is safe
+        self.gpu.axpby_dev(nb, 1.0, &self.k.values, -1.0, &self.a_zhz.values, &self.k.values)?;
+        self.gpu.axpby_dev(nb, 1.0, &self.k.values,  1.0, &self.z_on_k.values, &self.k.values)?;
+        self.gpu.symmetrize_dev(nb, &self.k_struct.transpose_block(), &self.k.values)?;
+        self.t_ks_valid = false;
+        Ok(())
+    }
+
+    /// McWeeny polish (Phase G3): `K ← 3KSK − 2KSKSK`, n_iters times.
+    /// Unlike TC2 the McWeeny map is *contracting* toward idempotency
+    /// with no branch discontinuity — the right polish after the δK0
+    /// warm seed, which TC2 repels (masked-map saddle). 3 SpGEMMs per
+    /// iter; trace is NOT conserved (drift is fixed by the TC2
+    /// floor-walk that follows).
+    pub fn mcweeny_polish(&mut self, n_iters: usize) -> Result<()> {
+        for _ in 0..n_iters {
+            self.spgemm_ks()?;                                   // t_ks = K·S
+            self.spgemm_ksk()?;                                  // q = K·S·K
+            self.gpu.spgemm_bsym_dev(&self.q, &self.s, &self.z_on_k)?;   // u = Q·S
+            self.gpu.spgemm_bsym_dev(&self.z_on_k, &self.k, &self.a_zhz)?; // v = U·K = KSKSK
+            self.gpu.mcweeny(self.k_struct.nblock, &self.q.values, &self.a_zhz.values, &self.k.values)?;
+        }
+        self.gpu.symmetrize_dev(self.k_struct.nblock, &self.k_struct.transpose_block(), &self.k.values)?;
+        self.t_ks_valid = false;
+        Ok(())
+    }
+
+    /// FF32-POLISH (manifest §4.12.2 r2): ONE float-float McWeeny step
+    ///   K' = 3KSK − 2KSKSK
+    /// with ALL intermediates carried as (hi,lo) float-float — f32 FMA
+    /// only, ~46-bit effective arithmetic, no native fp64. Four planned
+    /// products on the existing plans, V fused into the final combine
+    /// (never stored). Decisive-test expectation: R_I ~1e-5 → ~1e-8.
+    /// Hi parts reuse `t_ks.values`/`q.values`; lo parts are the
+    /// persistent `ff_t_lo`/`ff_q_lo`. Requires `plan_ks`/`plan_tk`
+    /// (plans are mandatory in production — SC3).
+    /// FF32-POLISH step, first half: T_ff = K·S then Q_ff = T_ff·K.
+    /// Leaves Q_ff = KSK of the CURRENT K in (q, ff_q_lo) — the residual
+    /// ‖Q−K‖ is therefore measurable here before the expensive U,V
+    /// products are spent (Phase-B early exit).
+    fn ff_prod_tq(&mut self) -> Result<()> {
+        let plan_ks = self.plan_ks.as_ref().ok_or_else(|| DftbError::InvalidInput(
+            "ff_prod_tq: plan_ks missing (RUST_DFTB_SPARSE_PLANS=0?)".into()))?;
+        let plan_tk = self.plan_tk.as_ref().ok_or_else(|| DftbError::InvalidInput(
+            "ff_prod_tq: plan_tk missing".into()))?;
+        // T_ff = K32·S32            (f32×f32 → ff; dedicated no-lo kernel)
+        self.gpu.spgemm_plan_bsym_ff0_dev(&self.k, &self.s, plan_ks, &self.t_ks, &self.ff_t_lo)?;
+        self.gpu.prof_tick("ff.ks");
+        // Q_ff = T_ff·K32           (ff×f32 → ff)
+        self.gpu.spgemm_plan_bsym_ff_dev(&self.t_ks, &self.ff_t_lo, true, &self.k, plan_tk, &self.q, &self.ff_q_lo)?;
+        self.gpu.prof_tick("ff.tk");
+        Ok(())
+    }
+
+    /// FF32-POLISH step, second half + update. Two product paths:
+    ///   4-product (default):  U_ff = Q_ff·S, V_ff = U_ff·K
+    ///   3-product (FF_VTQ=1): V_ff = T_ff·Q_ff — V=KSKSK is symmetric and
+    ///     T·Q = KS·KSK = V exactly; needs the ff×ff kernel so Q's lo part
+    ///     is not dropped. plan_tk serves verbatim (same structures).
+    /// Requires `ff_prod_tq` to have left T_ff in (t_ks, ff_t_lo) — note
+    /// the 4-product path OVERWRITES t_ks with U_ff (same structure).
+    fn ff_prod_uv(&mut self, vtq: bool) -> Result<()> {
+        let plan_ks = self.plan_ks.as_ref().ok_or_else(|| DftbError::InvalidInput(
+            "ff_prod_uv: plan_ks missing".into()))?;
+        let plan_tk = self.plan_tk.as_ref().ok_or_else(|| DftbError::InvalidInput(
+            "ff_prod_uv: plan_tk missing".into()))?;
+        if vtq {
+            // V_ff = T_ff·Q_ff (ff×ff → ff) — 3 products total
+            self.gpu.spgemm_plan_bsym_ffb_dev(&self.t_ks, &self.ff_t_lo, &self.q, &self.ff_q_lo, plan_tk, &self.a_zhz, &self.ff_v_lo)?;
+            self.gpu.prof_tick("ff.uk");
+        } else {
+            // U_ff = Q_ff·S32 → reuse T buffers (ff×f32 → ff)
+            self.gpu.spgemm_plan_bsym_ff_dev(&self.q, &self.ff_q_lo, true, &self.s, plan_ks, &self.t_ks, &self.ff_t_lo)?;
+            self.gpu.prof_tick("ff.qs");
+            // V_ff = U_ff·K32 → a_zhz (hi) + ff_v_lo — via the VERIFIED
+            // product kernel (the fused product+combine variant lost its
+            // compensation under compiler scheduling: 1.7e-7 vs 9.7e-14)
+            self.gpu.spgemm_plan_bsym_ff_dev(&self.t_ks, &self.ff_t_lo, true, &self.k, plan_tk, &self.a_zhz, &self.ff_v_lo)?;
+            self.gpu.prof_tick("ff.uk");
+        }
+        // K' = round_f32(3Q_ff − 2V_ff) — elementwise combine
+        self.gpu.mcw_ff_combine_dev(self.k_struct.nblock, &self.q.values, &self.ff_q_lo, &self.a_zhz.values, &self.ff_v_lo, &self.knew.values)?;
+        self.gpu.symmetrize_dev(self.k_struct.nblock, &self.k_struct.transpose_block(), &self.knew.values)?;
+        self.gpu.prof_tick("ff.comb");
+        std::mem::swap(&mut self.k.values, &mut self.knew.values);
+        self.t_ks_valid = false;
+        Ok(())
+    }
+
+    pub fn mcweeny_ff_step(&mut self) -> Result<()> {
+        let vtq = std::env::var("RUST_DFTB_TC2_FF_VTQ")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false);
+        self.ff_prod_tq()?;
+        self.ff_prod_uv(vtq)
+    }
+
+    /// FF32-POLISH unit check: run T_ff = K·S then Q_ff = T_ff·K via the
+    /// ff plan kernels, comparing (hi+lo) against host-f64 dense products
+    /// on each output mask. Returns (err1_hi, err1_ff, err2_hi, err2_ff).
+    /// Diagnostic only.
+    pub fn ff_test_ks(&mut self) -> Result<(f64, f64, f64, f64)> {
+        let plan_ks = self.plan_ks.as_ref().ok_or_else(|| DftbError::InvalidInput("ff_test_ks: no plan_ks".into()))?;
+        let plan_tk = self.plan_tk.as_ref().ok_or_else(|| DftbError::InvalidInput("ff_test_ks: no plan_tk".into()))?;
+        // product 1: T_ff = K32·S32  (f32×f32)
+        self.gpu.spgemm_plan_bsym_ff_dev(&self.k, &self.ff_t_lo, false, &self.s, plan_ks, &self.t_ks, &self.ff_t_lo)?;
+        // snapshot T_ff before product 3 reuses the buffers
+        let nt = self.t_ks_struct.nblock * BS2;
+        let mut t_hi_snap = vec![0.0f32; nt];
+        let mut t_lo_snap = vec![0.0f32; nt];
+        self.gpu.read_f32(&self.t_ks.values, &mut t_hi_snap)?;
+        self.gpu.read_f32(&self.ff_t_lo, &mut t_lo_snap)?;
+        // product 2: Q_ff = T_ff·K32 (ff×f32)
+        self.gpu.spgemm_plan_bsym_ff_dev(&self.t_ks, &self.ff_t_lo, true, &self.k, plan_tk, &self.q, &self.ff_q_lo)?;
+        // A/B: same product with a_has_lo=0 — if outputs are identical,
+        // the A_lo path is dead in the kernel.
+        let nq = self.k_struct.nblock * BS2;
+        let mut q_hi_a = vec![0.0f32; nq];
+        let mut q_lo_a = vec![0.0f32; nq];
+        self.gpu.read_f32(&self.q.values, &mut q_hi_a)?;
+        self.gpu.read_f32(&self.ff_q_lo, &mut q_lo_a)?;
+        self.gpu.spgemm_plan_bsym_ff_dev(&self.t_ks, &self.ff_t_lo, false, &self.k, plan_tk, &self.q, &self.ff_q_lo)?;
+        let mut q_hi_b = vec![0.0f32; nq];
+        let mut q_lo_b = vec![0.0f32; nq];
+        self.gpu.read_f32(&self.q.values, &mut q_hi_b)?;
+        self.gpu.read_f32(&self.ff_q_lo, &mut q_lo_b)?;
+        let d_hi: f64 = q_hi_a.iter().zip(&q_hi_b).map(|(&a, &b)| ((a - b) as f64).powi(2)).sum::<f64>().sqrt();
+        let d_lo: f64 = q_lo_a.iter().zip(&q_lo_b).map(|(&a, &b)| ((a - b) as f64).powi(2)).sum::<f64>().sqrt();
+        eprintln!("[ff_test] A_lo on/off diff: ‖ΔQ_hi‖={d_hi:.3e}  ‖ΔQ_lo‖={d_lo:.3e}");
+        // restore the a_has_lo=1 result
+        self.gpu.spgemm_plan_bsym_ff_dev(&self.t_ks, &self.ff_t_lo, true, &self.k, plan_tk, &self.q, &self.ff_q_lo)?;
+        // product 3: U_ff = Q_ff·S (ff×f32 → ff on M_TKS)
+        self.gpu.spgemm_plan_bsym_ff_dev(&self.q, &self.ff_q_lo, true, &self.s, plan_ks, &self.t_ks, &self.ff_t_lo)?;
+        // product 4 (production split path): V_ff = U_ff·K on M_K, then
+        // elementwise combine K' = round_f32(3Q_ff − 2V_ff).
+        self.gpu.spgemm_plan_bsym_ff_dev(&self.t_ks, &self.ff_t_lo, true, &self.k, plan_tk, &self.a_zhz, &self.ff_v_lo)?;
+        let knew_test = GpuBsrMatrix::zero(&self.gpu, &self.k_struct)?;
+        self.gpu.mcw_ff_combine_dev(self.k_struct.nblock, &self.q.values, &self.ff_q_lo, &self.a_zhz.values, &self.ff_v_lo, &knew_test.values)?;
+
+        // host f64 references
+        let n4 = self.n_atom * BS;
+        let mut kd = vec![0.0f32; n4 * n4];
+        self.k_to_dense_into(&mut kd)?;
+        let s_host = self.s.to_host(&self.gpu)?;
+        let mut sd = vec![0.0f32; n4 * n4];
+        crate::methods::sparse::bsr4::bsr_values_to_dense(self.n_atom, &s_host.row_ptr, &s_host.col_idx, &s_host.values, &mut sd);
+        let k64: Vec<f64> = kd.iter().map(|&x| x as f64).collect();
+        let s64: Vec<f64> = sd.iter().map(|&x| x as f64).collect();
+        let tref = crate::methods::sparse::bsr4::matmul_f64_mt(n4, &k64, &s64);
+        let qref = crate::methods::sparse::bsr4::matmul_f64_mt(n4, &tref, &k64);
+        let uref = crate::methods::sparse::bsr4::matmul_f64_mt(n4, &qref, &s64);
+        let vref = crate::methods::sparse::bsr4::matmul_f64_mt(n4, &uref, &k64);
+        let kref: Vec<f64> = (0..n4 * n4).map(|i| 3.0 * qref[i] - 2.0 * vref[i]).collect();
+
+        let check = |gpu: &crate::methods::sparse::gpu_sparse::SparseBsr4Gpu,
+                     st: &std::sync::Arc<crate::methods::sparse::gpu_sparse::GpuBsrStructure>,
+                     hi: &[f32], lo: &[f32],
+                     reff: &[f64]| -> Result<(f64, f64)> {
+            let rp = st.row_ptr_host(gpu)?;
+            let ci = st.col_idx_host(gpu)?;
+            let mut e_hi = 0.0f64; let mut e_ff = 0.0f64; let mut den = 0.0f64;
+            for i in 0..self.n_atom {
+                for b in rp[i] as usize..rp[i + 1] as usize {
+                    let j = ci[b] as usize;
+                    for l in 0..BS2 {
+                        let r = i * BS + l / BS; let c = j * BS + l % BS;
+                        let t = reff[r * n4 + c];
+                        let h = hi[b * BS2 + l] as f64;
+                        let f = h + lo[b * BS2 + l] as f64;
+                        e_hi += (h - t) * (h - t);
+                        e_ff += (f - t) * (f - t);
+                        den += t * t;
+                    }
+                }
+            }
+            Ok((e_hi.sqrt() / den.sqrt().max(1e-30), e_ff.sqrt() / den.sqrt().max(1e-30)))
+        };
+        let (e1h, e1f) = check(&self.gpu, &self.t_ks_struct, &t_hi_snap, &t_lo_snap, &tref)?;
+        // V_ff via the verified kernel (product 4)
+        let mut v_hi = vec![0.0f32; self.k_struct.nblock * BS2];
+        let mut v_lo = vec![0.0f32; self.k_struct.nblock * BS2];
+        self.gpu.read_f32(&self.a_zhz.values, &mut v_hi)?;
+        self.gpu.read_f32(&self.ff_v_lo, &mut v_lo)?;
+        let (e4h, e4f) = check(&self.gpu, &self.k_struct, &v_hi, &v_lo, &vref)?;
+        eprintln!("[ff_test] V=UK err(hi)={e4h:.3e} err(ff)={e4f:.3e}");
+        // NOTE: t_ks now holds U_ff (product 3 overwrote it); check U_ff.
+        let mut u_hi = vec![0.0f32; nt];
+        let mut u_lo = vec![0.0f32; nt];
+        self.gpu.read_f32(&self.t_ks.values, &mut u_hi)?;
+        self.gpu.read_f32(&self.ff_t_lo, &mut u_lo)?;
+        let (e3h, e3f) = check(&self.gpu, &self.t_ks_struct, &u_hi, &u_lo, &uref)?;
+        eprintln!("[ff_test] U=QS err(hi)={e3h:.3e} err(ff)={e3f:.3e}");
+        // f32-emulated combine (mirror of bsr4_mcw_ff_combine — used for
+        // host-side replay comparisons below)
+        let ff_combine = |qh: f32, ql: f32, vh: f32, vl: f32| -> f32 {
+            3.0f32.mul_add(qh, (-2.0f32).mul_add(vh, 3.0f32.mul_add(ql, -2.0f32 * vl)))
+        };
+        // final K' vs dense-f64 McWeeny reference (masked on M_K)
+        let mut e_mx_at = (0usize, 0usize, 0usize);
+        let den_k;
+        let kd2;
+        {
+            let mut kd2v = vec![0.0f32; self.k_struct.nblock * BS2];
+            self.gpu.read_f32(&knew_test.values, &mut kd2v)?;
+            let mut e = 0.0f64; let mut den = 0.0f64;
+            let mut e_mx = 0.0f64;
+            let mut n_big = 0usize;
+            for i in 0..self.n_atom {
+                for b in self.m_k.0[i] as usize..self.m_k.0[i + 1] as usize {
+                    let j = self.m_k.1[b] as usize;
+                    for l in 0..BS2 {
+                        let r = i * BS + l / BS; let c = j * BS + l % BS;
+                        let d = kd2v[b * BS2 + l] as f64 - kref[r * n4 + c];
+                        e += d * d; den += kref[r * n4 + c] * kref[r * n4 + c];
+                        if d.abs() > e_mx { e_mx = d.abs(); e_mx_at = (i, j, l); }
+                        if d.abs() > 1e-7 { n_big += 1; }
+                    }
+                }
+            }
+            eprintln!("[ff_test] K' vs f64-McW ref: {:.3e}  max|d|={e_mx:.3e} at {e_mx_at:?}  n(>1e-7)={n_big}", e.sqrt() / den.sqrt().max(1e-30));
+            den_k = den;
+            kd2 = kd2v;
+        }
+        // NOTE: q/lo buffers still hold Q_ff (untouched by product 3/4)
+        let mut q_hiv = vec![0.0f32; self.k_struct.nblock * BS2];
+        let mut q_lov = vec![0.0f32; self.k_struct.nblock * BS2];
+        self.gpu.read_f32(&self.q.values, &mut q_hiv)?;
+        self.gpu.read_f32(&self.ff_q_lo, &mut q_lov)?;
+        let (e2h, e2f) = check(&self.gpu, &self.k_struct, &q_hiv, &q_lov, &qref)?;
+
+        // Host-side replay of the fused final from the GPU's OWN
+        // (Q_ff, U_ff) buffers: V_h = U_ff·K in f64, K'_h = 3Q_ff−2V_h.
+        // If K'_h ≈ kref but GPU K' differs → bug inside the final kernel.
+        {
+            let mut ud = vec![0.0f64; n4 * n4];
+            let trp = self.t_ks_struct.row_ptr_host(&self.gpu)?;
+            let tci = self.t_ks_struct.col_idx_host(&self.gpu)?;
+            for i in 0..self.n_atom {
+                for b in trp[i] as usize..trp[i + 1] as usize {
+                    let j = tci[b] as usize;
+                    for l in 0..BS2 {
+                        ud[(i * BS + l / BS) * n4 + j * BS + l % BS] = u_hi[b * BS2 + l] as f64 + u_lo[b * BS2 + l] as f64;
+                    }
+                }
+            }
+            let mut qd = vec![0.0f64; n4 * n4];
+            for i in 0..self.n_atom {
+                for b in self.m_k.0[i] as usize..self.m_k.0[i + 1] as usize {
+                    let j = self.m_k.1[b] as usize;
+                    for l in 0..BS2 {
+                        qd[(i * BS + l / BS) * n4 + j * BS + l % BS] = q_hiv[b * BS2 + l] as f64 + q_lov[b * BS2 + l] as f64;
+                    }
+                }
+            }
+            let vh = crate::methods::sparse::bsr4::matmul_f64_mt(n4, &ud, &k64);
+            let knh: Vec<f64> = (0..n4 * n4).map(|i| 3.0 * qd[i] - 2.0 * vh[i]).collect();
+            let mut kd3 = vec![0.0f32; self.k_struct.nblock * BS2];
+            self.gpu.read_f32(&knew_test.values, &mut kd3)?;
+            let (mut e_ref, mut e_dev, mut den) = (0.0f64, 0.0f64, 0.0f64);
+            for i in 0..self.n_atom {
+                for b in self.m_k.0[i] as usize..self.m_k.0[i + 1] as usize {
+                    let j = self.m_k.1[b] as usize;
+                    for l in 0..BS2 {
+                        let r = i * BS + l / BS; let c = j * BS + l % BS;
+                        e_ref += (knh[r * n4 + c] - kref[r * n4 + c]).powi(2);
+                        e_dev += (kd3[b * BS2 + l] as f64 - knh[r * n4 + c]).powi(2);
+                        den += kref[r * n4 + c] * kref[r * n4 + c];
+                    }
+                }
+            }
+            eprintln!("[ff_test] host-replay K'_h vs f64 ref: {:.3e} | GPU K' vs K'_h: {:.3e}",
+                e_ref.sqrt() / den.sqrt().max(1e-30), e_dev.sqrt() / den.sqrt().max(1e-30));
+            // f32-emulated combine on the same (Q_ff,V_ff) buffers —
+            // if it matches the GPU kernel, the residual is the scheme's
+            // own precision, not a kernel bug.
+            let mut e_kern = 0.0f64; let mut e_hionly = 0.0f64; let mut e_ffv = 0.0f64;
+            for i in 0..self.n_atom {
+                for b in self.m_k.0[i] as usize..self.m_k.0[i + 1] as usize {
+                    let j = self.m_k.1[b] as usize;
+                    for l in 0..BS2 {
+                        let ix = b * BS2 + l;
+                        let rc = (i * BS + l / BS) * n4 + j * BS + l % BS;
+                        let emu = ff_combine(q_hiv[ix], q_lov[ix], v_hi[ix], v_lo[ix]) as f64;
+                        e_kern += (emu - kd3[ix] as f64).powi(2);
+                        e_ffv += (emu - kref[rc]).powi(2);
+                        let hi = 3.0f32 * q_hiv[ix] - 2.0f32 * v_hi[ix];
+                        e_hionly += (hi as f64 - kref[rc]).powi(2);
+                    }
+                }
+            }
+            eprintln!("[ff_test] host-f32-emulated combine vs GPU K': {:.3e}", e_kern.sqrt() / den.sqrt().max(1e-30));
+            eprintln!("[ff_test] emulated-combine vs kref: {:.3e} | hi-only 3Q−2V vs kref: {:.3e}",
+                e_ffv.sqrt() / den.sqrt().max(1e-30), e_hionly.sqrt() / den.sqrt().max(1e-30));
+            // worst element dump
+            {
+                let (i, j, l) = e_mx_at;
+                let b0 = self.m_k.0[i] as usize;
+                let b1 = self.m_k.0[i + 1] as usize;
+                let mut bix = None;
+                for b in b0..b1 { if self.m_k.1[b] as usize == j { bix = Some(b); break; } }
+                let ix = bix.unwrap() * BS2 + l;
+                let kn = ff_combine(q_hiv[ix], q_lov[ix], v_hi[ix], v_lo[ix]);
+                eprintln!("[ff_test] worst el ({i},{j},l{l}): Qhi={:.9e} Qlo={:.3e} Vhi={:.9e} Vlo={:.3e} GPU={:.9e} emu={:.9e} ref={:.9e}",
+                    q_hiv[ix], q_lov[ix], v_hi[ix], v_lo[ix], kd3[ix], kn,
+                    kref[(i * BS + l / BS) * n4 + j * BS + l % BS]);
+            }
+            // Theoretical floor: pure f32 rounding of the exact update.
+            let mut e_rnd = 0.0f64;
+            for i in 0..self.n_atom {
+                for b in self.m_k.0[i] as usize..self.m_k.0[i + 1] as usize {
+                    let j = self.m_k.1[b] as usize;
+                    for l in 0..BS2 {
+                        let x = kref[(i * BS + l / BS) * n4 + j * BS + l % BS];
+                        e_rnd += (x - x as f32 as f64).powi(2);
+                    }
+                }
+            }
+            eprintln!("[ff_test] pure f32 rounding floor: {:.3e}", e_rnd.sqrt() / den.sqrt().max(1e-30));
+        }
+
+        // Masked-f64 reference: Q through the plan terms only — separates
+        // mask TRUNCATION error from arithmetic error. M_TKS = M_K clone,
+        // but true supp(K·S) reaches ~r_hs beyond M_K — the plan drops
+        // those left-operand terms.
+        let tks_dummy = Bsr4Matrix::from_structure(self.n_atom, self.m_t_ks.0.clone(), self.m_t_ks.1.clone())?;
+        let k_dummy = Bsr4Matrix::from_structure(self.n_atom, self.m_k.0.clone(), self.m_k.1.clone())?;
+        let plan_h = build_spgemm_plan_bsym(&tks_dummy, &k_dummy, &self.m_k)?;
+        let mut q_mask = vec![0.0f64; n4 * n4];
+        for i in 0..self.n_atom {
+            let a0 = self.m_t_ks.0[i] as usize;
+            let c0 = self.m_k.0[i] as usize;
+            let c1 = self.m_k.0[i + 1] as usize;
+            for cb in c0..c1 {
+                let j = self.m_k.1[cb] as usize;
+                for t in plan_h.plan_ptr[cb] as usize..plan_h.plan_ptr[cb + 1] as usize {
+                    let ka = self.m_t_ks.1[a0 + plan_h.plan_a_idx[t] as usize] as usize;
+                    let kb = plan_h.plan_b_idx[t] as usize;
+                    let kj = self.m_k.1[kb] as usize;
+                    for r in 0..BS { for m in 0..BS { for c in 0..BS {
+                        q_mask[(i * BS + r) * n4 + j * BS + c] +=
+                            tref[(i * BS + r) * n4 + ka * BS + m] * k64[(kj * BS + m) * n4 + j * BS + c];
+                    }}}
+                }
+            }
+        }
+        let (e2m, e_tr): (f64, f64) = {
+            let mut em = 0.0f64; let mut et = 0.0f64; let mut den = 0.0f64;
+            // GPU Q_ff vs masked ref, and masked vs dense ref
+            let mut hi = vec![0.0f32; self.k_struct.nblock * BS2];
+            let mut lo = vec![0.0f32; self.k_struct.nblock * BS2];
+            self.gpu.read_f32(&self.q.values, &mut hi)?;
+            self.gpu.read_f32(&self.ff_q_lo, &mut lo)?;
+            for i in 0..self.n_atom {
+                for b in self.m_k.0[i] as usize..self.m_k.0[i + 1] as usize {
+                    let j = self.m_k.1[b] as usize;
+                    for l in 0..BS2 {
+                        let r = i * BS + l / BS; let c = j * BS + l % BS;
+                        let f = hi[b * BS2 + l] as f64 + lo[b * BS2 + l] as f64;
+                        em += (f - q_mask[r * n4 + c]) * (f - q_mask[r * n4 + c]);
+                        et += (q_mask[r * n4 + c] - qref[r * n4 + c]) * (q_mask[r * n4 + c] - qref[r * n4 + c]);
+                        den += qref[r * n4 + c] * qref[r * n4 + c];
+                    }
+                }
+            }
+            (em.sqrt() / den.sqrt().max(1e-30), et.sqrt() / den.sqrt().max(1e-30))
+        };
+        eprintln!("[ff_test] Q_ff vs masked-f64: {e2m:.3e} | mask truncation (masked vs dense f64): {e_tr:.3e}");
+        Ok((e1h, e1f, e2h, e2f))
+    }
+
+    /// Debug probe (FF32-POLISH): Frobenius norms of the float-float LO
+    /// buffers on host — expected ~eps·‖hi‖ ~1e-7× values if the
+    /// TwoProd/TwoSum compensation is live; ~0 means the compiler ate it.
+    pub fn ff_lo_norms(&mut self) -> Result<(f64, f64)> {
+        let nq = self.k_struct.nblock * BS2;
+        let nt = self.t_ks_struct.nblock * BS2;
+        let mut vq = vec![0.0f32; nq];
+        let mut vt = vec![0.0f32; nt];
+        self.gpu.read_f32(&self.ff_q_lo, &mut vq)?;
+        self.gpu.read_f32(&self.ff_t_lo, &mut vt)?;
+        let sq = |v: &[f32]| v.iter().map(|&x| (x as f64) * (x as f64)).sum::<f64>().sqrt();
+        Ok((sq(&vq), sq(&vt)))
     }
 
     /// Download K values into persistent `k_host` (no extra alloc).

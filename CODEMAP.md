@@ -94,7 +94,18 @@ QM/QM fragment solver with OpenCL GPU offload. Python utilities (`pyBall/`,
   do not use for production), `gpu_scc_plan.rs` (persistent SCC inner loop),
   `gpu_dftb.rs` (**production run loop** — `GpuDftb::new` / `set_coords` / `scc` /
   **`eval(want_forces)`** / `fire_step` / `md_step`; compile once, reuse buffers),
-  `gpu_forces.rs`/`.cl` (analytic GPU forces; H2O vs CPU rel ~3e-5).
+  `gpu_forces.rs`/`.cl` (analytic GPU forces; H2O vs CPU rel ~3e-5),
+  `gpu_cdft.rs`/`.cl` (**CDFT fragment-charge constraints** — `set_cdft` /
+  `cdft_scc` / `cdft_energies`; λ-shift kernel hooked inside
+  `enq_dq_v_hscc`; spec `tasts/HBond_Relaxed_Scan_GPU/Dense_Multi_CDFT.spec.md`,
+  audit `topical_audit/cdft_constraints.md`, guide `userguide/cdft.md`,
+  test `tests/gpu_cdft.rs`),
+  `gpu_hermitian.rs` + `gpu_pbc_plan.rs` + `gpu_pbc.rs`/`.cl` +
+  `pbc_cell.rs` (complex-Hermitian PBC/k-point path — `GpuPbc` driver:
+  SK image pairs, Ewald γ, Bloch fold, batched `n_rep` SCC; Fortran
+  parity `tests/gpu_pbc_fortran.rs` + `tests/pbc_fortran/`),
+  `methods/dftb/forces.rs::repulsive_energy_pbc` (image-cell E_rep for
+  `pbc_eval`).
   Drive it with **`dftb_engine --script rust_dftb/scripts/*.rhai`** (see
   `scripts/test_gpu_dftb_molecules.rhai`). Do **not** add a new cargo test /
   `src/bin` / `examples/` target per molecule. `tests/gpu_dftb.rs` is H2O smoke
@@ -112,6 +123,16 @@ QM/QM fragment solver with OpenCL GPU offload. Python utilities (`pyBall/`,
 - `scripts/` — **Rhai test/user scripts** (e.g. `test_gpu_dftb_molecules.rhai`,
   `test_sparse_dftb_sih4.rhai`, `test_graphene_sparse.rhai`). Run:
   `cargo run --release --bin dftb_engine -- --script scripts/<file>.rhai --sk-dir …`.
+  Scan demos: `scan2d_pyridone.rhai` (neutral 20×20 PT grid),
+  `scan2d_pyridone_cdft.rhai` (**CDFT worked example** — same grid × 3 states:
+  neutral + Q₁=±1 e CT diabatics, → `plot_scan2d_cdft.py` →
+  `debug/pyridone_2d_scan_cdft.png`; guide `doc/prokop/userguide/cdft.md`),
+  `scan2d_qxhq_pbc.rhai` (**periodic PT scan** on the QX/HQ chain via
+  `pbc_new`/`pbc_set_coords`/`pbc_scc`/`pbc_eval`/`pbc_energy_i`; cell
+  built by `make_qxhq_chain.py`, one junction crosses the cell
+  boundary; → `plot_scan2d_pbc.py` → `debug/qxhq_pbc_Emap.png`; guide
+  `doc/prokop/userguide/hbond_pbc_scans.md`, audit
+  `doc/prokop/topical_audit/gpu_pbc_hbond_scans.md`).
 - `tools/` — crate-local Python tools: `sk_compress/` (SK table compression),
   `make_diatomic_hsd.py`, `run_dftbcore_dump.py`.
 
@@ -147,7 +168,11 @@ QM/QM fragment solver with OpenCL GPU offload. Python utilities (`pyBall/`,
     `f32_floor_dense_hbond.md` (bugs vs arithmetic floor). Also
     `davidson_eigensolver.md`, `eigensolver_performance.md`,
     `sparse_tc2_purification.md`, `dftbplus_parity_harness.md`,
-    `scc_mulliken_charges.md`.
+    `scc_mulliken_charges.md`, `cdft_constraints.md` (CDFT fragment
+    constraints on `GpuDftb`). Task specs under `tasts/`: e.g.
+    `tasts/HBond_Relaxed_Scan_GPU/` (`*.manifest..md` work orders,
+    `*.labbook.md` verified numbers, `Dense_Multi_CDFT.spec.md`,
+    `Dense_Multi_PBC.arch_notes.md`).
 
 ## Folder & artifact policy (concise)
 

@@ -1321,3 +1321,65 @@ symmetry by up to 1.9 mHa (input rNN 3.042 vs 3.034 A; halves up to
   (−53.41927 / −53.41903 vs relaxed −53.41990 / −53.41984) — the
   frozen-scaffold penalty is essentially removed. Cheap stand-in for
   the relaxed scan. Map `debug/dzp_2d_scan_Emap_interp.png`.
+
+## Dense_Multi_CDFT (fragment charge constraints, for PCET diabatics)
+
+Spec `Dense_Multi_CDFT.spec.md`. Implemented as a pure add-on:
+`src/qmqm/gpu_cdft.cl` (`cdft_hscc_shift_batched` — one WG/system,
+h_scc += ½λ_F·S·(w_μ+w_ν) after the fused dq→V→H_scc build, gated on
+`active`) + `src/qmqm/gpu_cdft.rs` (`GpuCdft`: frag map, λ buffer,
+targets, secant history). Only solver-side touch: `plan.cdft:
+Option<GpuCdft>` + one enqueue in `enq_dq_v_hscc` — `None` = zero
+cost. λ outer loop + fragment-charge reduction on host in f64.
+`cdft_energies()` = E_eval − Σλ_F·(Q_F+Q0_F) — see the corrected
+numbers below (the first version subtracted λ·Δq only and leaked
+λ·Q0_F ~13 Ha). Forces get the −λ·dQ/dR term for free via the shifted
+h_scc.
+Rhai: `gpu_cdft(name,frag,targets)`, `gpu_cdft_scc`,
+`gpu_cdft_qf`, `gpu_cdft_lam`, `gpu_cdft_set_lam`, `gpu_cdft_energies`,
+`gpu_cdft_clear`. Per-replica targets → diabatic-state ladder in one
+batch. Test `tests/gpu_cdft.rs`: H2O {O} target −0.20 e converges in
+12 outer iters (Q=−0.200016, λ=0.334 Ha, constrained E = E0 + 0.131 Ha);
+8-replica ladder 0.00–0.35 e all converge (err ≤1e-4); clear restores
+E0 to 3e-9. Not yet: spin-polarized DFTB (needed for D+A− states),
+CDFT-CI coupling, TD-DFTB.
+
+## 2026-09-15 — CDFT on a real scan: pyridone 2D PT map + the Q_gross energy bug
+
+Ran `scripts/scan2d_pyridone_cdft.rhai` — the same 20×20 N–H…O grid as
+`scan2d_pyridone.rhai`, three maps: neutral, Q₁=−1 e (M1⁺M2⁻), Q₁=+1 e
+(M1⁻M2⁺), frag = monomer of nearest heavy atom (12/24 atoms on M1).
+
+**BUG found & fixed (energy accounting).** First run showed the CT state
+~12–13 Ha BELOW neutral — variationally impossible. Cause: the h_scc
+shift adds `λ·Tr[P·S·w̃]` = λ·Q_gross(F) to e_band (gross Mulliken pop,
+q0+Δq), but `cdft_energies` subtracted only λ·Q_F → leaked λ·Q0_F
+≈ 0.38·35 ≈ 13 Ha. Fix: `GpuCdft.q0_frag[f] = Σ_{a∈F} q0_a`, correction
+`E = E_eval − Σ λ_F·(Q_F + Q0_F)`. After fix: spot check at
+(d1,d2)=(1.0,1.28) gives E(CT⁻) = E_neutral + 0.250 Ha; releasing the
+constraint warm-started from the CT state returns E0 to ~1e-6 Ha.
+Lesson: check the variational sanity bound (E_constrained ≥ E_ground)
+BEFORE trusting any constrained energy — the test now asserts it.
+
+**Convergence machinery (all needed on a real dimer).** Bare secant got
+~97% but only by lucky dips; bisection-on-bracket locked at basin
+boundaries (194/400 — WORSE, removed). Final scheme: target continuation
+(ramp natural→target over 8 outer iters) + damped secant (per-(b,f) step
+halving on sign flip) + basin reset on stall (q→q0, λ→0 after 3 stalled
+iters) + best-λ restore at exit (unconverged replicas get the
+closest-achievable state). Manual `gpu_cdft_set_lam` Q(λ) sweeps show
+the response is smooth WITHIN a basin (dQ/dλ ≈ −3.7/Ha on M1) — the
+difficulty is basin switching, not response steepness.
+
+**Results:** conv 385/400 (Q₁=−1) and 371/400 (Q₁=+1) in 40 outer iters,
+~5 s per CT map. CT⁻ map: single minimum at (d1≈1.78, d2≈1.02) —
+proton pulled onto the oxidized monomer's oxygen (PCET coupling
+confirmed qualitatively). ~5% of the grid has no reachable ±1 e
+Mulliken state — real physics (closed shell moves ~2 e chunks, target
+sits between basins). A few points show E_CT < E_neutral → the neutral
+SCC landed in a metastable basin there; the constrained search found a
+deeper state. Map: `debug/pyridone_2d_scan_cdft.png`
+(`scripts/plot_scan2d_cdft.py`).
+
+**libm dep added** to rust_dftb/Cargo.toml — `pbc_cell.rs` (Ewald WIP)
+uses `libm::erfc`.

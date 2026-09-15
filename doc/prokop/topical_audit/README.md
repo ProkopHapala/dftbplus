@@ -41,3 +41,13 @@ implementations of the same concept across Rust, Fortran, Python, and OpenCL.
 - **sparse_nanocrystal_vibrations.md** — sparse GPU DFTB for vibrational
   calculations on Si/H nanocrystals. See
   `tasts/Sparse_Nanocrystal_Vibrations/Sparse_Nanocrystal_Vibrations.manifest.md` §0.
+- **cdft_constraints.md** — constrained DFT (fragment Mulliken-charge
+  constraints) on the dense GPU solver: the λ-shift enters `h_scc` as
+  `½λ·S·(w_μ+w_ν)`, so one kernel + an outer-λ host loop give
+  charge-localized diabatic states with correct constrained-surface
+  forces. Per-replica targets = diabatic ladder in one batch.
+- **gpu_pbc_hbond_scans.md** — 2-D proton-transfer scans on a periodic
+  H-bond wire via `GpuPbc` (`pbc_*` rhai bindings). QX/HQ chain built
+  from ascii-art with herringbone tilt; one junction crosses the cell
+  boundary. Batched 400-replica SCC: d1↔d2 symmetry 9e-6 Ha, degenerate
+  endpoints, stepwise-wins mechanism.

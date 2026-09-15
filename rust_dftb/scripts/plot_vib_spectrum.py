@@ -62,6 +62,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("freqs", nargs="+", help="sparse_vibrations freq.txt file(s)")
     ap.add_argument("--ref", help="DFTB+ vibrations.tag (atomic units)")
+    ap.add_argument("--bands", default="Si–Si frame@100,Si–H bend@700,Si–H stretch@2200",
+                    help="comma list of 'label@cm-1' x-axis annotations")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
 
@@ -80,10 +82,11 @@ def main():
     xhi = max(f.max() for f, _, _ in panels) * 1.03
     axes[0, 0].set_xlim(min(-30, min(f.min() for f, _, _ in panels) * 1.2), xhi)
     axes[-1, 0].set_xlabel("frequency (cm$^{-1}$)")
-    for x, lab in [(100, "Si–Si frame"), (700, "Si–H bend"), (2200, "Si–H stretch")]:
-        axes[-1, 0].annotate(lab, (x, 0), textcoords="offset points", xytext=(0, -22),
+    for spec in args.bands.split(","):
+        lab, x = spec.rsplit("@", 1)
+        axes[-1, 0].annotate(lab, (float(x), 0), textcoords="offset points", xytext=(0, -22),
                              ha="center", fontsize=8, color="#555555")
-        axes[-1, 0].vlines(x, -0.06, 0.0, color="#555555", lw=0.8)
+        axes[-1, 0].vlines(float(x), -0.06, 0.0, color="#555555", lw=0.8)
     fig.suptitle("Vibrational stick spectrum", fontsize=11)
     fig.tight_layout(rect=[0, 0.04, 1, 0.97])
 

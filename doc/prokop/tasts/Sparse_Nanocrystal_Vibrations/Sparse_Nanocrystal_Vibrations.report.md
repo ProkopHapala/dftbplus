@@ -2247,3 +2247,38 @@ Kernel START/END events on the two TC2 SpGEMMs (plan path only), drained per SCC
 - Geometry confound is small: sparse min is 0.024 Å RMS from DFTB+ min; Hessian at own min vs ref's own min.
 - Contributing causes (unresolved): the ~0.99 Ha energy offset at identical geometry means a real model-parity gap (full mask, r_I~1e-7 — NOT a mask/f32 issue); FD noise ±~10 cm⁻¹ on the softest modes; index-matching ambiguity inside dense degenerate clusters (e.g., mode 59: 561→519 may be reordering).
 - Verdict: **pipeline functional and honest; frequencies qualitatively right, quantitatively ~5–15% soft-stiff vs DFTB+** — consistent with a systematic force-model bias, not noise. Needs the parity-gap investigation before quantitative frequency claims on large systems.
+
+### §15.14 — FF32-POLISH endgame: implemented, debugged, benchmarked (2026-09-17)
+
+Emulated float-float (double-single, `hi+lo` f32 pair ≈ 46-bit) McWeeny polish on GPU — all f32 FMA, no native f64 (RTX 3090 f64 ≈ 1/64 rate). Design per manifest §4.12.2 r2 / GPT-5.6 spec: products stay float-float through the whole chain `T_ff=K·S → Q_ff=T_ff·K → U_ff=Q_ff·S → V_ff=U_ff·K → K'=f32(3Q−2V)`, reusing the precomputed symbolic plans (`plan_ks`, `plan_tk`); three persistent lo buffers (`ff_t_lo` on M_TKS, `ff_q_lo`/`ff_v_lo` on M_K; hi parts reuse `t_ks`/`q`/`a_zhz`).
+
+**Bug found + fixed (compiler reassociation):** the original fused product+combine kernel (`bsr4_mcw_ff_final`) measured 1.7e-7 elementwise error while every intermediate product verified ≤9.7e-14 and a host f64 replay from the GPU's own buffers gave 1.3e-13 — the NVIDIA OpenCL compiler reassociated the TwoSum chain inside that kernel (the same macro in the product kernel survived — fragile luck). `-cl-fp32-contract=off` is NOT supported by this driver. Fix: V_ff goes through the verified `bsr4_spgemm_plan_Bsym_ff` product kernel (V now stored on M_K, +1 hi+lo buffer) and the combine became a single explicit-fma chain `Knew = fma(3,Qh, fma(-2,Vh, fma(3,Ql,-2·Vl)))` — the lo parts are ~1e-8 linear corrections, so this is ~1-ulp accurate AND contraction-immune. Result: GPU output **bitwise identical** to the Rust-f32 emulation; `K'` at 5.4e-8 ≈ 2× the pure f32-rounding floor (2.7e-8).
+
+**Numerical validation** (`sparse_ff_test`, r_k=40 Å — full M_K, zero truncation):
+
+| product | err(hi only) | err(hi+lo) vs masked-f64 | mask truncation |
+|---|---|---|---|
+| T=K·S | 2.6e-8 | **7.2e-15** | 0.0 |
+| Q=(KS)·K | 2.7e-8 | **6.6e-14** | 0.0 |
+| U=Q·S | 2.6e-8 | **5.3e-14** | — |
+| V=U·K | 2.7e-8 | **9.7e-14** | — |
+
+**Benchmark** (R10, 330 Si, 918 orbs, deg≈330; `bench_ff_endgame.rhai` + `RUST_DFTB_PROF=evt`; figures `debug/tc2_ff_endgame_rk{20,40}.png`):
+
+| metric | f32 TC2 iter | FF32 McWeeny step |
+|---|---|---|
+| wall | **14.5 ms** | **44 ms ≈ 3.0 f32 iters** (spec ≤8) |
+| products | 2 f32 SpGEMM | 4 ff SpGEMM + combine + sym |
+
+Convergence (true R_I by `sparse_ri_f64`):
+
+- **r_k=40 Å** (M_K covers the cluster, tail=0): f32 purify floor 2.7e-7 → +1 FF step **3.96e-8** → +2 **2.92e-8** → in-loop endgame (6 steps, terminal) **1.81e-8** → asymptote ≈ f32-storage fixed point ~1.4e-8. Total purify+polish 0.68 s vs 0.44 s f32-only → **15× residual improvement for +55% wall**.
+- **r_k=20 Å** (production mask, tail ‖K'∖M_K‖/‖K'‖=5.3e-6): f32 floor ~4.9e-5 → FF plateau ~3e-5 — **representation-limited, not arithmetic**. Widening M_K is the only lever at fixed r_k.
+- **f32-McWeeny endgame** (no FF): limit-cycles at ~1.4e-7 device for 130+ iters — same floor, no benefit.
+- **Device R_I floor ~1e-7**: the in-loop residual is itself f32-computed and cannot resolve below ~1e-7; the FF improvement is only visible via `sparse_ri_f64` (f64 host diagnostic).
+
+**Design consequence:** the earlier "f32 arithmetic floor ~1e-5" was entirely (a) product arithmetic (fixed by FF kernels) and (b) `M_TKS=M_K` product truncation (fixed by building the true structural product mask `build_product_mask(M_K,M_HS)`) and (c) M_K *storage* truncation — the remaining irreducible floor set by `r_k`. For R10, r_k=40 Å costs nothing in degree (deg already ≈ n_atom) and buys 1000× residual; for genuinely large systems the r_k floor is the honest price of sparsity.
+
+**Integration:** `RUST_DFTB_TC2_FF=1` + `RUST_DFTB_TC2_FF_SWITCH` (default 1e-3) + `RUST_DFTB_TC2_FF_STEPS` (default 2). Once the step cap is hit the purify returns the polished K immediately (`NumericalFloor`) — returning to f32 TC2 re-pollutes the state to ~1e-7 within a few iters, so the endgame is deliberately terminal. `sparse_sync` rhai call added for honest enqueue+drain timing.
+
+**Remaining/open:** R_H on a converged H_scc (subspace leg) still unmeasured; force-noise-vs-R_I sweep (does the Hessian even need <1e-5?) is the next physics-relevant question; P-space path untouched by the M_TKS change; sparse SCC 4-iter failure at R10 remains a separate unresolved issue.
