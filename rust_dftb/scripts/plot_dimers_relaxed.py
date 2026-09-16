@@ -35,5 +35,5 @@ for ax, (name, path, J) in zip(axes, SYS):
     ax.set_title(name,fontsize=11); ax.set_aspect("equal")
     ax.set_xlabel("x [A]"); ax.set_ylabel("y [A]")
 fig.tight_layout()
-out = "/home/prokop/git/dftbplus/rust_dftb/debug/dimers_relaxed.png"
+out = "/home/prokop/git/dftbplus/debug/dimers_relaxed.png"
 fig.savefig(out,dpi=150); print("wrote",out)

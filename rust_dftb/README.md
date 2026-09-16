@@ -63,11 +63,16 @@ RUST_DFTB_SCC_VERBOSE=1 cargo run --example hbond_ref -- ...
 - `src/methods/dftb/` — DFTB SK tables, H0/S assembly, SCC, forces
 - `src/methods/xtb/` — xTB analytical integrals, GFN1/2
 - `src/methods/sparse/` — BSR4 sparse + GPU purification + Davidson eigensolver.
-  Includes `sparse_forces.rs` (P3: sparse D=2K, W=2KHK via masked SpGEMM) and
-  symbolic SpGEMM plans (P4). See
+  Includes `sparse_forces.rs` (sparse D=2K, W=2KHK via masked SpGEMM + device
+  pair contraction), symbolic SpGEMM plans (P4), two-phase TC2/FF32 purify,
+  and the FD-Hessian warm-update tiers — `dmm_descend`/`linear_response`
+  (`sparse_system.rs`) + clamped `forces_frozen` (explicit K₀/W₀/q₀ snapshot,
+  0 device products): measured R10 ladder 5.5 ms/6.3% → 64 ms/3.1% →
+  105 ms/1.0% → cold ~345 ms per displaced eval (report
+  `doc/prokop/reports/2026-09-16_sparse_dmm_warm_density_hessian.md`). See
   `doc/prokop/topical_audit/sparse_nanocrystal_vibrations.md` for the Si/H
-  nanocrystal vibrations task (Gates C–E pass, Gate F blocked on sparse
-  analytic force bridge).
+  nanocrystal vibrations task (end-to-end FD Hessians via `sparse_vibrations`;
+  guide `doc/prokop/userguide/sparse_vibrations.md`).
 - `src/qmqm/` — multi-fragment QM/QM solver + GPU runtime. Production
   engine `gpu_dftb.rs` (`GpuDftb`: persistent buffers, batched SCC/FIRE/MD,
   analytic forces via `gpu_forces.rs`/`.cl`). Extensions: `gpu_cdft.rs`/`.cl`

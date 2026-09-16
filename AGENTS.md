@@ -39,4 +39,4 @@ DFTB+ fork: upstream Fortran reference (`src/dftbp/`) + from-scratch Rust reimpl
 
 ## Repo policy — details: §10 (`CODEMAP.md` is the router)
 
-- `debug/` — all debug artifacts; **never commit** it. `scripts/` — kept reusable scripts only. `doc/prokop/tasts/<task>/` — specs only, no artifacts. `tests/` — reference data only. Update `OVERVIEW_Roadmap.md` when status changes.
+- `debug/` — all debug artifacts; **never commit** (gitignored). `scripts/` — kept reusable scripts only. `doc/prokop/tasts/<task>/` — specs only, no artifacts. `tests/` — reference data only; regeneration scratch goes in a gitignored `work/` subdir. **Crate sanity:** no `debug/`, `work/`, or generated artifacts inside `rust_dftb/` — reference data → top-level `tests/`, artifacts → top-level `debug/`. Update `OVERVIEW_Roadmap.md` when status changes.

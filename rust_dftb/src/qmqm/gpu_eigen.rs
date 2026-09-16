@@ -216,6 +216,106 @@ pub fn direct_jacobi_batched(
     Ok(d)
 }
 
+// ------------------------------------------------------------------
+// Block Jacobi (manifest §16.D) — one WG/system, one thread per row,
+// pivot+U in local memory only. New architecture alongside the direct
+// kernel — the old path stays default; this is selected by the caller.
+// ------------------------------------------------------------------
+
+const GPU_BLOCK_JACOBI_TEMPLATE: &str = include_str!("gpu_block_jacobi.cl");
+
+/// Workgroup for `block_jacobi_1wg`: one thread per row, rounded to a
+/// warp — ceil(n/32)·32 (n=86→96, n=246→256). The kernel assumes WG ≥ n.
+pub fn block_jacobi_wg(n: usize) -> usize {
+    ((n.max(1) + 31) / 32 * 32).max(32)
+}
+
+/// Render the block-Jacobi template. `b` = block size (pivot is 2B×2B in
+/// local memory: B=16 → ~8.4 KB/WG).
+pub fn render_block_source(b: usize, wg: usize) -> String {
+    let pb = 2 * b;
+    GPU_BLOCK_JACOBI_TEMPLATE
+        .replace("#define B 16", &format!("#define B {b}"))
+        .replace("#define PB 32", &format!("#define PB {pb}"))
+        .replace("#define PLD 33", &format!("#define PLD {}", pb + 1))
+        .replace("#define WG 96", &format!("#define WG {wg}"))
+        .replace("#define MAX_SWEEPS 40", &format!("#define MAX_SWEEPS {}", jacobi_sweeps(40)))
+}
+
+/// Bound-handle builder for `block_jacobi_1wg` — same prebound-handle
+/// pattern as `build_jacobi_kernel` but the signature has no Fermi tail;
+/// instead `eig` (= the plan's eig_diag buffer) receives the eigenvalues,
+/// replacing the extract_diag launch. Occupation then runs the existing
+/// standalone `fermi_occ_batched`.
+pub fn build_block_jacobi_kernel(
+    rt: &mut GpuRuntime,
+    n: usize,
+    batch: usize,
+    a_buf: &Buffer<f32>,
+    v_buf: &Buffer<f32>,
+    act_buf: &Buffer<i32>,
+    diag: &Buffer<f32>,
+    eig: &Buffer<f32>,
+    init_v: i32,
+) -> Result<Kernel> {
+    if n == 0 || n > 256 {
+        return Err(DftbError::InvalidInput(format!(
+            "block_jacobi_1wg: n={n} out of range 1..=256"
+        )));
+    }
+    let wg = block_jacobi_wg(n);
+    if wg > rt.caps().max_work_group_size {
+        return Err(DftbError::InvalidInput(format!(
+            "block_jacobi_1wg: n={n} needs WG={wg} > device max_work_group_size {}",
+            rt.caps().max_work_group_size
+        )));
+    }
+    let source = render_block_source(16, wg);
+    let program = rt.build_program(&source)?;
+    Kernel::builder()
+        .program(&program).name("block_jacobi_1wg").queue(rt.queue().clone())
+        .global_work_size(batch * wg).local_work_size(wg)
+        .arg(a_buf).arg(v_buf).arg(n as i32).arg(batch as i32).arg(init_v)
+        .arg(act_buf).arg(diag).arg(eig)
+        .build().map_err(map_ocl_err)
+}
+
+/// Standalone block-Jacobi benchmark/diagnostic — same contract as
+/// `direct_jacobi_batched` (all active, init_v=0, returns diag
+/// [batch][4] = {off, off/‖A‖_F, stop, sweeps}).
+pub fn block_jacobi_batched(
+    rt: &mut GpuRuntime,
+    a_buf: &Buffer<f32>,
+    v_buf: &Buffer<f32>,
+    n: usize,
+    batch: usize,
+) -> Result<Vec<f32>> {
+    if n == 0 || batch == 0 {
+        return Ok(Vec::new());
+    }
+    if n > 256 {
+        return Err(DftbError::InvalidInput(format!(
+            "block_jacobi_batched: n={n} exceeds capacity 256"
+        )));
+    }
+    let wg = block_jacobi_wg(n);
+    let source = render_block_source(16, wg);
+    let program = rt.build_program(&source)?;
+    let ones = rt.buffer_from_slice(&vec![1i32; batch])?;
+    let diag = rt.zero_buffer::<f32>(4 * batch)?;
+    let eig = rt.zero_buffer::<f32>(batch * n)?;
+    let kernel = Kernel::builder()
+        .program(&program).name("block_jacobi_1wg").queue(rt.queue().clone())
+        .global_work_size(batch * wg).local_work_size(wg)
+        .arg(a_buf).arg(v_buf).arg(n as i32).arg(batch as i32).arg(0i32)
+        .arg(&ones).arg(&diag).arg(&eig)
+        .build().map_err(map_ocl_err)?;
+    unsafe { kernel.enq().map_err(map_ocl_err)?; }
+    let mut d = vec![0.0f32; 4 * batch];
+    rt.read_buffer(&diag, &mut d)?;
+    Ok(d)
+}
+
 /// Tiled block Jacobi eigensolver for N > 64.
 ///
 /// Diagonalizes `batch` symmetric N×N matrices. One workgroup per system.

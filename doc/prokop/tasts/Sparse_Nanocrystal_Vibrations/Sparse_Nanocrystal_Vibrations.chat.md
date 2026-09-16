@@ -12148,3 +12148,1778 @@ $$
 So **5–10× is still a reasonable target** for the intermediate tier.
 
 The measured 25% improvement does not demonstrate that warm reuse is ineffective. It demonstrates that the current implementation is spending most of its time **reconverging quantities that this tier was explicitly supposed not to reconverge**.
+
+
+
+
+---
+
+
+# USER
+
+OK, there are results considering both speed and accuracy. It seems to me that there are only two viable modes - the cheap forzen density 7-12ms with 2.4% error and full-cold-fixq convergence with 345ms, warm DDM=3+1McW or warm DMM=6 ret=2 seems useless. but maybe the code do this inefficiently
+
+would you check the code on the git? It is uptodate 
+https://github.com/ProkopHapala/dftbplus/tree/main/rust_dftb/src/methods/sparse
+
+
+---
+
+You're right — let me separate the two things cleanly and get the actual numbers.
+
+**Frozen density was ~7–11 ms/eval** (measured earlier — it's just geometry + forces, zero electronic work). So the gap isn't "warm ≈ cold" — it's frozen ~10ms vs warm ~260ms vs cold ~345ms. The question is really: *why does the warm update cost ~250ms when the state barely changes?*
+
+Honest overhead breakdown of that ~250ms (each planned product ≈ 5–7ms at deg330):
+
+| stage | products | ~ms | overhead or physics? |
+|---|---|---|---|
+| NS warm Z (3 iters) | 6 | ~40 | **overhead** — 1 iter gives R_Z=8.5e-5, plenty |
+| K0 build for δK0 seed | ~3 + sync | ~25 | **overhead** — needed only for the seed |
+| seed shift | 0 | ~2 | cheap |
+| DMM rotation 6×3 | 18 | ~120 | physics — the actual fix |
+| retraction 2×4 | 8 | ~55 | **overhead** — insurance for the big steps |
+| measure r_I/Tr | 2 | ~14 | gate |
+| forces | ~8 | ~60 | unavoidable (frozen pays it too) |
+
+So ~140ms is overhead around ~120ms of real rotation — and the rotation itself needs 6 steps only because steepest descent contracts ~1.7×/step and the seed lands 15× above the gate.
+
+The minimal "Tier-1" config the notes describe — 1–2 rotation steps, **no retraction at all** (the tangent update only breaks idempotency at O(η²)), no polish — I haven't actually tested yet. Let me measure it:
+
+Very informative — all three no-retract runs **fail loudly at the force check**, not the R_H gate: unretracted K drifts to r_I≈2e-3 → dummy lanes get occupied → gate fires. GPT's O(η²) claim holds only at small η; at η=8 the violation is real.
+
+But notice: the retract condition `istep+1 < n_steps` **skips the last step** — it assumed a post-polish follows, which is now gone. That means even "ret=2" never cleans the final state. Let me fix that and test minimal configs:
+
+Now the picture is clear. Key numbers:
+
+- **Frozen was ~7–11 ms/eval** — that's geometry+forces only, zero electronic work. That's the floor.
+- No-retract DMM fails loudly on **r_I/dummy lanes** (r_I≈2e-3 → pad orbitals occupied), not on R_H — at η=8 the O(η²) tangent violation is real, so *some* retraction is mandatory.
+- But notice: the unretracted state had **lower R_H** (4.2e-5 at step 5) than any retracted one — each McWeeny *raises* R_H while fixing r_I. We're paying 8 products for retraction that actively hurts the stationarity metric.
+
+The minimal correct recipe per the data: **short DMM + exactly one terminal McWeeny** (fixes r_I AND dummy lanes, costs 4 products, once). Test: DMM=3, RET=0, MCPOL=1, gate relaxed to 2e-4 for measurement:
+
+Two important findings:
+
+1. **DMM=3 + one terminal McWeeny: ~175 ms/eval, R_H=8.3e-5** — passes, forces ΔF=7.10e-2 vs cold 6.90e-2 (~2.8% err).
+2. Without any retraction the force gate fails on **dummy-lane occupation** — GPT's "tangent update" claim only holds at small η; at η=8 some retraction is mandatory.
+
+Now the overhead ledger at ~175 ms:
+
+| stage | ~ms | |
+|---|---|---|
+| NS warm Z (3 iters, 6 prod) | ~40 | overhead — 1 iter gives R_Z=8.5e-5, enough |
+| K0 build for seed | ~25 | overhead — needed only for δK0 seed |
+| DMM 3×3 | ~60 | the physics |
+| terminal McWeeny | ~28 | mandatory retraction |
+| measure+gate | ~15 | |
+| forces+geom | ~10 | frozen pays this too |
+
+Let me check if NS iter count is controllable — that's the largest single overhead item:
+
+NS already exits on `ns_tol=1e-5` — it converges in 3 iters because warm Z starts at R_Z=2.3e-3. Setting tol to ~2e-4 stops after 1 iter. Check if that's env-controllable in the vib path:
+
+Let me verify the frozen-mode number and then give you the honest accounting:
+
+Now I have the complete honest picture. Let me lay it out:
+
+## Measured per-eval costs (R10, h=0.05, solve+forces)
+
+| mode | ms/eval | ΔF vs cold | electronic work |
+|---|---|---|---|
+| **frozen** | **7–12** | 2.4% | zero |
+| warm DMM=3 +1McW | ~175 | 2.8% | 13 products |
+| warm DMM=6 ret=2 | ~300 | 0.4% | 26 products |
+| cold fixq | ~345 | ref | ~50 products |
+
+Two things worth noting immediately: **frozen is only 2.4% off on R10** — comparable to the minimal warm tier (2.8%). For this system your original instinct was nearly right.
+
+## Where the warm time actually goes
+
+Of the ~165ms warm-update overhead (frozen≈10ms is the floor — geometry+forces only):
+
+| stage | ~ms | reducible? |
+|---|---|---|
+| DMM rotation (3 steps × 3 prod) | ~60 | **physics floor** for steepest descent |
+| NS warm Z (3 iters) | ~40 | → ~13ms at 1 iter (R_Z=8.5e-5 suffices) |
+| K0 build for seed/bounds | ~25 | mostly needed (b_zh, η bounds) |
+| terminal McWeeny | ~28 | **mandatory** — no-retract fails dummy-lane gate |
+| measure/gates | ~20 | → ~7ms (R_H only) |
+| | | |
+
+Realistic floor for a *correct, certified* warm update: **~100–120ms → ~3× faster than cold**, not 10×.
+
+## Why 10× is impossible here — the one-sentence answer
+
+The seed residual R_H=7e-4 must contract ~7× to pass the force-validated gate, and steepest descent contracts only ~1.7×/step **regardless of how small the initial error is** — the rate is set by η·(εmax−εmin), a spectral bound, not by the residual. "K barely changes" buys a good starting point, but each rotation still costs 3 products and the manifold retraction is mandatory at usable step sizes. A 10× warm solve (~5 products) requires **Newton-class convergence (CG/BB on the manifold)** — which is exactly the "general solver speedup" item — or accepting R_H~2e-4 / frozen.
+
+## What I'd propose
+
+- **Tier-0 = frozen (~10ms, ~2% err on R10)** — screening/default; it nearly matches minimal-warm accuracy here and is 30× cheaper.
+- **Tier-1 = DMM=3 + 1 McWeeny (~175ms, ~3%)** — the responsive minimal tier, works but no real accuracy gain over frozen on R10.
+- **Tier-2 = DMM=6 ret=2 (~300ms, 0.4%)** — the certified tier, now ~15% faster than cold.
+
+The honest conclusion: at this system size the warm-vs-cold win is bounded ~2-3× by descent physics; the order-of-magnitude win you originally wanted is **batch-parallel columns** (the product goal) — per-eval ~7ms/products means the GPU is launch-bound, and N columns fused is where 10× lives. The CG-manifold step is the only in-solver change that would shrink the step count itself.
+
+Want me to (a) trim the warm overheads (1-iter NS, slim gates → ~140ms), (b) implement CG-DMM, or (c) move to the batched-column engine?
+
+
+
+---
+
+# CHAt GPT 5.6 sol
+
+I checked the **current `main`**, not the older attached files. I would **not yet conclude that only frozen and cold-fixed-q are viable**, because the current comparison has two serious problems:
+
+1. the current **frozen-force path appears inconsistent / stale**, and
+2. the current “warm” implementation is **not really the cheap reuse scheme we discussed**. It still does ~25–40 sparse products per displacement.
+
+So the measured `10 ms / 175 ms / 300 ms / 345 ms` hierarchy is actually quite understandable from the code.
+
+## 1. First: I think there is a bug in the frozen benchmark
+
+`forces_frozen()` does this:
+
+```rust
+compute_v()
+build_hscc_from_v()
+self.forces()
+```
+
+It **does not recompute `b_zh = Z·H_scc`** for the displaced geometry.
+
+But `forces()` defaults to `force_w_zk=true` and calls
+
+```rust
+build_dw_into(..., self.ws.b_zh(), true)
+```
+
+i.e. it uses
+
+$$
+W = 2(ZH_{\rm SCC})K.
+$$
+
+And the force workspace explicitly says that `b_zh` must be the **fresh current** \(Z H_{\rm SCC}\), produced by the last K0/P0 build.
+
+But frozen mode does no K0/P0 build.
+
+Worse, `restore_central_state()` restores K and Z but not `b_zh`; the central-state comment explicitly says `b_zh` is not snapshotted.
+
+So unless your benchmark explicitly set
+
+```bash
+RUST_DFTB_W_ZK=0
+```
+
+the frozen force is potentially using \(ZH\) from the **previous electronic calculation / previous Hessian displacement**.
+
+That means the impressive
+
+$$
+7\!-\!12\ {\rm ms},\quad 2.4\% \text{ error}
+$$
+
+number may not yet be a clean frozen-density result.
+
+### Very first test
+
+No coding needed:
+
+```bash
+RUST_DFTB_W_ZK=0
+```
+
+for the frozen Hessian test.
+
+That forces the legacy
+
+$$
+W=2K H_{\rm SCC} K
+$$
+
+path using the **current displaced H**, so it cannot use stale `b_zh`.
+
+Also reverse the order in which a few \(+h/-h\) columns are evaluated. A proper frozen force should not depend on which displacement was evaluated before it.
+
+I would settle this before drawing any physics conclusions from the 2.4%.
+
+---
+
+# 2. The present “warm” mode is much more expensive than it sounds
+
+The agent's headline
+
+> DMM=3 + McWeeny = 13 products
+
+counts only the central part.
+
+The actual current `scc_fixedq()` path does considerably more.
+
+### DMM=3 + terminal McWeeny
+
+Current code does approximately:
+
+| operation                     |    SpGEMMs |
+| ----------------------------- | ---------: |
+| warm Newton–Schulz Z, 3 iters |       ~5–6 |
+| displaced K0 construction     |          2 |
+| DMM 3 steps                   |          9 |
+| terminal McWeeny              |          4 |
+| `measure_projector_state()`   |          2 |
+| final `R_H`                   |         ~2 |
+| force W                       |          1 |
+| **total**                     | **~25–26** |
+
+At your measured ~5–7 ms/product, that predicts
+
+$$
+125\!-\!180\ {\rm ms},
+$$
+
+which is almost exactly the observed ~175 ms.
+
+So there is no mystery.
+
+### DMM=6, retract every 2
+
+Current `dmm_descend()` now explicitly retracts **including the last step**. Therefore 6 steps with `retract_every=2` means **three McWeeny retractions**, not two. Each retraction is four SpGEMMs.
+
+So:
+
+$$
+18\ {\rm DMM}
++
+12\ {\rm McWeeny}
+$$
+
+just inside `dmm_descend`.
+
+Including Z, K0, diagnostics and force, you're around **40+ products**, versus ~50–55 for cold TC2.
+
+Of course it runs at ~300 ms versus ~345 ms.
+
+The current result does **not** show that density reuse inherently gives only 15–30%. It shows that this implementation has evolved into a small iterative solver.
+
+---
+
+# 3. I think the `δK0` seed is fundamentally suspect
+
+This is perhaps the most important algorithmic issue.
+
+The current warm path first computes the new
+
+$$
+K_0^{\rm spectral}
+=
+\frac{\epsilon_{\max}Z-ZHZ}{\Delta\epsilon}
+$$
+
+and then constructs
+
+$$
+K_{\rm seed}
+=
+K_{\rm conv}^{\rm center}
++
+\left(
+K_0^{\rm new}-K_0^{\rm center}
+\right).
+$$
+
+The code describes this as a “first-order occupied-subspace rotation.” 
+
+I don't think that description is correct.
+
+It is the first-order change of the **linear spectral initializer**, not the first-order change of the occupied projector.
+
+Those are different things.
+
+\(K_0\) depends on:
+
+* \(H\),
+* \(S^{-1}\),
+* \(\epsilon_{\min}\),
+* \(\epsilon_{\max}\),
+* and the normalization \(1/\Delta\epsilon\).
+
+So
+
+$$
+\delta K_0
+$$
+
+contains changes in the entire spectral scaling, diagonal occupation-like components, etc. It is not restricted to occupied↔virtual rotations.
+
+That very naturally explains why your seed lands significantly **off the projector manifold** and why later DMM requires expensive McWeeny retractions.
+
+It may also explain the dummy-lane trouble.
+
+In other words, we may currently be doing:
+
+> start from an excellent converged K → deliberately contaminate it with a crude spectral-initializer difference → spend 10–20 products repairing the damage.
+
+That is not the warm-start experiment I intended.
+
+---
+
+# 4. You're also reconverging Z much too accurately for the cheap tier
+
+The workspace documentation is explicit:
+
+> one warm Newton–Schulz step gives the first-order inverse correction.
+
+
+
+Indeed,
+
+$$
+S_1=S_0+\delta S
+$$
+
+and one warm NS step gives
+
+$$
+Z_1
+=
+2Z_0-Z_0S_1Z_0
+=
+Z_0-Z_0\delta S Z_0+O(\delta S^2).
+$$
+
+That is precisely what a first-order response tier needs.
+
+But `scc_fixedq()` uses the ordinary tight `ns_tol=1e-5`, so your measured displacement needs ~3 iterations.
+
+For the cheap tier that is conceptually backwards.
+
+I'd use either:
+
+* **0 NS steps** as an explicit approximation A/B;
+* **exactly 1 warm NS step** as the normal response tier.
+
+Not “iterate until Z is converged like the cold solver”.
+
+---
+
+# 5. There is also pure diagnostic overhead in the production path
+
+`measure_projector_state()` explicitly performs
+
+$$
+KS,\quad KSK
+$$
+
+= **2 products**.
+
+Then the final `rh_stationarity()` needs \(KS\) and \(H(KS)\). The measure routine does not mark its freshly computed `t_ks` as valid, so `rh_stationarity()` can recompute \(KS\) again.
+
+Thus certification itself can cost approximately another **3–4 SpGEMMs** per displacement.
+
+That is ~20–30 ms just to prove that the approximation you deliberately chose is approximate.
+
+For a calibrated Hessian mode I would absolutely **not** do expensive \(R_I/R_H\) gates on every column.
+
+Use them in debug/validation runs, establish a fixed recipe, then production does:
+
+```text
+N known response steps
+→ force
+```
+
+No convergence loop and no convergence diagnostics.
+
+---
+
+# 6. McWeeny retraction is currently 4 products, but it can be 3
+
+Current f32 `mcweeny_polish_planned()` computes
+
+$$
+T=KS,
+$$
+
+$$
+Q=TK=KSK,
+$$
+
+$$
+U=QS,
+$$
+
+$$
+V=UK=KSKSK.
+$$
+
+Four products.
+
+But you already discovered the cheaper identity in the FF32 work:
+
+$$
+V=TQ
+=
+(KS)(KSK)
+=
+KSKSK.
+$$
+
+Therefore ordinary f32 retraction can be:
+
+$$
+T=KS,
+$$
+
+$$
+Q=TK,
+$$
+
+$$
+V=TQ,
+$$
+
+only **3 products**.
+
+The FF implementation already has this exact `T·Q` three-product variant in current `main`.
+
+So if we ultimately retain McWeeny in a warm mode, the existing 4-product retraction is unnecessarily expensive.
+
+---
+
+# What I would actually test now
+
+I would **not implement CG-DMM yet** and definitely not jump to batching yet.
+
+The clean cheap-warm experiment has still not been performed.
+
+### Remove the δK0 seed entirely
+
+Start from exactly the central converged K:
+
+$$
+K \leftarrow K_{\rm center}.
+$$
+
+Do not construct a new spectral K0.
+
+Do not do Gershgorin.
+
+Do not do \(ZHZ\).
+
+Store the central spectral width once if you merely need a scale for \(\eta\).
+
+Refresh only
+
+$$
+B=ZH_{\rm SCC}
+$$
+
+because it is physically needed by the response and forces.
+
+That alone removes K0 work and, more importantly, avoids deliberately pushing K off manifold.
+
+---
+
+## Then test these extremely simple variants
+
+At the **actual Hessian step** \(h=0.02\) Å, not the 0.05 Å benchmark:
+
+### A. Frozen
+
+Central K, central q.
+
+Fix the stale-W issue first.
+
+### B. Direct 1-step H response
+
+Central K.
+
+One warm Z correction.
+
+Then one DMM step:
+
+$$
+T=KS,
+$$
+
+$$
+X=(ZH)K,
+$$
+
+$$
+Y=T X,
+$$
+
+$$
+K\leftarrow K-\eta(X+X^T-2Y).
+$$
+
+No McWeeny.
+
+No \(R_I\) gate.
+
+No K0 seed.
+
+### C. Metric transport + 1 H response
+
+Before the H step:
+
+$$
+Q=K S_{\rm new} K,
+$$
+
+$$
+K_{\rm metric}=2K-Q.
+$$
+
+This is the genuine first-order correction for the changed overlap metric:
+
+$$
+K_{\rm metric}
+=
+K-K\,\delta S\,K+O(h^2).
+$$
+
+Then one H-response step.
+
+### D. Same with 2 H-response steps
+
+Still **no retraction** initially.
+
+Only if this clean start actually develops unacceptable \(R_I\) do we add **one terminal 3-product McWeeny**.
+
+---
+
+# Why this is a much fairer test
+
+The current warm path is starting from a seed with \(R_I\sim10^{-3}\)–\(10^{-2}\)-class contamination and then using large `η=8` DMM steps.
+
+So the fact that McWeeny becomes mandatory does not prove:
+
+> any useful response update must pay for a retraction.
+
+It may merely prove:
+
+> the δK0 seed plus aggressive steepest descent pushes K off-manifold.
+
+Starting directly from an extremely good central projector is exactly where the tangent argument
+
+$$
+\Delta R_I=O(h^2)
+$$
+
+should actually apply.
+
+---
+
+# The target product count should be far lower
+
+For a clean 1-step response with one warm Z step:
+
+$$
+Z\text{ correction}: 2
+$$
+
+$$
+ZH: 1
+$$
+
+$$
+H\text{-response}: 3
+$$
+
+$$
+W\text{ for force}: 1
+$$
+
+roughly
+
+$$
+\boxed{7\ {\rm SpGEMMs}}
+$$
+
+plus cheap vector operations.
+
+With metric transport add ~2:
+
+$$
+\boxed{9}.
+$$
+
+At 5–7 ms/product:
+
+$$
+35\!-\!65\ {\rm ms},
+$$
+
+plus your ~10 ms geometry/force overhead.
+
+That is a completely different regime from 175 ms.
+
+If Z can simply remain central in the low tier, it drops another 2 products.
+
+This is the experiment that tells us whether a useful middle tier exists.
+
+---
+
+## And compare Hessian columns, not individual-force percentage
+
+I still dislike the `ΔF rel. err = 2.4%` metric as the main criterion.
+
+What matters is:
+
+$$
+H_{:,j}
+=
+-\frac{F(+h)-F(-h)}{2h}.
+$$
+
+Some electronic error common to \(+h\) and \(-h\) cancels beautifully.
+
+Some tiny-looking force error that is antisymmetric gets amplified into the Hessian.
+
+So for 3 representative coordinates report:
+
+$$
+\frac{\|H_j^{\rm approx}-H_j^{\rm cold}\|}
+{\|H_j^{\rm cold}\|}
+$$
+
+and absolute RMS/max Hessian error.
+
+That decides whether frozen really is “2.4% accurate” for the quantity you care about.
+
+---
+
+# My current verdict
+
+Your intuition may ultimately be correct:
+
+> **frozen + cold-fixed-q may be the only worthwhile modes.**
+
+If a **clean 1-step central-K response** costs ~40–60 ms and does not materially improve the Hessian over frozen, I would drop the entire middle tier without hesitation.
+
+But the present DMM results do **not** establish that yet.
+
+The current warm mode is burdened by:
+
+* tight 3-iteration Z reconvergence,
+* an expensive and mathematically dubious δK0 seed,
+* 3–6 unpreconditioned steepest-descent steps,
+* 4-product McWeeny retractions,
+* expensive projector/stationarity gates,
+* and for DMM6/RET2, **three** retractions in current `main`, not two.
+
+And the frozen benchmark itself likely has a stale `ZH` force auxiliary under the default force path.
+
+So my next instruction to the agent would be:
+
+> **Do not implement CG or batching. First fix/validate frozen `b_zh`, then remove δK0 entirely and benchmark central-K + 0/1 warm-NS + 1/2 raw H-aware response steps, no retraction and no production gates, at the actual h=0.02 Å. Compare finite-difference Hessian columns against cold-fixed-q. Only if that clean experiment fails should we declare the middle tier useless.**
+
+
+
+
+
+
+
+
+
+
+---
+
+
+# USER
+
+there is some update form my coding agent:
+```
+Major finding — GPT-5.6 was right. With the stale b_zh bug fixed, frozen-density Hessian columns are ~86% wrong at h=0.02, not 2.4%. The old number was an artifact of W=2(ZH)K using the central ZH. This completely changes the mode ranking — frozen is not viable on R10 at all.
+```
+
+however, I thnk if we can get 2.5% error by using central ZH, then even better,it is perhaps even cheaprt method how to get approaxmately good result? Or do I miss something/ Maybe there is some theoretical justification - prossibly like Hariss functional ? 
+
+https://en.wikipedia.org/wiki/Harris_functional
+
+
+---
+
+
+# Chat GPT 5.6 sol
+
+
+Yes — I think you may have accidentally discovered a **better-defined approximation** than the “fixed frozen-density” version. The 2.5% result is not necessarily a lucky bug.
+
+The key is that
+
+$$
+W=(ZH)K
+$$
+
+is only the correct energy-weighted density when \(K\) is the stationary occupied projector of that same \(H,S\).
+
+If you freeze \(K=K_0\) but update \(ZH\rightarrow Z(R)H(R)\), then
+
+$$
+\widetilde W(R)=Z(R)H(R)K_0
+$$
+
+is generally **not** the energy-weighted density corresponding to any stationary electronic state. You have mixed an old projector with a new Hamiltonian.
+
+That can easily be *worse* than freezing both.
+
+## Why freezing both \(K_0\) and \(W_0\) makes sense
+
+At the central converged geometry,
+
+$$
+H_0 C_0=S_0 C_0\epsilon_0,
+$$
+
+with
+
+$$
+K_0=C_0C_0^T
+$$
+
+and
+
+$$
+W_0=C_0\epsilon_0C_0^T
+    = Z_0H_0K_0.
+$$
+
+The usual nonorthogonal-basis electronic force contains
+
+$$
+F_R^{el}
+=
+-2\,\mathrm{Tr}\left(K H_R\right)
++
+2\,\mathrm{Tr}\left(W S_R\right)
++\cdots
+$$
+
+where the second term is the Pulay/overlap part.
+
+Now consider the SCF **Lagrangian**
+
+$$
+\mathcal L(C,\Lambda;R)
+=
+2\,\mathrm{Tr}(C^T H(R) C)
+-
+2\,\mathrm{Tr}
+\left[
+\Lambda(C^T S(R)C-I)
+\right]
++\cdots.
+$$
+
+At \(R_0\),
+
+$$
+C=C_0,\qquad \Lambda=\epsilon_0.
+$$
+
+If we deliberately **freeze both** \(C_0\) and its Lagrange multipliers \(\epsilon_0\), then differentiating this frozen Lagrangian gives exactly
+
+$$
+\boxed{
+F_R^{\rm frozen}
+=
+-2\,\mathrm{Tr}(K_0H_R)
++
+2\,\mathrm{Tr}(W_0S_R)
++\cdots
+}
+$$
+
+So the “stale `b_zh`” calculation was effectively doing something physically coherent:
+
+$$
+\boxed{K=K_0,\quad W=W_0}
+$$
+
+rather than the inconsistent hybrid
+
+$$
+K=K_0,\quad W=Z(R)H(R)K_0.
+$$
+
+I would therefore stop calling the former a bug. I would call it something like:
+
+**Frozen-orbital / unrelaxed-electronic Hessian**
+
+or
+
+**clamped-electron Hessian**.
+
+---
+
+## Why updating only \(ZH\) can become catastrophically worse
+
+This also explains the surprising
+
+$$
+2.5\% \rightarrow 86\%
+$$
+
+change.
+
+Write
+
+$$
+F=ZH,\qquad W=FK.
+$$
+
+For a small displacement,
+
+$$
+\delta W
+=
+(\delta F)K_0
++
+F_0(\delta K)
++O(h^2).
+$$
+
+The actual electronic response contains **both** terms.
+
+The supposedly “corrected frozen” calculation uses
+
+$$
+\delta W_{\rm mixed}
+=
+(\delta F)K_0
+$$
+
+but deliberately sets
+
+$$
+\delta K=0.
+$$
+
+So it includes **half of a coupled response**.
+
+There can be large cancellation between
+
+$$
+(\delta F)K_0
+$$
+
+and
+
+$$
+F_0\delta K.
+$$
+
+Keeping the first but dropping the second may therefore be dramatically worse than dropping **both**:
+
+$$
+\delta W_{\rm frozen}=0.
+$$
+
+That is a very common theme in variational electronic-structure theory: a consistently frozen approximation can behave much better than a partially relaxed but nonstationary one.
+
+So the 86% number does **not** mean:
+
+> “frozen density is terrible.”
+
+It means more specifically:
+
+> “using the stationary-force identity \(W=ZHK\) with a K which is no longer stationary for that H can be terrible.”
+
+That is quite a different conclusion.
+
+---
+
+# Relation to Harris functional
+
+Your Harris intuition is relevant, but I would not call this literally the Harris functional.
+
+The Harris/Harris–Foulkes idea is to take an approximate input density \(n_0\), construct a potential from it, solve the one-electron problem once, and evaluate a specially arranged non-selfconsistent energy functional. Around the self-consistent solution, the Harris energy error is second order in the input-density error. ([Wikipedia][1])
+
+And DFTB itself has very close historical/conceptual connections to stationary/Harris–Foulkes approximations to DFT; the Foulkes–Haydock work explicitly framed tight-binding models as stationary approximations to self-consistent DFT. ([APS Journals][2])
+
+But Harris would normally still obtain the **current** one-electron eigenstates from the potential generated by the frozen input density.
+
+Your cheap approximation goes one step further:
+
+$$
+\boxed{
+\text{freeze the occupied orbitals/projector and their energy multipliers themselves.}
+}
+$$
+
+So I think the closer concepts are:
+
+* **frozen-orbital approximation**;
+* **unrelaxed Hessian**;
+* **force theorem / frozen-potential approximation**.
+
+Andersen's force theorem is particularly close philosophically: first-order total-energy changes can be obtained using a frozen effective potential, and the approach has even been applied to elastic constants, i.e. second derivatives with respect to distortions. ([ScienceDirect][3])
+
+But I would describe your method on its own terms rather than borrowing the Harris name.
+
+---
+
+# In fact, we can implement this more cleanly than relying on stale `b_zh`
+
+Don't preserve the accidental bug.
+
+At the central geometry explicitly snapshot:
+
+$$
+K_0
+$$
+
+and
+
+$$
+\boxed{
+W_0=2(Z_0H_{\rm SCC,0})K_0
+}
+$$
+
+on \(M_{HS}\).
+
+You could even snapshot
+
+$$
+D_0=2K_0
+$$
+
+although scaling K is trivial.
+
+Then for every Hessian displacement:
+
+```text
+assemble current H0, S and their derivatives
+keep q = q0
+keep D = D0
+keep W = W0
+evaluate force contraction with current geometry
+```
+
+No Z.
+
+No \(ZH\).
+
+No SpGEMM.
+
+No purification.
+
+So this should remain essentially at the current
+
+$$
+7-12\ {\rm ms/eval}
+$$
+
+cost.
+
+And unlike the accidental stale-buffer version, the semantics are explicit and deterministic.
+
+I would call the force function something like
+
+```text
+forces_frozen_orbital()
+```
+
+with the contract
+
+```text
+D = D_center
+W = W_center
+q = q_center
+current dH/dR, dS/dR, gamma'(R), repulsion
+```
+
+That is a perfectly meaningful approximation.
+
+---
+
+## SCC terms need to be frozen consistently too
+
+For SCC-DFTB I would use central
+
+$$
+q_0,\quad K_0,\quad W_0.
+$$
+
+But explicit geometry dependence should still be evaluated at the displaced geometry:
+
+* current Slater–Koster derivatives;
+* current \(S_R\);
+* current \(\gamma_{AB}(R)\) and \(\gamma'_{AB}(R)\);
+* current repulsive forces.
+
+What you **don't** update is the electronic response:
+
+$$
+\delta q=0,\qquad
+\delta K=0,\qquad
+\delta W=0.
+$$
+
+That is the clean definition of a clamped-electronic Hessian.
+
+---
+
+# Why it can plausibly be as good as 2.5%
+
+The exact Hessian can schematically be separated as
+
+$$
+\boxed{
+H_{\rm exact}
+=
+H_{\rm unrelaxed}
++
+H_{\rm electronic\ response}.
+}
+$$
+
+Your frozen \(K_0,W_0\) calculation gives the first term.
+
+The second contains the coupled response
+
+$$
+\frac{dK}{dR},\qquad
+\frac{dq}{dR},
+$$
+
+analogous to CPHF/CPKS response in conventional quantum chemistry. Analytic second derivatives in SCF theories indeed require these coupled-perturbed response terms. ([ScienceDirect][4])
+
+For a gapped, fairly covalent Si nanocrystal, it is entirely plausible that the electronic-relaxation contribution to many force constants is only a few percent.
+
+So
+
+$$
+\sim2.5\%
+$$
+
+doesn't look absurd at all.
+
+It will probably become worse for:
+
+* small-gap systems;
+* metals;
+* strong charge-transfer modes;
+* highly polar bonds;
+* dangling bonds/surface states;
+* near-degenerate orbitals.
+
+But for your intended Si/H nanocrystals it might be an extremely attractive approximation.
+
+---
+
+## And this changes how I see the DMM work
+
+We may now have a much cleaner hierarchy:
+
+$$
+\boxed{
+\begin{array}{lll}
+\textbf{Frozen orbital} &
+K_0,W_0,q_0 &
+\sim10\ {\rm ms}
+\\[1mm]
+\textbf{Fully relaxed fixed-q} &
+K(R)\ \text{converged},\ q_0 &
+\sim345\ {\rm ms}
+\\[1mm]
+\textbf{Full SCC} &
+K(R),q(R) &
+\text{reference}
+\end{array}
+}
+$$
+
+The DMM intermediate tier only deserves to survive if it offers something compelling between those.
+
+If explicit frozen \(K_0,W_0\) really gives Hessian errors ~2–3% while costing 30× less than cold, then I agree with your earlier instinct: **DMM=3 at 175 ms for similar accuracy is pointless.**
+
+But first reproduce the 2.5% result with a deliberate snapshot of **both \(K_0\) and \(W_0\)**, rather than stale state left accidentally in `b_zh`.
+
+That is the crucial test.
+
+If it reproduces, I think you've found a real useful approximation, not merely an implementation accident. And theoretically I would justify it primarily as the **frozen-orbital/unrelaxed Hessian obtained from the stationary SCF Lagrangian**, with Harris/force-theorem methods as close conceptual relatives rather than claiming it *is* the Harris functional.
+
+[1]: https://en.wikipedia.org/wiki/Harris_functional?utm_source=chatgpt.com "Harris functional"
+[2]: https://journals.aps.org/prb/abstract/10.1103/PhysRevB.39.12520?utm_source=chatgpt.com "Tight-binding models and density-functional theory | Phys. Rev. B"
+[3]: https://www.sciencedirect.com/science/article/pii/0038109884902242?utm_source=chatgpt.com "“Force theorem” and elastic constants of solids - ScienceDirect"
+[4]: https://www.sciencedirect.com/science/article/abs/pii/0301010486800234?utm_source=chatgpt.com "Second-order coupled perturbed hartree—fock equations for closed-shell and open-shell self-consistent-field wavefunctions - ScienceDirect"
+
+
+
+
+---
+
+# USER
+
+There are some other ideas:
+
+coding agent did but I'm not really sure it implement your ideas of chep apporx correctly (I mean tier-1 with rotation correction, not the fully forzen one)
+
+I not usre if this NS=1 + DMM=2 means exacly what you said? It seems to me still more work than necessary?
+
+---
+
+You're right — let me read the full GPT-5.6 analysis from line 12151:
+
+I've read the whole analysis. GPT-5.6 is right on the key points — and two of them are verifiable bugs I should check *now* before trusting any numbers I reported:
+
+1. **Frozen path may be broken**: `forces_frozen()` calls `forces()` which uses `b_zh = Z·H_scc` — but frozen mode never rebuilds `b_zh` for the displaced H, and `restore_central_state` doesn't snapshot it. The 7–12ms/2.4% "frozen" result may be stale-W garbage.
+2. **The δK0 seed contaminates the manifold** — it's the first-order change of the *spectral initializer*, not the occupied projector. That's why retractions became mandatory.
+3. **Certification + over-converged Z** burn ~10 products proving an approximation is approximate.
+
+Let me verify the code claims first:
+
+Now check `restore_central_state`, `compute_z` warm behavior, and the vib loop:
+
+Now let me check `compute_z`, `rh_stationarity` (t_ks reuse), and the NS iter structure:
+
+Now I understand the code structure. GPT-5.6's critique is verifiable — the key claims:
+
+1. **`forces_frozen()` never refreshes `b_zh=Z·H_scc`** — `forces()` defaults to `w_zk=true` → W=2(ZH)K uses **stale ZH** from the last `compute_k0` (previous displacement or central). Confirmed: `b_zh` isn't in the snapshot, isn't rebuilt in frozen path. The 7–12ms/2.4% numbers are suspect.
+2. **δK0 seed contaminates the manifold** — it's the first-order change of the *spectral initializer* (includes Δε normalization, bounds shift), not of the occupied projector → lands off-manifold → retractions mandatory. Circular self-inflicted cost.
+3. DMM=6/ret=2 now does **3 retractions** (my last-step fix) = 30 products inside dmm_descend alone.
+4. McWeeny can be 3 products (V=T·Q), gates cost ~4 products/eval, NS at tol=1e-5 is over-converged for a response tier.
+
+The plan: fix frozen `b_zh`, then implement the clean Tier-1 (central K + 0/1 NS + optional metric transport + 1–2 DMM steps, no retraction, no gates) and benchmark at h=0.02 with Hessian-column error metric. Let me check the bench script first:
+
+Now I'll implement the clean experiment. Changes:
+
+1. **Fix frozen `b_zh` staleness** — refresh `B=Z·H_scc` after `build_hscc_from_v` in `forces_frozen`.
+2. **Store `(emin, emax)` in the central snapshot** — bounds for η without a K0 build.
+3. **`VIB_SEED=0`** — skip δK0 entirely (central K, refresh only b_zh).
+4. **`VIB_NSMAX`** — cap warm NS iters (0 = keep central Z, 1 = first-order).
+5. **`VIB_METRIC=1`** — metric transport `K←2K−KS₁K` before the H response.
+6. **3-product McWeeny** (`V=T·Q`) and `measure_projector_state` marking `t_ks` valid so `rh_stationarity` reuses it.
+
+Now the 3-product McWeeny (`V = T·Q` instead of `U=Q·S; V=U·K`):
+
+Now make `measure_projector_state` leave `t_ks` marked valid (saves a product in `rh_stationarity`):
+
+Now add spectral bounds to the snapshot:
+
+Now fix `forces_frozen` — the stale `b_zh` bug:
+
+Now restructure `scc_fixedq` — NS cap + seedless/metric-transport path:
+
+Now the `VIB_GATES=0` option — skip the R_H certification product for calibrated runs:
+
+Build still running (warnings are pre-existing). Wait for it:
+
+Build clean. Check the DUMPCOL mechanics then run the experiment matrix at h=0.02:
+
+The dump is `F+−F−` per column — exactly the Hessian column (up to −1/2h). Now run the experiment at **h=0.02** (the real displacement), 3 columns. First the cold reference and the fixed frozen path:
+
+Cold at h=0.02: ~350ms/eval, 23 TC2 iters. Now the **fixed** frozen path:
+
+Frozen still ~8.5ms/eval (b_zh refresh adds ~1 product). But frozen `max|ΔF|≈5.4e-2` vs cold `2.9e-2` — let me check the cold columns 0–2 and compute the actual Hessian-column errors:
+
+**Major finding — GPT-5.6 was right.** With the stale `b_zh` bug fixed, frozen-density Hessian columns are **~86% wrong** at h=0.02, not 2.4%. The old number was an artifact of `W=2(ZH)K` using the *central* ZH. This completely changes the mode ranking — frozen is not viable on R10 at all.
+
+Now the tier-1 experiments — central K, no δK0 seed, 1 warm NS iter, raw DMM steps, no retraction (RHGATE relaxed to observe, not pass):
+
+NS cap of 1 fails the tolerance check (R_Z=9.2e-4 > 1e-5). For the first-order tier that's *fine* — add `VIB_NSTOL` so 1 iter is accepted, and `NSMAX=0` keeps central Z:
+
+Built. Run the tier-1 matrix — B: central K + 1 NS step + 1 DMM step, no seed/retract:
+
+~94 ms/eval for the 1-NS + 1-DMM tier. Check the actual Hessian-column errors:
+
+23.6% column error at 94ms — better than frozen (86%) but not good. Try more DMM steps and the metric-transport variant:
+
+DMM steps *grow* R_H during descent then symmetrize recovers it — K accumulates asymmetry (the −2Y term isn't symmetrized). Check column errors first:
+
+Big result at h=0.02:
+
+| mode | ms/eval | column error |
+|---|---|---|
+| frozen (fixed b_zh) | ~8.5 | **86%** |
+| 1 NS + 1 DMM | ~94 | 23.5% |
+| 1 NS + 2 DMM | ~105 | **5.3–6.0%** |
+| 1 NS + 4 DMM | ~150 | 6–7% (overshoot) |
+| cold | ~350 | ref |
+
+The R_H growth during descent is likely **asymmetry accumulation** — mathematically Y=KHK is symmetric but truncation noise isn't, and `dmm_descend` never symmetrizes K. That's a free fix (elementwise, no product):
+
+Now rerun the full tier-1 matrix with per-step symmetrization, including metric-transport variants:
+
+Clear picture at h=0.02 — **metric transport is rejected** (sm0: 99% error, worse than frozen!), and the sweet spot is **2 DMM steps ≈ 6.2% at ~93ms**. But there's a ~6% error floor that more steps don't beat. Let me sweep η and NS count to find what sets it:
+
+Key finding: **NS accuracy sets the floor** — `ns0d2` = `ns1d2` = 6.2% (one warm NS iter adds nothing at DMM=2), but 3 tight NS iters → **3.0%**. The response direction X=(ZH)K needs Z accurate. Try pushing: tight NS + more DMM steps:
+
+Now we're getting somewhere — **ns3 + 4 DMM = 1.0% column error at ~165ms (2.1× vs cold)**, and retraction *hurts* (4.8% vs 3.0%). Push a bit further to find the plateau:
+
+ns3d6 died on column 2 — let me see why:
+
+ns3d6 fails loudly on Tr(KS) drift (459.0105 > gate) — the unretracted manifold drift hits the occupation gate. The sweet spot is ns3d4. One more trim — does NS=2 (quadratic convergence → R_Z~1e-6) keep the 1% accuracy:
+
+No columns ran — NSMAX=2 likely fails the 1e-5 check early. Check:
+
+R_Z=1.37e-5 just misses tol at iter 2. Loosen NSTOL slightly for the 2-iter config:
+
+Decisive sweep complete. GPT-5.6's diagnosis was correct on both counts — and it changes the conclusions I wrote into the docs yesterday.
+
+## Corrected findings (h=0.02 Å, 3 columns, R10)
+
+**Frozen density is dead.** After fixing the stale `b_zh` bug (frozen never rebuilt `Z·H_scc` for the displaced H — the "2.4%" I reported was an artifact), the true frozen column error is **~86%**. Metric transport alone (`K←2K−KSK`) is even worse: **99%**. Both rejected by measurement.
+
+**The seedless DMM ladder works** — central K, no δK0 contaminant, no retraction:
+
+| config | ~ms/eval | column err |
+|---|---|---|
+| NS=1 + DMM=2 | ~100 | 6.2% |
+| NS=0 + DMM=2 | ~100 | 6.2% (1 warm NS iter adds nothing) |
+| **NS=2 + DMM=4** | **~175** | **1.0%** |
+| NS=3 + DMM=4 | ~165 | 1.0% (iter 3 never runs) |
+| NS=3 + DMM=6 | ~230 | Tr(KS) gate fails — drift |
+| cold fixq | ~350 | ref |
+
+Two measured facts that matter:
+
+1. **Z accuracy sets the error floor**, not step count: loose Z (R_Z~1e-3) caps at 6%, tight Z (R_Z~1e-5) reaches 1%. The response direction `X=(ZH)K` inherits Z's error directly.
+2. **Retraction hurts, doesn't help.** McWeeny is H-blind — every retracted variant is worse than its unretracted twin (4.8% vs 3.0%). GPT-5.6 was right that the δK0 seed was the thing forcing retractions; without it, 4 raw DMM steps stay on-manifold.
+
+**Net: ~2× faster than cold at 1% column error, honest and gate-passing.** Not 10× — steepest descent still contracts only ~1.6×/step.
+
+## Remaining levers, ranked by measured evidence
+
+1. **CG/BB step on the manifold** — the only thing that cuts the 4-step descent itself. Should reach ~110ms.
+2. **±h antisymmetric response sharing** — `K(−h) ≈ 2K₀ − K(+h)` is exact to O(h²); solve once, pay only `forces()` for the −h side. ~1.5× on top → ~120ms/column-pair amortized.
+3. **Batched columns** — still the real 10×.
+
+One housekeeping issue: **yesterday's doc updates contain the wrong frozen number** (2.4% — pre-b_zh-fix). The report, topical audit, tasks, and roadmap all need correcting to 86%/refuted.
+
+Want me to (a) implement CG-DMM, (b) implement ±h sharing, (c) fix the docs with corrected numbers first?
+
+
+
+---
+
+# Chat GPT 5.6 sol
+
+Yes. I think your suspicion is justified: **`NS=1 + DMM=2` is already more elaborate than the truly cheap Tier-1 I originally had in mind.** It is a useful calibration point, but I would not yet call it the final cheap-response algorithm.
+
+There is also an important practical issue: I checked current GitHub `main`, and the latest `VIB_NSMAX / VIB_SEED / VIB_METRIC` changes described by the coding agent are **not pushed there yet**. `scc_fixedq()` on `main` still does the old `compute_k0_from_hscc()` + `k_seed_shift()` path. So I can audit the underlying DMM/NS implementation, but not the exact latest local wrapper.
+
+More importantly, I found a subtlety in the NS counting that may explain some of the agent's conclusions.
+
+## “NS=2” does not necessarily mean two Newton updates
+
+The current `compute_z()` loop does:
+
+```text
+for iter:
+    T = Z*S                 # product
+    measure R_Z
+
+    if R_Z < tol:
+        return              # NO Newton update this iteration
+
+    Q = T*Z                 # second product
+    Z = 2Z - Q              # actual Newton update
+```
+
+Therefore:
+
+* reported `iter=1` can mean **zero** Newton corrections if the starting Z already passes the loose tolerance;
+* `max_iter=2` can mean **one actual Newton correction + one residual check**;
+* `max_iter=3` may still mean only one correction if the corrected Z passes on the next check.
+
+This immediately makes me suspicious of the report:
+
+> NS=2 + DMM=4 ≈ NS=3 + DMM=4; “iter 3 never runs”
+
+That may simply mean:
+
+$$
+\boxed{\text{one actual Newton update is sufficient}}
+$$
+
+rather than two or three.
+
+The agent should report separately:
+
+```text
+n_ZS_products
+n_TZ_products
+n_actual_Z_updates
+```
+
+not call all of them “NS iterations”.
+
+---
+
+# What does `DMM=2` actually mean?
+
+This part *does* correspond to the H-aware rotation we discussed.
+
+One current DMM step is:
+
+$$
+T=KS
+$$
+
+$$
+X=(ZH)K
+$$
+
+$$
+Y=TX
+$$
+
+then
+
+$$
+G=X+X^T-2Y,
+\qquad
+K\leftarrow K-\eta G.
+$$
+
+So it is exactly **3 SpGEMMs per step**.
+
+Thus:
+
+$$
+\text{DMM}=2
+$$
+
+means six SpGEMMs of steepest-descent response.
+
+That is already a little iterative electronic solver. It is not the “one cheap first-order correction” I originally envisioned.
+
+The fact that it improves the Hessian from ~86% error to ~6% is useful evidence, but the implementation is still doing more than the conceptual Tier-1 minimum.
+
+---
+
+# I would now distinguish FOUR ideas, not mix them
+
+### 0. Clamped \(K_0,W_0,q_0\)
+
+This is the accidentally discovered “stale ZH” method we discussed.
+
+Explicitly snapshot
+
+$$
+K_0,\qquad W_0=2Z_0H_0K_0,\qquad q_0
+$$
+
+and use them for every displaced force.
+
+Zero electronic SpGEMMs per displacement.
+
+If the old ~2.5% Hessian-column error reproduces when implemented deliberately, **this is enormously attractive** and should absolutely survive as a mode.
+
+---
+
+### 1. Minimal H-response
+
+This is what I originally meant by cheap Tier-1:
+
+```text
+restore K0, Z0, q0
+build current H1
+
+B1 = Z0 * H1               # 1 product
+
+one H-aware rotation:
+    T = K0 * S1            # 1
+    X = B1 * K0            # 1
+    Y = T * X              # 1
+    K1 = K0 - η G
+
+force:
+    W1 = 2 B1 * K1         # 1
+```
+
+Total:
+
+$$
+\boxed{5\ {\rm SpGEMMs}}
+$$
+
+with **no NS**, no McWeeny, no R_I gate, no R_H gate.
+
+That is the true minimal version.
+
+The agent's data says one DMM step with their current parameters gives rather poor accuracy, ~20%+, so this particular scalar-gradient update may simply be insufficient. But it still deserves a clean benchmark with **accurate central inputs and no other overhead**, because that is the actual cheap method.
+
+---
+
+### 2. Two-step response
+
+Same, but two DMM steps:
+
+$$
+1 + 2(3) +1
+=
+\boxed{8\ {\rm products}}.
+$$
+
+Your agent already found something close to this:
+
+$$
+\sim6\% \text{ Hessian error}.
+$$
+
+And notably:
+
+> NS=0 + DMM=2 = NS=1 + DMM=2
+
+according to the report.
+
+That tells us something very useful:
+
+$$
+\boxed{\text{for the ~6% tier, updating Z is apparently unnecessary.}}
+$$
+
+So calling the method “NS=1 + DMM=2” obscures the simpler result. The candidate is really:
+
+$$
+\boxed{\text{central }Z + 2\text{ DMM steps}.}
+$$
+
+---
+
+### 3. More accurate warm solve
+
+Once we demand ~1% error, their measurements indicate something like:
+
+$$
+\text{accurate }Z + 4\text{ DMM}
+$$
+
+which costs ~160–175 ms.
+
+I agree this is no longer very compelling versus 350 ms cold. It is a 2× solver, not a qualitatively cheaper approximation.
+
+---
+
+# Why I'm particularly interested in the NS=2 result
+
+The agent concluded:
+
+> “Z accuracy sets the floor.”
+
+That may be true, but I think they may have overstated the amount of work needed to obtain accurate Z.
+
+Because Newton-Schulz is quadratic,
+
+$$
+E_{n+1}\sim E_n^2.
+$$
+
+If the restored central Z starts at
+
+$$
+R_Z\sim9\times10^{-4},
+$$
+
+one actual NS correction should ideally put it roughly around
+
+$$
+10^{-6}
+$$
+
+up to sparse-mask effects.
+
+And their own observation that “NS=2 and NS=3 give the same result, third iteration doesn't run” is consistent with exactly that.
+
+So the accurate-response path may actually be:
+
+```text
+ONE genuine Z correction
++ 4 DMM steps
+```
+
+not “2–3 NS iterations + 4 DMM”.
+
+That distinction matters for the product count.
+
+---
+
+# But I think we can go cheaper than ordinary DMM
+
+The current DMM is steepest descent. That's why it needs repeated steps.
+
+At the center,
+
+$$
+[P_0,F_0]=0,
+\qquad
+P_0=K_0S_0,\quad F_0=Z_0H_0.
+$$
+
+For a small displacement,
+
+$$
+F_1=F_0+\delta F.
+$$
+
+To first order the driving gradient is therefore determined only by the perturbation:
+
+$$
+G^{(1)}
+=
+[P_0,[P_0,\delta F]].
+$$
+
+This suggests a cheaper **linear-response-specific** implementation rather than repeatedly recomputing the full nonlinear DMM gradient.
+
+In K-like form, store centrally:
+
+$$
+P_0=K_0S_0,
+\qquad
+B_0=Z_0H_0.
+$$
+
+For the displacement compute
+
+$$
+B_1=Z_0H_1,
+\qquad
+\delta B=B_1-B_0.
+$$
+
+Then approximately:
+
+$$
+X=(\delta B)K_0,
+$$
+
+$$
+Y=P_0X,
+$$
+
+$$
+G_1=X+X^T-2Y.
+$$
+
+That's only:
+
+* \(B_1=Z_0H_1\): 1 product;
+* \(X=\delta B K_0\): 1;
+* \(Y=P_0X\): 1;
+
+followed by the update.
+
+So a first-order response state can potentially be built with
+
+$$
+\boxed{3\ {\rm products}}
+$$
+
+and the final force W adds one:
+
+$$
+\boxed{4\ {\rm products/eval}}.
+$$
+
+This is much closer to what I had originally imagined.
+
+### Important caveat
+
+That formula is a **central-metric first-order approximation**. It neglects some explicit changed-\(S\) terms in the full nonlinear gradient. I would not declare it mathematically equivalent to the present DMM.
+
+But that's precisely okay for this tier: it is a controlled approximation to test.
+
+And your data already says:
+
+$$
+\text{NS=0 and NS=1 practically identical for DMM2}.
+$$
+
+So a frozen-central-metric response is not an unreasonable experiment at all.
+
+---
+
+# Why this formulation may behave better than one ordinary DMM step
+
+The ordinary DMM calculates two large quantities that nearly cancel:
+
+$$
+X+X^T
+$$
+
+and
+
+$$
+2PX.
+$$
+
+At the central stationary state their difference is zero.
+
+At a \(0.02\) Å displacement you are interested in only the tiny difference caused by the perturbation.
+
+So instead of calculating
+
+$$
+G(F_0+\delta F)
+$$
+
+from full matrices, calculate directly the incremental quantity involving
+
+$$
+\delta F.
+$$
+
+This has two potential advantages:
+
+1. less numerical cancellation;
+2. all operations act directly on the \(O(h)\) perturbation that we actually need.
+
+It is much more naturally a **Hessian response approximation** than generic DMM descent.
+
+---
+
+# And before CG, I would try an even simpler optimization
+
+The results:
+
+$$
+\text{DMM1: poor}
+$$
+
+$$
+\text{DMM2: much better}
+$$
+
+suggest the first step is largely under/over-relaxed because one scalar \(\eta\) poorly approximates all occupied–virtual denominators.
+
+Before implementing full conjugate gradients, try a **two-step Chebyshev / BB style step schedule**:
+
+$$
+K_1=K_0-\eta_1 G_0
+$$
+
+$$
+K_2=K_1-\eta_2 G_1.
+$$
+
+No additional SpGEMM versus DMM=2.
+
+Only choose \(\eta_1,\eta_2\) better than using the same `η=8/Δε` twice.
+
+A two-step optimized Richardson/Chebyshev iteration can be substantially better than two identical steepest-descent steps when the spectrum of response gaps lies in a known interval.
+
+If that makes
+
+$$
+\text{DMM2}
+$$
+
+approach the current DMM4 accuracy, you've halved the expensive part essentially for free.
+
+---
+
+# I also want one clean timing table based on actual kernel counts
+
+The reported ~100 ms for `NS0+DMM2` still looks suspiciously high.
+
+If a sparse product is ~5–7 ms, I expect approximately:
+
+$$
+B=ZH: 1
+$$
+
+$$
+2\times\text{DMM}:6
+$$
+
+$$
+W:1
+$$
+
+giving
+
+$$
+8 \times 5\!-\!7 \approx40\!-\!56\ {\rm ms},
+$$
+
+plus perhaps ~10 ms geometry/CPU force work.
+
+So I'd expect something closer to
+
+$$
+50\!-\!70\ {\rm ms},
+$$
+
+not ~100 ms.
+
+The missing ~30–50 ms is probably certification / synchronization / residual evaluation.
+
+For a calibrated Tier-1 production Hessian there should be **none** of:
+
+```text
+measure_projector_state()
+rh_stationarity()
+trace gate
+energy evaluation
+host residual reads
+```
+
+on every displaced force.
+
+Those belong in the validation benchmark.
+
+Production Tier-1 should literally be:
+
+```text
+fixed predetermined arithmetic
+→ force
+```
+
+and nothing else.
+
+---
+
+## So I would tell the agent to do this next
+
+Not CG yet.
+
+Not more NS/DMM sweeps.
+
+Do three very stripped runs:
+
+| approximation  | actual response operations                                            |
+| -------------- | --------------------------------------------------------------------- |
+| **clamped DW** | frozen \(K_0,W_0,q_0\), 0 products                                    |
+| **linear1**    | central \(Z_0\), one perturbative H-response, ~4 products incl. force |
+| **DMM2-lite**  | central \(Z_0\), exactly 2 DMM steps, ~8 products incl. force         |
+
+No K0 seed.
+No NS.
+No metric transport.
+No McWeeny.
+No \(R_I/R_H\) measurements in the timed section.
+
+Evaluate the Hessian-column error afterward, outside the timing.
+
+And separately do:
+
+```text
+1 true Newton correction of Z
++ DMM2-lite
+```
+
+to measure whether Z correction actually improves DMM2.
+
+Crucially, have the profiler print **actual kernel counts**, not names such as `NS=1` or `NS=2`.
+
+---
+
+The most interesting possibility to me now is actually that the useful hierarchy becomes:
+
+$$
+\boxed{
+\begin{array}{ll}
+\text{clamped }(K,W) & \sim10\text{ ms, perhaps }\sim2\!-\!3\%\\
+\text{cheap linear response} & \sim30\!-\!50\text{ ms}\\
+\text{cold fixed-q} & \sim350\text{ ms}
+\end{array}}
+$$
+
+and the 100–175 ms iterative DMM middle ground disappears entirely.
+
+That would be a much more useful design.

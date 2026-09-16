@@ -2342,3 +2342,215 @@ f32: H/S/C/B/D/W/X storage, GEMM (4-acc FMA), Jacobi A/V updates, Rayleigh matve
 - **Stagnation detection got 8× slower:** `hist[b]` is sampled once per chunk end (rms in `rms_host` is only the LAST iteration of the chunk), so `samples>=8` needs ~64 iterations. Fix cheaply: `diis_step_batched` already writes `rms` every iteration — give it a `B×CHUNK` history buffer + slot arg so one chunk-end read restores per-iteration rms history. Same readback count.
 - **`n_iters`/`iters_used` is chunk-aligned** — a replica that converged on iter 2 of a chunk reports the chunk boundary. Report semantics only; if exact converged-iteration matters, status kernel can write the iter index alongside status.
 - Device-side stop inside a chunk is per-replica correct: nonfinite/diverged replica → `active=0` → `Failed` at chunk end; chunk-mates continue. Only a genuine readback failure fails the active set (fail-loud, correct).
+
+## 16. Dense-solver throughput work order — 2026-09-16 (post-20×20-benchmark, GPT-5.6 + SWE-2)
+
+Evidence: `doc/prokop/reports/2026-09-16_dense_gpu_pes_forces_benchmark.md`.
+Measured: N≈84–87 batch-400 gain G400 = 400·t1/t400 ≈ **84–92× ≈ SM count** —
+all speedup currently comes from ~one-WG-per-SM replication; per-matrix the
+GPU runs at roughly CPU speed (batch=1 ratio 0.7–0.95×). Warm Jacobi does
+**0 sweeps** in the common case yet `scc.jacobi` dominates device time
+(prologue + fused Fermi tail machinery). Direct cyclic Jacobi streams A/V
+from global: ~10 MB/replica/sweep at N=86, ~226 MB at N=246 → ~0.6 FLOP/B,
+bandwidth-bound. WG=512 was tuned on batch=1 latency; local footprint
+~13.3 KB/WG of which ~9.2 KB is **dead Fermi-tail scratch**.
+
+**Rules for this work order:** new solver built **alongside** the existing
+one (env/flag-selected, e.g. `RUST_DFTB_EIGSOLVER=block`), old path stays
+default until the new one is proven on correctness AND throughput. All §14
+invariants apply: no global atomics, no per-iteration host sync, no kernel
+builds/allocs inside solver loops, no physical matrix repacking, no silent
+CPU fallback, no one-launch-per-Jacobi-round. **Benchmark production batch
+(82–400 actives), never batch=1.** Correctness gates: frozen-H ε/CᵀSC/HC−SCε
+parity, E/q parity vs CPU f64, GC PT-scan ΔΔE ≤ 5e-5 Ha, bit-determinism.
+
+### 16.A Instrumentation first (cheap, gates everything below)
+
+- [ ] At plan build, query+print per kernel: `CL_KERNEL_LOCAL_MEM_SIZE`,
+  `CL_KERNEL_PRIVATE_MEM_SIZE` (register spill!), `CL_KERNEL_PREFERRED_WORK_GROUP_SIZE_MULTIPLE`,
+  device local-mem size, chosen WG. Residency is currently *inferred* from
+  wall time — make it measured.
+- [ ] `n_active(iter)` curve: record active count at each chunk boundary;
+  report `Σ n_active` (true work) and the tail population. Instrument
+  before attributing cost to "lockstep".
+- [ ] Histograms: Jacobi sweeps per launch {0,1,2+,cold} and Fermi Newton
+  iters (suspect 1–4 warm, not the 24 cap).
+- [ ] Benchmark hygiene: same 400 geometries on CPU sequential with
+  `OPENBLAS_NUM_THREADS=1` (measured: threading *hurts* — AZA 12.2→9.4 ms,
+  DTH 164→131 ms; 1-thread is the controlled baseline), record BLAS lib,
+  report SCC-only and SCC+eval separately.
+
+### 16.B Kernel slimming — low risk (second, with the new kernels)
+
+- [ ] **Split Fermi tail out of `jacobi_cyclic_global_batched`** → new
+  `fermi_post_batched` kernel, WG32/replica (subgroup/shuffle reduce;
+  5-stage reduce not 9). f32 logistic from f32 ε/kT, f64 accumulate for
+  Σf and Σf(1−f), warm-start μ, safeguarded bracket fallback, record Newton
+  iters, write occ_w/μ/occ mask — same outputs as today. Reclaims ~9.2 KB
+  local/WG + register pressure + 24-iteration WG-wide f64 reduce chain.
+  Rule learned: don't fuse kernels whose natural granularity differs 16×.
+- [ ] **WG ∝ N for the direct Jacobi:** `wg = ceil(N/32)·32` (N=86→96,
+  N=246→256) as the new default guess; then A/B WG ∈ {64,96,128,256,512}
+  at active counts {400,160,80,40,20,5,1} separately for 0-sweep and
+  forced-1-sweep matrices. Keep the number that wins throughput, not the
+  batch-1 number that produced 512.
+- [ ] **Kill hot-path host allocs:** `set_coords` must not rebuild
+  `scc_ok`; `scc_mix_inner` hist/stagnant/done/samples/q_in/q_out/res/q_f32
+  → persistent plan scratch. (§14 I3 violation, even if not the factor-10.)
+
+### 16.C Scheduler — logical compaction (third — harness built around the new kernels)
+
+- [ ] **`active_ids[batch]` + `n_active` persistent buffers.** Compact at
+  the *existing* chunk-end readback (no new sync): build prefix in
+  preallocated host scratch, upload 10–50 ints. All SCC kernels change
+  `get_group_id → sid` to `sid = active_ids[slot]` (1-WG/system: dim0;
+  GEMM: dim2; system×col: slot=gid/n). Launch with `n_active`, persistent
+  kernel handles, override global size at enqueue — no rebuilds. Keep the
+  device `active[]` flag inside a chunk (immediate park) — the two
+  mechanisms complement.
+- [ ] **Adaptive chunk size** by active fraction (e.g. >50%→8, 10–50%→4,
+  <10%→2) — compacts the tail sooner. Thresholds are A/B params.
+
+### 16.D New eigensolver — `jacobi_block_1wg` (IMPLEMENT FIRST — the kernels are the core, harness builds around them)
+
+One WG/replica, **one thread per row** (WG=ceil(N/32)·32: 96 @N=86,
+256 @N=246), **serial block Jacobi inside the WG** (NOT multi-WG, NOT the
+old one-WG tiled kernel's 16k barriers, NOT 4-replicas-per-WG packing —
+rejected: kills independent completion + needs subgroup barriers).
+**General for ALL N, including N≤64**: small systems use the same kernel
+(fewer/no block pairs; N≤2B degenerates to a pure local solve) — less
+local memory per WG = more resident replicas/CU is the whole point.
+
+- [ ] Kernel skeleton (`gpu_block_jacobi.cl`):
+  ```
+  sid = active_ids[group_id(0)];  row = local_id;  (row<n guards)
+  probe pass: row-wise ‖A‖_F / ‖offdiag‖ partials → serial reduce by
+      thread 0 (86 floats — NOT a 9-level tree) → if converged: return
+  for sweep in 0..MAX:
+      for bp<bq over nb=ceil(N/B) block pairs (serial, ~15 @N=86,B=16):
+          gather 2B×2B compound pivot → local P; U←I (cooperative load)
+          local Brent–Luk eigensolve P,U (reuse inner machinery; M=32)
+          rows outside pivot: x[2B] regs ← A[row,idx]; A[row,idx]←x·U;
+              symmetric write A[idx,row]; V[row,idx]←x·U — one stream pass
+          pivot rows ← local P
+          barrier(local|global) per pair
+      convergence norm once per block sweep; early-out
+  ```
+- [ ] Local memory = **only** P+U (+rot tables + row partials): B=16 →
+  ~8.4 KB/WG; B=24 → ~18.8 KB; B=32 → ~33 KB (reference point showing the
+  occupancy sacrifice). Row strips stay in **registers** (x[32], unrolled
+  loops so they don't spill); rest of A/V streamed — trust L1/L2 for the
+  ambiguous reuse (each lane reuses its 64 B row fragments ~2B times).
+- [ ] Warm fast path = the probe: the common SCC iteration must cost ~one
+  N² read (~30 KB), nothing else. Fermi is the separate 16.B kernel.
+- [ ] A/B: B∈{16,24} × N∈{86,246} × active∈{400,20}; also vs old solver
+  same matrices. Report per-sweep time, sweeps-to-converge (block sweeps
+  are heavier — check sweep count vs scalar), residency (16.A queries).
+- [ ] Correctness: off-norm exit, stagnation/backstop, non-finite diag,
+  N≤256 cap; frozen-H parity + E/q parity + scan ΔΔE gates.
+
+### 16.D0 Concrete implementation decisions (2026-09-16, kernels-first order)
+
+- [*] `src/qmqm/gpu_block_jacobi.cl` — new file. Kernel `block_jacobi_1wg`:
+  `args = (A[batch][n*n], V[batch][n*n], n, batch, init_v, active, diag[batch][4], eig[batch][n])`.
+  Signature differs from the old kernel — no Fermi args (tail removed).
+- [*] Render-time defines: `B` (default 16), `PB=2B`, `PLD=PB+1`, `WG=ceil(n/32)*32`,
+  `MAX_SWEEPS`, `JACOBI_OFF_TOL`, `PAIR_SKIP_REL`, `INNER_MAX`, `INNER_TOL`.
+- [*] Probe first: row-partial frob/off → tree reduce → `off<=tol*frob` → write
+  diag{off,rel,0,0} + eig, return. The common warm iteration = one N² read.
+- [*] Pivot padded to full PB=32 (dummy rows: P[i][i]=1e30, off=0, U=I) →
+  all inner loops fixed-trip-count, unrollable, `x[32]` stays in registers.
+- [*] Inner pivot solve = Brent–Luk cyclic Jacobi on P/U in local, same
+  rotation math as `jacobi_cyclic_local_batched`; early-out on relative
+  off-norm, cap INNER_MAX.
+- [*] Writeback: thread r<n owns row r. Pivot rows: A[r][piv]=P row.
+  External rows: load x=A[r][piv] (2 contiguous segments), per j compute
+  acc=Σx[i]U[i][j] and write A[r][piv_j] + mirrored A[piv_j][r] — x[32]
+  only, no second register block. All rows (incl. pivot): same for V.
+- [*] n≤32 special case: single block → whole matrix is the pivot →
+  pure local solve, U→V. n≤64 uses the same kernel (2–4 pairs) — one
+  unified solver for ALL N.
+- [*] Host: `render_block_source(b,wg)` + `block_jacobi_batched()` (standalone,
+  mirrors `direct_jacobi_batched` contract, returns diag) in gpu_eigen.rs.
+- [*] Plan integration behind `RUST_DFTB_EIGSOLVER=block` (default direct —
+  old solver untouched): build `k_bjacobi` (hp→cp, init_v=0),
+  `k_bjacobi_warm` (hp→c, init_v=1), `k_bjacobi_s` (s_work→s_v, ones).
+  Kernel writes eig_diag itself → skip extract_diag; `occupation()` runs
+  the existing standalone `k_fermi_occ` (W5 bisection) for smeared path.
+  check_jacobi/report_jacobi get diag for ALL N in block mode.
+- [ ] Follow-up (not first cut): WG32 Newton `fermi_post_batched` with warm
+  μ to replace the 40-iter bisection; then WG/B A/B sweep at batch=400.
+
+### 16.E Deferred — only if measured necessary
+
+- [ ] Multi-WG block Jacobi (pivot kernel + transform kernels + kernel-
+  boundary sync): only if N≈246 still too slow OR n_active<82 tails
+  dominate wall time after 16.C.
+- [ ] Streaming slot pool: finished scan slot ← next pending geometry
+  (keeps GPU full across a whole 2D scan; also shrinks memory footprint if
+  C_sat < batch). Later: async per-slot state machine for relaxed scans.
+- [ ] A-local/V-global probe (N≤96, ~30 KB) — diagnostic only, tests the
+  memory-traffic hypothesis; do NOT make it a third permanent solver.
+- [ ] cuSOLVER `syevjBatched` one-off benchmark — external ceiling check
+  only, no production dependency.
+
+### 16.F First measurements (2026-09-16, `test_block_vs_direct_jacobi_bench` + scan400 A/B)
+
+- [*] Kernel correctness: `test_block_jacobi_eigen_quality` green for
+  n ∈ {6,16,31,32,33,48,64,65,86,87,96,128,246,256} + adversarial
+  (clustered/repeated/zero-block/all-zero/exact-diagonal). res ~3e-6,
+  orth ~2e-7, eig parity within Weyl bound. Bug found+fixed: inner-solve
+  exit norm must exclude the 1e30 pad diagonals.
+- [*] Standalone A/B (`tests/gpu_tiled_jacobi.rs::test_block_vs_direct_jacobi_bench`,
+  3-rep wall-clock, upload included both sides):
+  n=246 batch=400: cold 1476→592 ms (**2.50×**), one-sweep 772→240 (**3.22×**);
+  n=86 batch=400: cold 0.89×, one 1.15× — wash at N≈85 saturated;
+  n=86 batch≤80: block 0.2× (serial inner-solve barriers — latency-bound
+  per replica; irrelevant at saturation but keep in mind for tails);
+  warm probe: block ~3× slower per launch (0.13 vs 0.04 ms @400 — fat
+  kernel body costs regs/local even on early-out; trim later).
+- [*] Production A/B (`test_gpu_scc_scan400_benchmark`, batch=400,
+  `RUST_DFTB_EIGSOLVER=block`, same 400 geometries):
+  **DTH N=246: 7719→2643 ms/solve (2.9×), 52→151 sys/s, 8.5→21.2× vs CPU**
+  — the memory-traffic hypothesis confirmed. azaindol N=84: 218→200 ms
+  (ms/iter 3.9→2.78 but iters 56→72 — convergence trajectory differs).
+  GC N=86: 434→504 ms — 2 marginal far-corner replicas hit iter cap
+  (failed=2; the same corner was marginal under direct). GC batch=100
+  also failed=1 → block mode convergence on the hardest scan corner is
+  slightly weaker than direct — investigate before considering default.
+- [ ] GC/PT-scan f64 parity in block mode (`test_gc_ptscan_pes_forces_vs_cpu`
+  with `RUST_DFTB_EIGSOLVER=block`) — BLOCKED on/off by the user's
+  in-progress sparse_dftb.rs edits; rerun whenever the lib compiles.
+- [~] Kernel resource query: done via pyopencl (lib-independent). Local/WG:
+  direct-WG512 = 13.0 KB, block = 8.9–9.5 KB → local ceiling 3 vs 5 WGs/SM.
+  NVIDIA driver does NOT report PRIVATE_MEM_SIZE (0) and reports
+  WORK_GROUP_SIZE=256 even for the WG=512 build (launch at 512 demonstrably
+  works — driver report unreliable). **Registers are the likely real
+  residency limiter — needs `ncu` on a real launch** (ncu is installed).
+- [ ] B=24 / WG A/B variants; `n_active` compaction (§16.C) still open.
+
+### 16.G First per-stage device-time profile (`RUST_DFTB_PROF=evt`, 2026-09-16 pm)
+
+Full tables + analysis in
+`reports/2026-09-16_dense_gpu_pes_forces_benchmark.md` Part 3. Headline
+findings that REVISE the 16.A–16.E plan:
+
+- [ ] **Production Jacobi does real sweeps every iteration** — 3.13 ms/call
+  (direct) / 4.48 (block) at n=86 vs 0.04/0.13 ms pure probe. The "warm =
+  ~0 sweeps" assumption does NOT hold on 2D-scan workloads; the charge
+  update re-excites off-diagonals above JACOBI_OFF_TOL each step.
+- [ ] **Block Jacobi is SLOWER per call at n=86** (4.48 vs 3.13 ms) —
+  latency-bound per-WG serial inner solves, not bandwidth, not occupancy.
+- [ ] **Post-block at n=246 the supporting O(N³) kernels are ~48% of dev
+  time and are memory-streamers, not GEMMs:** `build_density_occ` (Fermi →
+  rank-N outer product, ~12 GB/call, 30 ms) + `snormalize_batched` (per-column
+  GEMV streaming full S per column, ~24 GB/call, 21 ms). Both should be
+  ~10× faster as tiled GEMMs (H-A) — the next target, bigger than further
+  Jacobi work at N=246.
+- [ ] **Roofline check for ≥100×:** needs ≤0.6 ms/iter at n=86; zero-cost
+  eigensolver alone leaves ~0.9 ms/iter of supporting work → ~70× ceiling.
+  100× requires eigensolver≈free AND GEMM-class density/snorm AND tail
+  compaction (see report Part 3 hypotheses H-A…H-G).
+- [ ] Algorithmic option to discuss (H-C): the warm iteration needs the
+  *projector response*, not eigenpairs — first-order ΔD or NS/Chebyshev
+  projector step in the near-diagonal basis; μ from Tr(DS)=N_e.

@@ -2046,15 +2046,40 @@ impl SparseSystemWorkspace {
     /// a warm-seed Err propagates (silent re-solve hid wrong-subspace
     /// states — measured R_H=1.4e-2, E_tot off 0.13 Ha).
     pub fn purify_hscc_warm(&mut self, tc2_max: usize, tc2_tol: f32) -> Result<(PurifyStatus, f32, f64, usize)> {
-        // B = Z·H_scc on M_TZS — same product as in compute_k0_impl.
-        match &self.plan_zh {
-            Some(plan) => self.gpu.spgemm_plan_bsym_dev(&self.z, &self.h_scc, plan, &self.b_zh)?,
-            None => self.gpu.spgemm_bsym_dev(&self.z, &self.h_scc, &self.b_zh)?,
-        }
+        self.refresh_b_zh()?;
         self.gpu.prof_tick("scc.k0");
         let r = self.tc2_purify(tc2_max, tc2_tol, 1);
         self.gpu.prof_tick("scc.tc2");
         r
+    }
+
+    /// Refresh `b_zh = Z·H_scc` on M_TZS — one SpGEMM (plan_zh).
+    /// Mandatory after `build_hscc_from_v` whenever the caller skips the
+    /// K0 build: `forces()`'s W=2(ZH)K path and `dmm_descend`'s X=(ZH)K
+    /// both consume b_zh, so a stale buffer silently injects the
+    /// PREVIOUS geometry's ZH (frozen-mode bug, GPT-5.6 chat §1).
+    pub fn refresh_b_zh(&mut self) -> Result<()> {
+        match &self.plan_zh {
+            Some(plan) => self.gpu.spgemm_plan_bsym_dev(&self.z, &self.h_scc, plan, &self.b_zh)?,
+            None => self.gpu.spgemm_bsym_dev(&self.z, &self.h_scc, &self.b_zh)?,
+        }
+        Ok(())
+    }
+
+    /// First-order metric transport (GPT-5.6 tier-1 seed): the overlap
+    /// changed S₀→S₁ under the displacement; the projector's first-order
+    /// correction is  K ← 2K − K·S₁·K  (= K − K·δS·K + O(δS²)). Two
+    /// planned products: T=K·S (plan_ks), Q=T·K (plan_tk); K ← 2K − Q.
+    pub fn metric_transport(&mut self) -> Result<()> {
+        if self.plan_ks.is_none() || self.plan_tk.is_none() {
+            return Err(DftbError::InvalidInput("metric_transport: plan_ks/plan_tk missing".into()));
+        }
+        self.gpu.spgemm_plan_bsym_dev(&self.k, &self.s, self.plan_ks.as_ref().unwrap(), &self.t_ks)?;
+        self.gpu.spgemm_plan_bsym_dev(&self.t_ks, &self.k, self.plan_tk.as_ref().unwrap(), &self.q)?;
+        let nb = self.k_struct.nblock;
+        self.gpu.axpby_dev(nb, 2.0, &self.k.values, -1.0, &self.q.values, &self.k.values)?;
+        self.t_ks_valid = false;
+        Ok(())
     }
 
     /// DIAGNOSTIC (frozen-input experiments): upload host K values on the
@@ -2112,22 +2137,20 @@ impl SparseSystemWorkspace {
         Ok(())
     }
 
-    /// Fully-planned McWeeny (DMM retraction path): same map
-    /// K ← 3KSK − 2KSKSK but every product on symbolic plans —
-    /// U = Q·S rides plan_ks (M_K×M_HS→M_TKS, U kept on M_TKS rather
-    /// than truncated to M_K — strictly more accurate) and V = U·K
-    /// rides plan_tk. Buffers: t_ks=T then U; q=Q; a_zhz=V.
-    /// Clobbers t_ks/q/a_zhz — callers holding A=a_zhz must rebuild.
+    /// Fully-planned McWeeny (DMM retraction path): K ← 3KSK − 2KSKSK,
+    /// **3 products**: T=K·S (plan_ks), Q=T·K (plan_tk), V=T·Q (plan_tk —
+    /// V=(KS)(KSK)=KSKSK, same identity as the FF VTQ path). Buffers:
+    /// t_ks=T, q=Q, a_zhz=V. Clobbers t_ks/q/a_zhz — callers holding
+    /// A=a_zhz must rebuild.
     pub fn mcweeny_polish_planned(&mut self, n_iters: usize) -> Result<()> {
         if self.plan_ks.is_none() || self.plan_tk.is_none() {
             return Err(DftbError::InvalidInput(
                 "mcweeny_polish_planned: plan_ks/plan_tk missing".into()));
         }
         for _ in 0..n_iters {
-            self.gpu.spgemm_plan_bsym_dev(&self.k, &self.s, self.plan_ks.as_ref().unwrap(), &self.t_ks)?;   // T = K·S
-            self.gpu.spgemm_plan_bsym_dev(&self.t_ks, &self.k, self.plan_tk.as_ref().unwrap(), &self.q)?;   // Q = T·K
-            self.gpu.spgemm_plan_bsym_dev(&self.q, &self.s, self.plan_ks.as_ref().unwrap(), &self.t_ks)?;   // U = Q·S
-            self.gpu.spgemm_plan_bsym_dev(&self.t_ks, &self.k, self.plan_tk.as_ref().unwrap(), &self.a_zhz)?; // V = U·K
+            self.gpu.spgemm_plan_bsym_dev(&self.k, &self.s, self.plan_ks.as_ref().unwrap(), &self.t_ks)?;    // T = K·S
+            self.gpu.spgemm_plan_bsym_dev(&self.t_ks, &self.k, self.plan_tk.as_ref().unwrap(), &self.q)?;    // Q = T·K = KSK
+            self.gpu.spgemm_plan_bsym_dev(&self.t_ks, &self.q, self.plan_tk.as_ref().unwrap(), &self.a_zhz)?; // V = T·Q = KSKSK
             self.gpu.mcweeny(self.k_struct.nblock, &self.q.values, &self.a_zhz.values, &self.k.values)?;
         }
         self.gpu.symmetrize_dev(self.k_struct.nblock, &self.k_struct.transpose_block(), &self.k.values)?;
@@ -2144,6 +2167,7 @@ impl SparseSystemWorkspace {
             return Err(DftbError::InvalidInput("measure_projector_state: plan_ks/plan_tk missing".into()));
         }
         self.gpu.spgemm_plan_bsym_dev(&self.k, &self.s, self.plan_ks.as_ref().unwrap(), &self.t_ks)?;
+        self.t_ks_valid = true;   // t_ks = K·S for the CURRENT K — rh_stationarity reuses it
         self.gpu.spgemm_plan_bsym_dev(&self.t_ks, &self.k, self.plan_tk.as_ref().unwrap(), &self.q)?;
         let tr = self.gpu.trace_ks_f64(&self.t_ks_struct, &self.t_ks.values, &self.n_orb_buf, &self.trace_atom, &mut self.trace_atom_host)?;
         self.gpu.idempotency_partial_dev(self.k_struct.nblock, &self.q.values, &self.k.values, &self.reduce_partial)?;
@@ -2204,6 +2228,11 @@ impl SparseSystemWorkspace {
             self.gpu.symmetrize_dev(nb, &self.k_struct.transpose_block(), &self.knew.values)?;             // knew = (X+Xᵀ)/2
             self.gpu.axpby_dev(nb, 2.0, &self.knew.values, -2.0, &self.q.values, &self.knew.values)?;      // knew = X+Xᵀ−2Y
             self.gpu.axpby_dev(nb, 1.0, &self.k.values, step, &self.knew.values, &self.k.values)?;
+            // Y=KHK is symmetric analytically — the asymmetry in Y is
+            // pure truncation noise; without this K drifts asymmetric
+            // and R_H inflates (measured: 1.9e-4→6.4e-4 over 4 steps,
+            // recovered to 2.3e-4 by the final symmetrize).
+            self.gpu.symmetrize_dev(nb, &self.k_struct.transpose_block(), &self.k.values)?;
             if verbose {
                 let g2 = self.gpu.frob_sq_to_f64(nb * BS2, &self.knew.values,
                     &self.reduce_partial, &self.reduce_a, &self.reduce_b,
@@ -2227,6 +2256,54 @@ impl SparseSystemWorkspace {
         }
         self.t_ks_valid = false;
         self.gpu.prof_tick("dmm");
+        Ok(())
+    }
+
+    /// Snapshot central P₀ = K·S (M_TKS) and X₀ = (Z·H)·K (M_K) for the
+    /// linear1 tier — call with the converged central K on device and
+    /// b_zh = Z·H_scc fresh at the central geometry. Two products, once
+    /// per Hessian.
+    pub fn snapshot_p0_x0(&mut self) -> Result<(Vec<f32>, Vec<f32>)> {
+        if self.plan_ks.is_none() || self.plan_fk.is_none() {
+            return Err(DftbError::InvalidInput("snapshot_p0_x0: plan_ks/plan_fk missing".into()));
+        }
+        self.gpu.spgemm_plan_bsym_dev(&self.k, &self.s, self.plan_ks.as_ref().unwrap(), &self.t_ks)?;
+        let mut p0 = vec![0.0f32; self.t_ks_struct.nblock * BS2];
+        self.gpu.read_f32(&self.t_ks.values, &mut p0)?;
+        self.gpu.spgemm_plan_bsym_dev(&self.b_zh, &self.k, self.plan_fk.as_ref().unwrap(), &self.z_on_k)?;
+        let mut x0 = vec![0.0f32; self.k_struct.nblock * BS2];
+        self.gpu.read_f32(&self.z_on_k.values, &mut x0)?;
+        Ok((p0, x0))
+    }
+
+    /// GPT-5.6 "linear1": ONE perturbative H-response step on the
+    /// CENTRAL metric — 3 products/eval (the 4th is the force W built
+    /// by forces()). Caller has restored K=K₀, kept Z=Z₀ and refreshed
+    /// b_zh = Z₀·H₁.
+    ///   X = B₁·K₀ − X₀ = (δB)·K₀     (plan_fk, X₀ uploaded to `knew`)
+    ///   Y = P₀·X    (P₀ = K₀S₀ central, uploaded to `t_ks`; plan_tk_g —
+    ///              X is asymmetric, bsym would compute P₀·Xᵀ)
+    ///   K ← K₀ − η·(X + Xᵀ − 2Y)
+    /// Working on δB directly avoids the X+Xᵀ≈2Y cancellation of the
+    /// full nonlinear gradient at a nearly-stationary point. No NS, no
+    /// retraction, no residual gates — calibrated production tier.
+    pub fn linear_response(&mut self, eta: f32, x0: &[f32], p0: &[f32]) -> Result<()> {
+        if self.plan_fk.is_none() || self.plan_tk_g.is_none() {
+            return Err(DftbError::InvalidInput(
+                "linear_response: plan_fk/plan_tk_g missing (RUST_DFTB_SPARSE_PLANS=0?)".into()));
+        }
+        let nb = self.k_struct.nblock;
+        self.gpu.spgemm_plan_bsym_dev(&self.b_zh, &self.k, self.plan_fk.as_ref().unwrap(), &self.z_on_k)?;  // X₁ = B₁·K₀
+        self.knew.upload_values(&self.gpu, x0)?;
+        self.gpu.axpby_dev(nb, 1.0, &self.z_on_k.values, -1.0, &self.knew.values, &self.z_on_k.values)?;    // X = X₁ − X₀
+        self.t_ks.upload_values(&self.gpu, p0)?;
+        self.gpu.spgemm_plan_dev(&self.t_ks, &self.z_on_k, self.plan_tk_g.as_ref().unwrap(), &self.q)?;     // Y = P₀·X
+        self.gpu.axpby_dev(nb, 1.0, &self.z_on_k.values, 0.0, &self.knew.values, &self.knew.values)?;       // knew = X
+        self.gpu.symmetrize_dev(nb, &self.k_struct.transpose_block(), &self.knew.values)?;                  // (X+Xᵀ)/2
+        self.gpu.axpby_dev(nb, 2.0, &self.knew.values, -2.0, &self.q.values, &self.knew.values)?;           // G = X+Xᵀ−2Y
+        self.gpu.axpby_dev(nb, 1.0, &self.k.values, -eta, &self.knew.values, &self.k.values)?;              // K ← K₀ − ηG
+        self.gpu.symmetrize_dev(nb, &self.k_struct.transpose_block(), &self.k.values)?;
+        self.t_ks_valid = false;
         Ok(())
     }
 

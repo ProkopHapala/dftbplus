@@ -262,6 +262,15 @@ pub struct GpuSccPlan {
     /// no X·C′ back-GEMM, ~1-2 sweeps instead of a cold solve.
     b_warm: bool,
 
+    /// Manifest §16.D: `RUST_DFTB_EIGSOLVER=block` selects the new
+    /// `block_jacobi_1wg` eigensolver (one WG/system, one thread per row,
+    /// pivot+U in local, eig_diag written in-kernel). The direct kernel
+    /// stays default. In block mode: no extract_diag launch; occupation
+    /// uses the standalone fermi_occ_batched (the fused tail is gone).
+    block_mode: bool,
+    k_bjacobi: Option<Kernel>,        // block jacobi, cold: a=hp v=cp init_v=0
+    k_bjacobi_warm: Option<Kernel>,   // block jacobi, warm: a=hp v=c init_v=1
+
     // S^{-1/2} kernels — built once; set_geometry only copies S and enqueues.
     k_s_jacobi: Kernel,
     k_s_invsqrt: Option<Kernel>,      // N≤64: build_inv_sqrt_from_eig
@@ -429,6 +438,24 @@ impl GpuSccPlan {
         let k_jacobi_warm = if n > 64 {
             Some(build_jacobi_kernel(rt, n, batch, &hp, &c, &active, jacobi_prec, &jacobi_diag, 1, &occ_w, &mu_out)?)
         } else { None };
+
+        // §16.D: block-Jacobi path — `RUST_DFTB_EIGSOLVER=block` selects
+        // `block_jacobi_1wg` (one WG/system, one thread per row, pivot+U in
+        // local, eig_diag written in-kernel). The direct kernel above is
+        // still built and stays the default — A/B on identical inputs.
+        let block_mode = std::env::var("RUST_DFTB_EIGSOLVER")
+            .map(|v| v == "block").unwrap_or(false);
+        let (k_bjacobi, k_bjacobi_warm) = if block_mode {
+            if n > 256 {
+                return Err(DftbError::InvalidInput(format!(
+                    "block_jacobi_1wg: n={n} exceeds capacity 256"
+                )));
+            }
+            (Some(crate::qmqm::gpu_eigen::build_block_jacobi_kernel(
+                rt, n, batch, &hp, &cp, &active, &jacobi_diag, &eig_diag, 0)?),
+             Some(crate::qmqm::gpu_eigen::build_block_jacobi_kernel(
+                rt, n, batch, &hp, &c, &active, &jacobi_diag, &eig_diag, 1)?))
+        } else { (None, None) };
 
         // 8. extract_diagonal_batched: args [0]=n, [1]=batch, [2]=a, [3]=diag
         let total_diag = n * batch;
@@ -652,7 +679,12 @@ impl GpuSccPlan {
             .arg_local::<f64>(wg_ered)
             .build().map_err(map_ocl_err)?;
 
-        let k_s_jacobi = build_jacobi_kernel(rt, n, batch, &s_work, &s_v, &ones, jacobi_prec, &jacobi_diag, 0, &occ_w, &mu_out)?;
+        let k_s_jacobi = if block_mode {
+            crate::qmqm::gpu_eigen::build_block_jacobi_kernel(
+                rt, n, batch, &s_work, &s_v, &ones, &jacobi_diag, &eig_diag, 0)?
+        } else {
+            build_jacobi_kernel(rt, n, batch, &s_work, &s_v, &ones, jacobi_prec, &jacobi_diag, 0, &occ_w, &mu_out)?
+        };
         let (k_s_invsqrt, k_s_scale, k_s_xgemm) = build_sinv_kernels(
             rt, &mat_prog, n, batch, &s_work, &s_v, &s_v_scaled, &x_buf, &lambda_min,
         )?;
@@ -728,7 +760,7 @@ impl GpuSccPlan {
             lowdin_e1_host: vec![0.0; batch],
             k_dq_v_hscc,
             k_matmul_xh, k_matmul_tx, k_matmul_xc, k_matmul_xh_warm, k_matmul_tx_warm, k_transpose,
-            k_jacobi, k_jacobi_warm, k_extract_diag, k_select_occ, k_fermi_occ, k_density, k_edm, k_occ_renorm, k_occ_snorm, k_occ_rayleigh, k_mulliken, k_residual_mix,
+            k_jacobi, k_jacobi_warm, k_bjacobi, k_bjacobi_warm, k_extract_diag, k_select_occ, k_fermi_occ, k_density, k_edm, k_occ_renorm, k_occ_snorm, k_occ_rayleigh, k_mulliken, k_residual_mix,
             k_diis, k_commit, k_frobenius_trace, k_dot, k_dot_q0,
             matmul_buf_base,
             n_occ: 0,
@@ -737,6 +769,7 @@ impl GpuSccPlan {
             occ_w_host: vec![0.0; batch * n],
             occ_repair: true,
             occ_repair_scc: true,
+            block_mode,
             x_warm: false,
             x_reuse: true,
             b_warm: false,
@@ -831,8 +864,13 @@ impl GpuSccPlan {
                 .ok_or_else(|| DftbError::InvalidInput("warm GEMM handle missing for n>64".into()))?;
             let k_tx = self.k_matmul_tx_warm.as_ref()
                 .ok_or_else(|| DftbError::InvalidInput("warm GEMM handle missing for n>64".into()))?;
-            let k_j = self.k_jacobi_warm.as_ref()
-                .ok_or_else(|| DftbError::InvalidInput("warm Jacobi handle missing for n>64".into()))?;
+            let k_j = if self.block_mode {
+                self.k_bjacobi_warm.as_ref()
+                    .ok_or_else(|| DftbError::InvalidInput("warm block-Jacobi handle missing".into()))?
+            } else {
+                self.k_jacobi_warm.as_ref()
+                    .ok_or_else(|| DftbError::InvalidInput("warm Jacobi handle missing for n>64".into()))?
+            };
             unsafe { k_xh.enq().map_err(map_ocl_err)?; }   // temp = cᵀ·H_scc
             rt.prof_tick("scc.gemm_th");
             unsafe { k_tx.enq().map_err(map_ocl_err)?; }   // hp = temp·c
@@ -848,15 +886,20 @@ impl GpuSccPlan {
             rt.prof_tick("scc.gemm_th");
             unsafe { self.k_matmul_tx.enq().map_err(map_ocl_err)?; }   // hp = temp·X
             rt.prof_tick("scc.gemm_th2");
-            unsafe { self.k_jacobi.enq().map_err(map_ocl_err)?; }      // V=I → cp
+            let k_j = if self.block_mode {
+                self.k_bjacobi.as_ref()
+                    .ok_or_else(|| DftbError::InvalidInput("block-Jacobi handle missing".into()))?
+            } else { &self.k_jacobi };
+            unsafe { k_j.enq().map_err(map_ocl_err)?; }              // V=I → cp
             rt.prof_tick("scc.jacobi");
             // W1: deferred to check_jacobi() at solve end (see above).
         }
         // R5: eig_diag needed only by select_occ (integer occ), the
         // fermi_ref fallback, or the finalize/eval readback — skip the
         // launch on the production smeared path (occ_w comes from the
-        // Jacobi tail).
-        if want_eig || self.kT <= 0.0 || self.fermi_ref {
+        // Jacobi tail). Block mode: block_jacobi_1wg writes eig_diag
+        // itself — never launch extract_diag.
+        if !self.block_mode && (want_eig || self.kT <= 0.0 || self.fermi_ref) {
             unsafe { self.k_extract_diag.enq().map_err(map_ocl_err)?; }
         }
         rt.prof_tick("scc.extract_diag");
@@ -1243,9 +1286,11 @@ impl GpuSccPlan {
     /// tail already wrote occ_w+mu (R5). `fermi_ref` reverts to the W5
     /// standalone kernel + integer mask for A/B.
     fn occupation(&mut self, rt: &mut GpuRuntime) -> Result<()> {
-        if self.kT > 0.0 && !self.fermi_ref && self.n > 64 {
+        if self.kT > 0.0 && !self.fermi_ref && self.n > 64 && !self.block_mode {
             return Ok(());   // R5: Jacobi tail wrote occ_w+mu on device
         }
+        // Block mode (§16.D): no fused tail — block_jacobi_1wg wrote
+        // eig_diag; the standalone W5 kernels produce occ_mask + occ_w+mu.
         unsafe { self.k_select_occ.enq().map_err(map_ocl_err)?; }
         rt.prof_tick("scc.select_occ");
         if self.kT <= 0.0 { return Ok(()); }
@@ -1526,7 +1571,7 @@ impl GpuSccPlan {
     /// Non-certified replicas are reported as Failed by the caller.
     pub fn check_jacobi(&mut self, rt: &GpuRuntime, ran: &[i32]) -> Result<Vec<bool>> {
         let mut ok = vec![true; self.batch];
-        if self.n <= 64 { return Ok(ok); }   // full-local kernel has no diag
+        if self.n <= 64 && !self.block_mode { return Ok(ok); }   // full-local kernel has no diag
         rt.read_buffer(&self.jacobi_diag, &mut self.jacobi_diag_h)?;
         // R8b: env-gated sweep/stop distribution report (diagnostic only).
         if std::env::var_os("RUST_DFTB_JACOBI_REPORT").is_some() {
@@ -1581,7 +1626,7 @@ impl GpuSccPlan {
     }
 
     fn report_jacobi_impl(&mut self, rt: &GpuRuntime, tag: &str, all: bool) -> Result<()> {
-        if self.n <= 64 { return Ok(()); }   // full-local kernel has no diag arg
+        if self.n <= 64 && !self.block_mode { return Ok(()); }   // full-local kernel has no diag arg
         rt.read_buffer(&self.jacobi_diag, &mut self.jacobi_diag_h)?;
         for b in 0..self.batch {
             if !all && self.active_host[b] == 0 { continue; }

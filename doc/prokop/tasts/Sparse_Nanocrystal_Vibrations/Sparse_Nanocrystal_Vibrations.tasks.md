@@ -1014,9 +1014,10 @@ below converge on the same mode ladder.
 
 - [x] Per-phase profile: set_coords 5 ms / scc 3.4–7.3 s / forces 7 ms
   (`scripts/bench_eval_r10.rhai`, `RUST_DFTB_PROF=mark`).
-- [x] `forces_frozen()` + `RUST_DFTB_VIB_FROZEN` (mode A): 12 ms/eval,
-  R10 Hessian 23 s. Framework modes good, stretches ~240 cm⁻¹ soft →
-  preview only.
+- [x] `forces_frozen()` + `RUST_DFTB_VIB_FROZEN` (mode A): now the
+  explicit clamped-electron freeze (`D₀,W₀,q₀` snapshot, 0 device
+  products) — 5.5 ms/eval, ~6.3% column error on R10 (h-independent).
+  Framework modes good, stretches ~240 cm⁻¹ soft → preview/screening.
 - [x] `purify_hscc_warm()` + `RUST_DFTB_WARM_K` (naive TC2 seed):
   **refuted** — repelling fixed point, r_I doubles per eval.
 
@@ -1038,7 +1039,7 @@ below converge on the same mode ladder.
   dominant physics).
 - [x] R10 per-eval ~0.36 s at tol 5e-5 → Hessian ≈ 12 min.
 
-### G3 — mode C: warm DM update — attempt #1 REFUTED, needs DMM
+### G3 — mode C: warm DM update — SOLVED via DMM commutator descent
 
 - [x] δK0 seed + McWeeny polish + TC2 (`RUST_DFTB_VIB_DMUPD`,
   `k_seed_shift`, `mcweeny_polish`): converges in ~7 iters BUT to a
@@ -1093,6 +1094,19 @@ below converge on the same mode ladder.
   η=10/4steps and ret=3 both fail LOUDLY (dummy-lane gate) —
   the tuned defaults have real margin. Defaults: DMM=6, ETA=8,
   RET=2, MCPOL=0, TC2MAX=0 (all env-overridable).
+- [x] Stripped tiers + frozen-orbital correction (2026-09-16, report
+  §15.17): the "stale b_zh" was the CORRECT clamped-electron
+  approximation — `W=W₀` explicitly snapshotted now; `forces_frozen`
+  is 0-product pure-CPU (**5.5 ms @ 6.3% col err**, h-independent).
+  New `VIB_LITE`/`VIB_LINEAR` strip ALL per-eval residual gates
+  (~40% of warm-eval cost was certification). **Final measured
+  ladder (h=0.02):** clamped 5.5 ms/6.3% → 1-Newton+DMM2-lite
+  **64 ms/3.1%** → 1-Newton+DMM4-lite **105 ms/1.0%** → cold 345 ms.
+  Z accuracy is the discriminator (central Z caps at ~6%; one Newton
+  update R_Z→1.4e-5 unlocks <6%). Refuted by measurement: linear1
+  (6.7% ≈ frozen at 6× cost), metric transport alone (99%), McWeeny
+  retractions in lite mode (hurt — H-blind). Next lever:
+  batch-parallel ±h columns.
 
 ### G4 — iteration-count discipline — partially done
 
@@ -1190,8 +1204,12 @@ accumulation. Harness: `tc2_conv_study.rhai` + `plot_tc2_convergence.py`
 - [x] Mixed-precision endgame design: DECIDED by A/B — f32 storage +
   f64 products suffices for ~1e-8 (all-f64 only below that); see
   MIXED-POLISH above.
-- [ ] LNV/commutator descent — still needed for G3 warm-DM
-  (subspace rotation), not for this floor.
+- [x] LNV/commutator descent — DONE for G3 warm-DM (`dmm_descend`,
+  see §G3 above); lite tiers measured: 1-Newton+DMM2 64 ms/3.1%,
+  +DMM4 105 ms/1.0% (h=0.02). Metric transport refuted (99% alone).
+  Next lever: batch-parallel ±h columns; untested: ±h antisymmetric
+  sharing (`K(−h)≈2K₀−K(+h)`), CG/BB on the manifold — GPT-5.6 in
+  chat ~line 12800/13400.
 - [ ] Accept floor ~5e-6 measured (1.4e-5 true, all physical) for now —
   physics cost already bounded: fixq-vs-SCC rms 6 cm⁻¹.
 

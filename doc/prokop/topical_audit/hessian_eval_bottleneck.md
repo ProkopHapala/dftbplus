@@ -69,16 +69,22 @@ Yet per eval:
 
 ## 3. Experiments run (both measured, code in tree, env-gated)
 
-### 3a. Frozen-density forces — `RUST_DFTB_VIB_FROZEN=1` ✅ works
+### 3a. Frozen-orbital (clamped-electron) forces — `RUST_DFTB_VIB_FROZEN=1` ✅ works
 
-`SparseDftb::forces_frozen()` (`sparse_dftb.rs`): after `set_coords`,
-rebuild `V = γ·Δq` at the new geometry with the **minimum's charges**,
-rebuild `H_scc` on device (one kernel), run the normal force contract
-with the stored K. No NS, no purify, no mixing.
+`SparseDftb::forces_frozen()` (`sparse_dftb.rs`): the ENTIRE electronic
+state is frozen at the central snapshot — `D=D₀`, `W=W₀=2(Z₀H₀)K₀`,
+`q=q₀`. Only the explicit geometry dependence is evaluated at the
+displaced position: `V = γ(R)·Δq₀` (CPU) + the pair contraction with
+current `dH/dR`, `dS/dR`, `γ'(R)`, repulsion. **Zero device products,
+no NS, no purify, no mixing.** (Physics: the SCF Lagrangian
+differentiated with orbitals AND Lagrange multipliers frozen — the
+consistent freeze preserves the `δW=(δF)K₀+F₀δK` cancellation that the
+inconsistent hybrid `W̃=Z(R)H(R)K₀` breaks; measured 6.3% vs 86% column
+error. See the 2026-09-16 report.)
 
-**Speed:** whole R10 Hessian (990 columns, 1980 evals) = **23 s**
-(~12 ms/eval: 5 set_coords + 7 forces). This is the seconds-not-hours
-regime.
+**Speed:** ~5.5 ms/eval electronic work (was ~12 ms when it still
+rebuilt H_scc/W per eval) — R10 Hessian ≈ 15–20 s. This is the
+seconds-not-hours regime.
 
 **Accuracy — measured, si10h16 (26 atoms):**
 rigid modes cleaner than SCC (−0.001 vs −16 cm⁻¹); framework modes match
@@ -91,7 +97,9 @@ reference-validated.
 
 **Verdict:** legitimate "fast preview" / framework-mode tool; NOT
 quantitative for the modes people care about (X–H stretches, anything
-charge-response-sensitive). It also answers "do we need SCC per
+charge-response-sensitive). On R10 Hessian columns the consistent
+freeze measures **~6.3% column error** (h-independent, h=0.02 and 0.05
+alike) — the screening tier. It also answers "do we need SCC per
 displacement": mostly yes for accuracy, but the *SCC state* doesn't need
 re-purification from scratch — see 3b.
 
@@ -151,7 +159,7 @@ Ordered by expected payoff at N≈300–1000, honest:
 |-----|------|--------------------|---------------------------|
 | R10 SCC, deg175 | nnz_k=57 736 | ~3.46 s (scc 3.45) | ~1.9 h (measured pace) |
 | R10 SCC, deg330 | nnz_k=108 090 | ~4.3–7.3 s (scc) | ~2.5–4 h |
-| R10 frozen-DM | deg330 | **12 ms** | **23 s (measured)** |
+| R10 frozen-orbital | deg330 | **5.5 ms** | ~15–20 s (extrap.) |
 | si10h16 frozen-DM | complete | ~ms | ~3 s (measured) |
 | cube65 SCC (old) | complete | ~0.46 s | ~4 min (measured) |
 
@@ -179,7 +187,7 @@ ONE purify, no DIIS (`RUST_DFTB_VIB_FIXQ`).
 | fixed-q cold tol=1e-5 (B) | rms 6.1, max 10.7 cm⁻¹ | ~1.0 s | ~30 min |
 | **fixed-q tol=5e-5 (B)** | **rms 6.3, max 10.9 cm⁻¹** | **~0.36 s** | **~12 min** |
 | fixed-q + δK0 warm (C try) | **rms 324 cm⁻¹ — WRONG** | ~0.22 s | — |
-| frozen DM (A) | rms 162, max 344 cm⁻¹ | ~12 ms | 23 s |
+| frozen-orbital (A) | rms 162, max 344 cm⁻¹ | 5.5 ms | ~15–20 s |
 
 **Mode C attempt — refuted with a sharp diagnosis.** δK0 seed
 `K_conv + (K0_new − K0_center)` lands at R_I~1e-3 (300× closer than cold
@@ -200,3 +208,80 @@ columns + per-column phase timing — the 8-col R10 measurement took
 **Headline now:** R10 Hessian ≈ 12 min at near-SCC accuracy via
 `FIXQ=1 TC2TOL=5e-5`. Next big lever: batch ±h columns (parallel
 engines) and/or a correct ‖[K,H]‖-minimizing warm update.
+
+---
+
+## Update — mode C solved: DMM commutator warm update (2026-09-16)
+
+The "correct ‖[K,H]‖-minimizing warm update" is now implemented and
+validated: `dmm_descend` in `sparse_system.rs`, driven from the
+`scc_fixedq` warm path under `RUST_DFTB_VIB_DMUPD=1`. Full report:
+`reports/2026-09-16_sparse_dmm_warm_density_hessian.md`.
+
+**Step (3 SpGEMMs, Z=S⁻¹, F=Z·H, T=K·S):**
+`X=F·K; Y=T·X; δK=−η(X+Xᵀ−2Y)`, η=eta_scale/(εmax−εmin), plus a planned
+McWeeny retraction every `ret` steps.
+
+**Bugs found en route:** (i) workspace Z is **S⁻¹ not S⁻¹ᐟ²** — the
+first update form was an ascent direction (Tr(H·G)<0, E_band rose);
+(ii) a **bsym SpGEMM plan on asymmetric X** silently computed T·Xᵀ —
+fixed with generic `plan_tk_g` (error 1.4e-2 → 8.4e-7); (iii) the
+`T·ZHZ` term is exactly `Xᵀ` — removed, that's why the first correct
+version was *slower* than cold. Post-DMM McWeeny/TC2 polish **raises**
+R_H (H-blind) — defaults off; state measured without modification.
+
+**Measured (R10, h=0.05 Å, solve+forces per eval):**
+
+| mode | products | ms/eval | R_H | ΔF vs cold |
+|------|---------:|--------:|----:|-----------|
+| frozen-orbital (clamped K₀,W₀,q₀) | 0 | 5.5 | — | 6.3% (corrected below) |
+| **DMM 6/η8/ret2** | ~26 | **260–340** | 4.2e-5 | **0.30%** |
+| DMM 3 +1McW | ~20 | ~175 | 8.3e-5 | 2.8% |
+| cold fixq | ~50 | 330–355 | 8.0e-5 | ref |
+
+**Honest verdict:** ~25% faster than cold, certified forces — but NOT
+the 10× the task wants. Steepest descent contracts ~1.7×/step (set by
+η·Δε, not the seed quality), the seed lands at R_H≈7e-4 vs the ~1e-4
+force-validated gate, and retraction is mandatory at usable η
+(unretracted → r_I≈2e-3 → dummy-lane force gate fires).
+
+---
+
+## Update — stripped tiers measured; frozen story CORRECTED (2026-09-16, later)
+
+The GPT-5.6 rebuttal was executed. Two inversions:
+
+**1. The stale `b_zh` was the CORRECT approximation; fixing it was the
+regression.** Stale `b_zh` made `W = 2(Z₀H₀)K₀ = W₀` — the consistent
+**clamped-electron (frozen-orbital) freeze**: `δq=δK=δW=0`, the SCF
+Lagrangian differentiated with orbitals AND multipliers frozen. The
+"corrected" hybrid `W̃=Z(R)H(R)K₀` keeps `(δF)K₀` but drops `F₀δK` —
+half a cancelling response → **86% error**. Now deliberate:
+`snapshot_electronic_state` stores `W₀`; `forces_frozen` is pure CPU
+(compute_v + pair contraction), **0 device products → 5.5 ms/eval,
+6.3% column error** (h-independent). The old 2.4% claim was
+unreproducible — 6.3% is the number.
+
+**2. ~40% of the warm-eval cost was certification inside the timed
+path.** `VIB_LITE=1` / `VIB_LINEAR=1` strip all per-eval residuals
+(measure/R_H/syncs — validation only now). Also: the δK0 seed is gone
+(`VIB_SEED=0` — it contaminates the manifold); retractions *hurt*
+(H-blind McWeeny); metric transport `K←2K−KS₁K` refuted (99% error);
+per-step K symmetrization added (free).
+
+**Final measured hierarchy (R10, h=0.02 Å, per displaced eval):**
+
+| tier | products | ms | col err | env |
+|------|---------:|---:|---------:|-----|
+| clamped (K₀,W₀,q₀) | 0 | 5.5 | 6.3% | `VIB_FROZEN` |
+| linear1 | 4 | 31 | 6.7% | `VIB_LINEAR` — refuted |
+| DMM2-lite, central Z | 8 | 55 | 6.2% | `VIB_LITE DMM=2` |
+| **1 Newton + DMM2-lite** | 11 | **64** | **3.1%** | `+NSMAX=2 NSTOL=3e-5` |
+| **1 Newton + DMM4-lite** | 17 | **105** | **1.0%** | `DMM=4` |
+| gated warm (ns2+DMM4) | ~22 | 175 | 1.0% | `VIB_DMUPD SEED=0` |
+| cold fixed-q | ~50 | 345 | ref | `VIB_FIXQ` |
+
+**Z accuracy is the tier discriminator:** central Z caps everything at
+~6% regardless of K-work; ONE Newton update (R_Z 2e-3→1.4e-5) unlocks
+1–3%. Per-eval work is now ~2× off the launch-bound product floor —
+the remaining 10× is **batch-parallel ±h columns**.

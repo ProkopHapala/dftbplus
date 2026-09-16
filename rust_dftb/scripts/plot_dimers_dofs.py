@@ -49,6 +49,6 @@ for name, path, J, d_lo, d_hi, tags, labs in SYS:
     axg.set_title(f"{NP}x{NP} = {NP*NP} replicas, d={d_lo}..{d_hi:.2f} A")
     axg.set_aspect("equal")
     fig.tight_layout()
-    out = f"/home/prokop/git/dftbplus/rust_dftb/debug/{name}_2d_scan_dofs.png"
+    out = f"/home/prokop/git/dftbplus/debug/{name}_2d_scan_dofs.png"
     fig.savefig(out, dpi=150)
     print("wrote", out)

@@ -2321,3 +2321,50 @@ In-SCC purifies under hiacc entered Phase B at 8e-6…9e-5 and polished 1–5 st
 Figures: `debug/tc2_ff_endgame_rk{20,40}_v2.png` (log-scale R_I vs iter and vs wall ms; ◇ = Phase-B FF iters; f64-verified FFSTEP series on rk40). Harness: `bench_ff_endgame.rhai` parameterized via `BENCH_RK/BENCH_TOL/BENCH_MAXITER/BENCH_FFSTEP` + new rhai `env()` binding.
 
 Unit tests: `sparse::sparse_system` 6/6 pass (caller-budget semantics keep the toy-system tests at their explicit 60-iter budgets).
+
+### §15.16 — DMM warm-density update for FD Hessians (2026-09-16)
+
+Full report: `reports/2026-09-16_sparse_dmm_warm_density_hessian.md`; bottleneck context: `topical_audit/hessian_eval_bottleneck.md` §"mode C".
+
+**Problem:** `VIB_DMUPD`'s δK0-seed + polish converged to a wrong-subspace projector (idempotent, right trace, R_H~1e-3) — purification polynomials cannot select the occupied subspace. The fix is a **subspace rotation**: steepest descent on the projector manifold under the generalized commutator.
+
+**Implemented** (`sparse_system.rs::dmm_descend`, driven from `scc_fixedq` under `RUST_DFTB_VIB_DMUPD=1`): restore central (q,K,Z,K0) → warm NS → δK0 first-order seed → DMM descent `δK = −η(X + Xᵀ − 2Y)` with `X=(Z·H)·K`, `Y=(K·S)·X`, η=`eta_scale/(εmax−εmin)` → hard `R_H ≤ 1e-4` gate → forces. Retraction = fully-planned McWeeny every `ret` steps; post-DMM polish defaults off (H-blind maps *raise* R_H).
+
+**Bugs found by measurement:** (i) workspace `Z` is **S⁻¹, not S⁻¹ᐟ²** — the first derivation assumed the square root and produced an *ascent* direction (dense-f64 verify: Tr(H·G)=−15.4, E_band rose every step); (ii) `Y=T·X` ran on a **bsym** SpGEMM plan but X is asymmetric → the kernel computed T·Xᵀ (error 1.4e-2); fixed with generic `plan_tk_g` (→8.4e-7). Rule recorded: asymmetric right operand ⇒ generic plan; (iii) `KS·ZHZ = KHZ = Xᵀ` is free from `symmetrize_dev` — the redundant 4th product is why the first working version was slower than cold.
+
+**Measured (R10, 330 Si, deg≈330, h=0.05 Å, solve+forces per eval):**
+
+| mode | products | ms/eval | R_H | ΔF vs cold fixq |
+|------|---------:|--------:|----:|----------------|
+| frozen | 0 | 7–12 | — | 2.4% |
+| **DMM 6/η8/ret2** | ~26 | **260–340** | 4.2e-5 | **0.30%** |
+| DMM 3 +1McW | ~20 | ~175 | 8.3e-5 | 2.8% |
+| cold fixq | ~50 | 330–355 | 8.0e-5 | ref |
+
+Rejected-by-measurement: η=10/4-step and ret=3 trip the dummy-lane force gate (off-manifold drift, r_I≈2e-3); ret=1 costs more than it saves; final McWeeny doubles R_H margin usage for a 3× r_I gain. Fail-loud gates fire correctly on all of these.
+
+**Honest verdict:** certified ~25% vs cold, NOT the 10× target — steepest-descent contraction (~1.7×/step) is set by η·Δε, not seed quality; seed lands at R_H≈7e-4 vs the ~1e-4 force-validated gate. Open Tier-1 plan (GPT-5.6 rebuttal, chat ~line 11600): skip δK0/K0 (metric-transport seed `K←2K−KS₁K`), 1 NS iter, 1–2 steps at real h=0.02 Å, antisymmetric ±h sharing → ~7 products target.
+
+### §15.17 — Stripped tiers + frozen-orbital correction (2026-09-16, later)
+
+The GPT-5.6 rebuttal (chat ~line 12800+, 13400+) was executed; it inverted the frozen-mode conclusion and produced the real tier ladder.
+
+**The stale `b_zh` was the correct approximation — the fix was the regression.** `forces_frozen` had built `W=2·b_zh·K` with `b_zh` stale from the central `compute_k0` ⇒ `W=2(Z₀H₀)K₀=W₀` — the **consistent clamped-electron (frozen-orbital) freeze** `δq=δK=δW=0` (SCF Lagrangian differentiated with orbitals AND multipliers frozen). The "fixed" hybrid `W̃=Z(R)H(R)K₀` keeps `(δF)K₀` but drops `F₀δK` — half a cancelling response → **86% column error**. Now deliberate: `snapshot_electronic_state` stores `W₀` (+`P₀=K₀S₀`, `X₀=B₀K₀` for the linear tier); `forces_frozen` is pure CPU (`compute_v` + pair contraction), **0 device products → 5.5 ms/eval, 6.3% column error** (h-independent — identical at h=0.02/0.05). The earlier "2.4%" figure is unreproducible; 6.3% is the reliable number.
+
+**Stripped tiers** (`VIB_LITE=1`, `VIB_LINEAR=1`): no δK0 seed (`VIB_SEED=0` default-worth), no retractions, no per-eval residual gates/measurements — those cost ~40% of the warm eval (ns0d2: 100→55 ms). Lite sets `e_tot=NaN` → `energy()` refuses loudly; only `forces()` is served.
+
+**Measured ladder (R10, h=0.02 Å, 3 cols, per displaced eval):**
+
+| tier | products | ms | col err | env |
+|------|---------:|---:|---------:|-----|
+| clamped (K₀,W₀,q₀) | 0 | 5.5 | 6.3% | `VIB_FROZEN` |
+| linear1 (δB response) | 4 | 31 | 6.7% | `VIB_LINEAR` — refuted |
+| DMM2-lite, central Z | 8 | 55 | 6.2% | `VIB_LITE DMM=2` |
+| 1 Newton + DMM2-lite | 11 | 64 | 3.1% | `+NSMAX=2 NSTOL=3e-5` |
+| 1 Newton + DMM4-lite | 17 | 105 | 1.0% | `DMM=4` |
+| gated warm (ns2+DMM4+gates) | ~22 | 175 | 1.0% | `VIB_DMUPD SEED=0` |
+| cold fixq | ~50 | 345 | ref | `VIB_FIXQ` |
+
+**Structural findings:** (i) **Z accuracy is the tier discriminator** — central Z (R_Z≈2e-3 at displaced S) caps ALL K-updates at ~6%; ONE actual Newton correction (R_Z→1.4e-5; "NS=2 iters" = 1 update + residual checks = 3 products) unlocks 1–3%; (ii) retractions *hurt* — every McWeeny-retracted variant is worse than its unretracted twin (4.8% vs 3.0%), the map is H-blind; without the δK0 contaminant ≤4 raw steps stay on-manifold (6 steps trip the Tr(KS) gate, loudly); (iii) metric transport alone gives 99% error — refuted; (iv) linear1's single fixed-η response is insufficient (6.7% ≈ frozen at 6× cost) — refuted at tested η.
+
+**Remaining 10× lever:** batch-parallel ±h columns (all 990 share topology/plans). Untested: ±h antisymmetric sharing (`K(−h)≈2K₀−K(+h)`, exact to O(h²)), Chebyshev/BB η schedule, CG on the manifold.

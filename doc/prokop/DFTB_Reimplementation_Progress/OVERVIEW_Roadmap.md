@@ -253,7 +253,8 @@ file/function where the work should land.
 > AT/GC **converge** now (no 25-iter stall). GC smeared kT=0.005: \|dE\|=1.58e-6. batch=8 identical replicas: bit-identical E. Formic z-scan \|ΔΔE\| ≤1.2e-6.
 > **GC N–H···N proton-transfer scan** (19 rigid pts, d=1.0–1.9 Å, kT=0.002, `tests/gpu_hbond_physics.rs::test_gc_ptscan_pes_forces_vs_cpu`): PES **shape** error max \|ΔΔE\|=3.7e-6 Ha (**0.10 meV**), barrier err 0.068 meV on a 39.7 kcal/mol barrier; forces max\|ΔF\|=5.5e-6 Ha/Å, projected scan force err 2.1e-6. The absolute error varies 1.4e-7–3.5e-6 along the scan → mostly a smooth offset, not fully constant. Detail: `f32_floor_dense_hbond.md` §3.2.
 > **20×20-scan throughput** (`tests/gpu_scc_bench.rs::test_gpu_scc_scan400_benchmark`, batch=400 distinct geometries, kT=0.002, tol=1e-6, vs sequential `DftbCpu`): azaindole 218 ms/solve → 1834 sys/s (22×); GC 434 ms → 923 sys/s (12×, 80 iters — slowest-replica bound); AT 253 ms → 1578 sys/s (21×); diazaphenalene 838 ms → 477 sys/s (11×); DTH (N=246) 7.7 s → 52 sys/s (8.5× — direct Jacobi O(N³)/replica dominates, **not** saturated). batch=1 GPU loses (0.5–0.9×): launch overhead. Full table: `reports/2026-09-16_dense_gpu_pes_forces_benchmark.md`.
-> **Levers A/B on GC:** occ_repair off → \|dE\|=2.4e-3 (critical); JACOBI_PREC 0→1→2 → 5.3e-7/1.05e-6/1.6e-6 (f64 Jacobi does **not** help — eigensolver is not the residual limiter). SCC floor: GC reaches the bit-exact f32 fixed point (rms=0) at tol≤1e-8, H2O plateaus at ~1e-7; but \|q_D−q_cpu\| stays ~3–9e-6 — the converged fixed point itself is offset by f32 assembly (max\|ΔS\| up to 9.9e-6 at N=246) and the γ-spline, **not** by eigensolver noise. Scripts: `rust_dftb/debug/diag_f32_*.rhai`.
+> **Root cause found:** N≈85 batch-400 gain ≈ 82–92× = SM count → ~1 WG/SM, one-WG-per-replica direct Jacobi at CPU speed per matrix; warm launches do 0 sweeps yet `scc.jacobi` dominates (fused Fermi tail + prologue machinery); WG=512 tuned on batch=1. Optimization work order: `HBond_Relaxed_Scan_GPU.manifest..md` §16 (Fermi split, WG∝N, active_ids compaction, new `jacobi_block_1wg` side-by-side solver).
+> **Levers A/B on GC:** occ_repair off → \|dE\|=2.4e-3 (critical); JACOBI_PREC 0→1→2 → 5.3e-7/1.05e-6/1.6e-6 (f64 Jacobi does **not** help — eigensolver is not the residual limiter). SCC floor: GC reaches the bit-exact f32 fixed point (rms=0) at tol≤1e-8, H2O plateaus at ~1e-7; but \|q_D−q_cpu\| stays ~3–9e-6 — the converged fixed point itself is offset by f32 assembly (max\|ΔS\| up to 9.9e-6 at N=246) and the γ-spline, **not** by eigensolver noise. Scripts: `debug/diag_f32_*.rhai`.
 
 > **Kickstart ≠ floor.** Package 1 made residuals and two cheap f64 islands honest. Package 2 then **measured**: AT `|dE|` is `δ_CH`, not frozen `δε_occ`. Löwdin Newton and f32 GEMM Kahan are in; Kahan does not cut `δ_CH`. Keep H/S/D/C/W **f32**. Do **not** all-f64 matrices. Do not re-enable f64 `batched_gemm`.
 >
@@ -485,18 +486,25 @@ full 22-issue checklist and `tasks.md` for the phased master task breakdown.
 
 ### 7.6.2 Current plan (Phases A–E, see `tasks.md`)
 
-**Next (2026-09-10):** `SparseDftb` + CLI exist (SiH4 numbers in manifest §0.7).
-Unify G3/F/G onto that solver. Then a nanocrystal `.rhai` (geometric mask).
-Device NS stays red. Do not chase G3.4 rel 1e-3 at h=1e-3 Å. Do not time
-`cargo test`.
+**2026-09-16 status:** `SparseDftb` is the production loop; end-to-end FD
+Hessians run via `sparse_vibrations` (`userguide/sparse_vibrations.md`).
+Per-eval tier ladder measured on R10 (330 Si, h=0.02 Å, column error vs cold
+fixq): **clamped frozen-orbital (`VIB_FROZEN`, explicit K₀/W₀/q₀ snapshot,
+0 device products) 5.5 ms @ 6.3%** → `VIB_LITE` 1-Newton+DMM2 **64 ms @
+3.1%** → 1-Newton+DMM4 **105 ms @ 1.0%** → cold fixq ~345 ms. DMM step
+`δK=−η(X+Xᵀ−2Y)`, `X=(Z·H)·K`, `Y=(K·S)·X` — 3 SpGEMMs/step. Key findings:
+Z accuracy is the tier discriminator (1 Newton update unlocks <6%);
+certification stripped from the timed path (~40% was residual checks);
+metric transport and single-step linear response refuted. Report:
+`reports/2026-09-16_sparse_dmm_warm_density_hessian.md`. Next:
+batch-parallel ±h columns (the remaining 10×).
 
-- **Phase A** — Foundation: canonical C² spline (A1), TC2 fix 2 SpGEMMs/iter (A2), plan integration (A3)
-- **Phase B** — Sparse SCC solver, GPU-resident, self-consistent — **G3.1/G3.2 SiH4 numbers on NVIDIA (not marked done)**
-  - B1: `SparseSystemWorkspace`, B2: GPU H0/S assembly, B3: GPU gamma, B4: GPU Hscc, B5: GPU K0+bounds, B6: SCC loop, B7: Mulliken
-- **Phase C** — Sparse analytic forces: G3.3/G3.4 in progress (`D=2K`, `W=2KHK` + CPU contraction). H-bond `gpu_forces.cl` is read-only; a shared GPU pair-force kernel waits until both paths are tested. Later: BSR pair-force + atom-gather (after dense H-bond agent finishes).
-- **Phase D** — Correctness gates: C/E still false (D1/D2); F/G investigating; H after USER confirm
-- **Must-build (overrides Gate I):** `SparseDftb` — **coded** (`sparse_dftb.rs`). Drive via `dftb_engine` + `scripts/test_sparse_dftb_sih4.rhai` (`userguide/sparse_dftb.md`). `tests/sparse_dftb.rs` is SiH4 smoke only. NVIDIA SiH4 2026-09-10: NS `R_Z=6e-8`, E=−2.764, reuse SCC 17→4 iters. Not USER-confirmed. Do not time `cargo test`.
-- **Phase E** — Performance: real counters (E1), cell-list masks (E2), degree buckets (E3), packed plans (E4), lane benchmark (E5), symmetrization policy (E6), scaling Gate I (E7), production Gate J (E8)
+- **Phase A** — Foundation: canonical C² spline (A1), TC2 fix 2 SpGEMMs/iter (A2), plan integration (A3) — done
+- **Phase B** — Sparse SCC solver, GPU-resident, self-consistent — done (`SparseDftb` production owner, `sparse_dftb.rs`)
+- **Phase C** — Sparse analytic forces — done, GPU-resident (`sparse_forces.rs`: masked-SpGEMM D/W + device pair contraction)
+- **Phase D** — Correctness gates: C/E still false (D1/D2); F/G investigating (FD-Hessian forces validated); H produced (cube65 ~5–15% stiff vs DFTB+)
+- **Must-build (overrides Gate I):** `SparseDftb` — done. Drive via `dftb_engine` + `scripts/test_sparse_dftb_sih4.rhai` (`userguide/sparse_dftb.md`). `tests/sparse_dftb.rs` is SiH4 smoke only.
+- **Phase E** — Performance: real counters (E1), cell-list masks (E2), degree buckets (E3), packed plans (E4), lane benchmark (E5), symmetrization policy (E6), scaling Gate I (E7), production Gate J (E8). Landed: two-phase TC2+FF32 purify (§15.15), DMM warm update (E.1).
 
 ---
 

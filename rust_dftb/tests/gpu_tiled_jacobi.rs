@@ -13,7 +13,7 @@
 //!   - Orthogonality < 1e-5
 //!   - Eigenvalue parity < 1e-4 Ha
 
-use rust_dftb::qmqm::gpu_eigen::{direct_jacobi_batched, jacobi_batched, tiled_jacobi_batched};
+use rust_dftb::qmqm::gpu_eigen::{block_jacobi_batched, direct_jacobi_batched, jacobi_batched, tiled_jacobi_batched};
 use rust_dftb::qmqm::gpu_runtime::GpuRuntime;
 
 fn try_runtime() -> Option<GpuRuntime> {
@@ -472,5 +472,189 @@ fn test_jacobi_batched_dispatcher() {
         let res = residual(&a_orig, &gpu_v, &eigs, n);
         eprintln!("jacobi_batched N={n}: residual={res:.2e}");
         assert!(res < 1e-5, "jacobi_batched N={n} residual {res:.2e} too large (target 1e-5)");
+    }
+}
+
+/// §16.D: `block_jacobi_1wg` — the new one-WG/one-thread-per-row block
+/// Jacobi eigensolver (pivot+U in local, A/V streamed). Covers ALL n:
+/// the single-block path (n≤32), the block-pair path (n>32), boundary
+/// sizes, adversarial spectra, and the warm-path probe exit (exactly
+/// diagonal input → 0 sweeps). Same quality gates as the direct kernel.
+#[test]
+fn test_block_jacobi_eigen_quality() {
+    let Some(mut rt) = try_runtime() else { return; };
+
+    for &n in &[6usize, 16, 31, 32, 33, 48, 64, 65, 86, 87, 96, 128, 246, 256] {
+        let a_orig = random_symmetric(n, 42);
+        let a_buf = rt.buffer_from_slice(&a_orig).unwrap();
+        let v_buf = rt.zero_buffer::<f32>(n * n).unwrap();
+        let diag = block_jacobi_batched(&mut rt, &a_buf, &v_buf, n, 1).unwrap();
+        let mut gpu_a = vec![0.0f32; n * n];
+        let mut gpu_v = vec![0.0f32; n * n];
+        rt.read_buffer(&a_buf, &mut gpu_a).unwrap();
+        rt.read_buffer(&v_buf, &mut gpu_v).unwrap();
+        let mut eigs = vec![0.0f32; n];
+        for i in 0..n { eigs[i] = gpu_a[i * n + i]; }
+        let res = residual(&a_orig, &gpu_v, &eigs, n);
+        let orth = orthogonality(&gpu_v, n);
+        let (ce, _) = cpu_eig(&a_orig, n);
+        let mut gs = eigs.clone(); gs.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        let mut cs = ce.clone();   cs.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        let par: f64 = (0..n).map(|i| (gs[i] as f64 - cs[i] as f64).abs()).fold(0.0, f64::max);
+        let af: f64 = a_orig.iter().map(|&x| (x as f64).powi(2)).sum::<f64>().sqrt();
+        let weyl = 2.0 * res * af + 1e-4;
+        eprintln!("[block] N={n}: stop={} sweeps={} res={res:.3e} orth={orth:.3e} eig_par={par:.3e} (weyl={weyl:.3e})",
+            diag[2], diag[3]);
+        assert_eq!(diag[2] as i32, 0, "block Jacobi N={n} stop={} (1=stall 2=maxsweeps 4=nonfinite)", diag[2]);
+        assert!(res < 1e-4, "block Jacobi N={n} residual {res:.3e}");
+        assert!(orth < 1e-4, "block Jacobi N={n} orth {orth:.3e}");
+        assert!(par < weyl, "block Jacobi N={n} eig parity {par:.3e} exceeds Weyl bound {weyl:.3e}");
+    }
+
+    // --- adversarial spectra at N=87, one batch (same cases as direct) ---
+    let n = 87usize;
+    let mut e = vec![1.0f64; n];
+    for k in 5..n { e[k] = 1.0 + 1e-6 * (k % 7) as f64; }
+    e[0] = -1.5; e[1] = -0.3; e[2] = 0.1; e[3] = 0.5; e[4] = 2.0;
+    let clustered = from_spectrum(n, &e, 7);
+    let e: Vec<f64> = (0..n).map(|k| if k < n / 2 { 0.5 } else { 1.5 }).collect();
+    let repeated = from_spectrum(n, &e, 11);
+    let mut zero_blk = random_symmetric(n, 13);
+    for i in (n - 8)..n { for j in 0..n { zero_blk[i * n + j] = 0.0; zero_blk[j * n + i] = 0.0; } }
+    let all_zero = vec![0.0f32; n * n];
+    // b4 exactly-diagonal: probe must exit with 0 sweeps (warm-path cost).
+    let mut diag_only = vec![0.0f32; n * n];
+    for i in 0..n { diag_only[i * n + i] = (i as f32) * 0.1 - 4.0; }
+
+    let cases: Vec<(&str, Vec<f32>)> = vec![
+        ("clustered", clustered), ("repeated", repeated),
+        ("zero_blk", zero_blk), ("all_zero", all_zero),
+        ("diag_only", diag_only),
+    ];
+    let batch = cases.len();
+    let mut a_flat = Vec::new();
+    for (_, a) in &cases { a_flat.extend_from_slice(a); }
+    let orig = a_flat.clone();
+    let a_buf = rt.buffer_from_slice(&a_flat).unwrap();
+    let v_buf = rt.zero_buffer::<f32>(batch * n * n).unwrap();
+    let diag = block_jacobi_batched(&mut rt, &a_buf, &v_buf, n, batch).unwrap();
+    let mut gpu_a = vec![0.0f32; batch * n * n];
+    let mut gpu_v = vec![0.0f32; batch * n * n];
+    rt.read_buffer(&a_buf, &mut gpu_a).unwrap();
+    rt.read_buffer(&v_buf, &mut gpu_v).unwrap();
+    for (b, (name, _)) in cases.iter().enumerate() {
+        let a0 = &orig[b * n * n..(b + 1) * n * n];
+        let v = &gpu_v[b * n * n..(b + 1) * n * n];
+        assert!(v.iter().all(|x| x.is_finite()), "block Jacobi {name}: non-finite eigenvectors");
+        let mut eigs = vec![0.0f32; n];
+        for i in 0..n { eigs[i] = gpu_a[b * n * n + i * n + i]; }
+        assert!(eigs.iter().all(|x| x.is_finite()), "block Jacobi {name}: non-finite eigenvalues");
+        let res = residual(a0, v, &eigs, n);
+        let orth = orthogonality(v, n);
+        let stop = diag[4 * b + 2] as i32;
+        let nsw = diag[4 * b + 3];
+        eprintln!("[block] N=87 {name}: stop={stop} sweeps={nsw} res={res:.3e} orth={orth:.3e}");
+        assert_eq!(stop, 0, "block Jacobi {name}: stop={stop}");
+        assert!(res < 1e-4, "block Jacobi {name} residual {res:.3e}");
+        assert!(orth < 1e-4, "block Jacobi {name} orth {orth:.3e}");
+        if *name == "diag_only" || *name == "all_zero" {
+            assert_eq!(nsw, 0.0, "block Jacobi {name}: probe should exit with 0 sweeps, got {nsw}");
+        }
+    }
+}
+
+
+/// §16.D A/B: block_jacobi_1wg vs jacobi_cyclic_global_batched at
+/// production batch sizes. Programs built once; each rep re-uploads the
+/// ORIGINAL matrices then enqueues + finish (upload included in both
+/// paths symmetrically). Three regimes: cold (random), one (just above
+/// tolerance), warm (0 sweeps — the common SCC iteration).
+/// `cargo test --release --test gpu_tiled_jacobi -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn test_block_vs_direct_jacobi_bench() {
+    use ocl::Kernel;
+    use rust_dftb::qmqm::gpu_eigen::{block_jacobi_wg, render_block_source};
+    use std::time::Instant;
+    let Some(mut rt) = try_runtime() else { return; };
+
+    // direct kernel program (prec=0, WG=512 — production settings)
+    let wg_d = 512usize.min(rt.caps().max_work_group_size);
+    let src_d = rust_dftb::qmqm::gpu_eigen::render_tiled_source(32, wg_d, 0);
+    let prog_d = rt.build_program(&src_d).unwrap();
+
+    // Kernel resource footprint → theoretical WGs/SM (occupancy ceiling).
+    let print_res = |rt: &GpuRuntime, k: &Kernel, tag: &str| {
+        use ocl::enums::KernelWorkGroupInfo::*;
+        let g = |i| k.wg_info(rt.device(), i).map(|r| format!("{r:?}")).unwrap_or_else(|_| "?".into());
+        eprintln!("[res] {tag}: local={} priv={} maxwg={}", g(LocalMemSize), g(PrivateMemSize), g(WorkGroupSize));
+    };
+
+    let mk = |n: usize, batch: usize, mode: &str, seed: u64| -> Vec<f32> {
+        let mut a = Vec::with_capacity(batch * n * n);
+        for b in 0..batch {
+            let mut m = random_symmetric(n, seed + b as u64);
+            match mode {
+                "warm" => for i in 0..n { for j in 0..n { if i != j { m[i*n+j] *= 1e-9; } } },
+                "one"  => for i in 0..n { for j in 0..n { if i != j { m[i*n+j] *= 3e-3; } } },
+                _ => {}
+            }
+            a.extend_from_slice(&m);
+        }
+        a
+    };
+
+    eprintln!("[bench] n batch mode | direct ms (sweeps) | block ms (sweeps) | ratio");
+    for &n in &[86usize, 246] {
+        let wg_b = block_jacobi_wg(n);
+        let src_b = render_block_source(16, wg_b);
+        let prog_b = rt.build_program(&src_b).unwrap();
+        for &batch in &[400usize, 80, 20] {
+            for mode in ["warm", "one", "cold"] {
+                let a = mk(n, batch, mode, 42);
+                let a_buf = rt.buffer_from_slice(&a).unwrap();
+                let v_buf = rt.zero_buffer::<f32>(batch * n * n).unwrap();
+                let ones = rt.buffer_from_slice(&vec![1i32; batch]).unwrap();
+                let diag_d = rt.zero_buffer::<f32>(4 * batch).unwrap();
+                let occ_w = rt.zero_buffer::<f32>(batch * n).unwrap();
+                let mu = rt.zero_buffer::<f32>(batch).unwrap();
+                let k_d = Kernel::builder().program(&prog_d).name("jacobi_cyclic_global_batched")
+                    .queue(rt.queue().clone()).global_work_size(batch * wg_d).local_work_size(wg_d)
+                    .arg(&a_buf).arg(&v_buf).arg(n as i32).arg(batch as i32).arg(0i32)
+                    .arg(&ones).arg(&diag_d).arg(0i32).arg(0i32).arg(0.0f32)
+                    .arg(&occ_w).arg(&mu).build().unwrap();
+                let diag_b = rt.zero_buffer::<f32>(4 * batch).unwrap();
+                let eig_b = rt.zero_buffer::<f32>(batch * n).unwrap();
+                let k_b = Kernel::builder().program(&prog_b).name("block_jacobi_1wg")
+                    .queue(rt.queue().clone()).global_work_size(batch * wg_b).local_work_size(wg_b)
+                    .arg(&a_buf).arg(&v_buf).arg(n as i32).arg(batch as i32).arg(0i32)
+                    .arg(&ones).arg(&diag_b).arg(&eig_b).build().unwrap();
+                if batch == 400 && mode == "warm" {
+                    print_res(&rt, &k_d, &format!("direct n={n} wg={wg_d}"));
+                    print_res(&rt, &k_b, &format!("block  n={n} wg={wg_b}"));
+                }
+
+                let run = |rt: &mut GpuRuntime, k: &Kernel, a_buf: &ocl::Buffer<f32>, a: &[f32]| -> std::time::Duration {
+                    rt.write_buffer(a_buf, a).unwrap();
+                    let t0 = Instant::now();
+                    unsafe { k.enq().unwrap(); }
+                    rt.finish().unwrap();
+                    t0.elapsed()
+                };
+                // warm-up once, then 3 timed reps
+                run(&mut rt, &k_d, &a_buf, &a);
+                let td: f64 = (0..3).map(|_| run(&mut rt, &k_d, &a_buf, &a).as_secs_f64()).sum::<f64>() / 3.0;
+                run(&mut rt, &k_b, &a_buf, &a);
+                let tb: f64 = (0..3).map(|_| run(&mut rt, &k_b, &a_buf, &a).as_secs_f64()).sum::<f64>() / 3.0;
+
+                let mut d4 = vec![0.0f32; 4 * batch];
+                rt.read_buffer(&diag_d, &mut d4).unwrap();
+                let (sw_d, bad_d) = (0..batch).fold((0.0f32, 0usize), |(s, c), b| (s + d4[4*b+3], c + (d4[4*b+2] != 0.0) as usize));
+                rt.read_buffer(&diag_b, &mut d4).unwrap();
+                let (sw_b, bad_b) = (0..batch).fold((0.0f32, 0usize), |(s, c), b| (s + d4[4*b+3], c + (d4[4*b+2] != 0.0) as usize));
+                eprintln!("[bench] n={n} batch={batch} {mode}: direct {:.2} ms (sw {:.1}, bad {bad_d}) | block {:.2} ms (sw {:.1}, bad {bad_b}) | {:.2}×",
+                    td * 1e3, sw_d / batch as f32, tb * 1e3, sw_b / batch as f32, td / tb);
+            }
+        }
     }
 }

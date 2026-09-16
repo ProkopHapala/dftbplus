@@ -192,9 +192,13 @@ fn test_gpu_scc_scan400_benchmark() {
     };
 
     eprintln!("=== 20x20 scan benchmark (batch={}): production GpuDftb, kT=0.002, tol=1e-6 ===", NP * NP);
+    // §16.D: optional subset filter for A/B runs (comma list of names).
+    let only: Option<Vec<String>> = std::env::var("RUST_DFTB_BENCH_SYSTEMS").ok()
+        .map(|s| s.split(',').map(|x| x.trim().to_string()).collect());
     eprintln!("{:>11} {:>5} {:>5} {:>7} | {:>9} {:>5} {:>8} {:>9} | {:>8} | {:>9} {:>8}",
         "system", "atoms", "orbs", "batch", "scc_ms", "iters", "ms/iter", "sys/s", "evalF_ms", "cpu_1pt", "speedup");
     for sys in SCAN_SYSTEMS {
+        if let Some(o) = &only { if !o.iter().any(|x| x == sys.name) { continue; } }
         let xyz = xyz_file(sys.file);
         let sp = xyz.species.clone();
         let base = xyz.coords.clone();
@@ -222,6 +226,9 @@ fn test_gpu_scc_scan400_benchmark() {
                 // Failed replicas are data, not a crash — a stalled replica
                 // costs its 100 iters, which is the production cost anyway.
                 n_failed = s.statuses.iter().filter(|st| **st == SccStatus::Failed).count();
+            }
+            if std::env::var("RUST_DFTB_PROF").is_ok() && batch == NP * NP {
+                eng.prof_report("scan400");
             }
             let t0 = std::time::Instant::now();
             eng.eval(true).unwrap();

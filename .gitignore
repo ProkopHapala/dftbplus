@@ -40,6 +40,12 @@ target/
 *.dylib
 Cargo.lock
 *.helper
+
+# Generated/scratch dirs — never commit, at any level (crate sanity)
+debug/
+work/
+waveplot_output/
+
 tests/dftb/*_debug*.txt
 tests/dftb/*.hsd
 tests/dftb/*.xyz

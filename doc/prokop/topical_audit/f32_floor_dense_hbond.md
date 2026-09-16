@@ -191,7 +191,7 @@ CPU reference convergence at the mid-transfer point: f64 DIIS reaches
 rms ~1e-8 in ≤32 iters then jitters around the limit cycle; tol 1e-9 does
 not converge there (200-iter cap hit at rms 1.7e-8 — a mixer floor, not a
 harder solve). Reference tol is therefore 1e-8, ~100× below the f32
-quantities measured. Plots: `rust_dftb/debug/ptscan_conv.png`,
+quantities measured. Plots: `debug/ptscan_conv.png`,
 `ptscan_pes.png`; raw log `debug/ptscan_conv.log`.
 
 Throughput on the same footing (multi-system 20×20-scan benchmark, batch

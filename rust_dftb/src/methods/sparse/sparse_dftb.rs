@@ -95,11 +95,30 @@ pub struct SparseDftbScc {
 /// per displacement from the restored state. `k0` = the cold-start
 /// matrix (emax·Z − ZHZ)/Δ at the center — enables the δK0 first-order
 /// subspace-rotation seed `K_conv + (K0_new − K0_center)` (Phase G3).
+/// `w0` = host W₀ = 2(Z₀H_scc,0)K₀ on M_HS — the frozen energy-weighted
+/// density for the clamped-electron (frozen-orbital) force: the SCF
+/// Lagrangian differentiated with BOTH the occupied projector AND its
+/// Lagrange multipliers held at the center (GPT-5.6 §6). Freezing only
+/// K while rebuilding W=Z(R)H(R)K₀ keeps half a cancelling response —
+/// measured 86% column error vs ~2.5% for the consistent freeze.
 pub struct SparseElectronicState {
     pub q: Vec<f64>,
     pub k: Vec<f32>,
     pub z: Vec<f32>,
     pub k0: Vec<f32>,
+    pub w0: Vec<f32>,
+    /// P₀ = K₀·S₀ on M_TKS and X₀ = (Z₀H₀)·K₀ on M_K — the central
+    /// metric/gradient references for the stripped first-order
+    /// response tier (GPT-5.6 linear1): X = B₁K₀ − X₀ = (δB)K₀ and
+    /// Y = P₀X are evaluated against the CENTRAL metric so all
+    /// products act on the O(h) perturbation directly (no X+Xᵀ≈2Y
+    /// cancellation between full matrices).
+    pub p0: Vec<f32>,
+    pub x0: Vec<f32>,
+    /// Central Gershgorin bounds — η scale for the DMM update so the
+    /// seedless tier (VIB_SEED=0) needs no displaced K0/Gershgorin.
+    pub emin: f32,
+    pub emax: f32,
 }
 
 /// Tunables. `new` uses `Default`. Changing n_atom or mask requires a new engine.
@@ -1257,23 +1276,28 @@ impl SparseDftb {
     /// `W=2·T·K` on M_HS via `SparseDWWorkspace`, download only `W[M_HS]` +
     /// `K[M_K]`, then a CPU pair contraction (`sparse_forces_bsr`). No dense
     /// orbital matrices, no O(N³) dense product.
-    /// Frozen-density force evaluation — the cheap FD-Hessian path.
-    /// Rebuilds V = γ·Δq at the CURRENT geometry with the EXISTING
-    /// (frozen) charges, rebuilds H_scc on device, then runs the usual
-    /// force contract with the stored K. No NS, no purify, no mixing —
-    /// physics = response of the energy at fixed density matrix, i.e.
-    /// charge redistribution upon displacement is neglected. Deliberately
-    /// bypasses the `last.n_scc` state gate by marking a frozen state.
+    /// Frozen-orbital (clamped-electron) force — the cheap FD-Hessian
+    /// path. The SCF Lagrangian is differentiated with the ENTIRE
+    /// electronic state frozen at the central snapshot: D=D₀, W=W₀,
+    /// q=q₀. Only the EXPLICIT geometry dependence is evaluated at the
+    /// displaced position: current dH/dR and dS/dR (inside the pair
+    /// contraction), γ(R)/γ′(R), repulsion. δq=δK=δW=0 — no NS, no
+    /// purify, no device products at all (GPT-5.6 §6: the consistent
+    /// freeze keeps the δW=(δF)K₀+F₀δK cancellation; a partially
+    /// relaxed non-stationary W is catastrophically worse — 86% vs
+    /// ~2.5% measured column error). Requires the central snapshot.
     pub fn forces_frozen(&mut self) -> Result<Forces> {
-        self.compute_v();
-        for i in 0..self.n_atom {
-            self.v_f32[i] = self.v[i] as f32;
+        if self.central.is_none() {
+            return Err(DftbError::InvalidInput(
+                "forces_frozen: no snapshot — call snapshot_electronic_state first".into()));
         }
-        self.ws.build_hscc_from_v(&self.v_f32)?;
-        // Mark a usable (frozen) state so forces() doesn't refuse.
+        self.compute_v();   // V = γ(R)·Δq₀ — gmat rebuilt by set_coords
+        let s = self.central.as_ref().unwrap();
+        self.k_vals.copy_from_slice(&s.k);
+        self.w_vals.copy_from_slice(&s.w0);
         self.last.n_scc = 1;
         self.last.purify_status = PurifyStatus::Converged;
-        self.forces()
+        self.contract_forces()
     }
 
     /// Snapshot the converged electronic state (q, K, Z, K0) into
@@ -1289,11 +1313,24 @@ impl SparseDftb {
         self.ws.gpu().read_f32(&self.ws.z().values, &mut z)?;
         // K0_center = f(Z_center, H_scc_center) — rebuild in `k`, read
         // to host, restore the converged K.
-        self.ws.compute_k0_from_hscc(0.1)?;
+        let (emin, emax) = self.ws.compute_k0_from_hscc(0.1)?;
         let mut k0 = vec![0.0f32; nb_k];
         self.ws.gpu().read_f32(&self.ws.k().values, &mut k0)?;
         self.ws.inject_k_values(&k)?;
-        self.central = Some(SparseElectronicState { q: self.q.clone(), k, z, k0 });
+        // W₀ = 2(Z₀H₀)K₀ on M_HS — explicit frozen-orbital snapshot
+        // (b_zh here is central Z·H_scc, just rebuilt by compute_k0).
+        let w_zk = self.cfg.force_w_zk.unwrap_or_else(|| {
+            std::env::var("RUST_DFTB_W_ZK")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(true)
+        });
+        self.dw_ws.build_dw_into(self.ws.gpu(), self.ws.k(), self.ws.h_scc(), self.ws.b_zh(), w_zk)?;
+        let mut w0 = vec![0.0f32; self.ws.hs_struct().nblock * BS2];
+        self.ws.gpu().read_f32(&self.dw_ws.w().values, &mut w0)?;
+        // Central metric/gradient snapshots for the linear1 tier —
+        // 2 products, once per Hessian.
+        let (p0, x0) = self.ws.snapshot_p0_x0()?;
+        self.central = Some(SparseElectronicState { q: self.q.clone(), k, z, k0, w0, p0, x0, emin, emax });
         Ok(())
     }
 
@@ -1332,11 +1369,55 @@ impl SparseDftb {
     /// Includes orbital (projector) relaxation, excludes charge
     /// response. No DIIS loop — ~1 purify instead of 9–17.
     pub fn scc_fixedq(&mut self) -> Result<SparseDftbScc> {
+        // Stripped calibrated tiers (GPT-5.6 §"four ideas"): LINEAR = one
+        // perturbative response on the central metric (~4 products/eval);
+        // LITE = central Z + N raw DMM steps (1+3N+1 products). BOTH skip
+        // NS, the δK0 seed, retractions, and ALL per-eval residual gates/
+        // measurements — fixed predetermined arithmetic → force. Use only
+        // for recipes already validated against cold columns.
+        let linear = std::env::var("RUST_DFTB_VIB_LINEAR").ok()
+            .and_then(|v| v.parse::<usize>().ok()).unwrap_or(0) != 0;
+        let lite = linear || std::env::var("RUST_DFTB_VIB_LITE").ok()
+            .and_then(|v| v.parse::<usize>().ok()).unwrap_or(0) != 0;
         if !self.z_valid {
-            let (rz, z_iters) = self.ws.compute_z(self.cfg.ns_max, self.cfg.ns_tol, 5, self.z_warm)?;
-            eprintln!("  [SparseDftb] NS (fixedq, warm={}): {z_iters} iters, R_Z={rz:.3e}", self.z_warm);
-            self.z_valid = true;
-            self.z_warm = true;
+            if lite && self.z_warm {
+                // lite tiers default to the central Z as-is (NSMAX=0);
+                // an explicit VIB_NSMAX runs that many warm NS updates
+                // (loose tol — a count cap, not a convergence target).
+                let ns_cap = std::env::var("RUST_DFTB_VIB_NSMAX").ok()
+                    .and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
+                if ns_cap == 0 {
+                    self.z_valid = true;
+                } else {
+                    let ns_tol = std::env::var("RUST_DFTB_VIB_NSTOL").ok()
+                        .and_then(|v| v.parse::<f32>().ok()).unwrap_or(1e-3);
+                    let (rz, z_iters) = self.ws.compute_z(ns_cap, ns_tol, 5, true)?;
+                    eprintln!("  [SparseDftb] NS (lite): {z_iters} iters, R_Z={rz:.3e}");
+                    self.z_valid = true;
+                    self.z_warm = true;
+                }
+            } else {
+            // RUST_DFTB_VIB_NSMAX caps warm NS iters for the cheap
+            // response tiers: 1 = exactly the first-order correction
+            // Z₁ = 2Z₀−Z₀S₁Z₀ (R_Z~8.5e-5 on R10 — ample for the DMM
+            // direction); 0 = keep the restored central Z entirely.
+            let ns_cap = std::env::var("RUST_DFTB_VIB_NSMAX").ok()
+                .and_then(|v| v.parse::<usize>().ok()).unwrap_or(self.cfg.ns_max);
+            if ns_cap == 0 && self.z_warm {
+                self.z_valid = true;   // keep central Z (first-order tier)
+            } else {
+                // VIB_NSTOL loosens the NS tolerance for the response
+                // tier — 1 warm step is the first-order inverse
+                // correction; demanding 1e-5 reconvergence wastes ~4
+                // products (GPT-5.6 §4).
+                let ns_tol = std::env::var("RUST_DFTB_VIB_NSTOL").ok()
+                    .and_then(|v| v.parse::<f32>().ok()).unwrap_or(self.cfg.ns_tol);
+                let (rz, z_iters) = self.ws.compute_z(ns_cap, ns_tol, 5, self.z_warm)?;
+                eprintln!("  [SparseDftb] NS (fixedq, warm={}): {z_iters} iters, R_Z={rz:.3e}", self.z_warm);
+                self.z_valid = true;
+                self.z_warm = true;
+            }
+            }
         }
         self.compute_v();
         for i in 0..self.n_atom {
@@ -1361,9 +1442,9 @@ impl SparseDftb {
         self.ws.set_tc2_hiacc(self.cfg.tc2_hiacc.unwrap_or(false));
         let seeded = dmupd && self.central.is_some();
         let r = if seeded {
-            let (k0c, kc) = {
+            let (k0c, kc, emin_c, emax_c) = {
                 let s = self.central.as_ref().unwrap();
-                (s.k0.clone(), s.k.clone())
+                (s.k0.clone(), s.k.clone(), s.emin, s.emax)
             };
             // δK0 seed lands at R_I~1e-3 with the first-order subspace
             // rotation, then DMM commutator descent (δK =
@@ -1392,11 +1473,50 @@ impl SparseDftb {
             // the retraction McWeeny already holds idempotency.
             let tc2_max = std::env::var("RUST_DFTB_VIB_TC2MAX").ok()
                 .and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
+            // GPT-5.6 tier-1 experiment: VIB_SEED=0 removes the δK0 seed
+            // entirely — it is the first-order change of the spectral
+            // INITIALIZER (bounds+normalization included), not of the
+            // occupied projector, and pushes the good central K
+            // off-manifold. Seedless = descent starts from the exact
+            // converged projector; b_zh is still refreshed (needed by
+            // the DMM X product AND the W=2(ZH)K force), bounds come
+            // from the snapshot. VIB_METRIC=1 applies the first-order
+            // overlap correction K←2K−KS₁K before the H response.
+            let seed_mode = std::env::var("RUST_DFTB_VIB_SEED").ok()
+                .and_then(|v| v.parse::<usize>().ok()).unwrap_or(1);
+            let metric = std::env::var("RUST_DFTB_VIB_METRIC").ok()
+                .and_then(|v| v.parse::<usize>().ok()).unwrap_or(0) != 0;
             (|| -> Result<(PurifyStatus, f32, f64, usize)> {
                 let dbg = crate::methods::sparse::gpu_sparse::algebra_verbose();
-                let (emin, emax) = self.ws.compute_k0_from_hscc(0.1)?;
-                self.ws.k_seed_shift(&k0c, &kc)?;
+                // Stripped tiers — fixed arithmetic, NO residual
+                // measurements in the timed path (they belong in the
+                // validation benchmark, ~4 products + host syncs each
+                // eval otherwise).
+                if lite {
+                    self.ws.refresh_b_zh()?;                    // B₁ = Z₀·H₁      (1)
+                    if linear {
+                        let s = self.central.as_ref().unwrap();
+                        let eta = eta_sc / (s.emax - s.emin).max(1e-6);
+                        self.ws.linear_response(eta, &s.x0, &s.p0)?;    // X,Y,update (3)
+                    } else if n_dmm > 0 {
+                        let (emin, emax) = { let s = self.central.as_ref().unwrap(); (s.emin, s.emax) };
+                        self.ws.dmm_descend(emin, emax, n_dmm, eta_sc, 0)?;   // 3/step
+                    }
+                    return Ok((PurifyStatus::Converged, f32::NAN, f64::NAN, 0));
+                }
+                let (emin, emax) = if seed_mode != 0 {
+                    let b = self.ws.compute_k0_from_hscc(0.1)?;
+                    self.ws.k_seed_shift(&k0c, &kc)?;
+                    b
+                } else {
+                    self.ws.refresh_b_zh()?;
+                    (emin_c, emax_c)
+                };
                 if dbg { eprintln!("    [vib] after seed:   R_H={:.3e}", self.ws.rh_stationarity()?); }
+                if metric {
+                    self.ws.metric_transport()?;
+                    if dbg { eprintln!("    [vib] after metric: R_H={:.3e}", self.ws.rh_stationarity()?); }
+                }
                 if n_dmm > 0 {
                     self.ws.dmm_descend(emin, emax, n_dmm, eta_sc, n_ret)?;
                     if dbg { eprintln!("    [vib] after DMM:    R_H={:.3e}", self.ws.rh_stationarity()?); }
@@ -1416,6 +1536,25 @@ impl SparseDftb {
             self.ws.purify_hscc(self.cfg.tc2_max, tc2_tol)
         };
         let (pstat, r_i, tr, tc2_iters) = r?;
+        if lite {
+            // No certification in the timed path (calibrated recipe).
+            // e_tot=NaN → energy() refuses loudly; forces() only needs
+            // n_scc>0 plus the K/W buffers.
+            self.last = SparseDftbEnergy {
+                e_h0: f64::NAN, e_scc: f64::NAN, e_el: f64::NAN,
+                e_rep: self.e_rep, e_tot: f64::NAN,
+                q: self.q.clone(), tr_ks: f32::NAN, r_i: f32::NAN,
+                n_scc: 1, tc2_iters: 0, k_pad: vec![], h_scc_pad: vec![],
+                v: self.v.clone(), r_scc: 0.0, r_h: f32::NAN,
+                purify_status: PurifyStatus::Converged,
+            };
+            self.k_warm = true;
+            return Ok(SparseDftbScc {
+                n_iters: 1, rms: 0.0, r_scc: 0.0, tr_ks: f32::NAN,
+                r_i: f32::NAN, r_h: f32::NAN,
+                purify_status: PurifyStatus::Converged,
+            });
+        }
         if pstat == PurifyStatus::NumericalFloor && !self.cfg.accept_numerical_floor.unwrap_or(true) {
             return Err(DftbError::InvalidInput(format!(
                 "scc_fixedq: TC2 NumericalFloor (R_I={r_i:e} > tol={}) — forces not validated",
@@ -1437,10 +1576,16 @@ impl SparseDftb {
         // cold-path floor (~1e-4 on R10): subspace error poisons forces
         // far below the gross-error gate, so the seeded default is
         // stricter. `RUST_DFTB_VIB_RHGATE` overrides both.
+        // RUST_DFTB_VIB_GATES=0 = calibrated production recipe: skip the
+        // per-column R_H certification (~2 SpGEMMs + host norm). Only for
+        // a recipe already validated against cold columns — the gate is
+        // the safeguard that catches wrong-subspace states (see above).
+        let gates_on = std::env::var("RUST_DFTB_VIB_GATES").ok()
+            .and_then(|v| v.parse::<usize>().ok()).unwrap_or(1) != 0;
         let rh_gate = std::env::var("RUST_DFTB_VIB_RHGATE").ok()
             .and_then(|v| v.parse::<f64>().ok())
             .unwrap_or(if seeded { 1e-4 } else { 5e-4 });
-        let r_h = self.ws.rh_stationarity()?;
+        let r_h = if gates_on { self.ws.rh_stationarity()? } else { f64::NAN };
         if r_h > rh_gate {
             return Err(DftbError::InvalidInput(format!(
                 "scc_fixedq: R_H={r_h:e} > gate={rh_gate:e} (seeded={seeded}, r_I={r_i:e}, Tr(KS)={tr:.6}, tc2_iters={tc2_iters}) — K is idempotent on a wrong occupied subspace; density reuse FAILED. Fix the warm update (‖[K,H]‖ descent, tasks G3) — silent cold re-solve removed."
@@ -1467,14 +1612,21 @@ impl SparseDftb {
         gpu.read_f32(&self.dw_ws.w().values, &mut self.w_vals)?;
         gpu.read_f32(&self.ws.k().values, &mut self.k_vals)?;
         gpu.prof_tick("f.dl");
+        let r = self.contract_forces();
+        self.ws.gpu().prof_tick("f.contract");
+        r
+    }
+
+    /// Host force contraction from the current `k_vals`/`w_vals`/`v` —
+    /// shared tail of `forces()` (relaxed state) and `forces_frozen`
+    /// (snapshot state). No device work.
+    fn contract_forces(&mut self) -> Result<Forces> {
         let ctx = SystemContext::from_sk_data(&self.builder.sk, &self.species)?;
-        let r = sparse_forces_bsr(
+        sparse_forces_bsr(
             &ctx, &self.coords, &self.hs_pairs, &self.k_diag,
             &self.k_vals, &self.w_vals, &self.v, &self.q, &self.q0,
             &self.gamma, &self.repulsive, self.hs_taper,
-        );
-        gpu.prof_tick("f.contract");
-        r
+        )
     }
 
     /// One FIRE step. Call `scc` first. Returns max |F|.

@@ -227,10 +227,14 @@ goes, so optimize the per-evaluation cost:
 | cube_Si65 | 65 | complete | 390 | ~0.46 s | ~1 min | ~3 min |
 | si_sphere_R10 | 330 | deg~175 | 1980 | ~3.5 s | ~5 min | ~1.9 h (extrap.) |
 | si_sphere_R10 | 330 | deg~330 | 1980 | ~4.3–7.3 s | ~10 s* | ~2.5–4 h (extrap.) |
-| si_sphere_R10 | 330 | deg~330, `RUST_DFTB_VIB_FROZEN` | 1980 | **12 ms** | ~10 s* | **23 s measured** |
+| si_sphere_R10 | 330 | deg~330, `RUST_DFTB_VIB_FROZEN` (clamped) | 1980 | **5.5 ms** | ~10 s* | ~15–20 s (extrap.) |
+| si_sphere_R10 | 330 | deg~330, `FIXQ+DMUPD+LITE DMM=2 NSMAX=2` | 1980 | **~64 ms** | — | ~2 min (extrap.) |
+| si_sphere_R10 | 330 | deg~330, `FIXQ+DMUPD+LITE DMM=4 NSMAX=2` | 1980 | **~105 ms** | — | ~3.5 min (extrap.) |
+| si_sphere_R10 | 330 | deg~330, `FIXQ=1` cold | 1980 | ~345 ms | — | ~11 min (extrap.) |
 
 \* R10 relax numbers are from the pre-relaxed geometry; a cold relax was
-~5 min (75 FIRE steps) at deg175.
+~5 min (75 FIRE steps) at deg175. Warm-tier column errors measured at
+h=0.02 Å vs cold fixq: clamped 6.3%, lite-DMM2 3.1%, lite-DMM4 1.0%.
 
 Two important things this table exposes:
 
@@ -242,13 +246,16 @@ Two important things this table exposes:
   *refuted*: the truncated-map fixed point repels a warm seed).
   Counterintuitively deg330 is *slower* per eval than deg175 — 12 ms vs
   2.7 ms per K·S·K — and deg175's purifier floor-churns anyway.
-- **`RUST_DFTB_VIB_FROZEN=1`** computes the FD Hessian with a **frozen
-  density matrix** (V rebuilt from the minimum's charges, no SCC at
-  displaced geometries): ~12 ms/eval → R10 in 23 s. **Accuracy warning
-  (measured on si10h16):** framework modes within ~1–9 cm⁻¹ of full SCC,
-  but Si–H stretches ~240 cm⁻¹ (10%) too soft — the charge response
-  stiffens the highest modes. Use for previews/framework bands, not for
-  quantitative stretch frequencies.
+- **`RUST_DFTB_VIB_FROZEN=1`** computes the FD Hessian with the **entire
+  electronic state clamped** at the central snapshot — `D=D₀`, `W=W₀`,
+  `q=q₀` (the "frozen-orbital" / clamped-electron approximation: the
+  SCF Lagrangian differentiated with orbitals AND Lagrange multipliers
+  frozen). Only explicit geometry dependence runs per eval → **zero
+  device products, ~5.5 ms/eval**. Measured Hessian-column error vs
+  cold fixq: **~6.3%** (h-independent). On si10h16 frequencies:
+  framework modes within ~1–9 cm⁻¹ of full SCC, but Si–H stretches
+  ~240 cm⁻¹ (10%) too soft — the charge response stiffens the highest
+  modes. Screening/framework tier, not quantitative stretches.
 - **`RUST_DFTB_VIB_FIXQ=1`** (recommended production mode) freezes the
   SCC *charges* at the minimum but still solves the density matrix for
   each displaced `H_scc` (one purify, no DIIS loop): si10h16 matches
@@ -261,10 +268,23 @@ Two important things this table exposes:
 - Every ±h column now restores a snapshot of the central converged
   state (`snapshot_electronic_state`) — identical solver history per
   column, no FD asymmetry from chained solves.
-- `RUST_DFTB_VIB_DMUPD` (δK0 warm seed + McWeeny polish) exists but is
-  **refuted**: it converges to a projector that is idempotent yet not
-  stationary w.r.t. H (R_H~1e-3 vs cold ~1e-7–1e-4) — si10h16 spectrum
-  off ~300 cm⁻¹. Guarded by an R_H check with cold fallback.
+- **`RUST_DFTB_VIB_DMUPD=1`** (warm density update, needs `FIXQ=1`):
+  reuses the central projector and descends the generalized-commutator
+  residual via **DMM steps** `δK = −η(X + Xᵀ − 2Y)`, `X = (Z·H)·K`,
+  `Y = (K·S)·X` — 3 SpGEMMs/step, per-step K symmetrization. Recommended
+  seedless (`VIB_SEED=0` — the δK0 initializer seed contaminates the
+  manifold; measured refuted). **Production tiers** (h=0.02 Å, R10):
+  `VIB_LITE=1 VIB_DMM=2 VIB_NSMAX=2 VIB_NSTOL=3e-5` → ~64 ms/eval @ 3.1%
+  column error; `VIB_DMM=4` → ~105 ms @ 1.0%. `VIB_LITE` strips ALL
+  per-eval residual gates/measurements (calibrated recipes only — use
+  the gated `DMUPD` path, ~175 ms, to validate a new recipe first).
+  `VIB_LINEAR=1` is a 4-product single-response tier — measured refuted
+  (6.7%, dominated by the free clamped mode). Knobs: `VIB_DMM` /
+  `VIB_DMM_ETA` (η·Δε, 8) / `VIB_DMM_RET` (retraction interval — now 0
+  in lite; retractions *hurt*, H-blind) / `VIB_NSMAX`/`VIB_NSTOL` (warm
+  NS cap — 1 Newton update is what unlocks <6% accuracy) /
+  `VIB_GATES=0` (skip R_H certification). Report:
+  `doc/prokop/reports/2026-09-16_sparse_dmm_warm_density_hessian.md`.
 
 Full bottleneck analysis + recommendations:
 `doc/prokop/topical_audit/hessian_eval_bottleneck.md`.

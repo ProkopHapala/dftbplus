@@ -405,6 +405,164 @@ The same corner is hard for the CPU f64 solver too (needs the most DIIS
 iterations, limit-cycle floor ~1e-8). If this matters for production,
 diagnose the residual trajectory — do not raise max_iter blindly.
 
+## Part 3 — Block-Jacobi solver implemented + first true device-time profile (2026-09-16 pm)
+
+A new eigensolver architecture (`block_jacobi_1wg`, `src/qmqm/gpu_block_jacobi.cl`,
+selected by `RUST_DFTB_EIGSOLVER=block`; the direct kernel stays the default) plus
+the first `RUST_DFTB_PROF=evt` per-stage device-time profile of the production
+SCC pipeline. The profile **changes the bottleneck ranking** — several beliefs
+from Parts 1–2 need revision.
+
+### Measured per-stage device time (marker-event spans, `RUST_DFTB_PROF=evt`)
+
+Caveat: values accumulate over all batch sizes run (1/100/400); `dev%` shares
+and per-call magnitudes are the reliable quantities. Marker spans include
+inter-stage idle, so small stages are mildly inflated by queue starvation.
+
+**GC (n=86), direct vs block:**
+
+| stage | direct dev | direct % | block dev | block % |
+|---|---:|---:|---:|---:|
+| scc.jacobi | 840 ms | **79.6%** | 1255 ms | **82.4%** |
+| scc.diis | 54 | 5.1 | 55 | 3.6 |
+| scc.eigh_finish (warm = `snormalize_batched`) | 50 | 4.7 | 50 | 3.3 |
+| scc.density (`build_density_occ_batched`) | 43 | 4.0 | 45 | 3.0 |
+| scc.fermi_occ (block only; direct has fused tail) | — | — | 43 | 2.8 |
+| scc.gemm_th + gemm_th2 (cᵀHc projection) | 49 | 4.6 | 49 | 3.2 |
+| scc.hscc / mulliken / extract / occ | ~17 | ~1.6 | ~18 | ~1.2 |
+| **wall scc b=400** | **352 ms, 80 it, 0 fail** | | **508 ms, 100 it, 2 fail** | |
+
+**DTH (n=246), direct vs block:**
+
+| stage | direct dev | direct % | block dev | block % |
+|---|---:|---:|---:|---:|
+| scc.jacobi | 13 697 ms | 77.2% | 3 872 ms (60.5/call) | **49.9%** |
+| scc.density | 2 022 | 11.4 | 1 929 (30.1 ms/call) | **24.9%** |
+| scc.eigh_finish (snorm) | 1 394 | 7.9 | 1 326 (20.7 ms/call) | **17.1%** |
+| scc.gemm_th + gemm_th2 | 471 | 2.7 | 438 | 5.6 |
+| scc.mulliken | 122 | 0.7 | 118 | 1.5 |
+| scc.fermi_occ (block only) | — | — | 27 | 0.4 |
+| scc.hscc / diis / rest | ~40 | ~0.2 | ~40 | ~0.6 |
+| **wall scc b=400** | **5 916 ms, 16 it** | | **2 584 ms, 16 it (2.3×)** | |
+
+### Fact 1 — the production Jacobi does REAL sweeps every iteration; the "warm = 0 sweeps" assumption was wrong for 2D scans
+
+Standalone warm probe (exactly-diagonal input): 0.04 ms/launch (direct, n=86,
+b=400). Production `scc.jacobi`: **3.13 ms/call** (direct) / **4.48 ms/call**
+(block) — i.e. ~1–3 real sweeps per iteration, every iteration. Each charge
+update re-excites the off-diagonals of `hp = cᵀH_scc c` by O(‖ΔH_scc‖), which is
+not below `JACOBI_OFF_TOL=1e-6`. The earlier "p90 = 0 sweeps" observation held
+for a different workload (near-equilibrium), not the 2D scan far corners.
+**The warm path is not free — it is a small but real eigensolve each step.**
+
+### Fact 2 — block Jacobi fixed the large-N problem, not the medium-N one
+
+- n=246: 214 → 60.5 ms/call (3.5×); solves the global-traffic bottleneck exactly
+  as designed (pivot-only local memory, row-owner writeback, ~8.4 KB/WG).
+- n=86: 3.13 → 4.48 ms/call — **slower**. At n=86 the direct kernel is already
+  latency- not bandwidth-bound (A fits in L2), and the block kernel pays more
+  per-WG serial latency: nb=6 → 15 serial block-pair ops, each an inner
+  Brent–Luk solve with barriers, while 64 of 96 threads idle during each inner
+  solve. Occupancy is not the limiter here — per-WG critical path is.
+
+### Fact 3 — after the block fix, the *supporting* O(N³) kernels are the new bottleneck at N=246
+
+Both are memory-streaming implementations of what should be tiled GEMMs:
+
+- **`snormalize_batched`** (warm `eigh_finish`, runs EVERY iteration): one WG per
+  (replica, column) — 98 400 WGs at b=400/n=246, each streaming the **full S
+  matrix (242 KB)** to compute `t_s = S·c_k` then `cᵀt_s`. ≈ **24 GB** of global
+  traffic per call → measured 20.7 ms ≈ 1.2 TB/s effective — pure bandwidth.
+  Exists only to arrest f32 column-norm drift of the warm basis.
+- **`build_density_occ_batched` under Fermi smearing**: `use_w=1` ⇒ `n_occ=n`
+  → a **full rank-N outer product** (D = 2·C·diag(w)·Cᵀ), each thread loops all
+  n columns with 2 gathers/FMA → ≈12 GB/call → measured 30.1 ms ≈ ~200 GFLOPS.
+  A column-scale + tiled SYRK-class kernel would be ~10× faster; and at
+  kT=0.002 only ~n_occ+few columns have w>1e-6 — the occupied-index-list
+  machinery (`loi`) already exists unused on this path.
+- `gemm_th`/`gemm_th2` (the projection GEMMs) are already tiled and cheap
+  (2.8–5.6%): the pipeline's own GEMMs show the headroom is real.
+
+### Fact 4 — lockstep tax is real and measurable
+
+`iters` = max over 400 replicas (GC: 80 direct / 100 block — **2 marginal
+far-corner replicas drag the whole batch to the cap**). Parked replicas still
+occupy WGs every launch (cheap early-exit, but the scheduler slot is spent).
+GC block-mode: iters 80→100 vs direct — the stragglers cost +20 iters × 400
+replicas of every kernel.
+
+### Fact 5 — local-memory occupancy measured (pyopencl build query)
+
+| kernel | WG | local/WG | → WGs/SM by local(48KB) | by threads(1536) |
+|---|---:|---:|---:|---:|
+| direct (fused Fermi tail) | 512 | 13.0 KB | 3 | 3 |
+| block n=86 | 96 | 8.9 KB | 5 | 16 |
+| block n=246 | 256 | 9.5 KB | 5 | 6 |
+
+The block slimming did its job (dead Fermi scratch gone: −4.1 KB). But
+`CL_KERNEL_PRIVATE_MEM_SIZE` reports 0 on this NVIDIA driver (unavailable),
+and `CL_KERNEL_WORK_GROUP_SIZE` reports **256 even for the WG=512 direct
+build** — either a driver quirk or the kernel is register-limited to ≤256
+threads/WG (launches at 512 demonstrably succeed and give correct results, so
+the report is at minimum unreliable). **Registers are probably the true
+residency limiter — needs `ncu` (`launch__registers_per_thread`,
+`sm__warps_active`) on a real launch to settle.** If block @n=86 gets ~4–6
+WGs/SM it is near the residency ceiling and per-WG latency (Fact 2) is what
+remains.
+
+### Roofline for the "≥100× vs 1 CPU thread" target
+
+CPU-sequential baseline for the same 400 GC points ≈ 4.9 s → 100× needs
+**≤49 ms total ≈ ≤0.6 ms/iter** at ~80 iters. Measured today: 4.4–5.1 ms/iter
+wall. Even a *zero-cost* eigensolver leaves ~0.9 ms/iter of non-eigen device
+work at n=86 (diis 0.20 + snorm 0.18 + density 0.16 + fermi 0.15 + gemms 0.18 +
+mulliken 0.03 + hscc 0.02) → ~70 ms → **~70× ceiling** with the current
+supporting kernels. To actually reach ~100× at n≈85, ALL of these must hold:
+
+1. eigensolver ≈ probe-cost or replaced by a GEMM-class method (below),
+2. density + snorm at tiled-GEMM efficiency (~5–10× each),
+3. tail compaction so iters ≈ mean not max.
+
+At n=246 the same analysis gives a ~2–3× further win on top of the current
+2.3× block gain, i.e. ~50× vs CPU-seq — N=246 may also want >1 WG per replica
+(block-pairs are independent enough for a 2-WG split) or accept it.
+
+### Ranked hypotheses / candidate levers (for discussion)
+
+- **H-A (biggest single win now, N≥120):** rewrite `snormalize_batched` +
+  `build_density_occ` as GEMM-class kernels. Density: column-scale `c` by
+  `√w` then lower-triangle tiled GEMM — reuses `matmul_tiled` machinery.
+  Est. −35–40% dev at n=246. Alternative cheaper still: cut `occ_w` at a
+  threshold → `n_eff` ≈ 35–45 columns (vs 246) on the existing rank-update
+  kernel — controlled error, must be measured vs PES parity.
+- **H-B (cheap):** snorm drift is *slow* — amortize to every k-th iteration
+  or gate it on a cheap orthonormality check, not every iteration.
+- **H-C (algorithmic, the real "≥100×" candidate):** in the warm near-diagonal
+  basis the SCC loop needs the *projector response*, not eigenpairs. Options:
+  (i) first-order density update `ΔD_ij = (w_j−w_i)·hp_ij/(ε_j−ε_i)` — O(n²)
+  elementwise, degeneracies handled via the Fermi window; (ii) 1–2
+  Newton–Schulz/Chebyshev projector steps as dense GEMMs (the sparse path
+  already does DMM/TC2 for exactly this reason); (iii) CheFSI/LOBPCG on the
+  n_occ subspace (n²·n_occ ≪ n³). Each removes sweeps AND their barriers;
+  Fermi μ comes from Tr(DS)=N_e instead of eigenvalues. Numerics must be
+  re-validated against the PES/force parity test — this changes *what* is
+  converged, not just how fast.
+- **H-D (structural):** `active_ids` compaction — parked replicas stop
+  consuming WG slots in the tail; recovers up to ~2× on straggler-bound
+  batches (GC). 
+- **H-E (structural, end-game):** persistent per-replica WG executing the
+  WHOLE SCC iteration (or solve) without kernel boundaries — eliminates the
+  ~10 boundary drains/iter AND the lockstep (each WG exits on its own
+  convergence). This is what "throughput = n_replicas" actually requires.
+  Cost: every stage becomes WG-local (a 96-thread GEMM is fine when 400 WGs
+  run concurrently); DIIS already per-replica on device.
+- **H-F (immediate measurement):** `ncu` on both kernels at production batch —
+  registers/thread, achieved occupancy, warp stall reasons. Settles whether
+  n=86 is latency- or residency-bound. Also A/B `B=8` pivot and `WG∝N`
+  variants at fixed kernel.
+- **H-G (correctness, open):** GC block-mode 2-replica marginal failure at the
+  far corner — diagnose stop-code/off-norm trajectory, do NOT paper over.
+
 ## Test/inventory changes
 
 - `tests/gpu_hbond_physics.rs::test_gc_ptscan_pes_forces_vs_cpu` (new;

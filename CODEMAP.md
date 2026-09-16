@@ -28,7 +28,9 @@ QM/QM fragment solver with OpenCL GPU offload. Python utilities (`pyBall/`,
 - `data/` — shared molecular inputs: `data/xyz/` (XYZ geometries), `data/mol/`
   (mol2).
 - `tests/` — upstream-style test reference data: `tests/dftb/*_ref/`,
-  `tests/grid/`. Inputs + reference outputs only — **no debug dumps**.
+  `tests/grid/`, `tests/pbc_fortran/` (Fortran reference for
+  `rust_dftb/tests/gpu_pbc_fortran.rs`). Inputs + reference outputs only —
+  **no debug dumps**.
 - `scripts/` — **reusable kept scripts** (Python/Bash) shared across tasks.
   Outputs go to `debug/`, never here. Key scripts:
   - `run_dftbplus_ref.py` — runs the Fortran DFTB+ binary on an XYZ, parses
@@ -53,7 +55,7 @@ QM/QM fragment solver with OpenCL GPU offload. Python utilities (`pyBall/`,
   - `compare_rust_vs_dftbplus.py` — numerical parity report (charges, eigenvalues,
     gaps).
   - `plot_formic_scan.py` — plots 1D/2D proton-transfer scan data from
-    `rust_dftb/debug/formic_dimer_scan/*.tsv`. Produces energy PES, Mulliken
+    `debug/formic_dimer_scan/*.tsv`. Produces energy PES, Mulliken
     charge, parity, and 2D contour plots (handles NaN for unconverged points).
   - `geometry_engine.py`, `plot_hbond.py`, `run_formic_dimer_*.sh`.
 - `debug/` — **all debug artifacts** (PNGs, scratch CSVs, SCC dumps, one-off
@@ -85,12 +87,16 @@ QM/QM fragment solver with OpenCL GPU offload. Python utilities (`pyBall/`,
     `bsr4.rs`, `gpu_sparse.rs`, `sparse_bsr4_purification.cl`,
     `davidson.rs` (generalized Davidson for `H C = S C ε`, frontier orbitals),
     `sparse_forces.rs` (P3: sparse D=2K, W=2KHK via masked SpGEMM),
-    `sparse_system.rs` (GPU BSR workspace), **`sparse_dftb.rs`** (production
-    owner: `SparseDftb::new` / `set_coords` / `scc` / `forces` / `fire_step` /
-    `md_step` / `relax` — compile once, persistent buffers). Drive with
+    `sparse_system.rs` (GPU BSR workspace: TC2/FF32 purify, `dmm_descend`
+    warm-density commutator update, `linear_response` stripped first-order
+    tier, `snapshot_p0_x0` central-metric snapshots, projector diagnostics),
+    **`sparse_dftb.rs`** (production owner: `SparseDftb::new` / `set_coords` /
+    `scc` / `forces` / `fire_step` / `md_step` / `relax` — compile once,
+    persistent buffers; FD Hessians via `sparse_vibrations`, mode knobs
+    `RUST_DFTB_VIB_*` — see `userguide/sparse_vibrations.md`). Drive with
     **`dftb_engine --script rust_dftb/scripts/test_sparse_dftb_sih4.rhai`**
-    (userguide `sparse_dftb.md`). Smoke: `tests/sparse_dftb.rs`. Physics gates
-    G3/F/G still use `scc.rs` (allocating).
+    (userguide `sparse_dftb.md`). Smoke: `tests/sparse_dftb.rs`. Report:
+    `doc/prokop/reports/2026-09-16_sparse_dmm_warm_density_hessian.md`.
 - `src/qmqm/` — multi-fragment QM/QM solver + GPU runtime: `fragment.rs`,
   `solver.rs`, `mixer.rs`, `shifts.rs`, `gamma.rs`, `charges.rs`,
   `gpu_driver.rs`, `gpu_runtime.rs`, `gpu_matrix.rs`, `gpu_prep.rs`,
@@ -107,7 +113,8 @@ QM/QM fragment solver with OpenCL GPU offload. Python utilities (`pyBall/`,
   `gpu_hermitian.rs` + `gpu_pbc_plan.rs` + `gpu_pbc.rs`/`.cl` +
   `pbc_cell.rs` (complex-Hermitian PBC/k-point path — `GpuPbc` driver:
   SK image pairs, Ewald γ, Bloch fold, batched `n_rep` SCC; Fortran
-  parity `tests/gpu_pbc_fortran.rs` + `tests/pbc_fortran/`),
+  parity `rust_dftb/tests/gpu_pbc_fortran.rs` + repo-root
+  `tests/pbc_fortran/` reference data),
   `methods/dftb/forces.rs::repulsive_energy_pbc` (image-cell E_rep for
   `pbc_eval`).
   Drive it with **`dftb_engine --script rust_dftb/scripts/*.rhai`** (see
@@ -184,13 +191,18 @@ QM/QM fragment solver with OpenCL GPU offload. Python utilities (`pyBall/`,
 
 ## Folder & artifact policy (concise)
 
-- **`debug/`** — all debug output goes here as `debug/<topic>/`. **Never `git add`
-  anything under `debug/`.** Not gitignored (kept navigable); rule is by convention.
-  Stage with `git add -A -- . ':!debug/'` and review `git status` before committing.
+- **`debug/`** — all debug output goes here as `debug/<topic>/`. **Gitignored —
+  never committed** (all artifacts are regenerable).
+- **`rust_dftb/` crate sanity** — the crate holds source, Cargo tests (`.rs` +
+  small code helpers), and crate tooling only. **No `debug/`, `work/`, scan dumps,
+  or other generated artifacts inside the crate.** Test reference data →
+  top-level `tests/`; diagnostics/artifacts → top-level `debug/`.
 - **`scripts/`** — reusable kept scripts. Write outputs to `debug/`, never into
   `scripts/` or task folders.
 - **`doc/prokop/tasts/<task>/`** — Markdown specs only. No `scripts/`/`artifacts/`
   subfolders.
 - **`tests/`** — reference data + inputs only. Debug dumps → `debug/scc/`.
-- Before every commit: confirm nothing under `debug/` is staged, no large/regenerable
-  files (`.png`, `.csv`, `.xyz`, `.log`) staged unless intended.
+  Regeneration scratch lives in a gitignored `work/` subdir (e.g.
+  `tests/pbc_fortran/work/`).
+- Before every commit: review `git status`; no large/regenerable files (`.png`,
+  `.csv`, `.xyz`, `.log`) staged unless intended.

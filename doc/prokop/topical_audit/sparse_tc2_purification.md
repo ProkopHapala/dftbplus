@@ -70,6 +70,25 @@ match to ~1e-5–1e-4 e, consistent with the TC2 tolerance.
   sparse implicit operator (`CholeskyTransformedOperator`) with sparse SpMV
   and triangular solves — see `chebyshev_ritz_eigensolver.md`.
 
+## Update (2026-09-16) — two-phase purify + DMM warm update
+
+- **Two-phase production policy** (`sparse_system.rs::tc2_purify`, report
+  §15.15): Phase A = bounded f32 TC2 (budget = caller's `tc2_max`, production
+  default 30) with a floor-stop on `trace_locked && best_ri < ff_switch &&
+  5-check stall`; Phase B = optional terminal **FF32 McWeeny polish**
+  (`tc2_hiacc` / `RUST_DFTB_TC2_FF`, ≤5 steps, `PolishedFF` status). FF
+  kernels: `FF_LO_GLOBAL` + `FF_ACC2` default-on → 27.4 ms/step ≈ 4.0× an
+  f32 iter at deg330. rk40: floor 2.7e-7 → R_I64 2.8e-8; rk20 stays
+  mask-limited ~3e-5 — by design.
+- **DMM warm update** (`dmm_descend`, `RUST_DFTB_VIB_DMUPD`): for small
+  geometry displacements (FD Hessians), purification from a warm seed is
+  *repelling* (masked fixed point) — the correct warm update minimizes
+  ‖[K,H]‖: `δK=−η(X+Xᵀ−2Y)`, `X=(Z·H)·K`, `Y=(K·S)·X`, Z=S⁻¹, plus
+  McWeeny retraction. Validated 0.30% ΔF vs cold at ~25% lower cost.
+  Report: `reports/2026-09-16_sparse_dmm_warm_density_hessian.md`.
+- **Note:** workspace `Z` is **S⁻¹** (Newton `Z←2Z−ZSZ`), not S⁻¹ᐟ² — a
+  derivation assuming the root produces an ascent direction (measured).
+
 ## Related
 
 - `/doc/prokop/reports/2025-09-05_scc_charges_davidson_parity.md` — session report.

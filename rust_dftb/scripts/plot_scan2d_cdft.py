@@ -81,7 +81,7 @@ for ax, tag in zip(axes[n_map:], ct_tags):
     fig.colorbar(cf, ax=ax, shrink=0.85)
     ax.set_xlabel("d1 [A]"); ax.set_ylabel("d2 [A]")
 
-out = f"/home/prokop/git/dftbplus/rust_dftb/debug/{out_name}.png"
+out = f"/home/prokop/git/dftbplus/debug/{out_name}.png"
 fig.savefig(out, dpi=150)
 print("wrote", out)
 for tag in tags:

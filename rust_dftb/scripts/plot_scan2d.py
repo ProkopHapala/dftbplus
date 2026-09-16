@@ -44,7 +44,7 @@ ax.set_xlabel("d1 = r(N6-H21) [A]"); ax.set_ylabel("d2 = r(N15-H27) [A]")
 ax.set_title(f"7-azaindole dimer SCC PES, {NP}x{NP} batch, kcal/mol above min")
 fig.colorbar(cf, label="E - E_min [kcal/mol]")
 fig.tight_layout()
-out = "/home/prokop/git/dftbplus/rust_dftb/debug/azaindol_2d_scan_Emap.png"
+out = "/home/prokop/git/dftbplus/debug/azaindol_2d_scan_Emap.png"
 fig.savefig(out, dpi=150)
 print("wrote", out)
 print(f"E_min={E.min():.6f} Ha at d1={d1[im]:.2f} d2={d2[im]:.2f}; "

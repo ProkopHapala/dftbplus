@@ -41,6 +41,10 @@ implementations of the same concept across Rust, Fortran, Python, and OpenCL.
 - **sparse_nanocrystal_vibrations.md** — sparse GPU DFTB for vibrational
   calculations on Si/H nanocrystals. See
   `tasts/Sparse_Nanocrystal_Vibrations/Sparse_Nanocrystal_Vibrations.manifest.md` §0.
+- **hessian_eval_bottleneck.md** — per-eval cost breakdown of the sparse
+  FD Hessian (SCC = >98%); mode ladder A (frozen) / B (fixed-q) / C (DMM
+  warm update — implemented, 0.3% ΔF at ~25% vs cold); batch-parallel
+  columns is the product-level fix.
 - **cdft_constraints.md** — constrained DFT (fragment Mulliken-charge
   constraints) on the dense GPU solver: the λ-shift enters `h_scc` as
   `½λ·S·(w_μ+w_ν)`, so one kernel + an outer-λ host loop give

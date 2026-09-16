@@ -1269,7 +1269,10 @@ atom 0, `RUST_DFTB_PROF=mark`; full detail in
   `RUST_DFTB_VIB_FROZEN`: R10 Hessian = **23 s** (12 ms/eval, 1980
   evals). Accuracy on si10h16: framework modes ±1–9 cm⁻¹ of full SCC,
   but Si–H stretches **~240 cm⁻¹ soft** (charge response stiffens the
-  top modes). Preview/framework tool, not quantitative.
+  top modes). Preview/framework tool, not quantitative. *(2026-09-16:
+  re-implemented as the explicit clamped-electron freeze — `W₀`
+  snapshotted, ZERO device products → 5.5 ms/eval, ~6.3% column error
+  on R10; see §4.12.1 mode-C update / report §15.17.)*
 - [*] **Warm-seeded TC2 implemented and REFUTED** —
   `purify_hscc_warm()` + `RUST_DFTB_WARM_K`: seeding stored converged K
   walks away from the fixed point (r_I doubles every eval, nonsense
@@ -1297,6 +1300,29 @@ atom 0, `RUST_DFTB_PROF=mark`; full detail in
   warm update must minimize ‖[K,H]‖ (LNV/DMM commutator descent), not
   polish idempotency. R_H gate (`rh_stationarity`, default 5e-4) now
   validates warm results and cold-restarts on failure.
+- [*] **Mode C SOLVED via DMM commutator descent (2026-09-16)** —
+  `dmm_descend` (`sparse_system.rs`), `δK=−η(X+Xᵀ−2Y)` with `X=(Z·H)·K`,
+  `Y=(K·S)·X`, Z=S⁻¹: 3 SpGEMMs/step + planned McWeeny retraction every
+  `ret` steps. Defaults `VIB_DMM=6, VIB_DMM_ETA=8, VIB_DMM_RET=2,
+  VIB_MCPOL=0, VIB_TC2MAX=0` (post-polish *raises* R_H — off). R10,
+  h=0.05 Å: R_H 4.2e-5 (vs cold 8e-5), **ΔF 0.30% vs cold fixq**,
+  ~260–340 ms/eval ≈ 25% faster than cold. Bugs fixed: Z=S⁻¹ root cause
+  of the ascent direction; bsym plan on asymmetric X → generic
+  `plan_tk_g`; redundant `T·ZHZ=Xᵀ` removed. Report:
+  `reports/2026-09-16_sparse_dmm_warm_density_hessian.md`.
+- [*] **Stripped tiers + frozen-orbital correction (2026-09-16, same
+  report)** — the "stale b_zh" was the CORRECT clamped-electron
+  approximation (`W=W₀`, not `Z(R)H(R)K₀` — the hybrid keeps half a
+  cancelling response → 86% err). Now explicit `W₀` snapshot;
+  `forces_frozen` = 0 device products, **5.5 ms @ 6.3% column error**.
+  New `VIB_LITE`/`VIB_LINEAR` strip all per-eval residual gates (~40%
+  of warm-eval cost was certification). Measured ladder (h=0.02):
+  clamped 5.5 ms/6.3% → **1 Newton + DMM2-lite 64 ms/3.1%** →
+  **+DMM4 105 ms/1.0%** → cold 345 ms. Z accuracy is the discriminator
+  (central Z caps at ~6%; 1 Newton update → R_Z 1.4e-5 unlocks <6%).
+  Refuted by measurement: linear1 (6.7% ≈ frozen at 6× cost), metric
+  transport (99%), retractions in lite mode (H-blind, hurt). Remaining
+  10× lever: batch-parallel ±h columns.
 - [*] **Floor-stop wins measured** — `RUST_DFTB_VIB_TC2TOL=5e-5` (above
   the deg330 floor 4.1e-5): purify converges at **25 iters** instead of
   plateau-churning to 80. Same Hessian accuracy (si10h16 rms 6.3 vs

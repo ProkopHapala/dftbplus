@@ -19,7 +19,7 @@ import os
 
 XYZ = "/home/prokop/git/dftbplus/data/xyz/azaindol_dimer.xyz"
 OUT_XYZ = "/home/prokop/git/dftbplus/data/xyz/azaindol_2d_scan_20x20.xyz"
-OUT_PNG = "/home/prokop/git/dftbplus/rust_dftb/debug/azaindol_2d_scan_dofs.png"
+OUT_PNG = "/home/prokop/git/dftbplus/debug/azaindol_2d_scan_dofs.png"
 
 NP = 20          # points per axis
 D0, DSTEP = 1.0, 0.05   # Angstrom — same convention as the GC 1D scan

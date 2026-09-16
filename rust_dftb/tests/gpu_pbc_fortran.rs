@@ -1,7 +1,7 @@
 //! Finite-precision parity test: Rust GPU PBC path vs the Fortran DFTB+
 //! reference implementation.
 //!
-//! Reference data lives in `tests/pbc_fortran/`:
+//! Reference data lives in repo-root `tests/pbc_fortran/` (outside the crate):
 //!   - `dftb_in.hsd`   — periodic C-O chain, 4 explicit fractional
 //!                       k-points, SCC, mio-1-1
 //!   - `reference.txt` — extracted charges/eigenvalues/energies
@@ -19,7 +19,7 @@
 use rust_dftb::qmqm::gpu_pbc::GpuPbc;
 use rust_dftb::qmqm::gpu_runtime::GpuRuntime;
 
-const REF_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/pbc_fortran/reference.txt");
+const REF_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/pbc_fortran/reference.txt");
 
 /// Flat `key = v1 v2 ...` file parser.
 fn parse_reference(path: &str) -> std::collections::HashMap<String, Vec<f64>> {
@@ -42,7 +42,7 @@ fn sk_dir() -> Option<String> {
     if std::path::Path::new(&dir).is_dir() { Some(dir) } else { None }
 }
 
-/// Geometry must mirror tests/pbc_fortran/dftb_in.hsd exactly.
+/// Geometry must mirror repo-root tests/pbc_fortran/dftb_in.hsd exactly.
 /// Returns (species, coords Å, lattice Å, k_frac, k_weights).
 fn cchain_input() -> (Vec<String>, Vec<[f64; 3]>, [[f64; 3]; 3], Vec<[f64; 3]>, Vec<f32>) {
     let species = vec!["C".to_string(), "O".to_string()];

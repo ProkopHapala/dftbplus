@@ -34,3 +34,9 @@ overcome, and open issues. Chronological order.
   floor ~1e-8 diagnosed via convergence plots) + **20×20-scan saturation
   benchmark** on 7 systems (H2O→DTH, N=6–246, batch 1–400): 52–342k sys/s,
   8.5–157× vs sequential CPU; Jacobi O(N³) bound at large N.
+- **2026-09-16_sparse_dmm_warm_density_hessian.md** — **sparse DMM warm-density
+  update for FD Hessians** (R10, 330 Si): 3-SpGEMM generalized-commutator step
+  `δK=−η(X+Xᵀ−2Y)` + planned McWeeny retraction, seeded from the central
+  projector. 0.30% ΔF vs cold at ~0.3 s/eval (~25% faster). Bugs fixed: Z=S⁻¹
+  (not S⁻¹ᐟ²) ascent-direction root cause; bsym plan on asymmetric operand
+  (silent T·Xᵀ). Honest accounting of why warm ≠ 10× yet + open Tier-1 plan.
