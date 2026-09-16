@@ -7,7 +7,25 @@ timestamp: 2026-09-09
 
 # HBond_Relaxed_Scan_GPU — Phase 4 hand-off report
 
-> **2026-09-14 status addendum (read this first).** The P4-era blockers
+> **2026-09-16 addendum (read this first).** PES-shape and force parity vs
+> CPU f64 are now measured, not just single-point |ΔE|: GC N–H···N 19-pt
+> rigid proton-transfer scan, kT=0.002 both paths — **max |ΔΔE| = 3.7e-6 Ha
+> = 0.10 meV** over a 39.7 kcal/mol barrier (barrier err 0.068 meV),
+> **max|ΔF| = 5.5e-6 Ha/Å**, projected scan force err 2.1e-6. f32 error is
+> a mostly-smooth offset (|dE| varies 1.4e-7→3.5e-6 along the scan).
+> Test `tests/gpu_hbond_physics.rs::test_gc_ptscan_pes_forces_vs_cpu`.
+> **20×20-scan throughput** on distinct geometries
+> (`tests/gpu_scc_bench.rs::test_gpu_scc_scan400_benchmark`, batch=400):
+> azaindole 1834 sys/s (22× CPU), GC 923 (12×), AT 1578 (21×),
+> diazaphenalene 477 (11×), DTH N=246 52 sys/s (8.5× — O(N³) Jacobi-bound,
+> not saturated). Closes "real distinct-geometry batch ≥200 run" below.
+> One GC far-corner replica (both protons maximally asymmetric) is
+> *marginally* nonconvergent at tol=1e-6 — diagnose residual trajectory,
+> don't raise max_iter. Full tables:
+> `doc/prokop/reports/2026-09-16_dense_gpu_pes_forces_benchmark.md`;
+> accuracy SSOT `topical_audit/f32_floor_dense_hbond.md` §3.2.
+
+> **2026-09-14 status addendum.** The P4-era blockers
 > below (1×4 crash, atomic accumulation, missing γ′/repulsive forces,
 > Neville tail) are **all stale** — the production solver is now a
 > persistent batched `GpuDftb` with device-resident SCC, DIIS, FIRE,

@@ -28,3 +28,9 @@ overcome, and open issues. Chronological order.
   kernel, ss×sp block indexing).
 - **2025-09-06_scan_plots_and_gamma_fix.md** — formic dimer 2D scan plots and
   gamma function fix.
+- **2026-09-16_dense_gpu_pes_forces_benchmark.md** — **dense-multi GPU PES/force
+  parity vs CPU f64** (GC N–H···N 19-pt proton-transfer scan: shape error
+  0.10 meV, barrier err 0.068 meV, max|ΔF| 5.5e-6 Ha/Å; CPU DIIS limit-cycle
+  floor ~1e-8 diagnosed via convergence plots) + **20×20-scan saturation
+  benchmark** on 7 systems (H2O→DTH, N=6–246, batch 1–400): 52–342k sys/s,
+  8.5–157× vs sequential CPU; Jacobi O(N³) bound at large N.

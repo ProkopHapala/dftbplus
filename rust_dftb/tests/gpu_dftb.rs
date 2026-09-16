@@ -351,3 +351,5 @@ fn test_gpu_dftb_no_loop_allocs() {
     eprintln!("[W10] alloc_count {a0} → {a1} (delta {} across scc+eval+fire+scc+eval)", a1 - a0);
     assert_eq!(a1, a0, "device buffer allocations inside solver loops: +{}", a1 - a0);
 }
+
+

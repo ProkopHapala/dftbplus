@@ -1046,9 +1046,53 @@ below converge on the same mode ladder.
   off ~300 cm⁻¹. Purification can only enforce idempotency+trace; the
   occupied-subspace selection comes only from the H-containing K0
   basin. Kept env-gated; `R_H` gate (5e-4) cold-restarts on failure.
-- [ ] Correct warm update must minimize ‖[K,H]‖: LNV/DMM commutator
-  descent (e.g. K ← K − η·Sym[(I−KS)Z·H·K + h.c.]) before polish.
-  Deferred — measure whether fixq-with-floor-tol already suffices.
+- [x] R10 re-confirmation (2026-09, ACC16 build): DMUPD seed at h=0.02
+  *passes* the R_H gate (2.9e-4, 2 TC2 iters, ~120 ms/eval) yet forces
+  are still ~85% wrong (max|ΔF|=5.1e-2 vs cold 2.8e-2). At h=0.05 the
+  gate correctly rejects (R_H=7e-4; accepted-for-test max|ΔF|=12.8e-2
+  vs cold 6.9e-2). Gate at 5e-4 is NECESSARY but NOT SUFFICIENT —
+  subspace error visible in forces well below it. WARM_K re-refuted on
+  R10: fake rms=0 convergence, R_H=1.4e-2, E_tot off 0.13 Ha.
+- [x] Silent fallbacks REMOVED (fail-loud): `scc_fixedq` R_H gate now
+  hard-errors (warm-seed default 1e-4 — forces were wrong at 2.9e-4 —
+  cold path 5e-4; `RUST_DFTB_VIB_RHGATE` overrides); `scc()` WARM_K
+  purify Err propagates (no `or_else` cold purify); `finalize_scc`
+  gates R_H (default 5e-4, `RUST_DFTB_SCC_RHGATE`, =0 disables) —
+  catches the fake-converged wrong-subspace state at the boundary.
+- [x] Correct warm update — DMM/LNV commutator descent IMPLEMENTED
+  and validated (2026-09): `dmm_descend` in `sparse_system.rs`.
+  Two hard-won correctness fixes along the way:
+  (a) stored Z is **S⁻¹** (Newton Z←2Z−ZSZ), not S^{-1/2} — the
+      (S⁻¹−K)HK form was an *ascent* direction (Tr(H·G)=−15.4,
+      E_band rose, R_H 7e-4→0.10). Correct generalized-overlap
+      direction: δK = −η·Sym[T·A + F·K − 2·T·W2] with T=KS,
+      F=ZH (b_zh), A=ZHZ, W2=F·K — verified dense-f64:
+      Tr(H·G)=+8.8e-4 ≥ 0, E_band descends monotonically.
+  (b) W3=T·W2 used a bsym plan but W2 is asymmetric → the kernel
+      computed T·W2ᵀ (dev-vs-f64 err 1.4e-2). Fixed with a generic
+      (non-bsym) symbolic plan `plan_tk_g` → err 8.4e-7.
+  Retraction: planned McWeeny every 2 steps (all 4 products on
+  existing plans — plan_ks rides Q·S, plan_tk rides T·K and U·K);
+  ret=3 fails LOUDLY (dummy-lane occupation 2.9e-4 — gate works).
+  Post-DMM McWeeny AND TC2 both *degrade* R_H → skipped by default
+  (`VIB_TC2MAX=0` → `measure_projector_state` reports honest
+  r_I/Tr without touching K).
+  **3-product collapsed form (GPT-5.6 note ~line 10900):** since
+  SZ=I (Z=S⁻¹), T·A = KHZ = Xᵀ is free from symmetrize and
+  T·W2 = KHK = Y — the old W1=T·A product was redundant. New step:
+  T=KS (plan_ks), X=(ZH)K (plan_fk), Y=T·X (plan_tk_g generic —
+  X asymmetric), knew = 2·sym(X) − 2·Y. 3 SpGEMMs/step, no A=ZHZ
+  build/rebuild at all (~30% less DMM work).
+  **Measured (R10 330Si, h=0.05, 3 cols, η=8, 6 steps, ret=2):**
+  seed R_H~6.9e-4 → **4.2e-5** (gate 1e-4, cold floor ~8e-5),
+  r_I~2.9e-4, Tr(KS)=459.0001. ΔF vs cold fixq: **rel Frobenius
+  err 0.30–0.35%** on all 3 columns (was ~85% wrong before).
+  Cost **~260–340 ms/eval vs cold ~330–355 ms — now faster**.
+  Post-DMM McWeeny (MCPOL=1) halves the R_H margin (4.2→7.5e-5)
+  for a 3× r_I gain — not worth it, default stays 0.
+  η=10/4steps and ret=3 both fail LOUDLY (dummy-lane gate) —
+  the tuned defaults have real margin. Defaults: DMM=6, ETA=8,
+  RET=2, MCPOL=0, TC2MAX=0 (all env-overridable).
 
 ### G4 — iteration-count discipline — partially done
 
@@ -1129,6 +1173,13 @@ accumulation. Harness: `tc2_conv_study.rhai` + `plot_tc2_convergence.py`
   target ≤8 — PASSED. In-loop endgame adds ~0.26 s to a 0.44 s purify.
   Product error vs masked-f64: T/Q/U/V all 5e-14..9.7e-14; mask
   truncation 0 at r_k=40 (5.3e-6 storage tail at r_k=20).
+- [x] FF32-POLISH production policy (2026-09-17, report §15.15):
+  Phase A f32 budget=caller max_iter (prod `tc2_max`=30) + floor-stop
+  (trace_locked && best<1e-3 && 5-check stall); Phase B terminal FF
+  ≤5 steps w/ mid-step residual early exit, `PolishedFF` status,
+  `tc2_hiacc` config. Kernels: split ff0/ff/ffb, FF_LO_GLOBAL +
+  FF_ACC2 default-on → **27 ms/step ≈ 4.0× f32-ACC16-iter (6.8 ms)**;
+  VTQ 3-product = wash. rk40: 30 f32 + 2 FF → R_I64=2.8e-8, 0.33 s.
 - [ ] R_H on a CONVERGED H_scc: rerun mcw_f64 after a real SCC to get
   the subspace-stationarity leg for the warm-DM design.
 - [ ] TRS4-vs-TC2 cost comparison by SpGEMM count / wall time (TRS4

@@ -239,6 +239,22 @@ file/function where the work should land.
 
 ### 6.4 GPU f32 accuracy — strategy (Astra 2026-09-10), **not a verdict**
 
+> **2026-09-16 re-measurement (`dftb_engine --release`, RTX 3090, mio-1-1, `gpu_measure`):** the 09-10 "floor" is gone — the limiter was **not** arithmetic but missing occupied-subspace repair (`occ_repair`: C′/c column renorm + Rayleigh ρ_k weights for E_band/W) and the warm-basis eigensolve. Measured vs CPU f64 `cpu_ref` at tol=1e-6:
+>
+> | system | N | \|dE\| Ha | max\|ΔF\| Ha/B | max\|Δq\| | SCC |
+> |---|---|---|---|---|---|
+> | H2O | 6 | 4.8e-9 | 2.2e-6 | 4.4e-7 | 8 it |
+> | azaindole dimer | 84 | 1.4e-6 | 5.7e-6 | 5.2e-6 | 16 it |
+> | GC | 86 | 5.3e-7 | 4.8e-6 | 3.3e-6 | 16 it |
+> | AT | 87 | 1.05e-6 | 4.6e-6 | 5.0e-6 | 24 it |
+> | diazaphenalene dimer | 120 | 1.2e-6 | 1.5e-5 | 6.2e-6 | 16 it |
+> | DiTetraceno-helicene | 246 | 1.26e-6 | 8.8e-6 | 8.9e-6 | 16 it |
+>
+> AT/GC **converge** now (no 25-iter stall). GC smeared kT=0.005: \|dE\|=1.58e-6. batch=8 identical replicas: bit-identical E. Formic z-scan \|ΔΔE\| ≤1.2e-6.
+> **GC N–H···N proton-transfer scan** (19 rigid pts, d=1.0–1.9 Å, kT=0.002, `tests/gpu_hbond_physics.rs::test_gc_ptscan_pes_forces_vs_cpu`): PES **shape** error max \|ΔΔE\|=3.7e-6 Ha (**0.10 meV**), barrier err 0.068 meV on a 39.7 kcal/mol barrier; forces max\|ΔF\|=5.5e-6 Ha/Å, projected scan force err 2.1e-6. The absolute error varies 1.4e-7–3.5e-6 along the scan → mostly a smooth offset, not fully constant. Detail: `f32_floor_dense_hbond.md` §3.2.
+> **20×20-scan throughput** (`tests/gpu_scc_bench.rs::test_gpu_scc_scan400_benchmark`, batch=400 distinct geometries, kT=0.002, tol=1e-6, vs sequential `DftbCpu`): azaindole 218 ms/solve → 1834 sys/s (22×); GC 434 ms → 923 sys/s (12×, 80 iters — slowest-replica bound); AT 253 ms → 1578 sys/s (21×); diazaphenalene 838 ms → 477 sys/s (11×); DTH (N=246) 7.7 s → 52 sys/s (8.5× — direct Jacobi O(N³)/replica dominates, **not** saturated). batch=1 GPU loses (0.5–0.9×): launch overhead. Full table: `reports/2026-09-16_dense_gpu_pes_forces_benchmark.md`.
+> **Levers A/B on GC:** occ_repair off → \|dE\|=2.4e-3 (critical); JACOBI_PREC 0→1→2 → 5.3e-7/1.05e-6/1.6e-6 (f64 Jacobi does **not** help — eigensolver is not the residual limiter). SCC floor: GC reaches the bit-exact f32 fixed point (rms=0) at tol≤1e-8, H2O plateaus at ~1e-7; but \|q_D−q_cpu\| stays ~3–9e-6 — the converged fixed point itself is offset by f32 assembly (max\|ΔS\| up to 9.9e-6 at N=246) and the γ-spline, **not** by eigensolver noise. Scripts: `rust_dftb/debug/diag_f32_*.rhai`.
+
 > **Kickstart ≠ floor.** Package 1 made residuals and two cheap f64 islands honest. Package 2 then **measured**: AT `|dE|` is `δ_CH`, not frozen `δε_occ`. Löwdin Newton and f32 GEMM Kahan are in; Kahan does not cut `δ_CH`. Keep H/S/D/C/W **f32**. Do **not** all-f64 matrices. Do not re-enable f64 `batched_gemm`.
 >
 > **2026-09-11 GPT 5.6 dense review (`e965ae00`) — active order:** `δ_CH` is probably **Jacobi C′ orthonormality loss** (`||C'ᵀC'−I||~2e-6`), not a precision wall — decompose per-column before accepting any floor. Strip the broad FP64 out of O(N³) Jacobi (FP32-FMA + 4 accumulators); move `repair_lowdin_x` to GPU GEMMs; device-resident geometry; fix FIRE then GPU. Full work order + FP32 policy table: `tasts/HBond_Relaxed_Scan_GPU/HBond_Relaxed_Scan_GPU.manifest..md` **§0.7 + §12**.

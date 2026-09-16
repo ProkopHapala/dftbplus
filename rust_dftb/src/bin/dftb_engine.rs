@@ -1515,8 +1515,28 @@ fn rhai_sparse_vibrations(name: &str, h: f64, scc_tol: f64, path: &str) -> Strin
                     ms[3 * si + 2] = (t2 - t1).as_secs_f64() * 1e3;
                     if sign > 0.0 { f_plus = Some(f); } else { f_minus = Some(f); }
                 }
-                eprintln!("[sparse] vib col {col}/{n3}: +h rst+geom={:.1}ms solve+f={:.1}ms | -h rst+geom={:.1}ms solve+f={:.1}ms",
-                    ms[0], ms[2], ms[3], ms[5]);
+                // Per-column force magnitudes — the cross-mode FD check
+                // (warm-seed acceptance changes forces, not just timing).
+                let fmax = |v: &Vec<[f64; 3]>| v.iter().flat_map(|a| a.iter()).fold(0.0f64, |m, x| m.max(x.abs()));
+                let fp = f_plus.as_ref().unwrap();
+                let fm = f_minus.as_ref().unwrap();
+                let mut fd_max = 0.0f64;
+                for j in 0..n_atom { for b in 0..3 { fd_max = fd_max.max((fp[j][b] - fm[j][b]).abs()); } }
+                eprintln!("[sparse] vib col {col}/{n3}: +h rst+geom={:.1}ms solve+f={:.1}ms | -h rst+geom={:.1}ms solve+f={:.1}ms | max|F+|={:.4e} max|F-|={:.4e} max|ΔF|={:.4e}",
+                    ms[0], ms[2], ms[3], ms[5], fmax(fp), fmax(fm), fd_max);
+                // Optional per-column ΔF dump for offline warm-vs-cold
+                // validation (RUST_DFTB_VIB_DUMPCOL=<dir>): one text file
+                // per column, n_atom lines of "fx fy fz" (F+−F−).
+                if let Ok(dir) = std::env::var("RUST_DFTB_VIB_DUMPCOL") {
+                    let mut txt = String::new();
+                    for j in 0..n_atom {
+                        for b in 0..3 {
+                            txt.push_str(&format!("{:.10e}\n", fp[j][b] - fm[j][b]));
+                        }
+                    }
+                    std::fs::write(format!("{dir}/df_{col}.txt"), txt)
+                        .unwrap_or_else(|e| panic!("vib dumpcol {dir}/df_{col}.txt: {e}"));
+                }
                 work[i][a] = x0[i][a];
                 let f_plus = f_plus.unwrap();
                 let f_minus = f_minus.unwrap();

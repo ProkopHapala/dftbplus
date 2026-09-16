@@ -1016,12 +1016,12 @@ impl SparseDftb {
             // Warm-K TC2 (K path only): the stored K is the converged
             // projector of the previous mix iter / ±h geometry. Opt-in —
             // convergence of a seeded projector is only sound near the
-            // fixed point; on any Err fall back to the cold K0 path.
+            // fixed point. NO cold fallback: a warm-seed failure is a
+            // hard error — fix the update, don't silently re-solve.
             let warm = env_flag("RUST_DFTB_WARM_K") && self.k_warm && !use_trs && !use_p;
             self.ws.set_tc2_hiacc(self.cfg.tc2_hiacc.unwrap_or(false));
             let r = if warm {
                 self.ws.purify_hscc_warm(self.cfg.tc2_max, self.cfg.tc2_tol)
-                    .or_else(|_| self.ws.purify_hscc(self.cfg.tc2_max, self.cfg.tc2_tol))
             } else if use_trs {
                 self.ws.purify_hscc_trs(self.cfg.tc2_max, self.cfg.tc2_tol)
             } else if use_p {
@@ -1129,6 +1129,19 @@ impl SparseDftb {
         // State = q_in (self.q) — K, H_scc, V all built from it this iter.
         let r_h = self.ws.rh_stationarity()?;
         self.ws.gpu().prof_tick("scc.fin");
+        // Stationarity gate — R_H measures whether K is the occupied
+        // projector of H_scc, not merely idempotent. A wrong-subspace
+        // state still shows r_scc=0 and small r_I (measured: WARM_K
+        // gives R_H=1.4e-2, E_tot off 0.13 Ha). Fail loud —
+        // `RUST_DFTB_SCC_RHGATE` overrides, =0 disables (study only).
+        let scc_rh_gate = std::env::var("RUST_DFTB_SCC_RHGATE").ok()
+            .and_then(|v| v.parse::<f64>().ok()).unwrap_or(5e-4);
+        if scc_rh_gate > 0.0 && r_h > scc_rh_gate {
+            return Err(DftbError::InvalidInput(format!(
+                "SparseDftb SCC converged (r_scc={:.3e}) but R_H={r_h:e} > gate={scc_rh_gate:e} — K is idempotent yet NOT the occupied projector of H_scc (wrong subspace). Energies/forces from this state are not valid; see manifest §4.12.1.",
+                info.rms
+            )));
+        }
         if self.dense_diag {
             self.materialize_dense_diag()?;
         }
@@ -1333,7 +1346,9 @@ impl SparseDftb {
         // Phase G3 δK0 seed: K_seed = K_conv + (K0_new − K0_center)
         // rotates the occupied subspace to first order; TC2 only
         // polishes. Opt-in via RUST_DFTB_VIB_DMUPD; needs the central
-        // snapshot. Falls back to the cold purify on any failure.
+        // snapshot. NO cold fallback: a seed that fails the R_H gate
+        // below is a hard error — fix the warm update (tasks G3:
+        // ‖[K,H]‖ commutator descent), don't silently re-solve.
         let dmupd = std::env::var("RUST_DFTB_VIB_DMUPD")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
@@ -1344,20 +1359,59 @@ impl SparseDftb {
         let tc2_tol = std::env::var("RUST_DFTB_VIB_TC2TOL").ok()
             .and_then(|v| v.parse::<f32>().ok()).unwrap_or(self.cfg.tc2_tol);
         self.ws.set_tc2_hiacc(self.cfg.tc2_hiacc.unwrap_or(false));
-        let r = if dmupd && self.central.is_some() {
+        let seeded = dmupd && self.central.is_some();
+        let r = if seeded {
             let (k0c, kc) = {
                 let s = self.central.as_ref().unwrap();
                 (s.k0.clone(), s.k.clone())
             };
-            // δK0 seed lands at R_I~1e-3; McWeeny polish contracts it
-            // (TC2 repels a warm seed — the masked-map saddle), then TC2
-            // walks the floor / fixes trace drift.
+            // δK0 seed lands at R_I~1e-3 with the first-order subspace
+            // rotation, then DMM commutator descent (δK =
+            // −η·Sym[(S⁻¹−K)HK]) fixes the O(h²) residual — the
+            // subspace-rotation mechanism purification lacks — then
+            // McWeeny restores idempotency and TC2 walks the floor /
+            // fixes trace drift. `RUST_DFTB_VIB_DMM` = descent steps
+            // (0 = seed only, refuted), `RUST_DFTB_VIB_DMM_ETA` = step
+            // scale (η = scale/(emax−emin), ~2 at the stability edge).
+            // Tuned on R10/330Si (measured, don't guess): η=8/Δε,
+            // 6 steps, McWeeny retract every 2 (ret=3 lets K drift far
+            // enough off-manifold to occupy dummy lanes → loud fail),
+            // no post-DMM McWeeny/TC2 — both degrade R_H; DMM's own
+            // retracts hold r_I~3e-4, Tr(KS)=Nocc.
             let n_mcw = std::env::var("RUST_DFTB_VIB_MCPOL").ok()
-                .and_then(|v| v.parse::<usize>().ok()).unwrap_or(4);
-            self.ws.compute_k0_from_hscc(0.1)
-                .and_then(|_| self.ws.k_seed_shift(&k0c, &kc))
-                .and_then(|_| self.ws.mcweeny_polish(n_mcw))
-                .and_then(|_| self.ws.tc2_purify(self.cfg.tc2_max, tc2_tol, 1))
+                .and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
+            let n_dmm = std::env::var("RUST_DFTB_VIB_DMM").ok()
+                .and_then(|v| v.parse::<usize>().ok()).unwrap_or(6);
+            let eta_sc = std::env::var("RUST_DFTB_VIB_DMM_ETA").ok()
+                .and_then(|v| v.parse::<f32>().ok()).unwrap_or(8.0);
+            let n_ret = std::env::var("RUST_DFTB_VIB_DMM_RET").ok()
+                .and_then(|v| v.parse::<usize>().ok()).unwrap_or(2);
+            // Post-DMM TC2 fixes r_I/trace drift but its masked f32 map
+            // degrades R_H (measured: 5.2e-5→7.8e-5 on R10 col0). Keep
+            // it bounded: RUST_DFTB_VIB_TC2MAX=0 skips it entirely —
+            // the retraction McWeeny already holds idempotency.
+            let tc2_max = std::env::var("RUST_DFTB_VIB_TC2MAX").ok()
+                .and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
+            (|| -> Result<(PurifyStatus, f32, f64, usize)> {
+                let dbg = crate::methods::sparse::gpu_sparse::algebra_verbose();
+                let (emin, emax) = self.ws.compute_k0_from_hscc(0.1)?;
+                self.ws.k_seed_shift(&k0c, &kc)?;
+                if dbg { eprintln!("    [vib] after seed:   R_H={:.3e}", self.ws.rh_stationarity()?); }
+                if n_dmm > 0 {
+                    self.ws.dmm_descend(emin, emax, n_dmm, eta_sc, n_ret)?;
+                    if dbg { eprintln!("    [vib] after DMM:    R_H={:.3e}", self.ws.rh_stationarity()?); }
+                }
+                self.ws.mcweeny_polish_planned(n_mcw)?;
+                if dbg { eprintln!("    [vib] after McW:    R_H={:.3e}", self.ws.rh_stationarity()?); }
+                if tc2_max == 0 {
+                    let (r_i, tr) = self.ws.measure_projector_state()?;
+                    if dbg { eprintln!("    [vib] no TC2:     R_H={:.3e} r_I={r_i:.3e} Tr={tr:.6}", self.ws.rh_stationarity()?); }
+                    return Ok((PurifyStatus::Converged, r_i, tr, 0));
+                }
+                let out = self.ws.tc2_purify(tc2_max, tc2_tol, 1);
+                if dbg { eprintln!("    [vib] after TC2:    R_H={:.3e}", self.ws.rh_stationarity()?); }
+                out
+            })()
         } else {
             self.ws.purify_hscc(self.cfg.tc2_max, tc2_tol)
         };
@@ -1376,22 +1430,21 @@ impl SparseDftb {
         }
         // R_H gate: a warm seed can produce an idempotent matrix that is
         // NOT the occupied projector of H_scc (wrong subspace — measured
-        // on si10h16: r_I fine, R_H wrong, spectrum shifted ~300 cm⁻¹).
-        // Gate on stationarity ‖HKS−SKH‖/(2‖HKS‖); cold restart on fail.
+        // on si10h16: r_I fine, R_H wrong, spectrum shifted ~300 cm⁻¹;
+        // on R10: an accepted seed at R_H=2.9e-4 gave ~85% force error).
+        // Gate on stationarity ‖HKS−SKH‖/(2‖HKS‖). HARD ERROR on
+        // failure — no silent cold restart. Warm seeds must land at the
+        // cold-path floor (~1e-4 on R10): subspace error poisons forces
+        // far below the gross-error gate, so the seeded default is
+        // stricter. `RUST_DFTB_VIB_RHGATE` overrides both.
         let rh_gate = std::env::var("RUST_DFTB_VIB_RHGATE").ok()
-            .and_then(|v| v.parse::<f64>().ok()).unwrap_or(5e-4);
-        let mut r_h = self.ws.rh_stationarity()?;
-        let (mut pstat, mut r_i, mut tr, mut tc2_iters) = (pstat, r_i, tr, tc2_iters);
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(if seeded { 1e-4 } else { 5e-4 });
+        let r_h = self.ws.rh_stationarity()?;
         if r_h > rh_gate {
-            eprintln!("  [SparseDftb] fixedq warm-seed rejected: R_H={r_h:.3e} > {rh_gate:e} — cold purify");
-            let (p, ri2, tr2, ti2) = self.ws.purify_hscc(self.cfg.tc2_max, tc2_tol)?;
-            pstat = p; r_i = ri2; tr = tr2; tc2_iters = ti2;
-            r_h = self.ws.rh_stationarity()?;
-            if r_h > rh_gate {
-                return Err(DftbError::InvalidInput(format!(
-                    "scc_fixedq: R_H={r_h:e} > {rh_gate:e} even after cold purify"
-                )));
-            }
+            return Err(DftbError::InvalidInput(format!(
+                "scc_fixedq: R_H={r_h:e} > gate={rh_gate:e} (seeded={seeded}, r_I={r_i:e}, Tr(KS)={tr:.6}, tc2_iters={tc2_iters}) — K is idempotent on a wrong occupied subspace; density reuse FAILED. Fix the warm update (‖[K,H]‖ descent, tasks G3) — silent cold re-solve removed."
+            )));
         }
         self.store_energy(tr, r_i, 1, tc2_iters, 0.0, r_h as f32, pstat)?;
         self.k_warm = true;

@@ -2282,3 +2282,42 @@ Convergence (true R_I by `sparse_ri_f64`):
 **Integration:** `RUST_DFTB_TC2_FF=1` + `RUST_DFTB_TC2_FF_SWITCH` (default 1e-3) + `RUST_DFTB_TC2_FF_STEPS` (default 2). Once the step cap is hit the purify returns the polished K immediately (`NumericalFloor`) — returning to f32 TC2 re-pollutes the state to ~1e-7 within a few iters, so the endgame is deliberately terminal. `sparse_sync` rhai call added for honest enqueue+drain timing.
 
 **Remaining/open:** R_H on a converged H_scc (subspace leg) still unmeasured; force-noise-vs-R_I sweep (does the Hessian even need <1e-5?) is the next physics-relevant question; P-space path untouched by the M_TKS change; sparse SCC 4-iter failure at R10 remains a separate unresolved issue.
+
+### §15.15 — Production two-phase purify + FF kernel optimization (2026-09-17, cont.)
+
+The §15.14 study machinery is now a production policy (manifest §4.12.2 consolidated). `tc2_purify` resolves the whole policy ONCE before the loop (no env reads inside): `budget = max_iter` (caller's budget; production default `tc2_max` = **30**, study scripts pass larger values; `RUST_DFTB_TC2_BUDGET` caps downward), `ff_on = ws.tc2_hiacc || RUST_DFTB_TC2_FF`, `ff_switch` (default 1e-3), `ff_steps` (cap 5), `ff_target` (default 1e-7), `ff_vtq` (3-product path, default off — see below).
+
+**Phase A** (f32 TC2): ordinary `Converged` exit unchanged; a new floor-stop fires when `trace_locked && best_ri < ff_switch && best unchanged over 5 checks` — safe because genuine mid-descent stalls live at R_I≫1e-2. Plateau/budget exits restore `k_best` → `NumericalFloor`; budget exhausted *without* a projector basin → `Err` (fail loud, no polishing of garbage).
+
+**Phase B** (hiacc only, terminal): each iteration computes T_ff,Q_ff first — Q=KSK is needed anyway, so the residual of the CURRENT K is measured *before* spending the U,V products. Early exit on `ri < ff_target` or stall (`ri_now > 0.7·prev`); cap `ff_steps`; best-of tracking restores the best polished state; the returned R_I and trace are measured on the RETURNED state (stale pre-FF residual bug fixed). New status `PurifyStatus::PolishedFF` — no longer disguised as `NumericalFloor`. `SparseDftbConfig.tc2_hiacc: Option<bool>` + `ws.set_tc2_hiacc` wired through `purify`, `purify_scc_step`, and the vibration paths.
+
+**Kernel optimization** (`sparse_bsr4_purification.cl`, R10 deg~330, ACC16 f32 baseline 6.8 ms/iter):
+
+| FF step variant | ms/step | vs f32-ACC16 iter |
+|---|---|---|
+| generic `a_has_lo` kernel (old) | 44–46 | 6.5× |
+| + specialized split (ff0/ff) | ~44 | — (product 1 already cheap) |
+| + `FF_LO_GLOBAL` (A_lo via L2, −21 KiB local) | 38.2 | 5.6× |
+| + `FF_ACC2` (2-way ff accumulators) | **27.4–27.8** | **4.0×** |
+| `FF_VTQ` 3-product V=T·Q (ff×ff kernel) | 27.4 | ~same |
+
+Both winners are now **default ON** (`RUST_DFTB_FF_LO_GLOBAL=0` / `FF_ACC2=0` opt out) — verified: LO_GLOBAL trajectory bitwise-identical, ACC2 identical to ~6 digits, both reach the same floor. VTQ measured a wash: the dropped product (Q·S on plan_ks ≈1.7 ms) is the cheap one while V=T·Q pays double-width B streaming on the expensive plan_tk — kept as `RUST_DFTB_TC2_FF_VTQ=1` option. Per-stage device profile (evt): ff.ks 1.25 + ff.tk 11.85 + ff.qs 1.74 + ff.uk 11.96 + comb 0.16 ≈ 27.0 ms; the ff product is now ~2.1× its f32 twin (11.9 vs 5.6 ms) vs ~2.75× flops — approaching flop-bound.
+
+**Production-policy measurements** (R10, `bench_ff_endgame.rhai`, all-new code path):
+
+| run | result | wall |
+|---|---|---|
+| fast, tol=1e-4, r_k=20, ACC4 | `Converged` iter 24, R_I64=1.3e-4 | 0.316 s (13.2 ms/it) |
+| fast, tol=1e-9, r_k=20, ACC4 | `NumericalFloor` @30, R_I64=4.8e-5 | 0.413 s |
+| fast, tol=1e-9, r_k=20, ACC16 | `NumericalFloor` @30, R_I64=4.8e-5 | **0.204 s** (6.8 ms/it) |
+| hiacc, r_k=40, target 1e-7 | plateau-stop @29 (1.1e-7) → 0 FF steps → `PolishedFF` 9.6e-8 | 0.271 s |
+| hiacc, r_k=40, target 1e-8 | +2 FF steps → `PolishedFF` dev 1.86e-8, **R_I64=2.8e-8** | 0.329 s |
+| hiacc, r_k=20 | +2 FF steps → `PolishedFF` dev 6.2e-6, R_I64=3.2e-5 (mask floor) | 0.272 s |
+
+In-SCC purifies under hiacc entered Phase B at 8e-6…9e-5 and polished 1–5 steps to ~1.3e-8 (rk40) / ~6e-6 (rk20) — early exit working, cap 5 bounding the mask-floor case.
+
+**Cost/benefit verdict:** on R10 hiacc costs +2×27 ms ≈ +60–80 ms over a ~200 ms ACC16 purify (+30–40%) and buys ~5–10× residual at rk40 (or nothing extra at rk20 where the mask floor dominates — as designed). The "30-iter cap + no floor dancing" bound holds: worst case 30×6.8 + 5×27 ≈ 0.34 s.
+
+Figures: `debug/tc2_ff_endgame_rk{20,40}_v2.png` (log-scale R_I vs iter and vs wall ms; ◇ = Phase-B FF iters; f64-verified FFSTEP series on rk40). Harness: `bench_ff_endgame.rhai` parameterized via `BENCH_RK/BENCH_TOL/BENCH_MAXITER/BENCH_FFSTEP` + new rhai `env()` binding.
+
+Unit tests: `sparse::sparse_system` 6/6 pass (caller-budget semantics keep the toy-system tests at their explicit 60-iter budgets).

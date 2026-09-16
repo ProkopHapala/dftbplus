@@ -103,10 +103,13 @@ pub struct SparseSystemWorkspace {
     plan_zh: Option<SpgemmPlanGpu>,  // Z·H → M_TZS (K0 B = Z·H)
     plan_bz: Option<SpgemmPlanGpu>,  // B·Z → M_K (K0 A = ZHZ)
     plan_ht: Option<SpgemmPlanGpu>,  // H·T → M_HT (R11 stationarity residual, generic plan)
+    plan_fk: Option<SpgemmPlanGpu>,  // F·K = (Z·H)·K → M_K (DMM double-commutator descent, G3)
+    plan_tk_g: Option<SpgemmPlanGpu>, // T·W2 → M_K, GENERIC plan — W2=F·K is asymmetric; the bsym kernel would silently compute T·W2ᵀ (measured: 1.4e-2 error vs 1e-6 for symmetric operands)
 
     // ── Atom-level buffers ──
     v_buf: Buffer<f32>,      // atom potentials V[N] for device Hscc (R13)
     n_orb_buf: Buffer<u32>,  // physical orbitals per atom (R14)
+    n_orb_host: Vec<u8>,     // host copy — debug verification masks (dmm_verify)
     /// Packed Mulliken out [2·N]: q at [0..N), q_dum at [N..2N) — one
     /// device write, one host read per iteration (F7).
     qpack_buf: Buffer<f32>,
@@ -342,6 +345,21 @@ impl SparseSystemWorkspace {
             Some(gpu.upload_plan(&plan)
                 .map_err(|e| DftbError::InvalidInput(format!("plan_ht upload failed: {e}")))?)
         } else { None };
+        // plan_fk: F·K = (Z·H)·K → M_K — DMM double-commutator descent
+        // (G3). NOTE: `z` is S⁻¹ (Newton iter Z←2Z−ZSZ), NOT S^{-1/2} —
+        // F = Z·H = S⁻¹H is the generalized-eigenvalue matrix and the
+        // projector is P = K·S, so the tangent gradient of E = 2Tr(FP)
+        // is the double commutator [P,[P,F]], S-selfadjointness making
+        // δE = −2η·Σμ² ≤ 0. B-symmetric kernel (K symmetric right op).
+        let plan_fk = build_plan(&t_zs_dummy, &k_dummy, &m_k, "plan_fk")?;
+        // plan_tk_g: generic (non-bsym) twin of plan_tk for products
+        // whose right operand is asymmetric — DMM W3 = T·(F·K).
+        let plan_tk_g = if plans_on {
+            let plan = crate::methods::sparse::bsr4::build_spgemm_plan(&t_ks_dummy, &k_dummy, &m_k)
+                .map_err(|e| DftbError::InvalidInput(format!("plan_tk_g build failed: {e}")))?;
+            Some(gpu.upload_plan(&plan)
+                .map_err(|e| DftbError::InvalidInput(format!("plan_tk_g upload failed: {e}")))?)
+        } else { None };
 
         // ── P = K·S purifier buffers (GPT-5.6 item 4) ──
         // M_P = M_K for the prototype (same sparsity class as the legacy
@@ -433,6 +451,7 @@ impl SparseSystemWorkspace {
             plan_bz,
             v_buf,
             n_orb_buf,
+            n_orb_host: n_orb.to_vec(),
             qpack_buf,
             qpack_host,
             hs_to_kt,
@@ -468,6 +487,8 @@ impl SparseSystemWorkspace {
             plan_pp,
             plan_pz,
             plan_ht,
+            plan_fk,
+            plan_tk_g,
             p_to_tzs,
             p_t,
             p_valid: false,
@@ -2021,8 +2042,9 @@ impl SparseSystemWorkspace {
     /// (B=Z·H Gershgorin + ZHZ + axpby) EXCEPT that B=Z·H_scc must be
     /// refreshed: `forces()` consumes `b_zh` for the W build. For a
     /// 0.02 Å FD displacement K changes by ~1e-3 — TC2 should converge
-    /// in ~O(5) iters instead of ~50. Caller falls back to
-    /// `purify_hscc` on Err (non-finite / trace-guard paths).
+    /// in ~O(5) iters instead of ~50. NO cold fallback in the caller:
+    /// a warm-seed Err propagates (silent re-solve hid wrong-subspace
+    /// states — measured R_H=1.4e-2, E_tot off 0.13 Ha).
     pub fn purify_hscc_warm(&mut self, tc2_max: usize, tc2_tol: f32) -> Result<(PurifyStatus, f32, f64, usize)> {
         // B = Z·H_scc on M_TZS — same product as in compute_k0_impl.
         match &self.plan_zh {
@@ -2087,6 +2109,236 @@ impl SparseSystemWorkspace {
         }
         self.gpu.symmetrize_dev(self.k_struct.nblock, &self.k_struct.transpose_block(), &self.k.values)?;
         self.t_ks_valid = false;
+        Ok(())
+    }
+
+    /// Fully-planned McWeeny (DMM retraction path): same map
+    /// K ← 3KSK − 2KSKSK but every product on symbolic plans —
+    /// U = Q·S rides plan_ks (M_K×M_HS→M_TKS, U kept on M_TKS rather
+    /// than truncated to M_K — strictly more accurate) and V = U·K
+    /// rides plan_tk. Buffers: t_ks=T then U; q=Q; a_zhz=V.
+    /// Clobbers t_ks/q/a_zhz — callers holding A=a_zhz must rebuild.
+    pub fn mcweeny_polish_planned(&mut self, n_iters: usize) -> Result<()> {
+        if self.plan_ks.is_none() || self.plan_tk.is_none() {
+            return Err(DftbError::InvalidInput(
+                "mcweeny_polish_planned: plan_ks/plan_tk missing".into()));
+        }
+        for _ in 0..n_iters {
+            self.gpu.spgemm_plan_bsym_dev(&self.k, &self.s, self.plan_ks.as_ref().unwrap(), &self.t_ks)?;   // T = K·S
+            self.gpu.spgemm_plan_bsym_dev(&self.t_ks, &self.k, self.plan_tk.as_ref().unwrap(), &self.q)?;   // Q = T·K
+            self.gpu.spgemm_plan_bsym_dev(&self.q, &self.s, self.plan_ks.as_ref().unwrap(), &self.t_ks)?;   // U = Q·S
+            self.gpu.spgemm_plan_bsym_dev(&self.t_ks, &self.k, self.plan_tk.as_ref().unwrap(), &self.a_zhz)?; // V = U·K
+            self.gpu.mcweeny(self.k_struct.nblock, &self.q.values, &self.a_zhz.values, &self.k.values)?;
+        }
+        self.gpu.symmetrize_dev(self.k_struct.nblock, &self.k_struct.transpose_block(), &self.k.values)?;
+        self.t_ks_valid = false;
+        Ok(())
+    }
+
+    /// Measure-only (r_I, Tr(KS)) of the current K — gate inputs for
+    /// the post-DMM no-TC2 path (the TC2 map itself degrades R_H, so
+    /// skipping it still needs the honest residuals). Two planned
+    /// products (T=K·S, Q=T·K) + two reductions; K untouched.
+    pub fn measure_projector_state(&mut self) -> Result<(f32, f64)> {
+        if self.plan_ks.is_none() || self.plan_tk.is_none() {
+            return Err(DftbError::InvalidInput("measure_projector_state: plan_ks/plan_tk missing".into()));
+        }
+        self.gpu.spgemm_plan_bsym_dev(&self.k, &self.s, self.plan_ks.as_ref().unwrap(), &self.t_ks)?;
+        self.gpu.spgemm_plan_bsym_dev(&self.t_ks, &self.k, self.plan_tk.as_ref().unwrap(), &self.q)?;
+        let tr = self.gpu.trace_ks_f64(&self.t_ks_struct, &self.t_ks.values, &self.n_orb_buf, &self.trace_atom, &mut self.trace_atom_host)?;
+        self.gpu.idempotency_partial_dev(self.k_struct.nblock, &self.q.values, &self.k.values, &self.reduce_partial)?;
+        let ri_sq = self.gpu.idempotency_finish_f64(self.k_struct.nblock, &self.reduce_partial, &self.reduce_a, &self.reduce_b, &mut self.reduce_tail_host)?;
+        let ksq = self.gpu.frob_sq_to_f64(self.k_struct.nblock * BS2, &self.k.values, &self.reduce_partial, &self.reduce_a, &self.reduce_b, &mut self.reduce_tail_host)?;
+        Ok(((ri_sq.sqrt() as f32) / (ksq.sqrt() as f32).max(1e-30), tr))
+    }
+
+    /// DMM/LNV commutator energy-descent (Phase G3 — the missing
+    /// subspace-rotation mechanism), CORRECTED generalized-overlap form.
+    /// `z` here is S⁻¹ (Newton Z←2Z−ZSZ), NOT S^{-1/2} — measured:
+    /// ‖ZSZ−I‖=‖Z²S−I‖=‖S⁻¹−I‖=18.5 on R10. The projector is P = K·S
+    /// and F = Z·H = S⁻¹H is the generalized-eigenvalue matrix
+    /// (b_zh — still held from compute_k0). E = 2Tr(F·P); the tangent
+    /// gradient is the double commutator
+    ///   δP = −η·[P,[P,F]] = −η(PF + FP − 2PFP)
+    /// and S-selfadjointness of P,F (SP, SF symmetric) makes [P,F]
+    /// S-antisymmetric → pure-imaginary spectrum → δE = −2η·Σμ² ≤ 0
+    /// (verified dense-f64; the earlier (S⁻¹−K)HK form used Z²=S^{-1/2}²
+    /// wrongly and was an ASCENT direction: Tr(H·G)=−15.4).
+    /// Back in K (δK = δP·Z, using PZ = KS·S⁻¹ = K and FZ = ZHZ = A):
+    ///   δK = −η·(T·A + F·K − 2·T·W2),  T=K·S, W2 = F·K.
+    /// GPT-5.6 collapsed form (3 SpGEMMs): since SZ=I (Z=S⁻¹),
+    ///   T·A = KHZ = (ZHK)ᵀ = Xᵀ — free from symmetrize — and
+    ///   T·W2 = KHK = Y, so  G = X + Xᵀ − 2Y  with X = (ZH)·K,
+    ///   Y = (KS)·X. The old 4-product form computed Xᵀ via a whole
+    ///   extra product (T·A) plus an A=ZHZ rebuild after every
+    ///   retraction — ~30% wasted work.
+    /// Per step: T=KS (plan_ks), X=F·K (plan_fk), Y=T·X (plan_tk_g —
+    /// X is asymmetric → generic plan, not bsym), then
+    /// knew = 2·sym(X) − 2·Y. A=ZHZ no longer needed at all.
+    /// Vanishes exactly at a stationary projector and descends E —
+    /// the H-information polynomial purifiers lack. η = eta_scale/Δε.
+    /// `retract_every`: every N steps one McWeeny retraction pulls K
+    /// back onto the manifold.
+    pub fn dmm_descend(&mut self, emin: f32, emax: f32, n_steps: usize, eta_scale: f32, retract_every: usize) -> Result<()> {
+        if self.plan_ks.is_none() || self.plan_fk.is_none() || self.plan_tk_g.is_none() {
+            return Err(DftbError::InvalidInput(
+                "dmm_descend: plan_ks/plan_fk/plan_tk_g missing (RUST_DFTB_SPARSE_PLANS=0?)".into()));
+        }
+        let nb = self.k_struct.nblock;
+        let delta = (emax - emin).max(1e-6);
+        let step = -eta_scale / delta;
+        let verbose = crate::methods::sparse::gpu_sparse::algebra_verbose();
+        for istep in 0..n_steps {
+            // T = K·S on M_TKS
+            self.gpu.spgemm_plan_bsym_dev(&self.k, &self.s, self.plan_ks.as_ref().unwrap(), &self.t_ks)?;
+            // X = F·K = (Z·H)·K on M_K → z_on_k
+            self.gpu.spgemm_plan_bsym_dev(&self.b_zh, &self.k, self.plan_fk.as_ref().unwrap(), &self.z_on_k)?;
+            // Y = T·X = KS·F·K on M_K → q — GENERIC plan: X is
+            // asymmetric, the bsym kernel would compute T·Xᵀ.
+            self.gpu.spgemm_plan_dev(&self.t_ks, &self.z_on_k, self.plan_tk_g.as_ref().unwrap(), &self.q)?;
+            if istep == 0 && std::env::var("RUST_DFTB_DMM_VERIFY").map(|v| v == "1").unwrap_or(false) {
+                self.dmm_verify_host()?;   // one-shot dense f64 cross-check of X/Y
+            }
+            // knew = X + Xᵀ − 2Y = [P,[P,F]]·Z
+            self.gpu.axpby_dev(nb, 1.0, &self.z_on_k.values, 0.0, &self.knew.values, &self.knew.values)?;  // knew = X
+            self.gpu.symmetrize_dev(nb, &self.k_struct.transpose_block(), &self.knew.values)?;             // knew = (X+Xᵀ)/2
+            self.gpu.axpby_dev(nb, 2.0, &self.knew.values, -2.0, &self.q.values, &self.knew.values)?;      // knew = X+Xᵀ−2Y
+            self.gpu.axpby_dev(nb, 1.0, &self.k.values, step, &self.knew.values, &self.k.values)?;
+            if verbose {
+                let g2 = self.gpu.frob_sq_to_f64(nb * BS2, &self.knew.values,
+                    &self.reduce_partial, &self.reduce_a, &self.reduce_b,
+                    &mut self.reduce_tail_host)?;
+                let e_band = 2.0 * self.gpu.trace_hk_to_f64(
+                    self.hs_struct.nblock, &self.h_scc.values, &self.k.values, &self.hs_to_kt,
+                    &self.reduce_partial, &self.reduce_a, &self.reduce_b, &mut self.reduce_tail_host)?;
+                eprintln!("    [dmm] step {istep}: |G|_F={:.3e}  E_band={e_band:.6}", g2.sqrt());
+            }
+            // Retract on schedule INCLUDING the last step — post-DMM
+            // polish is gone, so the terminal state is what forces see
+            // (measured: skipping it leaves r_I~2e-3 → dummy lanes
+            // occupied → loud force-gate failure).
+            if retract_every > 0 && (istep + 1) % retract_every == 0 {
+                self.mcweeny_polish_planned(1)?;
+                if verbose {
+                    let rh = self.rh_stationarity()?;
+                    eprintln!("    [dmm] retract after step {istep}: R_H={rh:.3e}");
+                }
+            }
+        }
+        self.t_ks_valid = false;
+        self.gpu.prof_tick("dmm");
+        Ok(())
+    }
+
+    /// One-shot dense f64 cross-check of the DMM products (debug only,
+    /// RUST_DFTB_DMM_VERIFY=1, called while z_on_k=X=(ZH)K, q=Y=(KS)X,
+    /// t_ks=T=KS — before the X+Xᵀ−2Y combine). Expands K,S,H,Z,F to
+    /// dense f64, rebuilds each product masked exactly like the device
+    /// plans, and reports per-product deviations + the descent sign
+    /// Tr(H·G). ~O(n³) once at step 0.
+    fn dmm_verify_host(&mut self) -> Result<()> {
+        let na = self.n_atom;
+        let n = na * BS;
+        let mut kd = vec![0.0f32; n * n];
+        let mut sd = vec![0.0f32; n * n];
+        let mut hd = vec![0.0f32; n * n];
+        let mut zd = vec![0.0f32; n * n];
+        let mut fd = vec![0.0f32; n * n];  // F = Z·H (b_zh on M_TZS)
+        let mut td = vec![0.0f32; n * n];  // T = K·S (t_ks on M_TKS)
+        let mut xd = vec![0.0f32; n * n];  // X = F·K (z_on_k on M_K)
+        let mut yd = vec![0.0f32; n * n];  // Y = T·X (q on M_K)
+        let mut vk = vec![0.0f32; self.k_struct.nblock * BS2];
+        let mut vs = vec![0.0f32; self.hs_struct.nblock * BS2];
+        let mut vh = vec![0.0f32; self.hs_struct.nblock * BS2];
+        let mut vz = vec![0.0f32; self.z_struct.nblock * BS2];
+        let mut vf = vec![0.0f32; self.t_zs_struct.nblock * BS2];
+        let mut vt = vec![0.0f32; self.t_ks_struct.nblock * BS2];
+        let mut vx = vec![0.0f32; self.k_struct.nblock * BS2];
+        let mut vy = vec![0.0f32; self.k_struct.nblock * BS2];
+        self.gpu.read_f32(&self.k.values, &mut vk)?;
+        self.gpu.read_f32(&self.s.values, &mut vs)?;
+        self.gpu.read_f32(&self.h_scc.values, &mut vh)?;
+        self.gpu.read_f32(&self.z.values, &mut vz)?;
+        self.gpu.read_f32(&self.b_zh.values, &mut vf)?;
+        self.gpu.read_f32(&self.t_ks.values, &mut vt)?;
+        self.gpu.read_f32(&self.z_on_k.values, &mut vx)?;
+        self.gpu.read_f32(&self.q.values, &mut vy)?;
+        crate::methods::sparse::bsr4::bsr_values_to_dense(na, &self.m_k.0, &self.m_k.1, &vk, &mut kd);
+        crate::methods::sparse::bsr4::bsr_values_to_dense(na, &self.m_hs.0, &self.m_hs.1, &vs, &mut sd);
+        crate::methods::sparse::bsr4::bsr_values_to_dense(na, &self.m_hs.0, &self.m_hs.1, &vh, &mut hd);
+        crate::methods::sparse::bsr4::bsr_values_to_dense(na, &self.m_z.0, &self.m_z.1, &vz, &mut zd);
+        crate::methods::sparse::bsr4::bsr_values_to_dense(na, &self.m_t_zs.0, &self.m_t_zs.1, &vf, &mut fd);
+        crate::methods::sparse::bsr4::bsr_values_to_dense(na, &self.m_t_ks.0, &self.m_t_ks.1, &vt, &mut td);
+        crate::methods::sparse::bsr4::bsr_values_to_dense(na, &self.m_k.0, &self.m_k.1, &vx, &mut xd);
+        crate::methods::sparse::bsr4::bsr_values_to_dense(na, &self.m_k.0, &self.m_k.1, &vy, &mut yd);
+        let f64 = |m: &[f32]| -> Vec<f64> { m.iter().map(|&x| x as f64).collect() };
+        let (k64, s64, h64, z64, f64_) = (f64(&kd), f64(&sd), f64(&hd), f64(&zd), f64(&fd));
+        let (tdev, xdev, ydev) = (f64(&td), f64(&xd), f64(&yd));
+        let mm = |a: &[f64], b: &[f64]| -> Vec<f64> {
+            let mut c = vec![0.0f64; n * n];
+            for i in 0..n {
+                for l in 0..n {
+                    let ail = a[i * n + l];
+                    if ail != 0.0 {
+                        for j in 0..n { c[i * n + j] += ail * b[l * n + j]; }
+                    }
+                }
+            }
+            c
+        };
+        // Physical-lane mask: padded BSR4 lanes (dummy orbitals) must not
+        // contaminate the checks.
+        let mut phys = vec![false; n];
+        for a in 0..na { for l in 0..self.n_orb_host[a] as usize { phys[a * BS + l] = true; } }
+        // symmetry of downloaded K (pad lanes ignored)
+        let mut k_asym = 0.0f64;
+        for i in 0..n { if !phys[i] { continue; } for j in 0..n { if !phys[j] { continue; }
+            let d = k64[i * n + j] - k64[j * n + i]; k_asym += d * d; } }
+        // Z identity check: Z should be S⁻¹ → ‖Z·S − I‖ ≈ 0
+        let zs = mm(&z64, &s64);
+        let mut e_zs = 0.0;
+        for i in 0..n { if !phys[i] { continue; } for j in 0..n { if !phys[j] { continue; }
+            let d = zs[i * n + j] - if i == j { 1.0 } else { 0.0 }; e_zs += d * d; } }
+        // Mask application helper: zero dense entries outside a CSR mask.
+        let apply_mask = |m: &[f64], mask: &(Vec<u32>, Vec<u32>)| -> Vec<f64> {
+            let mut out = vec![0.0f64; n * n];
+            for i in 0..na {
+                for p in (mask.0[i] as usize)..(mask.0[i + 1] as usize) {
+                    let j = mask.1[p] as usize;
+                    for r in 0..BS { for c in 0..BS {
+                        out[(i * BS + r) * n + j * BS + c] = m[(i * BS + r) * n + j * BS + c];
+                    } }
+                }
+            }
+            out
+        };
+        let fro_p = |m: &[f64]| -> f64 {
+            let mut s = 0.0;
+            for i in 0..n { if !phys[i] { continue; } for j in 0..n { if !phys[j] { continue; } s += m[i * n + j] * m[i * n + j]; } }
+            s.sqrt()
+        };
+        let diff = |a: &[f64], b: &[f64]| -> f64 {
+            let mut s = 0.0;
+            for i in 0..n { if !phys[i] { continue; } for j in 0..n { if !phys[j] { continue; } let d = a[i * n + j] - b[i * n + j]; s += d * d; } }
+            s.sqrt()
+        };
+        // Per-product host references (masked exactly like the device):
+        let ks_host = apply_mask(&mm(&k64, &s64), &self.m_t_ks);
+        let x_host = apply_mask(&mm(&f64_, &k64), &self.m_k);
+        let y_host = apply_mask(&mm(&ks_host, &x_host), &self.m_k);
+        eprintln!("    [dmm-verify] per-product ‖dev−host_f64masked‖:  T=KS {:.4e}  X=(ZH)K {:.4e}  Y=(KS)X {:.4e}",
+            diff(&tdev, &ks_host), diff(&xdev, &x_host), diff(&ydev, &y_host));
+        // Full combined G = X + Xᵀ − 2Y, host masked chain:
+        let g_host = { let mut g = vec![0.0f64; n * n];
+            for i in 0..n { for j in 0..n { g[i * n + j] = x_host[i * n + j] + x_host[j * n + i] - 2.0 * y_host[i * n + j]; } } g };
+        let g_dev = { let mut g = vec![0.0f64; n * n];
+            for i in 0..n { for j in 0..n { g[i * n + j] = xdev[i * n + j] + xdev[j * n + i] - 2.0 * ydev[i * n + j]; } } g };
+        let tr_hg = |g: &[f64]| -> f64 {
+            let hg = mm(&h64, g);
+            (0..n).filter(|&i| phys[i]).map(|i| hg[i * n + i]).sum()
+        };
+        eprintln!("    [dmm-verify] ‖ZS−I‖_phys={:.3e}  ‖G_host‖={:.4e}  ‖G_dev−G_host‖={:.4e}  Tr(H·G_host)={:+.6e}  Tr(H·G_dev)={:+.6e}   (Tr must be ≥0 for descent)",
+            e_zs.sqrt(), fro_p(&g_host), diff(&g_dev, &g_host), tr_hg(&g_host), tr_hg(&g_dev));
         Ok(())
     }
 

@@ -1474,8 +1474,11 @@ point to a genuine **f32 representation floor** for this matrix.
   benchmark polish wall-time vs f32 iter cost.
 
 **Production purification policy — CONSOLIDATED (2026-09-15; GPT-5.6
-review chat L10089–10604 + Devin analysis). AGREED DESIGN, not yet
-coded. The current in-loop `use_ff` branch is study harness.**
+review chat L10089–10604 + Devin analysis). IMPLEMENTED + BENCHMARKED
+2026-09-17 (report §15.15): Phase A/B in `tc2_purify`, `PolishedFF`
+status, `cfg.tc2_hiacc`, specialized ff kernels; measured FF step
+27 ms vs f32-ACC16 iter 6.8 ms (≈4×); rk40 polish 1.1e-7 → 2.8e-8
+(f64-verified) in 2 steps, +30–40% purify wall.**
 
 Two separate phases — FF is a *terminal* phase, never a branch inside
 the TC2 loop (each in-loop FF iteration currently wastes one full f32
@@ -1543,6 +1546,11 @@ Both baselines must use the best f32 kernel.
    latency- not bandwidth-bound, so the extra B stream may be nearly
    free. NOTE: this falsifies the "2× hard floor" claim — that floor
    assumed 4 products; 3 products → ~1.5–2× TC2-iter per step.
+   **MEASURED 2026-09-17: a WASH on R10** (27.4 vs 27.8 ms/step) —
+   the dropped product (Q·S on plan_ks ≈1.7 ms) is the cheap one,
+   while V=T·Q pays double-width B streaming on the expensive plan.
+   Kept as `RUST_DFTB_TC2_FF_VTQ=1` option; may win at higher
+   deg_S/deg_K contrast.
 5. FF-TC2 experiment (2 products → ~1.5×/step): the branch-saddle
    limit cycle was f32-noise-driven; with ~1e-13 products plain TC2
    may collapse to the f32-storage floor directly. Numerically risky —

@@ -98,6 +98,10 @@ def main():
     if args and args[0] == "--title":
         title_tag = args[1]
         args = args[2:]
+    cost_tag = "f32 iter ~14.5 ms, FF step ~44 ms"
+    if args and args[0] == "--cost":
+        cost_tag = args[1]
+        args = args[2:]
     while args and args[0] == "--fflog":
         spec = args[1]
         lbl, path = spec.split("=", 1)
@@ -164,7 +168,7 @@ def main():
     ax2.legend(fontsize=8)
     ax3.set_ylabel(r"$R_I$")
     ax3.set_xlabel("cumulative wall time in purify [ms]")
-    ax3.set_title("accuracy vs cost — f32 iter ~14.5 ms, FF step ~44 ms")
+    ax3.set_title(f"accuracy vs cost — {cost_tag}")
     ax3.grid(True, which="both", alpha=0.3)
     ax3.legend(fontsize=8)
 

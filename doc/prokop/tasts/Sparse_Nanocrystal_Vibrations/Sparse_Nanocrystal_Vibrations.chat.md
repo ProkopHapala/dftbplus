@@ -10602,3 +10602,1549 @@ And then optimize the FF kernel in this order:
 Given your measurements, I think **~2.3–2.6× one TC2 iteration per FF McWeeny step** is a reasonable optimization target. Remember that **2× is the hard algorithmic floor** for K-space McWeeny because it has four products versus TC2's two.
 
 So I would not obsess about squeezing 3× down to 1.5×. The bigger win is to make **one FF step replace the entire f32 endgame**, and to stop the solver deterministically instead of ever dancing for 50 iterations again.
+
+
+
+
+
+---
+
+# USER
+
+I want to go back and discuss how to best reuse density matrix or other matrixes when computing hessian? You had complains about repeling unoccupied eighevectros, if we do it naively, that it will never rotate occupied/unnocupied suspsace? Right?
+
+althou I may see that algebracially, intuitively I thinkthe electron density (which is trace of density matrix right?) is changing very little as we displace atoms just a little bit (0.1A) so it makes very much sense to use the forzen density (or density matrix) form the rho[x0] to compute all displaced rho[ x0+d ]
+
+yes do this it is the priority:
+
+Next step per the notes: the real fix is a ‖[K,H]‖-descending warm update (LNV/DMM commutator step — e.g. `K ← K − η·Sym[(I−KS)·Z·H·K + h.c.]`) before idempotency polish. That's the only mechanism that can rotate the subspace instead of repelling it. Want me to implement that next?
+
+But let me know - the substapce of eigenvectros is perhaps wrong but the density matrix exstimate is good, or not what I'm missing. Perhaps this require deepr discussion...
+
+---
+
+# Chat GPT 5.6 sol
+
+Yes — the important distinction is:
+
+$$
+\boxed{\text{the old density matrix is an excellent \emph{initial guess}, but polynomial purification alone cannot update its occupied subspace.}}
+$$
+
+Those statements are completely compatible.
+
+Your intuition is right: for a small displacement \(R_0\to R_0+\delta R\), especially \(0.01\)–\(0.02\) Å around equilibrium, the true electronic state changes only slightly,
+
+$$
+K(R_0+\delta R)=K_0+\delta K,\qquad \delta K=O(\delta R).
+$$
+
+So throwing \(K_0\) away and reconstructing K from a spectral guess is absurdly wasteful. The whole Hessian strategy should exploit that.
+
+What was wrong was only the **naive way of reusing K**: taking \(K_0\) and applying TC2/McWeeny. Those maps know about \(K\) and \(S\), but essentially not about the changed Hamiltonian. Therefore they can fix eigenvalues/idempotency but cannot rotate the occupied subspace toward the new eigenvectors of \(H(R_0+\delta R)\).
+
+## First, what exactly is “density” here?
+
+For real AO basis functions,
+
+$$
+\rho(\mathbf r)=
+2\sum_{\mu\nu}K_{\mu\nu}
+\phi_\mu(\mathbf r)\phi_\nu(\mathbf r).
+$$
+
+So no, the electron density is not simply the trace of K.
+
+The total electron number in a nonorthogonal basis is
+
+$$
+N_e=2\,\mathrm{Tr}(KS),
+$$
+
+and Mulliken populations similarly come from diagonal blocks of \(KS\).
+
+There is also a subtle but important point for your intuition: when the atoms move, the AO basis functions move with them.
+
+Therefore even if we keep exactly the same numerical coefficients \(K_{\mu\nu}\),
+
+$$
+K(R_0+\delta R)\approx K(R_0),
+$$
+
+the real-space density \(\rho(\mathbf r)\) is **not frozen in space** because the \(\phi_\mu(\mathbf r;R)\) have moved.
+
+So “reuse K” is already considerably better physically than “freeze the real-space electron cloud”.
+
+That strengthens your argument.
+
+---
+
+# Why old K is good but not sufficient
+
+Imagine an orthogonal basis first.
+
+At the original geometry,
+
+$$
+P_0=
+\sum_{i\in\mathrm{occ}}
+|\psi_i^0\rangle\langle\psi_i^0|.
+$$
+
+After a small displacement,
+
+$$
+|\psi_i\rangle
+=
+|\psi_i^0\rangle+
+\sum_{a\in\mathrm{unocc}}
+|\psi_a^0\rangle
+\frac{\langle\psi_a^0|\delta H|\psi_i^0\rangle}
+{\epsilon_i-\epsilon_a}
++\cdots.
+$$
+
+Therefore the new projector is
+
+$$
+P=P_0+\delta P
+$$
+
+where \(\delta P\) consists primarily of small occupied↔unoccupied rotations.
+
+So geometrically the situation is:
+
+```text
+old occupied subspace:      ─────────────
+new occupied subspace:       ─────────────
+                              small angle
+```
+
+They are extremely close.
+
+That is exactly why \(P_0\) is a fantastic starting point.
+
+But now consider applying a polynomial:
+
+$$
+P\rightarrow f(P).
+$$
+
+It preserves P's eigenvectors. If \(P_0\) is already a perfect projector,
+
+$$
+P_0^2=P_0,
+$$
+
+then McWeeny literally gives
+
+$$
+3P_0^2-2P_0^3=P_0.
+$$
+
+It has absolutely no information telling it:
+
+> rotate this occupied state slightly toward that previously-unoccupied state.
+
+This is what we meant.
+
+It isn't that the starting density matrix is bad. Quite the opposite:
+
+> **It is almost correct, but its remaining error is precisely in a direction that purification cannot correct.**
+
+---
+
+# Why this tiny density change still matters to a Hessian
+
+There is one place where I would temper the “density barely changes, therefore freeze it” intuition.
+
+At the SCF minimum,
+
+$$
+E=E(R,K(R)).
+$$
+
+Because K is variationally optimized, the first derivative does not explicitly require \(dK/dR\) in the usual Hellmann–Feynman/Pulay sense.
+
+But the **second derivative does**:
+
+$$
+\frac{d^2E}{dR^2}
+=
+\frac{\partial^2E}{\partial R^2}
++
+\frac{\partial^2E}{\partial R\,\partial K}
+\frac{dK}{dR}
++\cdots.
+$$
+
+Now
+
+$$
+\delta K\sim h,
+$$
+
+which looks tiny.
+
+But the Hessian is extracted as
+
+$$
+H\sim
+\frac{F(R+h)-F(R-h)}{2h}.
+$$
+
+So that \(O(h)\) electronic response gets divided by \(h\) and gives an **\(O(1)\) contribution to the Hessian**.
+
+Therefore:
+
+* frozen K is an excellent cheap approximation and diagnostic;
+* it may even be sufficiently accurate for some modes;
+* but it is not formally the fully relaxed Born–Oppenheimer Hessian.
+
+We should measure how important the correction is rather than assume.
+
+---
+
+# The H-aware update you quoted is actually the right idea
+
+The expression
+
+$$
+(I-KS)\,ZHK
+$$
+
+has a nice interpretation.
+
+`K` spans the occupied space. Therefore approximately:
+
+$$
+KS \equiv P_{\rm occ},
+$$
+
+and
+
+$$
+I-KS\equiv P_{\rm unocc}.
+$$
+
+So
+
+$$
+(I-KS)ZHK
+$$
+
+means, schematically:
+
+$$
+\boxed{
+\text{take occupied states}
+\xrightarrow{H}
+\text{see where H wants to send them}
+\xrightarrow{P_{\rm unocc}}
+\text{keep only the occupied→unoccupied component}.
+}
+$$
+
+That is **exactly the missing rotation**.
+
+The symmetric K-space gradient can be written cleanly as
+
+$$
+\boxed{
+G =
+ZHK + KH Z - 2KHK
+}
+$$
+
+because
+
+$$
+G=
+(I-KS)ZHK+\mathrm{h.c.}
+$$
+
+when \(SZ\simeq ZS\simeq I\).
+
+Then update
+
+$$
+\boxed{
+K' = K-\eta G.
+}
+$$
+
+For \(S=I\), this reduces to
+
+$$
+G=PH+HP-2PHP
+=[P,[P,H]],
+$$
+
+the standard double-commutator/Grassmann gradient.
+
+This is a beautiful form because:
+
+* it is zero when occupied and unoccupied spaces are stationary under H;
+* it explicitly rotates occupied ↔ unoccupied space;
+* it does not try to rebuild the density matrix from scratch.
+
+---
+
+## And it may be surprisingly cheap with matrices you already have
+
+You already keep
+
+$$
+B=ZH
+$$
+
+as `b_zh`. Your workspace explicitly keeps this product from the K0 construction and force path. 
+
+You also already have
+
+$$
+T=KS
+$$
+
+as `t_ks`.
+
+Then calculate
+
+$$
+X=(ZH)K.
+$$
+
+One sparse multiplication.
+
+Next,
+
+$$
+Y=(KS)X.
+$$
+
+But
+
+$$
+(KS)(ZHK)\simeq KHK.
+$$
+
+Second sparse multiplication.
+
+Then simply
+
+$$
+G = X + X^T -2Y.
+$$
+
+So an H-aware rotation step costs roughly **two SpGEMMs**.
+
+That is comparable to **one TC2 iteration**, not some huge new solver.
+
+This is exactly what we want.
+
+---
+
+# There is another nice property: we don't need to purify after every tiny rotation
+
+The update
+
+$$
+K\rightarrow K-\eta G
+$$
+
+is tangent to the manifold of projectors when K is already close to idempotent.
+
+That means its violation of
+
+$$
+KSK=K
+$$
+
+is only **second order in the step size**.
+
+So I would *not* do:
+
+```text
+H-gradient step
+4-product FF McWeeny
+H-gradient step
+4-product FF McWeeny
+...
+```
+
+That would again be expensive.
+
+Instead:
+
+```text
+old good K
+   ↓
+H-aware update
+   ↓
+H-aware update
+   ↓
+perhaps H-aware update
+   ↓
+ONE final FF32 McWeeny polish
+```
+
+That is likely much cheaper.
+
+---
+
+# There are actually two changes after moving the atoms
+
+This deserves separating carefully.
+
+At \(R_0+\delta R\):
+
+### A. The basis/overlap changed
+
+$$
+S_0\rightarrow S_1.
+$$
+
+Even if the physical occupied space did not respond at all,
+
+$$
+K_0S_1K_0\neq K_0.
+$$
+
+So the old K isn't exactly metric-idempotent anymore.
+
+### B. The Hamiltonian changed
+
+$$
+H_0\rightarrow H_1.
+$$
+
+So even after fixing the metric normalization, the occupied subspace needs a small rotation.
+
+Those are conceptually different.
+
+For A, a purification-like operation is exactly appropriate because **we don't want to rotate the subspace**.
+
+For example calculate
+
+$$
+Q=K_0S_1K_0.
+$$
+
+Since
+
+$$
+Q=K_0+O(\delta S),
+$$
+
+the update
+
+$$
+\boxed{
+K_{\rm metric}\approx2K_0-Q
+}
+$$
+
+is the first-order metric correction.
+
+Notice that this is literally one TC2-style branch, but here we are using it intentionally as a **metric transport** rather than pretending it solves the electronic problem.
+
+Then the H-aware update handles B.
+
+That decomposition is conceptually very clean.
+
+---
+
+# So for Hessian displacements I would use this workflow
+
+At the central relaxed geometry save a reference snapshot:
+
+$$
+\boxed{
+K_0,\quad q_0,\quad Z_0,\quad S_0
+}
+$$
+
+and whatever DIIS information is useful.
+
+Then **every** \(+h\) and \(-h\) displacement starts independently from this same central snapshot.
+
+Not from the previous Hessian column.
+
+That preserves excellent \(+/-\) symmetry.
+
+For each displaced geometry:
+
+### 1. Update geometry-dependent matrices
+
+Build
+
+$$
+H_0(R),\quad S(R).
+$$
+
+Warm-correct Z from \(Z_0\). Your current Newton–Schulz implementation is already explicitly designed for this and notes that one warm step gives the first-order inverse correction. 
+
+### 2. Start from \(K_0,q_0\)
+
+No cold K0 construction.
+
+No 20-iteration purification.
+
+### 3. Optionally metric-correct K
+
+One cheap correction such as
+
+$$
+Q=K S K,
+\qquad
+K\leftarrow2K-Q.
+$$
+
+Whether this is even necessary should be measured. At \(h=0.02\) Å the defect may already be tiny.
+
+### 4. Build displaced \(H_{\rm SCC}(q_0)\)
+
+Now we have the Hamiltonian whose occupied subspace we actually want.
+
+### 5. Apply 1–few H-aware rotation steps
+
+$$
+X=(ZH)K,
+$$
+
+$$
+Y=(KS)X,
+$$
+
+$$
+G=X+X^T-2Y,
+$$
+
+$$
+K\leftarrow K-\eta G.
+$$
+
+Monitor the stationarity residual
+
+$$
+R_H=
+\frac{\|HKS-SKH\|}{2\|HKS\|}.
+$$
+
+You already implemented exactly this diagnostic. 
+
+This is the convergence criterion for the **orientation of the occupied subspace**.
+
+Not \(R_I\).
+
+### 6. One FF32 McWeeny polish
+
+After the subspace is rotated correctly,
+
+$$
+KSK-K
+$$
+
+will have accumulated a small second-order defect.
+
+Clean it once with the accurate FF32 McWeeny machinery you now have.
+
+Then:
+
+$$
+R_I\sim10^{-8}
+$$
+
+where permitted by the mask.
+
+### 7. Evaluate Mulliken q and SCC residual
+
+Now compare
+
+$$
+q_{\rm out}-q_0.
+$$
+
+I expect this to be small.
+
+If SCC isn't converged, update q/DIIS, rebuild \(H_{\rm SCC}\), and repeat **the H-aware correction**, not cold purification.
+
+So the outer loop becomes approximately:
+
+```text
+q0, K0
+  ↓
+H_scc(q0)
+  ↓
+1–3 K rotation steps
+  ↓
+q1
+  ↓
+DIIS
+  ↓
+H_scc(q1)
+  ↓
+perhaps 1–2 K rotation steps
+  ↓
+q2
+```
+
+I would hope for roughly **1–3 SCC iterations**, rather than 15.
+
+---
+
+# How should we choose η?
+
+This is the part I would treat experimentally rather than overdesign initially.
+
+In an orthogonal eigenbasis,
+
+$$
+G_{ov}\sim(\epsilon_v-\epsilon_o)\,\delta P_{ov}.
+$$
+
+Therefore
+
+$$
+\delta P'_{ov}
+\approx
+\left(1-\eta(\epsilon_v-\epsilon_o)\right)
+\delta P_{ov}.
+$$
+
+So η has dimensions of inverse energy.
+
+A very conservative stable initial estimate is related to the spectral width:
+
+$$
+\eta\sim
+\frac{1}{\epsilon_{\max}-\epsilon_{\min}}.
+$$
+
+You already calculate spectral bounds.
+
+I'd test:
+
+$$
+\eta=
+\frac{0.25}{W},
+\frac{0.5}{W},
+\frac{1}{W},
+\frac{1.5}{W}
+$$
+
+where
+
+$$
+W=\epsilon_{\max}-\epsilon_{\min}.
+$$
+
+Measure \(R_H\) after each step.
+
+Later we can make this much better with line search, Barzilai–Borwein, or an approximate energy-denominator preconditioner.
+
+But first establish whether **one or two stupidly simple gradient rotations reduce \(R_H\) by orders of magnitude**. I think they should.
+
+---
+
+## Frozen-density Hessian should still be tested
+
+I would actually retain three modes, because they answer useful physics questions:
+
+| Mode                  | electronic treatment            |
+| --------------------- | ------------------------------- |
+| **Frozen K/q**        | central K and q reused          |
+| **Fixed-q relaxed K** | H-aware K rotation, q fixed     |
+| **Full warm SCC**     | H-aware K rotation + q response |
+
+This decomposition will tell you where the Hessian correction actually comes from.
+
+I would not be surprised if, for passivated semiconducting Si:
+
+$$
+H_{\rm frozen}
+$$
+
+is already rather close,
+
+and
+
+$$
+H_{\rm fixed-q}
+$$
+
+captures most of the remaining correction.
+
+Then SCC charge response may be very small.
+
+But let's measure rather than guess.
+
+---
+
+# The deeper resolution of your intuition
+
+I would phrase it this way:
+
+> The density matrix at the displaced geometry is indeed almost the same matrix. That's precisely why we should reuse it.
+
+But:
+
+> The small difference is mostly an infinitesimal rotation of the occupied subspace, and purification cannot generate that rotation because it only acts on the spectrum of the matrix it was given.
+
+Therefore the optimal algorithm is **not**
+
+$$
+K_0\rightarrow\text{cold purification}.
+$$
+
+Nor is it
+
+$$
+K_0\rightarrow\text{purify }K_0\text{ harder}.
+$$
+
+It is
+
+$$
+\boxed{
+K_0
+\rightarrow
+\text{small H-driven rotation}
+\rightarrow
+\text{small idempotency polish}.
+}
+$$
+
+That is exactly the numerical analogue of the physical statement:
+
+$$
+\rho(R_0+\delta R)\approx\rho(R_0).
+$$
+
+And yes — I agree this should now be the priority. The accuracy/f32 issue is sufficiently under control to tackle the much bigger Hessian inefficiency: **never cold-solve the electronic projector for each tiny displacement again.**
+
+
+
+---
+
+
+# USER
+
+Good, I understan and gree, but based on what you said it definitely make sense to define one lower accuracy tier of calculation in between "forozen density" (which is already enoguh for hessian very ofthen and which I wanted to use originally), and full solver, we can do your rotation/correction for changed H and S but without additional refinnmeent by accurate ff32 McWeeny polish
+
+basically compute forces and finite differences immediately from 
+5. Apply 1–few H-aware rotation steps
+
+6. should be reserved only for high-accuracy tier.
+
+
+---
+
+
+# Chat GPT 5.6 sol
+
+
+Yes — I think that is the right hierarchy, and it is much cleaner conceptually.
+
+You effectively want **three electronic-response tiers for Hessians**, not just “frozen” versus “fully converged”:
+
+| tier                  | what changes after displacement                                                         | intended use                                      |
+| --------------------- | --------------------------------------------------------------------------------------- | ------------------------------------------------- |
+| **0. Frozen K/q**     | only geometry/H/S/forces; reuse central electronic state                                | cheapest screening / often already useful Hessian |
+| **1. Warm rotated K** | update K for changed \(S\) and \(H\) with a few cheap H-aware steps; **no FF32 polish** | default practical Hessian                         |
+| **2. Fully accurate** | warm K rotation + SCC response + final FF32 McWeeny polish                              | reference / high-accuracy vibrations              |
+
+I actually think Tier 1 should probably become the **default production Hessian mode** once validated.
+
+The important point is that after a small displacement the main missing physics from frozen K is not “make K mathematically perfect again”, but:
+
+$$
+\boxed{\text{move the occupied subspace to follow the changed Hamiltonian.}}
+$$
+
+That is exactly what the H-aware correction does.
+
+So after, say, 1–3 rotation steps, even if
+
+$$
+R_I=\frac{\|KSK-K\|}{\|K\|}
+$$
+
+has degraded somewhat from \(10^{-8}\) to perhaps \(10^{-5}\)–\(10^{-4}\), the force may already be much more physically correct because the occupied subspace is oriented correctly.
+
+For a Hessian, that can be far more important than squeezing idempotency down another three orders of magnitude.
+
+## I would define Tier 1 like this
+
+Start from the converged central state:
+
+$$
+K_0,\ q_0,\ Z_0.
+$$
+
+For every \(R_0\pm h e_i\):
+
+1. update \(S,H_0,Z\);
+2. reuse \(K_0,q_0\);
+3. optionally do one cheap metric transport,
+
+   $$
+   K\leftarrow2K-KSK,
+   $$
+
+   if the change in S makes \(R_I\) noticeably bad;
+4. build \(H_{\rm SCC}(q_0)\);
+5. do 1–3 H-aware rotations,
+
+   $$
+   X=(ZH)K,
+   $$
+
+   $$
+   Y=(KS)X,
+   $$
+
+   $$
+   G=X+X^T-2Y,
+   $$
+
+   $$
+   K\leftarrow K-\eta G;
+   $$
+6. **stop there**;
+7. recompute the matrices needed for forces from this K and evaluate forces immediately.
+
+No TC2.
+
+No McWeeny.
+
+No FF32.
+
+That gives you a very cheap electronically responsive state.
+
+The important diagnostics should be:
+
+$$
+R_H
+$$
+
+for stationarity,
+
+and
+
+$$
+R_I
+$$
+
+only as a sanity bound.
+
+For Tier 1 I would not demand tiny \(R_I\). I'd only require that it doesn't blow up.
+
+For example, something like:
+
+$$
+R_H\ \text{decreasing strongly},
+$$
+
+and
+
+$$
+R_I < 10^{-3}
+$$
+
+might already be perfectly acceptable.
+
+That threshold must come from force tests, not mathematical aesthetics.
+
+## Why I like this tier
+
+A rotation step should cost roughly two SpGEMMs.
+
+So if one or two rotations are enough, the displaced-force cost could be comparable to only a few ordinary sparse iterations.
+
+That is exactly the regime you originally wanted:
+
+> small displacement → small electronic update → cheap force.
+
+And because the update is tangent-ish to the projector manifold, the idempotency damage from the rotation should be only second order in the small update.
+
+Schematically, if
+
+$$
+K'=K+\delta K_{\rm tangent},
+$$
+
+then
+
+$$
+K'SK'-K'
+$$
+
+does not acquire a first-order error from the subspace rotation.
+
+So for tiny Hessian displacements, there is a real chance you can run several H-aware correction steps and still retain acceptable projector quality without any polish.
+
+That makes Tier 1 physically well motivated, not just a crude approximation.
+
+---
+
+## Tier 2 should then be a small extension of Tier 1
+
+High-accuracy mode:
+
+```text
+same Tier-1 warm rotation
+        ↓
+possibly SCC q update(s)
+        ↓
+one FF32 McWeeny polish
+        ↓
+forces
+```
+
+I would reserve FF32 exactly as you suggest.
+
+And I would avoid polishing after every H-aware step. Do all rotations first, then at most one final polish.
+
+---
+
+# There is even a useful Tier 1.5
+
+You may eventually want:
+
+$$
+\boxed{\text{fixed }q,\ \text{relaxed K}}
+$$
+
+versus
+
+$$
+\boxed{\text{relaxed }q,\ \text{relaxed K}}.
+$$
+
+That separates orbital response from SCC charge response.
+
+So experimentally you could compare four Hessians:
+
+```text
+A: frozen K, frozen q
+B: rotated K, frozen q
+C: rotated K + SCC q response
+D: C + FF32 polish
+```
+
+This decomposition will tell you where the actual frequency changes come from.
+
+My guess is that for passivated Si, B will already capture most of the difference between A and D.
+
+But that should be measured.
+
+## One subtle but important implementation point
+
+After the H-aware rotations, before force evaluation, you must make sure every dependent object is rebuilt consistently from the **final rotated K**.
+
+At minimum:
+
+$$
+T=KS
+$$
+
+must correspond to the final K.
+
+Any force auxiliary involving K, such as W, must also be recomputed.
+
+Do not reuse stale `t_ks`, `W`, or Mulliken q from before the rotations.
+
+Otherwise the Tier-1 force test becomes meaningless.
+
+---
+
+I would formalize the modes as something like:
+
+```text
+HESS_ELECTRONIC_FROZEN
+    no K update
+
+HESS_ELECTRONIC_WARM
+    metric correction if needed
+    1–3 H-aware rotations
+    no SCC refinement
+    no FF polish
+
+HESS_ELECTRONIC_WARM_SCC
+    H-aware rotations
+    1–few SCC charge updates
+    no FF polish
+
+HESS_ELECTRONIC_ACCURATE
+    warm SCC
+    final FF32 McWeeny polish
+```
+
+But for practical use, I think the three main user-facing tiers should stay simple:
+
+```text
+frozen
+warm
+accurate
+```
+
+with **warm** meaning exactly what you proposed: rotate/correct the old density matrix just enough to follow the displaced Hamiltonian, then compute forces immediately.
+
+
+
+
+
+
+
+
+---
+
+
+# USER
+
+there are some result and I'm very dissatisfied with that, but I suspect it is because the coding agent is doing things wrong
+
+---
+
+My discussion with the coding agent:
+
+---
+
+# SWE-2
+
+ 
+Let me read the rest of that section, then check what `compute_k0_from_hscc` actually does:
+
+I've now read the GPT 5.6 notes carefully. There are **three concrete, implementable ideas** we haven't exploited yet — and one explains exactly why the performance didn't improve.
+
+## Why warm ≈ cold (the real answer)
+
+Count SpGEMMs per displaced eval:
+
+- **Cold:** ~23 TC2 iters × 2 products ≈ 46 products + K0 build ≈ ~50.
+- **My warm path:** 6 DMM steps × **4 products** + 2 retracts × (4 McWeeny + 1 A-rebuild) + K0 build ≈ ~40 products.
+
+I implemented the *mathematically correct* direction but in a **redundant form**. GPT's notes give the cheaper version:
+
+**Their gradient:** `X = (ZH)·K`, `Y = (KS)·X`, `G = X + Xᵀ − 2Y` — **3 SpGEMMs/step** (T=KS, X, Y).
+
+**Mine:** `W = T·A + F·K − 2·T·W2` — 4 SpGEMMs/step + A=ZHZ built once + rebuilt after every retract.
+
+But they're the *same matrix*: since Z=S⁻¹, `T·A = KS·ZHZ = KHZ = Xᵀ` — I'm computing both halves of a symmetrization that `symmetrize_dev` gives for free. And `T·W2 = KHK = Y`. So **W1 is entirely redundant** — one wasted product per step plus 2 per retract.
+
+Second unused idea: the retraction concern is overblown — the tangent update breaks idempotency only at O(η²), so ret=2 at η=8 is conservative; with cheaper steps we could even afford ret=1.
+
+Let me rewrite `dmm_descend` in the 3-product form:
+
+Symmetrize gives (A+Aᵀ)/2 — so `knew = 2·sym(X) − 2·Y = X + Xᵀ − 2Y` exactly. Rewriting `dmm_descend` to the 3-product form:
+
+Now update `dmm_verify_host` for the X/Y product form:
+
+3-product form: **338/259ms vs cold ~345ms** — now faster, and R_H improved slightly (4.2e-5). The panic is just the missing dump dir:
+
+Force agreement identical (0.3%) with warm now ~260ms vs cold ~345ms — **~25% faster**. Try trimming to 5 and 4 steps:
+
+DMM=4/η=10 fails loudly (dummy lanes — good). RET=1 costs more than it saves. Current default (6/8/2) is the sweet spot. One safety question: r_I~3e-4 after DMM — test whether one final McWeeny keeps R_H under gate while cleaning idempotency:
+
+Final McWeeny halves the R_H margin (4.2→7.5e-5) for only a 3× r_I gain — not worth it; MCPOL=0 stays. Update the doc and summarize:
+
+## Answer to your question, then what I just did
+
+**Why warm wasn't faster:** my DMM step was correct but wasteful — 4 SpGEMMs/step, plus an `A=ZHZ` rebuild after every retraction. Total ≈40 products/eval vs cold's ~46 — parity, not a win. I had implemented the direction in a redundant form.
+
+**What the GPT 5.6 notes gave us (line ~10900):** the collapsed gradient
+
+```
+X = (ZH)·K ;  Y = (KS)·X ;  G = X + Xᵀ − 2Y
+```
+
+Since Z = S⁻¹ exactly (SZ=I), my `T·A = KHZ` is literally `Xᵀ` — obtainable **free** from `symmetrize_dev` — and my `T·W2 = KHK` is `Y`. So one whole product per step plus all the A-builds were pure waste.
+
+**Implemented:** 3-SpGEMM DMM step (T=KS, X=(ZH)K, Y=T·X via the generic plan, `knew = 2·sym(X) − 2·Y`), no A=ZHZ anywhere.
+
+### Measured (R10, 330 Si, h=0.05, 3 columns)
+
+| | cold fixq | warm DMM (4-prod) | warm DMM (3-prod) |
+|---|---|---|---|
+| ms/eval | 330–355 | 370–460 | **~260–340** |
+| R_H after | 8.0e-5 | 4.7e-5 | **4.2e-5** |
+| ΔF rel. err vs cold | — | 0.30% | **0.30%** (identical — same math) |
+
+Warm is now ~25% faster than cold *and* produces a cleaner state (R_H below the cold floor). Same forces, fewer flops — the win is real, not tuned.
+
+**Explored and rejected, all measured:** η=10/4-steps and ret=3 both trip the dummy-lane force gate loudly (off-manifold drift); ret=1 costs more in retractions than it saves in steps; a final McWeeny doubles R_H margin usage for little r_I gain. Current defaults (6 steps, η=8, ret=2, no post-polish) sit at 2× margin under the gate.
+
+**Still unused from the notes:** (a) skipping the K0 build entirely — seed via metric transport `K←2K−KSK` + reuse central spectral bounds for η; saves ~2 products + syncs but needs bounds plumbing, likely a wash vs the good δK0 seed; (b) 1–3-step Tier-1 with R_I<1e-3 as the only bound — we could try DMM=3–4 at η=8 against the force check if you want the truly minimal tier; (c) BB/line-search η. Say which you want next.
+
+
+---
+
+# USER
+
+still, what the hell. How many iterations we do on cold-start? Like 20-30 TC2 iters? and you say that when we do war start with only 3 sparse-matrix multiplication it is basically the same speed (like 20% faster). That is not acceptable. I expected roghly 10x (order of magnitude) speed up. Do not code analyse it again why it does not work as I expected. 
+
+
+---
+
+# SWE-2
+
+Fair — let me do the honest arithmetic, no code.
+
+## Where the products actually go (per displaced eval)
+
+| stage | products | why it's there |
+|---|---|---|
+| NS warm-start Z | 3 iters = **6** | Z=S⁻¹ needed for F=ZH and the seed |
+| K0 build (δK0 seed) | **~3** + Gershgorin sync | the first-order seed that makes DMM cheap |
+| DMM rotation | 6 steps × 3 = **18** | the actual subspace fix |
+| McWeeny retraction | 2 × 4 = **8** | keeps K on the projector manifold |
+| measure r_I/Tr | **2** | gate inputs |
+| **solve subtotal** | **~37** | |
+| cold TC2 subtotal | 23 iters × 2 + K0/NS ≈ **~55** | |
+
+So the warm solve is ~37 vs ~55 products → ~30% fewer → ~25% faster. The arithmetic matches the measurement exactly.
+
+## Why it's not 10× — the real reason
+
+Your mental model is "K barely changes → ~3 multiplications." That model fails on **one number**: the δK0 seed arrives at R_H = 6.9e-4, and the force-validated gate is ~1e-4 (measured: R_H=2.9e-4 gave 85% force error). We need **~15× contraction of the residual**, and each DMM step contracts only ~1.7× because the stable step is capped at η·(εmax−εmin) ~ 1. That's the physics: steepest descent on the Grassmannian has a convergence rate set by the spectrum width, independent of how good the seed is. 6 steps × 3 products + 8 retraction products is what 15× contraction costs.
+
+The retraction is the second cost: 8 products for safety — and ret=3 already proved louder-than-acceptable drift.
+
+## What would actually get toward 10×
+
+Honest options, ordered by leverage:
+
+1. **Relax the gate to ~2e-4 if forces tolerate it.** After 2 DMM steps + 1 retract we're at R_H≈1.6e-4 — untested territory. If ΔF error stays ~1%, that's ~13 products vs 37 → **~2× further**. Cheap to test, real chance of working since a *DMM-relaxed* 1.6e-4 is physically different from the *seed-only* 2.9e-4 that failed before.
+
+2. **Conjugate-gradient on the manifold (the real algorithmic answer).** Steepest-descent → CG roughly squares the rate: ~2-3 steps instead of 6. Polak–Ribière needs 2 norm reductions/step (cheap) + a line-search trace. This is the standard DMM literature result — could plausibly reach ~15-20 products total.
+
+3. **BB step-size** — same idea, cheaper version, using successive |G| norms.
+
+4. **Amortize the fixed costs**: NS could probably run 1-2 iters (R_Z=8.5e-5 is enough for DMM purposes), K0 could reuse central spectral bounds instead of re-Gershgorin. Saves ~4-6 products of overhead.
+
+5. **The actual 10× path is batching**, which was always the product: at ~7ms/product the GPU is launch-bound, not saturated — N columns' products fused/batched is where the order of magnitude lives.
+
+My recommendation: test (1) right now — it's one env var away from an answer — then implement (2) CG-DMM if you want the solve itself fast. Want me to run the gate-relaxation force test?
+
+
+
+
+
+---
+
+
+# Chat GPT 5.6 sol
+
+Yes — I think the coding agent’s arithmetic is internally consistent, but it is **solving the wrong problem**.
+
+A “warm Hessian” calculation that still does ~37 SpGEMMs is not the Tier-1 approximation we discussed. It is basically a mini electronic-structure solve initialized from the old state. No wonder it is only 25–30% faster than ~55-product cold purification.
+
+The order-of-magnitude speedup you expected is still plausible for the **low-accuracy response tier**, but only if we actually exploit the premise
+
+$$
+K(R_0+\delta R)=K_0+O(\delta R)
+$$
+
+instead of reconverging it almost to the cold solution.
+
+### What I think is wrong with the current warm benchmark
+
+The biggest issue is the `δK0` seed. It explicitly requires constructing the new spectral \(K_0\) first. The current implementation of `compute_k0` computes \(B=ZH\), obtains Gershgorin bounds with host reads, computes \(B Z=ZHZ\), then constructs the spectral K0.   The warm-seed routine then takes the difference between this newly constructed K0 and the central K0. 
+
+That may be a useful research seed, but for our Hessian Tier 1 it defeats the point. We wanted:
+
+$$
+\boxed{\text{start directly from the converged central }K}
+$$
+
+and perturb it. No spectral initialization, no Gershgorin, no \(ZHZ\).
+
+The second problem is **three Newton–Schulz iterations**. Your code itself states that one warm NS step gives the first-order inverse correction to \(S^{-1}\).  In fact, if
+
+$$
+S_1=S_0+\delta S,\qquad Z_0=S_0^{-1},
+$$
+
+then one NS step gives
+
+$$
+Z_1=2Z_0-Z_0S_1Z_0
+   =Z_0-Z_0\delta S Z_0,
+$$
+
+which is exactly the inverse through first order in \(\delta S\). That is exactly the accuracy class we need for a low-order Hessian response. Running three iterations is trying to reconverge Z when we only need its first-order change.
+
+The third problem is the biggest: **six DMM rotations plus two McWeeny retractions**. We explicitly defined the intermediate tier as “a few H-aware rotations, then use it immediately — no accurate projector refinement.” But their benchmark spends
+
+$$
+6\times3=18
+$$
+
+products on gradient descent and another 8 on retractions. That is no longer the intermediate tier.
+
+The claim that “six steps are required by the physics” is also too strong. Six steps are required by **unpreconditioned steepest descent with their chosen \(\eta\), if the goal is to converge \(R_H\) down to approximately the cold-solver threshold**. That is a very different statement.
+
+For Tier 1, we should not converge \(R_H\). We should ask:
+
+> After 0, 1, 2, 3 response steps, how accurate is the *finite-difference Hessian column*?
+
+---
+
+## The warm path I actually intended is much closer to 5–10 products
+
+At the central geometry save
+
+$$
+K_0,\quad Z_0,\quad q_0
+$$
+
+and restore these for every displacement.
+
+For \(R_1=R_0+h e_\alpha\), the cheap but physically sensible one-shot response could be:
+
+$$
+Z_1 \approx 2Z_0-Z_0S_1Z_0
+$$
+
+(one warm NS step: **2 products**).
+
+Then
+
+$$
+B=Z_1H_{\rm SCC}(q_0)
+$$
+
+(**1 product**).
+
+Now form
+
+$$
+T=K_0S_1,
+$$
+
+$$
+X=BK_0,
+$$
+
+$$
+Y=TX,
+$$
+
+and the Hamiltonian-driven tangent correction
+
+$$
+G=X+X^T-2Y.
+$$
+
+That is **3 products**.
+
+Then simply
+
+$$
+K_1=K_0-\eta G.
+$$
+
+No TC2. No McWeeny. No retraction.
+
+Finally, for the force path recompute
+
+$$
+W=2BK_1,
+$$
+
+another **1 product**.
+
+Total:
+
+$$
+\boxed{2+1+3+1=7\ {\rm products}}
+$$
+
+versus roughly 50–55 cold.
+
+That is already around
+
+$$
+\boxed{7\text{–}8\times}
+$$
+
+on product count.
+
+If we establish that central \(Z_0\) can be reused for the low tier, it becomes roughly 5 products, i.e. **~10×**.
+
+I would not initially assume we can freeze Z, because the overlap response contributes at first order to a Hessian. But one NS step is a very clean compromise.
+
+---
+
+# I would actually include the metric correction in the same one-shot update
+
+There is an even nicer version.
+
+The old K satisfies
+
+$$
+K_0S_0K_0=K_0,
+$$
+
+but at the displaced geometry
+
+$$
+K_0S_1K_0\neq K_0.
+$$
+
+The first-order metric transport we discussed is
+
+$$
+K_{\rm metric}=2K_0-K_0S_1K_0.
+$$
+
+We can calculate this while sharing the same \(T=K_0S_1\):
+
+$$
+T=K_0S_1,
+\qquad
+Q=TK_0.
+$$
+
+Then combine both first-order corrections **without iterating**:
+
+$$
+\boxed{
+K_1=
+2K_0-Q
+-\eta\left(X+X^T-2Y\right)
+}
+$$
+
+where
+
+$$
+X=(Z_1H_1)K_0,\qquad Y=T X.
+$$
+
+This is rather attractive conceptually:
+
+* \(2K_0-Q\) transports the projector to the changed metric \(S_1\);
+* the \(G\) term rotates its occupied space toward the changed H.
+
+Because both corrections are first-order, evaluating both from the original central K is perfectly consistent to \(O(h)\); their cross-coupling is only \(O(h^2)\).
+
+This costs one extra product \(Q=TK_0\), so about **8 products total including Z update and final W**, still ~7× cheaper than cold.
+
+That is much closer to what I think the intermediate Hessian tier should be.
+
+---
+
+## Why six steepest-descent steps are the wrong target
+
+Their statement:
+
+> “we need ~15× contraction of \(R_H\), therefore six DMM steps”
+
+implicitly assumes the warm state must reach essentially the same stationarity as the cold state.
+
+But we deliberately introduced different accuracy tiers precisely so that this is **not** required.
+
+Tier 0: frozen electronic state.
+
+Tier 1: first-order electronic response.
+
+Tier 2: converged warm SCC + accurate FF32 polish.
+
+If Tier 1 requires six iterations, two retractions and a cold K0 build, then there is barely any reason for Tier 1 to exist.
+
+Also, their steepest descent is the slowest plausible way to solve the occupied–virtual response. Linearizing in the eigenbasis gives roughly
+
+$$
+\delta G_{ai}
+\sim(\epsilon_a-\epsilon_i)\delta K_{ai}.
+$$
+
+A single scalar \(\eta\) therefore treats all occupied–virtual energy denominators equally. The convergence rate is governed by a **condition number of those gaps**, not by some fundamental statement that six rotations are physically necessary.
+
+If later we want the fully relaxed warm state cheaply, then BB, conjugate-gradient, or an energy-denominator preconditioner makes sense.
+
+But I would **not implement CG yet**. First establish whether one or two response steps already give the Hessian we need.
+
+---
+
+# The h=0.05 Å benchmark is also not the benchmark I would use
+
+This jumped out at me.
+
+Our original vibration calculation was using roughly
+
+$$
+h=0.02\ {\rm Å}.
+$$
+
+The coding agent benchmarked the warm method with
+
+$$
+h=0.05\ {\rm Å}.
+$$
+
+The electronic perturbation is consequently about 2.5× larger.
+
+That directly makes:
+
+* the old K worse,
+* old Z worse,
+* the tangent rotation larger,
+* manifold drift larger,
+* more retractions necessary.
+
+Now that we have solved the numerical precision problem, I would benchmark the response algorithm at the **actual Hessian displacement we intend to use**, probably \(0.02\) Å or perhaps smaller.
+
+If one DMM step works at 0.02 Å but six are required at 0.05 Å, I don't care about the latter for production Hessians.
+
+---
+
+# I am also suspicious of the “85% force error”
+
+This needs to be defined very carefully.
+
+Near an equilibrium geometry, forces themselves can be small. A percentage such as
+
+$$
+\frac{\|F_{\rm warm}-F_{\rm ref}\|}{\|F_{\rm ref}\|}
+$$
+
+can become enormous for a perfectly usable approximation if the denominator is small.
+
+For vibrations the quantity we actually care about is the **Hessian column**
+
+$$
+H_{\alpha}
+=
+-\frac{F(R_0+h e_\alpha)-F(R_0-h e_\alpha)}{2h}.
+$$
+
+So the decisive benchmark should be, for each selected coordinate:
+
+$$
+\Delta H_\alpha
+=
+H_\alpha^{\rm warm}-H_\alpha^{\rm cold}.
+$$
+
+Report absolute RMS/max errors in physically meaningful units and perhaps a relative norm versus the Hessian column.
+
+Do the comparison after:
+
+$$
+0,\ 1,\ 2,\ 3
+$$
+
+H-aware updates.
+
+That directly tells us the answer.
+
+Do **not** pick the number of DMM steps from an arbitrary \(R_H<10^{-4}\) gate unless we first establish that this gate predicts Hessian accuracy.
+
+---
+
+## There is another very Hessian-specific optimization the agent hasn't mentioned
+
+For a central finite difference,
+
+$$
+K(+h)=K_0+hK'_0+O(h^2),
+$$
+
+$$
+K(-h)=K_0-hK'_0+O(h^2).
+$$
+
+So to first order the electronic corrections for \(+h\) and \(-h\) are just opposites.
+
+That means we should eventually consider computing **one electronic response per Cartesian coordinate**, not two independent warm solves:
+
+$$
+\delta K \approx K(+h)-K_0,
+$$
+
+then use
+
+$$
+K_+ =K_0+\delta K,
+\qquad
+K_- =K_0-\delta K.
+$$
+
+Or better, form the antisymmetric perturbations in H and S and solve directly for \(K'_0\).
+
+Any error from ignoring the even \(O(h^2)\) electronic response contributes only the same order as the central finite-difference truncation we already accept.
+
+This could roughly halve the expensive electronic-response work per Hessian column while also enforcing beautiful \(+/-\) symmetry.
+
+That is much more relevant to obtaining a 10× Hessian speedup than CG-converging each displaced state separately.
+
+---
+
+## So I would stop the current line of optimization
+
+I would **not** next test a looser \(R_H\) gate and I would **not** implement CG-DMM yet.
+
+I would ask the coding agent for one very focused experiment, with no new algorithmic sophistication:
+
+| mode                    | expensive operations before force |
+| ----------------------- | --------------------------------: |
+| frozen                  |                0 K-response steps |
+| one-shot H rotation     |            1 DMM step, no retract |
+| metric + one H rotation | combined first-order update above |
+| two H rotations         |               2 steps, no retract |
+| current mini-solver     |             6 steps + retractions |
+| cold                    |                         reference |
+
+Use the **actual \(h=0.02\) Å** and perhaps 3 representative coordinates.
+
+For each, report:
+
+$$
+t_{\rm eval},
+\qquad
+N_{\rm SpGEMM},
+\qquad
+R_I,\qquad
+R_H,
+$$
+
+but most importantly
+
+$$
+\|H_\alpha-H_\alpha^{\rm cold}\|_{\rm RMS},
+\qquad
+\max|\Delta H_\alpha|.
+$$
+
+No K0/Gershgorin in the first-order modes. No FF32. No McWeeny retractions. No per-step convergence tests. Reuse central bounds if \(\eta\) needs a scale.
+
+The current persistent workspace is already built specifically to survive across Hessian displacements rather than being reconstructed. 
+
+### My expectation
+
+I would now set the performance target roughly as:
+
+$$
+\text{frozen}: \quad \text{baseline very cheap}
+$$
+
+$$
+\text{1-step response}: \quad 5\text{–}8\ {\rm products}
+$$
+
+$$
+\text{2-step response}: \quad 8\text{–}11\ {\rm products}
+$$
+
+versus
+
+$$
+\text{cold}: \quad 50\text{–}55\ {\rm products}.
+$$
+
+So **5–10× is still a reasonable target** for the intermediate tier.
+
+The measured 25% improvement does not demonstrate that warm reuse is ineffective. It demonstrates that the current implementation is spending most of its time **reconverging quantities that this tier was explicitly supposed not to reconverge**.

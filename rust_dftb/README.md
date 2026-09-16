@@ -80,8 +80,13 @@ RUST_DFTB_SCC_VERBOSE=1 cargo run --example hbond_ref -- ...
 - `tests/` — parity tests vs Fortran DFTB+, GPU tests, integration tests.
   Key GPU tests: `gpu_scc.rs` (H2O/N2 parity), `hbond_gpu_scc.rs` (formic dimer
   1D scan), `formic_scan_plots.rs` (1D+2D scan with plots, `--ignored`),
-  `gpu_scc_bench.rs` (timing benchmarks, `--ignored`), `gpu_forces.rs`
+  `gpu_scc_bench.rs` (timing benchmarks, `--ignored`; `test_gpu_scc_scan400_benchmark`
+  = multi-system 20×20-scan throughput vs CPU, see
+  `doc/prokop/reports/2026-09-16_dense_gpu_pes_forces_benchmark.md`), `gpu_forces.rs`
   (Phase 4 analytic force parity, synthetic H2/sp3 pass, real-SK H2O blocked),
+  `gpu_hbond_physics.rs` (honest physics diagnostics; hosts
+  `test_gc_ptscan_pes_forces_vs_cpu` — production-path GC proton-transfer PES-shape
+  + analytic-force parity vs CPU f64, 0.10 meV shape error),
   `gpu_cdft.rs` (CDFT fragment-charge constraints: H2O {O} target + 8-replica
   ladder, asserts constrained E ≥ E₀).
   Sparse nanocrystal tests: `sih_padded_basis.rs` (Gate D), `locality_sweep.rs`

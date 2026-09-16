@@ -58,6 +58,10 @@ QM/QM fragment solver with OpenCL GPU offload. Python utilities (`pyBall/`,
   - `geometry_engine.py`, `plot_hbond.py`, `run_formic_dimer_*.sh`.
 - `debug/` — **all debug artifacts** (PNGs, scratch CSVs, SCC dumps, one-off
   plots). Organized as `debug/<topic>/`. **Never commit anything here.**
+  Current: `plot_ptscan_conv.py`/`plot_ptscan_pes.py` (GC PT-scan CPU DIIS
+  convergence + GPU-vs-CPU PES/force overlays → `ptscan_conv.png`,
+  `ptscan_pes.png`), `ptscan_conv.log`, `diag_f32_*.rhai` (f32 lever A/B
+  probes).
 - `doc/` — documentation (see below).
 - `utils/`, `sys/`, `cmake/` — build/system helpers.
 
@@ -110,7 +114,11 @@ QM/QM fragment solver with OpenCL GPU offload. Python utilities (`pyBall/`,
   `scripts/test_gpu_dftb_molecules.rhai`). Do **not** add a new cargo test /
   `src/bin` / `examples/` target per molecule. `tests/gpu_dftb.rs` is H2O smoke
   only. Diagnostics still in `rust_dftb/tests/gpu_hbond_physics.rs` (throwaway
-  runtimes — not the product). SK interpolator:
+  runtimes — not the product; also hosts `test_gc_ptscan_pes_forces_vs_cpu`,
+  the production-path GC proton-transfer **PES-shape + forces parity vs CPU
+  f64**, and `tests/gpu_scc_bench.rs::test_gpu_scc_scan400_benchmark`, the
+  multi-system 20×20-scan throughput bench — report
+  `reports/2026-09-16_dense_gpu_pes_forces_benchmark.md`). SK interpolator:
   `doc/prokop/topical_audit/sk_interpolation.md`. f32 floor vs bugs (dense):
   `doc/prokop/topical_audit/f32_floor_dense_hbond.md`. Sparse floor vs pipeline:
   `doc/prokop/topical_audit/f32_floor_sparse.md`.

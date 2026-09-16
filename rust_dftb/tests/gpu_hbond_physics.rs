@@ -1292,3 +1292,160 @@ fn test_scc_electronic_parity_tight_h2o_cpu_fed() {
     assert!(de < E_EL_TOL, "CPU-fed SCC |dE|={de:.3e} > {E_EL_TOL:.1e} (old tests allowed 1e-3)");
     assert!(dq < Q_TOL, "CPU-fed SCC |dq|={dq:.3e} > {Q_TOL:.1e}");
 }
+
+/// GC N–H···N proton-transfer scan: GPU f32 dense-multi vs CPU f64 —
+/// PES *shape* and forces, not just absolute energy.
+///
+/// The single-point parity numbers (~1e-6 Ha) do not answer whether f32
+/// errors are a near-constant offset or distort the energy landscape.
+/// Rigid scan: H13 moved along the N8→N20 axis, d(N8–H13) = 1.0…1.9 Å
+/// (19 pts, same coordinate as scripts/test_gpu_ptscan_gc.rhai).
+/// Smearing kT = 0.002 Ha on BOTH paths — the mid-transfer HOMO/LUMO gap
+/// is ~0.5 mHa and integer occupation flip-flops there (production value).
+///
+/// Per point: |E_gpu−E_cpu|, ΔΔE(x) = (E_g(x)−E_g(0)) − (E_c(x)−E_c(0))
+/// (the PES-shape error), max/rms |ΔF| over all Cartesian components, and
+/// the projected scan force F(H13)·û. Interior points also report the
+/// finite-difference consistency of each method's own E(d) profile vs its
+/// analytic projected force — catches a force that disagrees with its own
+/// energy surface even when GPU↔CPU agree.
+///
+/// Measured (RTX 3090, mio-1-1, --release): max|ΔΔE| = 3.7e-6 Ha = 0.100 meV
+/// over a 39.7 kcal/mol barrier (barrier err 0.068 meV); max|ΔF| = 5.5e-6
+/// Ha/Å; max|ΔF_scan| = 2.1e-6 Ha/Å. SSOT:
+/// doc/prokop/topical_audit/f32_floor_dense_hbond.md §3.2,
+/// plots debug/ptscan_pes.png + debug/ptscan_conv.png.
+#[test]
+fn test_gc_ptscan_pes_forces_vs_cpu() {
+    use rust_dftb::methods::dftb::dftb_cpu::DftbCpu;
+    use rust_dftb::methods::dftb::forces::{parse_all_repulsive, repulsive_energy};
+    use rust_dftb::qmqm::{GpuDftb, SccStatus};
+
+    let _rt = require_nvidia(); // production engine picks its own device; this asserts NVIDIA exists
+    let dir = require_sk_dir();
+    let (sp, base) = gc_pair();
+    let n_atoms = sp.len();
+    assert_eq!(n_atoms, 29, "GC pair must have 29 atoms");
+
+    // Scan coordinate: donor N8 (idx 8), transferring H13 (idx 13),
+    // acceptor N20 (idx 20) — same triplet as test_gpu_ptscan_gc.rhai.
+    assert_eq!(sp[8], "N"); assert_eq!(sp[13], "H"); assert_eq!(sp[20], "N");
+    let mut u = [0.0f64; 3];
+    for c in 0..3 { u[c] = base[20][c] - base[8][c]; }
+    let unn = (u[0] * u[0] + u[1] * u[1] + u[2] * u[2]).sqrt();
+    for c in 0..3 { u[c] /= unn; }
+
+    const N_PTS: usize = 19;
+    const D0: f64 = 1.0;
+    const DSTEP: f64 = 0.05;
+    const KT: f32 = 0.002;
+    let d_vals: Vec<f64> = (0..N_PTS).map(|i| D0 + i as f64 * DSTEP).collect();
+    let geoms: Vec<Vec<[f64; 3]>> = d_vals.iter()
+        .map(|&d| {
+            let mut g = base.clone();
+            for c in 0..3 { g[13][c] = base[8][c] + u[c] * d; }
+            g
+        })
+        .collect();
+
+    // --- GPU: one persistent engine, batch = whole scan ---
+    let sk = load_sk_for_species(&dir, &sp).unwrap();
+    let all: Vec<[f64; 3]> = geoms.iter().flatten().cloned().collect();
+    let mut eng = GpuDftb::new(sk.clone(), &dir, sp.clone(), all, N_PTS)
+        .unwrap_or_else(|e| panic!("GpuDftb::new: {e}"));
+    eng.set_smearing(KT);
+    let s = eng.scc(100, 1e-6).unwrap_or_else(|e| panic!("scan scc: {e}"));
+    eprintln!("[PTSCAN] GPU scc: iters={} rms={:.3e} statuses={:?}", s.n_iters, s.rms, s.statuses);
+    let n_failed = s.statuses.iter().filter(|st| **st == SccStatus::Failed).count();
+    assert_eq!(n_failed, 0, "{n_failed}/{N_PTS} scan replicas failed SCC");
+    let ev = eng.eval(true).unwrap_or_else(|e| panic!("scan eval: {e}"));
+    let f_gpu = ev.forces.as_ref().expect("eval(true) returns forces");
+    let e_gpu = &ev.energy;
+
+    // --- CPU f64 reference per point (independent SCC, same smearing) ---
+    let mut unique: Vec<String> = Vec::new();
+    for s_ in &sp { if !unique.contains(s_) { unique.push(s_.clone()); } }
+    let repulsive = parse_all_repulsive(&dir, &unique, unique.len())
+        .unwrap_or_else(|e| panic!("parse_all_repulsive: {e}"));
+    let mut cpu = DftbCpu::new(sk, sp.clone()).unwrap_or_else(|e| panic!("DftbCpu::new: {e}"));
+    cpu.set_smearing(KT as f64);
+    let mut e_cpu = Vec::with_capacity(N_PTS);
+    let mut f_cpu: Vec<[f64; 3]> = Vec::with_capacity(N_PTS * n_atoms);
+    for (i, g) in geoms.iter().enumerate() {
+        cpu.update_geometry(g).unwrap_or_else(|e| panic!("cpu update_geometry pt {i}: {e}"));
+        cpu.reset_charges();
+        // tol=1e-8: the f64 DIIS hits a limit-cycle floor ~1e-8 rms at the
+        // mid-transfer point (measured — see debug/ptscan_conv.log); tighter
+        // asks for a residual below the mixer's floor, more iterations just
+        // burn time on the plateau. 1e-8 charge-rms is ~100× below the f32
+        // energy/force errors being measured, so the reference is exact for
+        // this comparison.
+        cpu.solve_scc(200, 1e-8).unwrap_or_else(|e| panic!("cpu scc pt {i} (d={:.2}): {e}", d_vals[i]));
+        let scc = cpu.build_result();
+        let e_rep = repulsive_energy(&dir, &sp, g).unwrap_or_else(|e| panic!("cpu e_rep pt {i}: {e}"));
+        e_cpu.push(scc.energy + e_rep);
+        let fo = cpu.compute_forces(&scc, &repulsive).unwrap_or_else(|e| panic!("cpu forces pt {i}: {e}"));
+        f_cpu.extend_from_slice(&fo.forces);
+    }
+
+    // --- Compare: absolute offset, PES shape, forces, FD consistency ---
+    eprintln!("[PTSCAN]  d(N-H)   E_gpu            E_cpu            |dE|       ΔΔE(meV)   max|dF|     rms|dF|    F_g·û      F_c·û");
+    let mut max_de = 0.0f64;
+    let mut max_dde = 0.0f64;
+    let mut rms_dde = 0.0f64;
+    let mut max_df = 0.0f64;
+    let mut max_df_scan = 0.0f64;
+    for i in 0..N_PTS {
+        let de = (e_gpu[i] - e_cpu[i]).abs();
+        let dde = ((e_gpu[i] - e_gpu[0]) - (e_cpu[i] - e_cpu[0])).abs();
+        let (mut mf, mut sf) = (0.0f64, 0.0f64);
+        for a in 0..n_atoms {
+            for c in 0..3 {
+                let d = (f_gpu[(i * n_atoms + a) * 3 + c] as f64 - f_cpu[i * n_atoms + a][c]).abs();
+                mf = mf.max(d);
+                sf += d * d;
+            }
+        }
+        let rms_f = (sf / (3 * n_atoms) as f64).sqrt();
+        // Projected scan force: F(H13)·û.  dE/dd = −F·û (H moves along û).
+        let fs_g: f64 = (0..3).map(|c| f_gpu[(i * n_atoms + 13) * 3 + c] as f64 * u[c]).sum();
+        let fs_c: f64 = (0..3).map(|c| f_cpu[i * n_atoms + 13][c] * u[c]).sum();
+        let dfs = (fs_g - fs_c).abs();
+        eprintln!("[PTSCAN] d={:.2}  {:+.9}  {:+.9}  {:.3e}  {:+8.3}  {:.3e}  {:.3e}  {:+.5}  {:+.5}",
+            d_vals[i], e_gpu[i], e_cpu[i], de, dde * 27.2114 * 1000.0, mf, rms_f, fs_g, fs_c);
+        max_de = max_de.max(de);
+        max_dde = max_dde.max(dde);
+        rms_dde += dde * dde;
+        max_df = max_df.max(mf);
+        max_df_scan = max_df_scan.max(dfs);
+    }
+    rms_dde = (rms_dde / N_PTS as f64).sqrt();
+
+    // Finite-difference consistency: F_fd(d) = −(E[i+1]−E[i−1])/(2·DSTEP)
+    // vs analytic F(H13)·û, separately for GPU and CPU.
+    let (mut fd_g, mut fd_c) = (0.0f64, 0.0f64);
+    for i in 1..N_PTS - 1 {
+        let fs_g: f64 = (0..3).map(|c| f_gpu[(i * n_atoms + 13) * 3 + c] as f64 * u[c]).sum();
+        let fs_c: f64 = (0..3).map(|c| f_cpu[i * n_atoms + 13][c] * u[c]).sum();
+        fd_g = fd_g.max((-(e_gpu[i + 1] - e_gpu[i - 1]) / (2.0 * DSTEP) - fs_g).abs());
+        fd_c = fd_c.max((-(e_cpu[i + 1] - e_cpu[i - 1]) / (2.0 * DSTEP) - fs_c).abs());
+    }
+
+    // Barrier: TS is the highest point of this rigid scan (mid-transfer).
+    let bar_g = e_gpu.iter().cloned().fold(f64::NEG_INFINITY, f64::max) - e_gpu[0];
+    let bar_c = e_cpu.iter().cloned().fold(f64::NEG_INFINITY, f64::max) - e_cpu[0];
+
+    eprintln!("[PTSCAN] summary: max|dE|={max_de:.3e} Ha  max|ΔΔE|={max_dde:.3e} Ha ({:.3} meV)  rms|ΔΔE|={:.3e}",
+        max_dde * 27.2114 * 1000.0, rms_dde);
+    eprintln!("[PTSCAN] forces: max|dF|={max_df:.3e} Ha/Å  max|dF_scan|={max_df_scan:.3e} Ha/Å");
+    eprintln!("[PTSCAN] FD consistency: max|F_fd−F·û| gpu={fd_g:.3e}  cpu={fd_c:.3e} Ha/Å");
+    eprintln!("[PTSCAN] barrier: gpu={:.4} Ha ({:.2} kcal/mol)  cpu={:.4} Ha ({:.2} kcal/mol)  err={:.3} meV",
+        bar_g, bar_g * 627.509, bar_c, bar_c * 627.509, (bar_g - bar_c).abs() * 27.2114 * 1000.0);
+
+    assert!(e_gpu.iter().all(|e| e.is_finite()), "non-finite GPU energy in scan");
+    // Regression lines, ~3–5× the measured f32 floor — not parity claims.
+    // GC PT-scan measured max|ΔΔE|≈3.7e-6; GC forces measured ~5e-6.
+    assert!(max_dde < 5e-5, "PES-shape error {max_dde:.3e} Ha — f32 error is NOT a constant offset");
+    assert!(max_df < 1e-3, "force parity failed: max|dF|={max_df:.3e} Ha/Å");
+    assert!(fd_g < 1e-2 && fd_c < 1e-2, "FD-vs-analytic force inconsistency: gpu={fd_g:.3e} cpu={fd_c:.3e} Ha/Å");
+}

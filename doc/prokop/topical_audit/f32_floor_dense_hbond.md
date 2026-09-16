@@ -7,6 +7,13 @@ timestamp: 2026-09-10
 
 # Dense H-bond GPU pipeline — bugs vs f32 floor
 
+> **SUPERSEDED 2026-09-16** — the `δ_CH` "floor" below is resolved by the
+> occupied-subspace repair (`occ_repair`: column renorm + Rayleigh ρ_k for
+> E_band/W) + warm-basis Jacobi now in `GpuSccPlan`. Current measured parity:
+> `OVERVIEW_Roadmap.md` §6.4 dated table — N≤246 |dE| ≲ 1.4e-6 Ha, forces
+> ≲ 1.5e-5 Ha/B, AT/GC converge (no stall). The classification (bug vs floor)
+> and "do not chase" guidance below remain valid; the quoted floors do not.
+
 **SSOT for:** what is a bug / physical misconception, what is a method stopgap,
 and what is the **measured** dense GPU floor after Package 2 (frozen-H) +
 Löwdin Newton + f32 GEMM Kahan (2026-09-10, NVIDIA 3090 `--release`).
@@ -153,6 +160,45 @@ Script: `rust_dftb/scripts/test_gpu_dftb_measure.rhai`. Same GPU-rounded `H_scc`
 | AT N=87 per-iter | **389 ms** of which occ_sort+upload **388 ms**; jacobi 0.10, gemm 0.12 | **788 ms** / occ_sort **786 ms**; jacobi 0.11, gemm 0.12 |
 
 AT wall time in that bench is **host occupation sort**, not Kahan. Do not quote 389 ms as GPU SCC. Production path is `GpuDftb`.
+
+### 3.2 PES shape + forces vs CPU f64 — GC proton transfer (current code, RTX 3090 `--release`)
+
+Test: `tests/gpu_hbond_physics.rs::test_gc_ptscan_pes_forces_vs_cpu`.
+Rigid scan of the GC N–H···N hydrogen bond: H13 displaced along the N8→N20
+axis, d(N8–H13) = 1.0…1.9 Å, 19 points (same coordinate as
+`scripts/test_gpu_ptscan_gc.rhai`). kT = 0.002 Ha smearing on both paths
+(mid-transfer gap ~0.5 mHa); GPU batch = 19 replicas in one `GpuDftb`;
+CPU = `DftbCpu` f64 per point (DIIS, tol 1e-8 — see convergence note).
+
+| Quantity | Measured |
+|---|---|
+| max \|E_gpu − E_cpu\| (absolute) | 3.5e-6 Ha — varies 1.4e-7…3.5e-6 along the scan, i.e. **not** a constant offset |
+| max \|ΔΔE\| = \|ΔE_gpu − ΔE_cpu\| vs pt 0 (PES **shape** error) | **3.7e-6 Ha = 0.10 meV** |
+| rms \|ΔΔE\| | 1.65e-6 Ha |
+| barrier (max−E₀ ≈ 39.7 kcal/mol) error | **0.068 meV** |
+| max \|ΔF\| (all atoms/components, all pts) | 5.5e-6 Ha/Å |
+| max \|ΔF_scan\| (projected F(H13)·û) | 2.1e-6 Ha/Å |
+| FD consistency \|F_fd − F·û\|, h = 0.05 Å | 4.3e-3 Ha/Å **identical for GPU and CPU** → pure central-FD truncation, not an inconsistency |
+
+Reading: the f32 error is **mostly** a smooth, slowly geometry-varying
+offset — the PES shape and the force profile are preserved to ~0.1 meV /
+~5e-6 Ha·Å⁻¹ over a 40 kcal/mol proton-transfer coordinate, including the
+nearly-degenerate midpoint. This is the regime that matters for
+barriers/relaxation; absolute |dE| ~1e-6–4e-6 is the part that does not
+fully cancel.
+
+CPU reference convergence at the mid-transfer point: f64 DIIS reaches
+rms ~1e-8 in ≤32 iters then jitters around the limit cycle; tol 1e-9 does
+not converge there (200-iter cap hit at rms 1.7e-8 — a mixer floor, not a
+harder solve). Reference tol is therefore 1e-8, ~100× below the f32
+quantities measured. Plots: `rust_dftb/debug/ptscan_conv.png`,
+`ptscan_pes.png`; raw log `debug/ptscan_conv.log`.
+
+Throughput on the same footing (multi-system 20×20-scan benchmark, batch
+1–400, all tested systems N=6–246):
+`doc/prokop/reports/2026-09-16_dense_gpu_pes_forces_benchmark.md` —
+52–342k systems/s, 8.5–157× vs sequential CPU; Jacobi O(N³)-per-replica
+bound at large N.
 
 ---
 
