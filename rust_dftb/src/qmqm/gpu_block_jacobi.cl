@@ -78,13 +78,37 @@ inline int2 bj_pair(int round, int ip) {
     return (int2)((round + ip) % m, (round + m - ip) % m);
 }
 
+// Workgroup sum for ARBITRARY lsz (WG = ceil(n/32)*32 → 96/160/224 are
+// not powers of two). The naive `o = lsz>>1` halving requires lsz to be
+// a power of two — at lsz=96 it only reduces lanes 0..63 and silently
+// drops every lane ≡2 mod 3. Fold the tail [p2,lsz) onto [0,lsz−p2)
+// first (p2 = largest power of two ≤ lsz), then halve over p2 entries.
+// All work-items must call this (workgroup barriers inside); the result
+// is read after the trailing barrier so `red` is reusable by the next call.
+inline float bj_wg_sum(__local float* red, float v, const int lid, const int lsz) {
+    red[lid] = v;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    int p2 = 1;
+    while ((p2 << 1) <= lsz) p2 <<= 1;
+    if (lid + p2 < lsz) red[lid] += red[lid + p2];
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int o = p2 >> 1; o > 0; o >>= 1) {
+        if (lid < o) red[lid] += red[lid + o];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    const float s = red[0];
+    barrier(CLK_LOCAL_MEM_FENCE);
+    return s;
+}
+
 // Pivot-local Brent-Luk Jacobi: diagonalize P (PB×PB, PLD-padded,
 // pad rows have huge diagonal + zero off-diagonal → identity rotations),
 // accumulating eigenvectors in U. All work-items must call this
 // (contains workgroup barriers). f32 throughout — rotation-angle error
 // ~1e-7 is self-correcting; accuracy is governed by the global
 // off-norm exit + the occ Rayleigh/renorm repair downstream.
-inline void bj_pivot_solve(
+// Returns the number of inner sweeps executed (for honest diagnostics).
+inline int bj_pivot_solve(
     __local float* P, __local float* U,
     __local float* rot_c, __local float* rot_s,
     __local int* rot_p, __local int* rot_q,
@@ -99,15 +123,9 @@ inline void bj_pivot_solve(
     for (int i = lid; i < m; i += lsz)
         for (int j = 0; j < m; ++j)
             fp += P[i * PLD + j] * P[i * PLD + j];
-    reduce[lid] = fp;
-    barrier(CLK_LOCAL_MEM_FENCE);
-    for (int o = lsz >> 1; o > 0; o >>= 1) {
-        if (lid < o) reduce[lid] += reduce[lid + o];
-        barrier(CLK_LOCAL_MEM_FENCE);
-    }
-    const float off_exit = INNER_TOL * sqrt(fmax(reduce[0], 1.0e-30f));
-    barrier(CLK_LOCAL_MEM_FENCE);
+    const float off_exit = INNER_TOL * sqrt(fmax(bj_wg_sum(reduce, fp, lid, lsz), 1.0e-30f));
 
+    int nsw_in = 0;
     for (int isw = 0; isw < INNER_MAX; ++isw) {
         for (int r = 0; r < PB - 1; ++r) {
             if (lid == 0) *l_nrot = 0;
@@ -173,16 +191,11 @@ inline void bj_pivot_solve(
         for (int i = lid; i < m; i += lsz)
             for (int j = 0; j < m; ++j)
                 if (i != j) fo += P[i * PLD + j] * P[i * PLD + j];
-        reduce[lid] = fo;
-        barrier(CLK_LOCAL_MEM_FENCE);
-        for (int o = lsz >> 1; o > 0; o >>= 1) {
-            if (lid < o) reduce[lid] += reduce[lid + o];
-            barrier(CLK_LOCAL_MEM_FENCE);
-        }
-        float off_in = sqrt(reduce[0]);
-        barrier(CLK_LOCAL_MEM_FENCE);
+        const float off_in = sqrt(bj_wg_sum(reduce, fo, lid, lsz));
+        nsw_in = isw + 1;
         if (!isfinite(off_in) || off_in <= off_exit) break;
     }
+    return nsw_in;
 }
 
 __kernel void block_jacobi_1wg(
@@ -227,21 +240,8 @@ __kernel void block_jacobi_1wg(
             if (j != lid) fo += v * v;
         }
     }
-    reduce[lid] = fro;
-    barrier(CLK_LOCAL_MEM_FENCE);
-    for (int o = lsz >> 1; o > 0; o >>= 1) {
-        if (lid < o) reduce[lid] += reduce[lid + o];
-        barrier(CLK_LOCAL_MEM_FENCE);
-    }
-    const float frob = sqrt(fmax(reduce[0], 1.0e-30f));
-    barrier(CLK_LOCAL_MEM_FENCE);
-    reduce[lid] = fo;
-    barrier(CLK_LOCAL_MEM_FENCE);
-    for (int o = lsz >> 1; o > 0; o >>= 1) {
-        if (lid < o) reduce[lid] += reduce[lid + o];
-        barrier(CLK_LOCAL_MEM_FENCE);
-    }
-    float off_cur = sqrt(reduce[0]);
+    const float frob = sqrt(fmax(bj_wg_sum(reduce, fro, lid, lsz), 1.0e-30f));
+    float off_cur = sqrt(bj_wg_sum(reduce, fo, lid, lsz));
     const float off_exit = JACOBI_OFF_TOL * frob;
 
     int stop = -1, nsw = 0;
@@ -259,7 +259,7 @@ __kernel void block_jacobi_1wg(
             }
         }
         barrier(CLK_LOCAL_MEM_FENCE);
-        bj_pivot_solve(P, U, rot_c, rot_s, rot_p, rot_q, reduce, &l_nrot, n, lid, lsz);
+        nsw = bj_pivot_solve(P, U, rot_c, rot_s, rot_p, rot_q, reduce, &l_nrot, n, lid, lsz);
         for (int i = lid; i < n; i += lsz) {
             // A row i <- P row i; V row i <- V row i · U (init_v: I·U=U, warm: c·U)
             float xv[PB];
@@ -273,20 +273,15 @@ __kernel void block_jacobi_1wg(
                 gV[i * n + j] = acc;
             }
         }
-        // Report the achieved inner off-norm against ‖A‖_F.
+        // Report the achieved inner off-norm against ‖A‖_F — and certify
+        // honestly: a finite residual ABOVE the global exit tolerance is a
+        // non-converged solve (stop=2, inner cap exhausted), not success.
         float fo2 = 0.0f;
         for (int i = lid; i < PB; i += lsz)
             for (int j = 0; j < PB; ++j)
                 if (i != j && i < n && j < n) fo2 += P[i * PLD + j] * P[i * PLD + j];
-        reduce[lid] = fo2;
-        barrier(CLK_LOCAL_MEM_FENCE);
-        for (int o = lsz >> 1; o > 0; o >>= 1) {
-            if (lid < o) reduce[lid] += reduce[lid + o];
-            barrier(CLK_LOCAL_MEM_FENCE);
-        }
-        off_cur = sqrt(reduce[0]);
-        stop = isfinite(off_cur) ? 0 : 4;
-        nsw = 1;
+        off_cur = sqrt(bj_wg_sum(reduce, fo2, lid, lsz));
+        stop = !isfinite(off_cur) ? 4 : ((off_cur <= fmax(off_exit, 1.0e-30f)) ? 0 : 2);
     } else if (stop < 0) {
         // ---- Block-pair sweeps ----
         const int nb = (n + B - 1) / B;
@@ -367,14 +362,7 @@ __kernel void block_jacobi_1wg(
             if (lid < n)
                 for (int j = 0; j < n; ++j)
                     if (j != lid) { float v = gA[lid * n + j]; fo += v * v; }
-            reduce[lid] = fo;
-            barrier(CLK_LOCAL_MEM_FENCE);
-            for (int o = lsz >> 1; o > 0; o >>= 1) {
-                if (lid < o) reduce[lid] += reduce[lid + o];
-                barrier(CLK_LOCAL_MEM_FENCE);
-            }
-            off_cur = sqrt(reduce[0]);
-            barrier(CLK_LOCAL_MEM_FENCE);
+            off_cur = sqrt(bj_wg_sum(reduce, fo, lid, lsz));
             nsw = sweep + 1;
             if (!isfinite(off_cur)) { stop = 4; }
             else if (off_cur <= off_exit) { stop = 0; }
@@ -386,8 +374,12 @@ __kernel void block_jacobi_1wg(
     }
 
     // ---- Eigenvalues + diagnostics ----
+    // First-failure latch (T01): the host clears stop to 0 at the start of
+    // each solve window; a recorded stop>0 is never overwritten by a later
+    // launch, so a mid-iteration failure can no longer be silently erased
+    // by a subsequent converged one before check_jacobi() reads it.
     if (lid < n) eig[(size_t)gid * n + lid] = gA[lid * n + lid];
-    if (lid == 0) {
+    if (lid == 0 && diag[4 * gid + 2] <= 0.0f) {
         diag[4 * gid]     = off_cur;
         diag[4 * gid + 1] = off_cur / frob;
         diag[4 * gid + 2] = (float)stop;

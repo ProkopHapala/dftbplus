@@ -563,6 +563,119 @@ fn test_block_jacobi_eigen_quality() {
     }
 }
 
+/// T01 (Dense_Multi tasks): deterministic lane-coverage regression for the
+/// block-Jacobi WG reductions. The `o = lsz>>1` halving drops lanes for
+/// non-power-of-two WGs — at WG96 lanes ≡2 mod 3 never reach reduce[0]
+/// (96→64 effective). A 0.01 impulse on rows (2,5) — both dropped — makes
+/// the broken probe report off=0 and exit with 0 sweeps, leaving the
+/// rotation unapplied (true residual ≈ √2·0.01/√86 ≈ 1.5e-3).
+#[test]
+fn test_block_jacobi_wg96_impulse_reduction() {
+    let Some(mut rt) = try_runtime() else { return; };
+    let n = 86usize;
+    let eps = 0.01f32;
+    let mut a = vec![0.0f32; n * n];
+    for i in 0..n { a[i * n + i] = 1.0; }
+    a[2 * n + 5] = eps; a[5 * n + 2] = eps;
+    let a_orig = a.clone();
+    let a_buf = rt.buffer_from_slice(&a).unwrap();
+    let v_buf = rt.zero_buffer::<f32>(n * n).unwrap();
+    let diag = block_jacobi_batched(&mut rt, &a_buf, &v_buf, n, 1).unwrap();
+    let mut gpu_a = vec![0.0f32; n * n];
+    let mut gpu_v = vec![0.0f32; n * n];
+    rt.read_buffer(&a_buf, &mut gpu_a).unwrap();
+    rt.read_buffer(&v_buf, &mut gpu_v).unwrap();
+    let mut eigs = vec![0.0f32; n];
+    for i in 0..n { eigs[i] = gpu_a[i * n + i]; }
+    let res = residual(&a_orig, &gpu_v, &eigs, n);
+    let true_off = (2.0f64).sqrt() * eps as f64;
+    eprintln!("[T01] N=86 impulse(2,5): stop={} sweeps={} reported_off={:.3e} res={res:.3e} (true initial off={true_off:.3e})",
+        diag[2], diag[3], diag[0]);
+    assert!(diag[3] >= 1.0,
+        "block Jacobi probe missed the impulse (reported off={:.3e}, true {true_off:.3e}) — a WG96 reduction dropped the rows", diag[0]);
+    assert!(res < 1e-4, "impulse residual {res:.3e} — the rotation was never applied");
+    assert_eq!(diag[2] as i32, 0, "impulse solve should converge, stop={}", diag[2]);
+}
+
+/// T01: the probe's row reduction must count EVERY lane, incl. the
+/// non-power-of-two WG tail — not just a known-dropped residue class.
+/// One small impulse on every super/sub-diagonal element; the total is
+/// kept below off_exit so the kernel exits at the probe and reports the
+/// measured norm in diag[0] — a direct count of which rows contributed.
+#[test]
+fn test_block_jacobi_probe_counts_all_rows() {
+    let Some(mut rt) = try_runtime() else { return; };
+    let eps = 5.0e-7f32;
+    for &n in &[33usize, 48, 64, 86, 87, 96, 128, 160, 161, 192, 224, 225, 246, 256] {
+        let mut a = vec![0.0f32; n * n];
+        for i in 0..n { a[i * n + i] = 1.0; }
+        for i in 0..n - 1 { a[i * n + i + 1] = eps; a[(i + 1) * n + i] = eps; }
+        let off_true = eps as f64 * (2.0 * (n - 1) as f64).sqrt();
+        let a_buf = rt.buffer_from_slice(&a).unwrap();
+        let v_buf = rt.zero_buffer::<f32>(n * n).unwrap();
+        let diag = block_jacobi_batched(&mut rt, &a_buf, &v_buf, n, 1).unwrap();
+        let off_rep = diag[0] as f64;
+        eprintln!("[T01] probe N={n}: reported off={off_rep:.4e} true={off_true:.4e} stop={} sweeps={}",
+            diag[2], diag[3]);
+        assert_eq!(diag[3], 0.0, "N={n}: expected probe exit (0 sweeps), got {}", diag[3]);
+        assert_eq!(diag[2] as i32, 0, "N={n}: expected converged probe exit, stop={}", diag[2]);
+        let rel = (off_rep - off_true).abs() / off_true;
+        assert!(rel < 2.0e-2,
+            "N={n}: probe off-norm {off_rep:.4e} vs true {off_true:.4e} (rel err {rel:.3e}) — reduction dropped lanes");
+    }
+}
+
+/// T01: the n≤PB single-block path must report honest status — an
+/// exhausted INNER_MAX with a finite residual above tolerance is a
+/// NON-converged solve (stop≠0), not silent success. Renders the
+/// template with INNER_MAX=1 so the cap is guaranteed hit on a dense
+/// random pivot.
+#[test]
+fn test_block_jacobi_inner_cap_reports_failure() {
+    use ocl::Kernel;
+    use rust_dftb::qmqm::gpu_eigen::{block_jacobi_wg, render_block_source};
+    let Some(mut rt) = try_runtime() else { return; };
+    let n = 24usize;   // ≤ PB=32 → single-block path
+    let a_orig = random_symmetric(n, 42);
+    let a_buf = rt.buffer_from_slice(&a_orig).unwrap();
+    let v_buf = rt.zero_buffer::<f32>(n * n).unwrap();
+    let ones = rt.buffer_from_slice(&vec![1i32; 1]).unwrap();
+    let diag_buf = rt.zero_buffer::<f32>(4).unwrap();
+    let eig_buf = rt.zero_buffer::<f32>(n).unwrap();
+    let wg = block_jacobi_wg(n);
+    let src = render_block_source(16, wg).replace("#define INNER_MAX 12", "#define INNER_MAX 1");
+    assert!(src.contains("#define INNER_MAX 1"), "INNER_MAX specialization failed");
+    let program = rt.build_program(&src).unwrap();
+    let kernel = Kernel::builder()
+        .program(&program).name("block_jacobi_1wg").queue(rt.queue().clone())
+        .global_work_size(wg).local_work_size(wg)
+        .arg(&a_buf).arg(&v_buf).arg(n as i32).arg(1i32).arg(0i32)
+        .arg(&ones).arg(&diag_buf).arg(&eig_buf)
+        .build().unwrap();
+    unsafe { kernel.enq().unwrap(); }
+    let mut d = vec![0.0f32; 4];
+    rt.read_buffer(&diag_buf, &mut d).unwrap();
+    eprintln!("[T01] INNER_MAX=1 N={n}: stop={} off={:.3e} rel={:.3e}", d[2], d[0], d[1]);
+    assert_ne!(d[2] as i32, 0,
+        "n≤PB path claimed success with INNER_MAX=1 — finite residual above tolerance must report stop≠0");
+
+    // The first-failure latch held stop=2 — a second launch in the same
+    // window must NOT overwrite it. Verify, then clear (new window) and
+    // check the nonfinite input is reported, not silently certified (4).
+    let mut bad = a_orig.clone();
+    bad[3 * n + 7] = f32::NAN;
+    a_buf.write(&bad).enq().unwrap();
+    unsafe { kernel.enq().unwrap(); }
+    rt.read_buffer(&diag_buf, &mut d).unwrap();
+    eprintln!("[T01] latch check N={n}: stop={} (first failure preserved)", d[2]);
+    assert_eq!(d[2] as i32, 2, "first failure must survive a later launch, got {}", d[2]);
+    diag_buf.cmd().fill(0.0f32, None).enq().unwrap();   // new solve window
+    unsafe { kernel.enq().unwrap(); }
+    rt.read_buffer(&diag_buf, &mut d).unwrap();
+    eprintln!("[T01] NaN input N={n}: stop={}", d[2]);
+    assert_eq!(d[2] as i32, 4, "NaN input must report stop=4, got {}", d[2]);
+}
+
 
 /// §16.D A/B: block_jacobi_1wg vs jacobi_cyclic_global_batched at
 /// production batch sizes. Programs built once; each rep re-uploads the
@@ -586,7 +699,7 @@ fn test_block_vs_direct_jacobi_bench() {
     // Kernel resource footprint → theoretical WGs/SM (occupancy ceiling).
     let print_res = |rt: &GpuRuntime, k: &Kernel, tag: &str| {
         use ocl::enums::KernelWorkGroupInfo::*;
-        let g = |i| k.wg_info(rt.device(), i).map(|r| format!("{r:?}")).unwrap_or_else(|_| "?".into());
+        let g = |i| k.wg_info(*rt.device(), i).map(|r| format!("{r:?}")).unwrap_or_else(|_| "?".into());
         eprintln!("[res] {tag}: local={} priv={} maxwg={}", g(LocalMemSize), g(PrivateMemSize), g(WorkGroupSize));
     };
 

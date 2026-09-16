@@ -181,7 +181,8 @@ __kernel void jacobi_cyclic_global_batched(
     // The host rejects n>256 at plan build; if it ever reaches the kernel,
     // report loudly via diag instead of scribbling past local arrays.
     if (jpair > 128) {
-        if (lid == 0) {
+        // First-failure latch — same contract as the main diag write below.
+        if (lid == 0 && diag[4*gid+2] <= 0.0f) {
             diag[4*gid] = INFINITY; diag[4*gid+1] = INFINITY;
             diag[4*gid+2] = 3.0f;   diag[4*gid+3] = 0.0f;
         }
@@ -333,7 +334,11 @@ __kernel void jacobi_cyclic_global_batched(
     }
 
     // ---- R5: stop-reason + achieved-residual diagnostics ----
-    if (lid == 0) {
+    // First-failure latch (T01): the host clears stop to 0 at the start of
+    // each solve window; a recorded stop>0 is never overwritten by a later
+    // launch, so a mid-iteration failure can no longer be silently erased
+    // by a subsequent converged one before check_jacobi() reads it.
+    if (lid == 0 && diag[4*gid+2] <= 0.0f) {
         diag[4*gid]   = off_cur;
         diag[4*gid+1] = off_cur / frob;
         diag[4*gid+2] = (float)stop;
@@ -351,9 +356,12 @@ __kernel void jacobi_cyclic_global_batched(
     // Safeguarded Newton (bisection fallback) solving Σ f_k(μ) = n_occ,
     // warm-started from mu[sid] of the previous solve. f64 for the
     // sum/decision (discrete-decision rule); f_k stored f32.
-    // Only on a converged eigensolve — a failed replica keeps its last
-    // occ_w and is parked as Failed downstream.
-    if (fermi_tail != 0 && stop == 0) {
+    // On every CERTIFIABLE exit (stop≤2 — the host certifies 1/2 at the
+    // f32 floor rel≤1e-4, so their occ_w must be fresh too — a tail gated
+    // on stop==0 alone would certify stale occupations). A non-finite
+    // solve (stop=4) can never be certified — its occ_w stays stale and
+    // the replica is parked as Failed downstream.
+    if (fermi_tail != 0 && stop <= 2) {
         const double kt = (double)kT;
         const double want = (double)n_occ_fermi;
         for (int k = lid; k < n; k += lsz) le[k] = gA[k * n + k];

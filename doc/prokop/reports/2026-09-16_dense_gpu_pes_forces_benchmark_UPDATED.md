@@ -2668,3 +2668,93 @@ $$
 
 I think that is much more consistent with the original philosophy of your multisolver than either WG512 or immediately turning one 86×86 matrix into a complicated multi-WG computation.
 
+---
+
+## T01/T02 measured results (2026-09-16, git 324a9e14 + T01 patch set)
+
+Working tree = HEAD `324a9e14` + T01 changes in `gpu_block_jacobi.cl`,
+`gpu_tiled_jacobi.cl`, `gpu_eigen.rs`, `gpu_scc_plan.rs`, `gpu_dftb.rs`,
+`tests/gpu_tiled_jacobi.rs`. Full logs: `debug/bench_t01_direct.log`,
+`debug/bench_t01_block.log`.
+
+### T01 correctness evidence
+
+Deterministic tests added to `tests/gpu_tiled_jacobi.rs`, all failed
+pre-fix as predicted, all pass post-fix:
+
+| test | pre-fix | post-fix |
+|---|---|---|
+| `wg96_impulse_reduction` (N86, I + 0.01 at (2,5)) | probe reported off=0, stop=0, 0 sweeps, res=1.5e-3 | off exact, 1 sweep, res=5.6e-9 |
+| `probe_counts_all_rows` (14 sizes) | N86: 5.34e-6 vs true 6.52e-6 (−18%) | reported == host-exact for all 14 |
+| `inner_cap_reports_failure` (INNER_MAX=1, N24) | stop=0 at rel=0.376 | stop=2; latch verified; NaN→stop=4 after window clear |
+
+Fixes: shared `bj_wg_sum` arbitrary-WG reduction at all 6 sites in
+`gpu_block_jacobi.cl`; `n<=PB` path requires actual tolerance; diag records
+latched (first failure wins until host clears the window); direct-kernel
+Fermi tail runs for all certifiable stops (≤2), closing the stale-`occ_w`
+hole where `check_jacobi` accepts stop=1/2 below rel 1e-4; direct-kernel WG
+clamped to a power of two below `max_work_group_size`.
+
+Test suite after fix (release, RTX 3090, mio-1-1):
+gpu_tiled_jacobi 8/8 · gpu_eigenproblem 10/10 · gpu_scc 6/6 ·
+gpu_scc_kernels 10/10 · gpu_dftb 8/8 · gpu_forces 5/5 ·
+gpu_hbond_physics 23/23 (incl. GC PES/forces parity, max|dF|=5.5e-6 Ha/Å).
+`gpu_diagonalization` has 2 failures (`*_n2`) that are **pre-existing on
+HEAD** — N=8 degenerate-subspace elementwise eigenvector compare in the
+untouched n≤64 `local_jacobi_blocks` path; eigenvalues pass.
+
+### T02-lite baseline — direct vs block, scan400 harness
+
+Command (both modes): `RUST_DFTB_SK_DIR=<mio-1-1> RUST_DFTB_BENCH_SYSTEMS=GC,DTH
+RUST_DFTB_PROF=1 cargo test --release --test gpu_scc_bench
+test_gpu_scc_scan400_benchmark -- --ignored --nocapture --test-threads=1`;
+block adds `RUST_DFTB_EIGSOLVER=block`. 3 scc runs averaged (per-run
+`reset_q0`, warm basis), `eval(true)` timed once, CPU = measured f64
+single-point.
+
+**Direct (production default):**
+
+| system | N | batch | scc ms | iters | ms/iter | sys/s | evalF ms | cpu 1pt ms | speedup | failed |
+|---|---|---|---|---|---|---|---|---|---|---|
+| GC  |  86 |   1 |   20.5 |  16 |   1.28 |  48.8 |   0.62 | 12.7 |  0.6x | 0 |
+| GC  |  86 | 100 |  144.8 |  72 |   2.01 | 690.7 |   2.02 | 12.7 |  8.8x | 0 |
+| GC  |  86 | 400 |  417.9 |  80 |   5.22 | 957.2 |   5.23 | 12.7 | 12.2x | 0 |
+| DTH | 246 |   1 |  268.0 |  16 |  16.75 |   3.7 |   6.02 | 132.5 |  0.5x | 0 |
+| DTH | 246 | 100 | 1519.6 |  16 |  94.97 |  65.8 |  44.68 | 132.5 |  8.7x | 0 |
+| DTH | 246 | 400 | 6777.3 |  16 | 423.58 |  59.0 | 267.33 | 132.5 |  7.8x | 0 |
+
+**Block (`RUST_DFTB_EIGSOLVER=block`, post-fix):**
+
+| system | N | batch | scc ms | iters | ms/iter | sys/s | evalF ms | cpu 1pt ms | speedup | failed |
+|---|---|---|---|---|---|---|---|---|---|---|
+| GC  |  86 |   1 |   52.3 |  16 |   3.27 |  19.1 |   0.68 | 13.5 | 0.3x | 0 |
+| GC  |  86 | 100 |  379.1 | 100 |   3.79 | 263.8 |   1.72 | 13.5 | 3.5x | 0 |
+| GC  |  86 | 400 |  579.6 | 100 |   5.80 | 690.1 |   5.93 | 13.5 | 9.3x | **1** |
+| DTH | 246 |   1 |  293.8 |  16 |  18.37 |   3.4 |   4.48 | 132.5 | 0.5x | 0 |
+| DTH | 246 | 100 |  843.3 |  16 |  52.71 | 118.6 |  40.98 | 132.5 | 15.7x | 0 |
+| DTH | 246 | 400 | 3136.3 |  16 | 196.02 | 127.5 | 266.23 | 132.5 | 16.9x | 0 |
+
+Stage profile at batch=400 (host ms per launch, avg over 3 runs):
+
+| stage | GC direct | GC block | DTH direct | DTH block |
+|---|---|---|---|---|
+| scc.jacobi      | 3.49 | 4.68 | 243.6 | 72.6 |
+| scc.hscc        | 0.60 | 0.58 | 39.6  | 21.0 |
+| scc.density     | 0.25 | 0.21 | 36.3  | 36.4 |
+| scc.eigh_finish | 0.26 | 0.24 | 25.8  | 25.3 |
+| scc.diis        | 0.25 | 0.26 |  0.58 | 0.54 |
+| scc.fermi_occ   | — (fused) | 0.23 | — (fused) | 0.64 |
+| scc.select_occ  | — | 0.15 | — | 0.26 |
+| scc.gemm_th+th2 | 0.26 | 0.26 |  8.5 | 8.6 |
+| scc.mulliken    | 0.10 | 0.10 |  2.3 | 2.3 |
+
+Reading: at N246 the one-WG block eigensolve is ~3.4× faster per launch
+(72.6 vs 243.6 ms) and cuts total scc wall 2.2×; at N86 it is slightly
+slower per launch (4.68 vs 3.49) *and* pays extra `fermi_occ`+`select_occ`
+kernels that direct fuses. Block GC also ran to the 100-iter cap with one
+failed replica (direct: 80 iters, 0 failures) — iteration count is a
+workload difference, not a pure speed difference; per-iter is the fair
+comparison. At both sizes the eigensolve no longer dominates once block is
+used: for DTH-block, `density`+`eigh_finish`+`hscc` ≈ 49% of host time —
+the T03 targets.
+

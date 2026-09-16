@@ -193,8 +193,11 @@ pub fn direct_jacobi_batched(
         return Ok(Vec::new());
     }
     // W3: WG=512 ~1.55× faster than 256 on RTX 3090 (direct_jacobi_bench);
-    // clamp to the device limit so the helper stays portable.
-    let wg = rt.caps().max_work_group_size.min(512).max(64);
+    // clamp to the device limit so the helper stays portable, and round
+    // down to a power of two — the kernel's halving reductions drop lanes
+    // on non-power-of-two workgroups (e.g. a 384-limit device).
+    let wg_max = rt.caps().max_work_group_size.min(512).max(64);
+    let wg = if wg_max.is_power_of_two() { wg_max } else { wg_max.next_power_of_two() >> 1 };
     let source = render_tiled_source(32, wg, prec);
     let program = rt.build_program(&source)?;
     let ones = rt.buffer_from_slice(&vec![1i32; batch])?;

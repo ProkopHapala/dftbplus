@@ -837,6 +837,9 @@ impl GpuDftb {
         // deferred check_jacobi at the end must not read stale diag records
         // of replicas that never ran.
         let jacobi_ran: Vec<i32> = self.plan.active_host.clone();
+        // T01: this solve is one certification window — clear the
+        // first-failure latch so a previous window's record can't leak in.
+        self.plan.clear_jacobi_diag(&self.rt)?;
         for (b, &a) in self.plan.active_host.iter().enumerate() {
             if a == 0 { done[b] = true; n_active -= 1; }
         }

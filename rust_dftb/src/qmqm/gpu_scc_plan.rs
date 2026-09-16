@@ -1045,6 +1045,7 @@ impl GpuSccPlan {
                 }
             }
             if !reused {
+                self.clear_jacobi_diag(rt)?;   // T01: the S-Jacobi rebuild is its own window
                 enqueue_sinv(
                     rt, s_buf, &self.s_work, self.batch * self.n * self.n,
                     &self.k_s_jacobi, self.k_s_invsqrt.as_ref(), self.k_s_scale.as_ref(), self.k_s_xgemm.as_ref(),
@@ -1505,6 +1506,7 @@ impl GpuSccPlan {
         // Finalize runs OUTSIDE the SCC loop — all replicas must be solved
         // at their q_gpu, including ones that were frozen at loop exit.
         self.activate_all(rt)?;
+        self.clear_jacobi_diag(rt)?;      // T01: new certification window
         self.bind_solve_params(n_occ)?;   // occ/density/Rayleigh scalars
 
         // 1-3. Δq → V=γΔq → H_scc — one fused launch (D10/R18)
@@ -1551,6 +1553,18 @@ impl GpuSccPlan {
         self.k_edm.set_arg(7u32, w).map_err(map_ocl_err)?;
         self.k_edm.set_arg(8u32, (self.kT > 0.0) as i32).map_err(map_ocl_err)?;
         unsafe { self.k_edm.enq().map_err(map_ocl_err) }
+    }
+
+    /// T01: clear the Jacobi diagnostic latch before a solve window.
+    /// The kernels record {off, rel, stop, sweeps} only while the stored
+    /// stop is ≤0 — a failure record is sticky and never overwritten by a
+    /// later converged launch — so each independent solve window (one SCC
+    /// loop, one finalize, one S-Jacobi rebuild) must reset it. Without the
+    /// clear, a previous window's failure would park every replica forever.
+    /// Device-side fill: no alloc, no host sync, in-order with the launches.
+    pub fn clear_jacobi_diag(&mut self, rt: &GpuRuntime) -> Result<()> {
+        if self.n <= 64 && !self.block_mode { return Ok(()); }   // local kernel has no diag
+        self.jacobi_diag.cmd().fill(0.0f32, None).enq().map_err(map_ocl_err)
     }
 
     /// W1 (manifest §14): deferred Jacobi certification — read the diag
@@ -1827,8 +1841,11 @@ fn build_jacobi_kernel(
         // W3 (manifest §14): WG=512 measured ~1.55× faster than 256 on the
         // direct kernel (N≈87, RTX 3090, direct_jacobi_bench 2026-09-13:
         // 4.37 vs 6.85 ms). Batch doesn't change per-replica time — one WG
-        // per system already parallelizes. Clamp to the device limit.
-        let wg = rt.caps().max_work_group_size.min(512).max(64);
+        // per system already parallelizes. Clamp to the device limit AND
+        // round down to a power of two — the kernel's halving reductions
+        // drop lanes on non-power-of-two WGs (e.g. a 384-limit device).
+        let wg_max = rt.caps().max_work_group_size.min(512).max(64);
+        let wg = if wg_max.is_power_of_two() { wg_max } else { wg_max.next_power_of_two() >> 1 };
         let source = tiled_render_source(b, wg, prec);
         let program = rt.build_program(&source)?;
         // Direct cyclic Jacobi (replaces the ~16k-barrier tiled path).
