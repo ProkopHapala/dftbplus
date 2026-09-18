@@ -2750,3 +2750,61 @@ the FD difference. Same-state kernel parity is covered by
 `test_sparse_pair_gpu_vs_cpu_parity` (max|dF|=1.2e-6 at small N); a
 component-level R18 parity check remains queued. The outcome-level
 Hessian is unaffected: n_imag=1 at −0.32 cm⁻¹, asymmetry 6.7e-3.
+
+### §15.27 — Frozen multi-replica batch (F1) implemented + measured (2026-09-19)
+
+Manifest §F.1 implemented as designed: replica axis `get_global_id(1)`
+on the 5 eval kernels (`gamma_matvec`, `gamma_force`, `hs_contract`,
+`rep_eval`, `force_gather`), 2D NDRange `gws=(domain, B)` / `lws=(·,1)`,
+shared inputs (pair topology, SK/rep tables, `dq₀`, `k0`, `w0`) single
+and read-only, per-replica `xyzu`/`pf`/`pe_rep`/force buffers at
+`b·stride` in one persistent `GpuFrozenBatch` (~6.9 MB/replica at R18).
+No atomics, no scheduler state machine — static JobId→SlotId mapping;
+results scattered to Hessian columns by evaluation index. `forces_frozen_batch(x0, evals, h)`
+is pure w.r.t. `x0` (bug fix: scalar path had left `self.coords` at the
+last displaced geometry — the base is now an explicit parameter). Driver:
+`RUST_DFTB_VIB_BATCH=B`; B=1 keeps the scalar loop verbatim. The batched
+path also skips `hs_assemble` — `hs_contract` recomputes SK+rotation from
+`xyzu` directly, so the assembled H/S blocks were dead work in frozen
+evals (the F0 item, folded in).
+
+**L0 parity (`test_sparse_frozen_batch_parity`, small system):**
+30 evals batched vs sequential `forces_frozen`: **max|dF| = 0.000e0,
+bit-identical**; subset reuse (7 evals into the same workspace)
+bit-identical; `test_sparse_pair_gpu_vs_cpu_parity` unchanged.
+
+**R18 measured (1648 atoms, 96 columns = 192 evals, `VIB_MAXCOL=96`,
+raw sphere, RTX 3090):**
+
+| B | ms/eval | vs scalar | batch wall/eval breakdown |
+|---:|---:|---:|---|
+| 1 (scalar loop) | ~1.6 | — | 0.5 rst+geom + 1.1 solve+f |
+| 8 | 0.31 | ~5.2× | one xyzu upload + one readback per 8 evals |
+| 16 | **0.27** | **~5.9×** | saturation knee |
+| 32 | 0.27–0.32 | ~5–6× | saturated — kernel-work-bound, not overhead-bound |
+
+Physics identical at every B: per-column `max|ΔF|` matches the scalar
+run column-for-column (e.g. 1.1310e-2/1.8520e-2/1.8445e-2 sequences
+identical at B=1/8/16/32). Full Hessian at B=16: `n_imag=1`,
+`freq_min=−0.32`, `freq_max=2298.25 cm⁻¹`, asymmetry 6.732e-3 —
+identical to the scalar full run.
+
+**End-to-end honest accounting:** full R18 frozen Hessian wall
+**138.2 s scalar → 138.6 s at B=16** — unchanged because the column
+phase (~16 s → ~2.7 s of evals) was never the bottleneck. Wall
+composition now: ~12 s init, ~7 s central SCC, ~2.7 s all 9888 evals,
+**~100 s dense host eigensolve (~72 %)**. Batching delivered its
+designed goal — the per-eval overhead floor is gone and columns are now
+~2 % of wall — but the next real lever on wall time is the O((3N)³)
+host `SymmetricEigen`, not more column work. B=16 is the default-safe
+choice at R18; at N=5k the same kernels get ~9× more work per launch so
+saturation moves to larger B (γ′ tiling is shared across the replica
+axis only through launch width — per-replica work is unchanged).
+
+**Deferred (unchanged plan):** fixq/SCC batching reuses the SlotId
+plumbing but needs the variable-convergence machinery from
+`Sparse_MultiSystem_Scheduler.chat.md` (active masks, compact job IDs,
+refill) — only justified after frozen Hessian + eigensolve path are
+settled. F2 column-local pair subranges (~167 of 200k pairs per
+displacement) remains the next per-eval lever; at B=16 the eval is now
+dominated by real kernel work so F2 shrinks total work, not overhead.

@@ -56,8 +56,10 @@
 #endif
 #if JACOBI_PREC >= 1
 typedef double jrot_t;   // rotation-parameter precision
+typedef double2 jlog2_t; // rotlog entry: bit-exact logged (c,s) for deferred V
 #else
 typedef float jrot_t;
+typedef float2 jlog2_t;  // prec=0: c,s are f32 — double2 log would be pure waste
 #endif
 #if JACOBI_PREC >= 2
 typedef double jupd_t;   // block/strip update accumulation precision
@@ -136,6 +138,16 @@ inline int2 cyclic_jacobi_pair(int round, int ipair, int jn) {
     int m = jn - 1;
     if (ipair == 0) return (int2)(m, round % m);
     return (int2)((round + ipair) % m, (round + m - ipair) % m);
+}
+
+// Packed symmetric-A index: the resident kernel stores only the lower
+// triangle (r>=c) of A as lA[r*(r+1)/2 + c] — halves the resident
+// footprint (n(n+1)/2·4 B ≈ 14.6 KB at n=86 vs 29.9 KB square) so TWO
+// workgroups can share an SM's 48 KB local memory. Accesses sort (r,c);
+// A is symmetric so A[r][c] == A[c][r] always.
+inline int lat(const int r, const int c) {
+    const int mx = max(r, c), mn = min(r, c);
+    return (mx * (mx + 1) >> 1) + mn;
 }
 
 // Workgroup reductions for ARBITRARY lsz (WG≈N sweeps want 96/160/224 —
@@ -223,7 +235,7 @@ __kernel void jacobi_cyclic_global_batched(
     // compiles these out — ~9 KB of local per WG on WG512.
     __local float  le[256];       // staged eigenvalues (diag of A)
     __local double dred[WG];      // f64 reductions: sum
-    __local double dred2[WG];     // f64 reductions: derivative
+    // dred2 removed — f64 reductions are sequential, share `dred` (-4 KB/WG).
     __local double lmu[4];        // {lo, hi, μ, done} — bracket state
 #endif
 
@@ -433,7 +445,7 @@ __kernel void jacobi_cyclic_global_batched(
                 ds += (x > 40.0 || x < -40.0) ? 0.0 : f * (1.0 - f);
             }
             const double st = jac_red_d(dred, s, lid, lsz, 0);
-            const double dst = jac_red_d(dred2, ds, lid, lsz, 0);
+            const double dst = jac_red_d(dred, ds, lid, lsz, 0);
             if (lid == 0) {
                 const double g = st - want;
                 if (fabs(g) < 1.0e-7 * fmax(want, 1.0)) {
@@ -477,18 +489,21 @@ __kernel void jacobi_cyclic_global_batched(
 //                 write-back at exit). ~2×n(n+1)×4 B local/WG — n=86 →
 //                 ~60 KB + scratch ≈ 1 WG/SM on a 100 KB SM.
 //   RESIDENT_V=0  A local, V deferred: rotations are logged to a global
-//                 rotlog (double2 (c,s) per (round,pair); (p,q) is
+//                 rotlog (jlog2_t (c,s) per (round,pair); (p,q) is
 //                 deterministic from the Brent–Luk schedule) and applied
 //                 to global V once per SWEEP in an apply epoch — V's
 //                 footprint (~30 KB at n=86) stays L1/L2-resident across
 //                 the epoch, so V global traffic drops ~n× (once per
-//                 sweep instead of once per round). ~n(n+1)×4 B local/WG
-//                 → 2–3 WGs/SM possible.
+//                 sweep instead of once per round). Packed lA ≈ n(n+1)/2×4 B
+//                 (~14.6 KB at n=86) + ~9 KB scratch ≈ 24 KB/WG
+//                 → 2 WGs/SM on a 48 KB device.
 //
-// lA/lV are dynamic __local args (row-padded LD=n+1 vs bank conflicts);
-// the host sizes them to the actual n and must check local_mem_size.
-// Same capacity limits: jpair ≤ 128 (rot arrays) → n ≤ 256; A-local
-// practical bound is the device local-mem limit.
+// lA/lV are dynamic __local args; the host sizes them to the actual n
+// and must check local_mem_size. lA is PACKED SYMMETRIC — only the
+// lower triangle lA[r*(r+1)/2+c] (lat() helper), n(n+1)/2·4 B ≈ 14.6 KB
+// at n=86 (vs 29.9 KB square); lV stays row-padded square (V is
+// orthogonal, not symmetric). Same capacity limits: jpair ≤ 128 (rot
+// arrays) → n ≤ 256; A-local practical bound is the device local limit.
 // ------------------------------------------------------------------
 #ifndef RESIDENT_V
 #define RESIDENT_V 0
@@ -509,8 +524,8 @@ __kernel void jacobi_resident_batched(
     const float kT,
     __global float* occ_w,
     __global float* mu,
-    __global double2* rotlog,          // [batch][jround*jpair] scratch (RESIDENT_V=0 only; pass any valid buf otherwise)
-    __local float* lA,                 // n*(n+1)
+    __global jlog2_t* rotlog,          // [batch][jround*jpair] scratch (RESIDENT_V=0 only; pass any valid buf otherwise)
+    __local float* lA,                 // n*(n+1)/2 — packed lower triangle (lat())
     __local float* lV,                 // n*(n+1) when RESIDENT_V, else 1-elem dummy
     __global const int* work_ids       // launch-index → physical slot (identity at full batch)
 ) {
@@ -522,7 +537,7 @@ __kernel void jacobi_resident_batched(
     const int jn = (n & 1) ? n + 1 : n;
     const int jpair = jn / 2;
     const int jround = jn - 1;
-    const int lald = n + 1;                    // padded local leading dim
+    const int lald = n + 1;                    // padded leading dim — lV only (lA is packed-triangular)
     const size_t log_stride = (size_t)jround * jpair;
 
     __local jrot_t rot_c[128];
@@ -531,11 +546,13 @@ __kernel void jacobi_resident_batched(
     __local int    rot_q[128];
     __local volatile int l_nrot;
     __local float  reduce[WG];
-    __local float  red2[WG];
+    // red2/dred2 removed: the reductions are strictly sequential — one
+    // buffer per dtype suffices, and the saved ~6 KB/WG of scratch is
+    // what puts TWO resident WGs (packed lA ~15 KB + ~9 KB scratch)
+    // inside a 48 KB SM.
 #ifndef JACOBI_NO_TAIL
     __local float  le[256];
     __local double dred[WG];
-    __local double dred2[WG];
     __local double lmu[4];
 #endif
 
@@ -557,7 +574,7 @@ __kernel void jacobi_resident_batched(
         int r = idx / n;
         int c = idx - r * n;
         float v = gA[idx];
-        lA[r * lald + c] = v;
+        if (r >= c) lA[lat(r, c)] = v;   // packed lower triangle only
         fa += v * v;
         if (r != c) fo += v * v;
 #if RESIDENT_V
@@ -567,7 +584,7 @@ __kernel void jacobi_resident_batched(
 #endif
     }
     const float frob = sqrt(fmax(jac_sum_f(reduce, fa, lid, lsz), 1.0e-30f));
-    float off_cur = sqrt(fmax(jac_sum_f(red2, fo, lid, lsz), 0.0f));
+    float off_cur = sqrt(fmax(jac_sum_f(reduce, fo, lid, lsz), 0.0f));
     barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
 
     const float off_exit = JACOBI_OFF_TOL * frob;
@@ -589,9 +606,9 @@ __kernel void jacobi_resident_batched(
                 int p = min(pq.x, pq.y);
                 int q = max(pq.x, pq.y);
                 rot_p[ip] = p; rot_q[ip] = q;
-                float apq = (q < n) ? lA[p * lald + q] : 0.0f;
-                float app = lA[p * lald + p];
-                float aqq = (q < n) ? lA[q * lald + q] : 1.0f;
+                float apq = (q < n) ? lA[lat(p, q)] : 0.0f;
+                float app = lA[lat(p, p)];
+                float aqq = (q < n) ? lA[lat(q, q)] : 1.0f;
                 jrot_t c, s;
                 if (!(fabs(apq) > PAIR_SKIP_REL * (fabs(app) + fabs(aqq)))) {
                     c = (jrot_t)1.0; s = (jrot_t)0.0;
@@ -607,7 +624,7 @@ __kernel void jacobi_resident_batched(
                 }
                 rot_c[ip] = c; rot_s[ip] = s;
 #if !RESIDENT_V
-                rotlog[(size_t)gid * log_stride + r * jpair + ip] = (double2)((double)c, (double)s);
+                rotlog[(size_t)gid * log_stride + r * jpair + ip] = (jlog2_t)((jrot_t)c, (jrot_t)s);
 #endif
             }
             barrier(CLK_LOCAL_MEM_FENCE);
@@ -623,24 +640,31 @@ __kernel void jacobi_resident_batched(
 #endif
                 if (it < nblk) {
                     int a = it / jpair, b = it - a * jpair;
+                    // Packed lA: block (a,b) and its transpose (b,a) map to
+                    // the SAME packed slots — only a<=b may run (each slot
+                    // gets exactly one writer; new M_ba = (new M_ab)' so the
+                    // transpose block would rewrite identical values, and
+                    // racing with it would double-rotate). Also halves the
+                    // phase-2 work vs the square layout.
+                    if (b < a) continue;
                     jupd_t sa = (jupd_t)rot_s[a], sb = (jupd_t)rot_s[b];
                     if (sa == (jupd_t)0.0 && sb == (jupd_t)0.0) continue;
                     int pa = rot_p[a], qa = rot_q[a];
                     int pb = rot_p[b], qb = rot_q[b];
                     jupd_t ca = (jupd_t)rot_c[a], cb = (jupd_t)rot_c[b];
-                    jupd_t apr = (jupd_t)lA[pa * lald + pb];
-                    jupd_t aps = (qb < n) ? (jupd_t)lA[pa * lald + qb] : (jupd_t)0.0;
-                    jupd_t aqr = (qa < n) ? (jupd_t)lA[qa * lald + pb] : (jupd_t)0.0;
-                    jupd_t aqs = (qa < n && qb < n) ? (jupd_t)lA[qa * lald + qb] : (jupd_t)0.0;
+                    jupd_t apr = (jupd_t)lA[lat(pa, pb)];
+                    jupd_t aps = (qb < n) ? (jupd_t)lA[lat(pa, qb)] : (jupd_t)0.0;
+                    jupd_t aqr = (qa < n) ? (jupd_t)lA[lat(qa, pb)] : (jupd_t)0.0;
+                    jupd_t aqs = (qa < n && qb < n) ? (jupd_t)lA[lat(qa, qb)] : (jupd_t)0.0;
                     jupd_t tpr = fma(cb, apr, -sb * aps);
                     jupd_t tps = fma(sb, apr, cb * aps);
                     jupd_t tqr = fma(cb, aqr, -sb * aqs);
                     jupd_t tqs = fma(sb, aqr, cb * aqs);
-                    lA[pa * lald + pb] = (float)fma(ca, tpr, -sa * tqr);
-                    if (qb < n) lA[pa * lald + qb] = (float)fma(ca, tps, -sa * tqs);
+                    lA[lat(pa, pb)] = (float)fma(ca, tpr, -sa * tqr);
+                    if (qb < n) lA[lat(pa, qb)] = (float)fma(ca, tps, -sa * tqs);
                     if (qa < n) {
-                        lA[qa * lald + pb] = (float)fma(sa, tpr, ca * tqr);
-                        if (qb < n) lA[qa * lald + qb] = (float)fma(sa, tps, ca * tqs);
+                        lA[lat(qa, pb)] = (float)fma(sa, tpr, ca * tqr);
+                        if (qb < n) lA[lat(qa, qb)] = (float)fma(sa, tps, ca * tqs);
                     }
                 }
 #if RESIDENT_V
@@ -666,11 +690,11 @@ __kernel void jacobi_resident_batched(
         // All of this sweep's rotations replayed against global V. V's
         // footprint (n²×4B) stays cache-resident across the epoch so this
         // is ~n× less global traffic than the per-round update; the log
-        // (jpair double2/round) streams through L2 trivially. Rounds must
+        // (jpair jlog2_t/round) streams through L2 trivially. Rounds must
         // apply in order; pairs within a round are disjoint.
         for (int r = 0; r < jround; ++r) {
             for (int ip = lid; ip < jpair; ip += lsz) {
-                const double2 cs = rotlog[(size_t)gid * log_stride + r * jpair + ip];
+                const jlog2_t cs = rotlog[(size_t)gid * log_stride + r * jpair + ip];
                 int2 pq = cyclic_jacobi_pair(r, ip, jn);
                 rot_c[ip] = (jrot_t)cs.x; rot_s[ip] = (jrot_t)cs.y;
                 rot_p[ip] = min(pq.x, pq.y); rot_q[ip] = max(pq.x, pq.y);
@@ -692,11 +716,13 @@ __kernel void jacobi_resident_batched(
 #endif
 
         // ---- Sweep-end off-norm + exit/stagnation tests — from lA ----
+        // Packed storage: only r>c elements exist; 2·Σ_{r>c} = Σ_{r≠c}
+        // (×2 is exact in fp — same off_cur value as the square loop).
         fo = 0.0f;
         for (int idx = lid; idx < nn; idx += lsz) {
             int r = idx / n;
             int c = idx - r * n;
-            if (r != c) { float v = lA[r * lald + c]; fo += v * v; }
+            if (r > c) { float v = lA[lat(r, c)]; fo += 2.0f * v * v; }
         }
         off_cur = sqrt(jac_sum_f(reduce, fo, lid, lsz));
         if (!isfinite(off_cur)) { stop = 4; break; }
@@ -711,7 +737,7 @@ __kernel void jacobi_resident_batched(
     for (int idx = lid; idx < nn; idx += lsz) {
         int r = idx / n;
         int c = idx - r * n;
-        gA[idx] = lA[r * lald + c];
+        gA[idx] = lA[lat(r, c)];        // packed slot serves both triangles
 #if RESIDENT_V
         gV[idx] = lV[r * lald + c];
 #endif
@@ -731,7 +757,7 @@ __kernel void jacobi_resident_batched(
     if (fermi_tail != 0 && stop <= 2) {
         const double kt = (double)kT;
         const double want = (double)n_occ_fermi;
-        for (int k = lid; k < n; k += lsz) le[k] = lA[k * lald + k];
+        for (int k = lid; k < n; k += lsz) le[k] = lA[lat(k, k)];
         barrier(CLK_LOCAL_MEM_FENCE);
 
         double elo = 1.0e300, ehi = -1.0e300;
@@ -760,7 +786,7 @@ __kernel void jacobi_resident_batched(
                 ds += (x > 40.0 || x < -40.0) ? 0.0 : f * (1.0 - f);
             }
             const double st = jac_red_d(dred, s, lid, lsz, 0);
-            const double dst = jac_red_d(dred2, ds, lid, lsz, 0);
+            const double dst = jac_red_d(dred, ds, lid, lsz, 0);
             if (lid == 0) {
                 const double g = st - want;
                 if (fabs(g) < 1.0e-7 * fmax(want, 1.0)) {

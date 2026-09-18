@@ -256,6 +256,32 @@ pub struct GpuPairState {
     f_host: Vec<f32>,  // 5·4·n packed [nscc, shift, rep, dc, tot]
     pe_host: Vec<f32>, // n_rep
     kd_host: Vec<f32>, // n
+    /// F1 (manifest §F.1): per-replica buffers for batched frozen-eval
+    /// launches — allocated lazily by `ensure_frozen_batch`, persistent
+    /// after. Shared inputs (pairs/SK/rep topology + central K0/W0/dq0)
+    /// stay single; only geometry-derived per-replica state replicates.
+    batch: Option<GpuFrozenBatch>,
+}
+
+/// F1 batched frozen-eval buffers (JobId = launch dim1 index). All are
+/// `cap`-strided replicas of the scalar path's intermediates — the
+/// kernels index them as `ptr += b·stride` with `b = get_global_id(1)`.
+pub struct GpuFrozenBatch {
+    cap: usize,
+    xyzu: Buffer<f32>,   // cap·4·n — per-replica packed geometry
+    v: Buffer<f32>,      // cap·n — γ·dq per replica
+    pf: Buffer<f32>,     // cap·8·n_pairs — per-pair (non_scc, shift)
+    pf_rep: Buffer<f32>, // cap·4·n_rep — (F_i, E_pair)
+    pe_rep: Buffer<f32>, // cap·n_rep — pair energies for host sums
+    gf: Buffer<f32>,     // cap·4·n — γ′ double-counting force
+    f_nscc: Buffer<f32>, // cap·4·n — five component outputs each
+    f_shift: Buffer<f32>,
+    f_rep: Buffer<f32>,
+    f_dc: Buffer<f32>,
+    f_tot: Buffer<f32>,
+    // Host staging (persistent, no per-call alloc).
+    f_host: Vec<f32>,  // cap·4·n — component readback
+    pe_host: Vec<f32>, // cap·n_rep — repulsive-energy readback
 }
 
 impl SparseSystemWorkspace {
@@ -778,7 +804,7 @@ impl SparseSystemWorkspace {
         }
         self.gpu.write_f32(&self.dq_buf, dq)?;
         self.gpu
-            .gamma_v_dev(self.n_atom, &self.xyzu_buf, &self.dq_buf, &self.v_buf)?;
+            .gamma_v_dev(self.n_atom, &self.xyzu_buf, &self.dq_buf, &self.v_buf, 1)?;
         self.gpu.read_f32(&self.v_buf, v_out)
     }
 
@@ -795,7 +821,7 @@ impl SparseSystemWorkspace {
         }
         self.gpu.write_f32(&self.dq_buf, dq)?;
         self.gpu
-            .gamma_f_dev(self.n_atom, &self.xyzu_buf, &self.dq_buf, &self.gf_buf)?;
+            .gamma_f_dev(self.n_atom, &self.xyzu_buf, &self.dq_buf, &self.gf_buf, 1)?;
         self.gpu.read_f32(&self.gf_buf, f_out)
     }
 
@@ -811,7 +837,7 @@ impl SparseSystemWorkspace {
         }
         self.gpu.write_f32(&self.dq_buf, dq)?;
         self.gpu
-            .gamma_f_dev(self.n_atom, &self.xyzu_buf, &self.dq_buf, &self.gf_buf)
+            .gamma_f_dev(self.n_atom, &self.xyzu_buf, &self.dq_buf, &self.gf_buf, 1)
     }
 
     // ── R17 GPU pair physics ───────────────────────────────────────────
@@ -894,6 +920,7 @@ impl SparseSystemWorkspace {
             f_host: vec![0.0f32; 4 * n],
             pe_host: vec![0.0f32; nr.max(1)],
             kd_host: vec![0.0f32; n],
+            batch: None,
         });
         Ok(())
     }
@@ -970,6 +997,7 @@ impl SparseSystemWorkspace {
         })?;
         self.gpu.rep_eval_dev(
             st.n_rep,
+            self.n_atom,
             &st.rpairs,
             &self.xyzu_buf,
             &st.species,
@@ -979,6 +1007,7 @@ impl SparseSystemWorkspace {
             &st.rep_data,
             &st.pf_rep,
             &st.pe_rep,
+            1,
         )?;
         self.gpu.read_f32(&st.pe_rep, &mut st.pe_host[..st.n_rep])?;
         Ok(st.pe_host[..st.n_rep].iter().map(|&e| e as f64).sum())
@@ -1021,6 +1050,7 @@ impl SparseSystemWorkspace {
             let st = self.pair.as_ref().unwrap();
             self.gpu.hs_contract_dev(
                 st.n_pairs,
+                n,
                 &st.pairs,
                 &st.pairs_k,
                 &self.xyzu_buf,
@@ -1036,6 +1066,7 @@ impl SparseSystemWorkspace {
                 w,
                 &self.v_buf,
                 &st.pf,
+                1,
             )?;
             self.gpu.force_gather_dev(
                 n,
@@ -1051,6 +1082,9 @@ impl SparseSystemWorkspace {
                 &st.f_rep,
                 &st.f_dc,
                 &st.f_tot,
+                st.n_pairs,
+                st.n_rep,
+                1,
             )?;
         }
         // Readback — 5 component buffers → Forces (f32→f64 on host).
@@ -1092,6 +1126,199 @@ impl SparseSystemWorkspace {
             1e-4,
         );
         Ok(out)
+    }
+
+    /// Lazily allocate the F1 replica buffers at `cap` eval slots (grow-
+    /// only, persistent). ~6.9 MB/replica at R18 — dominated by `pf`
+    /// (8·n_pairs f32); shared inputs are never replicated.
+    fn ensure_frozen_batch(&mut self, cap: usize) -> Result<()> {
+        let st = self.pair.as_mut().ok_or_else(|| {
+            DftbError::InvalidInput("ensure_frozen_batch: GPU pair data not initialized".into())
+        })?;
+        if st.batch.as_ref().is_some_and(|b| b.cap >= cap) {
+            return Ok(());
+        }
+        let (n, np, nr) = (self.n_atom, st.n_pairs, st.n_rep);
+        let gpu = &self.gpu;
+        st.batch = Some(GpuFrozenBatch {
+            cap,
+            xyzu: gpu.zero_f32(cap * 4 * n)?,
+            v: gpu.zero_f32(cap * n)?,
+            pf: gpu.zero_f32(cap * 8 * np.max(1))?,
+            pf_rep: gpu.zero_f32(cap * 4 * nr.max(1))?,
+            pe_rep: gpu.zero_f32(cap * nr.max(1))?,
+            gf: gpu.zero_f32(cap * 4 * n)?,
+            f_nscc: gpu.zero_f32(cap * 4 * n)?,
+            f_shift: gpu.zero_f32(cap * 4 * n)?,
+            f_rep: gpu.zero_f32(cap * 4 * n)?,
+            f_dc: gpu.zero_f32(cap * 4 * n)?,
+            f_tot: gpu.zero_f32(cap * 4 * n)?,
+            f_host: vec![0.0f32; cap * 4 * n],
+            pe_host: vec![0.0f32; cap * nr.max(1)],
+        });
+        Ok(())
+    }
+
+    /// F1 batched frozen-eval force path (manifest §F.1): `batch` replica
+    /// geometries packed in `xyzu` (batch·4·n f32, JobId = replica index),
+    /// ONE upload + ONE launch per stage + ONE readback set. `k`/`w` are
+    /// the shared central snapshot (read-only); `dq` is shared. No SCC,
+    /// no H/S assembly — `hs_contract` recomputes pair values from each
+    /// replica's geometry. Returns one `Forces` per replica (indexed by
+    /// JobId, never physical slot) — bit-identical to the scalar path.
+    pub fn forces_frozen_batch_dev(
+        &mut self,
+        xyzu: &[f32],
+        dq: &[f32],
+        k: &Buffer<f32>,
+        w: &Buffer<f32>,
+        batch: usize,
+    ) -> Result<Vec<crate::methods::dftb::forces::Forces>> {
+        let n = self.n_atom;
+        if batch == 0 || xyzu.len() != batch * 4 * n || dq.len() != n {
+            return Err(DftbError::InvalidInput(format!(
+                "forces_frozen_batch_dev: batch={batch} xyzu {} != B·4·n {} / dq {} != n {n}",
+                xyzu.len(),
+                batch * 4 * n,
+                dq.len()
+            )));
+        }
+        self.ensure_frozen_batch(batch)?;
+        // OCC-GUARD-DUMMY on the shared central K — once, not per replica
+        // (frozen mode never mutates it).
+        {
+            let st = self.pair.as_mut().unwrap();
+            self.gpu.hs_kdummy_dev(
+                n,
+                self.k_struct.diag_block(),
+                k,
+                &self.n_orb_buf,
+                &st.kdummy,
+            )?;
+            self.gpu.read_f32(&st.kdummy, &mut st.kd_host)?;
+            let occ_dummy: f64 = st.kd_host[..n].iter().map(|&x| (x as f64).abs()).sum();
+            if occ_dummy > 1e-6 {
+                return Err(DftbError::InvalidInput(format!(
+                    "Padded (dummy) orbitals carry occupation Σ|2K|={occ_dummy:.3e} — \
+                     BSR4 padding leaks into the physics"
+                )));
+            }
+        }
+        // One geometry upload + one dq upload for the whole batch.
+        {
+            let st = self.pair.as_ref().unwrap();
+            self.gpu.write_f32(&st.batch.as_ref().unwrap().xyzu, xyzu)?;
+        }
+        self.gpu.write_f32(&self.dq_buf, dq)?;
+        // Launch chain — all 2D (dim1 = replica slot). Order mirrors the
+        // scalar path: V → contract → γ′ → rep → gather.
+        {
+            let st = self.pair.as_ref().unwrap();
+            let bt = st.batch.as_ref().unwrap();
+            self.gpu
+                .gamma_v_dev(n, &bt.xyzu, &self.dq_buf, &bt.v, batch)?;
+            self.gpu.hs_contract_dev(
+                st.n_pairs,
+                n,
+                &st.pairs,
+                &st.pairs_k,
+                &bt.xyzu,
+                &st.species,
+                &self.n_orb_buf,
+                st.n_sp as u32,
+                &st.sk_meta,
+                &st.sk_parm,
+                &st.sk_ctrl,
+                st.max_ctrl as u32,
+                st.taper,
+                k,
+                w,
+                &bt.v,
+                &bt.pf,
+                batch,
+            )?;
+            self.gpu
+                .gamma_f_dev(n, &bt.xyzu, &self.dq_buf, &bt.gf, batch)?;
+            self.gpu.rep_eval_dev(
+                st.n_rep,
+                n,
+                &st.rpairs,
+                &bt.xyzu,
+                &st.species,
+                st.n_sp as u32,
+                &st.rep_off,
+                st.rep_max_int as u32,
+                &st.rep_data,
+                &bt.pf_rep,
+                &bt.pe_rep,
+                batch,
+            )?;
+            self.gpu.force_gather_dev(
+                n,
+                &st.fp_ptr,
+                &st.fp_list,
+                &bt.pf,
+                &st.rp_ptr,
+                &st.rp_list,
+                &bt.pf_rep,
+                &bt.gf,
+                &bt.f_nscc,
+                &bt.f_shift,
+                &bt.f_rep,
+                &bt.f_dc,
+                &bt.f_tot,
+                st.n_pairs,
+                st.n_rep,
+                batch,
+            )?;
+        }
+        // Readback — same five component checks as the scalar path, per
+        // replica slice. pe_rep validates E_rep finite per replica.
+        let n_rep = self.pair.as_ref().unwrap().n_rep;
+        let mut outs: Vec<crate::methods::dftb::forces::Forces> = (0..batch)
+            .map(|_| crate::methods::dftb::forces::Forces::zeros(n))
+            .collect();
+        {
+            let st = self.pair.as_mut().unwrap();
+            let bt = st.batch.as_mut().unwrap();
+            self.gpu
+                .read_f32(&bt.pe_rep, &mut bt.pe_host[..batch * n_rep])?;
+            for b in 0..batch {
+                let e_rep: f64 = bt.pe_host[b * n_rep..(b + 1) * n_rep]
+                    .iter()
+                    .map(|&e| e as f64)
+                    .sum();
+                if !e_rep.is_finite() {
+                    return Err(DftbError::InvalidInput(format!(
+                        "forces_frozen_batch_dev: non-finite E_rep replica {b}"
+                    )));
+                }
+            }
+            // Component buffers → Forces fields — ONE read per component
+            // (all replicas), then pull3 per JobId slice.
+            macro_rules! pull_comp {
+                ($buf:expr, $field:ident) => {{
+                    self.gpu.read_f32($buf, &mut bt.f_host[..batch * 4 * n])?;
+                    for (b, out) in outs.iter_mut().enumerate() {
+                        pull3(&bt.f_host[b * 4 * n..(b + 1) * 4 * n], &mut out.$field);
+                    }
+                }};
+            }
+            pull_comp!(&bt.f_nscc, non_scc);
+            pull_comp!(&bt.f_shift, scc_shift);
+            pull_comp!(&bt.f_rep, repulsive);
+            pull_comp!(&bt.f_dc, scc_dc);
+            pull_comp!(&bt.f_tot, forces);
+        }
+        for out in &outs {
+            crate::methods::dftb::forces::check_finite(&out.forces, "forces (GPU frozen batch)");
+            crate::methods::dftb::forces::check_newton(
+                &out.forces,
+                "forces (GPU frozen batch)",
+                1e-4,
+            );
+        }
+        Ok(outs)
     }
 
     /// Sparse masked band energy `Tr(K·H0)` on device (R7) — f32 partials

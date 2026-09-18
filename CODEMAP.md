@@ -89,10 +89,19 @@ QM/QM fragment solver with OpenCL GPU offload. Python utilities (`pyBall/`,
     `sparse_forces.rs` (P3: sparse D=2K, W=2KHK via masked SpGEMM),
     `sparse_system.rs` (GPU BSR workspace: TC2/FF32 purify, `dmm_descend`
     warm-density commutator update, `linear_response` stripped first-order
-    tier, `snapshot_p0_x0` central-metric snapshots, projector diagnostics),
+    tier, `snapshot_p0_x0` central-metric snapshots, projector diagnostics,
+    `GpuFrozenBatch` + `forces_frozen_batch_dev` — multi-replica frozen
+    force batch, one persistent workspace, `gid(1)` replica axis),
+    `sparse_hs.cl` (`hs_contract`/`rep_eval`/`force_gather` — device
+    SK assembly + analytic K/W pair contraction + repulsive + gather),
+    `sparse_gamma.cl` (tiled `gamma_matvec`/`gamma_force` — local-memory
+    n-body γ/γ′, no dense γ matrix),
     **`sparse_dftb.rs`** (production owner: `SparseDftb::new` / `set_coords` /
     `scc` / `forces` / `fire_step` / `md_step` / `relax` — compile once,
-    persistent buffers; FD Hessians via `sparse_vibrations`, mode knobs
+    persistent buffers; `GpuCentralState` device-resident K/Z/K₀/W₀
+    snapshots, lazy H/S mirrors; FD Hessians via `sparse_vibrations`,
+    frozen multi-replica via `forces_frozen_batch(x0, evals, h)` —
+    `RUST_DFTB_VIB_BATCH`, bitwise vs sequential; mode knobs
     `RUST_DFTB_VIB_*` — see `userguide/sparse_vibrations.md`). Drive with
     **`dftb_engine --script rust_dftb/scripts/test_sparse_dftb_sih4.rhai`**
     (userguide `sparse_dftb.md`). Smoke: `tests/sparse_dftb.rs`. Report:

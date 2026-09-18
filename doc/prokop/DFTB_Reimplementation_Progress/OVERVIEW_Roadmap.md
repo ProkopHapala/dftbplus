@@ -499,6 +499,20 @@ metric transport and single-step linear response refuted. Report:
 `reports/2026-09-16_sparse_dmm_warm_density_hessian.md`. Next:
 batch-parallel ±h columns (the remaining 10×).
 
+**2026-09-19 status (report §15.24–§15.27, manifest §F):** all per-eval
+pair physics GPU-resident (SK assembly, K/W contract, repulsive, tiled
+γ/γ′ — no dense matrices, no atomics); residency audit eliminated
+~155 MB/eval of PCIe (K/Z/W device snapshots, lazy H/S mirrors);
+**F1 multi-replica frozen batch done** — `gid(1)` replica axis on the 5
+eval kernels, `RUST_DFTB_VIB_BATCH`, bitwise-equal vs sequential
+(`test_sparse_frozen_batch_parity`). Measured R18 (1648 atoms):
+10.8 → 1.6 ms/eval (residency) → **0.27 ms/eval at B=16** (~40× vs
+post-port, ~720× vs CPU ~194 ms); full 4944-col frozen Hessian evals
+~2.7 s. Wall is now ~72% the dense 4944² host eigensolve — next lever is
+eigensolve replacement or F2 column-local subranges, not more column
+batching. fixq/SCC batching deferred (needs variable-convergence
+scheduling — scheduler chat doc blueprint).
+
 - **Phase A** — Foundation: canonical C² spline (A1), TC2 fix 2 SpGEMMs/iter (A2), plan integration (A3) — done
 - **Phase B** — Sparse SCC solver, GPU-resident, self-consistent — done (`SparseDftb` production owner, `sparse_dftb.rs`)
 - **Phase C** — Sparse analytic forces — done, GPU-resident (`sparse_forces.rs`: masked-SpGEMM D/W + device pair contraction)

@@ -278,10 +278,17 @@ __kernel void hs_contract(
     __global const float* k_vals,
     __global const float* w_vals,
     __global const float* v_atom,
-    __global float4* pf)
+    __global float4* pf,
+    const uint n_atom)
 {
     uint p = get_global_id(0);
     if (p >= npairs) return;
+    // F1 replica axis: dim1 = eval slot — xyzu/v_atom/pf are per-replica
+    // strided; k_vals/w_vals are the shared central snapshot (read-only).
+    const uint b = get_global_id(1);
+    xyzu   += (size_t)b * n_atom;
+    v_atom += (size_t)b * n_atom;
+    pf     += (size_t)b * 2 * npairs;
     pf[2 * p] = (float4)0.0f;
     pf[2 * p + 1] = (float4)0.0f;
     int4 pr = pairs[p];
@@ -382,10 +389,17 @@ __kernel void rep_eval(
     const uint rep_max_int,
     __global const float* rep_data,
     __global float4* pf_rep,
-    __global float* pe_rep)
+    __global float* pe_rep,
+    const uint n_atom)
 {
     uint p = get_global_id(0);
     if (p >= nrep) return;
+    // F1 replica axis: dim1 = eval slot — xyzu/pf_rep/pe_rep are
+    // per-replica strided; rep tables are shared (read-only).
+    const uint b = get_global_id(1);
+    xyzu   += (size_t)b * n_atom;
+    pf_rep += (size_t)b * nrep;
+    pe_rep += (size_t)b * nrep;
     pf_rep[p] = (float4)0.0f;
     pe_rep[p] = 0.0f;
     int2 rp = rpairs[p];
@@ -456,10 +470,23 @@ __kernel void force_gather(
     __global float4* f_shift,
     __global float4* f_rep,
     __global float4* f_dc,
-    __global float4* f_tot)
+    __global float4* f_tot,
+    const uint npairs,
+    const uint nrep)
 {
     uint a = get_global_id(0);
     if (a >= n) return;
+    // F1 replica axis: dim1 = eval slot — all per-pair/per-atom buffers
+    // are per-replica strided; the gather topology (fp/rp) is shared.
+    const uint b = get_global_id(1);
+    pf     += (size_t)b * 2 * npairs;
+    pf_rep += (size_t)b * nrep;
+    gf     += (size_t)b * n;
+    f_nscc += (size_t)b * n;
+    f_shift += (size_t)b * n;
+    f_rep  += (size_t)b * n;
+    f_dc   += (size_t)b * n;
+    f_tot  += (size_t)b * n;
     float4 fn = (float4)0.0f, fs = (float4)0.0f;
     for (uint e = fp_ptr[a]; e < fp_ptr[a + 1]; e++) {
         int ent = fp_list[e];

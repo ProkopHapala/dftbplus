@@ -229,8 +229,10 @@ pub struct GpuSccPlan {
     pub diis_coeffs: Buffer<f32>, // [batch*max_hist] coefficients
     pub diis_flag: Buffer<i32>,   // [batch] fallback counter (D9: no printf)
     pub diis_reason: Buffer<i32>, // [batch] last fallback reason
-    pub diis_work: Buffer<f64>,   // [batch*max_hist*n_atoms] W13: f64 QR columns
-    pub diis_max_hist: usize,     // max history length (typically 10)
+    // pub diis_work: Buffer<f64>,   // REMOVED 2026-09-18: W13 f64 QR columns moved to
+    //                              // __local inside diis_step_batched (serial thread-0
+    //                              // QR on global scratch was the #2 kernel cost).
+    pub diis_max_hist: usize, // max history length (typically 10)
 
     // Host staging buffers (reused, not re-allocated)
     pub eig_diag_host: Vec<f32>, // [batch*n]
@@ -345,7 +347,7 @@ pub struct GpuSccPlan {
     /// the streaming kernel at N=86, identical diag/tail contract). The log
     /// is per-sweep scratch: [batch][jround·jpair] double2, allocated only
     /// in ResidentDefV mode (1-elem dummy otherwise — bound but unread).
-    jacobi_rotlog: Buffer<f64>,
+    jacobi_rotlog: Buffer<f32>,
 
     // S^{-1/2} kernels — built once; set_geometry only copies S and enqueues.
     k_s_jacobi: Kernel,
@@ -419,12 +421,23 @@ impl GpuSccPlan {
         // (A in __local + deferred V apply) when it fits local_mem — measured
         // ~2.3–2.7× the streaming direct kernel at N=86. rotlog is the
         // per-sweep rotation-log scratch that mode needs ([batch][jround·jpair]
-        // double2; n=86/b400 ≈ 23 MB); 1-elem dummy otherwise.
+        // jlog2_t — float2 at prec=0, double2 at prec>=1; n=86/b400 ≈ 11.5 MB
+        // at the prec=0 default); 1-elem dummy otherwise.
+        // R8: env override for A/B sweeps (test processes can't call
+        // set_jacobi_prec before a plan is built inside a helper).
+        let jacobi_prec = std::env::var("RUST_DFTB_JACOBI_PREC")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .map(|p| {
+                assert!(p <= 2, "RUST_DFTB_JACOBI_PREC must be 0,1,2 — got {p}");
+                p
+            })
+            .unwrap_or_else(|| JACOBI_PREC.load(std::sync::atomic::Ordering::Relaxed));
         let eig_kind = crate::qmqm::gpu_eigen::eigsolver_kind(n, rt.caps().local_mem_size);
         let jn_pad = (n + 1) & !1usize;
-        let jacobi_rotlog = rt.zero_buffer::<f64>(
+        let jacobi_rotlog = rt.zero_buffer::<f32>(
             if eig_kind == crate::qmqm::gpu_eigen::EigKind::ResidentDefV && n > 64 {
-                batch * (jn_pad - 1) * (jn_pad / 2) * 2
+                batch * (jn_pad - 1) * (jn_pad / 2) * if jacobi_prec >= 1 { 4 } else { 2 }
             } else {
                 1
             },
@@ -476,9 +489,10 @@ impl GpuSccPlan {
         let diis_buf_idx = rt.zero_buffer::<i32>(batch)?;
         let diis_n_filled = rt.zero_buffer::<i32>(batch)?;
         let diis_coeffs = rt.zero_buffer::<f32>(batch * diis_max_hist)?;
-        // W13: f64 QR working columns for the DIIS solve (global scratch —
-        // private/local f64 arrays of hist×n_atoms would spill registers).
-        let diis_work = rt.zero_buffer::<f64>(batch * diis_max_hist * n_atoms)?;
+        // W13: f64 QR working columns are now __local inside diis_step_batched
+        // (hist×n_atoms f64 per workgroup ≈ 2.3 KB — fits local; the former
+        // global scratch made the serial thread-0 QR ~10K global accesses).
+        // let diis_work = rt.zero_buffer::<f64>(batch * diis_max_hist * n_atoms)?;
         let diis_flag = rt.zero_buffer::<i32>(batch)?;
         let diis_reason = rt.zero_buffer::<i32>(batch)?;
         eprintln!("[GpuSccPlan] DIIS hist={diis_max_hist} (min(10,n_atoms={n_atoms})) N={n} batch={batch}");
@@ -568,16 +582,6 @@ impl GpuSccPlan {
         // 7. Jacobi eigensolver — gated on `active` so done replicas' WGs exit.
         //    R1: two prebound handles — cold writes V←I into cp (init_v=0),
         //    warm rotates c in place (init_v=1). Warm exists only for n>64.
-        // R8: env override for A/B sweeps (test processes can't call
-        // set_jacobi_prec before a plan is built inside a helper).
-        let jacobi_prec = std::env::var("RUST_DFTB_JACOBI_PREC")
-            .ok()
-            .and_then(|s| s.parse::<u32>().ok())
-            .map(|p| {
-                assert!(p <= 2, "RUST_DFTB_JACOBI_PREC must be 0,1,2 — got {p}");
-                p
-            })
-            .unwrap_or_else(|| JACOBI_PREC.load(std::sync::atomic::Ordering::Relaxed));
         let k_jacobi = build_jacobi_kernel(
             rt,
             n,
@@ -1058,7 +1062,10 @@ impl GpuSccPlan {
             .arg(&active)
             .arg(0.0f32) // rms_tol — set per call in scc_step_diis*
             .arg_local::<f32>(wg_diis)
-            .arg(&diis_work) // [18] W13: f64 QR scratch
+            // [18] W13: f64 QR working columns — LOCAL (was a 928 KB global
+            // scratch; the thread-0 QR did ~10K serial global accesses → the
+            // #2 kernel at 15.6% of SCC dev time).
+            .arg_local::<f64>(diis_max_hist * n_atoms)
             .arg(&work_ids) // [19] T06
             .build()
             .map_err(map_ocl_err)?;
@@ -1329,7 +1336,6 @@ impl GpuSccPlan {
             diis_coeffs,
             diis_flag,
             diis_reason,
-            diis_work,
             diis_max_hist,
             eig_diag_host: vec![0.0; batch * n],
             eig_rho_host: vec![0.0; batch * n],
@@ -1535,10 +1541,7 @@ impl GpuSccPlan {
             )));
         }
         if ids != self.work_ids_host.as_slice() {
-            self.work_ids
-                .write(ids)
-                .enq()
-                .map_err(map_ocl_err)?;
+            self.work_ids.write(ids).enq().map_err(map_ocl_err)?;
             self.work_ids_host.clear();
             self.work_ids_host.extend_from_slice(ids);
         }
@@ -1616,7 +1619,11 @@ impl GpuSccPlan {
             rt.prof_tick("scc.gemm_th");
             self.enq_mm(k_tx)?; // hp = temp·c
             rt.prof_tick("scc.gemm_th2");
-            let jfac = if self.block_mode { self.lg.bjac } else { self.lg.jac };
+            let jfac = if self.block_mode {
+                self.lg.bjac
+            } else {
+                self.lg.jac
+            };
             self.enq1(k_j, jfac)?; // rotate c in place
             rt.prof_tick("scc.jacobi");
             // W1 (§14): NO report_jacobi here — read_buffer → queue.finish()
@@ -1635,7 +1642,11 @@ impl GpuSccPlan {
             } else {
                 &self.k_jacobi
             };
-            let jfac = if self.block_mode { self.lg.bjac } else { self.lg.jac };
+            let jfac = if self.block_mode {
+                self.lg.bjac
+            } else {
+                self.lg.jac
+            };
             self.enq1(k_j, jfac)?; // V=I → cp
             rt.prof_tick("scc.jacobi");
             // W1: deferred to check_jacobi() at solve end (see above).
@@ -2776,12 +2787,11 @@ fn build_matmul_kernels(
         const TILE_K: usize = 32;
         let row_groups = (n + MAT_TILE_M - 1) / MAT_TILE_M;
         let col_groups = (n + MAT_TILE_N - 1) / MAT_TILE_N;
-        let gws =
-            ocl::SpatialDims::Three(col_groups * MAT_TILE_N, row_groups * MAT_TILE_M, batch);
+        let gws = ocl::SpatialDims::Three(col_groups * MAT_TILE_N, row_groups * MAT_TILE_M, batch);
         let lws = ocl::SpatialDims::Two(MAT_TILE_N, MAT_TILE_M);
         let a_local = MAT_TILE_M * TILE_K;
         let b_local = MAT_TILE_N * (TILE_K + 1); // W2: padded Bs for the trans-B layout
-                                             // batched_gemm_active: same arg order as batched_gemm + [11] active.
+                                                 // batched_gemm_active: same arg order as batched_gemm + [11] active.
         let k_xh = Kernel::builder()
             .program(mat_prog)
             .name("batched_gemm_active")
@@ -2910,7 +2920,7 @@ fn build_jacobi_kernel(
     occ_w: &Buffer<f32>, // R5: Fermi tail outputs (n>64 kernel only)
     mu: &Buffer<f32>,
     kind: crate::qmqm::gpu_eigen::EigKind,
-    rotlog: &Buffer<f64>,
+    rotlog: &Buffer<f32>,
     work_ids: &Buffer<i32>,
 ) -> Result<Kernel> {
     if n <= 64 {

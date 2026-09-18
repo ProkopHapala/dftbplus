@@ -976,7 +976,7 @@ impl SparseBsr4Gpu {
             b.build().map_err(map_ocl_err)?
         };
         // hs_contract: npairs, pairs, pairs_k, xyzu, species, n_orb, nsp,
-        //   sk_meta, sk_parm, sk_ctrl, max_ctrl, taper, k, w, v, pf
+        //   sk_meta, sk_parm, sk_ctrl, max_ctrl, taper, k, w, v, pf, n_atom
         let k_hs_contract = {
             let mut b = Kernel::builder();
             b.program(&program).name("hs_contract").queue(queue.clone());
@@ -996,10 +996,11 @@ impl SparseBsr4Gpu {
             b.arg(&dummy_f32);
             b.arg(&dummy_f32);
             b.arg(&dummy_f32);
+            b.arg(0u32); // F1: n_atom (replica stride)
             b.build().map_err(map_ocl_err)?
         };
         // rep_eval: nrep, rpairs, xyzu, species, nsp, rep_off, rep_max_int,
-        //   rep_data, pf_rep, pe_rep
+        //   rep_data, pf_rep, pe_rep, n_atom
         let k_rep_eval = {
             let mut b = Kernel::builder();
             b.program(&program).name("rep_eval").queue(queue.clone());
@@ -1013,10 +1014,11 @@ impl SparseBsr4Gpu {
             b.arg(&dummy_f32);
             b.arg(&dummy_f32);
             b.arg(&dummy_f32);
+            b.arg(0u32); // F1: n_atom (replica stride)
             b.build().map_err(map_ocl_err)?
         };
         // force_gather: n, fp_ptr, fp_list, pf, rp_ptr, rp_list, pf_rep, gf,
-        //   f_nscc, f_shift, f_rep, f_dc, f_tot
+        //   f_nscc, f_shift, f_rep, f_dc, f_tot, npairs, nrep
         let k_force_gather = {
             let mut b = Kernel::builder();
             b.program(&program)
@@ -1035,6 +1037,8 @@ impl SparseBsr4Gpu {
             b.arg(&dummy_f32);
             b.arg(&dummy_f32);
             b.arg(&dummy_f32);
+            b.arg(0u32); // F1: npairs (replica stride)
+            b.arg(0u32); // F1: nrep   (replica stride)
             b.build().map_err(map_ocl_err)?
         };
         // hs_kdummy: n, k_diag, k_vals, n_orb, partial
@@ -2301,17 +2305,19 @@ impl SparseBsr4Gpu {
         xyzu: &Buffer<f32>,
         dq: &Buffer<f32>,
         v: &Buffer<f32>,
+        batch: usize,
     ) -> Result<()> {
         let k = &self.k_gamma_v;
         k.set_arg(0, n_atom as u32).map_err(map_ocl_err)?;
         k.set_arg(1, xyzu).map_err(map_ocl_err)?;
         k.set_arg(2, dq).map_err(map_ocl_err)?;
         k.set_arg(3, v).map_err(map_ocl_err)?;
+        // F1: dim1 = replica slot (JobId); batch=1 ≡ the scalar path.
         let gws = n_atom.div_ceil(GAMMA_WG as usize) * GAMMA_WG as usize;
         unsafe {
             k.cmd()
-                .global_work_size(gws)
-                .local_work_size(GAMMA_WG as usize)
+                .global_work_size(ocl::SpatialDims::Two(gws, batch))
+                .local_work_size(ocl::SpatialDims::Two(GAMMA_WG as usize, 1))
                 .enq()
                 .map_err(map_ocl_err)?;
         }
@@ -2327,17 +2333,19 @@ impl SparseBsr4Gpu {
         xyzu: &Buffer<f32>,
         dq: &Buffer<f32>,
         f: &Buffer<f32>,
+        batch: usize,
     ) -> Result<()> {
         let k = &self.k_gamma_f;
         k.set_arg(0, n_atom as u32).map_err(map_ocl_err)?;
         k.set_arg(1, xyzu).map_err(map_ocl_err)?;
         k.set_arg(2, dq).map_err(map_ocl_err)?;
         k.set_arg(3, f).map_err(map_ocl_err)?;
+        // F1: dim1 = replica slot (JobId); batch=1 ≡ the scalar path.
         let gws = n_atom.div_ceil(GAMMA_WG as usize) * GAMMA_WG as usize;
         unsafe {
             k.cmd()
-                .global_work_size(gws)
-                .local_work_size(GAMMA_WG as usize)
+                .global_work_size(ocl::SpatialDims::Two(gws, batch))
+                .local_work_size(ocl::SpatialDims::Two(GAMMA_WG as usize, 1))
                 .enq()
                 .map_err(map_ocl_err)?;
         }
@@ -2427,6 +2435,7 @@ impl SparseBsr4Gpu {
     pub fn hs_contract_dev(
         &self,
         npairs: usize,
+        n_atom: usize,
         pairs: &Buffer<i32>,
         pairs_k: &Buffer<i32>,
         xyzu: &Buffer<f32>,
@@ -2442,6 +2451,7 @@ impl SparseBsr4Gpu {
         w_vals: &Buffer<f32>,
         v_atom: &Buffer<f32>,
         pf: &Buffer<f32>,
+        batch: usize,
     ) -> Result<()> {
         let k = &self.k_hs_contract;
         k.set_arg(0, npairs as u32).map_err(map_ocl_err)?;
@@ -2461,9 +2471,11 @@ impl SparseBsr4Gpu {
         k.set_arg(13, w_vals).map_err(map_ocl_err)?;
         k.set_arg(14, v_atom).map_err(map_ocl_err)?;
         k.set_arg(15, pf).map_err(map_ocl_err)?;
+        k.set_arg(16, n_atom as u32).map_err(map_ocl_err)?;
+        // F1: dim1 = replica slot; batch=1 ≡ the scalar path.
         unsafe {
             k.cmd()
-                .global_work_size(npairs)
+                .global_work_size(ocl::SpatialDims::Two(npairs, batch))
                 .enq()
                 .map_err(map_ocl_err)?;
         }
@@ -2476,6 +2488,7 @@ impl SparseBsr4Gpu {
     pub fn rep_eval_dev(
         &self,
         nrep: usize,
+        n_atom: usize,
         rpairs: &Buffer<i32>,
         xyzu: &Buffer<f32>,
         species: &Buffer<u32>,
@@ -2485,6 +2498,7 @@ impl SparseBsr4Gpu {
         rep_data: &Buffer<f32>,
         pf_rep: &Buffer<f32>,
         pe_rep: &Buffer<f32>,
+        batch: usize,
     ) -> Result<()> {
         let k = &self.k_rep_eval;
         k.set_arg(0, nrep as u32).map_err(map_ocl_err)?;
@@ -2497,9 +2511,11 @@ impl SparseBsr4Gpu {
         k.set_arg(7, rep_data).map_err(map_ocl_err)?;
         k.set_arg(8, pf_rep).map_err(map_ocl_err)?;
         k.set_arg(9, pe_rep).map_err(map_ocl_err)?;
+        k.set_arg(10, n_atom as u32).map_err(map_ocl_err)?;
+        // F1: dim1 = replica slot; batch=1 ≡ the scalar path.
         unsafe {
             k.cmd()
-                .global_work_size(nrep.max(1))
+                .global_work_size(ocl::SpatialDims::Two(nrep.max(1), batch))
                 .enq()
                 .map_err(map_ocl_err)?;
         }
@@ -2524,6 +2540,9 @@ impl SparseBsr4Gpu {
         f_rep: &Buffer<f32>,
         f_dc: &Buffer<f32>,
         f_tot: &Buffer<f32>,
+        npairs: usize,
+        nrep: usize,
+        batch: usize,
     ) -> Result<()> {
         let k = &self.k_force_gather;
         k.set_arg(0, n_atom as u32).map_err(map_ocl_err)?;
@@ -2539,9 +2558,12 @@ impl SparseBsr4Gpu {
         k.set_arg(10, f_rep).map_err(map_ocl_err)?;
         k.set_arg(11, f_dc).map_err(map_ocl_err)?;
         k.set_arg(12, f_tot).map_err(map_ocl_err)?;
+        k.set_arg(13, npairs as u32).map_err(map_ocl_err)?;
+        k.set_arg(14, nrep as u32).map_err(map_ocl_err)?;
+        // F1: dim1 = replica slot; batch=1 ≡ the scalar path.
         unsafe {
             k.cmd()
-                .global_work_size(n_atom)
+                .global_work_size(ocl::SpatialDims::Two(n_atom, batch))
                 .enq()
                 .map_err(map_ocl_err)?;
         }
@@ -4562,8 +4584,8 @@ mod tests {
         let b_dq = gpu.buf_f32(&dqf).unwrap();
         let b_v = gpu.zero_f32(n).unwrap();
         let b_f = gpu.zero_f32(4 * n).unwrap();
-        gpu.gamma_v_dev(n, &b_xyzu, &b_dq, &b_v).unwrap();
-        gpu.gamma_f_dev(n, &b_xyzu, &b_dq, &b_f).unwrap();
+        gpu.gamma_v_dev(n, &b_xyzu, &b_dq, &b_v, 1).unwrap();
+        gpu.gamma_f_dev(n, &b_xyzu, &b_dq, &b_f, 1).unwrap();
         let mut v = vec![0.0f32; n];
         let mut f = vec![0.0f32; 4 * n];
         gpu.read_f32(&b_v, &mut v).unwrap();

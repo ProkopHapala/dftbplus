@@ -240,7 +240,9 @@ fn jacobi_prec_bench() {
             let src = rt.buffer_from_slice(&input).unwrap();
             let a_buf = rt.zero_buffer::<f32>(input.len()).unwrap();
             let v_buf = rt.zero_buffer::<f32>(input.len()).unwrap();
-            let wids = rt.buffer_from_slice(&(0..batch as i32).collect::<Vec<_>>()).unwrap(); // T06 identity
+            let wids = rt
+                .buffer_from_slice(&(0..batch as i32).collect::<Vec<_>>())
+                .unwrap(); // T06 identity
             let mut ah = vec![0.0f32; input.len()];
             let mut vh = vec![0.0f32; input.len()];
             for prec in 0..3u32 {
@@ -370,7 +372,9 @@ fn direct_jacobi_bench() {
             let a_buf = rt.zero_buffer::<f32>(input.len()).unwrap();
             let v_buf = rt.zero_buffer::<f32>(input.len()).unwrap();
             let ones = rt.buffer_from_slice(&vec![1i32; batch]).unwrap();
-            let wids = rt.buffer_from_slice(&(0..batch as i32).collect::<Vec<_>>()).unwrap(); // T06 identity
+            let wids = rt
+                .buffer_from_slice(&(0..batch as i32).collect::<Vec<_>>())
+                .unwrap(); // T06 identity
             let diag_buf = rt.zero_buffer::<f32>(4 * batch).unwrap();
             let mut ah = vec![0.0f32; input.len()];
             let mut vh = vec![0.0f32; input.len()];
@@ -1079,7 +1083,9 @@ fn test_block_vs_direct_jacobi_bench() {
                 let a_buf = rt.buffer_from_slice(&a).unwrap();
                 let v_buf = rt.zero_buffer::<f32>(batch * n * n).unwrap();
                 let ones = rt.buffer_from_slice(&vec![1i32; batch]).unwrap();
-                let wids = rt.buffer_from_slice(&(0..batch as i32).collect::<Vec<_>>()).unwrap(); // T06 identity
+                let wids = rt
+                    .buffer_from_slice(&(0..batch as i32).collect::<Vec<_>>())
+                    .unwrap(); // T06 identity
                 let diag_d = rt.zero_buffer::<f32>(4 * batch).unwrap();
                 let occ_w = rt.zero_buffer::<f32>(batch * n).unwrap();
                 let mu = rt.zero_buffer::<f32>(batch).unwrap();
@@ -1235,7 +1241,9 @@ fn block_jacobi_param_sweep() {
             let a_buf = rt.buffer_from_slice(&a).unwrap();
             let v_buf = rt.zero_buffer::<f32>(batch * n * n).unwrap();
             let ones = rt.buffer_from_slice(&vec![1i32; batch]).unwrap();
-            let wids = rt.buffer_from_slice(&(0..batch as i32).collect::<Vec<_>>()).unwrap(); // T06 identity
+            let wids = rt
+                .buffer_from_slice(&(0..batch as i32).collect::<Vec<_>>())
+                .unwrap(); // T06 identity
             let diag = rt.zero_buffer::<f32>(4 * batch).unwrap();
             let eig = rt.zero_buffer::<f32>(batch * n).unwrap();
             for &(b, imax, itol) in cfgs {
@@ -1429,6 +1437,42 @@ fn kernel_resources() {
             print(&k, &format!("direct wg={wg} notail={no_tail}"));
         }
     }
+    // Packed-lA resident kernel: static __local + dynamic arg_local must sum
+    // under ~24 KB for two workgroups to co-reside on a 48 KB SM.
+    let n86 = 86usize;
+    let rotlog = rt.zero_buffer::<f32>(n86 * n86).unwrap();
+    for &wg in &[256usize, 512] {
+        for &no_tail in &[false, true] {
+            let src = render_tiled_source_cfg(32, wg, 0, no_tail);
+            let program = rt.build_program(&src).unwrap();
+            let k = Kernel::builder()
+                .program(&program)
+                .name("jacobi_resident_batched")
+                .queue(rt.queue().clone())
+                .global_work_size(wg)
+                .local_work_size(wg)
+                .arg(&a)
+                .arg(&v)
+                .arg(n86 as i32)
+                .arg(1i32)
+                .arg(0i32)
+                .arg(&ones)
+                .arg(&diag)
+                .arg(0i32)
+                .arg(0i32)
+                .arg(0.0f32)
+                .arg(&occ_w)
+                .arg(&mu)
+                .arg(&rotlog)
+                .arg_local::<f32>(n86 * (n86 + 1) / 2)
+                .arg_local::<f32>(1)
+                .arg(&wids)
+                .build()
+                .unwrap();
+            let dyn_b = n86 * (n86 + 1) / 2 * 4 + 4;
+            print(&k, &format!("res-defV wg={wg} notail={no_tail} (+{dyn_b}B arg_local)"));
+        }
+    }
 }
 
 /// T08 #5: direct-kernel `jacobi_cyclic_global_batched` sweep at N=86 —
@@ -1474,7 +1518,9 @@ fn direct_jacobi_wg_sweep() {
             let a_buf = rt.buffer_from_slice(&a).unwrap();
             let v_buf = rt.zero_buffer::<f32>(batch * n * n).unwrap();
             let ones = rt.buffer_from_slice(&vec![1i32; batch]).unwrap();
-            let wids = rt.buffer_from_slice(&(0..batch as i32).collect::<Vec<_>>()).unwrap(); // T06 identity
+            let wids = rt
+                .buffer_from_slice(&(0..batch as i32).collect::<Vec<_>>())
+                .unwrap(); // T06 identity
             let diag = rt.zero_buffer::<f32>(4 * batch).unwrap();
             let occ_w = rt.zero_buffer::<f32>(batch * n).unwrap();
             let mu = rt.zero_buffer::<f32>(batch).unwrap();
@@ -1685,13 +1731,17 @@ fn resident_jacobi_sweep() {
             let a_buf = rt.buffer_from_slice(&a).unwrap();
             let v_buf = rt.zero_buffer::<f32>(batch * n * n).unwrap();
             let ones = rt.buffer_from_slice(&vec![1i32; batch]).unwrap();
-            let wids = rt.buffer_from_slice(&(0..batch as i32).collect::<Vec<_>>()).unwrap(); // T06 identity
+            let wids = rt
+                .buffer_from_slice(&(0..batch as i32).collect::<Vec<_>>())
+                .unwrap(); // T06 identity
             let diag = rt.zero_buffer::<f32>(4 * batch).unwrap();
             let occ_w = rt.zero_buffer::<f32>(batch * n).unwrap();
             let mu = rt.zero_buffer::<f32>(batch).unwrap();
             let jn = if n & 1 == 1 { n + 1 } else { n };
+            // jlog2_t entry: prec=1 → double2 (4 f32); prec=0 → float2 (2 f32).
+            // This sweep renders resident kernels at prec=1 → 4 f32s/entry.
             let rotlog = rt
-                .zero_buffer::<f64>(batch * (jn - 1) * (jn / 2) * 2)
+                .zero_buffer::<f32>(batch * (jn - 1) * (jn / 2) * 4)
                 .unwrap();
             // (tag, kind): direct | resident deferred-V | resident full-local
             for &(tag, rv) in &[("direct", -1i32), ("res-defV", 0), ("res-AV", 1)] {
@@ -1701,8 +1751,12 @@ fn resident_jacobi_sweep() {
                     }
                     for &no_tail in &[false, true] {
                         let tag = format!("{tag} WG={wg} notail={no_tail}");
-                        let la = n * (n + 1) * 4;
-                        if rv >= 0 && (la * if rv == 1 { 2 } else { 1 }) as u64 > local_cap {
+                        // packed lA (triangle) + square lV when resident_v
+                        let la = n * (n + 1) / 2 * 4 + if rv == 1 { n * (n + 1) * 4 } else { 0 };
+                        // +16 KB: kernel's own static __local scratch
+                        // (reduce/dred/le/rot arrays) — same headroom as
+                        // RESIDENT_SCRATCH_HEADROOM in gpu_eigen.rs.
+                        if rv >= 0 && la as u64 + 16 * 1024 > local_cap {
                             eprintln!("[rsweep] n={n} {mode} {tag}: SKIP local {la}B over cap");
                             continue;
                         }
@@ -1744,7 +1798,7 @@ fn resident_jacobi_sweep() {
                             .arg(&mu);
                         if rv >= 0 {
                             kb.arg(&rotlog)
-                                .arg_local::<f32>(n * (n + 1))
+                                .arg_local::<f32>(n * (n + 1) / 2)
                                 .arg_local::<f32>(if rv == 1 { n * (n + 1) } else { 1 });
                         }
                         kb.arg(&wids); // T06: last arg in both kernel signatures

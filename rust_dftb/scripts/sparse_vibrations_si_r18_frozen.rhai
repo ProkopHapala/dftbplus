@@ -2,9 +2,11 @@
 // Si sphere R18 (1648 atoms: 1202 Si + 446 H), matsci-0-3 SK set.
 //
 // Tier-A frozen mode (manifest §4.12.1 / report §15.17): the converged
-// (K0, W0, q0) is snapshotted once at the reference geometry, then every
-// ±h column costs ZERO device products — CPU set_coords + pair contraction
-// only. Measured on R10: 5.5 ms/eval, ~6.3% column error (h-independent).
+// (K0, W0, q0) is snapshotted once at the reference geometry (device-
+// resident, §15.25), then every ±h column costs ZERO device products —
+// GPU pair contraction vs the resident K0/W0 only. Multi-replica batch
+// (report §15.27): RUST_DFTB_VIB_BATCH=B runs B displaced geometries per
+// launch wave on a gid(1) replica axis — bitwise-identical to sequential.
 // CAVEAT: missing charge/orbital response softens Si–H stretches
 // (~240 cm-1 on si10h16 vs full SCC) — framework modes are fine; treat the
 // top of the spectrum as preview quality. Quantitative mode = VIB_FIXQ
@@ -35,17 +37,21 @@
 //     scc_fixedq (VIB_FIXQ mode only; frozen mode has no per-column solve).
 //
 // Tiers measured on this machine (RTX 3090, 1648 atoms, h=0.02):
-//   frozen  ~0.19 s/eval → full Hessian ~31 min   (VIB_FROZEN=1)
+//   frozen  ~1.6 ms/eval (B=1) → 0.27 ms/eval at VIB_BATCH=16 — full
+//           Hessian evals ~2.7 s; total wall ~139 s dominated by the
+//           dense 4944^2 host eigensolve (~100 s).  (VIB_FROZEN=1)
 //           QUALITATIVE ONLY — si10h16 parity vs scc: rms 157 cm-1,
 //           Si-H ~250 cm-1 soft, rigid modes land at +120 cm-1.
 //   fixq    ~0.92 s/eval → full Hessian ~2.5 h    (VIB_FIXQ=1)
 //           quantitative — si10h16 parity vs scc: rms 5.9 cm-1,
 //           Si-H ~8 cm-1 soft, rigid modes intact. RECOMMENDED.
 //   full scc ~est. 5-8 s/eval → overnight         (no env)
-// Per-eval time is ~all CPU (H/S assembly 55 ms + gamma 20 ms + force
-// contraction ~99 ms are host code; GPU idles in frozen mode).
+// Frozen evals are fully GPU-resident (§15.25): central K0/W0/dq live on
+// device; per eval only xyzu up + forces down (O(N) transfers).
 //
 // env knobs: VIB_H (FD step, default 0.02 A), BENCH_ST (scc tol, 1e-5),
+//   RUST_DFTB_VIB_BATCH (frozen evals per launch wave, default 1; ~16
+//   saturates at R18 — §15.27),
 //   R18_XYZ (override input geometry), R18_RELAX=1 (run FIRE + save),
 //   R18_FMAX (relax force tol, 1e-4), R18_STEPS (relax max steps, 400),
 //   R18_RTRUNC / R18_TAPER / R18_RK / R18_RZ (mask radii; defaults

@@ -30,7 +30,14 @@ fn try_runtime() -> Option<GpuRuntime> {
 }
 
 /// Assert that `buf` holds `sentinel` at every slot not in `touched`.
-fn assert_untouched(got: &[f32], batch: usize, stride: usize, touched: &[usize], sentinel: f32, what: &str) {
+fn assert_untouched(
+    got: &[f32],
+    batch: usize,
+    stride: usize,
+    touched: &[usize],
+    sentinel: f32,
+    what: &str,
+) {
     for s in 0..batch {
         if touched.contains(&s) {
             continue;
@@ -134,7 +141,9 @@ fn test_work_ids_one_wg_compact() {
             q_next[s * n_atoms + a] = 100.0 * s as f32 + a as f32;
         }
     }
-    let q_buf = rt.buffer_from_slice(&vec![-999f32; batch * n_atoms]).unwrap();
+    let q_buf = rt
+        .buffer_from_slice(&vec![-999f32; batch * n_atoms])
+        .unwrap();
     let qn_buf = rt.buffer_from_slice(&q_next).unwrap();
     let active = rt.buffer_from_slice(&vec![1i32; batch]).unwrap();
     let ids = [2i32];
@@ -160,7 +169,11 @@ fn test_work_ids_one_wg_compact() {
     rt.read_buffer(&q_buf, &mut got).unwrap();
 
     for a in 0..n_atoms {
-        assert_eq!(got[2 * n_atoms + a], q_next[2 * n_atoms + a], "commit slot 2 atom {a}");
+        assert_eq!(
+            got[2 * n_atoms + a],
+            q_next[2 * n_atoms + a],
+            "commit slot 2 atom {a}"
+        );
     }
     assert_untouched(&got, batch, n_atoms, &[2], -999.0, "commit_q");
 }
@@ -225,7 +238,8 @@ fn test_work_ids_sys_col_compact() {
     for s in 0..batch {
         for i in 0..n {
             for j in 0..n {
-                c[s * nn + i * n + j] = ((s + 1) * (i + 1)) as f32 * (j == i % n) as i32 as f32 + 0.5 * (s + 1) as f32;
+                c[s * nn + i * n + j] =
+                    ((s + 1) * (i + 1)) as f32 * (j == i % n) as i32 as f32 + 0.5 * (s + 1) as f32;
             }
         }
     }
@@ -258,14 +272,24 @@ fn test_work_ids_sys_col_compact() {
     // Columns of slots 1,3 must be unit L2 norm (SC==C → plain renorm).
     for &s in &[1usize, 3] {
         for col in 0..n {
-            let nrm: f32 = (0..n).map(|i| got[s * nn + i * n + col].powi(2)).sum::<f32>().sqrt();
-            assert!((nrm - 1.0).abs() < 1e-4, "cs_normalize slot {s} col {col}: |C|={nrm}");
+            let nrm: f32 = (0..n)
+                .map(|i| got[s * nn + i * n + col].powi(2))
+                .sum::<f32>()
+                .sqrt();
+            assert!(
+                (nrm - 1.0).abs() < 1e-4,
+                "cs_normalize slot {s} col {col}: |C|={nrm}"
+            );
         }
     }
     // Slots 0,2 must equal the original C exactly.
     for &s in &[0usize, 2] {
         for k in 0..nn {
-            assert_eq!(got[s * nn + k], c[s * nn + k], "cs_normalize untouched slot {s}[{k}]");
+            assert_eq!(
+                got[s * nn + k],
+                c[s * nn + k],
+                "cs_normalize untouched slot {s}[{k}]"
+            );
         }
     }
 }
@@ -302,7 +326,14 @@ fn test_work_ids_resident_jacobi_subset() {
         a[s * nn..(s + 1) * nn].copy_from_slice(&m);
     }
     // CPU reference eigenvalues for the target slot.
-    let dm = DMatrix::from_row_slice(n, n, &a[target * nn..(target + 1) * nn].iter().map(|&x| x as f64).collect::<Vec<_>>());
+    let dm = DMatrix::from_row_slice(
+        n,
+        n,
+        &a[target * nn..(target + 1) * nn]
+            .iter()
+            .map(|&x| x as f64)
+            .collect::<Vec<_>>(),
+    );
     let mut want_eig: Vec<f64> = dm.symmetric_eigenvalues().iter().cloned().collect();
     want_eig.sort_by(|x, y| x.partial_cmp(y).unwrap());
 
@@ -313,12 +344,16 @@ fn test_work_ids_resident_jacobi_subset() {
     let occ_w = rt.zero_buffer::<f32>(batch * n).unwrap();
     let mu = rt.zero_buffer::<f32>(batch).unwrap();
     let jn = if n & 1 == 1 { n + 1 } else { n };
-    let rotlog = rt.zero_buffer::<f64>(batch * (jn - 1) * (jn / 2) * 2).unwrap();
+    let rotlog = rt
+        .zero_buffer::<f32>(batch * (jn - 1) * (jn / 2) * 4)
+        .unwrap(); // prec=1 → double2 jlog2_t
     let ids = [target as i32];
     let wids = rt.buffer_from_slice(&ids).unwrap();
     let wg = 256usize.min(rt.caps().max_work_group_size);
 
-    let prog = rt.build_program(&render_resident_source(wg, 1, false, true)).unwrap();
+    let prog = rt
+        .build_program(&render_resident_source(wg, 1, false, true))
+        .unwrap();
     let k = Kernel::builder()
         .program(&prog)
         .name("jacobi_resident_batched")
@@ -338,7 +373,7 @@ fn test_work_ids_resident_jacobi_subset() {
         .arg(&occ_w)
         .arg(&mu)
         .arg(&rotlog)
-        .arg_local::<f32>(n * (n + 1))
+        .arg_local::<f32>(n * (n + 1) / 2) // packed symmetric lA
         .arg_local::<f32>(1)
         .arg(&wids)
         .build()
@@ -369,7 +404,10 @@ fn test_work_ids_resident_jacobi_subset() {
         );
     }
     for i in 0..n {
-        let nrm: f64 = (0..n).map(|r| (gv[target * nn + r * n + i] as f64).powi(2)).sum::<f64>().sqrt();
+        let nrm: f64 = (0..n)
+            .map(|r| (gv[target * nn + r * n + i] as f64).powi(2))
+            .sum::<f64>()
+            .sqrt();
         assert!((nrm - 1.0).abs() < 1e-4, "V col {i} norm {nrm}");
     }
     // Slots 0,1,3 of A untouched; all non-target V slots still zero.
@@ -378,7 +416,11 @@ fn test_work_ids_resident_jacobi_subset() {
             continue;
         }
         for kk in 0..nn {
-            assert_eq!(ga[s * nn + kk], a[s * nn + kk], "A slot {s}[{kk}] untouched");
+            assert_eq!(
+                ga[s * nn + kk],
+                a[s * nn + kk],
+                "A slot {s}[{kk}] untouched"
+            );
             assert_eq!(gv[s * nn + kk], 0.0, "V slot {s}[{kk}] untouched");
         }
     }
@@ -428,11 +470,15 @@ fn work_ids_saturation_sweep() {
     let occ_w = rt.zero_buffer::<f32>(batch * n).unwrap();
     let mu = rt.zero_buffer::<f32>(batch).unwrap();
     let jn = if n & 1 == 1 { n + 1 } else { n };
-    let rotlog = rt.zero_buffer::<f64>(batch * (jn - 1) * (jn / 2) * 2).unwrap();
+    let rotlog = rt
+        .zero_buffer::<f32>(batch * (jn - 1) * (jn / 2) * 4)
+        .unwrap(); // prec=1 → double2 jlog2_t
     let all_ids: Vec<i32> = (0..batch as i32).collect();
     let wids_full = rt.buffer_from_slice(&all_ids).unwrap();
     let wg = 512usize.min(rt.caps().max_work_group_size);
-    let prog = rt.build_program(&render_resident_source(wg, 1, false, true)).unwrap();
+    let prog = rt
+        .build_program(&render_resident_source(wg, 1, false, true))
+        .unwrap();
 
     eprintln!("[wsweep] n={n} batch={batch} wg={wg} | S | compact ms | masked ms | dead-WG ms");
     for &s in &[400usize, 300, 200, 100, 50, 25, 10, 1] {
@@ -462,7 +508,7 @@ fn work_ids_saturation_sweep() {
                 .arg(&occ_w)
                 .arg(&mu)
                 .arg(&rotlog)
-                .arg_local::<f32>(n * (n + 1))
+                .arg_local::<f32>(n * (n + 1) / 2) // packed symmetric lA
                 .arg_local::<f32>(1)
                 .arg(wids)
                 .build()
@@ -507,7 +553,9 @@ fn test_work_ids_active_mask_interplay() {
             q_next[s * n_atoms + a] = 10.0 * s as f32 + a as f32;
         }
     }
-    let q_buf = rt.buffer_from_slice(&vec![-999f32; batch * n_atoms]).unwrap();
+    let q_buf = rt
+        .buffer_from_slice(&vec![-999f32; batch * n_atoms])
+        .unwrap();
     let qn_buf = rt.buffer_from_slice(&q_next).unwrap();
     let mut act = vec![1i32; batch];
     act[1] = 0; // frozen
@@ -535,7 +583,11 @@ fn test_work_ids_active_mask_interplay() {
     rt.read_buffer(&q_buf, &mut got).unwrap();
 
     for a in 0..n_atoms {
-        assert_eq!(got[2 * n_atoms + a], q_next[2 * n_atoms + a], "commit slot 2 atom {a}");
+        assert_eq!(
+            got[2 * n_atoms + a],
+            q_next[2 * n_atoms + a],
+            "commit slot 2 atom {a}"
+        );
     }
     assert_untouched(&got, batch, n_atoms, &[2], -999.0, "commit_q+active");
 }

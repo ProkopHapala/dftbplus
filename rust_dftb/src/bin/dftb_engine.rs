@@ -1920,6 +1920,19 @@ fn rhai_sparse_vibrations(name: &str, h: f64, scc_tol: f64, path: &str) -> Strin
         };
         let frozen = env_on("RUST_DFTB_VIB_FROZEN");
         let fixq = env_on("RUST_DFTB_VIB_FIXQ") && !frozen;
+        // F1 batched frozen columns (manifest §F.1): RUST_DFTB_VIB_BATCH
+        // evals in flight per launch — frozen columns are uniform
+        // one-shot jobs, no SCC machinery. GPU-pair path only.
+        let vib_batch = if frozen {
+            std::env::var("RUST_DFTB_VIB_BATCH")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(1)
+                .max(1)
+        } else {
+            1
+        };
+        let batched = vib_batch > 1 && frozen && !eng.cpu_pair();
         // Central electronic state (manifest §4.12 / Phase G1): every ±h
         // column restores it — identical solver history, no FD asymmetry
         // from a chained previous column.
@@ -1932,104 +1945,175 @@ fn rhai_sparse_vibrations(name: &str, h: f64, scc_tol: f64, path: &str) -> Strin
         let maxcol = std::env::var("RUST_DFTB_VIB_MAXCOL")
             .ok()
             .and_then(|v| v.parse::<usize>().ok());
-        eprintln!("[sparse] vibrations '{name}': {n3} columns, h={h} Å, scc_tol={scc_tol:e} frozen={frozen} fixq={fixq} maxcol={maxcol:?}");
+        eprintln!("[sparse] vibrations '{name}': {n3} columns, h={h} Å, scc_tol={scc_tol:e} frozen={frozen} fixq={fixq} batch={vib_batch} maxcol={maxcol:?}");
         let t_vib0 = std::time::Instant::now();
-        'cols: for i in 0..n_atom {
-            for a in 0..3 {
-                let col = 3 * i + a;
-                if let Some(mc) = maxcol {
-                    if col >= mc {
-                        break 'cols;
+        if batched {
+            // F1 batched frozen columns (manifest §F.1): evals in column
+            // order (+h,−h adjacent), chunked by vib_batch. JobId = eval
+            // index — results scatter to columns, never by slot.
+            let mut evals: Vec<(usize, usize, f64)> = Vec::new();
+            'collect: for i in 0..n_atom {
+                for a in 0..3 {
+                    let col = 3 * i + a;
+                    if let Some(mc) = maxcol {
+                        if col >= mc {
+                            break 'collect;
+                        }
+                    }
+                    evals.push((i, a, 1.0));
+                    evals.push((i, a, -1.0));
+                }
+            }
+            let fmax = |v: &Vec<[f64; 3]>| {
+                v.iter()
+                    .flat_map(|a| a.iter())
+                    .fold(0.0f64, |m, x| m.max(x.abs()))
+            };
+            // Per-column (f_plus, f_minus) pending slots — at most one
+            // column straddles a chunk boundary.
+            let mut pend: std::collections::HashMap<usize, [Option<Vec<[f64; 3]>>; 2]> =
+                std::collections::HashMap::new();
+            for chunk in evals.chunks(vib_batch) {
+                let t0 = std::time::Instant::now();
+                let fs = eng
+                    .forces_frozen_batch(&x0, chunk, h)
+                    .unwrap_or_else(|e| panic!("vibrations '{name}' batched frozen evals: {e}"));
+                let ms_ev = t0.elapsed().as_secs_f64() * 1e3 / chunk.len() as f64;
+                for (&(i, a, sign), f) in chunk.iter().zip(fs.into_iter()) {
+                    let col = 3 * i + a;
+                    let si = if sign > 0.0 { 0 } else { 1 };
+                    let e = pend.entry(col).or_insert_with(|| [None, None]);
+                    e[si] = Some(f.forces);
+                    if e[0].is_some() && e[1].is_some() {
+                        let [fp, fm] = pend.remove(&col).unwrap();
+                        let fp = fp.unwrap();
+                        let fm = fm.unwrap();
+                        let mut fd_max = 0.0f64;
+                        for j in 0..n_atom {
+                            for b in 0..3 {
+                                fd_max = fd_max.max((fp[j][b] - fm[j][b]).abs());
+                            }
+                        }
+                        eprintln!("[sparse] vib col {col}/{n3} (B={vib_batch}): {ms_ev:.2}ms/eval | max|F+|={:.4e} max|F-|={:.4e} max|ΔF|={:.4e}",
+                            fmax(&fp), fmax(&fm), fd_max);
+                        if let Ok(dir) = std::env::var("RUST_DFTB_VIB_DUMPCOL") {
+                            let mut txt = String::new();
+                            for j in 0..n_atom {
+                                for b in 0..3 {
+                                    txt.push_str(&format!("{:.10e}\n", fp[j][b] - fm[j][b]));
+                                }
+                            }
+                            std::fs::write(format!("{dir}/df_{col}.txt"), txt)
+                                .unwrap_or_else(|e| panic!("vib dumpcol {dir}/df_{col}.txt: {e}"));
+                        }
+                        for j in 0..n_atom {
+                            for b in 0..3 {
+                                hess[(3 * j + b) * n3 + col] = -(fp[j][b] - fm[j][b]) / (2.0 * h);
+                            }
+                        }
                     }
                 }
-                let mut f_plus = None;
-                let mut f_minus = None;
-                let mut ms = [0.0f64; 6]; // [+h: rst,set,f] [-h: rst,set,f]
-                for (si, sign) in [1.0f64, -1.0].iter().enumerate() {
-                    let sign = *sign;
-                    let t0 = std::time::Instant::now();
-                    eng.restore_central_state()
-                        .unwrap_or_else(|e| panic!("vibrations '{name}' col {col} restore: {e}"));
-                    work[i][a] = x0[i][a] + sign * h;
-                    eng.set_coords(&work).unwrap_or_else(|e| {
-                        panic!("vibrations '{name}' col {col} {sign:+}h set_coords: {e}")
-                    });
-                    let t1 = std::time::Instant::now();
-                    let f = if frozen {
-                        eng.forces_frozen()
+            }
+        } else {
+            'cols: for i in 0..n_atom {
+                for a in 0..3 {
+                    let col = 3 * i + a;
+                    if let Some(mc) = maxcol {
+                        if col >= mc {
+                            break 'cols;
+                        }
+                    }
+                    let mut f_plus = None;
+                    let mut f_minus = None;
+                    let mut ms = [0.0f64; 6]; // [+h: rst,set,f] [-h: rst,set,f]
+                    for (si, sign) in [1.0f64, -1.0].iter().enumerate() {
+                        let sign = *sign;
+                        let t0 = std::time::Instant::now();
+                        eng.restore_central_state().unwrap_or_else(|e| {
+                            panic!("vibrations '{name}' col {col} restore: {e}")
+                        });
+                        work[i][a] = x0[i][a] + sign * h;
+                        eng.set_coords(&work).unwrap_or_else(|e| {
+                            panic!("vibrations '{name}' col {col} {sign:+}h set_coords: {e}")
+                        });
+                        let t1 = std::time::Instant::now();
+                        let f = if frozen {
+                            eng.forces_frozen()
                             .unwrap_or_else(|e| {
                                 panic!("vibrations '{name}' col {col} {sign:+}h forces_frozen: {e}")
                             })
                             .forces
-                    } else if fixq {
-                        eng.scc_fixedq().unwrap_or_else(|e| {
-                            panic!("vibrations '{name}' col {col} {sign:+}h scc_fixedq: {e}")
-                        });
-                        eng.forces()
-                            .unwrap_or_else(|e| {
-                                panic!("vibrations '{name}' col {col} {sign:+}h forces: {e}")
-                            })
-                            .forces
-                    } else {
-                        eng.scc(80, scc_tol).unwrap_or_else(|e| {
-                            panic!("vibrations '{name}' col {col} {sign:+}h scc: {e}")
-                        });
-                        eng.forces()
-                            .unwrap_or_else(|e| {
-                                panic!("vibrations '{name}' col {col} {sign:+}h forces: {e}")
-                            })
-                            .forces
-                    };
-                    let t2 = std::time::Instant::now();
-                    ms[3 * si] = (t1 - t0).as_secs_f64() * 1e3;
-                    ms[3 * si + 1] = 0.0;
-                    ms[3 * si + 2] = (t2 - t1).as_secs_f64() * 1e3;
-                    if sign > 0.0 {
-                        f_plus = Some(f);
-                    } else {
-                        f_minus = Some(f);
-                    }
-                }
-                // Per-column force magnitudes — the cross-mode FD check
-                // (warm-seed acceptance changes forces, not just timing).
-                let fmax = |v: &Vec<[f64; 3]>| {
-                    v.iter()
-                        .flat_map(|a| a.iter())
-                        .fold(0.0f64, |m, x| m.max(x.abs()))
-                };
-                let fp = f_plus.as_ref().unwrap();
-                let fm = f_minus.as_ref().unwrap();
-                let mut fd_max = 0.0f64;
-                for j in 0..n_atom {
-                    for b in 0..3 {
-                        fd_max = fd_max.max((fp[j][b] - fm[j][b]).abs());
-                    }
-                }
-                eprintln!("[sparse] vib col {col}/{n3}: +h rst+geom={:.1}ms solve+f={:.1}ms | -h rst+geom={:.1}ms solve+f={:.1}ms | max|F+|={:.4e} max|F-|={:.4e} max|ΔF|={:.4e}",
-                    ms[0], ms[2], ms[3], ms[5], fmax(fp), fmax(fm), fd_max);
-                // Optional per-column ΔF dump for offline warm-vs-cold
-                // validation (RUST_DFTB_VIB_DUMPCOL=<dir>): one text file
-                // per column, n_atom lines of "fx fy fz" (F+−F−).
-                if let Ok(dir) = std::env::var("RUST_DFTB_VIB_DUMPCOL") {
-                    let mut txt = String::new();
-                    for j in 0..n_atom {
-                        for b in 0..3 {
-                            txt.push_str(&format!("{:.10e}\n", fp[j][b] - fm[j][b]));
+                        } else if fixq {
+                            eng.scc_fixedq().unwrap_or_else(|e| {
+                                panic!("vibrations '{name}' col {col} {sign:+}h scc_fixedq: {e}")
+                            });
+                            eng.forces()
+                                .unwrap_or_else(|e| {
+                                    panic!("vibrations '{name}' col {col} {sign:+}h forces: {e}")
+                                })
+                                .forces
+                        } else {
+                            eng.scc(80, scc_tol).unwrap_or_else(|e| {
+                                panic!("vibrations '{name}' col {col} {sign:+}h scc: {e}")
+                            });
+                            eng.forces()
+                                .unwrap_or_else(|e| {
+                                    panic!("vibrations '{name}' col {col} {sign:+}h forces: {e}")
+                                })
+                                .forces
+                        };
+                        let t2 = std::time::Instant::now();
+                        ms[3 * si] = (t1 - t0).as_secs_f64() * 1e3;
+                        ms[3 * si + 1] = 0.0;
+                        ms[3 * si + 2] = (t2 - t1).as_secs_f64() * 1e3;
+                        if sign > 0.0 {
+                            f_plus = Some(f);
+                        } else {
+                            f_minus = Some(f);
                         }
                     }
-                    std::fs::write(format!("{dir}/df_{col}.txt"), txt)
-                        .unwrap_or_else(|e| panic!("vib dumpcol {dir}/df_{col}.txt: {e}"));
-                }
-                work[i][a] = x0[i][a];
-                let f_plus = f_plus.unwrap();
-                let f_minus = f_minus.unwrap();
-                for j in 0..n_atom {
-                    for b in 0..3 {
-                        hess[(3 * j + b) * n3 + col] = -(f_plus[j][b] - f_minus[j][b]) / (2.0 * h);
+                    // Per-column force magnitudes — the cross-mode FD check
+                    // (warm-seed acceptance changes forces, not just timing).
+                    let fmax = |v: &Vec<[f64; 3]>| {
+                        v.iter()
+                            .flat_map(|a| a.iter())
+                            .fold(0.0f64, |m, x| m.max(x.abs()))
+                    };
+                    let fp = f_plus.as_ref().unwrap();
+                    let fm = f_minus.as_ref().unwrap();
+                    let mut fd_max = 0.0f64;
+                    for j in 0..n_atom {
+                        for b in 0..3 {
+                            fd_max = fd_max.max((fp[j][b] - fm[j][b]).abs());
+                        }
                     }
-                }
-                if col % 6 == 0 {
-                    eprintln!("[sparse] vibrations '{name}': col {col}/{n3}");
+                    eprintln!("[sparse] vib col {col}/{n3}: +h rst+geom={:.1}ms solve+f={:.1}ms | -h rst+geom={:.1}ms solve+f={:.1}ms | max|F+|={:.4e} max|F-|={:.4e} max|ΔF|={:.4e}",
+                    ms[0], ms[2], ms[3], ms[5], fmax(fp), fmax(fm), fd_max);
+                    // Optional per-column ΔF dump for offline warm-vs-cold
+                    // validation (RUST_DFTB_VIB_DUMPCOL=<dir>): one text file
+                    // per column, n_atom lines of "fx fy fz" (F+−F−).
+                    if let Ok(dir) = std::env::var("RUST_DFTB_VIB_DUMPCOL") {
+                        let mut txt = String::new();
+                        for j in 0..n_atom {
+                            for b in 0..3 {
+                                txt.push_str(&format!("{:.10e}\n", fp[j][b] - fm[j][b]));
+                            }
+                        }
+                        std::fs::write(format!("{dir}/df_{col}.txt"), txt)
+                            .unwrap_or_else(|e| panic!("vib dumpcol {dir}/df_{col}.txt: {e}"));
+                    }
+                    work[i][a] = x0[i][a];
+                    let f_plus = f_plus.unwrap();
+                    let f_minus = f_minus.unwrap();
+                    for j in 0..n_atom {
+                        for b in 0..3 {
+                            hess[(3 * j + b) * n3 + col] =
+                                -(f_plus[j][b] - f_minus[j][b]) / (2.0 * h);
+                        }
+                    }
+                    if col % 6 == 0 {
+                        eprintln!("[sparse] vibrations '{name}': col {col}/{n3}");
+                    }
                 }
             }
         }
@@ -2038,11 +2122,15 @@ fn rhai_sparse_vibrations(name: &str, h: f64, scc_tol: f64, path: &str) -> Strin
             return format!("vibrations '{name}': PARTIAL {mc} columns in {:.1}s — measurement run, no eigensolve",
                 t_vib0.elapsed().as_secs_f64());
         }
-        // Restore input geometry + reconverge so the engine's state is consistent.
-        eng.set_coords(&x0)
-            .unwrap_or_else(|e| panic!("vibrations '{name}' restore set_coords: {e}"));
-        eng.scc(80, scc_tol)
-            .unwrap_or_else(|e| panic!("vibrations '{name}' restore scc: {e}"));
+        // Restore input geometry + reconverge so the engine's state is
+        // consistent — skipped when batched (the batched evals never
+        // mutated engine state; it is still the central snapshot).
+        if !batched {
+            eng.set_coords(&x0)
+                .unwrap_or_else(|e| panic!("vibrations '{name}' restore set_coords: {e}"));
+            eng.scc(80, scc_tol)
+                .unwrap_or_else(|e| panic!("vibrations '{name}' restore scc: {e}"));
+        }
         sync_geom_coords(name, &x0);
 
         // Symmetrize (FD noise + truncation asymmetry — report, don't hide).

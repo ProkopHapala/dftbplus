@@ -1212,8 +1212,7 @@ impl GpuDftb {
             // the work list is rebuilt from active_host so converged/failed
             // replicas stop occupying workgroups in the NEXT chunk.
             // RUST_DFTB_SCC_COMPACT=0 keeps full-domain launches for A/B.
-            let compact =
-                std::env::var("RUST_DFTB_SCC_COMPACT").ok().as_deref() != Some("0");
+            let compact = std::env::var("RUST_DFTB_SCC_COMPACT").ok().as_deref() != Some("0");
             let mut work_list: Vec<i32> = Vec::with_capacity(self.batch);
             // Seed the compact domain up front when the initial mask is
             // already sparse (retry-mask re-solves run only the flagged

@@ -240,3 +240,81 @@ fn test_sparse_pair_gpu_vs_cpu_parity() {
     eprintln!("[pair parity] displaced forces total: max|dF|={d2:.3e}");
     assert!(d2 < 5e-3, "displaced force parity {d2:.3e}");
 }
+
+// ============================================================================
+// F1 (manifest §F.1): batched frozen-orbital evals — one launch per stage
+// over `evals` replica slots (kernel dim1 = JobId) vs the scalar
+// restore→set_coords→forces_frozen reference. The batched path shares the
+// central K0/W0/dq0 read-only and must be BIT-IDENTICAL to the scalar
+// chain (same per-work-item math, no atomics, no reordering).
+// ============================================================================
+
+#[test]
+fn test_sparse_frozen_batch_parity() {
+    let dir = require_sih_sk_dir();
+    let (sp, xyz) = sih4();
+    let sk = load_sk_for_species(&dir, &sp).unwrap_or_else(|e| panic!("load SK: {e}"));
+    let mut eng =
+        SparseDftb::new(sk, &dir, sp, xyz).unwrap_or_else(|e| panic!("SparseDftb::new: {e}"));
+    eng.scc(80, 1e-5).unwrap_or_else(|e| panic!("SCC: {e}"));
+    eng.snapshot_electronic_state()
+        .unwrap_or_else(|e| panic!("snapshot: {e}"));
+    if eng.cpu_pair() {
+        panic!("test requires the GPU pair path — RUST_DFTB_SPARSE_CPU is set");
+    }
+    let h = 0.01f64;
+    let x0 = eng.coords().to_vec();
+    let n = eng.n_atom();
+    // All (atom, axis, ±h) evals — 30 one-shot jobs, JobId = eval index.
+    let evals: Vec<(usize, usize, f64)> = (0..n)
+        .flat_map(|a| (0..3).flat_map(move |ax| [(a, ax, 1.0), (a, ax, -1.0)]))
+        .collect();
+    // Scalar reference — the driver's sequential frozen chain.
+    let mut work = x0.clone();
+    let mut f_ref: Vec<Vec<[f64; 3]>> = Vec::with_capacity(evals.len());
+    for &(a, ax, sign) in &evals {
+        eng.restore_central_state()
+            .unwrap_or_else(|e| panic!("restore: {e}"));
+        work[a][ax] = x0[a][ax] + sign * h;
+        eng.set_coords(&work)
+            .unwrap_or_else(|e| panic!("set_coords: {e}"));
+        work[a][ax] = x0[a][ax];
+        f_ref.push(
+            eng.forces_frozen()
+                .unwrap_or_else(|e| panic!("forces_frozen: {e}"))
+                .forces,
+        );
+    }
+    // Batched — all 30 evals in ONE call (cap grown to 30). NOTE: the
+    // scalar loop left eng.coords at the LAST displaced geometry — the
+    // explicit x0 arg is what makes the batched base unambiguous.
+    let f_b = eng
+        .forces_frozen_batch(&x0, &evals, h)
+        .unwrap_or_else(|e| panic!("forces_frozen_batch: {e}"));
+    assert_eq!(f_b.len(), evals.len(), "batch result count mismatch");
+    let mut dmax = 0.0f64;
+    for (e, (fr, fb)) in f_ref.iter().zip(f_b.iter()).enumerate() {
+        let d = max_diff3(fr, &fb.forces);
+        dmax = dmax.max(d);
+        assert_eq!(
+            d, 0.0,
+            "eval {e}: batched vs scalar max|dF|={d:.3e} — replica slot \
+             math must be bit-identical to the scalar chain"
+        );
+    }
+    eprintln!(
+        "[frozen batch] {} evals: max|dF|={dmax:.3e} (bit-identical)",
+        evals.len()
+    );
+    // Partial reuse — a smaller second batch must not corrupt cap state.
+    let sub: Vec<(usize, usize, f64)> = evals[..7].to_vec();
+    let f_s = eng
+        .forces_frozen_batch(&x0, &sub, h)
+        .unwrap_or_else(|e| panic!("forces_frozen_batch subset: {e}"));
+    assert_eq!(f_s.len(), 7);
+    for (e, (fr, fb)) in f_ref.iter().take(7).zip(f_s.iter()).enumerate() {
+        let d = max_diff3(fr, &fb.forces);
+        assert_eq!(d, 0.0, "subset eval {e}: max|dF|={d:.3e}");
+    }
+    eprintln!("[frozen batch] subset reuse (7 evals): bit-identical");
+}

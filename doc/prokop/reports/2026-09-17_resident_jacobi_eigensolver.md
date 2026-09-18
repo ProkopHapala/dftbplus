@@ -129,8 +129,28 @@ DTH 6358 → 1745 ms ≈ 3.6×.
 - **Scheduler coupling** — slot-pool design (`Slot_Pool_Scheduler.design.md`)
   must co-optimize slot count × WG × resident footprint; resident kernels
   shrink the per-slot local budget question to lA+scratch.
-- Rotlog is f64 (double2) per logged pair — could shrink to f32 (c,s fit) if
-  buffer pressure matters; not measured.
+- ~~Rotlog is f64 (double2) per logged pair~~ → DONE 2026-09-18: prec-gated
+  `jlog2_t` — float2 at prec=0 (production; c,s are f32 anyway), double2 at
+  prec≥1 (accuracy reference). 23→11.5 MB buffer at n=86/b400.
+
+## Addendum 2026-09-18 — packed-triangular lA
+
+`lA` now stores only the lower triangle via `lat(r,c) = max(r,c)·(max+1)/2 +
+min(r,c)` — 14.6 KB at n=86 (was 29.9 KB square). Invariants:
+
+- Phase-2 iterates only pair-blocks `a≤b`: blocks (a,b) and transpose (b,a)
+  map to the SAME packed slots, so the transpose block is skipped (it would
+  rewrite identical values — `new M_ba = (new M_ab)ᵀ` — and race). This also
+  halves the phase-2 block count vs square.
+- `red2`/`dred2` scratch buffers removed — the reductions are strictly
+  sequential, one buffer per dtype suffices.
+- Measured `CL_KERNEL_LOCAL_MEM_SIZE` (incl. arg_local): **24 224 B/WG at
+  WG512+tail → 2×24 224 = 48 448 ≤ 49 152 → 2 WG/SM now fits** (was hard
+  1 WG/SM). res-defV capacity extended to n≤127.
+- Verified: parity unchanged (par=1.73e-6, bad=0; resident sweep, work-ids
+  subset, gpu_scc 8/8). Speed: ~5–9 % (WG512 notail one 10.67 ms, cold
+  18.18 ms) — NOT 2×; the kernel is not occupancy-bound, V-replay traffic
+  and barrier serialization dominate (see Measured_Facts §6).
 
 ## Files touched
 

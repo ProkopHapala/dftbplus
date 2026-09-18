@@ -214,10 +214,9 @@ goes, so optimize the per-evaluation cost:
    overhead itself). `RUST_DFTB_TC2_STOP_W=28` enables the
    replay-validated floor detector: ~15–30% fewer iterations on
    plateaued runs, bit-identical energies on tested workloads.
-6. **Big crystals are serial today.** The planned remedy is
-   **batch-parallel ±h displacements** sharing topology/plans — until
-   then, run big Hessians overnight or validate on a smaller crystal
-   first.
+6. **Frozen columns run B-at-a-time on one GPU** (`RUST_DFTB_VIB_BATCH`,
+   see §4.2). In fixq/full-SCC mode columns remain serial — batching
+   them needs per-replica convergence scheduling (deferred, manifest §F).
 
 ### 4.1 Measured wall times (RTX 3090, `--release`, warm starts on)
 
@@ -231,10 +230,15 @@ goes, so optimize the per-evaluation cost:
 | si_sphere_R10 | 330 | deg~330, `FIXQ+DMUPD+LITE DMM=2 NSMAX=2` | 1980 | **~64 ms** | — | ~2 min (extrap.) |
 | si_sphere_R10 | 330 | deg~330, `FIXQ+DMUPD+LITE DMM=4 NSMAX=2` | 1980 | **~105 ms** | — | ~3.5 min (extrap.) |
 | si_sphere_R10 | 330 | deg~330, `FIXQ=1` cold | 1980 | ~345 ms | — | ~11 min (extrap.) |
+| si_sphere_R18 | 1648 | r_k=12, `FROZEN` B=1, GPU-resident | 9888 | **~1.6 ms** | — | ~16 s evals / 138 s wall† |
+| si_sphere_R18 | 1648 | r_k=12, `FROZEN` `VIB_BATCH=16` | 9888 | **~0.27 ms** | — | ~2.7 s evals / 139 s wall† |
+| si_sphere_R18 | 1648 | r_k=12, `FROZEN`, CPU ref (`SPARSE_CPU=1`) | 9888 | ~194 ms | — | ~32 min (extrap.) |
 
 \* R10 relax numbers are from the pre-relaxed geometry; a cold relax was
 ~5 min (75 FIRE steps) at deg175. Warm-tier column errors measured at
 h=0.02 Å vs cold fixq: clamped 6.3%, lite-DMM2 3.1%, lite-DMM4 1.0%.
+† R18 wall is dominated by the dense 4944×4944 host eigensolve
+(~100 s); force evals are ~2% of wall at B=16 (report §15.27).
 
 Two important things this table exposes:
 
@@ -267,7 +271,46 @@ Two important things this table exposes:
   waiting for a full Hessian (8 columns ≈ 10 s).
 - Every ±h column now restores a snapshot of the central converged
   state (`snapshot_electronic_state`) — identical solver history per
-  column, no FD asymmetry from chained solves.
+  column, no FD asymmetry from chained solves. In GPU mode the snapshot
+  is **device-resident** (`GpuCentralState`: `k`/`z`/`k0`/`w0` device
+  buffers captured once; restore = device→device copy, no PCIe
+  traffic — §15.25).
+
+### 4.2 Multi-replica frozen batch — `RUST_DFTB_VIB_BATCH=B`
+
+Frozen-mode only. Runs `B` displaced geometries **per kernel-launch
+wave** on a single GPU: each eval kernel (`gamma_matvec`,
+`gamma_force`, `hs_contract`, `rep_eval`, `force_gather`) gets a second
+NDRange axis `get_global_id(1) = b` = the replica slot. **Each replica
+is a complete, independent system eval** — full all-pairs physics of
+one displaced geometry against the shared read-only central state —
+not a partitioned system.
+
+```bash
+RUST_DFTB_VIB_FROZEN=1 RUST_DFTB_VIB_BATCH=16 dftb_engine \
+    --script my_vib.rhai --sk-dir $RUST_DFTB_SK_DIR
+```
+
+- **What is shared:** pair topology, SK/repulsive tables, `dq₀`, and the
+  central `K₀`/`W₀` device buffers — all read-only during the batch.
+- **What is replicated:** `xyzu`, `v_atom`, pair-force records, force
+  outputs — ~7 MB/replica at N=1648 (B=16 ≈ 110 MB on a 25 GB card).
+- **Guarantees:** bitwise-identical to the sequential path (same kernel
+  math per replica, no atomics, gather-only writes; verified by
+  `test_sparse_frozen_batch_parity`, max|dF| = 0.0). B=1 is exactly the
+  sequential loop.
+- **Measured at R18 (1648 atoms, RTX 3090):** B=1 ~1.6 ms/eval → B=8
+  0.31 → **B=16 0.27 ms/eval** (~5.9×) → B=32 saturated. The full
+  4944-column frozen Hessian spends ~2.7 s in force evals; the wall is
+  then dominated by the dense host eigensolve (~100 s at this size).
+- **Why frozen only:** a frozen eval is a uniform one-shot job — no
+  convergence, no iteration, no per-replica solver state — so static
+  batching is optimal. fixq/DMM evals have per-replica matrices and
+  (for fixq) variable iteration counts; batching them needs active-mask
+  scheduling (the multi-system scheduler design, manifest §F — planned,
+  not implemented).
+- CPU reference mode (`RUST_DFTB_SPARSE_CPU=1`) rejects `VIB_BATCH > 1`
+  with an explicit error — there is no implicit fallback.
 - **`RUST_DFTB_VIB_DMUPD=1`** (warm density update, needs `FIXQ=1`):
   reuses the central projector and descends the generalized-commutator
   residual via **DMM steps** `δK = −η(X + Xᵀ − 2Y)`, `X = (Z·H)·K`,

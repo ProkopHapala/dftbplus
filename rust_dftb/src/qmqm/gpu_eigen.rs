@@ -248,8 +248,8 @@ pub fn resident_jacobi_batched(
     if batch == 0 {
         return Ok(Vec::new());
     }
-    let la = n * (n + 1) * 4;
-    let lv = if resident_v { la } else { 4 };
+    let la = n * (n + 1) / 2 * 4; // packed symmetric lA
+    let lv = if resident_v { n * (n + 1) * 4 } else { 4 };
     let local_need = (la + lv) as u64;
     let local_cap = rt.caps().local_mem_size;
     if local_need > local_cap {
@@ -263,12 +263,13 @@ pub fn resident_jacobi_batched(
     let ones = rt.buffer_from_slice(&vec![1i32; batch])?;
     let diag = rt.zero_buffer::<f32>(4 * batch)?;
     let jn = if n & 1 == 1 { n + 1 } else { n };
+    // jlog2_t entry: double2 (4 f32) at prec>=1, float2 (2 f32) at prec=0.
     let log_len = if resident_v {
         1
     } else {
-        batch * (jn - 1) * (jn / 2) * 2
+        batch * (jn - 1) * (jn / 2) * if prec >= 1 { 4 } else { 2 }
     };
-    let rotlog = rt.zero_buffer::<f64>(log_len)?;
+    let rotlog = rt.zero_buffer::<f32>(log_len)?;
     let occ_w = rt.zero_buffer::<f32>(batch * n)?;
     let mu = rt.zero_buffer::<f32>(batch)?;
     let wids = rt.buffer_from_slice(&(0..batch as i32).collect::<Vec<_>>())?; // T06 identity
@@ -291,7 +292,7 @@ pub fn resident_jacobi_batched(
         .arg(&occ_w)
         .arg(&mu)
         .arg(&rotlog)
-        .arg_local::<f32>(n * (n + 1))
+        .arg_local::<f32>(n * (n + 1) / 2)
         .arg_local::<f32>(if resident_v { n * (n + 1) } else { 1 })
         .arg(&wids)
         .build()
@@ -482,8 +483,14 @@ const RESIDENT_SCRATCH_HEADROOM: u64 = 16 * 1024;
 /// simply picks a non-resident kind (a capacity-based algorithm choice at
 /// plan build, not a runtime fallback).
 fn resident_fits(n: usize, resident_v: bool, local_cap: u64) -> bool {
-    let la = (n * (n + 1) * 4) as u64;
-    la * if resident_v { 2 } else { 1 } + RESIDENT_SCRATCH_HEADROOM <= local_cap
+    // lA is packed-symmetric (n(n+1)/2 floats); lV stays square.
+    let la = (n * (n + 1) / 2 * 4) as u64;
+    let lv = if resident_v {
+        (n * (n + 1) * 4) as u64
+    } else {
+        0
+    };
+    la + lv + RESIDENT_SCRATCH_HEADROOM <= local_cap
 }
 
 /// T08/T08b measured solver dispatch: `RUST_DFTB_EIGSOLVER` ∈
@@ -509,13 +516,13 @@ pub fn eigsolver_kind(n: usize, local_cap: u64) -> EigKind {
         Some("resident") => {
             assert!(resident_fits(n, false, local_cap),
                 "RUST_DFTB_EIGSOLVER=resident: n={n} needs {} B __local + scratch > device local_mem_size {local_cap} B",
-                n * (n + 1) * 4);
+                n * (n + 1) / 2 * 4);
             EigKind::ResidentDefV
         }
         Some("resident_av") => {
             assert!(resident_fits(n, true, local_cap),
                 "RUST_DFTB_EIGSOLVER=resident_av: n={n} needs {} B __local + scratch > device local_mem_size {local_cap} B",
-                2 * n * (n + 1) * 4);
+                n * (n + 1) / 2 * 4 + n * (n + 1) * 4);
             EigKind::ResidentAV
         }
         Some(v) => {
@@ -534,8 +541,9 @@ pub fn use_block_jacobi(n: usize) -> bool {
 /// Bound-handle builder for `jacobi_resident_batched` — same prebound-handle
 /// pattern and tail-arg indices (7..11) as the direct kernel, so the plan's
 /// `bind_solve_params`/`check_jacobi` contracts carry over unchanged.
-/// `rotlog` is the deferred-V scratch ([batch][jround·jpair] double2); pass
-/// any valid buffer when `resident_v` (unused by the kernel then).
+/// `rotlog` is the deferred-V scratch ([batch][jround·jpair] jlog2_t —
+/// double2 at prec>=1, float2 at prec=0); pass any valid buffer when
+/// `resident_v` (unused by the kernel then).
 pub fn build_resident_jacobi_kernel(
     rt: &mut GpuRuntime,
     n: usize,
@@ -548,7 +556,7 @@ pub fn build_resident_jacobi_kernel(
     init_v: i32,
     occ_w: &Buffer<f32>,
     mu: &Buffer<f32>,
-    rotlog: &Buffer<f64>,
+    rotlog: &Buffer<f32>,
     resident_v: bool,
     no_tail: bool,
     work_ids: &Buffer<i32>,
@@ -561,7 +569,7 @@ pub fn build_resident_jacobi_kernel(
     if !resident_fits(n, resident_v, rt.caps().local_mem_size) {
         return Err(DftbError::InvalidInput(format!(
             "jacobi_resident_batched: n={n} resident_v={resident_v} needs {} B __local + scratch > device local_mem_size {} B",
-            n * (n + 1) * 4 * if resident_v { 2 } else { 1 }, rt.caps().local_mem_size
+            n * (n + 1) / 2 * 4 + if resident_v { n * (n + 1) * 4 } else { 0 }, rt.caps().local_mem_size
         )));
     }
     let wg = direct_jacobi_wg(rt.caps().max_work_group_size);
@@ -586,7 +594,7 @@ pub fn build_resident_jacobi_kernel(
         .arg(occ_w)
         .arg(mu)
         .arg(rotlog)
-        .arg_local::<f32>(n * (n + 1))
+        .arg_local::<f32>(n * (n + 1) / 2)
         .arg_local::<f32>(if resident_v { n * (n + 1) } else { 1 })
         .arg(work_ids)
         .build()
@@ -1030,7 +1038,9 @@ mod tests {
             let mut block_a = vec![0.0f32; input.len()];
             let mut block_v = vec![0.0f32; input.len()];
             let mut accuracy_ok = true;
-            let wids = rt.buffer_from_slice(&(0..batch as i32).collect::<Vec<_>>()).expect("T06 identity work_ids");
+            let wids = rt
+                .buffer_from_slice(&(0..batch as i32).collect::<Vec<_>>())
+                .expect("T06 identity work_ids");
             let kernels: Vec<Kernel> = (0..2).map(|mode| {
                 let source = format!("#define JACOBI_BLOCK_UPDATE {mode}\n{}", render_source(n));
                 let program = rt.build_program(&source).expect("compile Jacobi comparison variant");
@@ -1196,7 +1206,9 @@ mod tests {
             let program = rt
                 .build_program(&source)
                 .expect("compile Jacobi sweep diagnostic");
-            let wids = rt.buffer_from_slice(&[0i32]).expect("T06 identity work_ids");
+            let wids = rt
+                .buffer_from_slice(&[0i32])
+                .expect("T06 identity work_ids");
             let kernel = Kernel::builder()
                 .program(&program)
                 .name("jacobi_cyclic_local_batched")

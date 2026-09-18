@@ -127,7 +127,7 @@ Existing cargo tests (`parity_*.rs`, `gpu_hbond_physics.rs`, `gpu_dftb.rs` H2O s
 ### 0.6 Astra review (2026-09-10) — implement this order
 
 Source: `doc/prokop/reports/2026-09-10_gpu_accuracy_physics_performance_second_review.md`.
-**Dense only here.** Do not edit `rust_dftb/src/methods/sparse/`. Keep H/S/D/C/W in **f32**. Drive via `dftb_engine` + `.rhai`, not a new cargo test. f64 `batched_gemm` stays reverted. f32 Kahan on GEMM is in; it did not remove `δ_CH`.
+**Dense only here.** Do not edit `rust_dftb/src/methods/sparse/`. Keep H/S/D/C/W in **f32**. Drive via `dftb_engine` + `.rhai`, not a new cargo test. f64 `batched_gemm` stays reverted. f32 Kahan on GEMM is in; it did not remove `δ_CH`. **f64 in any GPU kernel is a policy violation unless deeply justified** (GUIDELINES §3, 2026-09-18 clause) — every site must be in the audit table `Measured_Facts_Jacobi_Sweeps.md` §4b with justification or removal plan; hybrid alternatives (double-single, compensated sums, f64-scalar/f32-bulk) must be analyzed first. Sanctioned islands: γ' force kernel, f64 energy out, DIIS Gram/GE — all else needs explicit approval.
 
 The review is right on the diagnosis: several different errors were lumped into “f32 floor” (mixer, incomplete SCC, stale diagnostics, output rounding, Jacobi stop). It is **stale** on pipeline items we already closed after the inspect (W on GPU, in-place pairs, `eval(want_forces)`, `orb_atom` tiled over batch).
 

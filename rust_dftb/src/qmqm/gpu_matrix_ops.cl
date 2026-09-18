@@ -1646,13 +1646,26 @@ __kernel void diis_step_batched(
                                  // convergence so the host can run chunked iterations)
     const float rms_tol,         // SCC convergence tolerance (f32 copy of the host tol)
     __local float* scratch,      // workgroup scratch (≥ lsz)
-    __global double* diis_work,  // [batch*DIIS_MAX_HIST*n_atoms] W13: f64 QR working columns
+    __local double* lW,          // [DIIS_MAX_HIST*n_atoms] W13: f64 QR working
+                                 //   columns — LOCAL since 2026-09-18: the QR
+                                 //   below runs on thread 0, and ~10K serial
+                                 //   f64 GLOBAL accesses was the #2 kernel cost
+                                 //   (0.33 ms/call, 15.6% of SCC dev time)
     __global const int* work_ids // launch-index → physical slot (identity at full batch)
 ) {
     const int sid = work_ids[get_group_id(0)];
     const int lid = get_local_id(0);
     const int lsz = get_local_size(0);
     __local int l_diis_ok;
+    // f64 QR solve scratch — only thread 0 touches these; __local keeps the
+    // serial Gram–Schmidt at local latency instead of global.
+    __local double l_Rq[DIIS_MAX_HIST * DIIS_MAX_HIST];
+    __local double l_Rs[DIIS_MAX_HIST * DIIS_MAX_HIST];
+    __local double l_diag[DIIS_MAX_HIST];
+    __local double l_cx[DIIS_MAX_HIST];
+    __local double l_yy[DIIS_MAX_HIST];
+    __local double l_nrm2[DIIS_MAX_HIST];
+    __local int    l_order[DIIS_MAX_HIST];
     if (sid >= batch || active[sid] == 0) return;
 
     __global const float* qn = q_new + (size_t)sid * n_atoms;
@@ -1703,61 +1716,96 @@ __kernel void diis_step_batched(
         return;
     }
 
-    if (lid == 0) {
-        // W13: pivoted f64 QR on the residual-history matrix — replaces the
-        // Gram+GE solve. κ(R) instead of κ²(RᵀR); dependent history columns
-        // drop INDIVIDUALLY by pivot magnitude (no drop-oldest retry — that
-        // was the blunt instrument this replaces). The Σc=1-constrained
-        // min-norm solve reduces to two triangular solves at κ(R):
-        //   c ∝ R_S⁻¹ R_S⁻ᵀ 1  over the surviving columns.
-        // Working columns live in `diis_work` (f64 global scratch).
-        double* W = diis_work + (size_t)sid * DIIS_MAX_HIST * n_atoms;
-        double Rq[DIIS_MAX_HIST * DIIS_MAX_HIST];  // Rq[i][j] = q_iᵀ r_j  (physical col j)
-        double Rs[DIIS_MAX_HIST * DIIS_MAX_HIST];  // triangular R in survivor order
-        double diag[DIIS_MAX_HIST];                // pre-normalization pivot norms
-        double cx[DIIS_MAX_HIST];                  // unnormalized coeffs (survivor order)
-        double yy[DIIS_MAX_HIST];
-        double nrm2[DIIS_MAX_HIST];                // −1 = consumed
-        int    order[DIIS_MAX_HIST];               // survivor k → physical slot
-        int ok = 1; int reason = 1; int nq = 0;
+    // Cooperative load of the residual history into local f64.
+    for (int i = lid; i < n * n_atoms; i += lsz) lW[i] = (double)rh[i];
+    barrier(CLK_LOCAL_MEM_FENCE);
 
-        for (int j = 0; j < n; j++) {
-            __global const float* rj = rh + (size_t)j * n_atoms;
-            double s = 0.0;
-            for (int a = 0; a < n_atoms; a++) {
-                double x = (double)rj[a];
-                W[j * n_atoms + a] = x;
-                s += x * x;
-            }
-            nrm2[j] = s;
+    // W13: pivoted f64 QR on the residual-history matrix — replaces the
+    // Gram+GE solve. κ(R) instead of κ²(RᵀR); dependent history columns
+    // drop INDIVIDUALLY by pivot magnitude (no drop-oldest retry — that
+    // was the blunt instrument this replaces). The Σc=1-constrained
+    // min-norm solve reduces to two triangular solves at κ(R):
+    //   c ∝ R_S⁻¹ R_S⁻ᵀ 1  over the surviving columns.
+    //
+    // Cooperative structure (2026-09-18): column j's dot/axpy runs on thread j
+    // — serial per column, so operation order is IDENTICAL to the old
+    // thread-0 loop (bit-identical results) but n columns proceed in parallel
+    // instead of serially on one thread. Only the ≤10×10 solve stays on
+    // thread 0. This was the #2 kernel cost: ~6K f64 ops serial on one thread
+    // at 1/64 f64 rate ≈ 0.25–0.33 ms/call.
+    __local double l_nrm_max;
+    __local int    l_nq;
+    __local int    l_jstar;
+    __local int    l_astop;
+    __local double l_inv;
+    __local int    l_ok;
+    __local int    l_reason;
+
+    // Column norms — thread j owns column j.
+    if (lid < n) {
+        double s = 0.0;
+        for (int a = 0; a < n_atoms; a++) {
+            double x = lW[lid * n_atoms + a];
+            s += x * x;
         }
-        double nrm_max = 0.0;
-        for (int j = 0; j < n; j++) nrm_max = fmax(nrm_max, nrm2[j]);
-        if (!isfinite(nrm_max) || nrm_max < 1.0e-40) { ok = 0; reason = 1; }
+        l_nrm2[lid] = s;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
 
-        for (int k = 0; k < n && ok; k++) {
+    if (lid == 0) {
+        double nrm_max = 0.0;
+        for (int j = 0; j < n; j++) nrm_max = fmax(nrm_max, l_nrm2[j]);
+        l_nrm_max = nrm_max;
+        l_nq = 0;
+        l_astop = 0;
+        l_ok = (isfinite(nrm_max) && nrm_max >= 1.0e-40) ? 1 : 0;
+        l_reason = 1;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    // Modified Gram–Schmidt with column pivoting.
+    for (int k = 0; k < n && l_ok && !l_astop; k++) {
+        if (lid == 0) {
             int jstar = -1; double best = 0.0;
             for (int j = 0; j < n; j++) {
-                if (nrm2[j] > best) { best = nrm2[j]; jstar = j; }
+                if (l_nrm2[j] > best) { best = l_nrm2[j]; jstar = j; }
             }
             // dependent: surviving norm below rel tol → drop this column and
             // (loop continues) all remaining dependent ones
-            if (jstar < 0 || best < 1.0e-24 * nrm_max) break;
-            order[nq] = jstar;
-            diag[nq] = sqrt(best);
-            double inv = 1.0 / diag[nq];
-            for (int a = 0; a < n_atoms; a++) W[jstar * n_atoms + a] *= inv;
-            nrm2[jstar] = -1.0;
-            nq++;
-            for (int j = 0; j < n; j++) {
-                if (nrm2[j] < 0.0) continue;
-                double rij = 0.0;
-                for (int a = 0; a < n_atoms; a++) rij += W[jstar * n_atoms + a] * W[j * n_atoms + a];
-                Rq[(nq - 1) * DIIS_MAX_HIST + j] = rij;
-                for (int a = 0; a < n_atoms; a++) W[j * n_atoms + a] -= rij * W[jstar * n_atoms + a];
-                nrm2[j] -= rij * rij;
+            if (jstar < 0 || best < 1.0e-24 * l_nrm_max) {
+                l_astop = 1;
+            } else {
+                l_order[l_nq] = jstar;
+                l_diag[l_nq] = sqrt(best);
+                l_inv = 1.0 / l_diag[l_nq];
+                l_jstar = jstar;
+                l_nrm2[jstar] = -1.0;
+                l_nq++;
             }
         }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (l_astop) break;
+        const int jstar = l_jstar;
+        // Normalize the pivot column — one element per thread.
+        for (int a = lid; a < n_atoms; a += lsz) lW[jstar * n_atoms + a] *= l_inv;
+        barrier(CLK_LOCAL_MEM_FENCE);
+        // Dot + axpy for each surviving column — thread j owns column j; the
+        // per-column serial order matches the old single-thread loop exactly.
+        if (lid < n && l_nrm2[lid] >= 0.0) {
+            const int j = lid;
+            double rij = 0.0;
+            for (int a = 0; a < n_atoms; a++) rij += lW[jstar * n_atoms + a] * lW[j * n_atoms + a];
+            l_Rq[(l_nq - 1) * DIIS_MAX_HIST + j] = rij;
+            for (int a = 0; a < n_atoms; a++) lW[j * n_atoms + a] -= rij * lW[jstar * n_atoms + a];
+            l_nrm2[j] -= rij * rij;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    if (lid == 0) {
+        int ok = l_ok;
+        int reason = l_reason;
+        const int nq = l_nq;
         if (nq < 2) { ok = 0; reason = 1; }   // no useful DIIS span → α-mix
 
         if (ok) {
@@ -1765,37 +1813,37 @@ __kernel void diis_step_batched(
             // element (k,i), i≤k, equals R_S[i][k] = q_iᵀ r_{order[k]} for
             // i<k and the pivot norm on the diagonal.
             for (int kp = 0; kp < nq; kp++) {
-                const int jp = order[kp];
-                for (int ip = 0; ip < kp; ip++) Rs[kp * DIIS_MAX_HIST + ip] = Rq[ip * DIIS_MAX_HIST + jp];
-                Rs[kp * DIIS_MAX_HIST + kp] = diag[kp];
+                const int jp = l_order[kp];
+                for (int ip = 0; ip < kp; ip++) l_Rs[kp * DIIS_MAX_HIST + ip] = l_Rq[ip * DIIS_MAX_HIST + jp];
+                l_Rs[kp * DIIS_MAX_HIST + kp] = l_diag[kp];
             }
             // R_Sᵀ y = 1 — forward substitution straight down the stored
             // lower triangle. Then R_S x = y — back-substitution over the
             // transpose of the stored triangle. c = x/Σx → Σc=1 exact.
             for (int k = 0; k < nq && ok; k++) {
                 double s = 1.0;
-                for (int i = 0; i < k; i++) s -= Rs[k * DIIS_MAX_HIST + i] * yy[i];
-                const double piv = Rs[k * DIIS_MAX_HIST + k];
+                for (int i = 0; i < k; i++) s -= l_Rs[k * DIIS_MAX_HIST + i] * l_yy[i];
+                const double piv = l_Rs[k * DIIS_MAX_HIST + k];
                 if (!isfinite(piv) || fabs(piv) < 1.0e-30) { ok = 0; reason = 2; break; }
-                yy[k] = s / piv;
+                l_yy[k] = s / piv;
             }
             if (ok) {
                 double xsum = 0.0;
                 for (int k = nq - 1; k >= 0; k--) {
-                    double s = yy[k];
-                    for (int i = k + 1; i < nq; i++) s -= Rs[i * DIIS_MAX_HIST + k] * cx[i];
-                    const double piv = Rs[k * DIIS_MAX_HIST + k];
+                    double s = l_yy[k];
+                    for (int i = k + 1; i < nq; i++) s -= l_Rs[i * DIIS_MAX_HIST + k] * l_cx[i];
+                    const double piv = l_Rs[k * DIIS_MAX_HIST + k];
                     if (!isfinite(piv) || fabs(piv) < 1.0e-30 || !isfinite(s)) { ok = 0; reason = 2; break; }
-                    cx[k] = s / piv;
-                    xsum += cx[k];
+                    l_cx[k] = s / piv;
+                    xsum += l_cx[k];
                 }
                 if (ok && (!isfinite(xsum) || fabs(xsum) < 1.0e-30)) { ok = 0; reason = 2; }
                 if (ok) {
                     for (int i = 0; i < n; i++) c[i] = 0.0f;
                     for (int k = 0; k < nq && ok; k++) {
-                        const double ck = cx[k] / xsum;
+                        const double ck = l_cx[k] / xsum;
                         if (!isfinite(ck) || fabs(ck) > 10.0) { ok = 0; reason = 2; break; }
-                        c[order[k]] = (float)ck;
+                        c[l_order[k]] = (float)ck;
                     }
                 }
             }

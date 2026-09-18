@@ -143,7 +143,8 @@ pub struct GpuPbcPlan {
     pub diis_coeffs: Buffer<f32>,
     pub diis_flag: Buffer<i32>,
     pub diis_reason: Buffer<i32>,
-    pub diis_work: Buffer<f64>,
+    // pub diis_work: Buffer<f64>,   // REMOVED 2026-09-18: W13 f64 QR columns moved to
+    //                              // __local inside diis_step_batched.
     pub diis_max_hist: usize,
 
     // ---- host mirrors ----
@@ -274,7 +275,9 @@ impl GpuPbcPlan {
         let diis_coeffs = rt.zero_buffer::<f32>(n_rep * diis_max_hist)?;
         let diis_flag = rt.zero_buffer::<i32>(n_rep)?;
         let diis_reason = rt.zero_buffer::<i32>(n_rep)?;
-        let diis_work = rt.zero_buffer::<f64>(n_rep * diis_max_hist * n_atoms)?;
+        // W13 f64 QR working columns are __local inside diis_step_batched —
+        // no global scratch buffer needed.
+        // let diis_work = rt.zero_buffer::<f64>(n_rep * diis_max_hist * n_atoms)?;
 
         // ---- programs (once; program cache hashes the source) ----
         let rot_fp64 = std::env::var("RUST_DFTB_HJACOBI_FP64")
@@ -569,7 +572,7 @@ impl GpuPbcPlan {
         // diis_step_batched: [0]n_atoms [1]batch [2]alpha [3]q_new [4]q_old [5]q0
         //   [6]q_next(→q_gpu in place) [7]dq_hist [8]r_hist [9]buf_idx [10]n_filled
         //   [11]coeffs [12]flag [13]reason [14]rms [15]active [16]rms_tol
-        //   [17]scratch [18]diis_work
+        //   [17]scratch [18]lW(__local f64 QR columns) [19]work_ids
         let wg_diis = 256usize;
         let k_diis = Kernel::builder()
             .program(&diis_prog)
@@ -595,7 +598,7 @@ impl GpuPbcPlan {
             .arg(&active_r)
             .arg(0.0f32) // rms_tol — bind_mix_params
             .arg_local::<f32>(wg_diis)
-            .arg(&diis_work)
+            .arg_local::<f64>(diis_max_hist * n_atoms) // [18] lW — __local QR columns
             .arg(&wids)
             .build()
             .map_err(map_ocl_err)?;
@@ -659,7 +662,6 @@ impl GpuPbcPlan {
             diis_coeffs,
             diis_flag,
             diis_reason,
-            diis_work,
             diis_max_hist,
             rms_host: vec![0.0; n_rep],
             active_host: vec![1; n_rep],

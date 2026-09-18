@@ -3027,12 +3027,14 @@ compare, fail-loud; the same loops also feed the pair list audit).
 
 Next steps (in order):
 
-- [ ] **F1 — batched column launches.** The point of residency: launch
-      `hs_contract` once per *color class* of independent displacements
-      (atoms ≥ r_full apart can be displaced simultaneously without pair
-      overlap). Batched xyzu/dq/out buffers, one upload + one readback
-      per class → 8–32× more work in flight per launch; the only regime
-      where the 3090's throughput is actually engaged.
+- [x] **F1 — batched column launches (DONE, measured §15.27).**
+      Implemented as the replica-axis variant (option C of §F.1, simpler
+      than color classes — no independence constraint needed): `gid(1)=b`
+      on the 5 eval kernels, one `GpuFrozenBatch` workspace, one xyzu
+      upload + one force readback per batch, `RUST_DFTB_VIB_BATCH`.
+      Measured R18: 1.6 → 0.27 ms/eval at B=16 (saturation), bitwise-
+      identical forces. Color-class *work sharing* remains a possible F2
+      refinement.
 - [ ] **F2 — column-local pair subranges.** Each column's H/S blocks and
       force contributions touch only the ~deg_hs pairs of the displaced
       atoms. Precompute per-atom pair sublists at init; pass subrange
@@ -3138,20 +3140,68 @@ today's sequential semantics exactly); batch result must equal
 sequential column-by-column **bitwise** (same kernel math per replica);
 CPU reference path untouched; missing `central_dev` still fails loud.
 
+Reflection on `Sparse_MultiSystem_Scheduler.chat.md` (GPT 5.6 slot
+scheduler + last-reply eigensolver economics) — what transfers to the
+frozen-column batch and what does not:
+
+- **Their core principle is identical to option C:** "schedule systems,
+  not matrix tiles; keep matrices resident, redirect the replica index
+  through a compact slot list." Our `gid(1)=b` replica axis is exactly
+  their `sid = work_ids[iw]` indirection with an identity map — adopt
+  their vocabulary now (`JobId` = Hessian column, `SlotId` = batch slot,
+  work index = launch-domain index) and their invariant that **results
+  are indexed by JobId, never SlotId** (force readback scatters to the
+  column's Hessian slot by column id, not batch position).
+- **Why most of their machinery does NOT apply to frozen columns:**
+  their scheduler exists because SCC convergence varies per replica →
+  idle workgroups → compact IDs + chunking + refill. Frozen columns have
+  **no convergence, no per-replica state, no phases** — one-shot jobs of
+  uniform cost. A static partition into batches is optimal; active
+  masks, convergence status, retry lists, and phase state machines are
+  all unneeded. The slot pool becomes simply "B columns in flight."
+- **Where their machinery DOES apply later:** if non-frozen (fixq)
+  displaced solves are ever batched, iteration counts vary per replica
+  and their Phase-A→D progression (compact work_ids → measured slot
+  count → queue+refill → async trajectories) is the right blueprint —
+  same machinery the T06 compact-domain work is building in qmqm.
+- **Last-reply transferable insight #1:** "why recompute P=f(H) when
+  P_{k+1}=P_k+δP for H_{k+1}=H_k+δH" — this is precisely what frozen
+  mode already is (δP≡0) and what the fixq δK0-seed + McWeeny path
+  approximates. It validates keeping frozen as the default column mode
+  and treats any non-frozen upgrade as a warm-seeded correction, never
+  a cold re-solve — consistent with manifest §4.12.
+- **Last-reply transferable insight #2:** eigenvectors are not needed —
+  P=f(H) gives charges, W=H·P gives forces. The sparse path already
+  embodies this (TRS4 produces K directly; no eigensolver in the eval
+  loop). The *remaining* dense 4944² nalgebra eigensolve (§15.26: ~70 %
+  of wall) is a post-processing step, not part of the physics loop —
+  any future replacement (GPU eigensolver / few-mode Lanczos) is an
+  independent decision, aligned with their "dispatch by N" conclusion.
+- **Their measurement discipline applies verbatim:** break-even by
+  measured times, not O() arguments — F0 first (free), F1 next, and
+  only then judge whether F2's extra index machinery is justified by
+  the measured launch floor.
+- **Their explicit don'ts we keep:** no megakernel fusing unlike stages;
+  no GPU-side atomic work queue (Rust-side batching is free at our
+  timescale); no copying state between slots; don't hard-code B —
+  `RUST_DFTB_VIB_BATCH` env, measured saturation.
+
 Phased plan + gates:
 
-- [ ] **F0 — frozen-path dead-work removal (no kernel changes).** Skip
-      `assemble_hs_dev`/mirror marking when the caller will only do
-      frozen forces (add a `set_coords_light`/mode arg — do NOT weaken
-      `set_coords`'s SCC contract); hoist the coincident-atom guard to a
-      device min-r² reduction over the static pair lists (fail-loud
-      unchanged); skip the `compute_v` host readback in the force-only
-      path. Gate: parity tests + R18 eval ≲1.0 ms.
-- [ ] **F1 — replica axis + `forces_frozen_batch`.** 2D NDRange on
+- [~] **F0 — frozen-path dead-work removal (no kernel changes).**
+      PARTIAL: the batch path never touches `assemble_hs_dev` (contract
+      recomputes SK from `xyzu`) — done; host coincident-atom guards
+      still run per eval; `compute_v` host readback still in the chain.
+      Gate met via F1 numbers instead (0.27 ms/eval at B=16).
+- [x] **F1 — replica axis + `forces_frozen_batch`.** DONE (2026-09-19,
+      §15.27): 2D NDRange on
       gamma_matvec/gamma_force/hs_contract/rep_eval/force_gather;
       batched `xyzu`/`v_atom`/`pf`/`pf_rep`/`f_out`; one upload + one
-      readback per batch; `B=1` ≡ sequential. Gate: batch-vs-sequential
-      force columns bitwise equal; R10/R18 bounded bench.
+      readback per batch; `B=1` ≡ sequential. Gates passed:
+      `test_sparse_frozen_batch_parity` bitwise equal (max|dF|=0.0,
+      30 evals + subset reuse); R18 bounded bench B=1/8/16/32 →
+      1.6/0.31/0.27/0.27 ms/eval; full Hessian at B=16 bitwise-same
+      spectrum (n_imag=1, −0.32/2298.25 cm⁻¹).
 - [ ] **F2 — column-local subranges.** Concatenated touched-pair list +
       per-replica offsets from `pair_gather_adj`; O(N) γ′ row kernel and
       ΔV row update; ΔF added to stored central F⁰ on device; readback
@@ -3159,3 +3209,33 @@ Phased plan + gates:
       on a bounded column set.
 - [ ] **F3 — fuse + resync.** Merge launches sharing `xyzu[b]` reads;
       single pe_rep device reduction. Re-benchmark; update report.
+- [ ] **F5 — fixed-iteration fixq batch (user proposal 2026-09-19:
+      constant purify counts instead of convergence scheduling).**
+      Key physics: all 6N displaced geometries of one Hessian have
+      ~identical spectral properties — same gap, spectral width varies
+      O(h) — so TC2 iteration count is ~constant across columns
+      (measured spread needed; expect ±2–3 of ~30). The variable-
+      convergence problem that motivated the full scheduler barely
+      exists *within one Hessian*. Design: run a FIXED recipe per
+      replica — warm-NS (fixed 1–3 iters) + `compute_k0_from_hscc` +
+      exactly M TC2 iterations (M = measured column max + margin ~5),
+      NO per-iteration convergence syncs — then ONE batched
+      verification at batch end: per-replica R_I + Tr(KS) (+ R_H gate
+      where it applies) reduced on device, single B-scalar readback,
+      **fail loud** naming the replica/JobId if any misses its floor.
+      This preserves fail-loud without any per-iter host syncs — the
+      verification is a post-hoc audit, not a control flow. Per-replica
+      buffers: ~6–8 live BSR matrices (S, H_scc, Z, K, T + purify
+      scratch + W) × ~26 MB at R18 ≈ 150–200 MB/replica → B=4–8
+      (0.8–1.6 GB) comfortable on 25 GB. Replica axis needed on the
+      assemble/hscc/NS/TC2/W chain (~10–15 kernels — the heavy lift;
+      the masked SpGEMM is already per-row-indexed so `gid(1)` extends
+      the same way). Calibration path: run N columns serially at
+      tc2_tol, record the iteration histogram, set M = max + margin —
+      per system, since count tracks gap not N.
+      Ordering vs DMM-batch: DMM-lite (F5a) is the cheaper first target
+      — fixed recipe already exists (`VIB_LITE`: refresh_b_zh + n_dmm×3
+      products, ~14 products @ DMM4 = 1.0 % column error), needs only
+      ~4 matrix buffers/replica (~100 MB) and ~6 kernels made replica-
+      aware. Do DMM first, learn the multi-matrix batching mechanics,
+      then fixq-fixed-M.

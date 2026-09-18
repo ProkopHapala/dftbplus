@@ -48,6 +48,27 @@ GPT-5.6 (commit `b269ab6`) found 22 issues; several are now stale (B-spline
 eval is production; sparse SCC exists in `scc.rs`). The remaining split is
 bugs / fitter / floor / missing pipeline — do not mix them.
 
+**2026-09-19 — GPU-resident pair physics + multi-replica frozen batch
+(report §15.24–§15.27, manifest §F):** the entire per-eval pair stage is
+on device now — tiled γ matvec/γ′ force (n-body local-memory tiles), GPU
+H/S SK assembly + analytic K/W contraction (`hs_contract`), repulsive
+splines, per-atom force gather — gather-only, no atomics, no dense
+matrices, explicit `RUST_DFTB_SPARSE_CPU=1` reference preserved. The
+residency audit then eliminated ~155 MB/eval of PCIe traffic
+(`GpuCentralState` device snapshots for K/Z/K₀/W₀; lazy H/S mirrors).
+Frozen eval: 10.8 → 1.6 ms at R18 (1648 atoms). **F1 batch:** `gid(1)`
+replica axis on the 5 eval kernels + `RUST_DFTB_VIB_BATCH` — each slot is
+a *full independent 1648-atom eval* sharing read-only topology/SK/K₀/W₀,
+bitwise-identical to sequential. Measured: B=8 → 0.31, **B=16 → 0.27
+ms/eval (~5.9×)**, B=32 saturated; ~720× vs single-thread CPU (~194 ms).
+Full 4944-column frozen Hessian: ~2.7 s of evals inside a ~139 s wall
+dominated (~72%) by the dense host eigensolve — the next lever is
+eigensolve replacement or F2 column-local subranges. fixq/DMM batching is
+deferred: DMM needs per-replica matrix buffers (uniform cost — batchable
+with static batches + ~26 MB/replica of K/Z/W storage); fixq additionally
+needs variable-convergence scheduling (active masks, compact job IDs —
+the `Sparse_MultiSystem_Scheduler.chat.md` blueprint).
+
 ## Implementations
 
 | Component | Location | Status | Notes |
@@ -61,6 +82,8 @@ bugs / fitter / floor / missing pipeline — do not mix them.
 | Vibrational spectra | `sparse_vibrations` rhai → FD Hessian | [~] produced | si10h16/cube65/R10; ~5–15% stiff vs DFTB+ — not benchmark-grade |
 | Production `SparseDftb` lifetime | `sparse_dftb.rs` | [*] production | Persistent engine; central-state snapshot per column |
 | FD-Hessian warm update | `sparse_system.rs::dmm_descend` / `linear_response`, `forces_frozen` | [*] validated | tier ladder: clamped 5.5 ms/6.3%, lite 64 ms/3.1%, 105 ms/1.0% |
+| GPU pair physics (frozen eval) | `sparse_hs.cl::hs_contract`, `sparse_gamma.cl`, `rep_eval`, `force_gather` | [*] production | all-pairs device path, gather-only; CPU explicit ref; parity 1.2e-6 |
+| Frozen multi-replica batch | `GpuFrozenBatch` + `forces_frozen_batch`, `VIB_BATCH` | [*] measured | gid(1) replica axis; bitwise vs sequential; B=16 → 0.27 ms/eval @R18 |
 
 ## Gate Status
 
@@ -73,7 +96,7 @@ bugs / fitter / floor / missing pipeline — do not mix them.
 | F | Geometry optimization | [~] investigating — FIRE 1.477 Å; not done |
 | G | Same-geometry Hessian parity | [~] investigating — 0.11% vs dense; FD columns validated 0.3% ΔF vs cold fixq |
 | H | Spectra at each method's own minimum | [~] produced — cube65 ~5–15% stiff vs DFTB+ reference |
-| I | Scaling and whole-program profile | [~] bottleneck measured — `hessian_eval_bottleneck.md`; batching not yet done |
+| I | Scaling and whole-program profile | [~] frozen columns batched (B=16 → 0.27 ms/eval @R18); wall now ~72% dense host eigensolve — eigensolve replacement or F2 column-local next |
 
 ## Remaining split (do not treat GPT-5.6 2026-09-09 list as current)
 

@@ -44,13 +44,23 @@ N=86, batch=400, ms per batched solve:
 
 N=246: same monotonic trend, WG512 fastest (897/1581 ms).
 
-→ **WG≈N hypothesis FALSIFIED. Small-WG-for-co-residency hypothesis FALSIFIED
-at batch=400.** Runtime decreases monotonically with WG. Explanation: the kernel
-is bandwidth-bound on A/V streaming (~10 MB/sweep/system → ~20 GB per solve ≈
+→ **WG≈N hypothesis FALSIFIED *for this kernel and this regime only*.**
+Runtime decreases monotonically with WG. Explanation: the kernel is
+bandwidth-bound on A/V streaming (~10 MB/sweep/system → ~20 GB per solve ≈
 790 GB/s ≈ 85% DRAM peak; 24 MB working set >> L2). More lanes = more
-outstanding memory requests = better MLP. CAVEAT: this was the *queued* regime
-(400 WGs ≫ resident); at small slot counts (scheduler, S≈64–128) resident
-occupancy becomes binding and small-WG is UNTESTED there.
+outstanding memory requests = better MLP — when DRAM bandwidth is the wall,
+idle threads are free.
+
+**⚠ REGIME-CONDITIONAL RESULT — do not generalize (user-flagged 2026-09-18).**
+This sweep was measured on the *streaming* (bandwidth-bound) direct kernel in
+the *queued* regime (400 WGs ≫ resident capacity). It is NOT evidence about
+the optimal shape of a compute/local-bound kernel: once A is resident and the
+bandwidth wall is gone, "wasting" lanes is no longer free — the resident
+kernel runs at 1 WG/SM (~25% thread occupancy) and the optimum WG ×
+co-residency product is an OPEN question, not a settled one. Do not cite the
+WG512-wins result to justify the current workgroup shape of the *resident*
+kernel; it was falsified only for the kernel that no longer ships at n=86.
+The same caveat applies to small-slot scheduler regime (S≈64–128, UNTESTED).
 
 ## 1b. Resident-A + deferred-V vs streaming direct (THE bandwidth fix)
 
@@ -107,8 +117,28 @@ which still wins). The real B-cost is LOCAL memory. ncu cannot profile OpenCL.
 
 - **JACOBI_PREC=0** (f32 rotations): NOT faster AND 10–30× worse eigenvalue
   parity (N246 cold: 7.8e-3 vs 2.6e-4). Rejected at equal accuracy.
+  **NOTE (2026-09-18): the production default was nevertheless later changed
+  to PREC=0** (commit 3be6c822; `JACOBI_PREC` atomic default 0, env
+  `RUST_DFTB_JACOBI_PREC`/`gpu_jacobi_prec()` override). The parity rejection
+  above stands as the measured record; the default flip is a policy decision
+  (f32-is-the-architecture) — prec=1 remains the accuracy-reference knob.
 - **JACOBI_NO_TAIL** (compile out Fermi tail): halves local mem, runtime ±3%
-  noise. No gain — fused tail kept (also saves a separate fermi_occ launch).
+  noise on the direct kernel. On res-defV standalone it IS ~10% (12.61→11.36
+  ms "one") because tail scratch shares the WG's local budget — but unfusing
+  changes occ values → different SCC trajectory (80 vs 100 iters), so no
+  clean e2e gain. Fused tail kept; `RUST_DFTB_JACOBI_NOTAIL=1` for A/B.
+
+## 4b. f64 audit (2026-09-18 — policy: f64 on GPU is a violation unless deeply justified)
+
+| site | precision | verdict |
+|---|---|---|
+| Jacobi rotations/updates | jrot_t/jupd_t = **f32** at prec=0 | clean (prec≥1 keeps f64 as accuracy reference) |
+| **rotlog scratch (res-defV)** | was `double2` | **FIXED → `jlog2_t`: float2 at prec=0, double2 at prec≥1.** Buffer 23→11.5 MB (n=86/b400); log stream 58.5→29 KB/sweep/system. Implemented + verified. |
+| Fermi tail (fused in Jacobi) | f64 exp + f64 reductions | ~1–3% of solve; scalar-decision class, allowed by GUIDELINES §3 — but re-verify (see T09). |
+| `fermi_occ_batched` standalone | f64, fixed-40-iter bisection | runs only n≤64/ref/block paths; measured 13–31% of dev time at n=6/28. Deferred — T10: warm-μ Newton upgrade. Re-verify indirect damage. |
+| `diis_step_batched` QR | f64 | user decision: keep; barrier-bound not arithmetic-bound. Re-verify. |
+| `energy_reduce_batched` | f64 accumulation | eval-only, not in SCC loop. Re-verify. |
+| `jacobi_cyclic_local_batched` (n≤64) | f64 internal? check | small-N path — audit pending. |
 
 ## 5. End-to-end SCC numbers (production; auto = resident n≤128-if-fits, block n>128)
 
@@ -134,6 +164,41 @@ finishes ~56 = the straggler tail the slot scheduler targets.
 - ~~Full-local-resident Jacobi~~ → TESTED (§1b): res-defV ~2.2× confirmed;
   res-AV blocked by 48 KB local cap at n=86 — untested on larger-local
   devices (e.g. 99 KB class would fit n=86 A+V).
+- ~~rotlog double2~~ → **DONE (2026-09-18): `jlog2_t` prec-gated** — float2
+  at prec=0 (production), double2 at prec≥1 (accuracy reference keeps
+  bit-exact logged rotations). 23→11.5 MB buffer, 58.5→29 KB/sweep/system.
+- ~~Packed symmetric lA → 2 WG/SM (the occupancy lever).~~ → **DONE
+  (2026-09-18): lA stores only the lower triangle via `lat(r,c) =
+  max(r,c)·(max+1)/2 + min(r,c)`** — 14.6 KB at n=86 (was 29.9 KB).
+  Phase-2 must skip transpose blocks (`b<a continue`): blocks (a,b) and
+  (b,a) map to the SAME packed slots → only a≤b runs (each slot one
+  writer; also halves phase-2 block count). red2/dred2 scratch aliased
+  away (reductions are sequential). Measured `CL_KERNEL_LOCAL_MEM_SIZE`
+  (incl. arg_local on this driver): **24 224 B/WG at WG512+tail**
+  → 2×24 224 = 48 448 ≤ 49 152 → **2 WG/SM now fits** (margin ~700 B;
+  was 39 KB → hard 1 WG/SM). Parity unchanged (par=1.73e-6, bad=0,
+  n=86 one/cold/WG256/512, work-ids subset test, scc suite 8/8).
+  **Performance: ~5–9 % faster, NOT 2×** — one WG512 notail 10.67 ms
+  (was ~11.4), cold WG512 notail 18.18 ms (was ~20). Interpretation:
+  crossing the 2-WG threshold did NOT produce a 2× jump → the kernel
+  is not occupancy/latency-bound; the V-replay global/L2 traffic and
+  barrier serialization dominate. This is the measured confirmation of
+  the user's hypothesis that other bottlenecks mask occupancy effects —
+  WG×co-residency remains open (§1 caveat), now with the extra datum
+  that 2-WG co-residency alone is worth ≲10 %, not 2×.
+  E2E GC batch=400 unchanged in the noise (196.4 ms/2.455 ms/iter,
+  80 iters, failed=0); DTH unchanged (block path).
+- **Block-kernel pivot skip (cheap decoupling).** `block_jacobi_1wg` runs
+  the gather + inner solve + full strip writeback for EVERY (bp,bq) pair
+  unconditionally — even when the off-diagonal block is already ~0
+  (U≈identity → the strip writeback is wasted streaming). A pivot-level
+  off-norm check during gather → skip writeback = free iterations on
+  warm SCC sweeps. Unimplemented.
+- **Full block decoupling → independent subproblems.** If a whole
+  off-diagonal B×B block is numerically zero, the matrix splits into two
+  independent eigenproblems (~4× less work at n/2, and each fits smaller
+  kernels/more resident WGs). Requires permutation + detection + routing —
+  not implemented; the pivot skip above is the incremental version.
 - res-defV for the BLOCK kernel at n=246: A alone is 242 KB — can't fit;
   the strip-resident variant (pivot block + streamed strips) is the n>128
   analogue, unimplemented.
@@ -141,5 +206,6 @@ finishes ~56 = the straggler tail the slot scheduler targets.
   sweep-epoch in-kernel apply already captured ~all the gain.
 - Block kernel WG<n via strided rows (currently requires WG≥n); untested,
   matters only in the small-slot resident regime.
-- Joint (N_slots × WG) co-optimization once the slot scheduler exists.
+- Joint (N_slots × WG) co-optimization once the slot scheduler exists —
+  and WG×co-residency for the resident kernel (see §1 caveat: open).
 - Hscc fusion, select_occ skip, warm-μ Newton — small (~0.3–0.5 ms/iter each).

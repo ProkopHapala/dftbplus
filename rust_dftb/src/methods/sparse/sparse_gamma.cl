@@ -93,6 +93,11 @@ __kernel void gamma_matvec(
 ){
     const uint i = get_global_id(0);
     const uint lid = get_local_id(0);
+    // F1 replica axis: dim1 = eval slot — xyzu/v are per-replica strided
+    // (JobId = launch index), dq is shared central state (read-only).
+    const uint b = get_global_id(1);
+    xyzu += (size_t)b * n;
+    v    += (size_t)b * n;
     __local float4 tj[GWG];
     __local float  tdq[GWG];
     const float4 mi = (i < n) ? xyzu[i] : (float4)(0.0f, 0.0f, 0.0f, 0.5f);
@@ -128,6 +133,11 @@ __kernel void gamma_force(
 ){
     const uint i = get_global_id(0);
     const uint lid = get_local_id(0);
+    // F1 replica axis: dim1 = eval slot — xyzu/f are per-replica strided,
+    // dq is shared central state (read-only).
+    const uint b = get_global_id(1);
+    xyzu += (size_t)b * n;
+    f    += (size_t)b * n;
     __local float4 tj[GWG];
     __local float  tdq[GWG];
     const float4 mi = (i < n) ? xyzu[i] : (float4)(0.0f, 0.0f, 0.0f, 0.5f);
