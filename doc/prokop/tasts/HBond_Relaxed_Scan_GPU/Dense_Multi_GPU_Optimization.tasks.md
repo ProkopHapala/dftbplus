@@ -154,6 +154,8 @@ Post-T03 measured context (block+direct DTH N246 evt profile): jacobi is **80.3%
 - [x] **rotlog double2 → prec-gated `jlog2_t` (2026-09-18, DONE).** Deferred-V rotation log was `double2` — deliberate correctness placeholder from the design doc (ladder double2→double-t→float2 planned, never executed). Under production prec=0 the logged c,s are f32 → the double2 was pure waste: 23 MB buffer + 58.5 KB/sweep/system stream at n=86/b400. Now `float2` at prec=0 (11.5 MB, 29 KB/sweep), `double2` kept at prec≥1 (bit-exact logged rotations for the accuracy-reference mode). Kernel + `gpu_eigen.rs` + `gpu_scc_plan.rs` + both tests updated; verified: work_ids 6/6 (prec=1 path), gpu_scc 8/8 + tiled_jacobi 9/9 (prec=0 production path).
 - [ ] **⚠ WG512-wins is regime-conditional — do not generalize (user-flagged).** The WG sweep falsified WG≈N on the *streaming, bandwidth-bound* direct kernel in the *queued* regime only. It is NOT evidence for the optimal shape of the resident (compute/local-bound) kernel, which runs at 1 WG/SM (~25% occupancy). Optimal WG × co-residency for the resident kernel is an OPEN question — re-derive after the occupancy levers below land.
 - [x] **Packed symmetric lA → 2 WG/SM — DONE (2026-09-18), modest gain.** lA stores only the lower triangle via `lat(r,c)` — 14.6 KB at n=86 (was 29.9 KB); phase-2 skips transpose blocks (`b<a continue`) since (a,b)/(b,a) share packed slots — also halves block count; red2/dred2 aliased away. Measured footprint **24 224 B/WG at WG512+tail → 2 WG/SM fits** (was hard 1 WG/SM). Parity unchanged (par=1.73e-6, bad=0; resident sweep, work-ids subset, scc 8/8 all green). **BUT only ~5–9 % faster, not 2×** — one WG512 notail 10.67 ms, cold 18.18 ms. Interpretation: kernel is not occupancy-bound; V-replay global/L2 traffic + barrier serialization dominate → measured confirmation that the occupancy hypothesis alone is worth ≲10 %. WG×co-residency stays OPEN (see caveat above) — the remaining WG question is now about barrier/phase structure, not lane count.
+- [x] **Solve-end V replay (K=4 log) — DONE (2026-09-18), ~6–9 % + the key falsification.** rotlog grew to `[batch][JACOBI_LOG_SWEEPS=4][jround·jpair]` jlog2_t (~47 MB at n=86/b400 — sized L2-resident); a single `jac_replay_V` pass applies all logged sweeps at solve end (same order → bit-identical V); >4 sweeps flush-replays mid-solve; dead (all-identity) rounds skip apply+global-fence. Measured: one 9.72 ms / cold 17.10 ms (was 10.67/18.18). K=8 regressed cold (203 KB/sys log → DRAM reads) — L2-residency of the log matters. **Falsification recorded (Measured_Facts §8): ~500× less V traffic + ~170 fewer barriers/sweep → only ~6–9 % ⇒ the kernel is ROUND-LATENCY-bound, not bandwidth- or occupancy-bound.** Next levers must attack round structure, not V traffic.
+- [ ] **res-AV via warp-shuffle reductions — feasible but DEPRIORITIZED by the §8 measurement.** res-AV eliminates the replay that turned out to be worth only ~6–9 %; its remaining value is structural simplicity, not speed. Fits if warp-shuffle cuts scratch to ~3.5 KB (14.6+29.9+3.5 ≈ 48 KB). res-AV is the "accumulate rotations in a local matrix" design — the accumulator IS V; provably no smaller transform exists (3655 rotations/sweep = n(n−1)/2 = orthogonal-group DOF — Measured_Facts §7).
 - [ ] **Block-kernel pivot skip (cheap decoupling).** `block_jacobi_1wg` unconditionally gathers + inner-solves + writes back the full strip for every (bp,bq) pair — even when the off-block is already ~0 (U≈identity → wasted strip streaming). Pivot-level off-norm check during gather → skip writeback. Free iterations on warm SCC sweeps at n=246.
 - [ ] **Full block decoupling → independent subproblems.** A numerically-zero off-diagonal B×B block splits the eigenproblem (~4× less work at n/2). Needs permutation + detection + routing infrastructure; pivot skip is the incremental version. Evaluate whether production H′ matrices actually decouple (fragment-separated systems) before building.
 - [x] **#7 spilling — mostly falsified** (CL_KERNEL_PRIVATE_MEM_SIZE, ncu does not support OpenCL): block B16 → 0 B, B24 → 16–24 B, B32 → 160–232 B/thread (~58 f32 — real but small; B32 still wins cold). Direct kernel 0 B always. The real B-cost is **local mem** (9.7→20.2→34.8 KB per WG), not private spill.
@@ -213,6 +215,59 @@ Items from the review's punch-list that are real but small after T03 (measured d
 - [ ] **Skip `select_occ` under smearing:** `occ_idx`/`occ_mask` are unread when `use_w=1` (density uses `t`, mulliken_cs/occ_rayleigh/occ_renorm use `occ_w`). Guard in `occupation()`.
 - [ ] **Fermi kernel upgrade:** standalone `fermi_occ_batched` is still fixed-40 f64 bisection — replace with warm-μ safeguarded Newton (WG32/64, f32 logistic + f64 scalar count). See T07.
 - [ ] **Alloc-free housekeeping:** `reset_diis` allocates `vec![0i32; batch]` per call; `check_jacobi` allocates temporaries. Preallocate at construction (see T09 audit).
+
+## T11 — Dense FOE / DM-purification eigensolver alternative (P1, in progress)
+
+**Depends on:** nothing blocking; separate code path — Jacobi untouched.
+**Files:** `src/qmqm/gpu_purify.cl` (new), `src/qmqm/gpu_purify.rs` (new),
+`tests/gpu_purify.rs` (new), `src/qmqm/mod.rs` (module registration only).
+**Design:** `Alternative_Dense_Multi_Eigensolve.md` §6; status §7.
+
+Goal: replace the round-latency-bound Jacobi solve (~5 % peak ceiling)
+with batched dense TC2 purification — one fused kernel launch per
+iteration, zero host syncs inside the loop, one workgroup per system.
+
+**Status 2026-09-18 — correctness verified, performance first-pass:**
+
+- [x] Orthogonal-basis TC2 (`D←D²` or `2D−D²` by `Tr(D)` vs `Nocc`),
+      Palser–Gershgorin init, device-side branch + trace + idempotency
+      reductions, ping-pong buffers, chunked convergence polling.
+- [x] **Device-side freeze** (`done[]` flag): converged systems mirror
+      Din→Dout — REQUIRED, the f32 TC2 fixed point is marginally stable
+      (dust eigenvalues regrow ×2/step; batched systems can't just exit).
+- [x] Parity test: n=86 batch=16, ΔE≈1e-6, ‖D−Dref‖≈3e-5, ‖D²−D‖≈1e-6,
+      converged at 56 iters. Probe test: element-wise ≤6e-6 vs f64 CPU at
+      every iter count, batch 1–400.
+- [x] Race found+fixed in `pur_reduce*` (missing barrier before
+      `return red[0]` → next reduce's first write clobbered the result;
+      corrupted spectral bounds, random victim). Deterministic since.
+- [ ] **Perf: row·row WG512 = 34.2 ms/solve (0.57 ms/iter ≈ 0.9 TFLOPS,
+      ~2.5 % peak) vs Jacobi ~17 ms cold** — currently behind on the
+      cold random-matrix benchmark; the GEMM interior is latency-bound,
+      not the harness (already 1 launch/iter, 0 syncs, 0 allocs).
+      Tiled T16 path exists but is broken (errs unwritten) — not debugged.
+
+**User-confirmed directions (2026-09-18):**
+
+- [ ] **GEMM interior = register-tiled small-GEMM** (user direction):
+      8×8 output tiles/thread, 64 threads/WG (8×8 grid → 64×64/pass,
+      2 passes at n=86), A/B staged via *small* `__local` blocks so many
+      WGs stay resident per CU. Target ≥5 TFLOPS batched at n=86.
+- [ ] **Warm start for the whole SCC** (user direction): payoff is
+      hot-start across geometry steps, not one cold solve. Mandatory
+      ingredient — copy sparse Phase-G3 (`sparse_system.rs::k_seed_shift`
+      + `mcweeny_polish`): `K_seed = K_conv_old + (K0_new − K0_old)`
+      (δK0 = first-order occupied/unoccupied subspace rotation —
+      polynomials of H cannot rotate eigenvectors), McWeeny polish,
+      then TC2 floor-walk. Bare TC2-on-old-K refuted in sparse
+      (`RUST_DFTB_WARM_K`) — δK0 shift is required.
+- [ ] Scope: batched multi-system only; single small systems stay on
+      Jacobi/LAPACK.
+- [ ] `SolveKind::{Eigen, Purify}` opt-in dispatch in `gpu_scc_plan.rs`.
+- [ ] Generalized metric form (`K·S·K`, `Tr(KS)`) — drops Löwdin X and
+      makes the sparse seed-shift recipe directly portable.
+- [ ] Equal-work + equal-accuracy benchmark vs Jacobi on real GC/DTH
+      Hamiltonians (random matrices are TC2's worst case — tiny gaps).
 
 ## Starting tests and handoff format
 

@@ -340,6 +340,7 @@ pub struct SparseBsr4Gpu {
     k_spgemm_bsym: Kernel,
     k_zero: Kernel,
     k_axpby: Kernel,
+    k_broadcast: Kernel,
     k_mcweeny: Kernel,
     k_tc2: Kernel,
     k_symmetrize: Kernel,
@@ -555,6 +556,20 @@ impl SparseBsr4Gpu {
             b.arg(0.0f32);
             b.arg(&dummy_f32);
             b.arg(&dummy_f32);
+            b.arg(0u32); // F5 sa
+            b.arg(0u32); // F5 sb
+            b.arg(0u32); // F5 sc
+            b.build().map_err(map_ocl_err)?
+        };
+        // bsr4_broadcast: n, src, dst -> 1 u32, 2 f32 buf
+        let k_broadcast = {
+            let mut b = Kernel::builder();
+            b.program(&program)
+                .name("bsr4_broadcast")
+                .queue(queue.clone());
+            b.arg(0u32);
+            b.arg(&dummy_f32);
+            b.arg(&dummy_f32);
             b.build().map_err(map_ocl_err)?
         };
         // bsr4_mcweeny: nblock, Q, V, Knew  -> 1 u32, 3 f32 buf
@@ -590,6 +605,7 @@ impl SparseBsr4Gpu {
             b.arg(0u32);
             b.arg(&dummy_u32);
             b.arg(&dummy_f32);
+            b.arg(0u32); // F5 sa
             b.build().map_err(map_ocl_err)?
         };
         // bsr4_mulliken_KS (R14): nrow, diag_block, ks, n_orb, q, q_dum
@@ -674,6 +690,9 @@ impl SparseBsr4Gpu {
             b.arg(&dummy_u32); // plan_ptr, plan_a_idx, plan_b_idx
             b.arg(&dummy_u32);
             b.arg(&dummy_f32); // C_row, C
+            b.arg(0u32); // F5 sa (block stride)
+            b.arg(0u32); // F5 sb
+            b.arg(0u32); // F5 sc
             b.build().map_err(map_ocl_err)?
         };
         // bsr4_spgemm_plan (generic, GPT-5.6 #4): same signature as the
@@ -692,6 +711,9 @@ impl SparseBsr4Gpu {
             b.arg(&dummy_u32); // plan_ptr, plan_a_idx, plan_b_idx
             b.arg(&dummy_u32);
             b.arg(&dummy_f32); // C_row, C
+            b.arg(0u32); // F5 sa (block stride)
+            b.arg(0u32); // F5 sb
+            b.arg(0u32); // F5 sc
             b.build().map_err(map_ocl_err)?
         };
         // bsr4_spgemm_plan_Bsym_ff (FF32-POLISH): nrow, A_row, A_hi,
@@ -866,6 +888,7 @@ impl SparseBsr4Gpu {
             b.arg(&dummy_f32);
             b.arg(&dummy_u32);
             b.arg(&dummy_f32);
+            b.arg(0u32); // F5 sblk (replica block stride)
             b.build().map_err(map_ocl_err)?
         };
         // bsr4_trace_hk_partial (R7): nblock_hs, H, K, hs_to_kT, partial
@@ -953,6 +976,7 @@ impl SparseBsr4Gpu {
             b.arg(&dummy_f32);
             b.arg(&dummy_f32);
             b.arg(&dummy_f32);
+            b.arg(0u32); // F5 sblk
             b.build().map_err(map_ocl_err)?
         };
         // hs_assemble: npairs, pairs, xyzu, species, n_orb, nsp, sk_meta,
@@ -973,6 +997,8 @@ impl SparseBsr4Gpu {
             b.arg(Float4::new(0.0, 0.0, 0.0, 0.0));
             b.arg(&dummy_f32);
             b.arg(&dummy_f32);
+            b.arg(0u32); // F5 n_atom (xyzu replica stride)
+            b.arg(0u32); // F5 sblk (h/s replica stride)
             b.build().map_err(map_ocl_err)?
         };
         // hs_contract: npairs, pairs, pairs_k, xyzu, species, n_orb, nsp,
@@ -997,6 +1023,8 @@ impl SparseBsr4Gpu {
             b.arg(&dummy_f32);
             b.arg(&dummy_f32);
             b.arg(0u32); // F1: n_atom (replica stride)
+            b.arg(0u32); // F5: k_str (0 = shared)
+            b.arg(0u32); // F5: w_str (0 = shared)
             b.build().map_err(map_ocl_err)?
         };
         // rep_eval: nrep, rpairs, xyzu, species, nsp, rep_off, rep_max_int,
@@ -1066,6 +1094,7 @@ impl SparseBsr4Gpu {
             k_spgemm_bsym,
             k_zero,
             k_axpby,
+            k_broadcast,
             k_mcweeny,
             k_tc2,
             k_symmetrize,
@@ -2368,6 +2397,8 @@ impl SparseBsr4Gpu {
         onsite: &Buffer<f32>,
         h: &Buffer<f32>,
         s: &Buffer<f32>,
+        sblk: u32,
+        batch: usize,
     ) -> Result<()> {
         let k = &self.k_hs_diag;
         k.set_arg(0, n_atom as u32).map_err(map_ocl_err)?;
@@ -2376,9 +2407,10 @@ impl SparseBsr4Gpu {
         k.set_arg(3, onsite).map_err(map_ocl_err)?;
         k.set_arg(4, h).map_err(map_ocl_err)?;
         k.set_arg(5, s).map_err(map_ocl_err)?;
+        k.set_arg(6, sblk).map_err(map_ocl_err)?;
         unsafe {
             k.cmd()
-                .global_work_size(n_atom)
+                .global_work_size(ocl::SpatialDims::Two(n_atom, batch))
                 .enq()
                 .map_err(map_ocl_err)?;
         }
@@ -2403,6 +2435,9 @@ impl SparseBsr4Gpu {
         taper: [f32; 4],
         h: &Buffer<f32>,
         s: &Buffer<f32>,
+        n_atom: u32,
+        sblk: u32,
+        batch: usize,
     ) -> Result<()> {
         let k = &self.k_hs_assemble;
         k.set_arg(0, npairs as u32).map_err(map_ocl_err)?;
@@ -2419,9 +2454,11 @@ impl SparseBsr4Gpu {
             .map_err(map_ocl_err)?;
         k.set_arg(11, h).map_err(map_ocl_err)?;
         k.set_arg(12, s).map_err(map_ocl_err)?;
+        k.set_arg(13, n_atom).map_err(map_ocl_err)?;
+        k.set_arg(14, sblk).map_err(map_ocl_err)?;
         unsafe {
             k.cmd()
-                .global_work_size(npairs)
+                .global_work_size(ocl::SpatialDims::Two(npairs, batch))
                 .enq()
                 .map_err(map_ocl_err)?;
         }
@@ -2452,6 +2489,8 @@ impl SparseBsr4Gpu {
         v_atom: &Buffer<f32>,
         pf: &Buffer<f32>,
         batch: usize,
+        k_str: u32,
+        w_str: u32,
     ) -> Result<()> {
         let k = &self.k_hs_contract;
         k.set_arg(0, npairs as u32).map_err(map_ocl_err)?;
@@ -2472,6 +2511,8 @@ impl SparseBsr4Gpu {
         k.set_arg(14, v_atom).map_err(map_ocl_err)?;
         k.set_arg(15, pf).map_err(map_ocl_err)?;
         k.set_arg(16, n_atom as u32).map_err(map_ocl_err)?;
+        k.set_arg(17, k_str).map_err(map_ocl_err)?;
+        k.set_arg(18, w_str).map_err(map_ocl_err)?;
         // F1: dim1 = replica slot; batch=1 ≡ the scalar path.
         unsafe {
             k.cmd()
@@ -2739,10 +2780,57 @@ impl SparseBsr4Gpu {
         k.set_arg(6, &plan.plan_b_idx).map_err(map_ocl_err)?;
         k.set_arg(7, &c.struct_.row_ptr).map_err(map_ocl_err)?;
         k.set_arg(8, &c.values).map_err(map_ocl_err)?;
+        k.set_arg(9, 0u32).map_err(map_ocl_err)?; // F5 strides: scalar = shared
+        k.set_arg(10, 0u32).map_err(map_ocl_err)?;
+        k.set_arg(11, 0u32).map_err(map_ocl_err)?;
         unsafe {
             k.cmd()
-                .global_work_size(gws)
-                .local_work_size(self.config.wg as usize)
+                .global_work_size(ocl::SpatialDims::Two(gws, 1))
+                .local_work_size(ocl::SpatialDims::Two(self.config.wg as usize, 1))
+                .enq()
+                .map_err(map_ocl_err)?;
+        }
+        Ok(())
+    }
+
+    /// F5 multi-replica planned b-symmetric SpGEMM: one 2D launch
+    /// (dim1 = replica slot). Value buffers are flat `batch·nblk·16`
+    /// slabs; `sa`/`sb`/`sc` are per-replica BLOCK strides (0 = shared
+    /// read-only operand — e.g. a central matrix). Structures/plans are
+    /// shared: all replicas have identical sparsity (frozen topology).
+    pub fn spgemm_plan_bsym_batch(
+        &self,
+        a: &GpuBsrMatrix,
+        a_vals: &Buffer<f32>,
+        sa: u32,
+        b_vals: &Buffer<f32>,
+        sb: u32,
+        plan: &SpgemmPlanGpu,
+        c: &GpuBsrMatrix,
+        c_vals: &Buffer<f32>,
+        sc: u32,
+        batch: usize,
+    ) -> Result<()> {
+        self.check_left_degree(a)?;
+        let nrow = a.struct_.n_atom;
+        let gws = nrow * self.config.wg as usize;
+        let k = &self.k_spgemm_plan_bsym;
+        k.set_arg(0, nrow as u32).map_err(map_ocl_err)?;
+        k.set_arg(1, &a.struct_.row_ptr).map_err(map_ocl_err)?;
+        k.set_arg(2, a_vals).map_err(map_ocl_err)?;
+        k.set_arg(3, b_vals).map_err(map_ocl_err)?;
+        k.set_arg(4, &plan.plan_ptr).map_err(map_ocl_err)?;
+        k.set_arg(5, &plan.plan_a_idx).map_err(map_ocl_err)?;
+        k.set_arg(6, &plan.plan_b_idx).map_err(map_ocl_err)?;
+        k.set_arg(7, &c.struct_.row_ptr).map_err(map_ocl_err)?;
+        k.set_arg(8, c_vals).map_err(map_ocl_err)?;
+        k.set_arg(9, sa).map_err(map_ocl_err)?;
+        k.set_arg(10, sb).map_err(map_ocl_err)?;
+        k.set_arg(11, sc).map_err(map_ocl_err)?;
+        unsafe {
+            k.cmd()
+                .global_work_size(ocl::SpatialDims::Two(gws, batch))
+                .local_work_size(ocl::SpatialDims::Two(self.config.wg as usize, 1))
                 .enq()
                 .map_err(map_ocl_err)?;
         }
@@ -2774,10 +2862,13 @@ impl SparseBsr4Gpu {
         k.set_arg(6, &plan.plan_b_idx).map_err(map_ocl_err)?;
         k.set_arg(7, &c.struct_.row_ptr).map_err(map_ocl_err)?;
         k.set_arg(8, &c.values).map_err(map_ocl_err)?;
+        k.set_arg(9, 0u32).map_err(map_ocl_err)?; // F5 strides: scalar = shared
+        k.set_arg(10, 0u32).map_err(map_ocl_err)?;
+        k.set_arg(11, 0u32).map_err(map_ocl_err)?;
         unsafe {
             k.cmd()
-                .global_work_size(gws)
-                .local_work_size(self.config.wg as usize)
+                .global_work_size(ocl::SpatialDims::Two(gws, 1))
+                .local_work_size(ocl::SpatialDims::Two(self.config.wg as usize, 1))
                 .enew(ev)
                 .enq()
                 .map_err(map_ocl_err)?;
@@ -2808,10 +2899,54 @@ impl SparseBsr4Gpu {
         k.set_arg(6, &plan.plan_b_idx).map_err(map_ocl_err)?;
         k.set_arg(7, &c.struct_.row_ptr).map_err(map_ocl_err)?;
         k.set_arg(8, &c.values).map_err(map_ocl_err)?;
+        k.set_arg(9, 0u32).map_err(map_ocl_err)?; // F5 strides: scalar = shared
+        k.set_arg(10, 0u32).map_err(map_ocl_err)?;
+        k.set_arg(11, 0u32).map_err(map_ocl_err)?;
         unsafe {
             k.cmd()
-                .global_work_size(gws)
-                .local_work_size(self.config.wg as usize)
+                .global_work_size(ocl::SpatialDims::Two(gws, 1))
+                .local_work_size(ocl::SpatialDims::Two(self.config.wg as usize, 1))
+                .enq()
+                .map_err(map_ocl_err)?;
+        }
+        Ok(())
+    }
+
+    /// F5 multi-replica generic planned SpGEMM (no B symmetry assumed).
+    /// Same contract as `spgemm_plan_bsym_batch`.
+    pub fn spgemm_plan_batch(
+        &self,
+        a: &GpuBsrMatrix,
+        a_vals: &Buffer<f32>,
+        sa: u32,
+        b_vals: &Buffer<f32>,
+        sb: u32,
+        plan: &SpgemmPlanGpu,
+        c: &GpuBsrMatrix,
+        c_vals: &Buffer<f32>,
+        sc: u32,
+        batch: usize,
+    ) -> Result<()> {
+        self.check_left_degree(a)?;
+        let nrow = a.struct_.n_atom;
+        let gws = nrow * self.config.wg as usize;
+        let k = &self.k_spgemm_plan;
+        k.set_arg(0, nrow as u32).map_err(map_ocl_err)?;
+        k.set_arg(1, &a.struct_.row_ptr).map_err(map_ocl_err)?;
+        k.set_arg(2, a_vals).map_err(map_ocl_err)?;
+        k.set_arg(3, b_vals).map_err(map_ocl_err)?;
+        k.set_arg(4, &plan.plan_ptr).map_err(map_ocl_err)?;
+        k.set_arg(5, &plan.plan_a_idx).map_err(map_ocl_err)?;
+        k.set_arg(6, &plan.plan_b_idx).map_err(map_ocl_err)?;
+        k.set_arg(7, &c.struct_.row_ptr).map_err(map_ocl_err)?;
+        k.set_arg(8, c_vals).map_err(map_ocl_err)?;
+        k.set_arg(9, sa).map_err(map_ocl_err)?;
+        k.set_arg(10, sb).map_err(map_ocl_err)?;
+        k.set_arg(11, sc).map_err(map_ocl_err)?;
+        unsafe {
+            k.cmd()
+                .global_work_size(ocl::SpatialDims::Two(gws, batch))
+                .local_work_size(ocl::SpatialDims::Two(self.config.wg as usize, 1))
                 .enq()
                 .map_err(map_ocl_err)?;
         }
@@ -2972,6 +3107,24 @@ impl SparseBsr4Gpu {
         b: &Buffer<f32>,
         c: &Buffer<f32>,
     ) -> Result<()> {
+        self.axpby_batch(nblock, alpha, a, 0, beta, b, 0, c, 0, 1)
+    }
+
+    /// F5 multi-replica axpby: 2D launch (dim1 = replica slot). sa/sb/sc
+    /// are ELEMENT strides per replica (0 = shared read-only operand).
+    pub fn axpby_batch(
+        &self,
+        nblock: usize,
+        alpha: f32,
+        a: &Buffer<f32>,
+        sa: u32,
+        beta: f32,
+        b: &Buffer<f32>,
+        sb: u32,
+        c: &Buffer<f32>,
+        sc: u32,
+        batch: usize,
+    ) -> Result<()> {
         let total = nblock * BS2;
         let k = &self.k_axpby;
         k.set_arg(0, nblock as u32).map_err(map_ocl_err)?;
@@ -2980,8 +3133,36 @@ impl SparseBsr4Gpu {
         k.set_arg(3, beta).map_err(map_ocl_err)?;
         k.set_arg(4, b).map_err(map_ocl_err)?;
         k.set_arg(5, c).map_err(map_ocl_err)?;
+        k.set_arg(6, sa).map_err(map_ocl_err)?;
+        k.set_arg(7, sb).map_err(map_ocl_err)?;
+        k.set_arg(8, sc).map_err(map_ocl_err)?;
         unsafe {
-            k.cmd().global_work_size(total).enq().map_err(map_ocl_err)?;
+            k.cmd()
+                .global_work_size(ocl::SpatialDims::Two(total, batch))
+                .enq()
+                .map_err(map_ocl_err)?;
+        }
+        Ok(())
+    }
+
+    /// F5 broadcast: dst[rep·n + i] = src[i] — replicate shared values
+    /// (central K₀/Z₀) into all replica slots. One launch, no sync.
+    pub fn broadcast_dev(
+        &self,
+        n: usize,
+        src: &Buffer<f32>,
+        dst: &Buffer<f32>,
+        batch: usize,
+    ) -> Result<()> {
+        let k = &self.k_broadcast;
+        k.set_arg(0, n as u32).map_err(map_ocl_err)?;
+        k.set_arg(1, src).map_err(map_ocl_err)?;
+        k.set_arg(2, dst).map_err(map_ocl_err)?;
+        unsafe {
+            k.cmd()
+                .global_work_size(ocl::SpatialDims::Two(n, batch))
+                .enq()
+                .map_err(map_ocl_err)?;
         }
         Ok(())
     }
@@ -3031,13 +3212,27 @@ impl SparseBsr4Gpu {
         transpose_block: &Buffer<u32>,
         a: &Buffer<f32>,
     ) -> Result<()> {
+        self.symmetrize_batch(nblock, transpose_block, a, 0, 1)
+    }
+
+    /// F5 multi-replica symmetrize: dim1 = replica slot; `sa` = ELEMENT
+    /// stride of `a` per replica (0 = single shared matrix).
+    pub fn symmetrize_batch(
+        &self,
+        nblock: usize,
+        transpose_block: &Buffer<u32>,
+        a: &Buffer<f32>,
+        sa: u32,
+        batch: usize,
+    ) -> Result<()> {
         let k = &self.k_symmetrize;
         k.set_arg(0, nblock as u32).map_err(map_ocl_err)?;
         k.set_arg(1, transpose_block).map_err(map_ocl_err)?;
         k.set_arg(2, a).map_err(map_ocl_err)?;
+        k.set_arg(3, sa).map_err(map_ocl_err)?;
         unsafe {
             k.cmd()
-                .global_work_size(nblock)
+                .global_work_size(ocl::SpatialDims::Two(nblock, batch))
                 .enq()
                 .map_err(map_ocl_err)?;
         }
@@ -3387,6 +3582,8 @@ impl SparseBsr4Gpu {
         v_atom: &Buffer<f32>,
         n_orb: &Buffer<u32>,
         h_out: &Buffer<f32>,
+        sblk: u32,
+        batch: usize,
     ) -> Result<()> {
         // SC4 (manifest §15.9): the kernel caches the row's V/n_orb in
         // `__local` arrays sized MAX_LEFT_BLOCKS and silently `return`s on
@@ -3412,10 +3609,11 @@ impl SparseBsr4Gpu {
         k.set_arg(5, v_atom).map_err(map_ocl_err)?;
         k.set_arg(6, n_orb).map_err(map_ocl_err)?;
         k.set_arg(7, h_out).map_err(map_ocl_err)?;
+        k.set_arg(8, sblk).map_err(map_ocl_err)?;
         unsafe {
             k.cmd()
-                .global_work_size(struct_.n_atom * wg)
-                .local_work_size(wg)
+                .global_work_size(ocl::SpatialDims::Two(struct_.n_atom * wg, batch))
+                .local_work_size(ocl::SpatialDims::Two(wg, 1))
                 .enq()
                 .map_err(map_ocl_err)?;
         }

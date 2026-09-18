@@ -162,8 +162,10 @@ finishes ~56 = the straggler tail the slot scheduler targets.
 ## 6. Current open hypotheses (what we have NOT tried)
 
 - ~~Full-local-resident Jacobi~~ → TESTED (§1b): res-defV ~2.2× confirmed;
-  res-AV blocked by 48 KB local cap at n=86 — untested on larger-local
-  devices (e.g. 99 KB class would fit n=86 A+V).
+  res-AV ~~blocked by 48 KB local cap~~ → **NOW FEASIBLE (§7): packed lA
+  made it 53.8 KB — needs only warp-shuffle reductions (~6 KB scratch)
+  to fit.** res-AV eliminates rotlog + the ~5 MB/sweep V-replay + ~170
+  barriers/sweep — the next structural lever at n=86.
 - ~~rotlog double2~~ → **DONE (2026-09-18): `jlog2_t` prec-gated** — float2
   at prec=0 (production), double2 at prec≥1 (accuracy reference keeps
   bit-exact logged rotations). 23→11.5 MB buffer, 58.5→29 KB/sweep/system.
@@ -209,3 +211,97 @@ finishes ~56 = the straggler tail the slot scheduler targets.
 - Joint (N_slots × WG) co-optimization once the slot scheduler exists —
   and WG×co-residency for the resident kernel (see §1 caveat: open).
 - Hscc fusion, select_occ skip, warm-μ Newton — small (~0.3–0.5 ms/iter each).
+
+## 7. The deferred-V (rotlog+replay) design — rationale, cost, and why
+##    "just accumulate one smaller rotation matrix" doesn't exist
+
+**Why deferred-V exists.** The resident kernel's win comes from keeping A
+in `__local` across all sweeps. V was left in `__global` because square lA
+(29.9 KB) + square lV (29.9 KB) = ~69 KB > 48 KB cap. Deferred-V is the
+workaround: don't touch V during the 85 rounds/sweep; log each round's
+jpair=43 (c,s) pairs to a global `rotlog`, then replay all rounds against
+gV once per sweep end.
+
+**Why there is no smaller rotation matrix.** User question: "accumulate
+the rotations into one local rotation matrix — it must be smaller than all
+those rotations." It is NOT smaller, and this is a theorem, not a tuning
+detail:
+
+- A real orthogonal n×n matrix has exactly **n(n−1)/2 degrees of freedom**
+  (one Givens angle per coordinate plane).
+- One full Jacobi sweep applies exactly jround·jpair = 85·43 = **3655 =
+  n(n−1)/2** rotations — the same count.
+- rotlog/sweep = 3655 float2 = 29.2 KB; the dense accumulated product
+  n×n = 29.6 KB. The log is already information-theoretically minimal —
+  the product cannot compress below n(n−1)/2 parameters, only re-encode
+  them redundantly.
+
+So "smaller accumulated transform" does not exist. What DOES exist is the
+accumulator itself: **the product matrix accumulated per round IS V**
+(V starts at I cold / previous basis warm; folding each round's rotation
+into it per round = `RESIDENT_V=1`, res-AV). Accumulating a separate U
+and applying `V ← V·U` once at solve end is the same 29.6 KB of local
+plus a wasted n³ matmul — strictly worse than res-AV. No variant beats
+"keep V local".
+
+**The cost of deferred-V — FALSIFIED estimate.** Pre-change estimate:
+~5 MB/sweep/system of gV traffic + ~170 replay barriers/sweep ⇒
+"V-replay dominates, res-AV is the fix." **Measured: wrong.** Batching
+the replay to solve end (§8) cut gV traffic ~nsw× and removed ~all
+replay barriers — and gained only ~6–9%, not ~1.5×. The replay was
+already cheap because V (~30 KB/sys) stays L2-resident across a sweep,
+so the ~85 re-streams hit L2 at streaming rate, and its barriers carry
+little work to drain. **The dominant cost is the round loop itself:**
+85 rounds × ~2–3 barriers × ~7 sweeps ≈ 1200–1800 barriers per solve,
+each draining phase-1 (only jpair=43 of 512 lanes busy) and phase-2
+(~925 halved block updates ≈ 36 flops/lane — ~nothing). ~10 µs/round
+wall at batch-400 = pure latency, not bandwidth. Levers that remain are
+about round latency/structure, not V traffic.
+
+**The fix that now exists.** res-AV removes rotlog, the replay phase, and
+~170 barriers/sweep in one move — V updates ride in the existing phase-2
+loop on local memory. It did not fit before packed-A (69 KB); now:
+
+  packed lA 14.6 + lV 29.9 + scratch 9.3 = 53.8 KB — over by ~5.8 KB.
+
+  Warp-shuffle reductions (reduce[512]→~16 partials, dred likewise) cut
+  scratch to ~3.5 KB → **≈48 KB, fits** (comfortably at WG256). res-AV
+  is correct BY CONSTRUCTION vs replay because it applies the identical
+  rotation sequence to local V. **But §8's measurement caps its upside:**
+  the replay it eliminates was worth only ~6–9%, so res-AV's remaining
+  value is mostly the simpler kernel structure, not a big win. Deprioritized
+  behind structural round-latency work.
+
+## 8. Solve-end V replay — IMPLEMENTED (K=4) + the latency finding
+
+`jacobi_resident_batched` now logs `JACOBI_LOG_SWEEPS=4` sweeps of
+rotations to rotlog (`[batch][4][jround·jpair]` jlog2_t = ~47 MB at
+n=86/b400/prec0 — sized to stay L2-resident) and replays them in ONE
+`jac_replay_V` pass at solve end (same rotation order → bit-identical V;
+the off-norm trajectory never touches V). A solve exceeding 4 sweeps
+flush-replays mid-solve and resets the log — worst case is K replays,
+never worse than per-sweep. Dead rounds (all-identity) skip their apply
+pass AND their global fence via a per-round nonzero count.
+
+**Measured (n=86, batch 400, res-defV WG512 notail):**
+
+| mode | per-sweep replay | K=8 log | **K=4 log** |
+|---|---:|---:|---:|
+| one  (sw≈3.7) | 10.67 ms | 10.15 | **9.72 ms** (−9%) |
+| cold (sw≈7.0) | 18.18 ms | 19.37 | **17.10 ms** (−6%) |
+
+K=8 *regressed* on cold: 8 sweeps × 29 KB ≈ 203 KB/sys log → ~80 MB
+batch-wide, exceeding L2 — the end replay then reads the log from DRAM
+instead of L2-hot. K=4 (≈117 KB/sys, 47 MB) stays L2-sized → wins
+everywhere. Parity unchanged (par=1.73e-6 one / 1.91e-5 cold, bad=0);
+e2e GC b400 194.6 ms ≈ neutral (warm solves log ≤1 sweep anyway).
+
+**The finding that matters:** ~500× less V traffic + ~170 fewer
+barriers/sweep bought only ~6–9%. ⇒ The kernel is **round-latency-bound**,
+not bandwidth-bound and not occupancy-bound. Each round serializes:
+phase-1 (43/512 lanes) → barrier → phase-2 (~36 flops/lane) → barrier.
+Next levers must attack the round structure itself — co-resident WGs to
+fill latency (the only occupancy that still matters), fewer/fatter
+rounds (impossible at element level — 43 disjoint pairs is already
+maximal), or the block-round / D&C restructure of the chat doc for n=246
+where pairs stream globally and rounds CAN be fused.

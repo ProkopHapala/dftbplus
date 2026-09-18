@@ -214,9 +214,11 @@ goes, so optimize the per-evaluation cost:
    overhead itself). `RUST_DFTB_TC2_STOP_W=28` enables the
    replay-validated floor detector: ~15–30% fewer iterations on
    plateaued runs, bit-identical energies on tested workloads.
-6. **Frozen columns run B-at-a-time on one GPU** (`RUST_DFTB_VIB_BATCH`,
-   see §4.2). In fixq/full-SCC mode columns remain serial — batching
-   them needs per-replica convergence scheduling (deferred, manifest §F).
+6. **Frozen and lite-DMM columns run B-at-a-time on one GPU**
+   (`RUST_DFTB_VIB_BATCH`, see §4.2). Cold fixq/full-SCC columns remain
+   serial — variable convergence needs per-replica scheduling
+   (deferred, manifest §F5b). `VIB_BATCH>1` without `FROZEN` or `LITE`
+   fails loud; there is no implicit scalar fallback.
 
 ### 4.1 Measured wall times (RTX 3090, `--release`, warm starts on)
 
@@ -229,10 +231,14 @@ goes, so optimize the per-evaluation cost:
 | si_sphere_R10 | 330 | deg~330, `RUST_DFTB_VIB_FROZEN` (clamped) | 1980 | **5.5 ms** | ~10 s* | ~15–20 s (extrap.) |
 | si_sphere_R10 | 330 | deg~330, `FIXQ+DMUPD+LITE DMM=2 NSMAX=2` | 1980 | **~64 ms** | — | ~2 min (extrap.) |
 | si_sphere_R10 | 330 | deg~330, `FIXQ+DMUPD+LITE DMM=4 NSMAX=2` | 1980 | **~105 ms** | — | ~3.5 min (extrap.) |
+| si_sphere_R10 | 330 | deg~330, `FIXQ+DMUPD+LITE DMM=4 NSMAX=0` `VIB_BATCH=16` | 1980 | **~53 ms** | — | ~1.7 min (extrap.) |
 | si_sphere_R10 | 330 | deg~330, `FIXQ=1` cold | 1980 | ~345 ms | — | ~11 min (extrap.) |
 | si_sphere_R18 | 1648 | r_k=12, `FROZEN` B=1, GPU-resident | 9888 | **~1.6 ms** | — | ~16 s evals / 138 s wall† |
 | si_sphere_R18 | 1648 | r_k=12, `FROZEN` `VIB_BATCH=16` | 9888 | **~0.27 ms** | — | ~2.7 s evals / 139 s wall† |
 | si_sphere_R18 | 1648 | r_k=12, `FROZEN`, CPU ref (`SPARSE_CPU=1`) | 9888 | ~194 ms | — | ~32 min (extrap.) |
+| si_sphere_R18 | 1648 | r_k=12, `FIXQ+DMUPD+LITE DMM=4 NSMAX=0` B=1 | 9888 | ~257 ms | — | ~42 min (extrap.) |
+| si_sphere_R18 | 1648 | r_k=12, `FIXQ+DMUPD+LITE DMM=4 NSMAX=0` `VIB_BATCH=16` | 9888 | **~208 ms** | — | ~34 min (extrap.) |
+| si_sphere_R18 | 1648 | r_k=12, `FIXQ=1` cold | 9888 | ~920 ms | — | ~2.5 h (extrap.) |
 
 \* R10 relax numbers are from the pre-relaxed geometry; a cold relax was
 ~5 min (75 FIRE steps) at deg175. Warm-tier column errors measured at
@@ -276,39 +282,65 @@ Two important things this table exposes:
   buffers captured once; restore = device→device copy, no PCIe
   traffic — §15.25).
 
-### 4.2 Multi-replica frozen batch — `RUST_DFTB_VIB_BATCH=B`
+### 4.2 Multi-replica batch — `RUST_DFTB_VIB_BATCH=B`
 
-Frozen-mode only. Runs `B` displaced geometries **per kernel-launch
-wave** on a single GPU: each eval kernel (`gamma_matvec`,
-`gamma_force`, `hs_contract`, `rep_eval`, `force_gather`) gets a second
-NDRange axis `get_global_id(1) = b` = the replica slot. **Each replica
-is a complete, independent system eval** — full all-pairs physics of
-one displaced geometry against the shared read-only central state —
+Works for **frozen** and **lite-DMM** (`VIB_FIXQ+DMUPD+LITE`) column
+modes — the two fixed-cost recipes. Runs `B` displaced geometries
+**per kernel-launch wave** on a single GPU: every eval kernel gets a
+second NDRange axis `get_global_id(1) = b` = the replica slot.
+**Each replica is a complete, independent system eval** — full physics
+of one displaced geometry against shared read-only central state —
 not a partitioned system.
 
 ```bash
 RUST_DFTB_VIB_FROZEN=1 RUST_DFTB_VIB_BATCH=16 dftb_engine \
     --script my_vib.rhai --sk-dir $RUST_DFTB_SK_DIR
+# or the ~1%-error tier:
+RUST_DFTB_VIB_FIXQ=1 RUST_DFTB_VIB_DMUPD=1 RUST_DFTB_VIB_LITE=1 \
+RUST_DFTB_VIB_DMM=4 RUST_DFTB_VIB_NSMAX=0 RUST_DFTB_VIB_BATCH=16 \
+    dftb_engine --script my_vib.rhai --sk-dir $RUST_DFTB_SK_DIR
 ```
 
-- **What is shared:** pair topology, SK/repulsive tables, `dq₀`, and the
-  central `K₀`/`W₀` device buffers — all read-only during the batch.
-- **What is replicated:** `xyzu`, `v_atom`, pair-force records, force
-  outputs — ~7 MB/replica at N=1648 (B=16 ≈ 110 MB on a 25 GB card).
-- **Guarantees:** bitwise-identical to the sequential path (same kernel
-  math per replica, no atomics, gather-only writes; verified by
-  `test_sparse_frozen_batch_parity`, max|dF| = 0.0). B=1 is exactly the
-  sequential loop.
-- **Measured at R18 (1648 atoms, RTX 3090):** B=1 ~1.6 ms/eval → B=8
-  0.31 → **B=16 0.27 ms/eval** (~5.9×) → B=32 saturated. The full
-  4944-column frozen Hessian spends ~2.7 s in force evals; the wall is
-  then dominated by the dense host eigensolve (~100 s at this size).
-- **Why frozen only:** a frozen eval is a uniform one-shot job — no
-  convergence, no iteration, no per-replica solver state — so static
-  batching is optimal. fixq/DMM evals have per-replica matrices and
-  (for fixq) variable iteration counts; batching them needs active-mask
-  scheduling (the multi-system scheduler design, manifest §F — planned,
-  not implemented).
+**Frozen path** — kernels `gamma_matvec`, `gamma_force`, `hs_contract`,
+`rep_eval`, `force_gather`:
+
+- **Shared:** pair topology, SK/repulsive tables, `dq₀`, central
+  `K₀`/`W₀` — all read-only during the batch.
+- **Replicated:** `xyzu`, `v_atom`, pair-force records, force outputs —
+  ~7 MB/replica at N=1648.
+- **Measured at R18:** B=1 ~1.6 ms/eval → B=8 0.31 → **B=16 0.27
+  ms/eval** (~5.9×) → B=32 saturated. Full 4944-column Hessian: ~2.7 s
+  in force evals; wall then dominated by the dense host eigensolve
+  (~100 s at this size).
+
+**Lite-DMM path** — the replica axis extends through the whole solve
+chain (`hs_diag`/`hs_assemble` → γ → `build_Hscc` → [warm-NS] →
+`B=Z·H` → `n_dmm`×3 SpGEMMs + updates → `W=2·sym(B·K)` → contract +
+gather). Replica strides: **block strides on SpGEMM plans, element
+strides on elementwise/contract kernels, 0 = shared operand**.
+
+- **Shared:** all sparse structures + symbolic SpGEMM plans, `dq₀`,
+  S operand in `T=K·S`, K₀/Z₀ seed (broadcast once per batch).
+- **Replicated:** geometry + ~10 BSR value slabs per replica (h, s,
+  hscc, z, k_ev, b_zh, t_ks, t_zs, x, y, w + force buffers) —
+  ~310 MB/replica at R18 → B=16 ≈ 5 GB.
+- **Measured, lite-DMM4:** R10 107.8 → **~53 ms/eval** at B=16 (~2×);
+  R18 257 → **~208 ms/eval** at B=16 (~1.24×). Modest gain is expected:
+  the chain is *memory-bound* (15 fat SpGEMMs/eval on deg-378 masks;
+  each plan term is a scattered 64 B B-block read, ~2 FLOP/B, already
+  saturating the GPU at B=1) — batching removes host-side
+  per-eval overhead, not parallel headroom. Saturation at B=8.
+- **Guarantees (both paths):** bitwise-identical to the sequential path
+  (same kernel math per replica, no atomics, gather-only writes;
+  `test_sparse_frozen_batch_parity` + `test_sparse_dmm_batch_parity`,
+  max|dF| = 0.0). B=1 is exactly the sequential loop.
+- **Why only fixed-cost modes:** frozen has zero iterations and lite
+  runs a predetermined step count — both are uniform one-shot jobs, so
+  static batching is optimal. Cold fixq has *variable* purify
+  iterations per replica; batching it needs either active-mask
+  scheduling (manifest §F, deferred) or the proposed fixed-M TC2 recipe
+  (F5b, not yet implemented). `VIB_BATCH>1` outside `FROZEN`/`LITE`
+  **fails loud** — no silent fallback.
 - CPU reference mode (`RUST_DFTB_SPARSE_CPU=1`) rejects `VIB_BATCH > 1`
   with an explicit error — there is no implicit fallback.
 - **`RUST_DFTB_VIB_DMUPD=1`** (warm density update, needs `FIXQ=1`):

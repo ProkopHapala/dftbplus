@@ -133,6 +133,9 @@ inline int2 inner_jacobi_pair(int round, int ipair) {
 #ifndef MAX_CSWEEPS
 #define MAX_CSWEEPS 40
 #endif
+#ifndef JACOBI_LOG_SWEEPS
+#define JACOBI_LOG_SWEEPS 8     // rotlog capacity in sweeps — V replays once at solve end; flush-replay mid-solve if exceeded
+#endif
 
 inline int2 cyclic_jacobi_pair(int round, int ipair, int jn) {
     int m = jn - 1;
@@ -509,6 +512,53 @@ __kernel void jacobi_cyclic_global_batched(
 #define RESIDENT_V 0
 #endif
 
+#if !RESIDENT_V
+// Deferred-V replay: apply `nrounds` logged rounds of (c,s) to global V.
+// `rlog` = this system's log base; rounds are laid out sweep-major
+// ([sweep][round][pair]), so the schedule round is rr % jround. Rounds
+// must apply in order; pairs within a round are disjoint. A round whose
+// logged rotations are all identity is skipped entirely (common on late
+// sweeps) — saves the n·jpair apply pass AND the global fence.
+// Must be called from uniform control flow (contains barriers).
+inline void jac_replay_V(
+    __global float* gV,
+    __global const jlog2_t* rlog,
+    const int nrounds,
+    const int jround, const int jpair, const int jn, const int n,
+    const int lid, const int lsz,
+    __local volatile int* nrot,
+    __local jrot_t* rot_c, __local jrot_t* rot_s,
+    __local int* rot_p, __local int* rot_q)
+{
+    for (int rr = 0; rr < nrounds; ++rr) {
+        if (lid == 0) *nrot = 0;
+        barrier(CLK_LOCAL_MEM_FENCE);
+        for (int ip = lid; ip < jpair; ip += lsz) {
+            const jlog2_t cs = rlog[(size_t)rr * jpair + ip];
+            const jrot_t s = (jrot_t)cs.y;
+            if (s != (jrot_t)0.0) atomic_inc(nrot);
+            rot_c[ip] = (jrot_t)cs.x; rot_s[ip] = s;
+            int2 pq = cyclic_jacobi_pair(rr % jround, ip, jn);
+            rot_p[ip] = min(pq.x, pq.y); rot_q[ip] = max(pq.x, pq.y);
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        if (*nrot == 0) continue;
+        for (int it = lid; it < n * jpair; it += lsz) {
+            int k = it / jpair, a = it - k * jpair;
+            jupd_t s = (jupd_t)rot_s[a];
+            if (s == (jupd_t)0.0) continue;
+            int p = rot_p[a], q = rot_q[a];
+            jupd_t c = (jupd_t)rot_c[a];
+            jupd_t vkp = (jupd_t)gV[k * n + p];
+            jupd_t vkq = (q < n) ? (jupd_t)gV[k * n + q] : (jupd_t)0.0;
+            gV[k * n + p] = (float)fma(c, vkp, -s * vkq);
+            if (q < n) gV[k * n + q] = (float)fma(s, vkp, c * vkq);
+        }
+        barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
+    }
+}
+#endif
+
 __kernel void jacobi_resident_batched(
     __global float* A,   // [batch][n*n] in/out — eigenvalues on diag at exit
     __global float* V,   // [batch][n*n] in/out — eigenvectors (cols) at exit
@@ -524,7 +574,7 @@ __kernel void jacobi_resident_batched(
     const float kT,
     __global float* occ_w,
     __global float* mu,
-    __global jlog2_t* rotlog,          // [batch][jround*jpair] scratch (RESIDENT_V=0 only; pass any valid buf otherwise)
+    __global jlog2_t* rotlog,          // [batch][JACOBI_LOG_SWEEPS·jround·jpair] scratch (RESIDENT_V=0 only; pass any valid buf otherwise)
     __local float* lA,                 // n*(n+1)/2 — packed lower triangle (lat())
     __local float* lV,                 // n*(n+1) when RESIDENT_V, else 1-elem dummy
     __global const int* work_ids       // launch-index → physical slot (identity at full batch)
@@ -538,7 +588,8 @@ __kernel void jacobi_resident_batched(
     const int jpair = jn / 2;
     const int jround = jn - 1;
     const int lald = n + 1;                    // padded leading dim — lV only (lA is packed-triangular)
-    const size_t log_stride = (size_t)jround * jpair;
+    const size_t log_stride = (size_t)jround * jpair;                       // one sweep's logged (c,s)
+    const size_t sys_stride = (size_t)JACOBI_LOG_SWEEPS * log_stride;       // this system's log region
 
     __local jrot_t rot_c[128];
     __local jrot_t rot_s[128];
@@ -592,6 +643,9 @@ __kernel void jacobi_resident_batched(
     int stall = 0;
     int stop = 0;
     int nsw  = 0;
+#if !RESIDENT_V
+    int nlog = 0;               // sweeps logged since the last V flush
+#endif
 
     if (off_cur > off_exit) {
     stop = 2;
@@ -624,7 +678,7 @@ __kernel void jacobi_resident_batched(
                 }
                 rot_c[ip] = c; rot_s[ip] = s;
 #if !RESIDENT_V
-                rotlog[(size_t)gid * log_stride + r * jpair + ip] = (jlog2_t)((jrot_t)c, (jrot_t)s);
+                rotlog[(size_t)gid * sys_stride + (size_t)nlog * log_stride + r * jpair + ip] = (jlog2_t)((jrot_t)c, (jrot_t)s);
 #endif
             }
             barrier(CLK_LOCAL_MEM_FENCE);
@@ -686,33 +740,7 @@ __kernel void jacobi_resident_batched(
         }
 
 #if !RESIDENT_V
-        // ---- Sweep-end deferred V apply ----
-        // All of this sweep's rotations replayed against global V. V's
-        // footprint (n²×4B) stays cache-resident across the epoch so this
-        // is ~n× less global traffic than the per-round update; the log
-        // (jpair jlog2_t/round) streams through L2 trivially. Rounds must
-        // apply in order; pairs within a round are disjoint.
-        for (int r = 0; r < jround; ++r) {
-            for (int ip = lid; ip < jpair; ip += lsz) {
-                const jlog2_t cs = rotlog[(size_t)gid * log_stride + r * jpair + ip];
-                int2 pq = cyclic_jacobi_pair(r, ip, jn);
-                rot_c[ip] = (jrot_t)cs.x; rot_s[ip] = (jrot_t)cs.y;
-                rot_p[ip] = min(pq.x, pq.y); rot_q[ip] = max(pq.x, pq.y);
-            }
-            barrier(CLK_LOCAL_MEM_FENCE);
-            for (int it = lid; it < n * jpair; it += lsz) {
-                int k = it / jpair, a = it - (it / jpair) * jpair;
-                jupd_t s = (jupd_t)rot_s[a];
-                if (s == (jupd_t)0.0) continue;
-                int p = rot_p[a], q = rot_q[a];
-                jupd_t c = (jupd_t)rot_c[a];
-                jupd_t vkp = (jupd_t)gV[k * n + p];
-                jupd_t vkq = (q < n) ? (jupd_t)gV[k * n + q] : (jupd_t)0.0;
-                gV[k * n + p] = (float)fma(c, vkp, -s * vkq);
-                if (q < n) gV[k * n + q] = (float)fma(s, vkp, c * vkq);
-            }
-            barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
-        }
+        ++nlog;   // sweep's rotations stay in rotlog — V replays once at solve end
 #endif
 
         // ---- Sweep-end off-norm + exit/stagnation tests — from lA ----
@@ -729,8 +757,26 @@ __kernel void jacobi_resident_batched(
         if (off_cur <= off_exit) { stop = 0; break; }
         if (off_cur > 0.9f * prev_off) { if (++stall >= 3) { stop = 1; break; } } else { stall = 0; }
         prev_off = off_cur;
+#if !RESIDENT_V
+        if (nlog == JACOBI_LOG_SWEEPS) {        // log full — flush to V, keep solving
+            jac_replay_V(gV, rotlog + (size_t)gid * sys_stride, nlog * jround,
+                         jround, jpair, jn, n, lid, lsz, &l_nrot, rot_c, rot_s, rot_p, rot_q);
+            nlog = 0;
+        }
+#endif
     }
     }
+
+#if !RESIDENT_V
+    // ---- Solve-end deferred V apply — ONE pass over all logged sweeps ----
+    // Identical math to the old per-sweep replay: the same rotations in the
+    // same order, just later — the off-norm trajectory never touches V, so
+    // the sweep path is unchanged and V comes out bit-identical. Global V
+    // traffic drops from ~(sweeps) full re-streams to one pass (×2 if the
+    // log had to flush mid-solve).
+    jac_replay_V(gV, rotlog + (size_t)gid * sys_stride, nlog * jround,
+                 jround, jpair, jn, n, lid, lsz, &l_nrot, rot_c, rot_s, rot_p, rot_q);
+#endif
 
     // ---- Write-back: transformed A (residue on failure = diagnostic
     // record, same contract as the streaming kernel) and lV → gV ----

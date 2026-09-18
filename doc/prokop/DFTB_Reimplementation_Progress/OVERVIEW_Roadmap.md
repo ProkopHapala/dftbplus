@@ -510,8 +510,15 @@ eval kernels, `RUST_DFTB_VIB_BATCH`, bitwise-equal vs sequential
 post-port, ~720× vs CPU ~194 ms); full 4944-col frozen Hessian evals
 ~2.7 s. Wall is now ~72% the dense 4944² host eigensolve — next lever is
 eigensolve replacement or F2 column-local subranges, not more column
-batching. fixq/SCC batching deferred (needs variable-convergence
-scheduling — scheduler chat doc blueprint).
+batching. **F5a DMM-lite batch done (report §15.28)** — the same replica
+axis through the whole lite recipe (assemble→H_scc→B=Z·H→n_dmm×3
+SpGEMMs→W→contract) on ~310 MB/replica value slabs; `forces_dmm_batch`,
+`VIB_BATCH>1`+`VIB_LITE` batched (non-lite fails loud), bitwise vs
+sequential (`test_sparse_dmm_batch_parity`). Measured lite-DMM4: R10
+107.8→~53 ms/eval (~2×), R18 257→~208 ms/eval (~1.24× — memory-bound
+SpGEMMs, ~2 FLOP/B on scattered B-reads, not latency-bound). Cold fixq batching (F5b) still deferred: needs
+variable-convergence scheduling (scheduler chat doc blueprint) or a
+calibrated fixed-M TC2 recipe.
 
 - **Phase A** — Foundation: canonical C² spline (A1), TC2 fix 2 SpGEMMs/iter (A2), plan integration (A3) — done
 - **Phase B** — Sparse SCC solver, GPU-resident, self-consistent — done (`SparseDftb` production owner, `sparse_dftb.rs`)

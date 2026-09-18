@@ -2808,3 +2808,72 @@ refill) — only justified after frozen Hessian + eigensolve path are
 settled. F2 column-local pair subranges (~167 of 200k pairs per
 displacement) remains the next per-eval lever; at B=16 the eval is now
 dominated by real kernel work so F2 shrinks total work, not overhead.
+
+### §15.28 — DMM-lite replica batch (F5a) implemented + measured (2026-09-19)
+
+**What shipped.** The frozen-batch `gid(1)` replica axis extended onto
+the full fixed-recipe lite path (`VIB_LITE` + `VIB_DMUPD`): per replica
+`hs_diag`/`hs_assemble` → γ V → `build_Hscc` → [n_ns warm-NS] →
+`B = Z·H` → `n_dmm`×(`T=K·S`, `X=B·K`, `Y=T·X`, `axpby`, `symmetrize`)
+→ `W = 2·sym(B·K)` → contract+gather. Replica strides added to every
+touched kernel — **block strides on SpGEMM plans, element strides on
+elementwise/contract kernels; stride 0 = shared operand** — plus
+`bsr4_broadcast` to seed K₀/Z₀ slabs. `GpuDmmBufs` persistent workspace
+allocates all per-replica value buffers once (h, s, hscc, z, k_ev,
+b_zh, t_ks, t_zs, x, y, w + pair/force buffers): ~310 MB/replica at
+R18 → B=16 ≈ 5 GB of 25 GB. Public API
+`SparseDftb::forces_dmm_batch(x0, evals, h, n_ns, n_dmm, eta)`; driver
+routes `VIB_BATCH>1` + `VIB_LITE`, and **fails loud on `VIB_BATCH>1`
+without lite** — non-lite fixq has variable convergence and is not
+silently scalarized.
+
+**L0 parity (`test_sparse_dmm_batch_parity`, SiH4):** all 30 displaced
+evals through one `forces_dmm_batch` call vs sequential scalar lite —
+**max|dF| = 0.000e0, bit-identical**; 7-eval subset reuse into the same
+workspace bit-identical. Full sparse suite 4/4 green (frozen batch,
+GPU-vs-CPU pair parity, sih4 reuse unchanged).
+
+**Measured, lite-DMM4 recipe** (`n_ns=0`, `n_dmm=4`, `eta=8`):
+
+| system | scalar B=1 | B=8 | B=16 | speedup |
+|---|---:|---:|---:|---:|
+| R10 (330 at, M_K deg≈330) | ~107.8 ms/eval | ~55.5 | ~53 | **~2.0×** |
+| R18 (1648 at, M_K deg≈378) | ~257 ms/eval | ~216 | **~208** | **~1.24×** |
+
+R10: `bench_vib_r10.rhai` on the relaxed R10, `VIB_MAXCOL=24` (48
+evals) — 5.2 s scalar → 2.6 s at B=16. R18: raw sphere,
+`VIB_MAXCOL=8` (16 evals), `TRUNC_PRODUCTS=1`. ΔF columns identical to
+scalar at every B (e.g. R18 col 0–3: 2.2694e-2/2.2707e-2/3.5104e-2/
+2.2730e-2 at both B=1 and B=16).
+
+**Honest interpretation — memory-bound, not latency-bound.** The
+frozen eval gained ~6× from batching because it was overhead-dominated;
+the lite chain is 15 planned SpGEMMs on ~412k-block, deg-378 masks.
+One SpGEMM = one launch: `gid(0)` workgroup owns one output block-row
+(A row cached in `__local`, ≤384 blocks = 24 KB), 128 threads = 8
+teams × 16 lanes striding the row's output blocks, each term a
+scattered 64 B B-block read from global. Arithmetic intensity is ~2
+FLOP/B (64 FMA per 64 B read) vs the ~38 FLOP/B balance point — the
+kernel is **bound by scattered B-read bandwidth**, already saturated
+at B=1 (1648 WGs ≈ 10 resident waves; 24 KB local caps 2 WGs/CU).
+Replicas multiply the B traffic, so the ~1.2× at R18 is only what
+batching can remove: host-side per-eval work (state restore, geometry
+upload, guard re-validation, readback), launch-ramp/tail amortization,
+and L2 reuse of genuinely shared operands (S in `T=K·S`). R10 gains
+more (~2×) because its smaller products leave a larger overhead
+fraction. Saturation at B=8 confirms it: doubling the batch buys ~4 %.
+**The real lever for every tier is SpGEMM memory behavior** —
+reordering plan terms B-block-major to reuse each fetched B block
+across multiple C accumulations — or a second GPU, which adds actual
+bandwidth where a second replica slot cannot.
+
+**Consequence for ordering.** DMM-batch throughput scales with product
+cost, so the next per-eval lever is the same as the scalar one —
+a bandwidth-efficient SpGEMM plan order, narrower K/Z masks where
+physics allows, or fewer products (recipe tuning), not bigger B.
+F5b (fixed-M TC2) inherits all of this plumbing;
+its batch economics will look like R18-DMM's (~1.2×) unless the
+products shrink — worth knowing before building it. The large fixq win
+remains wall-clock, not per-eval: lite-DMM4 at ~208 ms/eval → full R18
+Hessian evals ≈ 34 min (vs ~2.5 h scalar fixq, ~45 min scalar lite),
+still eigensolve-dominated downstream.

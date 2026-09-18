@@ -420,9 +420,10 @@ impl GpuSccPlan {
         // T08b: eigensolver dispatch (n>64). resident = jacobi_resident_batched
         // (A in __local + deferred V apply) when it fits local_mem — measured
         // ~2.3–2.7× the streaming direct kernel at N=86. rotlog is the
-        // per-sweep rotation-log scratch that mode needs ([batch][jround·jpair]
-        // jlog2_t — float2 at prec=0, double2 at prec>=1; n=86/b400 ≈ 11.5 MB
-        // at the prec=0 default); 1-elem dummy otherwise.
+        // rotation-log scratch that mode needs ([batch][RESIDENT_LOG_SWEEPS·
+        // jround·jpair] jlog2_t — float2 at prec=0, double2 at prec>=1;
+        // n=86/b400 ≈ 47 MB at the prec=0 default — buys batched V replay
+        // while staying L2-sized); 1-elem dummy otherwise.
         // R8: env override for A/B sweeps (test processes can't call
         // set_jacobi_prec before a plan is built inside a helper).
         let jacobi_prec = std::env::var("RUST_DFTB_JACOBI_PREC")
@@ -437,7 +438,7 @@ impl GpuSccPlan {
         let jn_pad = (n + 1) & !1usize;
         let jacobi_rotlog = rt.zero_buffer::<f32>(
             if eig_kind == crate::qmqm::gpu_eigen::EigKind::ResidentDefV && n > 64 {
-                batch * (jn_pad - 1) * (jn_pad / 2) * if jacobi_prec >= 1 { 4 } else { 2 }
+                batch * crate::qmqm::gpu_eigen::RESIDENT_LOG_SWEEPS * (jn_pad - 1) * (jn_pad / 2) * if jacobi_prec >= 1 { 4 } else { 2 }
             } else {
                 1
             },

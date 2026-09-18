@@ -226,6 +226,7 @@ and the lack of a proper LBFGS optimizer (FIRE is inefficient near the minimum).
 | GPU Jacobi resident (n≲96) | OpenCL | `gpu_tiled_jacobi.cl::jacobi_resident_batched` | **active, auto-default** | A `__local`-resident all sweeps + per-sweep deferred-V apply via rotlog; ~2.2× vs direct at N=86, bit-identical accuracy. res-AV variant (V also local) gated by 48 KB device cap |
 | GPU block Jacobi (n>128) | OpenCL | `rust_dftb/src/qmqm/gpu_block_jacobi.cl::block_jacobi_1wg` | active | compound-pivot B=32/IMAX=1/ITOL=1e-6 (tuned); ~5× vs direct at N=246 |
 | GPU eigensolver dispatch | Rust | `rust_dftb/src/qmqm/gpu_eigen.rs::eigsolver_kind` | active | auto = resident-if-fits (n≤128) / block (n>128) / direct fallback; `RUST_DFTB_EIGSOLVER`={auto,direct,block,resident,resident_av}, fail-loud |
+| GPU dense TC2 purification | OpenCL | `rust_dftb/src/qmqm/gpu_purify.rs` + `gpu_purify.cl` | **experimental** | eigensolve *alternative*: batched DM purification, 1 WG/system, fused step (D²+‖D²−D‖+Tr+branch+freeze), 1 launch/iter, zero syncs. Parity verified (n=86 b16: ΔE≈1e-6, ‖D−Dref‖≈3e-5); perf first-pass 34 ms/solve at b400 (row·row GEMM ~0.9 TFLOPS) — needs register-tiled GEMM + warm-start to compete. Design+status: `tasts/HBond_Relaxed_Scan_GPU/Alternative_Dense_Multi_Eigensolve.md` |
 | Davidson partial eigensolve | Rust | `rust_dftb/src/methods/sparse/davidson.rs` | experimental | for sparse/large systems, frontier orbitals only. Fails on coronene (diagonal preconditioner). See `davidson_eigensolver.md`. |
 | Chebyshev+Ritz sparse eigensolve | Python | `scripts/sparse_homo_lumo.py` | active | Cholesky-transformed implicit operator + polynomial filter. Converges on coronene, circumcoronene, ribbons to N=1156. 7.5× faster than dense at N=1156. See `chebyshev_ritz_eigensolver.md`. |
 
@@ -248,7 +249,8 @@ and the lack of a proper LBFGS optimizer (FIRE is inefficient near the minimum).
 ## Cross-references
 
 - Session report: `doc/prokop/reports/2025-09-05_hbond_optimization_lapack.md`
-- GPU Jacobi measurements (2026-09-17): `doc/prokop/reports/2026-09-17_resident_jacobi_eigensolver.md` + measured sweep digest `doc/prokop/tasts/HBond_Relaxed_Scan_GPU/Measured_Facts_Jacobi_Sweeps.md` — the GPU-side counterpart: streaming direct kernel is DRAM-bandwidth-bound; resident-A + deferred-V fixes it (~2.2×).
+- GPU Jacobi measurements (2026-09-17): `doc/prokop/reports/2026-09-17_resident_jacobi_eigensolver.md` + measured sweep digest `doc/prokop/tasts/HBond_Relaxed_Scan_GPU/Measured_Facts_Jacobi_Sweeps.md` — the GPU-side counterpart: streaming direct kernel is DRAM-bandwidth-bound; resident-A + deferred-V fixes it (~2.2×). Further falsification (2026-09-18, §8 of the digest): Jacobi is **round-latency-bound** — ~5 % of peak is its structural ceiling; the ≥10× routes are GEMM-shaped algorithms.
+- Alternative eigensolve strategies (2026-09-18): `doc/prokop/tasts/HBond_Relaxed_Scan_GPU/Alternative_Dense_Multi_Eigensolve.md` — DM-purification/FOE (implemented, parity-verified, first-pass perf), sign-function spectral D&C (deferred), Householder (rejected).
 - Task spec: `doc/prokop/tasts/GPU_MultiSystem/hbond_switching.md`
 - SCC solver: `rust_dftb/src/qmqm/solver.rs`
 - Fragment diagonalize: `rust_dftb/src/qmqm/fragment.rs`

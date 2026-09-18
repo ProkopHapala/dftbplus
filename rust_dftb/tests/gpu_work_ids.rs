@@ -345,7 +345,7 @@ fn test_work_ids_resident_jacobi_subset() {
     let mu = rt.zero_buffer::<f32>(batch).unwrap();
     let jn = if n & 1 == 1 { n + 1 } else { n };
     let rotlog = rt
-        .zero_buffer::<f32>(batch * (jn - 1) * (jn / 2) * 4)
+        .zero_buffer::<f32>(batch * rust_dftb::qmqm::gpu_eigen::RESIDENT_LOG_SWEEPS * (jn - 1) * (jn / 2) * 4)
         .unwrap(); // prec=1 → double2 jlog2_t
     let ids = [target as i32];
     let wids = rt.buffer_from_slice(&ids).unwrap();
@@ -471,7 +471,7 @@ fn work_ids_saturation_sweep() {
     let mu = rt.zero_buffer::<f32>(batch).unwrap();
     let jn = if n & 1 == 1 { n + 1 } else { n };
     let rotlog = rt
-        .zero_buffer::<f32>(batch * (jn - 1) * (jn / 2) * 4)
+        .zero_buffer::<f32>(batch * rust_dftb::qmqm::gpu_eigen::RESIDENT_LOG_SWEEPS * (jn - 1) * (jn / 2) * 4)
         .unwrap(); // prec=1 → double2 jlog2_t
     let all_ids: Vec<i32> = (0..batch as i32).collect();
     let wids_full = rt.buffer_from_slice(&all_ids).unwrap();

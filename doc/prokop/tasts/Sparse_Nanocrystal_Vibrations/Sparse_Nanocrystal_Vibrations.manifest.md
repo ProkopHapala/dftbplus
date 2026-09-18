@@ -3209,7 +3209,28 @@ Phased plan + gates:
       on a bounded column set.
 - [ ] **F3 — fuse + resync.** Merge launches sharing `xyzu[b]` reads;
       single pe_rep device reduction. Re-benchmark; update report.
-- [ ] **F5 — fixed-iteration fixq batch (user proposal 2026-09-19:
+- [x] **F5a — DMM-lite replica batch (DONE 2026-09-19, report §15.28).**
+      `forces_dmm_batch(x0, evals, h, n_ns, n_dmm, eta)`: same `gid(1)`
+      replica axis extended onto the full lite recipe — hs_diag/
+      hs_assemble → gamma_matvec → build_Hscc → [n_ns warm-NS] → B=Z·H
+      → n_dmm×(T=K·S, X=B·K, Y=T·X, axpby, symmetrize) → W=2·sym(B·K)
+      → contract+gather — all on per-replica value buffers (replica
+      strides: block strides on SpGEMM, element strides on elementwise/
+      contract kernels; 0 = shared operand). Shared: sparse structures,
+      all symbolic plans, K₀/Z₀ seed (broadcast once per batch), S
+      operand in T=K·S. `GpuDmmBufs` persistent workspace (~310 MB/
+      replica at R18 → B=16 ≈ 5 GB). Driver: `VIB_BATCH>1` + `VIB_LITE`
+      → batched; non-lite `VIB_BATCH>1` fails loud (no silent fallback).
+      L0 `test_sparse_dmm_batch_parity`: 30 evals + subset reuse,
+      **max|dF|=0.000e0 bit-identical**; all 4 sparse tests pass.
+      Measured — R10 lite-DMM4: 107.8 → 53 ms/eval at B=16 (~2×);
+      R18 lite-DMM4: 257 → 208 ms/eval at B=16 (~1.24×, saturated at
+      B=8; the chain is memory-bound — 15 fat SpGEMMs/eval on
+      412k-block masks, each term a scattered 64B B-block read at
+      ~2 FLOP/B — so batching removes host-side per-eval overhead,
+      not parallel headroom; the real lever is SpGEMM memory
+      behavior or a second GPU, not more replicas).
+- [ ] **F5b — fixed-iteration fixq batch (user proposal 2026-09-19:
       constant purify counts instead of convergence scheduling).**
       Key physics: all 6N displaced geometries of one Hessian have
       ~identical spectral properties — same gap, spectral width varies

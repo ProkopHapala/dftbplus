@@ -42,16 +42,23 @@
 //           dense 4944^2 host eigensolve (~100 s).  (VIB_FROZEN=1)
 //           QUALITATIVE ONLY — si10h16 parity vs scc: rms 157 cm-1,
 //           Si-H ~250 cm-1 soft, rigid modes land at +120 cm-1.
+//   lite    ~257 ms/eval (B=1) → ~208 ms/eval at VIB_BATCH=16 (~1.24×;
+//           memory-bound SpGEMMs — §15.28) → full Hessian evals ~34 min
+//           (VIB_FIXQ=1 VIB_DMUPD=1 VIB_LITE=1 VIB_DMM=4 VIB_NSMAX=0)
+//           ~1.0% column error vs cold fixq (R10-calibrated) — the
+//           quality/throughput sweet spot for production Hessians.
 //   fixq    ~0.92 s/eval → full Hessian ~2.5 h    (VIB_FIXQ=1)
 //           quantitative — si10h16 parity vs scc: rms 5.9 cm-1,
-//           Si-H ~8 cm-1 soft, rigid modes intact. RECOMMENDED.
+//           Si-H ~8 cm-1 soft, rigid modes intact. RECOMMENDED for
+//           reference/parity columns.
 //   full scc ~est. 5-8 s/eval → overnight         (no env)
 // Frozen evals are fully GPU-resident (§15.25): central K0/W0/dq live on
 // device; per eval only xyzu up + forces down (O(N) transfers).
 //
 // env knobs: VIB_H (FD step, default 0.02 A), BENCH_ST (scc tol, 1e-5),
-//   RUST_DFTB_VIB_BATCH (frozen evals per launch wave, default 1; ~16
-//   saturates at R18 — §15.27),
+//   RUST_DFTB_VIB_BATCH (frozen or lite-DMM evals per launch wave,
+//   default 1; ~16 saturates at R18 — §15.27/§15.28; fails loud on
+//   non-lite fixq),
 //   R18_XYZ (override input geometry), R18_RELAX=1 (run FIRE + save),
 //   R18_FMAX (relax force tol, 1e-4), R18_STEPS (relax max steps, 400),
 //   R18_RTRUNC / R18_TAPER / R18_RK / R18_RZ (mask radii; defaults

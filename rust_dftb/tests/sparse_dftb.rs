@@ -318,3 +318,92 @@ fn test_sparse_frozen_batch_parity() {
     }
     eprintln!("[frozen batch] subset reuse (7 evals): bit-identical");
 }
+
+// ============================================================================
+// F5a (manifest §F.1): batched fixed-iteration DMM-lite evals — each
+// replica runs the same predetermined recipe (assemble→V→H_scc→B=Z·H→
+// n_dmm DMM steps→W→contract) on its own matrix slabs. Bit-parity target
+// vs the scalar lite chain (restore→set_coords→scc_fixedq[lite]→forces):
+// identical kernel sequence per replica, deterministic row reductions.
+// ============================================================================
+
+#[test]
+fn test_sparse_dmm_batch_parity() {
+    // Scalar lite recipe envs (read inside scc_fixedq): lite + dmupd
+    // selects the fixed-cost branch; DMM/ETA match the batch args.
+    std::env::set_var("RUST_DFTB_VIB_LITE", "1");
+    std::env::set_var("RUST_DFTB_VIB_DMUPD", "1");
+    std::env::set_var("RUST_DFTB_VIB_DMM", "4");
+    std::env::set_var("RUST_DFTB_VIB_DMM_ETA", "8.0");
+    std::env::set_var("RUST_DFTB_VIB_NSMAX", "0");
+    std::env::remove_var("RUST_DFTB_VIB_LINEAR");
+    std::env::remove_var("RUST_DFTB_VIB_SEED");
+    std::env::remove_var("RUST_DFTB_VIB_METRIC");
+    let dir = require_sih_sk_dir();
+    let (sp, xyz) = sih4();
+    let sk = load_sk_for_species(&dir, &sp).unwrap_or_else(|e| panic!("load SK: {e}"));
+    let mut eng =
+        SparseDftb::new(sk, &dir, sp, xyz).unwrap_or_else(|e| panic!("SparseDftb::new: {e}"));
+    eng.scc(80, 1e-5).unwrap_or_else(|e| panic!("SCC: {e}"));
+    eng.snapshot_electronic_state()
+        .unwrap_or_else(|e| panic!("snapshot: {e}"));
+    if eng.cpu_pair() {
+        panic!("test requires the GPU pair path — RUST_DFTB_SPARSE_CPU is set");
+    }
+    let h = 0.01f64;
+    let x0 = eng.coords().to_vec();
+    let n = eng.n_atom();
+    let evals: Vec<(usize, usize, f64)> = (0..n)
+        .flat_map(|a| (0..3).flat_map(move |ax| [(a, ax, 1.0), (a, ax, -1.0)]))
+        .collect();
+    // Scalar lite reference — restore central state, displace, fixedq
+    // (lite → refresh_b_zh + 4 DMM steps), forces.
+    let mut work = x0.clone();
+    let mut f_ref: Vec<Vec<[f64; 3]>> = Vec::with_capacity(evals.len());
+    for &(a, ax, sign) in &evals {
+        eng.restore_central_state()
+            .unwrap_or_else(|e| panic!("restore: {e}"));
+        work[a][ax] = x0[a][ax] + sign * h;
+        eng.set_coords(&work)
+            .unwrap_or_else(|e| panic!("set_coords: {e}"));
+        work[a][ax] = x0[a][ax];
+        eng.scc_fixedq()
+            .unwrap_or_else(|e| panic!("scc_fixedq lite: {e}"));
+        f_ref.push(
+            eng.forces()
+                .unwrap_or_else(|e| panic!("forces: {e}"))
+                .forces,
+        );
+    }
+    // Batched — same recipe: n_ns=0 (shared central Z), 4 DMM steps,
+    // eta=8.0. One call, JobId-indexed outputs.
+    let f_b = eng
+        .forces_dmm_batch(&x0, &evals, h, 0, 4, 8.0)
+        .unwrap_or_else(|e| panic!("forces_dmm_batch: {e}"));
+    assert_eq!(f_b.len(), evals.len(), "batch result count mismatch");
+    let mut dmax = 0.0f64;
+    for (e, (fr, fb)) in f_ref.iter().zip(f_b.iter()).enumerate() {
+        let d = max_diff3(fr, &fb.forces);
+        dmax = dmax.max(d);
+        assert_eq!(
+            d, 0.0,
+            "eval {e}: dmm-batch vs scalar lite max|dF|={d:.3e} — replica \
+             slot math must be bit-identical to the scalar chain"
+        );
+    }
+    eprintln!(
+        "[dmm batch] {} evals: max|dF|={dmax:.3e} (bit-identical)",
+        evals.len()
+    );
+    // Subset reuse — a smaller second batch must not corrupt cap state.
+    let sub: Vec<(usize, usize, f64)> = evals[..7].to_vec();
+    let f_s = eng
+        .forces_dmm_batch(&x0, &sub, h, 0, 4, 8.0)
+        .unwrap_or_else(|e| panic!("forces_dmm_batch subset: {e}"));
+    assert_eq!(f_s.len(), 7);
+    for (e, (fr, fb)) in f_ref.iter().take(7).zip(f_s.iter()).enumerate() {
+        let d = max_diff3(fr, &fb.forces);
+        assert_eq!(d, 0.0, "subset eval {e}: max|dF|={d:.3e}");
+    }
+    eprintln!("[dmm batch] subset reuse (7 evals): bit-identical");
+}

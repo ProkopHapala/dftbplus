@@ -30,6 +30,7 @@ pub mod gpu_forces;
 pub mod gpu_hermitian;
 pub mod gpu_pbc;
 pub mod gpu_pbc_plan;
+pub mod gpu_purify;
 pub mod pbc_cell;
 // Constrained-DFT fragment-charge layer (Dense_Multi_CDFT spec) —
 // optional attach on GpuSccPlan; None → zero cost on the solver.

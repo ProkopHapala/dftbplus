@@ -146,6 +146,14 @@ const GPU_TILED_JACOBI_TEMPLATE: &str = include_str!("gpu_tiled_jacobi.cl");
 /// block pairs are processed sequentially, not in parallel.
 const TILED_MAX_SWEEPS: usize = 100;
 
+/// Rotlog capacity in sweeps for `jacobi_resident_batched` deferred-V —
+/// a solve exceeding it flush-replays mid-solve and keeps going. Chosen
+/// so the batch-400 n=86 log region (~47 MB) stays L2-sized: measured
+/// cold-solve regression at 8 (≈200 KB/sys → log reads miss L2 during
+/// the end replay). Must match the kernel-side JACOBI_LOG_SWEEPS
+/// injected by render_resident_source.
+pub const RESIDENT_LOG_SWEEPS: usize = 4;
+
 /// `RUST_DFTB_JACOBI_SWEEPS` env override (diagnostic), else `default`.
 /// Shared so the production direct kernel (MAX_CSWEEPS) and the deprecated
 /// tiled path (MAX_SWEEPS) honor the same knob — R5.
@@ -178,6 +186,7 @@ pub fn render_tiled_source_cfg(b: usize, wg: usize, prec: u32, no_tail: bool) ->
         .replace("#define STRIP_R 32", &format!("#define STRIP_R {}", b))
         .replace("#define MAX_SWEEPS 50", &format!("#define MAX_SWEEPS {}", jacobi_sweeps(TILED_MAX_SWEEPS)))
         .replace("#define MAX_CSWEEPS 40", &format!("#define MAX_CSWEEPS {}", jacobi_sweeps(40)))
+        .replace("#define JACOBI_LOG_SWEEPS 8", &format!("#define JACOBI_LOG_SWEEPS {}", RESIDENT_LOG_SWEEPS))
         .replace("#define JACOBI_PREC 2", &format!("#define JACOBI_PREC {}", prec))
         // R8b: env-tunable off-norm exit threshold for sweep/tolerance sweeps.
         .replace("#ifndef JACOBI_OFF_TOL\n#define JACOBI_OFF_TOL 1.0e-6f    // off/‖A‖_F exit threshold\n#endif",
@@ -263,11 +272,12 @@ pub fn resident_jacobi_batched(
     let ones = rt.buffer_from_slice(&vec![1i32; batch])?;
     let diag = rt.zero_buffer::<f32>(4 * batch)?;
     let jn = if n & 1 == 1 { n + 1 } else { n };
-    // jlog2_t entry: double2 (4 f32) at prec>=1, float2 (2 f32) at prec=0.
+    // jlog2_t entry: double2 (4 f32) at prec>=1, float2 (2 f32) at prec=0;
+    // the log holds RESIDENT_LOG_SWEEPS sweeps — V replays once at solve end.
     let log_len = if resident_v {
         1
     } else {
-        batch * (jn - 1) * (jn / 2) * if prec >= 1 { 4 } else { 2 }
+        batch * RESIDENT_LOG_SWEEPS * (jn - 1) * (jn / 2) * if prec >= 1 { 4 } else { 2 }
     };
     let rotlog = rt.zero_buffer::<f32>(log_len)?;
     let occ_w = rt.zero_buffer::<f32>(batch * n)?;

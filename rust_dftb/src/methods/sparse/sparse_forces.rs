@@ -283,6 +283,11 @@ impl SparseDWWorkspace {
     pub fn w(&self) -> &GpuBsrMatrix {
         &self.w
     }
+    /// Access the W = (Z·H_scc)·K symbolic plan (F5a batched DMM builds
+    /// per-replica W outside this workspace's single-system buffers).
+    pub fn plan_zk(&self) -> Option<&SpgemmPlanGpu> {
+        self.plan_zk.as_ref()
+    }
 }
 
 /// Build `D = 2K` and `W = 2 K H_scc K` on the GPU using masked SpGEMM.

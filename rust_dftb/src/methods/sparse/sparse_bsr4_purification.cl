@@ -444,10 +444,20 @@ __kernel void bsr4_spgemm_plan_Bsym(
     __global const uint*  plan_b_idx,
 
     __global const uint*  C_row,
-    __global float*       C
+    __global float*       C,
+
+    // F5 multi-replica: dim1 = replica slot — sa/sb/sc are the per-matrix
+    // BLOCK strides (0 for a shared read-only operand).
+    const uint sa,
+    const uint sb,
+    const uint sc
 ){
     const uint i   = get_group_id(0);
     const uint lid = get_local_id(0);
+    const uint rep = get_group_id(1);
+    A += (size_t)rep * sa * BS2;
+    B += (size_t)rep * sb * BS2;
+    C += (size_t)rep * sc * BS2;
 
     if(i >= nrow) return;
 
@@ -626,10 +636,20 @@ __kernel void bsr4_spgemm_plan(
     __global const uint*  plan_b_idx,
 
     __global const uint*  C_row,
-    __global float*       C
+    __global float*       C,
+
+    // F5 multi-replica: dim1 = replica slot — sa/sb/sc are per-matrix
+    // BLOCK strides (0 for a shared read-only operand).
+    const uint sa,
+    const uint sb,
+    const uint sc
 ){
     const uint i   = get_group_id(0);
     const uint lid = get_local_id(0);
+    const uint rep = get_group_id(1);
+    A += (size_t)rep * sa * BS2;
+    B += (size_t)rep * sb * BS2;
+    C += (size_t)rep * sc * BS2;
 
     if(i >= nrow) return;
 
@@ -1285,9 +1305,19 @@ __kernel void bsr4_axpby(
     const float beta,
     __global const float* B,
 
-    __global float* C
+    __global float* C,
+
+    // F5 multi-replica: dim1 = replica slot — ELEMENT strides
+    // (0 = shared read-only operand).
+    const uint sa,
+    const uint sb,
+    const uint sc
 ){
     const uint i = get_global_id(0);
+    const uint rep = get_global_id(1);
+    A += (size_t)rep * sa;
+    B += (size_t)rep * sb;
+    C += (size_t)rep * sc;
 
     if(i < nblock*BS2){
 
@@ -1298,6 +1328,24 @@ __kernel void bsr4_axpby(
                 beta*B[i]
             );
     }
+}
+
+
+// ============================================================================
+// BROADCAST: dst[rep*n + i] = src[i] — replicate a shared matrix/vector
+// into all replica slots (F5 multi-replica state init).
+// ============================================================================
+
+__kernel void bsr4_broadcast(
+    const uint n,
+
+    __global const float* src,
+
+    __global float*       dst
+){
+    const uint i   = get_global_id(0);
+    const uint rep = get_global_id(1);
+    if(i < n) dst[(size_t)rep*n + i] = src[i];
 }
 
 
@@ -1416,9 +1464,14 @@ __kernel void bsr4_symmetrize(
 
     __global const uint* transpose_block,
 
-    __global float* A
+    __global float* A,
+
+    // F5 multi-replica: dim1 = replica slot — ELEMENT stride of A
+    // (0 = single shared matrix, scalar path).
+    const uint sa
 ){
     const uint b = get_global_id(0);
+    A += (size_t)get_global_id(1) * sa;
 
     if(b >= nblock) return;
 
@@ -1520,10 +1573,19 @@ __kernel void bsr4_build_Hscc(
     // dummy lanes would pollute the padded space (second review R13).
     __global const uint* n_orb,
 
-    __global float* H
+    __global float* H,
+
+    // F5 multi-replica: dim1 (group) = replica slot — shared BLOCK stride
+    // for H0/S/H (same M_HS mask); V_atom strides by nrow per replica.
+    const uint sblk
 ){
     const uint i   = get_group_id(0);
     const uint lid = get_local_id(0);
+    const uint rep = get_group_id(1);
+    H0 += (size_t)rep * sblk * BS2;
+    S  += (size_t)rep * sblk * BS2;
+    H  += (size_t)rep * sblk * BS2;
+    V_atom += (size_t)rep * nrow;
 
     if(i >= nrow) return;
 

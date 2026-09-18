@@ -91,7 +91,10 @@ QM/QM fragment solver with OpenCL GPU offload. Python utilities (`pyBall/`,
     warm-density commutator update, `linear_response` stripped first-order
     tier, `snapshot_p0_x0` central-metric snapshots, projector diagnostics,
     `GpuFrozenBatch` + `forces_frozen_batch_dev` — multi-replica frozen
-    force batch, one persistent workspace, `gid(1)` replica axis),
+    force batch, one persistent workspace, `gid(1)` replica axis;
+    `GpuDmmBufs` + `forces_dmm_batch_dev` — same axis through the full
+    lite recipe (assemble→H_scc→B=Z·H→n_dmm×3 SpGEMMs→W→contract),
+    replica strides on all solve kernels, ~310 MB/replica at R18),
     `sparse_hs.cl` (`hs_contract`/`rep_eval`/`force_gather` — device
     SK assembly + analytic K/W pair contraction + repulsive + gather),
     `sparse_gamma.cl` (tiled `gamma_matvec`/`gamma_force` — local-memory
@@ -100,8 +103,10 @@ QM/QM fragment solver with OpenCL GPU offload. Python utilities (`pyBall/`,
     `scc` / `forces` / `fire_step` / `md_step` / `relax` — compile once,
     persistent buffers; `GpuCentralState` device-resident K/Z/K₀/W₀
     snapshots, lazy H/S mirrors; FD Hessians via `sparse_vibrations`,
-    frozen multi-replica via `forces_frozen_batch(x0, evals, h)` —
-    `RUST_DFTB_VIB_BATCH`, bitwise vs sequential; mode knobs
+    frozen multi-replica via `forces_frozen_batch(x0, evals, h)` and
+    lite-DMM via `forces_dmm_batch(x0, evals, h, n_ns, n_dmm, eta)` —
+    `RUST_DFTB_VIB_BATCH` (frozen or `VIB_LITE` only, else fails loud),
+    bitwise vs sequential; mode knobs
     `RUST_DFTB_VIB_*` — see `userguide/sparse_vibrations.md`). Drive with
     **`dftb_engine --script rust_dftb/scripts/test_sparse_dftb_sih4.rhai`**
     (userguide `sparse_dftb.md`). Smoke: `tests/sparse_dftb.rs`. Report:
@@ -114,6 +119,12 @@ QM/QM fragment solver with OpenCL GPU offload. Python utilities (`pyBall/`,
   `RUST_DFTB_EIGSOLVER`={auto,direct,block,resident,resident_av}; measured
   digest `doc/prokop/tasts/HBond_Relaxed_Scan_GPU/Measured_Facts_Jacobi_Sweeps.md`,
   report `doc/prokop/reports/2026-09-17_resident_jacobi_eigensolver.md`),
+  `gpu_purify.rs` + `gpu_purify.cl` (batched dense TC2 density-matrix
+  purification — alternative eigensolve path, one WG/system, fused
+  step kernel + device-side freeze; `RUST_DFTB_PURIFY_{WG,TILE}` knobs;
+  correctness verified, GEMM interior still first-pass; design+status
+  `doc/prokop/tasts/HBond_Relaxed_Scan_GPU/Alternative_Dense_Multi_Eigensolve.md`,
+  tests `tests/gpu_purify.rs`),
   `gpu_matrix_ops.cl`, `gpu_scc.rs` (legacy one-shot SCC;
   do not use for production), `gpu_scc_plan.rs` (persistent SCC inner loop),
   `gpu_dftb.rs` (**production run loop** — `GpuDftb::new` / `set_coords` / `scc` /

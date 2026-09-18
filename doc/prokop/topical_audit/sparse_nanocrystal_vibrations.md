@@ -63,11 +63,18 @@ bitwise-identical to sequential. Measured: B=8 → 0.31, **B=16 → 0.27
 ms/eval (~5.9×)**, B=32 saturated; ~720× vs single-thread CPU (~194 ms).
 Full 4944-column frozen Hessian: ~2.7 s of evals inside a ~139 s wall
 dominated (~72%) by the dense host eigensolve — the next lever is
-eigensolve replacement or F2 column-local subranges. fixq/DMM batching is
-deferred: DMM needs per-replica matrix buffers (uniform cost — batchable
-with static batches + ~26 MB/replica of K/Z/W storage); fixq additionally
-needs variable-convergence scheduling (active masks, compact job IDs —
-the `Sparse_MultiSystem_Scheduler.chat.md` blueprint).
+eigensolve replacement or F2 column-local subranges. **F5a DMM-lite
+batch (done, report §15.28):** the same `gid(1)` axis extended through
+the whole lite recipe (assemble → H_scc → B=Z·H → n_dmm×3 SpGEMMs → W →
+contract) on ~310 MB/replica of value slabs; `forces_dmm_batch`,
+`VIB_BATCH>1`+`VIB_LITE` → batched, non-lite fails loud. Bitwise vs
+sequential (`test_sparse_dmm_batch_parity`, max|dF|=0). Measured: R10
+107.8→~53 ms/eval (~2×), R18 257→~208 ms/eval (~1.24×) — memory-bound
+(scattered 64 B B-reads, ~2 FLOP/B), not latency-bound; the gain is
+removed host overhead, not parallel headroom. Cold fixq batching (F5b) additionally needs either
+variable-convergence scheduling (active masks, compact job IDs — the
+`Sparse_MultiSystem_Scheduler.chat.md` blueprint) or a calibrated
+fixed-M TC2 recipe — same plumbing, more live matrices per replica.
 
 ## Implementations
 
@@ -84,6 +91,7 @@ the `Sparse_MultiSystem_Scheduler.chat.md` blueprint).
 | FD-Hessian warm update | `sparse_system.rs::dmm_descend` / `linear_response`, `forces_frozen` | [*] validated | tier ladder: clamped 5.5 ms/6.3%, lite 64 ms/3.1%, 105 ms/1.0% |
 | GPU pair physics (frozen eval) | `sparse_hs.cl::hs_contract`, `sparse_gamma.cl`, `rep_eval`, `force_gather` | [*] production | all-pairs device path, gather-only; CPU explicit ref; parity 1.2e-6 |
 | Frozen multi-replica batch | `GpuFrozenBatch` + `forces_frozen_batch`, `VIB_BATCH` | [*] measured | gid(1) replica axis; bitwise vs sequential; B=16 → 0.27 ms/eval @R18 |
+| DMM-lite multi-replica batch | `GpuDmmBufs` + `forces_dmm_batch`, `VIB_BATCH`+`VIB_LITE` | [*] measured | replica strides through assemble/HSCC/SpGEMM/W chain; bitwise vs sequential; B=16 → 53 ms/eval @R10, 208 ms/eval @R18 (memory-bound — scattered B-reads ~2 FLOP/B) |
 
 ## Gate Status
 
@@ -96,7 +104,7 @@ the `Sparse_MultiSystem_Scheduler.chat.md` blueprint).
 | F | Geometry optimization | [~] investigating — FIRE 1.477 Å; not done |
 | G | Same-geometry Hessian parity | [~] investigating — 0.11% vs dense; FD columns validated 0.3% ΔF vs cold fixq |
 | H | Spectra at each method's own minimum | [~] produced — cube65 ~5–15% stiff vs DFTB+ reference |
-| I | Scaling and whole-program profile | [~] frozen columns batched (B=16 → 0.27 ms/eval @R18); wall now ~72% dense host eigensolve — eigensolve replacement or F2 column-local next |
+| I | Scaling and whole-program profile | [~] frozen + lite-DMM columns batched (B=16 → 0.27 / 208 ms/eval @R18); wall now ~72% dense host eigensolve — eigensolve replacement or F2 column-local next |
 
 ## Remaining split (do not treat GPT-5.6 2026-09-09 list as current)
 

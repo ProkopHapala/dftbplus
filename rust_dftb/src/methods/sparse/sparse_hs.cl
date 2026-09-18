@@ -160,9 +160,12 @@ __kernel void hs_diag(
     __global const uint* n_orb,
     __global const float4* onsite,
     __global float* h,
-    __global float* s)
+    __global float* s,
+    const uint sblk)   // F5 replica: h/s BLOCK stride (dim1 = slot)
 {
     uint i = get_global_id(0);
+    h += (size_t)get_global_id(1) * sblk * 16;
+    s += (size_t)get_global_id(1) * sblk * 16;
     if (i >= n) return;
     int ni = (int)n_orb[i];
     uint bd = hs_diag[i];
@@ -191,9 +194,15 @@ __kernel void hs_assemble(
     const uint max_ctrl,
     const float4 taper,
     __global float* h,
-    __global float* s)
+    __global float* s,
+    const uint n_atom,  // F5 replica: xyzu float4 stride (dim1 = slot)
+    const uint sblk)    // F5 replica: h/s BLOCK stride
 {
     uint p = get_global_id(0);
+    const uint rep = get_global_id(1);
+    xyzu += (size_t)rep * n_atom;
+    h += (size_t)rep * sblk * 16;
+    s += (size_t)rep * sblk * 16;
     if (p >= npairs) return;
     int4 pr = pairs[p];
     int i = pr.x, j = pr.y, bij = pr.z, bji = pr.w;
@@ -279,15 +288,20 @@ __kernel void hs_contract(
     __global const float* w_vals,
     __global const float* v_atom,
     __global float4* pf,
-    const uint n_atom)
+    const uint n_atom,
+    const uint k_str,  // F5 replica: k_vals ELEMENT stride (0 = shared)
+    const uint w_str)  // F5 replica: w_vals ELEMENT stride (0 = shared)
 {
     uint p = get_global_id(0);
     if (p >= npairs) return;
     // F1 replica axis: dim1 = eval slot — xyzu/v_atom/pf are per-replica
-    // strided; k_vals/w_vals are the shared central snapshot (read-only).
+    // strided; k_vals/w_vals are shared (strides 0) in the frozen path or
+    // per-replica (strides = nnz·16) in the DMM path.
     const uint b = get_global_id(1);
     xyzu   += (size_t)b * n_atom;
     v_atom += (size_t)b * n_atom;
+    k_vals += (size_t)b * k_str;
+    w_vals += (size_t)b * w_str;
     pf     += (size_t)b * 2 * npairs;
     pf[2 * p] = (float4)0.0f;
     pf[2 * p + 1] = (float4)0.0f;

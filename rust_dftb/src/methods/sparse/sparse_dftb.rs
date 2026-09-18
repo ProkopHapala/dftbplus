@@ -1942,17 +1942,57 @@ impl SparseDftb {
         evals: &[(usize, usize, f64)],
         h: f64,
     ) -> Result<Vec<Forces>> {
+        let batch = self.pack_displacement_batch(x0, evals, h, "forces_frozen_batch")?;
+        if self.central.is_none() {
+            return Err(DftbError::InvalidInput(
+                "forces_frozen_batch: no snapshot — call snapshot_electronic_state first".into(),
+            ));
+        }
+        let (kb, wb) = {
+            let cd = self.central_dev.as_ref().ok_or_else(|| {
+                DftbError::InvalidInput(
+                    "forces_frozen_batch: device snapshot missing — snapshot_electronic_state did not complete".into(),
+                )
+            })?;
+            (cd.k.clone(), cd.w0.clone())
+        };
+        // Shared central dq — the frozen Lagrangian's charge state, NOT
+        // self.q (batch is self-contained: no restore_central_state
+        // ordering dependency).
+        {
+            let n = self.n_atom;
+            let s = self.central.as_ref().unwrap();
+            for i in 0..n {
+                self.dq_f32[i] = (s.q[i] - self.q0[i]) as f32;
+            }
+        }
+        self.ws
+            .forces_frozen_batch_dev(&self.xyzu_batch, &self.dq_f32, &kb, &wb, batch)
+    }
+
+    /// Shared batch preamble (F1/F5a): validates x0/evals/h, packs the
+    /// per-replica displaced geometries into `self.xyzu_batch` (one
+    /// upload per batch), builds the pair-adjacency guards once. Same
+    /// physics contract as `set_coords` localized to the moved atom.
+    /// Returns the batch size.
+    fn pack_displacement_batch(
+        &mut self,
+        x0: &[[f64; 3]],
+        evals: &[(usize, usize, f64)],
+        h: f64,
+        tag: &str,
+    ) -> Result<usize> {
         let n = self.n_atom;
         if x0.len() != n {
             return Err(DftbError::InvalidInput(format!(
-                "forces_frozen_batch: x0 len {} != n_atom {n}",
+                "{tag}: x0 len {} != n_atom {n}",
                 x0.len()
             )));
         }
         for (i, c) in x0.iter().enumerate() {
             if !c[0].is_finite() || !c[1].is_finite() || !c[2].is_finite() {
                 return Err(DftbError::InvalidInput(format!(
-                    "forces_frozen_batch: non-finite x0 atom {i} {c:?}"
+                    "{tag}: non-finite x0 atom {i} {c:?}"
                 )));
             }
         }
@@ -1969,42 +2009,26 @@ impl SparseDftb {
             let dmax = dmax2.sqrt();
             if 2.0 * dmax > self.cfg.r_skin_ang {
                 return Err(DftbError::InvalidInput(format!(
-                    "forces_frozen_batch: x0 Verlet skin exhausted — max |ΔR|={dmax:.4} Å \
+                    "{tag}: x0 Verlet skin exhausted — max |ΔR|={dmax:.4} Å \
                      vs skin/2={:.4} Å. Topology is frozen at SparseDftb::new; rebuild the engine.",
                     self.cfg.r_skin_ang / 2.0
                 )));
             }
         }
         if self.cpu_pair {
-            return Err(DftbError::InvalidInput(
-                "forces_frozen_batch: batched path requires the GPU pair kernels — \
-                 cpu_pair is active (RUST_DFTB_SPARSE_CPU=1); use scalar forces_frozen"
-                    .into(),
-            ));
+            return Err(DftbError::InvalidInput(format!(
+                "{tag}: batched path requires the GPU pair kernels — \
+                 cpu_pair is active (RUST_DFTB_SPARSE_CPU=1); use the scalar path"
+            )));
         }
         if evals.is_empty() {
-            return Err(DftbError::InvalidInput(
-                "forces_frozen_batch: empty eval list".into(),
-            ));
+            return Err(DftbError::InvalidInput(format!("{tag}: empty eval list")));
         }
         if !h.is_finite() || h <= 0.0 {
             return Err(DftbError::InvalidInput(format!(
-                "forces_frozen_batch: h={h} must be finite and > 0"
+                "{tag}: h={h} must be finite and > 0"
             )));
         }
-        if self.central.is_none() {
-            return Err(DftbError::InvalidInput(
-                "forces_frozen_batch: no snapshot — call snapshot_electronic_state first".into(),
-            ));
-        }
-        let (kb, wb) = {
-            let cd = self.central_dev.as_ref().ok_or_else(|| {
-                DftbError::InvalidInput(
-                    "forces_frozen_batch: device snapshot missing — snapshot_electronic_state did not complete".into(),
-                )
-            })?;
-            (cd.k.clone(), cd.w0.clone())
-        };
         // Host per-atom pair adjacency for the localized coincidence
         // guard — frozen topology, built once.
         if self.hs_adj.is_none() {
@@ -2018,17 +2042,17 @@ impl SparseDftb {
         for (b, &(a, ax, sign)) in evals.iter().enumerate() {
             if a >= n {
                 return Err(DftbError::InvalidInput(format!(
-                    "forces_frozen_batch: eval {b} atom {a} >= n_atom {n}"
+                    "{tag}: eval {b} atom {a} >= n_atom {n}"
                 )));
             }
             if ax >= 3 {
                 return Err(DftbError::InvalidInput(format!(
-                    "forces_frozen_batch: eval {b} axis {ax} >= 3"
+                    "{tag}: eval {b} axis {ax} >= 3"
                 )));
             }
             if !sign.is_finite() || sign == 0.0 {
                 return Err(DftbError::InvalidInput(format!(
-                    "forces_frozen_batch: eval {b} sign={sign} must be finite and non-zero"
+                    "{tag}: eval {b} sign={sign} must be finite and non-zero"
                 )));
             }
             // Verlet skin: |x0[a] + sign·h·e_ax − coords_build[a]| ≤ skin/2.
@@ -2039,7 +2063,7 @@ impl SparseDftb {
             }
             if !self.full_mask && 4.0 * d2 > self.cfg.r_skin_ang * self.cfg.r_skin_ang {
                 return Err(DftbError::InvalidInput(format!(
-                    "forces_frozen_batch: eval {b} Verlet skin exhausted — atom {a} |ΔR|={:.4} Å \
+                    "{tag}: eval {b} Verlet skin exhausted — atom {a} |ΔR|={:.4} Å \
                      vs skin/2={:.4} Å. Topology is frozen at SparseDftb::new; rebuild the engine.",
                     d2.sqrt(),
                     self.cfg.r_skin_ang / 2.0
@@ -2056,7 +2080,7 @@ impl SparseDftb {
                 let dz = x0[a][2] + if ax == 2 { sign * h } else { 0.0 } - x0[j][2];
                 if dx * dx + dy * dy + dz * dz == 0.0 {
                     return Err(DftbError::InvalidInput(format!(
-                        "forces_frozen_batch: eval {b} atoms {a} and {j} coincide (M_HS pair) — \
+                        "{tag}: eval {b} atoms {a} and {j} coincide (M_HS pair) — \
                          DirectionCosines undefined"
                     )));
                 }
@@ -2071,7 +2095,7 @@ impl SparseDftb {
                 let dz = x0[a][2] + if ax == 2 { sign * h } else { 0.0 } - x0[j][2];
                 if dx * dx + dy * dy + dz * dz < 1e-4 {
                     return Err(DftbError::InvalidInput(format!(
-                        "forces_frozen_batch: eval {b} atoms {a} and {j} closer than \
+                        "{tag}: eval {b} atoms {a} and {j} closer than \
                          MIN_NEIGH_DIST=0.01 Å (repulsive pair)"
                     )));
                 }
@@ -2096,17 +2120,62 @@ impl SparseDftb {
                 self.xyzu_batch[o + 3] = self.gamma.u(self.species_code[i]) as f32;
             }
         }
-        // Shared central dq — the frozen Lagrangian's charge state, NOT
-        // self.q (batch is self-contained: no restore_central_state
-        // ordering dependency).
+        Ok(batch)
+    }
+
+    /// F5a batched fixed-iteration DMM-lite column path (manifest §F.1
+    /// F5a): `evals.len()` displaced geometries evaluated in ONE launch
+    /// wave, each running the same predetermined recipe (assemble H/S →
+    /// V → H_scc → [n_ns warm NS] → B=Z·H → n_dmm DMM steps → W →
+    /// contract). K/Z seed from the device central snapshot. `eta_scale`
+    /// maps to the scalar path's RUST_DFTB_VIB_DMM_ETA (step = −η/Δε).
+    /// No residual gates — caller validates post-hoc.
+    pub fn forces_dmm_batch(
+        &mut self,
+        x0: &[[f64; 3]],
+        evals: &[(usize, usize, f64)],
+        h: f64,
+        n_ns: usize,
+        n_dmm: usize,
+        eta_scale: f32,
+    ) -> Result<Vec<Forces>> {
+        let batch = self.pack_displacement_batch(x0, evals, h, "forces_dmm_batch")?;
+        let (emin, emax) = {
+            let s = self.central.as_ref().ok_or_else(|| {
+                DftbError::InvalidInput(
+                    "forces_dmm_batch: no snapshot — call snapshot_electronic_state first".into(),
+                )
+            })?;
+            (s.emin, s.emax)
+        };
+        let (kb, zb) = {
+            let cd = self.central_dev.as_ref().ok_or_else(|| {
+                DftbError::InvalidInput(
+                    "forces_dmm_batch: device snapshot missing — snapshot_electronic_state did not complete".into(),
+                )
+            })?;
+            (cd.k.clone(), cd.z.clone())
+        };
+        let step = -eta_scale / (emax - emin).max(1e-6);
+        // fixq charge state — dq = q − q0 shared across replicas (the
+        // lite path never iterates charges).
         {
-            let s = self.central.as_ref().unwrap();
+            let n = self.n_atom;
             for i in 0..n {
-                self.dq_f32[i] = (s.q[i] - self.q0[i]) as f32;
+                self.dq_f32[i] = (self.q[i] - self.q0[i]) as f32;
             }
         }
-        self.ws
-            .forces_frozen_batch_dev(&self.xyzu_batch, &self.dq_f32, &kb, &wb, batch)
+        self.ws.forces_dmm_batch_dev(
+            &self.xyzu_batch,
+            &self.dq_f32,
+            n_ns,
+            n_dmm,
+            step,
+            self.dw_ws.plan_zk(),
+            &kb,
+            &zb,
+            batch,
+        )
     }
 
     /// Snapshot the converged electronic state (q, K, Z, K0) into

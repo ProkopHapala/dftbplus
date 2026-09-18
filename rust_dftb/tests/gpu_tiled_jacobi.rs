@@ -1440,7 +1440,9 @@ fn kernel_resources() {
     // Packed-lA resident kernel: static __local + dynamic arg_local must sum
     // under ~24 KB for two workgroups to co-reside on a 48 KB SM.
     let n86 = 86usize;
-    let rotlog = rt.zero_buffer::<f32>(n86 * n86).unwrap();
+    let rotlog = rt
+        .zero_buffer::<f32>(rust_dftb::qmqm::gpu_eigen::RESIDENT_LOG_SWEEPS * (n86 - 1) * (n86 / 2) * 2)
+        .unwrap(); // prec=0 → float2; [sweeps][jround][jpair] solve-end log
     for &wg in &[256usize, 512] {
         for &no_tail in &[false, true] {
             let src = render_tiled_source_cfg(32, wg, 0, no_tail);
@@ -1739,9 +1741,10 @@ fn resident_jacobi_sweep() {
             let mu = rt.zero_buffer::<f32>(batch).unwrap();
             let jn = if n & 1 == 1 { n + 1 } else { n };
             // jlog2_t entry: prec=1 → double2 (4 f32); prec=0 → float2 (2 f32).
-            // This sweep renders resident kernels at prec=1 → 4 f32s/entry.
+            // This sweep renders resident kernels at prec=1 → 4 f32s/entry;
+            // the log holds RESIDENT_LOG_SWEEPS sweeps (solve-end V replay).
             let rotlog = rt
-                .zero_buffer::<f32>(batch * (jn - 1) * (jn / 2) * 4)
+                .zero_buffer::<f32>(batch * rust_dftb::qmqm::gpu_eigen::RESIDENT_LOG_SWEEPS * (jn - 1) * (jn / 2) * 4)
                 .unwrap();
             // (tag, kind): direct | resident deferred-V | resident full-local
             for &(tag, rv) in &[("direct", -1i32), ("res-defV", 0), ("res-AV", 1)] {

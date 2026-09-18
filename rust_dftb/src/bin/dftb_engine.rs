@@ -1920,19 +1920,40 @@ fn rhai_sparse_vibrations(name: &str, h: f64, scc_tol: f64, path: &str) -> Strin
         };
         let frozen = env_on("RUST_DFTB_VIB_FROZEN");
         let fixq = env_on("RUST_DFTB_VIB_FIXQ") && !frozen;
-        // F1 batched frozen columns (manifest §F.1): RUST_DFTB_VIB_BATCH
-        // evals in flight per launch — frozen columns are uniform
-        // one-shot jobs, no SCC machinery. GPU-pair path only.
-        let vib_batch = if frozen {
+        let lite = env_on("RUST_DFTB_VIB_LITE");
+        // F1 batched frozen columns (manifest §F.1) + F5a batched
+        // fixed-iteration DMM-lite fixq columns: RUST_DFTB_VIB_BATCH
+        // evals in flight per launch — both tiers are uniform
+        // fixed-cost jobs, no SCC machinery. GPU-pair path only.
+        // fixq WITHOUT lite stays scalar: purify convergence varies per
+        // replica and needs the active-mask scheduler (manifest §F.1 F5b).
+        let dmm_batch = fixq && lite;
+        let vib_batch = if frozen || dmm_batch {
             std::env::var("RUST_DFTB_VIB_BATCH")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(1)
                 .max(1)
         } else {
+            if fixq && std::env::var("RUST_DFTB_VIB_BATCH").is_ok() {
+                eprintln!("[sparse] vibrations '{name}': RUST_DFTB_VIB_BATCH ignored for non-lite fixq — variable purify convergence needs the scheduler; set RUST_DFTB_VIB_LITE=1 for the fixed-cost DMM tier");
+            }
             1
         };
-        let batched = vib_batch > 1 && frozen && !eng.cpu_pair();
+        // F5a recipe knobs — same envs as the scalar lite path.
+        let dmm_ns = std::env::var("RUST_DFTB_VIB_NSMAX")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0);
+        let dmm_steps = std::env::var("RUST_DFTB_VIB_DMM")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(6);
+        let dmm_eta = std::env::var("RUST_DFTB_VIB_DMM_ETA")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(8.0);
+        let batched = vib_batch > 1 && (frozen || dmm_batch) && !eng.cpu_pair();
         // Central electronic state (manifest §4.12 / Phase G1): every ±h
         // column restores it — identical solver history, no FD asymmetry
         // from a chained previous column.
@@ -1945,7 +1966,7 @@ fn rhai_sparse_vibrations(name: &str, h: f64, scc_tol: f64, path: &str) -> Strin
         let maxcol = std::env::var("RUST_DFTB_VIB_MAXCOL")
             .ok()
             .and_then(|v| v.parse::<usize>().ok());
-        eprintln!("[sparse] vibrations '{name}': {n3} columns, h={h} Å, scc_tol={scc_tol:e} frozen={frozen} fixq={fixq} batch={vib_batch} maxcol={maxcol:?}");
+        eprintln!("[sparse] vibrations '{name}': {n3} columns, h={h} Å, scc_tol={scc_tol:e} frozen={frozen} fixq={fixq} lite={lite} batch={vib_batch} dmm={{ns:{dmm_ns} steps:{dmm_steps} eta:{dmm_eta}}} maxcol={maxcol:?}");
         let t_vib0 = std::time::Instant::now();
         if batched {
             // F1 batched frozen columns (manifest §F.1): evals in column
@@ -1975,9 +1996,13 @@ fn rhai_sparse_vibrations(name: &str, h: f64, scc_tol: f64, path: &str) -> Strin
                 std::collections::HashMap::new();
             for chunk in evals.chunks(vib_batch) {
                 let t0 = std::time::Instant::now();
-                let fs = eng
-                    .forces_frozen_batch(&x0, chunk, h)
-                    .unwrap_or_else(|e| panic!("vibrations '{name}' batched frozen evals: {e}"));
+                let fs = if frozen {
+                    eng.forces_frozen_batch(&x0, chunk, h)
+                        .unwrap_or_else(|e| panic!("vibrations '{name}' batched frozen evals: {e}"))
+                } else {
+                    eng.forces_dmm_batch(&x0, chunk, h, dmm_ns, dmm_steps, dmm_eta)
+                        .unwrap_or_else(|e| panic!("vibrations '{name}' batched dmm evals: {e}"))
+                };
                 let ms_ev = t0.elapsed().as_secs_f64() * 1e3 / chunk.len() as f64;
                 for (&(i, a, sign), f) in chunk.iter().zip(fs.into_iter()) {
                     let col = 3 * i + a;

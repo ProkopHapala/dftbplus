@@ -2554,3 +2554,74 @@ findings that REVISE the 16.A–16.E plan:
 - [ ] Algorithmic option to discuss (H-C): the warm iteration needs the
   *projector response*, not eigenpairs — first-order ΔD or NS/Chebyshev
   projector step in the near-diagonal basis; μ from Tr(DS)=N_e.
+
+## 17. Dense FOE / DM-purification path — status + work order (2026-09-18)
+
+**Files (new, separate path — Jacobi untouched):**
+`rust_dftb/src/qmqm/gpu_purify.rs` + `gpu_purify.cl`,
+`rust_dftb/tests/gpu_purify.rs`. Design + bring-up bug analysis:
+`Alternative_Dense_Multi_Eigensolve.md` §6–§7. Tasks entry: T11.
+
+**Why:** Jacobi is round-latency-bound — measured ceiling ~5 % of GPU
+peak (Measured_Facts §8). Purification expresses the whole solve as
+batched dense GEMMs (the throughput-friendly shape) and produces the
+density matrix *directly* — no eigenvectors, no occupation sort, no
+density-build kernel, no Fermi bisection inside the solve.
+
+### 17.1 Verified correctness (do not re-open)
+
+- TC2 parity (n=86, batch=16, nocc=43, tol=1e-5): converged 56 iters,
+  ΔE≈1e-6 Ha, ‖D−Dref‖≈3e-5, ‖D²−D‖≈1e-6, asym=0.
+- Step probe: element-wise ≤6e-6 vs f64 CPU reference at every iteration
+  count, batch 1–400.
+- Three bring-up bugs fixed — see §7.2 of the design doc (test-side
+  nalgebra sort; **mandatory device-side freeze** — f32 TC2 fixed point
+  is marginally stable, converged systems must stop updating while
+  others iterate; **`pur_reduce` barrier-before-return race** — the
+  nondeterministic spectral-bounds corruption).
+
+### 17.2 Measured performance — first pass, honest
+
+n=86, batch=400, cold random matrices (TC2's worst case — tiny gaps →
+60 iters): **34.2 ms/solve at WG512** (0.57 ms/iter ≈ 0.9 TFLOPS ≈
+2.5 % peak) vs Jacobi ~17 ms cold / ~9.7 ms warm. Purify loses on this
+benchmark as-is; the deficit is the row·row GEMM interior, NOT the
+harness (already 1 launch/iter, 0 syncs, 0 allocs, ping-pong buffers,
+max occupancy — zero local memory).
+
+### 17.3 User-confirmed design directions (2026-09-18)
+
+1. **GEMM interior = register-tiled small-GEMM.** The matmul is the easy
+   part to optimize: 8×8 output tiles per thread, 64 threads/workgroup
+   (8×8 thread grid → 64×64 per pass, 2 passes at n=86), A/B staged via
+   *small* `__local` blocks so many WGs stay resident per CU. Standard
+   SGEMM shape — target ≥5 TFLOPS batched at n=86. Row·row (0.9 TFLOPS)
+   is the floor, not the ceiling.
+2. **Warm start solves the whole SCC, not one diagonalization.** The
+   payoff regime is hot-start: across geometry steps the density changes
+   little. BUT polynomials of H cannot rotate eigenvectors — when H/S
+   change, the occupied subspace must rotate first. Copy the sparse
+   Phase-G3 recipe (`sparse_system.rs::k_seed_shift` + `mcweeny_polish`):
+   `K_seed = K_conv_old + (K0_new − K0_old)` (δK0 = first-order
+   occupied/unoccupied rotation), McWeeny polish (contracting, no TC2
+   branch discontinuity), then TC2 floor-walk for trace. Bare
+   TC2-on-old-K was refuted in sparse (`RUST_DFTB_WARM_K`) — the δK0
+   shift is mandatory.
+3. **Scope:** batched multi-system only — a single small system cannot
+   saturate the GPU; keep Jacobi/LAPACK there.
+
+### 17.4 Work order (priority)
+
+- [ ] Register-tiled GEMM interior per §17.3.1 (8×8 thread tiles,
+      64 thr/WG, small local staging tiles); A/B vs row·row at WG 256/512.
+- [ ] Warm-start API: accept previous D + saved K0; δK0 shift + McWeeny
+      polish per §17.3.2; equal-accuracy bench vs Jacobi on real GC
+      Hamiltonians (random matrices are TC2's worst case).
+- [ ] `SolveKind::{Eigen, Purify}` opt-in dispatch in `gpu_scc_plan.rs`
+      (Jacobi stays default; fail loud on unsupported cases).
+- [ ] Generalized metric form (K·S·K, Tr(KS)) — drops the Löwdin X and
+      makes the sparse seed-shift recipe directly portable.
+- [ ] Debug or delete broken `PURIFY_TILE>0` path (writes no
+      diagnostics — must not silently pass).
+- [ ] Finite-T caveat: TC2 gives the 0 K projector; kT=0.002 Ha smearing
+      needs eigen path or Chebyshev-FOE later.

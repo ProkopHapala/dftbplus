@@ -282,6 +282,32 @@ pub struct GpuFrozenBatch {
     // Host staging (persistent, no per-call alloc).
     f_host: Vec<f32>,  // cap·4·n — component readback
     pe_host: Vec<f32>, // cap·n_rep — repulsive-energy readback
+    /// F5a: per-replica matrix state for the fixed-iteration DMM-lite
+    /// batch — allocated lazily by `ensure_dmm_batch`.
+    dmm: Option<GpuDmmBufs>,
+}
+
+/// F5a DMM-lite batch buffers (JobId = launch dim1 index). Values-only
+/// flat slabs `cap·nblock·16` on the shared frozen-topology structures —
+/// every replica has identical sparsity, so all plans/masks stay shared
+/// and only the values replicate. `stride` per matrix = its nblock
+/// (SpGEMM kernels take block strides; elementwise take ·16).
+pub struct GpuDmmBufs {
+    cap: usize,
+    h: Buffer<f32>,    // cap·nb_hs·16 — per-replica H0
+    s: Buffer<f32>,    // cap·nb_hs·16 — per-replica S
+    hscc: Buffer<f32>, // cap·nb_hs·16 — per-replica H_scc
+    w: Buffer<f32>,    // cap·nb_hs·16 — per-replica W = 2·sym(B·K)
+    b_zh: Buffer<f32>, // cap·nb_tzs·16 — B = Z·H_scc
+    t_zs: Buffer<f32>, // cap·nb_tzs·16 — T = Z·S (warm NS)
+    t_ks: Buffer<f32>, // cap·nb_tks·16 — T = K·S (DMM)
+    z: Buffer<f32>,    // cap·nb_z·16 — per-replica Z (NS>0 only)
+    qz: Buffer<f32>,   // cap·nb_z·16 — NS scratch Q = T·Z
+    znew: Buffer<f32>, // cap·nb_z·16 — NS scratch
+    k: Buffer<f32>,    // cap·nb_k·16 — per-replica evolving K
+    x: Buffer<f32>,    // cap·nb_k·16 — DMM X = B·K
+    y: Buffer<f32>,    // cap·nb_k·16 — DMM Y = T·X
+    knew: Buffer<f32>, // cap·nb_k·16 — DMM gradient scratch
 }
 
 impl SparseSystemWorkspace {
@@ -775,6 +801,8 @@ impl SparseSystemWorkspace {
             &self.v_buf,
             &self.n_orb_buf,
             &self.h_scc.values,
+            0,
+            1,
         )
     }
 
@@ -952,6 +980,8 @@ impl SparseSystemWorkspace {
                 &st.onsite,
                 &self.h0.values,
                 &self.s.values,
+                0,
+                1,
             )?;
             self.gpu.hs_assemble_dev(
                 st.n_pairs,
@@ -967,6 +997,9 @@ impl SparseSystemWorkspace {
                 st.taper,
                 &self.h0.values,
                 &self.s.values,
+                self.n_atom as u32,
+                0,
+                1,
             )?;
             self.gpu.inf_norm_into_dev(
                 &self.hs_struct,
@@ -1067,6 +1100,8 @@ impl SparseSystemWorkspace {
                 &self.v_buf,
                 &st.pf,
                 1,
+                0,
+                0,
             )?;
             self.gpu.force_gather_dev(
                 n,
@@ -1155,6 +1190,7 @@ impl SparseSystemWorkspace {
             f_tot: gpu.zero_f32(cap * 4 * n)?,
             f_host: vec![0.0f32; cap * 4 * n],
             pe_host: vec![0.0f32; cap * nr.max(1)],
+            dmm: None,
         });
         Ok(())
     }
@@ -1236,44 +1272,67 @@ impl SparseSystemWorkspace {
                 &bt.v,
                 &bt.pf,
                 batch,
-            )?;
-            self.gpu
-                .gamma_f_dev(n, &bt.xyzu, &self.dq_buf, &bt.gf, batch)?;
-            self.gpu.rep_eval_dev(
-                st.n_rep,
-                n,
-                &st.rpairs,
-                &bt.xyzu,
-                &st.species,
-                st.n_sp as u32,
-                &st.rep_off,
-                st.rep_max_int as u32,
-                &st.rep_data,
-                &bt.pf_rep,
-                &bt.pe_rep,
-                batch,
-            )?;
-            self.gpu.force_gather_dev(
-                n,
-                &st.fp_ptr,
-                &st.fp_list,
-                &bt.pf,
-                &st.rp_ptr,
-                &st.rp_list,
-                &bt.pf_rep,
-                &bt.gf,
-                &bt.f_nscc,
-                &bt.f_shift,
-                &bt.f_rep,
-                &bt.f_dc,
-                &bt.f_tot,
-                st.n_pairs,
-                st.n_rep,
-                batch,
+                0,
+                0,
             )?;
         }
-        // Readback — same five component checks as the scalar path, per
-        // replica slice. pe_rep validates E_rep finite per replica.
+        self.batch_force_tail_dev(batch)?;
+        self.batch_force_readback(batch, "forces (GPU frozen batch)")
+    }
+
+    /// Shared batched force tail (F1/F5a): after `hs_contract` has filled
+    /// `bt.pf` and `bt.v`, launches γ′ double-counting + repulsive eval +
+    /// the per-atom gather — all 2D, dim1 = replica slot.
+    fn batch_force_tail_dev(&mut self, batch: usize) -> Result<()> {
+        let n = self.n_atom;
+        let st = self.pair.as_ref().unwrap();
+        let bt = st.batch.as_ref().unwrap();
+        self.gpu
+            .gamma_f_dev(n, &bt.xyzu, &self.dq_buf, &bt.gf, batch)?;
+        self.gpu.rep_eval_dev(
+            st.n_rep,
+            n,
+            &st.rpairs,
+            &bt.xyzu,
+            &st.species,
+            st.n_sp as u32,
+            &st.rep_off,
+            st.rep_max_int as u32,
+            &st.rep_data,
+            &bt.pf_rep,
+            &bt.pe_rep,
+            batch,
+        )?;
+        self.gpu.force_gather_dev(
+            n,
+            &st.fp_ptr,
+            &st.fp_list,
+            &bt.pf,
+            &st.rp_ptr,
+            &st.rp_list,
+            &bt.pf_rep,
+            &bt.gf,
+            &bt.f_nscc,
+            &bt.f_shift,
+            &bt.f_rep,
+            &bt.f_dc,
+            &bt.f_tot,
+            st.n_pairs,
+            st.n_rep,
+            batch,
+        )?;
+        Ok(())
+    }
+
+    /// Shared batched readback (F1/F5a): five component buffers → one
+    /// `Forces` per replica slice (JobId order), with the same finite /
+    /// Newton checks as the scalar path.
+    fn batch_force_readback(
+        &mut self,
+        batch: usize,
+        tag: &str,
+    ) -> Result<Vec<crate::methods::dftb::forces::Forces>> {
+        let n = self.n_atom;
         let n_rep = self.pair.as_ref().unwrap().n_rep;
         let mut outs: Vec<crate::methods::dftb::forces::Forces> = (0..batch)
             .map(|_| crate::methods::dftb::forces::Forces::zeros(n))
@@ -1290,7 +1349,7 @@ impl SparseSystemWorkspace {
                     .sum();
                 if !e_rep.is_finite() {
                     return Err(DftbError::InvalidInput(format!(
-                        "forces_frozen_batch_dev: non-finite E_rep replica {b}"
+                        "{tag}: non-finite E_rep replica {b}"
                     )));
                 }
             }
@@ -1311,14 +1370,414 @@ impl SparseSystemWorkspace {
             pull_comp!(&bt.f_tot, forces);
         }
         for out in &outs {
-            crate::methods::dftb::forces::check_finite(&out.forces, "forces (GPU frozen batch)");
-            crate::methods::dftb::forces::check_newton(
-                &out.forces,
-                "forces (GPU frozen batch)",
-                1e-4,
-            );
+            crate::methods::dftb::forces::check_finite(&out.forces, tag);
+            crate::methods::dftb::forces::check_newton(&out.forces, tag, 1e-4);
         }
         Ok(outs)
+    }
+
+    /// F5a: allocate the per-replica DMM matrix slabs (persistent after
+    /// first call). Requires the frozen-batch workspace for geometry and
+    /// force outputs (same cap).
+    fn ensure_dmm_batch(&mut self, cap: usize) -> Result<()> {
+        self.ensure_frozen_batch(cap)?;
+        let st = self.pair.as_mut().ok_or_else(|| {
+            DftbError::InvalidInput("ensure_dmm_batch: GPU pair data not initialized".into())
+        })?;
+        if st
+            .batch
+            .as_ref()
+            .unwrap()
+            .dmm
+            .as_ref()
+            .is_some_and(|d| d.cap >= cap)
+        {
+            return Ok(());
+        }
+        let gpu = &self.gpu;
+        let (nh, nk, nz, ntks, ntzs) = (
+            self.hs_struct.nblock,
+            self.k_struct.nblock,
+            self.z_struct.nblock,
+            self.t_ks_struct.nblock,
+            self.t_zs_struct.nblock,
+        );
+        st.batch.as_mut().unwrap().dmm = Some(GpuDmmBufs {
+            cap,
+            h: gpu.zero_f32(cap * nh * BS2)?,
+            s: gpu.zero_f32(cap * nh * BS2)?,
+            hscc: gpu.zero_f32(cap * nh * BS2)?,
+            w: gpu.zero_f32(cap * nh * BS2)?,
+            b_zh: gpu.zero_f32(cap * ntzs * BS2)?,
+            t_zs: gpu.zero_f32(cap * ntzs * BS2)?,
+            t_ks: gpu.zero_f32(cap * ntks * BS2)?,
+            z: gpu.zero_f32(cap * nz * BS2)?,
+            qz: gpu.zero_f32(cap * nz * BS2)?,
+            znew: gpu.zero_f32(cap * nz * BS2)?,
+            k: gpu.zero_f32(cap * nk * BS2)?,
+            x: gpu.zero_f32(cap * nk * BS2)?,
+            y: gpu.zero_f32(cap * nk * BS2)?,
+            knew: gpu.zero_f32(cap * nk * BS2)?,
+        });
+        Ok(())
+    }
+
+    /// F5a batched fixed-iteration DMM-lite force path (manifest §F.1
+    /// F5a): each replica runs the SAME predetermined recipe — assemble
+    /// H/S at its own geometry, H_scc from its own γ·dq potential,
+    /// `n_ns` warm Newton–Schulz updates on Z (0 = shared central Z),
+    /// B = Z·H_scc, `n_dmm` DMM descent steps on K (seeded from the
+    /// shared central K), W = 2·sym(B·K), then the standard pair
+    /// contraction. NO per-iteration residual checks or host syncs —
+    /// verification is the caller's post-hoc audit. `step` is the DMM
+    /// step size −η/Δε (negative). `k_src`/`z_src` are the shared central
+    /// K/Z device buffers (read-only — broadcast into the replica slabs).
+    /// Bitwise parity target vs the scalar lite path: identical kernel
+    /// sequence per replica.
+    pub fn forces_dmm_batch_dev(
+        &mut self,
+        xyzu: &[f32],
+        dq: &[f32],
+        n_ns: usize,
+        n_dmm: usize,
+        step: f32,
+        plan_zk: Option<&SpgemmPlanGpu>,
+        k_src: &Buffer<f32>,
+        z_src: &Buffer<f32>,
+        batch: usize,
+    ) -> Result<Vec<crate::methods::dftb::forces::Forces>> {
+        let n = self.n_atom;
+        if batch == 0 || xyzu.len() != batch * 4 * n || dq.len() != n {
+            return Err(DftbError::InvalidInput(format!(
+                "forces_dmm_batch_dev: batch={batch} xyzu {} != B·4·n {} / dq {} != n {n}",
+                xyzu.len(),
+                batch * 4 * n,
+                dq.len()
+            )));
+        }
+        if self.plan_zh.is_none()
+            || self.plan_ks.is_none()
+            || self.plan_fk.is_none()
+            || self.plan_tk_g.is_none()
+            || (n_ns > 0 && (self.plan_zs.is_none() || self.plan_tz.is_none()))
+        {
+            return Err(DftbError::InvalidInput(
+                "forces_dmm_batch_dev: required SpGEMM plans missing \
+                 (RUST_DFTB_SPARSE_PLANS=0?)"
+                    .into(),
+            ));
+        }
+        let plan_zk = plan_zk.ok_or_else(|| {
+            DftbError::InvalidInput("forces_dmm_batch_dev: plan_zk missing".into())
+        })?;
+        self.ensure_dmm_batch(batch)?;
+        let (nb_hs, nb_k, nb_z, nb_tks, nb_tzs) = (
+            self.hs_struct.nblock as u32,
+            self.k_struct.nblock as u32,
+            self.z_struct.nblock as u32,
+            self.t_ks_struct.nblock as u32,
+            self.t_zs_struct.nblock as u32,
+        );
+        // Geometry + shared dq upload — once for the whole batch.
+        {
+            let st = self.pair.as_ref().unwrap();
+            self.gpu.write_f32(&st.batch.as_ref().unwrap().xyzu, xyzu)?;
+        }
+        self.gpu.write_f32(&self.dq_buf, dq)?;
+        // Assemble per-replica H/S at each replica geometry, per-replica
+        // V = γ(x_b)·dq (shared charges), then H_scc[b].
+        {
+            let st = self.pair.as_ref().unwrap();
+            let bt = st.batch.as_ref().unwrap();
+            let dm = bt.dmm.as_ref().unwrap();
+            self.gpu.hs_diag_dev(
+                n,
+                self.hs_struct.diag_block(),
+                &self.n_orb_buf,
+                &st.onsite,
+                &dm.h,
+                &dm.s,
+                nb_hs,
+                batch,
+            )?;
+            self.gpu.hs_assemble_dev(
+                st.n_pairs,
+                &st.pairs,
+                &bt.xyzu,
+                &st.species,
+                &self.n_orb_buf,
+                st.n_sp as u32,
+                &st.sk_meta,
+                &st.sk_parm,
+                &st.sk_ctrl,
+                st.max_ctrl as u32,
+                st.taper,
+                &dm.h,
+                &dm.s,
+                n as u32,
+                nb_hs,
+                batch,
+            )?;
+            self.gpu
+                .gamma_v_dev(n, &bt.xyzu, &self.dq_buf, &bt.v, batch)?;
+            self.gpu.build_hscc_dev(
+                &self.hs_struct,
+                &dm.h,
+                &dm.s,
+                &bt.v,
+                &self.n_orb_buf,
+                &dm.hscc,
+                nb_hs,
+                batch,
+            )?;
+        }
+        // Per-replica state init: K = central K₀ broadcast; Z either
+        // shared (n_ns=0) or broadcast + n_ns warm NS updates.
+        {
+            let st = self.pair.as_ref().unwrap();
+            let dm = st.batch.as_ref().unwrap().dmm.as_ref().unwrap();
+            self.gpu
+                .broadcast_dev(nb_k as usize * BS2, k_src, &dm.k, batch)?;
+            let (z_vals, sa_z) = if n_ns > 0 {
+                self.gpu
+                    .broadcast_dev(nb_z as usize * BS2, z_src, &dm.z, batch)?;
+                for _ in 0..n_ns {
+                    // T = Z·S (plan_zs), Q = T·Z (plan_tz),
+                    // Z ← sym(2Z − Q) — no residual check (fixed count).
+                    self.gpu.spgemm_plan_bsym_batch(
+                        &self.z,
+                        &dm.z,
+                        nb_z,
+                        &dm.s,
+                        nb_hs,
+                        self.plan_zs.as_ref().unwrap(),
+                        &self.t_zs,
+                        &dm.t_zs,
+                        nb_tzs,
+                        batch,
+                    )?;
+                    self.gpu.spgemm_plan_bsym_batch(
+                        &self.t_zs,
+                        &dm.t_zs,
+                        nb_tzs,
+                        &dm.z,
+                        nb_z,
+                        self.plan_tz.as_ref().unwrap(),
+                        &self.z,
+                        &dm.qz,
+                        nb_z,
+                        batch,
+                    )?;
+                    self.gpu.axpby_batch(
+                        nb_z as usize,
+                        2.0,
+                        &dm.z,
+                        nb_z * BS2 as u32,
+                        -1.0,
+                        &dm.qz,
+                        nb_z * BS2 as u32,
+                        &dm.znew,
+                        nb_z * BS2 as u32,
+                        batch,
+                    )?;
+                    self.gpu.symmetrize_batch(
+                        nb_z as usize,
+                        &self.z_struct.transpose_block(),
+                        &dm.znew,
+                        nb_z * BS2 as u32,
+                        batch,
+                    )?;
+                    // z ← znew (copy via axpby; beta=0 ignores B).
+                    self.gpu.axpby_batch(
+                        nb_z as usize,
+                        1.0,
+                        &dm.znew,
+                        nb_z * BS2 as u32,
+                        0.0,
+                        &dm.znew,
+                        nb_z * BS2 as u32,
+                        &dm.z,
+                        nb_z * BS2 as u32,
+                        batch,
+                    )?;
+                }
+                (&dm.z, nb_z)
+            } else {
+                (z_src, 0u32)
+            };
+            // B = Z·H_scc per replica (shared Z when n_ns=0).
+            self.gpu.spgemm_plan_bsym_batch(
+                &self.z,
+                z_vals,
+                sa_z,
+                &dm.hscc,
+                nb_hs,
+                self.plan_zh.as_ref().unwrap(),
+                &self.b_zh,
+                &dm.b_zh,
+                nb_tzs,
+                batch,
+            )?;
+            // Fixed DMM descent: T=K·S, X=B·K, Y=T·X,
+            // K ← sym(K + step·sym(X) ... ) — mirrors dmm_descend with
+            // retract_every=0, identical kernel order per replica.
+            for _ in 0..n_dmm {
+                self.gpu.spgemm_plan_bsym_batch(
+                    &self.k,
+                    &dm.k,
+                    nb_k,
+                    &dm.s,
+                    nb_hs,
+                    self.plan_ks.as_ref().unwrap(),
+                    &self.t_ks,
+                    &dm.t_ks,
+                    nb_tks,
+                    batch,
+                )?;
+                self.gpu.spgemm_plan_bsym_batch(
+                    &self.b_zh,
+                    &dm.b_zh,
+                    nb_tzs,
+                    &dm.k,
+                    nb_k,
+                    self.plan_fk.as_ref().unwrap(),
+                    &self.z_on_k,
+                    &dm.x,
+                    nb_k,
+                    batch,
+                )?;
+                self.gpu.spgemm_plan_batch(
+                    &self.t_ks,
+                    &dm.t_ks,
+                    nb_tks,
+                    &dm.x,
+                    nb_k,
+                    self.plan_tk_g.as_ref().unwrap(),
+                    &self.q,
+                    &dm.y,
+                    nb_k,
+                    batch,
+                )?;
+                let ek = nb_k * BS2 as u32;
+                // knew = X
+                self.gpu.axpby_batch(
+                    nb_k as usize,
+                    1.0,
+                    &dm.x,
+                    ek,
+                    0.0,
+                    &dm.x,
+                    ek,
+                    &dm.knew,
+                    ek,
+                    batch,
+                )?;
+                self.gpu.symmetrize_batch(
+                    nb_k as usize,
+                    &self.k_struct.transpose_block(),
+                    &dm.knew,
+                    ek,
+                    batch,
+                )?;
+                // knew = X+Xᵀ−2Y  (knew currently (X+Xᵀ)/2 → ·2 −2Y)
+                self.gpu.axpby_batch(
+                    nb_k as usize,
+                    2.0,
+                    &dm.knew,
+                    ek,
+                    -2.0,
+                    &dm.y,
+                    ek,
+                    &dm.knew,
+                    ek,
+                    batch,
+                )?;
+                // K += step·knew ; sym(K)
+                self.gpu.axpby_batch(
+                    nb_k as usize,
+                    1.0,
+                    &dm.k,
+                    ek,
+                    step,
+                    &dm.knew,
+                    ek,
+                    &dm.k,
+                    ek,
+                    batch,
+                )?;
+                self.gpu.symmetrize_batch(
+                    nb_k as usize,
+                    &self.k_struct.transpose_block(),
+                    &dm.k,
+                    ek,
+                    batch,
+                )?;
+            }
+            // W = 2·sym(B·K) — the w_zk one-product path.
+            self.gpu.spgemm_plan_bsym_batch(
+                &self.b_zh,
+                &dm.b_zh,
+                nb_tzs,
+                &dm.k,
+                nb_k,
+                plan_zk,
+                &self.h_scc,
+                &dm.w,
+                nb_hs,
+                batch,
+            )?;
+            let eh = nb_hs * BS2 as u32;
+            self.gpu.axpby_batch(
+                nb_hs as usize,
+                2.0,
+                &dm.w,
+                eh,
+                0.0,
+                &dm.w,
+                eh,
+                &dm.w,
+                eh,
+                batch,
+            )?;
+            self.gpu.symmetrize_batch(
+                nb_hs as usize,
+                &self.hs_struct.transpose_block(),
+                &dm.w,
+                eh,
+                batch,
+            )?;
+        }
+        // Contraction with per-replica K/W — k_str/w_str select the
+        // replica slabs (elements).
+        {
+            let st = self.pair.as_ref().unwrap();
+            let bt = st.batch.as_ref().unwrap();
+            let dm = bt.dmm.as_ref().unwrap();
+            self.gpu.hs_contract_dev(
+                st.n_pairs,
+                n,
+                &st.pairs,
+                &st.pairs_k,
+                &bt.xyzu,
+                &st.species,
+                &self.n_orb_buf,
+                st.n_sp as u32,
+                &st.sk_meta,
+                &st.sk_parm,
+                &st.sk_ctrl,
+                st.max_ctrl as u32,
+                st.taper,
+                &dm.k,
+                &dm.w,
+                &bt.v,
+                &bt.pf,
+                batch,
+                nb_k * BS2 as u32,
+                nb_hs * BS2 as u32,
+            )?;
+        }
+        self.batch_force_tail_dev(batch)?;
+        self.batch_force_readback(batch, "forces (GPU dmm batch)")
     }
 
     /// Sparse masked band energy `Tr(K·H0)` on device (R7) — f32 partials
