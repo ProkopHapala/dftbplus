@@ -13,10 +13,8 @@ use crate::methods::dftb::forces::{repulsive_energy, Forces};
 use crate::methods::dftb::gamma::GammaTable;
 use crate::methods::dftb::hamiltonian::HamiltonianBuilder;
 use crate::methods::dftb::sk_data::SkData;
-use crate::methods::sparse::bsr4::{
-    build_full_mask, pad_physical_to_bsr4, Bsr4Matrix, BS,
-};
-use crate::methods::sparse::gpu_sparse::{SparseBsr4Gpu, tc2_trace_tol};
+use crate::methods::sparse::bsr4::{build_full_mask, pad_physical_to_bsr4, Bsr4Matrix, BS};
+use crate::methods::sparse::gpu_sparse::{tc2_trace_tol, SparseBsr4Gpu};
 use crate::methods::sparse::sparse_forces::sparse_analytic_forces;
 use crate::qmqm::shifts::compute_intra_shifts;
 
@@ -30,9 +28,9 @@ pub const E_DUMMY: f32 = 2.0;
 
 #[derive(Debug, Clone)]
 pub struct SparseDftbEnergy {
-    pub e_h0: f64,   // 2 Tr(K H0) — closed-shell band energy of H0
-    pub e_scc: f64,  // ½ Δq · V
-    pub e_el: f64,   // e_h0 + e_scc
+    pub e_h0: f64,  // 2 Tr(K H0) — closed-shell band energy of H0
+    pub e_scc: f64, // ½ Δq · V
+    pub e_el: f64,  // e_h0 + e_scc
     pub e_rep: f64,
     pub e_tot: f64,
     pub q: Vec<f64>,
@@ -69,12 +67,7 @@ pub fn trace_ab(a: &[f32], b: &[f32], n: usize) -> f64 {
 }
 
 /// Dummy-safe Hscc = H0 + ½ S ⊙ (V_A + V_B) on physical orbitals only.
-pub fn apply_shift_padded(
-    h0: &[f32],
-    s: &[f32],
-    v: &[f64],
-    atom_n_orb: &[u8],
-) -> Vec<f32> {
+pub fn apply_shift_padded(h0: &[f32], s: &[f32], v: &[f64], atom_n_orb: &[u8]) -> Vec<f32> {
     let n_atom = atom_n_orb.len();
     let n = n_atom * BS;
     assert_eq!(h0.len(), n * n);
@@ -101,7 +94,13 @@ pub fn apply_shift_padded(
 }
 
 /// `Hscc = H0 + ½ S ⊙ (V_A+V_B)` into a preallocated buffer (`out` may alias `h0` only if copied first).
-pub fn apply_shift_padded_into(h0: &[f32], s: &[f32], v: &[f64], atom_n_orb: &[u8], out: &mut [f32]) {
+pub fn apply_shift_padded_into(
+    h0: &[f32],
+    s: &[f32],
+    v: &[f64],
+    atom_n_orb: &[u8],
+    out: &mut [f32],
+) {
     let n_atom = atom_n_orb.len();
     let n = n_atom * BS;
     assert_eq!(h0.len(), n * n);
@@ -114,7 +113,9 @@ pub fn apply_shift_padded_into(h0: &[f32], s: &[f32], v: &[f64], atom_n_orb: &[u
         for b in 0..n_atom {
             let nb = atom_n_orb[b] as usize;
             let avg = 0.5 * (v[a] + v[b]);
-            if avg == 0.0 { continue; }
+            if avg == 0.0 {
+                continue;
+            }
             for i in 0..na {
                 for j in 0..nb {
                     let p = (a * BS + i) * n + (b * BS + j);
@@ -203,10 +204,21 @@ pub fn energy_non_scc(
         panic!("energy_non_scc: non-finite E_h0={e_h0} E_rep={e_rep}");
     }
     Ok(SparseDftbEnergy {
-        e_h0, e_scc: 0.0, e_el: e_h0, e_rep, e_tot: e_h0 + e_rep,
-        q: vec![0.0; n_atom], tr_ks: tr, r_i, n_scc: 0, tc2_iters,
-        k_pad: k_dense, h_scc_pad: h_pad, v: vec![0.0; n_atom],
-        r_scc: 0.0, r_h: f32::NAN,
+        e_h0,
+        e_scc: 0.0,
+        e_el: e_h0,
+        e_rep,
+        e_tot: e_h0 + e_rep,
+        q: vec![0.0; n_atom],
+        tr_ks: tr,
+        r_i,
+        n_scc: 0,
+        tc2_iters,
+        k_pad: k_dense,
+        h_scc_pad: h_pad,
+        v: vec![0.0; n_atom],
+        r_scc: 0.0,
+        r_h: f32::NAN,
         purify_status: crate::methods::sparse::gpu_sparse::PurifyStatus::Converged,
     })
 }
@@ -237,14 +249,36 @@ fn energy_from_k(
     let e_scc = 0.5 * dq.iter().zip(v.iter()).map(|(d, vi)| d * vi).sum::<f64>();
     let e_el = e_h0 + e_scc;
     SparseDftbEnergy {
-        e_h0, e_scc, e_el, e_rep, e_tot: e_el + e_rep,
-        q: q.to_vec(), tr_ks: tr, r_i, n_scc, tc2_iters,
-        k_pad: k_dense.to_vec(), h_scc_pad: h_scc, v, r_scc, r_h,
+        e_h0,
+        e_scc,
+        e_el,
+        e_rep,
+        e_tot: e_el + e_rep,
+        q: q.to_vec(),
+        tr_ks: tr,
+        r_i,
+        n_scc,
+        tc2_iters,
+        k_pad: k_dense.to_vec(),
+        h_scc_pad: h_scc,
+        v,
+        r_scc,
+        r_h,
         purify_status: crate::methods::sparse::gpu_sparse::PurifyStatus::Converged,
     }
 }
 
-fn mulliken_q(gpu: &SparseBsr4Gpu, k: &Bsr4Matrix, s: &Bsr4Matrix, mask: &(Vec<u32>, Vec<u32>), n_atom: usize, nocc: f32, tr: f32, it: usize, atom_n_orb: &[u8]) -> Result<Vec<f64>> {
+fn mulliken_q(
+    gpu: &SparseBsr4Gpu,
+    k: &Bsr4Matrix,
+    s: &Bsr4Matrix,
+    mask: &(Vec<u32>, Vec<u32>),
+    n_atom: usize,
+    nocc: f32,
+    tr: f32,
+    it: usize,
+    atom_n_orb: &[u8],
+) -> Result<Vec<f64>> {
     let t_ks = gpu.matmul_masked_bsym(k, s, mask)?;
     let (q_f32, q_dum) = gpu.mulliken(&t_ks, atom_n_orb)?;
     let qd_max: f32 = q_dum.iter().map(|x| x.abs()).fold(0.0, f32::max);
@@ -255,7 +289,8 @@ fn mulliken_q(gpu: &SparseBsr4Gpu, k: &Bsr4Matrix, s: &Bsr4Matrix, mask: &(Vec<u
     }
     if q_f32.len() != n_atom {
         return Err(DftbError::InvalidInput(format!(
-            "Mulliken len {} != n_atom {n_atom}", q_f32.len()
+            "Mulliken len {} != n_atom {n_atom}",
+            q_f32.len()
         )));
     }
     let q: Vec<f64> = q_f32.iter().map(|&x| x as f64).collect();
@@ -310,17 +345,33 @@ pub fn run_sparse_scc(
     let e_rep = repulsive_energy(sk_dir, species, coords)?;
     let mut q = match q_init {
         Some(qi) => {
-            assert_eq!(qi.len(), n_atom, "q_init len {} != n_atom {n_atom}", qi.len());
+            assert_eq!(
+                qi.len(),
+                n_atom,
+                "q_init len {} != n_atom {n_atom}",
+                qi.len()
+            );
             qi.to_vec()
         }
         None => q0.to_vec(),
     };
     let mut v = vec![0.0f64; n_atom];
     let mut last = SparseDftbEnergy {
-        e_h0: 0.0, e_scc: 0.0, e_el: 0.0, e_rep, e_tot: 0.0,
-        q: q.clone(), tr_ks: 0.0, r_i: 0.0, n_scc: 0, tc2_iters: 0,
-        k_pad: vec![], h_scc_pad: vec![], v: vec![0.0; n_atom],
-        r_scc: 0.0, r_h: f32::NAN,
+        e_h0: 0.0,
+        e_scc: 0.0,
+        e_el: 0.0,
+        e_rep,
+        e_tot: 0.0,
+        q: q.clone(),
+        tr_ks: 0.0,
+        r_i: 0.0,
+        n_scc: 0,
+        tc2_iters: 0,
+        k_pad: vec![],
+        h_scc_pad: vec![],
+        v: vec![0.0; n_atom],
+        r_scc: 0.0,
+        r_h: f32::NAN,
         purify_status: crate::methods::sparse::gpu_sparse::PurifyStatus::Failed,
     };
     let mut rms_prev = f64::INFINITY;
@@ -328,7 +379,8 @@ pub fn run_sparse_scc(
         let dq: Vec<f64> = q.iter().zip(q0).map(|(a, b)| a - b).collect();
         compute_intra_shifts(coords, species_code, &dq, gamma, &mut v);
         let h_scc = apply_shift_padded(&h0_pad, &s_pad, &v, atom_n_orb);
-        let (k, r_i, tr, tc2_iters) = purify_h_with_z(gpu, &h_scc, &s_bsr, &z, nocc, &mask, atom_n_orb)?;
+        let (k, r_i, tr, tc2_iters) =
+            purify_h_with_z(gpu, &h_scc, &s_bsr, &z, nocc, &mask, atom_n_orb)?;
         let q_new = mulliken_q(gpu, &k, &s_bsr, &mask, n_atom, nocc, tr, it, atom_n_orb)?;
         let k_dense = k.to_dense();
         let t_dense = gpu.matmul_masked_bsym(&k, &s_bsr, &mask)?.to_dense();
@@ -345,8 +397,22 @@ pub fn run_sparse_scc(
         }
         rms = (rms / n_atom as f64).sqrt();
         last = energy_from_k(
-            &k_dense, &h0_pad, n, &q_new, q0, coords, species_code, gamma,
-            e_rep, tr, r_i, it + 1, tc2_iters, h_scc, rms, f32::NAN,
+            &k_dense,
+            &h0_pad,
+            n,
+            &q_new,
+            q0,
+            coords,
+            species_code,
+            gamma,
+            e_rep,
+            tr,
+            r_i,
+            it + 1,
+            tc2_iters,
+            h_scc,
+            rms,
+            f32::NAN,
         );
         if verbose {
             eprintln!(
@@ -356,15 +422,21 @@ pub fn run_sparse_scc(
             );
         }
         if !last.e_el.is_finite() || !e_rep.is_finite() {
-            panic!("sparse SCC non-finite energy at iter {it}: E_el={} E_rep={e_rep}", last.e_el);
+            panic!(
+                "sparse SCC non-finite energy at iter {it}: E_el={} E_rep={e_rep}",
+                last.e_el
+            );
         }
         if rms < scc_tol {
             // Stationary repair: K, H, V, q from the same output charges (review §3.2).
             let dq_out: Vec<f64> = q_new.iter().zip(q0).map(|(a, b)| a - b).collect();
             compute_intra_shifts(coords, species_code, &dq_out, gamma, &mut v);
             let h_fin = apply_shift_padded(&h0_pad, &s_pad, &v, atom_n_orb);
-            let (k_fin, r_i_f, tr_f, tc2_f) = purify_h_with_z(gpu, &h_fin, &s_bsr, &z, nocc, &mask, atom_n_orb)?;
-            let q_fin = mulliken_q(gpu, &k_fin, &s_bsr, &mask, n_atom, nocc, tr_f, it, atom_n_orb)?;
+            let (k_fin, r_i_f, tr_f, tc2_f) =
+                purify_h_with_z(gpu, &h_fin, &s_bsr, &z, nocc, &mask, atom_n_orb)?;
+            let q_fin = mulliken_q(
+                gpu, &k_fin, &s_bsr, &mask, n_atom, nocc, tr_f, it, atom_n_orb,
+            )?;
             let mut r_fin = 0.0f64;
             for a in 0..n_atom {
                 let d = q_fin[a] - q_new[a];
@@ -375,8 +447,22 @@ pub fn run_sparse_scc(
             let r_h = gpu.hamiltonian_residual(&h_bsr, &k_fin, &s_bsr, &mask)?;
             let k_fin_d = k_fin.to_dense();
             last = energy_from_k(
-                &k_fin_d, &h0_pad, n, &q_fin, q0, coords, species_code, gamma,
-                e_rep, tr_f, r_i_f, it + 1, tc2_f, h_fin, r_fin, r_h,
+                &k_fin_d,
+                &h0_pad,
+                n,
+                &q_fin,
+                q0,
+                coords,
+                species_code,
+                gamma,
+                e_rep,
+                tr_f,
+                r_i_f,
+                it + 1,
+                tc2_f,
+                h_fin,
+                r_fin,
+                r_h,
             );
             eprintln!(
                 "  [sparse SCC] finalize  r_scc={r_fin:.3e}  R_H={r_h:.3e}  Tr(KS)={tr_f:.6}  R_I={r_i_f:.3e}  E_tot={:.8}",
@@ -425,11 +511,32 @@ pub fn eval_sparse_energy_forces(
     let h0: Vec<f64> = (0..n * n).map(|i| ham.h0[(i / n, i % n)]).collect();
     let s: Vec<f64> = (0..n * n).map(|i| ham.s[(i / n, i % n)]).collect();
     let e = run_sparse_scc(
-        gpu, &h0, &s, atom_n_orb, nocc, q0, species_code, coords, gamma,
-        sk_dir, species, 0.5, 1e-5, max_scc, q_init,
+        gpu,
+        &h0,
+        &s,
+        atom_n_orb,
+        nocc,
+        q0,
+        species_code,
+        coords,
+        gamma,
+        sk_dir,
+        species,
+        0.5,
+        1e-5,
+        max_scc,
+        q_init,
     )?;
     let f = sparse_analytic_forces(
-        sk, species, coords, atom_n_orb, &e.k_pad, &e.h_scc_pad, &e.q, q0, sk_dir,
+        sk,
+        species,
+        coords,
+        atom_n_orb,
+        &e.k_pad,
+        &e.h_scc_pad,
+        &e.q,
+        q0,
+        sk_dir,
     )?;
     Ok((e, f))
 }

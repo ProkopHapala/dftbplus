@@ -21,7 +21,9 @@ fn is_no_platform_panic(msg: &str) -> bool {
 }
 
 fn panic_msg(payload: &(dyn std::any::Any + Send)) -> String {
-    payload.downcast_ref::<String>().cloned()
+    payload
+        .downcast_ref::<String>()
+        .cloned()
         .or_else(|| payload.downcast_ref::<&str>().map(|s| (*s).to_string()))
         .unwrap_or_else(|| "non-string panic".to_string())
 }
@@ -49,7 +51,10 @@ pub fn require_sih_sk_dir() -> String {
     let h_si = p.join("H-Si.skf");
     assert!(si_si.is_file(), "Si-Si.skf missing in {dir}");
     assert!(h_h.is_file(), "H-H.skf missing in {dir}");
-    assert!(si_h.is_file() || h_si.is_file(), "Si-H.skf / H-Si.skf missing in {dir}");
+    assert!(
+        si_h.is_file() || h_si.is_file(),
+        "Si-H.skf / H-Si.skf missing in {dir}"
+    );
     eprintln!("[sparse SK] {dir}");
     dir
 }
@@ -58,7 +63,8 @@ pub fn require_sih_sk_dir() -> String {
 pub fn require_nvidia_runtime() -> Option<GpuRuntime> {
     match catch_unwind(AssertUnwindSafe(GpuRuntime::new)) {
         Ok(Ok(rt)) => {
-            require_nvidia_device(rt.caps()).unwrap_or_else(|e| panic!("sparse GPU required (no skip): {e}"));
+            require_nvidia_device(rt.caps())
+                .unwrap_or_else(|e| panic!("sparse GPU required (no skip): {e}"));
             print_gpu_banner(&rt);
             Some(rt)
         }
@@ -77,7 +83,9 @@ pub fn require_nvidia_runtime() -> Option<GpuRuntime> {
 
 /// BSR4 GPU for sparse tests. `None` only if there is no OpenCL platform.
 pub fn require_sparse_gpu() -> Option<SparseBsr4Gpu> {
-    match catch_unwind(AssertUnwindSafe(|| SparseBsr4Gpu::new(SparseBsr4Config::default()))) {
+    match catch_unwind(AssertUnwindSafe(|| {
+        SparseBsr4Gpu::new(SparseBsr4Config::default())
+    })) {
         Ok(Ok(gpu)) => Some(gpu),
         Ok(Err(e)) => panic!("sparse GPU required (no skip on OpenCL Err): {e}"),
         Err(payload) => {

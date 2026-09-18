@@ -18,14 +18,14 @@
 
 use nalgebra::{DMatrix, SymmetricEigen};
 use rust_dftb::methods::sparse::bsr4::{
-    build_geometric_mask, build_full_mask, build_product_mask, Bsr4Matrix, BS,
+    build_full_mask, build_geometric_mask, build_product_mask, Bsr4Matrix, BS,
 };
 use rust_dftb::methods::sparse::gpu_sparse::SparseBsr4Gpu;
 use rust_dftb::methods::sparse::harness::{require_sih_sk_dir, require_sparse_gpu};
 use rust_dftb::{load_sk_for_species, HamiltonianBuilder};
 
 const ANG2BOHR: f64 = 1.889_726_133;
-const E_DUMMY: f32 = 2.0;  // dummy orbital onsite energy (above occupied spectrum, not too high)
+const E_DUMMY: f32 = 2.0; // dummy orbital onsite energy (above occupied spectrum, not too high)
 
 // ---------------------------------------------------------------------
 // Helpers
@@ -75,7 +75,10 @@ fn dmatrix_to_row_major_f32(m: &DMatrix<f64>) -> Vec<f32> {
 }
 
 fn dense_max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max)
+    a.iter()
+        .zip(b.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max)
 }
 
 /// Build the padded BSR4 H and S matrices from a dense (variable-orbital)
@@ -91,7 +94,7 @@ fn dense_max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
 /// Returns (h_padded_dense, s_padded_dense, n_orb_physical, n_orb_padded,
 ///          atom_orb_off_physical, dummy_orb_indices).
 fn build_padded_bsr4(
-    h0_dense: &[f64],  // n_phys × n_phys row-major
+    h0_dense: &[f64], // n_phys × n_phys row-major
     s_dense: &[f64],
     atom_n_orb: &[u8],
 ) -> (Vec<f32>, Vec<f32>, usize, usize, Vec<usize>, Vec<usize>) {
@@ -160,7 +163,9 @@ fn cpu_density_kernel(h: &[f32], s: &[f32], n: usize, nocc: usize) -> Vec<f32> {
     let sf = row_major_to_dmatrix_f64(s, n);
     let se = SymmetricEigen::new(sf.clone());
     let mut d = DMatrix::<f64>::zeros(n, n);
-    for i in 0..n { d[(i, i)] = 1.0 / se.eigenvalues[i].max(1e-12).sqrt(); }
+    for i in 0..n {
+        d[(i, i)] = 1.0 / se.eigenvalues[i].max(1e-12).sqrt();
+    }
     let s_inv_sqrt = &se.eigenvectors * &d * se.eigenvectors.transpose();
     let h_orth = &s_inv_sqrt * &hf * &s_inv_sqrt;
     let he = SymmetricEigen::new(h_orth);
@@ -223,18 +228,24 @@ fn test_sih_padded_basis_gate_d() {
 
     // SiH4 (silane): 1 Si + 4 H, tetrahedral geometry
     // Si-H bond length ~1.48 Å, tetrahedral angle 109.47°
-    let species = vec!["Si".to_string(), "H".to_string(), "H".to_string(), "H".to_string(), "H".to_string()];
+    let species = vec![
+        "Si".to_string(),
+        "H".to_string(),
+        "H".to_string(),
+        "H".to_string(),
+        "H".to_string(),
+    ];
     let bond = 1.48f64;
     let theta = 109.47f64 * std::f64::consts::PI / 180.0;
     let cos_t = theta.cos();
     let sin_t = theta.sin();
     // Place Si at origin, 4 H at tetrahedral positions
     let coords = vec![
-        [0.0, 0.0, 0.0],  // Si
-        [bond, 0.0, 0.0],  // H1
-        [bond * cos_t, bond * sin_t, 0.0],  // H2
-        [bond * cos_t, bond * sin_t * cos_t, bond * sin_t * sin_t],  // H3
-        [bond * cos_t, -bond * sin_t * cos_t, -bond * sin_t * sin_t],  // H4 (approximate)
+        [0.0, 0.0, 0.0],                                              // Si
+        [bond, 0.0, 0.0],                                             // H1
+        [bond * cos_t, bond * sin_t, 0.0],                            // H2
+        [bond * cos_t, bond * sin_t * cos_t, bond * sin_t * sin_t],   // H3
+        [bond * cos_t, -bond * sin_t * cos_t, -bond * sin_t * sin_t], // H4 (approximate)
     ];
 
     // Load SK data
@@ -248,23 +259,33 @@ fn test_sih_padded_basis_gate_d() {
 
     // Physical orbital counts: Si=4, H=1
     let atom_n_orb: Vec<u8> = vec![4, 1, 1, 1, 1];
-    assert_eq!(n_phys, atom_n_orb.iter().map(|&n| n as usize).sum::<usize>());
+    assert_eq!(
+        n_phys,
+        atom_n_orb.iter().map(|&n| n as usize).sum::<usize>()
+    );
 
     // Electron count: Si has 4 valence e-, H has 1 each → 4 + 4*1 = 8 e- → 4 occ MOs
     // (matsci-0-3 SK files don't encode n_shell on the grid line, so q0
     // extraction from the SK file is unreliable; use known valence counts.)
-    let n_electrons: f64 = 4.0 + 4.0 * 1.0;  // Si + 4*H
+    let n_electrons: f64 = 4.0 + 4.0 * 1.0; // Si + 4*H
     let n_occ_phys = (n_electrons / 2.0).round() as usize;
     eprintln!("  n_electrons={n_electrons}, n_occ_phys={n_occ_phys}");
 
     // Flatten H0 and S to row-major f64
-    let h0_dense: Vec<f64> = (0..n_phys * n_phys).map(|idx| scc.h0[(idx / n_phys, idx % n_phys)]).collect();
-    let s_dense: Vec<f64> = (0..n_phys * n_phys).map(|idx| scc.s[(idx / n_phys, idx % n_phys)]).collect();
+    let h0_dense: Vec<f64> = (0..n_phys * n_phys)
+        .map(|idx| scc.h0[(idx / n_phys, idx % n_phys)])
+        .collect();
+    let s_dense: Vec<f64> = (0..n_phys * n_phys)
+        .map(|idx| scc.s[(idx / n_phys, idx % n_phys)])
+        .collect();
 
     // Build padded BSR4 H and S
     let (h_pad, s_pad, n_phys, n_padded, padded_off, dummy_indices) =
         build_padded_bsr4(&h0_dense, &s_dense, &atom_n_orb);
-    eprintln!("  n_padded={n_padded}, n_dummy_orbs={}", dummy_indices.len());
+    eprintln!(
+        "  n_padded={n_padded}, n_dummy_orbs={}",
+        dummy_indices.len()
+    );
 
     // Dense reference (using padded matrices, same n_occ_phys)
     let k_ref_dense = cpu_density_kernel(&h_pad, &s_pad, n_padded, n_occ_phys);
@@ -311,7 +332,9 @@ fn test_sih_padded_basis_gate_d() {
     let (emin, emax) = gpu.spectral_bounds(&h_bsr, &z, &mask, 0.1).unwrap();
     eprintln!("  spectral bounds: emin={emin:.4} emax={emax:.4}");
 
-    let k0 = gpu.build_k0(&h_bsr, &s_bsr, &z, &mask, &mask, emin, emax).unwrap();
+    let k0 = gpu
+        .build_k0(&h_bsr, &s_bsr, &z, &mask, &mask, emin, emax)
+        .unwrap();
     let nocc_f = n_occ_phys as f32;
     let (k_final, r_in, tr, tc2_iters, _hist) = gpu
         .tc2_purify(&k0, &s_bsr, nocc_f, &mask, &mask, &atom_n_orb, 80, 1e-4)
@@ -324,8 +347,10 @@ fn test_sih_padded_basis_gate_d() {
     // 1. Correct electron count: Tr(KS) → physical Nocc
     let tr_err = (tr as f64 - n_occ_phys as f64).abs();
     eprintln!("  Tr(KS) = {tr:.6}, Nocc_phys = {n_occ_phys}, |err| = {tr_err:.3e}");
-    assert!(tr_err < 1e-4,
-        "Gate D: Tr(KS)={tr:.6} != Nocc_phys={n_occ_phys}, err={tr_err:.3e} (G2)");
+    assert!(
+        tr_err < 1e-4,
+        "Gate D: Tr(KS)={tr:.6} != Nocc_phys={n_occ_phys}, err={tr_err:.3e} (G2)"
+    );
 
     // 2. Dummy occupation negligible
     let k_sparse_dense = k_final.to_dense();
@@ -350,11 +375,17 @@ fn test_sih_padded_basis_gate_d() {
         max_dummy_occ_sparse = max_dummy_occ_sparse.max(occ.abs());
         total_dummy_occ_sparse += occ.abs();
     }
-    eprintln!("  Sparse dummy occ: max={max_dummy_occ_sparse:.3e}, total={total_dummy_occ_sparse:.3e}");
-    assert!(max_dummy_occ_sparse < 1e-8,
-        "Gate D: max dummy occupation {max_dummy_occ_sparse:.3e} too large (G2)");
-    assert!(total_dummy_occ_sparse < 1e-8,
-        "Gate D: total dummy occupation {total_dummy_occ_sparse:.3e} too large (G2)");
+    eprintln!(
+        "  Sparse dummy occ: max={max_dummy_occ_sparse:.3e}, total={total_dummy_occ_sparse:.3e}"
+    );
+    assert!(
+        max_dummy_occ_sparse < 1e-8,
+        "Gate D: max dummy occupation {max_dummy_occ_sparse:.3e} too large (G2)"
+    );
+    assert!(
+        total_dummy_occ_sparse < 1e-8,
+        "Gate D: total dummy occupation {total_dummy_occ_sparse:.3e} too large (G2)"
+    );
 
     // 3. Active Mulliken electron sum has correct physical count
     // Note: K is the spinless density kernel, Tr(KS) = Nocc. The electron
@@ -364,26 +395,38 @@ fn test_sih_padded_basis_gate_d() {
     let q_sparse = cpu_mulliken_charges(&k_sparse_dense, &s_pad, species.len());
     let active_electrons: f64 = 2.0 * q_sparse.iter().sum::<f64>();
     eprintln!("  Active Mulliken sum = {active_electrons:.6} (expected {n_electrons:.6})");
-    assert!((active_electrons - n_electrons).abs() < 1e-4,
-        "Gate D: active Mulliken electron sum {active_electrons:.6} != {n_electrons:.6} (G2)");
+    assert!(
+        (active_electrons - n_electrons).abs() < 1e-4,
+        "Gate D: active Mulliken electron sum {active_electrons:.6} != {n_electrons:.6} (G2)"
+    );
 
     // 4. Dense/sparse energy/charge parity
     let e_sparse = cpu_energy(&k_sparse_dense, &h_pad, n_padded);
     let energy_err = (e_sparse - e_ref).abs();
     eprintln!("  E_sparse={e_sparse:.6}, E_ref={e_ref:.6}, |dE|={energy_err:.3e}");
-    assert!(energy_err < 1e-6,
-        "Gate D: energy parity failed |dE|={energy_err:.3e} (measured 8.6e-8; G2)");
+    assert!(
+        energy_err < 1e-6,
+        "Gate D: energy parity failed |dE|={energy_err:.3e} (measured 8.6e-8; G2)"
+    );
 
-    let charge_err = q_sparse.iter().zip(q_ref.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f64, f64::max);
+    let charge_err = q_sparse
+        .iter()
+        .zip(q_ref.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f64, f64::max);
     eprintln!("  |dq|={charge_err:.3e}");
-    assert!(charge_err < 1e-5,
-        "Gate D: charge parity failed |dq|={charge_err:.3e} (measured 3e-6; G2)");
+    assert!(
+        charge_err < 1e-5,
+        "Gate D: charge parity failed |dq|={charge_err:.3e} (measured 3e-6; G2)"
+    );
 
     // 5. K parity (sparse vs dense)
     let k_err = dense_max_abs_diff(&k_sparse_dense, &k_ref_dense);
     eprintln!("  ||K_sparse - K_ref||_max = {k_err:.3e}");
-    assert!(k_err < 5e-2,
-        "Gate D: K parity failed ||dK||={k_err:.3e} > 5e-2");
+    assert!(
+        k_err < 5e-2,
+        "Gate D: K parity failed ||dK||={k_err:.3e} > 5e-2"
+    );
 
     eprintln!("\n  Gate D: PASS — padded Si/H basis is nonsingular, dummy occupation negligible.");
 }

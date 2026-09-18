@@ -30,8 +30,8 @@ use crate::core::error::{DftbError, Result};
 use crate::qmqm::gpu_eigen::{build_inv_sqrt_batched, jacobi_batched};
 use crate::qmqm::gpu_matrix::{
     build_density_masked_batched, delta_q_batched, dot_batched, extract_diagonal_batched,
-    frobenius_trace_batched, gamma_matvec_batched, h_scc_update_batched,
-    matmul_batched, mulliken_charges_batched, residual_and_mix_batched,
+    frobenius_trace_batched, gamma_matvec_batched, h_scc_update_batched, matmul_batched,
+    mulliken_charges_batched, residual_and_mix_batched,
 };
 use crate::qmqm::gpu_runtime::GpuRuntime;
 use ocl::Buffer;
@@ -98,25 +98,77 @@ impl GpuSccTiming {
         eprintln!("    S^{{-1/2}} precompute : {:.4} s", self.t_inv_sqrt);
         eprintln!("    alloc buffers       : {:.4} s", self.t_alloc);
         eprintln!("    --- per-iter (cumulative, {} iters) ---", n_iters);
-        eprintln!("    delta_q             : {:.4} s  ({:.4} ms/iter)", self.t_delta_q, self.t_delta_q / n_iters as f64 * 1e3);
-        eprintln!("    gamma_matvec        : {:.4} s  ({:.4} ms/iter)", self.t_gamma_matvec, self.t_gamma_matvec / n_iters as f64 * 1e3);
-        eprintln!("    h_scc_update        : {:.4} s  ({:.4} ms/iter)", self.t_h_scc_update, self.t_h_scc_update / n_iters as f64 * 1e3);
-        eprintln!("    gemm (2×)           : {:.4} s  ({:.4} ms/iter)", self.t_gemm, self.t_gemm / n_iters as f64 * 1e3);
-        eprintln!("    jacobi              : {:.4} s  ({:.4} ms/iter)", self.t_jacobi, self.t_jacobi / n_iters as f64 * 1e3);
-        eprintln!("    occ_sort+upload     : {:.4} s  ({:.4} ms/iter)", self.t_occ_sort, self.t_occ_sort / n_iters as f64 * 1e3);
-        eprintln!("    back_gemm           : {:.4} s  ({:.4} ms/iter)", self.t_back_gemm, self.t_back_gemm / n_iters as f64 * 1e3);
-        eprintln!("    density             : {:.4} s  ({:.4} ms/iter)", self.t_density, self.t_density / n_iters as f64 * 1e3);
-        eprintln!("    mulliken            : {:.4} s  ({:.4} ms/iter)", self.t_mulliken, self.t_mulliken / n_iters as f64 * 1e3);
-        eprintln!("    diis_mix (CPU)      : {:.4} s  ({:.4} ms/iter)", self.t_diis_mix, self.t_diis_mix / n_iters as f64 * 1e3);
+        eprintln!(
+            "    delta_q             : {:.4} s  ({:.4} ms/iter)",
+            self.t_delta_q,
+            self.t_delta_q / n_iters as f64 * 1e3
+        );
+        eprintln!(
+            "    gamma_matvec        : {:.4} s  ({:.4} ms/iter)",
+            self.t_gamma_matvec,
+            self.t_gamma_matvec / n_iters as f64 * 1e3
+        );
+        eprintln!(
+            "    h_scc_update        : {:.4} s  ({:.4} ms/iter)",
+            self.t_h_scc_update,
+            self.t_h_scc_update / n_iters as f64 * 1e3
+        );
+        eprintln!(
+            "    gemm (2×)           : {:.4} s  ({:.4} ms/iter)",
+            self.t_gemm,
+            self.t_gemm / n_iters as f64 * 1e3
+        );
+        eprintln!(
+            "    jacobi              : {:.4} s  ({:.4} ms/iter)",
+            self.t_jacobi,
+            self.t_jacobi / n_iters as f64 * 1e3
+        );
+        eprintln!(
+            "    occ_sort+upload     : {:.4} s  ({:.4} ms/iter)",
+            self.t_occ_sort,
+            self.t_occ_sort / n_iters as f64 * 1e3
+        );
+        eprintln!(
+            "    back_gemm           : {:.4} s  ({:.4} ms/iter)",
+            self.t_back_gemm,
+            self.t_back_gemm / n_iters as f64 * 1e3
+        );
+        eprintln!(
+            "    density             : {:.4} s  ({:.4} ms/iter)",
+            self.t_density,
+            self.t_density / n_iters as f64 * 1e3
+        );
+        eprintln!(
+            "    mulliken            : {:.4} s  ({:.4} ms/iter)",
+            self.t_mulliken,
+            self.t_mulliken / n_iters as f64 * 1e3
+        );
+        eprintln!(
+            "    diis_mix (CPU)      : {:.4} s  ({:.4} ms/iter)",
+            self.t_diis_mix,
+            self.t_diis_mix / n_iters as f64 * 1e3
+        );
         eprintln!("    --- post-convergence ---");
         eprintln!("    energy              : {:.4} s", self.t_energy);
         eprintln!("    readback            : {:.4} s", self.t_readback);
         eprintln!("    TOTAL               : {:.4} s", self.t_total);
-        let per_iter = (self.t_delta_q + self.t_gamma_matvec + self.t_h_scc_update
-            + self.t_gemm + self.t_jacobi + self.t_occ_sort + self.t_back_gemm
-            + self.t_density + self.t_mulliken + self.t_diis_mix) / n_iters as f64;
+        let per_iter = (self.t_delta_q
+            + self.t_gamma_matvec
+            + self.t_h_scc_update
+            + self.t_gemm
+            + self.t_jacobi
+            + self.t_occ_sort
+            + self.t_back_gemm
+            + self.t_density
+            + self.t_mulliken
+            + self.t_diis_mix)
+            / n_iters as f64;
         eprintln!("    per-iter total      : {:.4} ms", per_iter * 1e3);
-        let jacobi_pct = if per_iter > 0.0 { self.t_jacobi / n_iters as f64 / per_iter * 100.0 } else { 0.0 };
+        let jacobi_pct = if per_iter > 0.0 {
+            self.t_jacobi / n_iters as f64 / per_iter * 100.0
+        } else {
+            0.0
+        };
         eprintln!("    jacobi fraction     : {:.1}%", jacobi_pct);
     }
 }
@@ -226,7 +278,17 @@ pub fn gpu_solve_scc_batched(
         gamma_matvec_batched(rt, g_buf, &dq, &v, n_atoms, batch)?;
 
         // 3. H_scc = H0 + 0.5·S·(V_i + V_j)
-        h_scc_update_batched(rt, h0_buf, s_buf, &v, &h_scc, orb_atom_buf, n, n_atoms, batch)?;
+        h_scc_update_batched(
+            rt,
+            h0_buf,
+            s_buf,
+            &v,
+            &h_scc,
+            orb_atom_buf,
+            n,
+            n_atoms,
+            batch,
+        )?;
 
         // 4. H' = X · H_scc · X  (2 GEMMs)
         matmul_batched(rt, &x_buf, &h_scc, &temp, n, batch)?;
@@ -246,10 +308,22 @@ pub fn gpu_solve_scc_batched(
             let mut eig_dbg = vec![0.0f32; n * n];
             rt.read_buffer(&hp, &mut eig_dbg)?;
             let diags: Vec<f32> = (0..n).map(|i| eig_dbg[i * n + i]).collect();
-            eprintln!("    [gpu_scc] iter {iter}: q0={:?}", &q_dbg[..n_atoms.min(4)]);
-            eprintln!("    [gpu_scc] iter {iter}: dq={:?}", &dq_dbg[..n_atoms.min(4)]);
-            eprintln!("    [gpu_scc] iter {iter}: V ={:?}", &v_dbg[..n_atoms.min(4)]);
-            eprintln!("    [gpu_scc] iter {iter}: eig(diag)={:?}", &diags[..n.min(6)]);
+            eprintln!(
+                "    [gpu_scc] iter {iter}: q0={:?}",
+                &q_dbg[..n_atoms.min(4)]
+            );
+            eprintln!(
+                "    [gpu_scc] iter {iter}: dq={:?}",
+                &dq_dbg[..n_atoms.min(4)]
+            );
+            eprintln!(
+                "    [gpu_scc] iter {iter}: V ={:?}",
+                &v_dbg[..n_atoms.min(4)]
+            );
+            eprintln!(
+                "    [gpu_scc] iter {iter}: eig(diag)={:?}",
+                &diags[..n.min(6)]
+            );
         }
 
         // 6. Extract diag(H') on GPU → read N*batch floats → sort → occ_mask → upload
@@ -280,11 +354,29 @@ pub fn gpu_solve_scc_batched(
         build_density_masked_batched(rt, &c, &occ_mask, &d, &eig_diag_buf, 0, n, batch)?;
 
         // 9. q_new = Mulliken(D, S)
-        mulliken_charges_batched(rt, &d, s_buf, &q_new, orb_atom_buf, n, n_atoms, batch, &active)?;
+        mulliken_charges_batched(
+            rt,
+            &d,
+            s_buf,
+            &q_new,
+            orb_atom_buf,
+            n,
+            n_atoms,
+            batch,
+            &active,
+        )?;
 
         // 10. residual + mix
         residual_and_mix_batched(
-            rt, &q_new, &q_bufs[q_cur], &q_bufs[1 - q_cur], &rms, &active, alpha, n_atoms, batch,
+            rt,
+            &q_new,
+            &q_bufs[q_cur],
+            &q_bufs[1 - q_cur],
+            &rms,
+            &active,
+            alpha,
+            n_atoms,
+            batch,
         )?;
 
         // Check convergence (read batch floats — negligible)
@@ -389,8 +481,23 @@ pub fn gpu_solve_scc_batched_diis(
 ) -> Result<GpuSccResult> {
     // Cold-start variant: initial charges = q0 (neutral valence)
     gpu_solve_scc_batched_diis_warmstart(
-        rt, h0_buf, s_buf, g_buf, q0_buf, q0_buf, orb_atom_buf,
-        n, n_atoms, n_occ, batch, max_iter, tol, alpha, max_history, warmup, false,
+        rt,
+        h0_buf,
+        s_buf,
+        g_buf,
+        q0_buf,
+        q0_buf,
+        orb_atom_buf,
+        n,
+        n_atoms,
+        n_occ,
+        batch,
+        max_iter,
+        tol,
+        alpha,
+        max_history,
+        warmup,
+        false,
     )
 }
 
@@ -428,7 +535,11 @@ pub fn gpu_solve_scc_batched_diis_warmstart(
     // Phase 3: N>64 is now supported via tiled Jacobi + tiled GEMM + tiled S^{-1/2}.
 
     let do_timing = timing_enabled();
-    let mut tm: Option<GpuSccTiming> = if do_timing { Some(GpuSccTiming::default()) } else { None };
+    let mut tm: Option<GpuSccTiming> = if do_timing {
+        Some(GpuSccTiming::default())
+    } else {
+        None
+    };
     let t_total_start = std::time::Instant::now();
 
     // --- Precompute X = S^{-1/2} (once) ---
@@ -436,33 +547,67 @@ pub fn gpu_solve_scc_batched_diis_warmstart(
 
     // --- Allocate working buffers (once) ---
     let nn = n * n;
-    let (q0_host, init_q_host, q_gpu, dq, v, h_scc, temp, hp, cp, c, d, q_new, tr, dot, occ_mask, eig_diag_buf) = timed!(tm, t_alloc, {
-    let q0_host = {
-        let mut tmp = vec![0.0f32; batch * n_atoms];
-        rt.read_buffer(q0_buf, &mut tmp)?;
-        tmp
-    };
-    // Start from warm-started initial charges (not necessarily q0)
-    let init_q_host = {
-        let mut tmp = vec![0.0f32; batch * n_atoms];
-        rt.read_buffer(init_q_buf, &mut tmp)?;
-        tmp
-    };
-    let q_gpu = rt.buffer_from_slice(&init_q_host)?;  // current charges (GPU)
-    let dq = rt.zero_buffer::<f32>(batch * n_atoms)?;
-    let v = rt.zero_buffer::<f32>(batch * n_atoms)?;
-    let h_scc = rt.zero_buffer::<f32>(batch * nn)?;
-    let temp = rt.zero_buffer::<f32>(batch * nn)?;
-    let hp = rt.zero_buffer::<f32>(batch * nn)?;
-    let cp = rt.zero_buffer::<f32>(batch * nn)?;
-    let c = rt.zero_buffer::<f32>(batch * nn)?;
-    let d = rt.zero_buffer::<f32>(batch * nn)?;
-    let q_new = rt.zero_buffer::<f32>(batch * n_atoms)?;
-    let tr = rt.zero_buffer::<f32>(batch)?;
-    let dot = rt.zero_buffer::<f32>(batch)?;
-    let occ_mask = rt.zero_buffer::<i32>(batch * n)?;
-    let eig_diag_buf = rt.zero_buffer::<f32>(batch * n)?; // Phase 0d
-    (q0_host, init_q_host, q_gpu, dq, v, h_scc, temp, hp, cp, c, d, q_new, tr, dot, occ_mask, eig_diag_buf)
+    let (
+        q0_host,
+        init_q_host,
+        q_gpu,
+        dq,
+        v,
+        h_scc,
+        temp,
+        hp,
+        cp,
+        c,
+        d,
+        q_new,
+        tr,
+        dot,
+        occ_mask,
+        eig_diag_buf,
+    ) = timed!(tm, t_alloc, {
+        let q0_host = {
+            let mut tmp = vec![0.0f32; batch * n_atoms];
+            rt.read_buffer(q0_buf, &mut tmp)?;
+            tmp
+        };
+        // Start from warm-started initial charges (not necessarily q0)
+        let init_q_host = {
+            let mut tmp = vec![0.0f32; batch * n_atoms];
+            rt.read_buffer(init_q_buf, &mut tmp)?;
+            tmp
+        };
+        let q_gpu = rt.buffer_from_slice(&init_q_host)?; // current charges (GPU)
+        let dq = rt.zero_buffer::<f32>(batch * n_atoms)?;
+        let v = rt.zero_buffer::<f32>(batch * n_atoms)?;
+        let h_scc = rt.zero_buffer::<f32>(batch * nn)?;
+        let temp = rt.zero_buffer::<f32>(batch * nn)?;
+        let hp = rt.zero_buffer::<f32>(batch * nn)?;
+        let cp = rt.zero_buffer::<f32>(batch * nn)?;
+        let c = rt.zero_buffer::<f32>(batch * nn)?;
+        let d = rt.zero_buffer::<f32>(batch * nn)?;
+        let q_new = rt.zero_buffer::<f32>(batch * n_atoms)?;
+        let tr = rt.zero_buffer::<f32>(batch)?;
+        let dot = rt.zero_buffer::<f32>(batch)?;
+        let occ_mask = rt.zero_buffer::<i32>(batch * n)?;
+        let eig_diag_buf = rt.zero_buffer::<f32>(batch * n)?; // Phase 0d
+        (
+            q0_host,
+            init_q_host,
+            q_gpu,
+            dq,
+            v,
+            h_scc,
+            temp,
+            hp,
+            cp,
+            c,
+            d,
+            q_new,
+            tr,
+            dot,
+            occ_mask,
+            eig_diag_buf,
+        )
     });
     // legacy path: all replicas active (extract_diagonal gates on it)
     let active = rt.buffer_from_slice(&vec![1i32; batch])?;
@@ -498,11 +643,33 @@ pub fn gpu_solve_scc_batched_diis_warmstart(
         n_iters = iter + 1;
 
         // 1-2. Δq = q − q0, V = G·Δq
-        timed!(tm, t_delta_q, delta_q_batched(rt, &q_gpu, q0_buf, &dq, n_atoms, batch)?);
-        timed!(tm, t_gamma_matvec, gamma_matvec_batched(rt, g_buf, &dq, &v, n_atoms, batch)?);
+        timed!(
+            tm,
+            t_delta_q,
+            delta_q_batched(rt, &q_gpu, q0_buf, &dq, n_atoms, batch)?
+        );
+        timed!(
+            tm,
+            t_gamma_matvec,
+            gamma_matvec_batched(rt, g_buf, &dq, &v, n_atoms, batch)?
+        );
 
         // 3. H_scc = H0 + 0.5·S·(V_i + V_j)
-        timed!(tm, t_h_scc_update, h_scc_update_batched(rt, h0_buf, s_buf, &v, &h_scc, orb_atom_buf, n, n_atoms, batch)?);
+        timed!(
+            tm,
+            t_h_scc_update,
+            h_scc_update_batched(
+                rt,
+                h0_buf,
+                s_buf,
+                &v,
+                &h_scc,
+                orb_atom_buf,
+                n,
+                n_atoms,
+                batch
+            )?
+        );
 
         // 4. H' = X · H_scc · X
         timed!(tm, t_gemm, {
@@ -517,67 +684,96 @@ pub fn gpu_solve_scc_batched_diis_warmstart(
         // Phase 0d: uses extract_diagonal_batched kernel instead of reading
         // the full N²*batch matrix. Reduces readback by factor of N.
         timed!(tm, t_occ_sort, {
-        extract_diagonal_batched(rt, &hp, &eig_diag_buf, n, batch, &active)?;
-        rt.read_buffer(&eig_diag_buf, &mut eig_diag)?;
-        for bi in 0..batch {
-            let mut idxs: Vec<usize> = (0..n).collect();
-            idxs.sort_unstable_by(|&a, &b| {
-                eig_diag[bi * n + a]
-                    .partial_cmp(&eig_diag[bi * n + b])
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            for (rank, &k) in idxs.iter().enumerate() {
-                mask_host[bi * n + k] = if rank < n_occ { 1 } else { 0 };
+            extract_diagonal_batched(rt, &hp, &eig_diag_buf, n, batch, &active)?;
+            rt.read_buffer(&eig_diag_buf, &mut eig_diag)?;
+            for bi in 0..batch {
+                let mut idxs: Vec<usize> = (0..n).collect();
+                idxs.sort_unstable_by(|&a, &b| {
+                    eig_diag[bi * n + a]
+                        .partial_cmp(&eig_diag[bi * n + b])
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                for (rank, &k) in idxs.iter().enumerate() {
+                    mask_host[bi * n + k] = if rank < n_occ { 1 } else { 0 };
+                }
             }
-        }
-        occ_mask.write(&mask_host).enq().map_err(crate::qmqm::gpu_runtime::map_ocl_err)?;
+            occ_mask
+                .write(&mask_host)
+                .enq()
+                .map_err(crate::qmqm::gpu_runtime::map_ocl_err)?;
         });
 
         // 7. C = X · C'
-        timed!(tm, t_back_gemm, matmul_batched(rt, &x_buf, &cp, &c, n, batch)?);
+        timed!(
+            tm,
+            t_back_gemm,
+            matmul_batched(rt, &x_buf, &cp, &c, n, batch)?
+        );
 
         // 8. D = 2·Σ_{k∈occ} C[:,k]·C[:,k]^T
-        timed!(tm, t_density, build_density_masked_batched(rt, &c, &occ_mask, &d, &eig_diag_buf, 0, n, batch)?);
+        timed!(
+            tm,
+            t_density,
+            build_density_masked_batched(rt, &c, &occ_mask, &d, &eig_diag_buf, 0, n, batch)?
+        );
 
         // 9. q_new = Mulliken(D, S) — device-resident
-        timed!(tm, t_mulliken, mulliken_charges_batched(rt, &d, s_buf, &q_new, orb_atom_buf, n, n_atoms, batch, &active)?);
+        timed!(
+            tm,
+            t_mulliken,
+            mulliken_charges_batched(
+                rt,
+                &d,
+                s_buf,
+                &q_new,
+                orb_atom_buf,
+                n,
+                n_atoms,
+                batch,
+                &active
+            )?
+        );
 
         // 10. CPU-driven DIIS mixing
         // Phase 0e: eliminated redundant q_gpu read — q_mixed_host from the
         // previous iteration is already the current q_gpu content (we just
         // uploaded it). Only q_new (Mulliken output) needs to be read.
         let max_rms = timed!(tm, t_diis_mix, {
-        rt.read_buffer(&q_new, &mut q_new_host)?;
-        // q_cur_host = q_mixed_host from previous iter (or init_q_host on iter 0)
-        q_cur_host.copy_from_slice(&q_mixed_host);
+            rt.read_buffer(&q_new, &mut q_new_host)?;
+            // q_cur_host = q_mixed_host from previous iter (or init_q_host on iter 0)
+            q_cur_host.copy_from_slice(&q_mixed_host);
 
-        let mut max_rms = 0.0f32;
-        rms_per_sys.fill(0.0f32);
-        for bi in 0..batch {
-            let q_new_slice = &q_new_host[bi * n_atoms..(bi + 1) * n_atoms];
-            let q_cur_slice = &q_cur_host[bi * n_atoms..(bi + 1) * n_atoms];
-            let q_mixed_slice = &mut q_mixed_host[bi * n_atoms..(bi + 1) * n_atoms];
+            let mut max_rms = 0.0f32;
+            rms_per_sys.fill(0.0f32);
+            for bi in 0..batch {
+                let q_new_slice = &q_new_host[bi * n_atoms..(bi + 1) * n_atoms];
+                let q_cur_slice = &q_cur_host[bi * n_atoms..(bi + 1) * n_atoms];
+                let q_mixed_slice = &mut q_mixed_host[bi * n_atoms..(bi + 1) * n_atoms];
 
-            // residual = q_new - q_cur
-            let residual: Vec<f64> = (0..n_atoms)
-                .map(|i| (q_new_slice[i] as f64) - (q_cur_slice[i] as f64))
-                .collect();
-            let rms = residual.iter().map(|r| r * r).sum::<f64>().sqrt() / (n_atoms as f64).sqrt();
-            rms_per_sys[bi] = rms as f32;
-            max_rms = max_rms.max(rms as f32);
+                // residual = q_new - q_cur
+                let residual: Vec<f64> = (0..n_atoms)
+                    .map(|i| (q_new_slice[i] as f64) - (q_cur_slice[i] as f64))
+                    .collect();
+                let rms =
+                    residual.iter().map(|r| r * r).sum::<f64>().sqrt() / (n_atoms as f64).sqrt();
+                rms_per_sys[bi] = rms as f32;
+                max_rms = max_rms.max(rms as f32);
 
-            // DIIS mix: convert to f64, mix, convert back to f32
-            let mut q_inout: Vec<f64> = q_cur_slice.iter().map(|&q| q as f64).collect();
-            let q_out: Vec<f64> = q_new_slice.iter().map(|&q| q as f64).collect();
-            mixers[bi].mix(&mut q_inout, &q_out, &residual);
-            for i in 0..n_atoms {
-                q_mixed_slice[i] = q_inout[i] as f32;
+                // DIIS mix: convert to f64, mix, convert back to f32
+                let mut q_inout: Vec<f64> = q_cur_slice.iter().map(|&q| q as f64).collect();
+                let q_out: Vec<f64> = q_new_slice.iter().map(|&q| q as f64).collect();
+                mixers[bi].mix(&mut q_inout, &q_out, &residual);
+                for i in 0..n_atoms {
+                    q_mixed_slice[i] = q_inout[i] as f32;
+                }
             }
-        }
 
-        // Upload mixed charges to GPU
-        q_gpu.write(&q_mixed_host).enq().map_err(crate::qmqm::gpu_runtime::map_ocl_err)?;
-        max_rms
+            // Upload mixed charges to GPU
+            q_gpu
+                .write(&q_mixed_host)
+                .enq()
+                .map_err(crate::qmqm::gpu_runtime::map_ocl_err)?;
+            max_rms
         }); // end timed!(t_diis_mix)
 
         if verbose && (iter < 5 || iter % 10 == 0) {

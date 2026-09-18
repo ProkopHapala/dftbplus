@@ -62,10 +62,20 @@ impl GpuForceDriver {
         let total_atoms = batch.total_atoms;
         let n_frags = batch.n_frags;
 
-        assert_eq!(dm.len(), batch.total_h_elements,
-            "dm length {} != total_h_elements {}", dm.len(), batch.total_h_elements);
-        assert_eq!(edm.len(), batch.total_h_elements,
-            "edm length {} != total_h_elements {}", edm.len(), batch.total_h_elements);
+        assert_eq!(
+            dm.len(),
+            batch.total_h_elements,
+            "dm length {} != total_h_elements {}",
+            dm.len(),
+            batch.total_h_elements
+        );
+        assert_eq!(
+            edm.len(),
+            batch.total_h_elements,
+            "edm length {} != total_h_elements {}",
+            edm.len(),
+            batch.total_h_elements
+        );
 
         let queue = rt.queue();
 
@@ -87,7 +97,9 @@ impl GpuForceDriver {
         for (bi, bucket) in batch.pair_buckets.iter().enumerate() {
             let sk_table = &batch.sk_tables[bucket.sk_table_idx];
             let n_pairs = bucket.n_pairs;
-            if n_pairs == 0 { continue; }
+            if n_pairs == 0 {
+                continue;
+            }
 
             let buf_pairs = upload_pairs(queue, &bucket.pairs)?;
             let buf_sk_h = upload_f32(queue, &sk_table.sk_h)?;
@@ -117,13 +129,18 @@ impl GpuForceDriver {
                 .arg(sk_table.n_sk_cols as i32)
                 .build()
                 .map_err(map_ocl_err)?;
-            unsafe { k.enq().map_err(map_ocl_err)?; }
+            unsafe {
+                k.enq().map_err(map_ocl_err)?;
+            }
             // R10: no finish() between buckets — in-order queue preserves order
         }
 
         // Single read+finish at the end
         let mut forces_host = vec![0.0f32; 3 * total_atoms];
-        buf_forces.read(&mut forces_host).enq().map_err(map_ocl_err)?;
+        buf_forces
+            .read(&mut forces_host)
+            .enq()
+            .map_err(map_ocl_err)?;
         queue.finish().map_err(map_ocl_err)?;
         Ok(forces_host)
     }
@@ -154,7 +171,9 @@ impl GpuForceDriver {
         for bucket in &batch.pair_buckets {
             let sk_table = &batch.sk_tables[bucket.sk_table_idx];
             let n_pairs = bucket.n_pairs;
-            if n_pairs == 0 { continue; }
+            if n_pairs == 0 {
+                continue;
+            }
 
             let buf_pairs = upload_pairs(queue, &bucket.pairs)?;
             let buf_sk_h = upload_f32(queue, &sk_table.sk_h)?;
@@ -184,11 +203,16 @@ impl GpuForceDriver {
                 .arg(sk_table.n_sk_cols as i32)
                 .build()
                 .map_err(map_ocl_err)?;
-            unsafe { k.enq().map_err(map_ocl_err)?; }
+            unsafe {
+                k.enq().map_err(map_ocl_err)?;
+            }
         }
 
         let mut forces_host = vec![0.0f32; 3 * total_atoms];
-        buf_forces.read(&mut forces_host).enq().map_err(map_ocl_err)?;
+        buf_forces
+            .read(&mut forces_host)
+            .enq()
+            .map_err(map_ocl_err)?;
         queue.finish().map_err(map_ocl_err)?;
         Ok(forces_host)
     }
@@ -214,10 +238,20 @@ impl GpuForceDriver {
         let n_frags = batch.n_frags;
         let queue = rt.queue();
 
-        assert_eq!(dm.len(), batch.total_h_elements,
-            "dm length {} != total_h_elements {}", dm.len(), batch.total_h_elements);
-        assert_eq!(v_shift.len(), total_atoms,
-            "v_shift length {} != total_atoms {}", v_shift.len(), total_atoms);
+        assert_eq!(
+            dm.len(),
+            batch.total_h_elements,
+            "dm length {} != total_h_elements {}",
+            dm.len(),
+            batch.total_h_elements
+        );
+        assert_eq!(
+            v_shift.len(),
+            total_atoms,
+            "v_shift length {} != total_atoms {}",
+            v_shift.len(),
+            total_atoms
+        );
 
         let buf_forces = Buffer::<f32>::builder()
             .queue(queue.clone())
@@ -234,7 +268,9 @@ impl GpuForceDriver {
         for bucket in &batch.pair_buckets {
             let sk_table = &batch.sk_tables[bucket.sk_table_idx];
             let n_pairs = bucket.n_pairs;
-            if n_pairs == 0 { continue; }
+            if n_pairs == 0 {
+                continue;
+            }
 
             let buf_pairs = upload_pairs(queue, &bucket.pairs)?;
             let buf_sk_s = upload_f32(queue, &sk_table.sk_s)?;
@@ -262,11 +298,16 @@ impl GpuForceDriver {
                 .arg(sk_table.n_sk_cols as i32)
                 .build()
                 .map_err(map_ocl_err)?;
-            unsafe { k.enq().map_err(map_ocl_err)?; }
+            unsafe {
+                k.enq().map_err(map_ocl_err)?;
+            }
         }
 
         let mut forces_host = vec![0.0f32; 3 * total_atoms];
-        buf_forces.read(&mut forces_host).enq().map_err(map_ocl_err)?;
+        buf_forces
+            .read(&mut forces_host)
+            .enq()
+            .map_err(map_ocl_err)?;
         queue.finish().map_err(map_ocl_err)?;
         Ok(forces_host)
     }
@@ -296,7 +337,11 @@ impl GpuForceDriver {
         let total_atoms = batch * n_atoms;
 
         assert_eq!(coords.len(), total_atoms * 3, "coords length mismatch");
-        assert_eq!(species_idx.len(), total_atoms, "species_idx length mismatch");
+        assert_eq!(
+            species_idx.len(),
+            total_atoms,
+            "species_idx length mismatch"
+        );
         assert_eq!(delta_q.len(), total_atoms, "delta_q length mismatch");
         assert_eq!(u_hub.len(), n_species, "u_hub length mismatch");
 
@@ -321,7 +366,7 @@ impl GpuForceDriver {
             crate::methods::dftb::gamma_spline::GAMMA_SPLINE_RMAX,
         )?;
         let buf_gamma_spl = upload_f32(queue, &gspl.knots)?;
-        let buf_park = upload_i32(queue, &vec![1i32; batch])?;   // W6b: all live
+        let buf_park = upload_i32(queue, &vec![1i32; batch])?; // W6b: all live
 
         let wg = 256usize;
         let k = Kernel::builder()
@@ -330,18 +375,30 @@ impl GpuForceDriver {
             .queue(queue.clone())
             .global_work_size(batch * wg)
             .local_work_size(wg)
-            .arg(n_atoms as i32).arg(batch as i32)
-            .arg(&buf_coords).arg(&buf_species).arg(&buf_dq).arg(&buf_u_hub)
+            .arg(n_atoms as i32)
+            .arg(batch as i32)
+            .arg(&buf_coords)
+            .arg(&buf_species)
+            .arg(&buf_dq)
+            .arg(&buf_u_hub)
             .arg(n_species as i32)
-            .arg(&buf_gamma_spl).arg(gspl.nk as i32)
-            .arg(gspl.dr as f32).arg(gspl.r_max as f32)
-            .arg(&buf_forces).arg(&buf_park)
+            .arg(&buf_gamma_spl)
+            .arg(gspl.nk as i32)
+            .arg(gspl.dr as f32)
+            .arg(gspl.r_max as f32)
+            .arg(&buf_forces)
+            .arg(&buf_park)
             .build()
             .map_err(map_ocl_err)?;
-        unsafe { k.enq().map_err(map_ocl_err)?; }
+        unsafe {
+            k.enq().map_err(map_ocl_err)?;
+        }
 
         let mut forces_host = vec![0.0f32; 3 * total_atoms];
-        buf_forces.read(&mut forces_host).enq().map_err(map_ocl_err)?;
+        buf_forces
+            .read(&mut forces_host)
+            .enq()
+            .map_err(map_ocl_err)?;
         queue.finish().map_err(map_ocl_err)?;
         Ok(forces_host)
     }
@@ -376,8 +433,10 @@ impl GpuForceDriver {
         let buf_offsets = upload_i32(&queue, spline_offsets)?;
 
         // Build kernel with REP_MAX_INTERVALS specialization
-        let source = FORCE_SOURCE.replace("#define REP_MAX_INTERVALS 30",
-            &format!("#define REP_MAX_INTERVALS {}", max_intervals));
+        let source = FORCE_SOURCE.replace(
+            "#define REP_MAX_INTERVALS 30",
+            &format!("#define REP_MAX_INTERVALS {}", max_intervals),
+        );
         let prog = rt.build_program(&source)?;
 
         let buf_spline_data = upload_f32(&queue, spline_data)?;
@@ -389,7 +448,7 @@ impl GpuForceDriver {
             .build()
             .map_err(map_ocl_err)?;
 
-        let buf_park = upload_i32(&queue, &vec![1i32; batch])?;   // W6b: all live
+        let buf_park = upload_i32(&queue, &vec![1i32; batch])?; // W6b: all live
         let wg = 256usize;
         let k = Kernel::builder()
             .program(&prog)
@@ -397,16 +456,26 @@ impl GpuForceDriver {
             .queue(queue.clone())
             .global_work_size(batch * wg)
             .local_work_size(wg)
-            .arg(n_atoms as i32).arg(batch as i32)
-            .arg(&buf_coords).arg(&buf_species).arg(&buf_offsets)
-            .arg(n_species as i32).arg(&buf_spline_data).arg(&buf_forces)
+            .arg(n_atoms as i32)
+            .arg(batch as i32)
+            .arg(&buf_coords)
+            .arg(&buf_species)
+            .arg(&buf_offsets)
+            .arg(n_species as i32)
+            .arg(&buf_spline_data)
+            .arg(&buf_forces)
             .arg(&buf_park)
             .build()
             .map_err(map_ocl_err)?;
-        unsafe { k.enq().map_err(map_ocl_err)?; }
+        unsafe {
+            k.enq().map_err(map_ocl_err)?;
+        }
 
         let mut forces_host = vec![0.0f32; 3 * total_atoms];
-        buf_forces.read(&mut forces_host).enq().map_err(map_ocl_err)?;
+        buf_forces
+            .read(&mut forces_host)
+            .enq()
+            .map_err(map_ocl_err)?;
         queue.finish().map_err(map_ocl_err)?;
         Ok(forces_host)
     }

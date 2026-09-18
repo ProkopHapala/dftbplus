@@ -52,6 +52,9 @@ pub struct GpuCdft {
     /// cdft_energies must subtract λ·(Q_F + q0_frag).
     pub q0_frag: Vec<f64>,
     k_shift: Kernel,
+    /// Local size the shift kernel was built with (gws = batch·wg_shift) —
+    /// T06 compact launches rescale the replica axis to work_n·wg_shift.
+    wg_shift: usize,
 }
 
 /// Result of one `GpuDftb::cdft_scc` outer-λ loop.
@@ -82,44 +85,65 @@ impl GpuCdft {
         orb_atom: &Buffer<i32>,
         h_scc: &Buffer<f32>,
         active: &Buffer<i32>,
+        work_ids: &Buffer<i32>,
     ) -> Result<Self> {
         if frag.len() != n_atoms {
             return Err(DftbError::InvalidInput(format!(
-                "GpuCdft: frag.len()={} != n_atoms={n_atoms}", frag.len()
+                "GpuCdft: frag.len()={} != n_atoms={n_atoms}",
+                frag.len()
             )));
         }
         let nfrag = frag.iter().copied().max().unwrap_or(-1) + 1;
         if nfrag <= 0 {
-            return Err(DftbError::InvalidInput("GpuCdft: no atom assigned to any fragment".into()));
+            return Err(DftbError::InvalidInput(
+                "GpuCdft: no atom assigned to any fragment".into(),
+            ));
         }
         let nfrag = nfrag as usize;
         if targets.len() != batch * nfrag {
             return Err(DftbError::InvalidInput(format!(
-                "GpuCdft: targets.len()={} != batch*nfrag {batch}*{nfrag}", targets.len()
+                "GpuCdft: targets.len()={} != batch*nfrag {batch}*{nfrag}",
+                targets.len()
             )));
         }
         for (a, &f) in frag.iter().enumerate() {
             if f >= nfrag as i32 || f < -1 {
                 return Err(DftbError::InvalidInput(format!(
-                    "GpuCdft: frag[{a}]={f} outside -1..{}", nfrag as i32 - 1
+                    "GpuCdft: frag[{a}]={f} outside -1..{}",
+                    nfrag as i32 - 1
                 )));
             }
         }
         if let Some(i) = targets.iter().position(|t| !t.is_finite()) {
-            return Err(DftbError::InvalidInput(format!("GpuCdft: targets[{i}]={} non-finite", targets[i])));
+            return Err(DftbError::InvalidInput(format!(
+                "GpuCdft: targets[{i}]={} non-finite",
+                targets[i]
+            )));
         }
         let buf_frag = rt.buffer_from_slice(frag)?;
         let buf_lam = rt.zero_buffer::<f32>(batch * nfrag)?;
         let prog = rt.build_program(CDFT_KERNEL_SOURCE)?;
         let wg = 256usize;
         let k_shift = Kernel::builder()
-            .program(&prog).name("cdft_hscc_shift_batched").queue(rt.queue().clone())
-            .global_work_size(batch * wg).local_work_size(wg)
-            .arg(n as i32).arg(n_atoms as i32).arg(batch as i32).arg(nfrag as i32)
-            .arg(s_buf).arg(orb_atom).arg(&buf_frag).arg(&buf_lam).arg(h_scc)
+            .program(&prog)
+            .name("cdft_hscc_shift_batched")
+            .queue(rt.queue().clone())
+            .global_work_size(batch * wg)
+            .local_work_size(wg)
+            .arg(n as i32)
+            .arg(n_atoms as i32)
+            .arg(batch as i32)
+            .arg(nfrag as i32)
+            .arg(s_buf)
+            .arg(orb_atom)
+            .arg(&buf_frag)
+            .arg(&buf_lam)
+            .arg(h_scc)
             .arg_local::<f32>(n_atoms)
             .arg(active)
-            .build().map_err(map_ocl_err)?;
+            .arg(work_ids)
+            .build()
+            .map_err(map_ocl_err)?;
         Ok(Self {
             nfrag,
             frag: frag.to_vec(),
@@ -131,16 +155,29 @@ impl GpuCdft {
             br_lo: vec![f64::NAN; batch * nfrag],
             br_hi: vec![f64::NAN; batch * nfrag],
             target: targets.to_vec(),
-            q0_frag: vec![0.0; nfrag],   // filled by set_cdft (needs q0)
+            q0_frag: vec![0.0; nfrag], // filled by set_cdft (needs q0)
             k_shift,
+            wg_shift: wg,
         })
     }
 
     /// Enqueue the h_scc shift on the kernel's bound queue. Called from
     /// `enq_dq_v_hscc` after the fused build — one extra launch per
     /// h_scc rebuild, only while a constraint set is attached.
+    #[allow(dead_code)]
     pub fn enq_shift(&self) -> Result<()> {
         unsafe { self.k_shift.enq().map_err(map_ocl_err) }
+    }
+
+    /// T06: compact-domain variant — launches `work_n` replica workgroups.
+    pub fn enq_shift_n(&self, work_n: usize) -> Result<()> {
+        unsafe {
+            self.k_shift
+                .cmd()
+                .global_work_size(work_n * self.wg_shift)
+                .enq()
+                .map_err(map_ocl_err)
+        }
     }
 
     /// Clear the bracket/secant history for element i — needed during
@@ -153,9 +190,15 @@ impl GpuCdft {
     }
 
     /// Diagnostic accessors for the driver stall report.
-    pub fn debug_br(&self, i: usize) -> (f64, f64) { (self.br_lo[i], self.br_hi[i]) }
-    pub fn lam_prev(&self, i: usize) -> f64 { self.lam_prev[i] }
-    pub fn err_prev(&self, i: usize) -> f64 { self.err_prev[i] }
+    pub fn debug_br(&self, i: usize) -> (f64, f64) {
+        (self.br_lo[i], self.br_hi[i])
+    }
+    pub fn lam_prev(&self, i: usize) -> f64 {
+        self.lam_prev[i]
+    }
+    pub fn err_prev(&self, i: usize) -> f64 {
+        self.err_prev[i]
+    }
 
     /// Upload host `lam` to the device buffer (between SCC solves).
     pub fn upload_lam(&self, rt: &GpuRuntime) -> Result<()> {
@@ -192,21 +235,31 @@ impl GpuCdft {
     /// The bracket is kept for diagnostics only.
     pub fn update_lam(&mut self, b: usize, f: usize, err: f64, kappa0: f64, step_cap: f64) {
         let i = b * self.nfrag + f;
-        if !self.step[i].is_finite() { self.step[i] = step_cap; }
+        if !self.step[i].is_finite() {
+            self.step[i] = step_cap;
+        }
         if err > 0.0 {
-            if self.br_lo[i].is_nan() || self.lam[i] > self.br_lo[i] { self.br_lo[i] = self.lam[i]; }
+            if self.br_lo[i].is_nan() || self.lam[i] > self.br_lo[i] {
+                self.br_lo[i] = self.lam[i];
+            }
         } else {
-            if self.br_hi[i].is_nan() || self.lam[i] < self.br_hi[i] { self.br_hi[i] = self.lam[i]; }
+            if self.br_hi[i].is_nan() || self.lam[i] < self.br_hi[i] {
+                self.br_hi[i] = self.lam[i];
+            }
         }
         let prev_err = self.err_prev[i];
-        if prev_err.is_finite() && err * prev_err < 0.0 { self.step[i] *= 0.5; }
+        if prev_err.is_finite() && err * prev_err < 0.0 {
+            self.step[i] *= 0.5;
+        }
         let mut d = if prev_err.is_finite() && (err - prev_err).abs() > 1e-8 {
             // secant: λ_new = λ − err·(λ − λ_prev)/(err − err_prev)
             -err * (self.lam[i] - self.lam_prev[i]) / (err - prev_err)
         } else {
             kappa0 * err
         };
-        if !d.is_finite() { d = kappa0 * err; }
+        if !d.is_finite() {
+            d = kappa0 * err;
+        }
         d = d.clamp(-self.step[i], self.step[i]);
         self.lam_prev[i] = self.lam[i];
         self.err_prev[i] = err;

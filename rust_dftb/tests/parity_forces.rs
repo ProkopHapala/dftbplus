@@ -16,17 +16,10 @@
 //! See `tests/run_forces.py` for the end-to-end driver that generates the
 //! reference file and invokes this test.
 
-use rust_dftb::{
-    load_sk_for_species,
-    parse_f64_list,
-    parse_xyz,
-    HamiltonianBuilder,
-};
 use rust_dftb::methods::dftb::forces::{
-    compute_non_scc_forces,
-    compute_scc_forces,
-    forces_hartree_ang_to_bohr,
+    compute_non_scc_forces, compute_scc_forces, forces_hartree_ang_to_bohr,
 };
+use rust_dftb::{load_sk_for_species, parse_f64_list, parse_xyz, HamiltonianBuilder};
 
 /// Load molecule + reference forces from env vars.
 fn load_env() -> Option<(Vec<String>, Vec<[f64; 3]>, Vec<[f64; 3]>, f64, bool)> {
@@ -57,12 +50,21 @@ fn load_env() -> Option<(Vec<String>, Vec<[f64; 3]>, Vec<[f64; 3]>, f64, bool)> 
             continue;
         }
         let vals = parse_f64_list(line);
-        assert_eq!(vals.len(), 3,
-            "ref force line must have 3 values, got {}: '{line}'", vals.len());
+        assert_eq!(
+            vals.len(),
+            3,
+            "ref force line must have 3 values, got {}: '{line}'",
+            vals.len()
+        );
         ref_forces.push([vals[0], vals[1], vals[2]]);
     }
-    assert_eq!(ref_forces.len(), species.len(),
-        "ref force count {} != atom count {}", ref_forces.len(), species.len());
+    assert_eq!(
+        ref_forces.len(),
+        species.len(),
+        "ref force count {} != atom count {}",
+        ref_forces.len(),
+        species.len()
+    );
 
     let tol: f64 = std::env::var("RUST_DFTB_FORCES_TOL")
         .ok()
@@ -113,9 +115,9 @@ fn compare_forces(rust: &[[f64; 3]], ref_f: &[[f64; 3]], label: &str) -> f64 {
 fn count_electrons(sk_dir: &str, species: &[String]) -> f64 {
     let sk = load_sk_for_species(sk_dir, species).expect("failed to load SK");
     let builder = HamiltonianBuilder::new(sk);
-    let ctx = rust_dftb::methods::dftb::hamiltonian::SystemContext::from_sk_data(
-        &builder.sk, species,
-    ).expect("failed to build ctx");
+    let ctx =
+        rust_dftb::methods::dftb::hamiltonian::SystemContext::from_sk_data(&builder.sk, species)
+            .expect("failed to build ctx");
     // q0 per atom = sum of valence electrons from onsite params.
     let mut total = 0.0f64;
     for i in 0..species.len() {
@@ -142,7 +144,11 @@ fn non_scc_forces_from_xyz() {
     let builder = HamiltonianBuilder::new(sk);
 
     let n_electrons = count_electrons(&sk_dir, &species);
-    eprintln!("[non_scc] n_atoms = {}, n_electrons = {}", species.len(), n_electrons);
+    eprintln!(
+        "[non_scc] n_atoms = {}, n_electrons = {}",
+        species.len(),
+        n_electrons
+    );
 
     let forces = compute_non_scc_forces(&builder, &species, &coords, n_electrons)
         .expect("non-SCC force computation failed");
@@ -161,8 +167,10 @@ fn non_scc_forces_from_xyz() {
     }
 
     let max_err = compare_forces(&rust_bohr, &ref_forces, "non_scc");
-    assert!(max_err < tol,
-        "non-SCC force mismatch: max |ΔF| = {max_err:.6e} >= tol {tol:.6e}");
+    assert!(
+        max_err < tol,
+        "non-SCC force mismatch: max |ΔF| = {max_err:.6e} >= tol {tol:.6e}"
+    );
 }
 
 /// SCC force parity test.
@@ -183,9 +191,13 @@ fn scc_forces_from_xyz() {
     eprintln!("[scc] n_atoms = {}", species.len());
 
     // Run SCC to convergence.
-    let scc = builder.build_scc(&species, &coords, 1000, 1e-10)
+    let scc = builder
+        .build_scc(&species, &coords, 1000, 1e-10)
         .expect("SCC did not converge");
-    eprintln!("[scc] converged in {} iterations, energy = {:.10}", scc.n_iter, scc.energy);
+    eprintln!(
+        "[scc] converged in {} iterations, energy = {:.10}",
+        scc.n_iter, scc.energy
+    );
     eprintln!("[scc] charges = {:?}", scc.charges);
     eprintln!("[scc] q0      = {:?}", scc.q0);
 
@@ -207,6 +219,8 @@ fn scc_forces_from_xyz() {
     }
 
     let max_err = compare_forces(&rust_bohr, &ref_forces, "scc");
-    assert!(max_err < tol,
-        "SCC force mismatch: max |ΔF| = {max_err:.6e} >= tol {tol:.6e}");
+    assert!(
+        max_err < tol,
+        "SCC force mismatch: max |ΔF| = {max_err:.6e} >= tol {tol:.6e}"
+    );
 }

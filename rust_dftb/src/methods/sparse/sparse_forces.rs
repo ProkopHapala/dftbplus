@@ -56,8 +56,12 @@ use crate::methods::dftb::forces::{
 use crate::methods::dftb::gamma::GammaTable;
 use crate::methods::dftb::hamiltonian::SystemContext;
 use crate::methods::dftb::sk_data::SkData;
-use crate::methods::sparse::bsr4::{build_product_mask, build_spgemm_plan_bsym, Bsr4Matrix, BS, BS2};
-use crate::methods::sparse::gpu_sparse::{GpuBsrMatrix, GpuBsrStructure, SparseBsr4Gpu, SpgemmPlanGpu};
+use crate::methods::sparse::bsr4::{
+    build_product_mask, build_spgemm_plan_bsym, Bsr4Matrix, BS, BS2,
+};
+use crate::methods::sparse::gpu_sparse::{
+    GpuBsrMatrix, GpuBsrStructure, SparseBsr4Gpu, SpgemmPlanGpu,
+};
 use nalgebra::DMatrix;
 use std::sync::Arc;
 
@@ -153,32 +157,60 @@ impl SparseDWWorkspace {
             let h_dummy = Bsr4Matrix::from_structure(n_atom, hs_mask.0.clone(), hs_mask.1.clone())?;
             let plan = build_spgemm_plan_bsym(&k_dummy, &h_dummy, &m_tw)
                 .map_err(|e| DftbError::InvalidInput(format!("plan_kh build failed (plans are mandatory in production — fix the mask or set RUST_DFTB_SPARSE_PLANS=0 for diagnostic intersection mode): {e}")))?;
-            Some(gpu.upload_plan(&plan)
-                .map_err(|e| DftbError::InvalidInput(format!("plan_kh upload failed: {e}")))?)
-        } else { None };
+            Some(
+                gpu.upload_plan(&plan)
+                    .map_err(|e| DftbError::InvalidInput(format!("plan_kh upload failed: {e}")))?,
+            )
+        } else {
+            None
+        };
         let plan_tk = if plans_on {
             let t_dummy = Bsr4Matrix::from_structure(n_atom, m_tw.0.clone(), m_tw.1.clone())?;
             let k_dummy = Bsr4Matrix::from_structure(n_atom, k_mask.0.clone(), k_mask.1.clone())?;
-            let plan = build_spgemm_plan_bsym(&t_dummy, &k_dummy, &hs_mask)
-                .map_err(|e| DftbError::InvalidInput(format!("plan_tk build failed (plans are mandatory in production): {e}")))?;
-            Some(gpu.upload_plan(&plan)
-                .map_err(|e| DftbError::InvalidInput(format!("plan_tk upload failed: {e}")))?)
-        } else { None };
+            let plan = build_spgemm_plan_bsym(&t_dummy, &k_dummy, &hs_mask).map_err(|e| {
+                DftbError::InvalidInput(format!(
+                    "plan_tk build failed (plans are mandatory in production): {e}"
+                ))
+            })?;
+            Some(
+                gpu.upload_plan(&plan)
+                    .map_err(|e| DftbError::InvalidInput(format!("plan_tk upload failed: {e}")))?,
+            )
+        } else {
+            None
+        };
         // P6 (GPT-5.6 item 6): plan for W = (Z·H_scc)·K — A=ZH on M_TZS
         // (non-symmetric), B=K symmetric → Bsym plan. Valid because the
         // code's Z is S⁻¹: Z·H·K = Σ_occ εᵢ cᵢcᵢᵀ exactly (verified by
         // test_w_zhk_vs_khk_parity). One SpGEMM, no KH intermediate.
         let plan_zk = if plans_on {
             let b_dummy = Bsr4Matrix::from_structure(
-                n_atom, tzs_struct.row_ptr_host(gpu)?, tzs_struct.col_idx_host(gpu)?)?;
+                n_atom,
+                tzs_struct.row_ptr_host(gpu)?,
+                tzs_struct.col_idx_host(gpu)?,
+            )?;
             let k_dummy = Bsr4Matrix::from_structure(n_atom, k_mask.0.clone(), k_mask.1.clone())?;
-            let plan = build_spgemm_plan_bsym(&b_dummy, &k_dummy, &hs_mask)
-                .map_err(|e| DftbError::InvalidInput(format!("plan_zk build failed (plans are mandatory in production): {e}")))?;
-            Some(gpu.upload_plan(&plan)
-                .map_err(|e| DftbError::InvalidInput(format!("plan_zk upload failed: {e}")))?)
-        } else { None };
+            let plan = build_spgemm_plan_bsym(&b_dummy, &k_dummy, &hs_mask).map_err(|e| {
+                DftbError::InvalidInput(format!(
+                    "plan_zk build failed (plans are mandatory in production): {e}"
+                ))
+            })?;
+            Some(
+                gpu.upload_plan(&plan)
+                    .map_err(|e| DftbError::InvalidInput(format!("plan_zk upload failed: {e}")))?,
+            )
+        } else {
+            None
+        };
 
-        Ok(Self { t, w, d, plan_kh, plan_tk, plan_zk })
+        Ok(Self {
+            t,
+            w,
+            d,
+            plan_kh,
+            plan_tk,
+            plan_zk,
+        })
     }
 
     /// Build `D = 2K` and `W = 2 K H_scc K` into the workspace's persistent
@@ -224,7 +256,14 @@ impl SparseDWWorkspace {
 
         // 3. Scale W by 2: W = 2 * project_MHS(T * K).
         let nblock_w = self.w.struct_.nblock;
-        gpu.axpby_dev(nblock_w, 2.0, &self.w.values, 0.0, &self.w.values, &self.w.values)?;
+        gpu.axpby_dev(
+            nblock_w,
+            2.0,
+            &self.w.values,
+            0.0,
+            &self.w.values,
+            &self.w.values,
+        )?;
 
         // 4. symmetrize(W).
         gpu.symmetrize_dev(nblock_w, self.w.struct_.transpose_block(), &self.w.values)?;
@@ -237,9 +276,13 @@ impl SparseDWWorkspace {
     }
 
     /// Access the D matrix (last computed).
-    pub fn d(&self) -> &GpuBsrMatrix { &self.d }
+    pub fn d(&self) -> &GpuBsrMatrix {
+        &self.d
+    }
     /// Access the W matrix (last computed).
-    pub fn w(&self) -> &GpuBsrMatrix { &self.w }
+    pub fn w(&self) -> &GpuBsrMatrix {
+        &self.w
+    }
 }
 
 /// Build `D = 2K` and `W = 2 K H_scc K` on the GPU using masked SpGEMM.
@@ -265,7 +308,10 @@ pub fn build_dw_sparse(
     m_hs: &(Vec<u32>, Vec<u32>),
 ) -> Result<SparseDW> {
     let n_atom = k.struct_.n_atom;
-    assert_eq!(h_scc.struct_.n_atom, n_atom, "K and H_scc must have same n_atom");
+    assert_eq!(
+        h_scc.struct_.n_atom, n_atom,
+        "K and H_scc must have same n_atom"
+    );
 
     // 1. M_TW = boolean_product(M_K, M_HS) — host-side, one-time per topology.
     let m_tw = build_product_mask(n_atom, m_k, m_hs);
@@ -302,8 +348,20 @@ pub fn build_dw_sparse(
 /// is the production-scale path once N4 is fixed.
 pub fn dw_from_k_padded(k_pad: &[f32], h_scc_pad: &[f32], n_atom: usize) -> (Vec<f64>, Vec<f64>) {
     let n = n_atom * BS;
-    assert_eq!(k_pad.len(), n * n, "dw_from_k_padded: K len {} != (n_atom*4)² {}", k_pad.len(), n * n);
-    assert_eq!(h_scc_pad.len(), n * n, "dw_from_k_padded: H len {} != (n_atom*4)² {}", h_scc_pad.len(), n * n);
+    assert_eq!(
+        k_pad.len(),
+        n * n,
+        "dw_from_k_padded: K len {} != (n_atom*4)² {}",
+        k_pad.len(),
+        n * n
+    );
+    assert_eq!(
+        h_scc_pad.len(),
+        n * n,
+        "dw_from_k_padded: H len {} != (n_atom*4)² {}",
+        h_scc_pad.len(),
+        n * n
+    );
     let k: Vec<f64> = k_pad.iter().map(|&x| x as f64).collect();
     let h: Vec<f64> = h_scc_pad.iter().map(|&x| x as f64).collect();
     let d: Vec<f64> = k.iter().map(|x| 2.0 * x).collect();
@@ -342,7 +400,13 @@ pub fn unpad_to_physical(padded: &[f64], atom_n_orb: &[u8]) -> DMatrix<f64> {
     let n_atom = atom_n_orb.len();
     let n_pad = n_atom * BS;
     let n_phys: usize = atom_n_orb.iter().map(|&n| n as usize).sum();
-    assert_eq!(padded.len(), n_pad * n_pad, "unpad_to_physical: len {} != n_pad² {}", padded.len(), n_pad * n_pad);
+    assert_eq!(
+        padded.len(),
+        n_pad * n_pad,
+        "unpad_to_physical: len {} != n_pad² {}",
+        padded.len(),
+        n_pad * n_pad
+    );
     let mut phys_off = vec![0usize; n_atom];
     let mut acc = 0usize;
     for a in 0..n_atom {
@@ -384,7 +448,8 @@ pub fn sparse_analytic_forces(
     let n_atom = atom_n_orb.len();
     if k_pad.is_empty() || h_scc_pad.is_empty() {
         return Err(DftbError::InvalidInput(
-            "sparse_analytic_forces: empty K or H_scc — run_sparse_scc must store k_pad/h_scc_pad".into(),
+            "sparse_analytic_forces: empty K or H_scc — run_sparse_scc must store k_pad/h_scc_pad"
+                .into(),
         ));
     }
     let n_pad = n_atom * BS;
@@ -426,10 +491,7 @@ pub fn sparse_analytic_forces(
 /// Returns `(D_dense, W_dense)` as `(n_orb × n_orb)` row-major f64 matrices
 /// where `n_orb = n_atom * 4` (BSR4 padded).
 #[cfg(test)]
-pub fn build_dw_dense_reference(
-    k: &Bsr4Matrix,
-    h_scc: &Bsr4Matrix,
-) -> (Vec<f64>, Vec<f64>, usize) {
+pub fn build_dw_dense_reference(k: &Bsr4Matrix, h_scc: &Bsr4Matrix) -> (Vec<f64>, Vec<f64>, usize) {
     let n_atom = k.n_atom;
     let n_orb = n_atom * BS;
     // f32 dense → f64 dense
@@ -444,7 +506,9 @@ pub fn build_dw_dense_reference(
     // W = 2 * K * H_scc * K (dense triple product)
     let t_dense = dense_matmul_f64(n_orb, &k_dense, &h_dense);
     let mut w_dense = dense_matmul_f64(n_orb, &t_dense, &k_dense);
-    for v in w_dense.iter_mut() { *v *= 2.0; }
+    for v in w_dense.iter_mut() {
+        *v *= 2.0;
+    }
     // Symmetrize W
     for i in 0..n_orb {
         for j in (i + 1)..n_orb {
@@ -552,14 +616,230 @@ pub(crate) fn hs_taper(t: Option<(f64, f64)>, r_ang: f64) -> (f64, f64) {
     match t {
         None => (1.0, 0.0),
         Some((r0, w)) => {
-            if r_ang <= r0 { (1.0, 0.0) }
-            else if r_ang >= r0 + w { (0.0, 0.0) }
-            else {
+            if r_ang <= r0 {
+                (1.0, 0.0)
+            } else if r_ang >= r0 + w {
+                (0.0, 0.0)
+            } else {
                 let x = std::f64::consts::PI * (r_ang - r0) / w;
-                (0.5 * (1.0 + x.cos()), -0.5 * x.sin() * std::f64::consts::PI / w)
+                (
+                    0.5 * (1.0 + x.cos()),
+                    -0.5 * x.sin() * std::f64::consts::PI / w,
+                )
             }
         }
     }
+}
+
+// ============================================================================
+// R17 — GPU pair-physics packing (sparse_hs.cl). All host-side, once at
+// engine init on the frozen topology. The SK channel map (sk_map /
+// NEW_TO_OLD) is resolved HERE, not in the kernel: each ordered species
+// pair's table contributes 8 packed channel slots
+//   0..3 = H {ssσ, spσ, ppσ, ppπ},  4..7 = S {same order}
+// each a fixed `max_ctrl` f32 B-spline control array. The kernels select
+// channels by shell-pair only — mirroring `eval_shell_integrals_*`, which
+// evaluates the (si,sj) table at (ang1≤ang2) pairs and the (sj,si) table
+// for (ang1>ang2) via tab_fwd/tab_rev (rotation.rs). The (l1>l2) case is
+// therefore served by the REVERSED pair's sp slot — pack per ordered pair.
+// ============================================================================
+
+/// Packed SK spline tables for the sparse_hs.cl kernels.
+pub struct SkGpuPack {
+    pub n_species: usize,
+    /// Padded control-point count per channel (every table zero-padded).
+    pub max_ctrl: usize,
+    /// int4 per ordered pair: {n_ctrl, n_integ, present, 0}.
+    pub meta: Vec<i32>,
+    /// float4 per ordered pair: {dr_bohr, r_max_bohr, 0, 0}.
+    pub parm: Vec<f32>,
+    /// [pair * 8 * max_ctrl + channel * max_ctrl + i] — f32 controls.
+    pub ctrl: Vec<f32>,
+}
+
+/// New-format (1-based) → old-format (0-based) column index — the same
+/// iSKInterOld map `SkTableSp::eval_shell_integrals_*` applies.
+fn sk_new_to_old(new_col: usize) -> usize {
+    const I_SK_OLD: [usize; 10] = [8, 9, 10, 13, 14, 15, 16, 18, 19, 20];
+    match I_SK_OLD.iter().position(|&c| c == new_col) {
+        Some(p) => p,
+        None => usize::MAX,
+    }
+}
+
+/// Pack the s/p SK tables for the `sparse_hs.cl` pair kernels.
+///
+/// `needed` lists the species pairs actually present in M_HS (both
+/// orderings are required — fail loud, same as the CPU pair path). Pairs
+/// not present in `needed` get `present=0` and zeroed slots — unreachable
+/// from the kernels but kept addressable so indexing stays uniform.
+///
+/// Extended-format (20-column) tables: the CPU decides old-vs-new column
+/// map per evaluated radius from `h_all[10..]`. That is r-dependent and
+// cannot be reproduced by a static pack — so an extended table whose
+/// high columns are only PARTLY nonzero (flickering map) is rejected
+/// loudly instead of silently diverging.
+pub fn pack_sk_gpu(ctx: &SystemContext<'_>, needed: &[(u8, u8)]) -> Result<SkGpuPack> {
+    let nsp = ctx.n_species;
+    for &(a, b) in needed {
+        for (x, y) in [(a, b), (b, a)] {
+            if ctx.pair_table(x, y).is_none() {
+                return Err(DftbError::InvalidInput(format!(
+                    "pack_sk_gpu: missing SK table for species pair ({x},{y}) — needed by M_HS"
+                )));
+            }
+        }
+    }
+    let max_ctrl = (0..nsp * nsp)
+        .filter_map(|p| ctx.pair_lut[p].map(|t| ctx.pair_tables[t]))
+        .map(|t| t.h.controls().len().max(t.s.controls().len()))
+        .max()
+        .unwrap_or(0);
+    if max_ctrl < 4 {
+        return Err(DftbError::InvalidInput(format!(
+            "pack_sk_gpu: max_ctrl={max_ctrl} — tables need ≥4 controls for the cubic stencil"
+        )));
+    }
+    let mut meta = vec![0i32; 4 * nsp * nsp];
+    let mut parm = vec![0.0f32; 4 * nsp * nsp];
+    let mut ctrl = vec![0.0f32; nsp * nsp * 8 * max_ctrl];
+    // Packed channel order: {ssσ, spσ, ppσ, ppπ} → new-format 1-based cols.
+    const NEW_COLS: [usize; 4] = [20, 19, 15, 16];
+    for a in 0..nsp {
+        for b in 0..nsp {
+            let p = a * nsp + b;
+            let Some(tidx) = ctx.pair_lut[p] else {
+                continue;
+            };
+            let tab = ctx.pair_tables[tidx];
+            let (h, s) = (&tab.h, &tab.s);
+            let n_ctrl = h.controls().len();
+            if s.controls().len() != n_ctrl {
+                return Err(DftbError::InvalidInput(format!(
+                    "pack_sk_gpu: {a}-{b} H/S control counts differ ({} vs {}) — kernel uses one grid per pair",
+                    n_ctrl, s.controls().len()
+                )));
+            }
+            if h.dr != s.dr {
+                return Err(DftbError::InvalidInput(format!(
+                    "pack_sk_gpu: {a}-{b} H/S grid spacings differ ({} vs {}) — kernel uses one dr per pair",
+                    h.dr, s.dr
+                )));
+            }
+            // is_extended replicates eval_shell_integrals_*: the CPU checks
+            // h_all[10..] PER RADIUS. Static decision: extended iff any grid
+            // row has a nonzero high column. Refuse tables where some rows
+            // are extended and others not while low channels stay nonzero
+            // (the CPU map would flicker mid-range — a real bug there).
+            let any_ext = h
+                .values
+                .iter()
+                .any(|r| r.iter().skip(10).any(|&v| v != 0.0));
+            if any_ext {
+                let flicker = h.values.iter().any(|r| {
+                    r.iter().take(10).any(|&v| v != 0.0) && r.iter().skip(10).all(|&v| v == 0.0)
+                });
+                if flicker {
+                    return Err(DftbError::InvalidInput(format!(
+                        "pack_sk_gpu: {a}-{b} extended-format table has rows with high columns all-zero while low channels are nonzero — the CPU column map is r-dependent there; unsupported"
+                    )));
+                }
+            }
+            for (ch, &new_col) in NEW_COLS.iter().enumerate() {
+                let col = if any_ext {
+                    new_col - 1
+                } else {
+                    sk_new_to_old(new_col)
+                };
+                if col == usize::MAX || col >= h.n_integ() {
+                    return Err(DftbError::InvalidInput(format!(
+                        "pack_sk_gpu: {a}-{b} channel {ch} (new_col {new_col}) maps outside n_integ={}",
+                        h.n_integ()
+                    )));
+                }
+                for (tab, base) in [(h, ch), (s, ch + 4)] {
+                    let dst = p * 8 * max_ctrl + base * max_ctrl;
+                    for (i, c) in tab.controls().iter().enumerate() {
+                        ctrl[dst + i] = c[col] as f32;
+                    }
+                }
+            }
+            meta[4 * p] = n_ctrl as i32;
+            meta[4 * p + 1] = h.n_integ() as i32;
+            meta[4 * p + 2] = 1;
+            parm[4 * p] = h.dr as f32;
+            parm[4 * p + 1] = h.r_max() as f32;
+        }
+    }
+    Ok(SkGpuPack {
+        n_species: nsp,
+        max_ctrl,
+        meta,
+        parm,
+        ctrl,
+    })
+}
+
+/// Restricted repulsive pair list (i<j) for the GPU `rep_eval` kernel:
+/// every pair within `spline_cutoff + skin` at build time. Pairs whose
+/// species have no spline record are skipped — they contribute exactly 0
+/// (the strict "every present species pair must have a spline" check lives
+/// in `pack_repulsive_gpu` at init, matching `repulsive_energy_cached`).
+pub fn build_rep_pairs(
+    coords: &[[f64; 3]],
+    species_code: &[u8],
+    repulsive: &[Option<RepulsiveSpline>],
+    n_species: usize,
+    skin_ang: f64,
+) -> Vec<(u32, u32)> {
+    let n = coords.len();
+    let mut out = Vec::new();
+    for i in 0..n {
+        let si = species_code[i] as usize;
+        for j in (i + 1)..n {
+            let sj = species_code[j] as usize;
+            let sp = repulsive[si * n_species + sj]
+                .as_ref()
+                .or(repulsive[sj * n_species + si].as_ref());
+            let Some(sp) = sp else { continue };
+            let cut = sp.cutoff / ANG2BOHR + skin_ang;
+            let dx = coords[j][0] - coords[i][0];
+            let dy = coords[j][1] - coords[i][1];
+            let dz = coords[j][2] - coords[i][2];
+            if dx * dx + dy * dy + dz * dz < cut * cut {
+                out.push((i as u32, j as u32));
+            }
+        }
+    }
+    out
+}
+
+/// Per-atom CSR adjacency over a unique-pair list for `force_gather`:
+/// entry `(p<<1)|is_j` — the gather applies `+pf` to i and `−pf` to j.
+/// Returns (ptr[n+1], list[2·n_pairs]).
+pub fn pair_gather_adj<'a>(
+    pairs: impl Iterator<Item = (u32, u32)>,
+    n_atom: usize,
+) -> (Vec<u32>, Vec<i32>) {
+    let mut deg = vec![0u32; n_atom];
+    let pairs: Vec<(u32, u32)> = pairs.collect();
+    for &(i, j) in &pairs {
+        deg[i as usize] += 1;
+        deg[j as usize] += 1;
+    }
+    let mut ptr = vec![0u32; n_atom + 1];
+    for i in 0..n_atom {
+        ptr[i + 1] = ptr[i] + deg[i];
+    }
+    let mut list = vec![0i32; ptr[n_atom] as usize];
+    let mut cur = ptr[..n_atom].to_vec();
+    for (p, &(i, j)) in pairs.iter().enumerate() {
+        list[cur[i as usize] as usize] = ((p as i32) << 1) | 0;
+        cur[i as usize] += 1;
+        list[cur[j as usize] as usize] = ((p as i32) << 1) | 1;
+        cur[j as usize] += 1;
+    }
+    (ptr, list)
 }
 
 /// Sparse analytic forces of the sparse SCC energy — F5.
@@ -578,18 +858,28 @@ pub fn sparse_forces_bsr(
     ctx: &SystemContext<'_>,
     coords: &[[f64; 3]],
     pairs: &[HsPair],
-    k_diag: &[u32],          // m_k block index of (i,i) per atom (dummy check)
-    k_vals: &[f32],          // K values on M_K
-    w_vals: &[f32],          // symmetrized W = 2KHK values on M_HS
-    v_shift: &[f64],         // atom SCC shifts V_i (the state that produced K)
+    k_diag: &[u32],  // m_k block index of (i,i) per atom (dummy check)
+    k_vals: &[f32],  // K values on M_K
+    w_vals: &[f32],  // symmetrized W = 2KHK values on M_HS
+    v_shift: &[f64], // atom SCC shifts V_i (the state that produced K)
     q: &[f64],
     q0: &[f64],
     gamma_tbl: &GammaTable,
     repulsive: &[Option<RepulsiveSpline>],
-    taper: Option<(f64, f64)>,   // (r_start_ang, width_ang) — see hs_taper
+    taper: Option<(f64, f64)>, // (r_start_ang, width_ang) — see hs_taper
+    // Precomputed SCC double-counting forces (GPU n-body γ′ kernel).
+    // `None` computes them on the CPU via `scc_double_counting_force`
+    // (reference/test path — O(N²) analytic per-pair evaluation).
+    scc_dc_override: Option<&[[f64; 3]]>,
 ) -> Result<Forces> {
     let n_atom = ctx.n_atoms;
-    let max_n = ctx.species_n_orb.iter().copied().map(|n| n as usize).max().unwrap_or(0);
+    let max_n = ctx
+        .species_n_orb
+        .iter()
+        .copied()
+        .map(|n| n as usize)
+        .max()
+        .unwrap_or(0);
     let max_block = max_n * max_n;
     let mut out = Forces::zeros(n_atom);
 
@@ -637,20 +927,34 @@ pub fn sparse_forces_bsr(
             .pair_table(si, sj)
             .map(|t| t.cutoff())
             .unwrap_or(f64::INFINITY)
-            .min(ctx.pair_table(sj, si).map(|t| t.cutoff()).unwrap_or(f64::INFINITY));
+            .min(
+                ctx.pair_table(sj, si)
+                    .map(|t| t.cutoff())
+                    .unwrap_or(f64::INFINITY),
+            );
         if r_bohr >= cut {
             continue;
         }
 
         let r_ang = r_bohr / ANG2BOHR;
         let (w, wp_ang) = hs_taper(taper, r_ang);
-        if w == 0.0 { continue; }   // beyond taper: exactly zero
+        if w == 0.0 {
+            continue;
+        } // beyond taper: exactly zero
 
         build_pair_block_with_derivs(
-            ctx, coords, i, j,
-            &mut h[..block_size], &mut s[..block_size],
-            &mut dh_dx[..block_size], &mut dh_dy[..block_size], &mut dh_dz[..block_size],
-            &mut ds_dx[..block_size], &mut ds_dy[..block_size], &mut ds_dz[..block_size],
+            ctx,
+            coords,
+            i,
+            j,
+            &mut h[..block_size],
+            &mut s[..block_size],
+            &mut dh_dx[..block_size],
+            &mut dh_dy[..block_size],
+            &mut dh_dz[..block_size],
+            &mut ds_dx[..block_size],
+            &mut ds_dy[..block_size],
+            &mut ds_dz[..block_size],
         )?;
 
         if w != 1.0 {
@@ -703,18 +1007,46 @@ pub fn sparse_forces_bsr(
             }
         }
         let f = 2.0 * ANG2BOHR;
-        out.non_scc[i][0] += f * cx; out.non_scc[i][1] += f * cy; out.non_scc[i][2] += f * cz;
-        out.non_scc[j][0] -= f * cx; out.non_scc[j][1] -= f * cy; out.non_scc[j][2] -= f * cz;
-        out.scc_shift[i][0] += f * sx; out.scc_shift[i][1] += f * sy; out.scc_shift[i][2] += f * sz;
-        out.scc_shift[j][0] -= f * sx; out.scc_shift[j][1] -= f * sy; out.scc_shift[j][2] -= f * sz;
+        out.non_scc[i][0] += f * cx;
+        out.non_scc[i][1] += f * cy;
+        out.non_scc[i][2] += f * cz;
+        out.non_scc[j][0] -= f * cx;
+        out.non_scc[j][1] -= f * cy;
+        out.non_scc[j][2] -= f * cz;
+        out.scc_shift[i][0] += f * sx;
+        out.scc_shift[i][1] += f * sy;
+        out.scc_shift[i][2] += f * sz;
+        out.scc_shift[j][0] -= f * sx;
+        out.scc_shift[j][1] -= f * sy;
+        out.scc_shift[j][2] -= f * sz;
     }
 
-    let delta_q: Vec<f64> = q.iter().zip(q0.iter()).map(|(a, b)| a - b).collect();
-    scc_double_counting_force(coords, &ctx.atom_species, &delta_q, gamma_tbl, &mut out.scc_dc);
+    match scc_dc_override {
+        Some(f) => {
+            if f.len() != n_atom {
+                return Err(DftbError::InvalidInput(format!(
+                    "sparse_forces_bsr: scc_dc_override len {} != n_atom {n_atom}",
+                    f.len()
+                )));
+            }
+            out.scc_dc.copy_from_slice(f);
+        }
+        None => {
+            let delta_q: Vec<f64> = q.iter().zip(q0.iter()).map(|(a, b)| a - b).collect();
+            scc_double_counting_force(
+                coords,
+                &ctx.atom_species,
+                &delta_q,
+                gamma_tbl,
+                &mut out.scc_dc,
+            );
+        }
+    }
     repulsive_force_cached(coords, ctx, repulsive, &mut out.repulsive)?;
     for i in 0..n_atom {
         for c in 0..3 {
-            out.forces[i][c] = out.non_scc[i][c] + out.scc_shift[i][c] + out.scc_dc[i][c] + out.repulsive[i][c];
+            out.forces[i][c] =
+                out.non_scc[i][c] + out.scc_shift[i][c] + out.scc_dc[i][c] + out.repulsive[i][c];
         }
     }
     check_finite(&out.forces, "sparse_forces_bsr total");
@@ -733,19 +1065,15 @@ mod tests {
     }
 
     /// Build a random symmetric Bsr4Matrix on a given mask with values in [-1, 1].
-    fn random_symmetric_bsr4(
-        n_atom: usize,
-        mask: &(Vec<u32>, Vec<u32>),
-        seed: u64,
-    ) -> Bsr4Matrix {
+    fn random_symmetric_bsr4(n_atom: usize, mask: &(Vec<u32>, Vec<u32>), seed: u64) -> Bsr4Matrix {
         use std::collections::HashMap;
-        let mut m = Bsr4Matrix::from_structure(
-            n_atom, mask.0.clone(), mask.1.clone(),
-        ).unwrap();
+        let mut m = Bsr4Matrix::from_structure(n_atom, mask.0.clone(), mask.1.clone()).unwrap();
         // Simple LCG for reproducibility
         let mut state = seed;
         let next = |state: &mut u64| {
-            *state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            *state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             ((*state >> 33) as f64 / (1u64 << 33) as f64) * 2.0 - 1.0
         };
         // Fill diagonal blocks
@@ -803,7 +1131,9 @@ mod tests {
     /// Test: D = 2K and W = 2KHK match dense reference.
     #[test]
     fn test_build_dw_sparse_vs_dense() {
-        let Some(gpu) = try_gpu() else { return; };
+        let Some(gpu) = try_gpu() else {
+            return;
+        };
 
         // Small system: 4 atoms, geometric mask with cutoff 3.0 Å
         let n_atom = 4;
@@ -852,23 +1182,35 @@ mod tests {
         eprintln!("P3 parity: D max|err| = {max_err_d:.3e}, W max|err| = {max_err_w:.3e}");
 
         // f32 SpGEMM vs f64 dense: expect ~1e-4 relative error
-        let d_scale = d_dense.iter().map(|x| x.abs()).fold(0.0f64, f64::max).max(1e-10);
-        let w_scale = w_dense.iter().map(|x| x.abs()).fold(0.0f64, f64::max).max(1e-10);
-        assert!(max_err_d / d_scale < 1e-4, "D error too large: {max_err_d:.3e} / {d_scale:.3e}");
-        assert!(max_err_w / w_scale < 1e-4, "W error too large: {max_err_w:.3e} / {w_scale:.3e}");
+        let d_scale = d_dense
+            .iter()
+            .map(|x| x.abs())
+            .fold(0.0f64, f64::max)
+            .max(1e-10);
+        let w_scale = w_dense
+            .iter()
+            .map(|x| x.abs())
+            .fold(0.0f64, f64::max)
+            .max(1e-10);
+        assert!(
+            max_err_d / d_scale < 1e-4,
+            "D error too large: {max_err_d:.3e} / {d_scale:.3e}"
+        );
+        assert!(
+            max_err_w / w_scale < 1e-4,
+            "W error too large: {max_err_w:.3e} / {w_scale:.3e}"
+        );
     }
 
     /// Test: D and W are symmetric.
     #[test]
     fn test_dw_symmetry() {
-        let Some(gpu) = try_gpu() else { return; };
+        let Some(gpu) = try_gpu() else {
+            return;
+        };
 
         let n_atom = 3;
-        let pos: Vec<[f64; 3]> = vec![
-            [0.0, 0.0, 0.0],
-            [1.5, 0.0, 0.0],
-            [0.0, 1.5, 0.0],
-        ];
+        let pos: Vec<[f64; 3]> = vec![[0.0, 0.0, 0.0], [1.5, 0.0, 0.0], [0.0, 1.5, 0.0]];
         let m_hs = build_geometric_mask(&pos, 3.0);
         let m_k = m_hs.clone();
 
@@ -888,7 +1230,9 @@ mod tests {
                 let (s, e) = (m.row_ptr[i] as usize, m.row_ptr[i + 1] as usize);
                 for blk in s..e {
                     let j = m.col_idx[blk] as usize;
-                    if i == j { continue; }
+                    if i == j {
+                        continue;
+                    }
                     let blk_ji = m.find(j, i).expect("symmetric block missing") as usize;
                     let v_ij = &m.values[blk * BS2..(blk + 1) * BS2];
                     let v_ji = &m.values[blk_ji * BS2..(blk_ji + 1) * BS2];
@@ -898,7 +1242,10 @@ mod tests {
                             max_diff = max_diff.max((v_ij[r * BS + c] - v_ji[c * BS + r]).abs());
                         }
                     }
-                    assert!(max_diff < 1e-4, "{label}: asymmetry at ({i},{j}): {max_diff:.3e}");
+                    assert!(
+                        max_diff < 1e-4,
+                        "{label}: asymmetry at ({i},{j}): {max_diff:.3e}"
+                    );
                 }
             }
         };
@@ -911,7 +1258,9 @@ mod tests {
     /// plans give identical results to the per-call allocation path.
     #[test]
     fn test_dw_workspace_vs_oneshot() {
-        let Some(gpu) = try_gpu() else { return; };
+        let Some(gpu) = try_gpu() else {
+            return;
+        };
 
         let n_atom = 4;
         let pos: Vec<[f64; 3]> = vec![
@@ -937,12 +1286,13 @@ mod tests {
         // b_zh is unused on that route but must be a valid M_TZS-shaped
         // operand for the workspace constructor's plan_zk).
         let m_tzs = m_hs.clone();
-        let tzs_struct = std::sync::Arc::new(
-            GpuBsrStructure::new(&gpu, n_atom, &m_tzs).unwrap(),
-        );
+        let tzs_struct = std::sync::Arc::new(GpuBsrStructure::new(&gpu, n_atom, &m_tzs).unwrap());
         let b_zh = GpuBsrMatrix::from_host(&gpu, &h_scc_host).unwrap();
-        let mut ws = SparseDWWorkspace::new(&gpu, &k_dev.struct_, &h_scc_dev.struct_, &tzs_struct).unwrap();
-        let (d_ws_ref, w_ws_ref) = ws.build_dw_into(&gpu, &k_dev, &h_scc_dev, &b_zh, false).unwrap();
+        let mut ws =
+            SparseDWWorkspace::new(&gpu, &k_dev.struct_, &h_scc_dev.struct_, &tzs_struct).unwrap();
+        let (d_ws_ref, w_ws_ref) = ws
+            .build_dw_into(&gpu, &k_dev, &h_scc_dev, &b_zh, false)
+            .unwrap();
         let d_ws = d_ws_ref.to_host(&gpu).unwrap();
         let w_ws = w_ws_ref.to_host(&gpu).unwrap();
 
@@ -952,19 +1302,34 @@ mod tests {
         // O(100) here (T·K of random ~O(1) blocks), so compare relative.
         let d_diff = bsr4_max_abs_diff(&d_oneshot, &d_ws);
         let w_diff = bsr4_max_abs_diff(&w_oneshot, &w_ws);
-        let w_scale = w_oneshot.values.iter().map(|x| x.abs()).fold(0.0f32, f32::max).max(1.0);
+        let w_scale = w_oneshot
+            .values
+            .iter()
+            .map(|x| x.abs())
+            .fold(0.0f32, f32::max)
+            .max(1.0);
         eprintln!("DW workspace vs oneshot: D max|diff|={d_diff:e}, W max|diff|={w_diff:e} (|W|max={w_scale:e})");
         assert!(d_diff < 1e-6, "D mismatch: {d_diff:e}");
-        assert!(w_diff < 1e-6 * w_scale, "W mismatch: {w_diff:e} (rel {})", w_diff / w_scale);
+        assert!(
+            w_diff < 1e-6 * w_scale,
+            "W mismatch: {w_diff:e} (rel {})",
+            w_diff / w_scale
+        );
 
         // Verify workspace is reusable: second call should give same result.
-        let (d2_ref, w2_ref) = ws.build_dw_into(&gpu, &k_dev, &h_scc_dev, &b_zh, false).unwrap();
+        let (d2_ref, w2_ref) = ws
+            .build_dw_into(&gpu, &k_dev, &h_scc_dev, &b_zh, false)
+            .unwrap();
         let d2 = d2_ref.to_host(&gpu).unwrap();
         let w2 = w2_ref.to_host(&gpu).unwrap();
         let d2_diff = bsr4_max_abs_diff(&d_oneshot, &d2);
         let w2_diff = bsr4_max_abs_diff(&w_oneshot, &w2);
         eprintln!("DW workspace reuse: D max|diff|={d2_diff:e}, W max|diff|={w2_diff:e}");
         assert!(d2_diff < 1e-6, "D reuse mismatch: {d2_diff:e}");
-        assert!(w2_diff < 1e-6 * w_scale, "W reuse mismatch: {w2_diff:e} (rel {})", w2_diff / w_scale);
+        assert!(
+            w2_diff < 1e-6 * w_scale,
+            "W reuse mismatch: {w2_diff:e} (rel {})",
+            w2_diff / w_scale
+        );
     }
 }

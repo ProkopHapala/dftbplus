@@ -69,7 +69,10 @@ fn render_source(n: usize) -> String {
         .replace("#define JROUND 7", &format!("#define JROUND {}", jround))
         .replace("#define WG 32", &format!("#define WG {}", wg))
         .replace("#define PPG 8", &format!("#define PPG {}", PPG))
-        .replace("#define MAX_SWEEPS 20", &format!("#define MAX_SWEEPS {}", MAX_SWEEPS))
+        .replace(
+            "#define MAX_SWEEPS 20",
+            &format!("#define MAX_SWEEPS {}", MAX_SWEEPS),
+        )
 }
 
 /// Batched Brent-Luk parallel cyclic Jacobi eigensolver.
@@ -109,6 +112,7 @@ pub fn jacobi_cyclic_local_batched(
     let source = render_source(n);
     let program = rt.build_program(&source)?;
 
+    let wids = rt.buffer_from_slice(&(0..batch as i32).collect::<Vec<_>>())?; // T06 identity
     let kernel = Kernel::builder()
         .program(&program)
         .name("jacobi_cyclic_local_batched")
@@ -119,6 +123,7 @@ pub fn jacobi_cyclic_local_batched(
         .arg(v_buf)
         .arg(n as i32)
         .arg(batch as i32)
+        .arg(&wids)
         .build()
         .map_err(map_ocl_err)?;
     unsafe {
@@ -145,16 +150,27 @@ const TILED_MAX_SWEEPS: usize = 100;
 /// Shared so the production direct kernel (MAX_CSWEEPS) and the deprecated
 /// tiled path (MAX_SWEEPS) honor the same knob — R5.
 pub fn jacobi_sweeps(default: usize) -> usize {
-    std::env::var("RUST_DFTB_JACOBI_SWEEPS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(default)
+    std::env::var("RUST_DFTB_JACOBI_SWEEPS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(default)
 }
 
 /// Render the tiled Jacobi OpenCL template with block-size specialization.
 /// `prec` = JACOBI_PREC (0=FP32-FMA, 1=FP64 c/s only, 2=broad FP64 reference).
 /// Public for the event-timed 3-mode benchmark in tests/gpu_tiled_jacobi.rs.
 pub fn render_tiled_source(b: usize, wg: usize, prec: u32) -> String {
+    render_tiled_source_cfg(b, wg, prec, false)
+}
+
+/// Full render: `no_tail` compiles the Fermi tail (and its ~9 KB/WG local
+/// scratch) out via JACOBI_NO_TAIL — valid only when the caller uses the
+/// standalone fermi_occ path; the kernel marks stop=5 if the tail is
+/// requested anyway (fail-loud host misconfig check).
+pub fn render_tiled_source_cfg(b: usize, wg: usize, prec: u32, no_tail: bool) -> String {
     let pb = 2 * b;
     let pld = pb + 1;
-    GPU_TILED_JACOBI_TEMPLATE
+    let src = GPU_TILED_JACOBI_TEMPLATE
         .replace("#define B 32", &format!("#define B {}", b))
         .replace("#define PB 64", &format!("#define PB {}", pb))
         .replace("#define PLD 65", &format!("#define PLD {}", pld))
@@ -167,7 +183,125 @@ pub fn render_tiled_source(b: usize, wg: usize, prec: u32) -> String {
         .replace("#ifndef JACOBI_OFF_TOL\n#define JACOBI_OFF_TOL 1.0e-6f    // off/‖A‖_F exit threshold\n#endif",
                  &format!("#define JACOBI_OFF_TOL {:.3e}f",
                      std::env::var("RUST_DFTB_JACOBI_OFF_TOL").ok()
-                         .and_then(|v| v.parse::<f32>().ok()).unwrap_or(1.0e-6)))
+                         .and_then(|v| v.parse::<f32>().ok()).unwrap_or(1.0e-6)));
+    if no_tail {
+        format!("#define JACOBI_NO_TAIL 1\n{src}")
+    } else {
+        src
+    }
+}
+
+/// Direct-kernel workgroup size. `RUST_DFTB_JACOBI_WG` overrides for sweeps
+/// (fail-loud on unparseable/over-limit); default min(512, device max).
+/// Arbitrary sizes are valid — the kernel's reductions handle non-PoT lsz
+/// (jac_sum_* fold-then-halve), so WG≈N (96/128/160) is legal now.
+pub fn direct_jacobi_wg(max_wg: usize) -> usize {
+    let default = max_wg.min(512).max(64);
+    let wg = std::env::var("RUST_DFTB_JACOBI_WG")
+        .ok()
+        .map(|v| {
+            v.parse::<usize>()
+                .unwrap_or_else(|_| panic!("RUST_DFTB_JACOBI_WG={v}: not a usize"))
+        })
+        .unwrap_or(default);
+    assert!(
+        wg >= 32 && wg <= max_wg,
+        "RUST_DFTB_JACOBI_WG={wg}: outside device range 32..={max_wg}"
+    );
+    wg
+}
+
+/// Resident-Jacobi render (T08b): `jacobi_resident_batched` — same template
+/// file, same helpers and diag/tail contract as the direct kernel.
+/// `resident_v` selects RESIDENT_V=1 (A+V both __local — ~2n(n+1)×4B/WG,
+/// 1 WG/SM at n≈86) vs RESIDENT_V=0 (A __local + deferred V: rotations
+/// logged to a global rotlog and applied once per sweep — ~n(n+1)×4B/WG,
+/// 2–3 WGs/SM). `no_tail` compiles the Fermi tail out (its ~9 KB scratch
+/// decides whether 3 WGs/SM fit at WG512).
+pub fn render_resident_source(wg: usize, prec: u32, resident_v: bool, no_tail: bool) -> String {
+    let src = render_tiled_source_cfg(32, wg, prec, no_tail);
+    if resident_v {
+        format!("#define RESIDENT_V 1\n{src}")
+    } else {
+        src
+    }
+}
+
+/// Standalone resident-Jacobi benchmark/diagnostic — same contract as
+/// `direct_jacobi_batched` (all active, init_v=0, returns diag
+/// [batch][4] = {off, off/‖A‖_F, stop, sweeps}). Allocates the rotlog
+/// scratch itself; the production plan keeps it persistent.
+pub fn resident_jacobi_batched(
+    rt: &mut GpuRuntime,
+    a_buf: &Buffer<f32>,
+    v_buf: &Buffer<f32>,
+    n: usize,
+    batch: usize,
+    prec: u32,
+    resident_v: bool,
+) -> Result<Vec<f32>> {
+    if n <= 64 || n > 256 {
+        return Err(DftbError::InvalidInput(format!(
+            "resident_jacobi_batched: n={n} out of range 65..=256 (n≤64 → jacobi_cyclic_local_batched)"
+        )));
+    }
+    if batch == 0 {
+        return Ok(Vec::new());
+    }
+    let la = n * (n + 1) * 4;
+    let lv = if resident_v { la } else { 4 };
+    let local_need = (la + lv) as u64;
+    let local_cap = rt.caps().local_mem_size;
+    if local_need > local_cap {
+        return Err(DftbError::InvalidInput(format!(
+            "resident_jacobi_batched: n={n} resident_v={resident_v} needs {local_need} B __local > device local_mem_size {local_cap} B"
+        )));
+    }
+    let wg = direct_jacobi_wg(rt.caps().max_work_group_size);
+    let source = render_resident_source(wg, prec, resident_v, false);
+    let program = rt.build_program(&source)?;
+    let ones = rt.buffer_from_slice(&vec![1i32; batch])?;
+    let diag = rt.zero_buffer::<f32>(4 * batch)?;
+    let jn = if n & 1 == 1 { n + 1 } else { n };
+    let log_len = if resident_v {
+        1
+    } else {
+        batch * (jn - 1) * (jn / 2) * 2
+    };
+    let rotlog = rt.zero_buffer::<f64>(log_len)?;
+    let occ_w = rt.zero_buffer::<f32>(batch * n)?;
+    let mu = rt.zero_buffer::<f32>(batch)?;
+    let wids = rt.buffer_from_slice(&(0..batch as i32).collect::<Vec<_>>())?; // T06 identity
+    let kernel = Kernel::builder()
+        .program(&program)
+        .name("jacobi_resident_batched")
+        .queue(rt.queue().clone())
+        .global_work_size(batch * wg)
+        .local_work_size(wg)
+        .arg(a_buf)
+        .arg(v_buf)
+        .arg(n as i32)
+        .arg(batch as i32)
+        .arg(0i32)
+        .arg(&ones)
+        .arg(&diag)
+        .arg(0i32)
+        .arg(0i32)
+        .arg(0.0f32)
+        .arg(&occ_w)
+        .arg(&mu)
+        .arg(&rotlog)
+        .arg_local::<f32>(n * (n + 1))
+        .arg_local::<f32>(if resident_v { n * (n + 1) } else { 1 })
+        .arg(&wids)
+        .build()
+        .map_err(map_ocl_err)?;
+    unsafe {
+        kernel.enq().map_err(map_ocl_err)?;
+    }
+    let mut d = vec![0.0f32; 4 * batch];
+    rt.read_buffer(&diag, &mut d)?;
+    Ok(d)
 }
 
 /// Production direct cyclic Jacobi for 64 < N ≤ 256 — the same
@@ -193,11 +327,9 @@ pub fn direct_jacobi_batched(
         return Ok(Vec::new());
     }
     // W3: WG=512 ~1.55× faster than 256 on RTX 3090 (direct_jacobi_bench);
-    // clamp to the device limit so the helper stays portable, and round
-    // down to a power of two — the kernel's halving reductions drop lanes
-    // on non-power-of-two workgroups (e.g. a 384-limit device).
-    let wg_max = rt.caps().max_work_group_size.min(512).max(64);
-    let wg = if wg_max.is_power_of_two() { wg_max } else { wg_max.next_power_of_two() >> 1 };
+    // T08: arbitrary WG is now safe (fold-then-halve reductions) — env
+    // override via RUST_DFTB_JACOBI_WG for the WG≈N sweep.
+    let wg = direct_jacobi_wg(rt.caps().max_work_group_size);
     let source = render_tiled_source(32, wg, prec);
     let program = rt.build_program(&source)?;
     let ones = rt.buffer_from_slice(&vec![1i32; batch])?;
@@ -205,15 +337,31 @@ pub fn direct_jacobi_batched(
     // R5 tail args — disabled (fermi_tail=0); occ_w/mu are bound dummies.
     let occ_w = rt.zero_buffer::<f32>(batch * n)?;
     let mu = rt.zero_buffer::<f32>(batch)?;
+    let wids = rt.buffer_from_slice(&(0..batch as i32).collect::<Vec<_>>())?; // T06 identity
     let kernel = Kernel::builder()
-        .program(&program).name("jacobi_cyclic_global_batched").queue(rt.queue().clone())
-        .global_work_size(batch * wg).local_work_size(wg)
-        .arg(a_buf).arg(v_buf).arg(n as i32).arg(batch as i32).arg(0i32)
-        .arg(&ones).arg(&diag)
-        .arg(0i32).arg(0i32).arg(0.0f32)
-        .arg(&occ_w).arg(&mu)
-        .build().map_err(map_ocl_err)?;
-    unsafe { kernel.enq().map_err(map_ocl_err)?; }
+        .program(&program)
+        .name("jacobi_cyclic_global_batched")
+        .queue(rt.queue().clone())
+        .global_work_size(batch * wg)
+        .local_work_size(wg)
+        .arg(a_buf)
+        .arg(v_buf)
+        .arg(n as i32)
+        .arg(batch as i32)
+        .arg(0i32)
+        .arg(&ones)
+        .arg(&diag)
+        .arg(0i32)
+        .arg(0i32)
+        .arg(0.0f32)
+        .arg(&occ_w)
+        .arg(&mu)
+        .arg(&wids)
+        .build()
+        .map_err(map_ocl_err)?;
+    unsafe {
+        kernel.enq().map_err(map_ocl_err)?;
+    }
     let mut d = vec![0.0f32; 4 * batch];
     rt.read_buffer(&diag, &mut d)?;
     Ok(d)
@@ -236,13 +384,213 @@ pub fn block_jacobi_wg(n: usize) -> usize {
 /// Render the block-Jacobi template. `b` = block size (pivot is 2B×2B in
 /// local memory: B=16 → ~8.4 KB/WG).
 pub fn render_block_source(b: usize, wg: usize) -> String {
+    render_block_source_cfg(b, wg, 12, 1.0e-7)
+}
+
+/// Full render with inner-pivot tuning: `inner_max` = Brent–Luk sweep cap
+/// per pivot, `inner_tol` = pivot off-norm exit relative to pivot ‖·‖_F.
+pub fn render_block_source_cfg(b: usize, wg: usize, inner_max: usize, inner_tol: f32) -> String {
     let pb = 2 * b;
     GPU_BLOCK_JACOBI_TEMPLATE
         .replace("#define B 16", &format!("#define B {b}"))
         .replace("#define PB 32", &format!("#define PB {pb}"))
         .replace("#define PLD 33", &format!("#define PLD {}", pb + 1))
         .replace("#define WG 96", &format!("#define WG {wg}"))
-        .replace("#define MAX_SWEEPS 40", &format!("#define MAX_SWEEPS {}", jacobi_sweeps(40)))
+        .replace(
+            "#define MAX_SWEEPS 40",
+            &format!("#define MAX_SWEEPS {}", jacobi_sweeps(40)),
+        )
+        .replace(
+            "#define INNER_MAX 12",
+            &format!("#define INNER_MAX {inner_max}"),
+        )
+        .replace(
+            "#define INNER_TOL 1.0e-7f",
+            &format!("#define INNER_TOL {inner_tol:e}f"),
+        )
+}
+
+/// Block-Jacobi tuning knobs — env overrides for parameter sweeps:
+///   RUST_DFTB_BJ_B     block size B (pivot is 2B×2B in local; default 32)
+///   RUST_DFTB_BJ_IMAX  inner Brent–Luk sweep cap per pivot (default 1)
+///   RUST_DFTB_BJ_ITOL  inner pivot off-norm exit, relative (default 1e-6)
+/// Fail-loud on unparseable values; B limited to 8..=32 (B=32 → PB=64,
+/// ~34 KB local per WG — larger B exceeds typical device local memory).
+/// Defaults are the measured T08 optimum (block_jacobi_param_sweep, batch
+/// 400, equal accuracy, bad=0): IMAX=1 is the dominant lever — converging
+/// each pivot to 1e-7 was waste since outer sweeps revisit them — and
+/// B=32 minimises serial pivots/sweep (n=246: 120→28). B16/IMAX12/ITOL1e-7
+/// = the pre-T08 baseline; envs restore it for A/B.
+pub fn block_jacobi_cfg() -> (usize, usize, f32) {
+    let b = std::env::var("RUST_DFTB_BJ_B")
+        .ok()
+        .map(|v| {
+            v.parse::<usize>()
+                .unwrap_or_else(|_| panic!("RUST_DFTB_BJ_B={v}: not a usize"))
+        })
+        .unwrap_or(32);
+    let imax = std::env::var("RUST_DFTB_BJ_IMAX")
+        .ok()
+        .map(|v| {
+            v.parse::<usize>()
+                .unwrap_or_else(|_| panic!("RUST_DFTB_BJ_IMAX={v}: not a usize"))
+        })
+        .unwrap_or(1);
+    let itol = std::env::var("RUST_DFTB_BJ_ITOL")
+        .ok()
+        .map(|v| {
+            v.parse::<f32>()
+                .unwrap_or_else(|_| panic!("RUST_DFTB_BJ_ITOL={v}: not an f32"))
+        })
+        .unwrap_or(1.0e-6);
+    assert!(
+        (8..=32).contains(&b),
+        "RUST_DFTB_BJ_B={b}: B must be in 8..=32 (PB=2B local pivot)"
+    );
+    assert!(imax >= 1, "RUST_DFTB_BJ_IMAX={imax}: must be >= 1");
+    assert!(
+        itol.is_finite() && itol > 0.0 && itol < 1.0,
+        "RUST_DFTB_BJ_ITOL={itol}: must be in (0,1)"
+    );
+    (b, imax, itol)
+}
+
+/// T08b n>64 eigensolver kind.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum EigKind {
+    /// jacobi_cyclic_global_batched — A/V streamed through global per round.
+    Direct,
+    /// jacobi_resident_batched RESIDENT_V=0 — A in __local, rotations logged
+    /// and applied to global V once per sweep. ~2.3–2.7× direct at N=86
+    /// (resident_jacobi_sweep, batch=400, identical res/orth/parity).
+    ResidentDefV,
+    /// jacobi_resident_batched RESIDENT_V=1 — A+V both __local. Largest
+    /// footprint (~2n(n+1)×4B/WG); on 48 KB-local devices only n≤~74 fits.
+    ResidentAV,
+    /// block_jacobi_1wg — pivot+U local, strips global. For n>128.
+    Block,
+}
+
+/// Headroom reserved for the resident kernel's static __local scratch
+/// (rot arrays ~1.5 KB + reduce/red2 ≤4 KB + Fermi tail ~9 KB at WG512)
+/// when deciding whether lA (=n(n+1)·4B dynamic local) fits the device.
+const RESIDENT_SCRATCH_HEADROOM: u64 = 16 * 1024;
+
+/// Whether A can be __local-resident on this device: dynamic lA + static
+/// scratch must fit local_mem_size. Fails loud via assert when an explicit
+/// RUST_DFTB_EIGSOLVER=resident* selection doesn't fit; in auto mode it
+/// simply picks a non-resident kind (a capacity-based algorithm choice at
+/// plan build, not a runtime fallback).
+fn resident_fits(n: usize, resident_v: bool, local_cap: u64) -> bool {
+    let la = (n * (n + 1) * 4) as u64;
+    la * if resident_v { 2 } else { 1 } + RESIDENT_SCRATCH_HEADROOM <= local_cap
+}
+
+/// T08/T08b measured solver dispatch: `RUST_DFTB_EIGSOLVER` ∈
+/// {auto,direct,block,resident,resident_av} (unset/auto → size+local rule).
+/// Measured at batch=400: N=86 — res-defV 11.4/20.0 ms vs direct 21.9/45.7 ms
+/// (one/cold, ~2.2×; resident_jacobi_sweep); end-to-end GC 2.19 vs 4.01
+/// ms/iter (1.84×). N=246 — block 71.4 ms/iter (resident can't fit: A alone
+/// is 242 KB). Auto: n≤128 → resident when lA+16KB ≤ local_mem, else direct;
+/// n>128 → block. Fail-loud on unknown values / unfit explicit selection.
+pub fn eigsolver_kind(n: usize, local_cap: u64) -> EigKind {
+    match std::env::var("RUST_DFTB_EIGSOLVER").ok().as_deref() {
+        None | Some("auto") => {
+            if n > 128 {
+                EigKind::Block
+            } else if resident_fits(n, false, local_cap) {
+                EigKind::ResidentDefV
+            } else {
+                EigKind::Direct
+            }
+        }
+        Some("block") => EigKind::Block,
+        Some("direct") => EigKind::Direct,
+        Some("resident") => {
+            assert!(resident_fits(n, false, local_cap),
+                "RUST_DFTB_EIGSOLVER=resident: n={n} needs {} B __local + scratch > device local_mem_size {local_cap} B",
+                n * (n + 1) * 4);
+            EigKind::ResidentDefV
+        }
+        Some("resident_av") => {
+            assert!(resident_fits(n, true, local_cap),
+                "RUST_DFTB_EIGSOLVER=resident_av: n={n} needs {} B __local + scratch > device local_mem_size {local_cap} B",
+                2 * n * (n + 1) * 4);
+            EigKind::ResidentAV
+        }
+        Some(v) => {
+            panic!("RUST_DFTB_EIGSOLVER={v}: expected auto|direct|block|resident|resident_av")
+        }
+    }
+}
+
+/// Legacy predicate kept for callers that only distinguish block-vs-not.
+/// Equivalent to `eigsolver_kind(n, u64::MAX) == Block` — the block solver
+/// is only ever selected for n>128, where residency cannot fit anyway.
+pub fn use_block_jacobi(n: usize) -> bool {
+    eigsolver_kind(n, u64::MAX) == EigKind::Block
+}
+
+/// Bound-handle builder for `jacobi_resident_batched` — same prebound-handle
+/// pattern and tail-arg indices (7..11) as the direct kernel, so the plan's
+/// `bind_solve_params`/`check_jacobi` contracts carry over unchanged.
+/// `rotlog` is the deferred-V scratch ([batch][jround·jpair] double2); pass
+/// any valid buffer when `resident_v` (unused by the kernel then).
+pub fn build_resident_jacobi_kernel(
+    rt: &mut GpuRuntime,
+    n: usize,
+    batch: usize,
+    a_buf: &Buffer<f32>,
+    v_buf: &Buffer<f32>,
+    act_buf: &Buffer<i32>,
+    prec: u32,
+    diag: &Buffer<f32>,
+    init_v: i32,
+    occ_w: &Buffer<f32>,
+    mu: &Buffer<f32>,
+    rotlog: &Buffer<f64>,
+    resident_v: bool,
+    no_tail: bool,
+    work_ids: &Buffer<i32>,
+) -> Result<Kernel> {
+    if n <= 64 || n > 256 {
+        return Err(DftbError::InvalidInput(format!(
+            "jacobi_resident_batched: n={n} out of range 65..=256"
+        )));
+    }
+    if !resident_fits(n, resident_v, rt.caps().local_mem_size) {
+        return Err(DftbError::InvalidInput(format!(
+            "jacobi_resident_batched: n={n} resident_v={resident_v} needs {} B __local + scratch > device local_mem_size {} B",
+            n * (n + 1) * 4 * if resident_v { 2 } else { 1 }, rt.caps().local_mem_size
+        )));
+    }
+    let wg = direct_jacobi_wg(rt.caps().max_work_group_size);
+    let source = render_resident_source(wg, prec, resident_v, no_tail);
+    let program = rt.build_program(&source)?;
+    Kernel::builder()
+        .program(&program)
+        .name("jacobi_resident_batched")
+        .queue(rt.queue().clone())
+        .global_work_size(batch * wg)
+        .local_work_size(wg)
+        .arg(a_buf)
+        .arg(v_buf)
+        .arg(n as i32)
+        .arg(batch as i32)
+        .arg(init_v)
+        .arg(act_buf)
+        .arg(diag)
+        .arg(0i32)
+        .arg(0i32)
+        .arg(0.0f32)
+        .arg(occ_w)
+        .arg(mu)
+        .arg(rotlog)
+        .arg_local::<f32>(n * (n + 1))
+        .arg_local::<f32>(if resident_v { n * (n + 1) } else { 1 })
+        .arg(work_ids)
+        .build()
+        .map_err(map_ocl_err)
 }
 
 /// Bound-handle builder for `block_jacobi_1wg` — same prebound-handle
@@ -260,6 +608,7 @@ pub fn build_block_jacobi_kernel(
     diag: &Buffer<f32>,
     eig: &Buffer<f32>,
     init_v: i32,
+    work_ids: &Buffer<i32>,
 ) -> Result<Kernel> {
     if n == 0 || n > 256 {
         return Err(DftbError::InvalidInput(format!(
@@ -273,14 +622,30 @@ pub fn build_block_jacobi_kernel(
             rt.caps().max_work_group_size
         )));
     }
-    let source = render_block_source(16, wg);
+    let (b, imax, itol) = block_jacobi_cfg();
+    // n ≤ PB = the whole matrix IS the pivot: the inner solve must fully
+    // converge (it IS the solve — no outer revisit rescues it). Keep a real
+    // cap there; approximate pivots (IMAX=1) are only valid when n > PB.
+    let imax = if n <= 2 * b { imax.max(12) } else { imax };
+    let source = render_block_source_cfg(b, wg, imax, itol);
     let program = rt.build_program(&source)?;
     Kernel::builder()
-        .program(&program).name("block_jacobi_1wg").queue(rt.queue().clone())
-        .global_work_size(batch * wg).local_work_size(wg)
-        .arg(a_buf).arg(v_buf).arg(n as i32).arg(batch as i32).arg(init_v)
-        .arg(act_buf).arg(diag).arg(eig)
-        .build().map_err(map_ocl_err)
+        .program(&program)
+        .name("block_jacobi_1wg")
+        .queue(rt.queue().clone())
+        .global_work_size(batch * wg)
+        .local_work_size(wg)
+        .arg(a_buf)
+        .arg(v_buf)
+        .arg(n as i32)
+        .arg(batch as i32)
+        .arg(init_v)
+        .arg(act_buf)
+        .arg(diag)
+        .arg(eig)
+        .arg(work_ids)
+        .build()
+        .map_err(map_ocl_err)
 }
 
 /// Standalone block-Jacobi benchmark/diagnostic — same contract as
@@ -307,13 +672,27 @@ pub fn block_jacobi_batched(
     let ones = rt.buffer_from_slice(&vec![1i32; batch])?;
     let diag = rt.zero_buffer::<f32>(4 * batch)?;
     let eig = rt.zero_buffer::<f32>(batch * n)?;
+    let wids = rt.buffer_from_slice(&(0..batch as i32).collect::<Vec<_>>())?; // T06 identity
     let kernel = Kernel::builder()
-        .program(&program).name("block_jacobi_1wg").queue(rt.queue().clone())
-        .global_work_size(batch * wg).local_work_size(wg)
-        .arg(a_buf).arg(v_buf).arg(n as i32).arg(batch as i32).arg(0i32)
-        .arg(&ones).arg(&diag).arg(&eig)
-        .build().map_err(map_ocl_err)?;
-    unsafe { kernel.enq().map_err(map_ocl_err)?; }
+        .program(&program)
+        .name("block_jacobi_1wg")
+        .queue(rt.queue().clone())
+        .global_work_size(batch * wg)
+        .local_work_size(wg)
+        .arg(a_buf)
+        .arg(v_buf)
+        .arg(n as i32)
+        .arg(batch as i32)
+        .arg(0i32)
+        .arg(&ones)
+        .arg(&diag)
+        .arg(&eig)
+        .arg(&wids)
+        .build()
+        .map_err(map_ocl_err)?;
+    unsafe {
+        kernel.enq().map_err(map_ocl_err)?;
+    }
     let mut d = vec![0.0f32; 4 * batch];
     rt.read_buffer(&diag, &mut d)?;
     Ok(d)
@@ -362,10 +741,11 @@ pub fn tiled_jacobi_batched_prec(
             "tiled_jacobi_batched: n={n} <= 64, use jacobi_cyclic_local_batched instead"
         )));
     }
-    let b = 32usize;  // block size
+    let b = 32usize; // block size
     let wg = 256usize; // workgroup size
     let source = render_tiled_source(b, wg, prec);
     let program = rt.build_program(&source)?;
+    let wids = rt.buffer_from_slice(&(0..batch as i32).collect::<Vec<_>>())?; // T06 identity
     let kernel = Kernel::builder()
         .program(&program)
         .name("tiled_jacobi_batched")
@@ -376,6 +756,7 @@ pub fn tiled_jacobi_batched_prec(
         .arg(v_buf)
         .arg(n as i32)
         .arg(batch as i32)
+        .arg(&wids)
         .build()
         .map_err(map_ocl_err)?;
     unsafe {
@@ -453,6 +834,7 @@ pub fn build_inv_sqrt(
     let source = render_source(n);
     let program = rt.build_program(&source)?;
 
+    let wids = rt.buffer_from_slice(&(0..batch as i32).collect::<Vec<_>>())?; // T06 identity
     let kernel = Kernel::builder()
         .program(&program)
         .name("build_inv_sqrt_from_eig")
@@ -465,6 +847,7 @@ pub fn build_inv_sqrt(
         .arg(&lambda_min_buf)
         .arg(n as i32)
         .arg(batch as i32)
+        .arg(&wids)
         .build()
         .map_err(map_ocl_err)?;
     unsafe {
@@ -511,8 +894,9 @@ fn build_inv_sqrt_tiled(
     let lambda_min_buf = rt.zero_buffer::<f32>(batch)?;
     // Use a simple 1D launch: one workgroup per system, 256 threads.
     let wg = 256usize;
-    let source = render_source(64);  // reuse the template (LAMBDA_FLOOR define)
+    let source = render_source(64); // reuse the template (LAMBDA_FLOOR define)
     let program = rt.build_program(&source)?;
+    let wids = rt.buffer_from_slice(&(0..batch as i32).collect::<Vec<_>>())?; // T06 identity
     let kernel = Kernel::builder()
         .program(&program)
         .name("scale_eigenvectors_batched")
@@ -525,17 +909,19 @@ fn build_inv_sqrt_tiled(
         .arg(&lambda_min_buf)
         .arg(n as i32)
         .arg(batch as i32)
+        .arg(&wids)
         .build()
         .map_err(map_ocl_err)?;
-    unsafe { kernel.enq().map_err(map_ocl_err)?; }
+    unsafe {
+        kernel.enq().map_err(map_ocl_err)?;
+    }
 
     // Step 3: X = V_scaled · V^T (tiled GEMM, transpose B).
     let x_buf = rt.zero_buffer::<f32>(n * n * batch)?;
     // C = V_scaled · V^T → trans_a=false, trans_b=true
     // Use matmul_tiled_batched_params for the transpose.
     matmul_tiled_batched_params(
-        rt, &v_scaled, &v_buf, &x_buf, n, batch,
-        false, true, 1.0, 0.0,
+        rt, &v_scaled, &v_buf, &x_buf, n, batch, false, true, 1.0, 0.0,
     )?;
 
     Ok((x_buf, lambda_min_buf))
@@ -560,102 +946,209 @@ pub fn build_inv_sqrt_batched(
 mod tests {
     use super::*;
     use nalgebra::{DMatrix, DVector, SymmetricEigen};
-    use ocl::{enums::{DeviceInfo, KernelWorkGroupInfo, ProfilingInfo}, flags, Event, Queue};
+    use ocl::{
+        enums::{DeviceInfo, KernelWorkGroupInfo, ProfilingInfo},
+        flags, Event, Queue,
+    };
     use std::time::Instant;
 
     fn fixture(n: usize, kind: usize) -> DMatrix<f64> {
         let v = DVector::from_fn(n, |i, _| ((i + 1) as f64).sin());
         let q = DMatrix::identity(n, n) - (&v * v.transpose()) * (2.0 / v.norm_squared());
-        let d = DMatrix::from_diagonal(&DVector::from_fn(n, |i, _| if kind == 1 { (i / 2) as f64 * 0.2 - 1.0 } else { i as f64 * 0.2 - 1.0 }));
+        let d = DMatrix::from_diagonal(&DVector::from_fn(n, |i, _| {
+            if kind == 1 {
+                (i / 2) as f64 * 0.2 - 1.0
+            } else {
+                i as f64 * 0.2 - 1.0
+            }
+        }));
         let a = if kind == 2 { d } else { &q * d * q.transpose() };
         DMatrix::from_fn(n, n, |i, j| a[(i.min(j), i.max(j))] as f32 as f64)
     }
 
     fn check_variants(configs: &[(usize, usize)], repeats: usize) {
         assert!(repeats % 2 == 1, "Jacobi comparison needs odd repeats so the final readback is the old variant; repeats={repeats}");
-        let mut rt = GpuRuntime::new().expect("Jacobi verification requires a working OpenCL device");
-        let name = rt.device().name().expect("query Jacobi verification device name");
-        let vendor = rt.device().vendor().expect("query Jacobi verification device vendor");
+        let mut rt =
+            GpuRuntime::new().expect("Jacobi verification requires a working OpenCL device");
+        let name = rt
+            .device()
+            .name()
+            .expect("query Jacobi verification device name");
+        let vendor = rt
+            .device()
+            .vendor()
+            .expect("query Jacobi verification device vendor");
         assert!(vendor.contains("NVIDIA"), "Jacobi performance verification requires NVIDIA, selected {vendor}: {name}; select OCL_DEFAULT_PLATFORM_IDX from clinfo -l");
-        eprintln!("Jacobi verification: {name}, local={:?}, max_wg={:?}, repeats={repeats}", rt.device().info(DeviceInfo::LocalMemSize).expect("query device local memory"), rt.device().info(DeviceInfo::MaxWorkGroupSize).expect("query device WG limit"));
-        let queue = Queue::new(rt.context(), *rt.device(), Some(flags::CommandQueueProperties::new().profiling())).expect("create Jacobi profiling queue");
+        eprintln!(
+            "Jacobi verification: {name}, local={:?}, max_wg={:?}, repeats={repeats}",
+            rt.device()
+                .info(DeviceInfo::LocalMemSize)
+                .expect("query device local memory"),
+            rt.device()
+                .info(DeviceInfo::MaxWorkGroupSize)
+                .expect("query device WG limit")
+        );
+        let queue = Queue::new(
+            rt.context(),
+            *rt.device(),
+            Some(flags::CommandQueueProperties::new().profiling()),
+        )
+        .expect("create Jacobi profiling queue");
         for &(n, batch) in configs {
             let (_, _, _, _, wg) = spec_params(n);
             let fixtures: Vec<DMatrix<f64>> = (0..3).map(|kind| fixture(n, kind)).collect();
-            let references: Vec<Vec<f64>> = fixtures.iter().map(|a| {
-                let mut vals = SymmetricEigen::new(a.clone()).eigenvalues.as_slice().to_vec();
-                vals.sort_by(f64::total_cmp);
-                vals
-            }).collect();
+            let references: Vec<Vec<f64>> = fixtures
+                .iter()
+                .map(|a| {
+                    let mut vals = SymmetricEigen::new(a.clone())
+                        .eigenvalues
+                        .as_slice()
+                        .to_vec();
+                    vals.sort_by(f64::total_cmp);
+                    vals
+                })
+                .collect();
             let mut input = vec![0.0f32; batch * n * n];
-            for b in 0..batch { for i in 0..n { for j in 0..n { input[b*n*n+i*n+j] = fixtures[b % 3][(i, j)] as f32; } } }
-            let src = rt.buffer_from_slice(&input).expect("upload Jacobi fixtures");
-            let a = rt.zero_buffer::<f32>(input.len()).expect("allocate Jacobi A");
-            let v = rt.zero_buffer::<f32>(input.len()).expect("allocate Jacobi V");
+            for b in 0..batch {
+                for i in 0..n {
+                    for j in 0..n {
+                        input[b * n * n + i * n + j] = fixtures[b % 3][(i, j)] as f32;
+                    }
+                }
+            }
+            let src = rt
+                .buffer_from_slice(&input)
+                .expect("upload Jacobi fixtures");
+            let a = rt
+                .zero_buffer::<f32>(input.len())
+                .expect("allocate Jacobi A");
+            let v = rt
+                .zero_buffer::<f32>(input.len())
+                .expect("allocate Jacobi V");
             let mut ah = vec![0.0f32; input.len()];
             let mut vh = vec![0.0f32; input.len()];
             let mut block_a = vec![0.0f32; input.len()];
             let mut block_v = vec![0.0f32; input.len()];
             let mut accuracy_ok = true;
+            let wids = rt.buffer_from_slice(&(0..batch as i32).collect::<Vec<_>>()).expect("T06 identity work_ids");
             let kernels: Vec<Kernel> = (0..2).map(|mode| {
                 let source = format!("#define JACOBI_BLOCK_UPDATE {mode}\n{}", render_source(n));
                 let program = rt.build_program(&source).expect("compile Jacobi comparison variant");
                 let kernel = Kernel::builder().program(&program).name("jacobi_cyclic_local_batched").queue(queue.clone())
-                    .global_work_size(batch * wg).local_work_size(wg).arg(&a).arg(&v).arg(n as i32).arg(batch as i32)
+                    .global_work_size(batch * wg).local_work_size(wg).arg(&a).arg(&v).arg(n as i32).arg(batch as i32).arg(&wids)
                     .build().expect("build persistent Jacobi comparison kernel");
                 eprintln!("  N={n} batch={batch} mode={mode} WG={wg} local={:?} private={:?} kernel_max_wg={:?}", kernel.wg_info(*rt.device(), KernelWorkGroupInfo::LocalMemSize).expect("query kernel local memory"), kernel.wg_info(*rt.device(), KernelWorkGroupInfo::PrivateMemSize).expect("query kernel private memory"), kernel.wg_info(*rt.device(), KernelWorkGroupInfo::WorkGroupSize).expect("query kernel WG limit"));
                 kernel
             }).collect();
-            rt.finish().expect("finish fixture uploads before using profiling queue");
+            rt.finish()
+                .expect("finish fixture uploads before using profiling queue");
             let mut times = [vec![0.0f64; repeats], vec![0.0f64; repeats]];
             let mut walls = [vec![0.0f64; repeats], vec![0.0f64; repeats]];
             for sample in 0..=repeats {
                 for turn in 0..2 {
                     let mode = (sample + turn) % 2;
-                    src.cmd().queue(&queue).copy(&a, None, None).enq().expect("reset Jacobi input by device copy");
-                    queue.finish().expect("finish Jacobi input reset outside timing");
+                    src.cmd()
+                        .queue(&queue)
+                        .copy(&a, None, None)
+                        .enq()
+                        .expect("reset Jacobi input by device copy");
+                    queue
+                        .finish()
+                        .expect("finish Jacobi input reset outside timing");
                     let mut event = Event::empty();
                     let start = Instant::now();
-                    unsafe { kernels[mode].cmd().enew(&mut event).enq().expect("enqueue Jacobi comparison"); }
+                    unsafe {
+                        kernels[mode]
+                            .cmd()
+                            .enew(&mut event)
+                            .enq()
+                            .expect("enqueue Jacobi comparison");
+                    }
                     event.wait_for().expect("wait for Jacobi comparison event");
                     let wall = start.elapsed().as_secs_f64() * 1e6;
-                    let t0 = event.profiling_info(ProfilingInfo::Start).expect("Jacobi event START").time().expect("START timestamp");
-                    let t1 = event.profiling_info(ProfilingInfo::End).expect("Jacobi event END").time().expect("END timestamp");
+                    let t0 = event
+                        .profiling_info(ProfilingInfo::Start)
+                        .expect("Jacobi event START")
+                        .time()
+                        .expect("START timestamp");
+                    let t1 = event
+                        .profiling_info(ProfilingInfo::End)
+                        .expect("Jacobi event END")
+                        .time()
+                        .expect("END timestamp");
                     assert!(t1 > t0, "invalid Jacobi timestamps: N={n} batch={batch} mode={mode} start={t0} end={t1}");
-                    if sample > 0 { times[mode][sample-1] = (t1 - t0) as f64 * 1e-3; walls[mode][sample-1] = wall; }
-                    if sample != repeats { continue; }
-                    a.cmd().queue(&queue).read(&mut ah).enq().expect("read Jacobi A for parity");
-                    v.cmd().queue(&queue).read(&mut vh).enq().expect("read Jacobi V for parity");
-                    assert!(ah.iter().chain(&vh).all(|x| x.is_finite()), "non-finite Jacobi output N={n} batch={batch} mode={mode}");
+                    if sample > 0 {
+                        times[mode][sample - 1] = (t1 - t0) as f64 * 1e-3;
+                        walls[mode][sample - 1] = wall;
+                    }
+                    if sample != repeats {
+                        continue;
+                    }
+                    a.cmd()
+                        .queue(&queue)
+                        .read(&mut ah)
+                        .enq()
+                        .expect("read Jacobi A for parity");
+                    v.cmd()
+                        .queue(&queue)
+                        .read(&mut vh)
+                        .enq()
+                        .expect("read Jacobi V for parity");
+                    assert!(
+                        ah.iter().chain(&vh).all(|x| x.is_finite()),
+                        "non-finite Jacobi output N={n} batch={batch} mode={mode}"
+                    );
                     let mut worst = [0.0f64; 4];
                     for b in 0..batch {
-                        let vals = DVector::from_fn(n, |i, _| ah[b*n*n+i*n+i] as f64);
-                        let eig = DMatrix::from_fn(n, n, |i, j| vh[b*n*n+i*n+j] as f64);
+                        let vals = DVector::from_fn(n, |i, _| ah[b * n * n + i * n + i] as f64);
+                        let eig = DMatrix::from_fn(n, n, |i, j| vh[b * n * n + i * n + j] as f64);
                         let d = DMatrix::from_diagonal(&vals);
                         let orig = &fixtures[b % 3];
                         let mut sorted = vals.as_slice().to_vec();
                         sorted.sort_by(f64::total_cmp);
                         let errors = [
-                            sorted.iter().zip(&references[b % 3]).map(|(a, b)| (a-b).abs()).fold(0.0, f64::max),
+                            sorted
+                                .iter()
+                                .zip(&references[b % 3])
+                                .map(|(a, b)| (a - b).abs())
+                                .fold(0.0, f64::max),
                             (orig * &eig - &eig * &d).amax(),
                             (&eig * &d * eig.transpose() - orig).amax(),
                             (eig.transpose() * &eig - DMatrix::identity(n, n)).amax(),
                         ];
-                        if batch <= 3 { eprintln!("    N={n} mode={mode} system={b} spectrum/residual/reconstruction/orthogonality={errors:?}"); }
-                        for i in 0..4 { worst[i] = worst[i].max(errors[i]); }
+                        if batch <= 3 {
+                            eprintln!("    N={n} mode={mode} system={b} spectrum/residual/reconstruction/orthogonality={errors:?}");
+                        }
+                        for i in 0..4 {
+                            worst[i] = worst[i].max(errors[i]);
+                        }
                         if !errors.iter().all(|e| e.is_finite() && *e < 1e-4) {
                             eprintln!("Jacobi accuracy violation N={n} batch={batch} mode={mode} system={b}, errors={errors:?}, tolerance=1e-4");
                             accuracy_ok = false;
                         }
                     }
-                    if mode == 1 { block_a.copy_from_slice(&ah); block_v.copy_from_slice(&vh); }
+                    if mode == 1 {
+                        block_a.copy_from_slice(&ah);
+                        block_v.copy_from_slice(&vh);
+                    }
                     eprintln!("  N={n} batch={batch} mode={mode} worst_errors={worst:?}");
                 }
             }
-            let differences = ah.iter().chain(&vh).zip(block_a.iter().chain(&block_v)).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
+            let differences = ah
+                .iter()
+                .chain(&vh)
+                .zip(block_a.iter().chain(&block_v))
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
             eprintln!("  N={n} batch={batch} old/block bitwise-different outputs={differences}");
-            assert_eq!(differences, 0, "Jacobi block transform differs from original on NVIDIA: N={n} batch={batch}");
-            for mode in 0..2 { times[mode].sort_by(f64::total_cmp); walls[mode].sort_by(f64::total_cmp); }
+            assert_eq!(
+                differences, 0,
+                "Jacobi block transform differs from original on NVIDIA: N={n} batch={batch}"
+            );
+            for mode in 0..2 {
+                times[mode].sort_by(f64::total_cmp);
+                walls[mode].sort_by(f64::total_cmp);
+            }
             eprintln!("Jacobi N={n} batch={batch}: event_us old={:.3} block={:.3} speedup={:.3}; enqueue+wait_us old={:.3} block={:.3}", times[0][repeats/2], times[1][repeats/2], times[0][repeats/2]/times[1][repeats/2], walls[0][repeats/2], walls[1][repeats/2]);
             assert!(accuracy_ok, "Jacobi absolute accuracy failed N={n} batch={batch}; per-system old/block diagnostics above, tolerance=1e-4 (unchanged)");
         }
@@ -666,30 +1159,73 @@ mod tests {
     #[ignore]
     fn jacobi_sweep_diagnostic() {
         let mut rt = GpuRuntime::new().expect("Jacobi sweep diagnostic requires OpenCL");
-        eprintln!("Jacobi sweep diagnostic on {}", rt.device().name().expect("query device name"));
+        eprintln!(
+            "Jacobi sweep diagnostic on {}",
+            rt.device().name().expect("query device name")
+        );
         let n = 64;
         let orig = fixture(n, 0);
-        let input: Vec<f32> = (0..n*n).map(|ij| orig[(ij/n, ij%n)] as f32).collect();
-        let a = rt.buffer_from_slice(&input).expect("upload Jacobi diagnostic matrix");
-        let v = rt.zero_buffer::<f32>(input.len()).expect("allocate Jacobi diagnostic eigenvectors");
+        let input: Vec<f32> = (0..n * n).map(|ij| orig[(ij / n, ij % n)] as f32).collect();
+        let a = rt
+            .buffer_from_slice(&input)
+            .expect("upload Jacobi diagnostic matrix");
+        let v = rt
+            .zero_buffer::<f32>(input.len())
+            .expect("allocate Jacobi diagnostic eigenvectors");
         let mut ah = vec![0.0f32; input.len()];
         let mut vh = vec![0.0f32; input.len()];
         let (_, _, _, _, wg) = spec_params(n);
-        for (rsqrt_mode, sweeps) in (0..3).flat_map(|mode| [1, 2, 3, 4, 5, 8, 12, 20].map(|sweeps| (mode, sweeps))) {
-            let mut source = format!("#define JACOBI_NORMALIZE_ROTATION {}\n#define MAX_SWEEPS {sweeps}\n{}", usize::from(rsqrt_mode == 2), render_source(n))
-                .replace("gA[i] = (r == c) ? lA[r * JLD + c] : 0.0f;", "gA[i] = lA[r * JLD + c];");
-            if rsqrt_mode == 1 { source = source.replace("float c = 1.0f / sqrt(1.0f + t * t);", "float c = rsqrt(1.0f + t * t);"); }
-            let program = rt.build_program(&source).expect("compile Jacobi sweep diagnostic");
-            let kernel = Kernel::builder().program(&program).name("jacobi_cyclic_local_batched").queue(rt.queue().clone())
-                .global_work_size(wg).local_work_size(wg).arg(&a).arg(&v).arg(n as i32).arg(1i32)
-                .build().expect("build Jacobi sweep diagnostic");
-            a.write(&input).enq().expect("reset Jacobi diagnostic input");
-            unsafe { kernel.enq().expect("enqueue Jacobi sweep diagnostic"); }
-            rt.read_buffer(&a, &mut ah).expect("read full transformed Jacobi matrix");
-            rt.read_buffer(&v, &mut vh).expect("read diagnostic eigenvectors");
-            assert!(ah.iter().chain(&vh).all(|x| x.is_finite()), "Jacobi diagnostic nonfinite at sweeps={sweeps}");
-            let b = DMatrix::from_fn(n, n, |i, j| ah[i*n+j] as f64);
-            let eig = DMatrix::from_fn(n, n, |i, j| vh[i*n+j] as f64);
+        for (rsqrt_mode, sweeps) in
+            (0..3).flat_map(|mode| [1, 2, 3, 4, 5, 8, 12, 20].map(|sweeps| (mode, sweeps)))
+        {
+            let mut source = format!(
+                "#define JACOBI_NORMALIZE_ROTATION {}\n#define MAX_SWEEPS {sweeps}\n{}",
+                usize::from(rsqrt_mode == 2),
+                render_source(n)
+            )
+            .replace(
+                "gA[i] = (r == c) ? lA[r * JLD + c] : 0.0f;",
+                "gA[i] = lA[r * JLD + c];",
+            );
+            if rsqrt_mode == 1 {
+                source = source.replace(
+                    "float c = 1.0f / sqrt(1.0f + t * t);",
+                    "float c = rsqrt(1.0f + t * t);",
+                );
+            }
+            let program = rt
+                .build_program(&source)
+                .expect("compile Jacobi sweep diagnostic");
+            let wids = rt.buffer_from_slice(&[0i32]).expect("T06 identity work_ids");
+            let kernel = Kernel::builder()
+                .program(&program)
+                .name("jacobi_cyclic_local_batched")
+                .queue(rt.queue().clone())
+                .global_work_size(wg)
+                .local_work_size(wg)
+                .arg(&a)
+                .arg(&v)
+                .arg(n as i32)
+                .arg(1i32)
+                .arg(&wids)
+                .build()
+                .expect("build Jacobi sweep diagnostic");
+            a.write(&input)
+                .enq()
+                .expect("reset Jacobi diagnostic input");
+            unsafe {
+                kernel.enq().expect("enqueue Jacobi sweep diagnostic");
+            }
+            rt.read_buffer(&a, &mut ah)
+                .expect("read full transformed Jacobi matrix");
+            rt.read_buffer(&v, &mut vh)
+                .expect("read diagnostic eigenvectors");
+            assert!(
+                ah.iter().chain(&vh).all(|x| x.is_finite()),
+                "Jacobi diagnostic nonfinite at sweeps={sweeps}"
+            );
+            let b = DMatrix::from_fn(n, n, |i, j| ah[i * n + j] as f64);
+            let eig = DMatrix::from_fn(n, n, |i, j| vh[i * n + j] as f64);
             let d = DMatrix::from_diagonal(&b.diagonal());
             let gram = eig.transpose() * &eig;
             eprintln!("rsqrt_mode={rsqrt_mode} sweeps={sweeps}: offnorm={:.9e} AV-VD={:.9e} AV-VB={:.9e} reconstruction={:.9e} full_reconstruction={:.9e} orthogonality={:.9e} trace_drift={:.9e} frobenius_drift={:.9e} column_norm2_min={:.9e} max={:.9e}",
@@ -700,12 +1236,37 @@ mod tests {
 
     #[test]
     fn jacobi_block_parity() {
-        check_variants(&[(1, 3), (2, 3), (3, 3), (7, 3), (8, 3), (14, 3), (27, 3), (28, 3), (32, 3), (63, 3), (64, 3)], 1);
+        check_variants(
+            &[
+                (1, 3),
+                (2, 3),
+                (3, 3),
+                (7, 3),
+                (8, 3),
+                (14, 3),
+                (27, 3),
+                (28, 3),
+                (32, 3),
+                (63, 3),
+                (64, 3),
+            ],
+            1,
+        );
     }
 
     #[test]
     #[ignore]
     fn jacobi_block_benchmark() {
-        check_variants(&[(8, 100), (28, 1), (28, 100), (28, 1000), (32, 100), (64, 100)], 7);
+        check_variants(
+            &[
+                (8, 100),
+                (28, 1),
+                (28, 100),
+                (28, 1000),
+                (32, 100),
+                (64, 100),
+            ],
+            7,
+        );
     }
 }

@@ -125,10 +125,18 @@ pub struct NanoStructure {
 
 impl NanoStructure {
     pub fn new() -> Self {
-        Self { elements: Vec::new(), positions: Vec::new(), bonds: Vec::new() }
+        Self {
+            elements: Vec::new(),
+            positions: Vec::new(),
+            bonds: Vec::new(),
+        }
     }
-    pub fn natom(&self) -> usize { self.positions.len() }
-    pub fn nbond(&self) -> usize { self.bonds.len() }
+    pub fn natom(&self) -> usize {
+        self.positions.len()
+    }
+    pub fn nbond(&self) -> usize {
+        self.bonds.len()
+    }
 
     /// Add an atom, return its index.
     pub fn add_atom(&mut self, el: Element, pos: [f64; 3]) -> usize {
@@ -148,8 +156,13 @@ impl NanoStructure {
         let mut s = format!("{}\n\n", self.natom());
         for i in 0..self.natom() {
             let [x, y, z] = self.positions[i];
-            s += &format!("{:2}  {:18.10}  {:18.10}  {:18.10}\n",
-                self.elements[i].symbol(), x, y, z);
+            s += &format!(
+                "{:2}  {:18.10}  {:18.10}  {:18.10}\n",
+                self.elements[i].symbol(),
+                x,
+                y,
+                z
+            );
         }
         s
     }
@@ -169,8 +182,13 @@ impl NanoStructure {
         }
         for i in 0..self.natom() {
             let [x, y, z] = self.positions[i];
-            s += &format!("{:2}  {:18.10}  {:18.10}  {:18.10}\n",
-                self.elements[i].symbol(), x, y, z);
+            s += &format!(
+                "{:2}  {:18.10}  {:18.10}  {:18.10}\n",
+                self.elements[i].symbol(),
+                x,
+                y,
+                z
+            );
         }
         s
     }
@@ -215,11 +233,17 @@ impl NanoStructure {
         let n = self.natom() as f64;
         let mut c = [0.0f64; 3];
         for &p in &self.positions {
-            c[0] += p[0]; c[1] += p[1]; c[2] += p[2];
+            c[0] += p[0];
+            c[1] += p[1];
+            c[2] += p[2];
         }
-        c[0] /= n; c[1] /= n; c[2] /= n;
+        c[0] /= n;
+        c[1] /= n;
+        c[2] /= n;
         for p in &mut self.positions {
-            p[0] -= c[0]; p[1] -= c[1]; p[2] -= c[2];
+            p[0] -= c[0];
+            p[1] -= c[1];
+            p[2] -= c[2];
         }
     }
 }
@@ -229,16 +253,20 @@ impl NanoStructure {
 /// Honeycomb lattice vectors (graphene convention).
 /// a1 = (3/2, √3/2)·a_CC,  a2 = (3/2, -√3/2)·a_CC
 pub fn lattice_vectors(a_cc: f64) -> [[f64; 3]; 2] {
-    [[1.5 * a_cc, 0.5 * SQRT_3 * a_cc, 0.0],
-     [1.5 * a_cc, -0.5 * SQRT_3 * a_cc, 0.0]]
+    [
+        [1.5 * a_cc, 0.5 * SQRT_3 * a_cc, 0.0],
+        [1.5 * a_cc, -0.5 * SQRT_3 * a_cc, 0.0],
+    ]
 }
 
 /// Three nearest-neighbor bond vectors from sublattice A to B.
 /// δ0 = (1, 0)·a_CC,  δ1 = (-1/2, √3/2)·a_CC,  δ2 = (-1/2, -√3/2)·a_CC
 pub fn nn_deltas(a_cc: f64) -> [[f64; 3]; 3] {
-    [[a_cc, 0.0, 0.0],
-     [-0.5 * a_cc, 0.5 * SQRT_3 * a_cc, 0.0],
-     [-0.5 * a_cc, -0.5 * SQRT_3 * a_cc, 0.0]]
+    [
+        [a_cc, 0.0, 0.0],
+        [-0.5 * a_cc, 0.5 * SQRT_3 * a_cc, 0.0],
+        [-0.5 * a_cc, -0.5 * SQRT_3 * a_cc, 0.0],
+    ]
 }
 
 /// Position key for deduplication (rounded to 4 decimals).
@@ -411,17 +439,13 @@ pub fn build_armchair_ribbon(
 /// `periodic`: if true, include PBC wrap-around bonds.
 ///
 /// Ported from NMP `KekuleFluid/Graph.py:build_rect_patch` (L80-125).
-pub fn build_sheet(
-    nx: usize,
-    ny: usize,
-    periodic: bool,
-    a_cc: f64,
-) -> NanoStructure {
+pub fn build_sheet(nx: usize, ny: usize, periodic: bool, a_cc: f64) -> NanoStructure {
     let mut st = NanoStructure::new();
     let [a1, a2] = lattice_vectors(a_cc);
     let deltas = nn_deltas(a_cc);
 
-    let mut pos_to_idx: std::collections::HashMap<(i64, i64), usize> = std::collections::HashMap::new();
+    let mut pos_to_idx: std::collections::HashMap<(i64, i64), usize> =
+        std::collections::HashMap::new();
 
     for n1 in 0..nx {
         for n2 in 0..ny {
@@ -430,14 +454,12 @@ pub fn build_sheet(
                 n1 as f64 * a1[1] + n2 as f64 * a2[1],
                 0.0,
             ];
-            let b_pos = [
-                a_pos[0] + deltas[0][0],
-                a_pos[1] + deltas[0][1],
-                0.0,
-            ];
+            let b_pos = [a_pos[0] + deltas[0][0], a_pos[1] + deltas[0][1], 0.0];
             for (p, _is_a) in [(a_pos, true), (b_pos, false)] {
                 let k = pos_key(&p);
-                pos_to_idx.entry(k).or_insert_with(|| st.add_atom(Element::C, p));
+                pos_to_idx
+                    .entry(k)
+                    .or_insert_with(|| st.add_atom(Element::C, p));
             }
         }
     }
@@ -450,11 +472,7 @@ pub fn build_sheet(
 
     for (ia, pos_a) in &a_atoms {
         for d in 0..3 {
-            let b_pos = [
-                pos_a[0] + deltas[d][0],
-                pos_a[1] + deltas[d][1],
-                0.0,
-            ];
+            let b_pos = [pos_a[0] + deltas[d][0], pos_a[1] + deltas[d][1], 0.0];
             if let Some(&ib) = pos_to_idx.get(&pos_key(&b_pos)) {
                 st.add_bond(*ia, ib);
             }
@@ -472,20 +490,16 @@ pub fn build_sheet(
         // For each A atom, check if A+δ_d wrapped by ±cell hits a B atom.
         for (ia, pos_a) in &a_atoms {
             for d in 0..3 {
-                let b_pos = [
-                    pos_a[0] + deltas[d][0],
-                    pos_a[1] + deltas[d][1],
-                    0.0,
-                ];
+                let b_pos = [pos_a[0] + deltas[d][0], pos_a[1] + deltas[d][1], 0.0];
                 for sign in [-1.0, 1.0] {
-                    let wrapped = [
-                        b_pos[0] + sign * cell[0],
-                        b_pos[1] + sign * cell[1],
-                        0.0,
-                    ];
+                    let wrapped = [b_pos[0] + sign * cell[0], b_pos[1] + sign * cell[1], 0.0];
                     if let Some(&ib) = pos_to_idx.get(&pos_key(&wrapped)) {
                         // Avoid duplicate bonds (check if ia-ib already exists)
-                        if !st.bonds.iter().any(|&[i, j]| (i == *ia && j == ib) || (i == ib && j == *ia)) {
+                        if !st
+                            .bonds
+                            .iter()
+                            .any(|&[i, j]| (i == *ia && j == ib) || (i == ib && j == *ia))
+                        {
                             st.add_bond(*ia, ib);
                         }
                     }
@@ -509,7 +523,8 @@ pub fn build_pah(n_shells: usize, a_cc: f64) -> NanoStructure {
     let deltas = nn_deltas(a_cc);
 
     let extent = (2 * n_shells + 3) as i32;
-    let mut pos_to_idx: std::collections::HashMap<(i64, i64), usize> = std::collections::HashMap::new();
+    let mut pos_to_idx: std::collections::HashMap<(i64, i64), usize> =
+        std::collections::HashMap::new();
 
     // Step 1: Build a large rect patch
     for n1 in -extent..=extent {
@@ -522,7 +537,9 @@ pub fn build_pah(n_shells: usize, a_cc: f64) -> NanoStructure {
             let b_pos = [a_pos[0] + deltas[0][0], a_pos[1] + deltas[0][1], 0.0];
             for p in [a_pos, b_pos] {
                 let k = pos_key(&p);
-                pos_to_idx.entry(k).or_insert_with(|| st.add_atom(Element::C, p));
+                pos_to_idx
+                    .entry(k)
+                    .or_insert_with(|| st.add_atom(Element::C, p));
             }
         }
     }
@@ -549,19 +566,27 @@ pub fn build_pah(n_shells: usize, a_cc: f64) -> NanoStructure {
     }
 
     // Step 3: Find central ring and select rings within n_shells
-    let ring_centers: Vec<[f64; 2]> = rings.iter().map(|ring| {
-        let n = ring.len() as f64;
-        let mut c = [0.0f64; 2];
-        for &ai in ring {
-            c[0] += st.positions[ai][0];
-            c[1] += st.positions[ai][1];
-        }
-        [c[0] / n, c[1] / n]
-    }).collect();
+    let ring_centers: Vec<[f64; 2]> = rings
+        .iter()
+        .map(|ring| {
+            let n = ring.len() as f64;
+            let mut c = [0.0f64; 2];
+            for &ai in ring {
+                c[0] += st.positions[ai][0];
+                c[1] += st.positions[ai][1];
+            }
+            [c[0] / n, c[1] / n]
+        })
+        .collect();
 
-    let central_idx = ring_centers.iter()
+    let central_idx = ring_centers
+        .iter()
         .enumerate()
-        .min_by(|(_, a), (_, b)| a[0].powi(2).partial_cmp(&(b[0].powi(2) + b[1].powi(2))).unwrap_or(std::cmp::Ordering::Equal))
+        .min_by(|(_, a), (_, b)| {
+            a[0].powi(2)
+                .partial_cmp(&(b[0].powi(2) + b[1].powi(2)))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
         .map(|(i, _)| i)
         .unwrap_or(0);
     let central_pos = ring_centers[central_idx];
@@ -582,9 +607,12 @@ pub fn build_pah(n_shells: usize, a_cc: f64) -> NanoStructure {
     // Step 4: Rebuild with only selected atoms
     let mut new_st = NanoStructure::new();
     let mut old_to_new: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
-    let mut new_pos_to_idx: std::collections::HashMap<(i64, i64), usize> = std::collections::HashMap::new();
+    let mut new_pos_to_idx: std::collections::HashMap<(i64, i64), usize> =
+        std::collections::HashMap::new();
     for i in 0..st.natom() {
-        if !selected_atoms.contains(&i) { continue; }
+        if !selected_atoms.contains(&i) {
+            continue;
+        }
         let new_i = new_st.add_atom(Element::C, st.positions[i]);
         old_to_new.insert(i, new_i);
         new_pos_to_idx.insert(pos_key(&st.positions[i]), new_i);
@@ -592,7 +620,9 @@ pub fn build_pah(n_shells: usize, a_cc: f64) -> NanoStructure {
 
     // Rebuild bonds among selected atoms
     for (ia, pos_a) in &a_atoms {
-        if !selected_atoms.contains(ia) { continue; }
+        if !selected_atoms.contains(ia) {
+            continue;
+        }
         let new_ia = old_to_new[ia];
         for d in 0..3 {
             let b_pos = [pos_a[0] + deltas[d][0], pos_a[1] + deltas[d][1], 0.0];
@@ -619,17 +649,13 @@ pub fn build_pah(n_shells: usize, a_cc: f64) -> NanoStructure {
 /// `passivate`: if true, add H to edge carbons.
 ///
 /// Ported from NMP `KekuleFluid/Graph.py:build_flake` (L264-327).
-pub fn build_flake(
-    radius: f64,
-    shape: FlakeShape,
-    passivate: bool,
-    a_cc: f64,
-) -> NanoStructure {
+pub fn build_flake(radius: f64, shape: FlakeShape, passivate: bool, a_cc: f64) -> NanoStructure {
     let mut st = NanoStructure::new();
     let [a1, a2] = lattice_vectors(a_cc);
     let deltas = nn_deltas(a_cc);
     let extent = (radius / a_cc) as i32 + 3;
-    let mut pos_to_idx: std::collections::HashMap<(i64, i64), usize> = std::collections::HashMap::new();
+    let mut pos_to_idx: std::collections::HashMap<(i64, i64), usize> =
+        std::collections::HashMap::new();
 
     for n1 in -extent..=extent {
         for n2 in -extent..=extent {
@@ -650,7 +676,9 @@ pub fn build_flake(
                 };
                 if inside {
                     let k = pos_key(&p);
-                    pos_to_idx.entry(k).or_insert_with(|| st.add_atom(Element::C, p));
+                    pos_to_idx
+                        .entry(k)
+                        .or_insert_with(|| st.add_atom(Element::C, p));
                 }
             }
         }
@@ -736,7 +764,8 @@ fn is_sublattice_a(pos: &[f64; 3], a_cc: f64) -> bool {
 /// Find all complete hexagonal rings (6-atom cycles) in the structure.
 fn find_hex_rings(st: &NanoStructure, a_cc: f64) -> Vec<Vec<usize>> {
     // Build adjacency
-    let mut adj: Vec<std::collections::HashSet<usize>> = vec![std::collections::HashSet::new(); st.natom()];
+    let mut adj: Vec<std::collections::HashSet<usize>> =
+        vec![std::collections::HashSet::new(); st.natom()];
     for &[i, j] in &st.bonds {
         adj[i].insert(j);
         adj[j].insert(i);
@@ -752,13 +781,21 @@ fn find_hex_rings(st: &NanoStructure, a_cc: f64) -> Vec<Vec<usize>> {
         let neighbors: Vec<usize> = adj[start].iter().copied().collect();
         for &n1 in &neighbors {
             for &n2 in &adj[n1] {
-                if n2 == start { continue; }
+                if n2 == start {
+                    continue;
+                }
                 for &n3 in &adj[n2] {
-                    if n3 == n1 || n3 == start { continue; }
+                    if n3 == n1 || n3 == start {
+                        continue;
+                    }
                     for &n4 in &adj[n3] {
-                        if n4 == n2 || n4 == n1 || n4 == start { continue; }
+                        if n4 == n2 || n4 == n1 || n4 == start {
+                            continue;
+                        }
                         for &n5 in &adj[n4] {
-                            if n5 == n3 || n5 == n2 || n5 == n1 || n5 == start { continue; }
+                            if n5 == n3 || n5 == n2 || n5 == n1 || n5 == start {
+                                continue;
+                            }
                             // Check if n5 connects back to start
                             if adj[n5].contains(&start) {
                                 let mut ring = [start, n1, n2, n3, n4, n5];
@@ -794,13 +831,18 @@ fn trim_dangling(st: &mut NanoStructure, a_cc: f64) {
         let remove: std::collections::HashSet<usize> = (0..st.natom())
             .filter(|&i| st.elements[i] == Element::C && c_neighbors[i] < 2)
             .collect();
-        if remove.is_empty() { break; }
+        if remove.is_empty() {
+            break;
+        }
 
         // Rebuild without removed atoms
         let mut new_st = NanoStructure::new();
-        let mut old_to_new: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+        let mut old_to_new: std::collections::HashMap<usize, usize> =
+            std::collections::HashMap::new();
         for i in 0..st.natom() {
-            if remove.contains(&i) { continue; }
+            if remove.contains(&i) {
+                continue;
+            }
             old_to_new.insert(i, new_st.add_atom(st.elements[i], st.positions[i]));
         }
         for &[i, j] in &st.bonds {
@@ -838,11 +880,17 @@ pub fn passivate_edges(st: &mut NanoStructure, a_cc: f64) {
 
     let mut h_to_add: Vec<(usize, [f64; 3])> = Vec::new();
     for i in 0..st.natom() {
-        if st.elements[i] != Element::C { continue; }
+        if st.elements[i] != Element::C {
+            continue;
+        }
         let neighbors = &c_neighbors[i];
         let nb = neighbors.len();
-        if nb >= 3 { continue; } // fully coordinated
-        if nb == 0 { continue; } // isolated atom
+        if nb >= 3 {
+            continue;
+        } // fully coordinated
+        if nb == 0 {
+            continue;
+        } // isolated atom
 
         let pos_i = st.positions[i];
 
@@ -886,14 +934,19 @@ fn missing_sp2_directions(
     neighbors: &[usize],
 ) -> Vec<[f64; 3]> {
     let nb = neighbors.len();
-    if nb == 0 { return Vec::new(); }
+    if nb == 0 {
+        return Vec::new();
+    }
 
     // Get unit vectors from this atom toward each neighbor
-    let vs: Vec<[f64; 3]> = neighbors.iter().map(|&j| {
-        let npos = neighbor_pos[j];
-        let d = [npos[0] - pos[0], npos[1] - pos[1], npos[2] - pos[2]];
-        normalize3(d)
-    }).collect();
+    let vs: Vec<[f64; 3]> = neighbors
+        .iter()
+        .map(|&j| {
+            let npos = neighbor_pos[j];
+            let d = [npos[0] - pos[0], npos[1] - pos[1], npos[2] - pos[2]];
+            normalize3(d)
+        })
+        .collect();
 
     match nb {
         1 => {
@@ -1022,7 +1075,12 @@ mod tests {
         let n_h = st.count(Element::H);
         assert_eq!(n_c, 20);
         assert!(n_h > 0, "should have H passivation");
-        println!("zigzag 4×5 passivated: {} C, {} H, {} bonds", n_c, n_h, st.nbond());
+        println!(
+            "zigzag 4×5 passivated: {} C, {} H, {} bonds",
+            n_c,
+            n_h,
+            st.nbond()
+        );
     }
 
     #[test]
@@ -1040,7 +1098,11 @@ mod tests {
         // Benzene: 6 atoms, 6 bonds
         assert_eq!(st.natom(), 6);
         assert_eq!(st.nbond(), 6);
-        println!("PAH n=0 (benzene): {} atoms, {} bonds", st.natom(), st.nbond());
+        println!(
+            "PAH n=0 (benzene): {} atoms, {} bonds",
+            st.natom(),
+            st.nbond()
+        );
     }
 
     #[test]
@@ -1048,14 +1110,26 @@ mod tests {
         let st = build_pah(1, A_CC);
         // Coronene: 24 atoms
         assert_eq!(st.natom(), 24);
-        println!("PAH n=1 (coronene): {} atoms, {} bonds", st.natom(), st.nbond());
+        println!(
+            "PAH n=1 (coronene): {} atoms, {} bonds",
+            st.natom(),
+            st.nbond()
+        );
     }
 
     #[test]
     fn test_flake_circle() {
         let st = build_flake(5.0, FlakeShape::Circle, false, A_CC);
-        assert!(st.natom() > 10, "flake should have reasonable size: {}", st.natom());
-        println!("flake r=5 circle: {} atoms, {} bonds", st.natom(), st.nbond());
+        assert!(
+            st.natom() > 10,
+            "flake should have reasonable size: {}",
+            st.natom()
+        );
+        println!(
+            "flake r=5 circle: {} atoms, {} bonds",
+            st.natom(),
+            st.nbond()
+        );
     }
 
     #[test]
@@ -1104,8 +1178,12 @@ mod tests {
         let mut found_ch2 = false;
         let mut max_angle_err = 0.0f64;
         for i in 0..st.natom() {
-            if st.elements[i] != Element::C { continue; }
-            if c_neighbors[i].len() != 1 || h_neighbors[i].len() != 2 { continue; }
+            if st.elements[i] != Element::C {
+                continue;
+            }
+            if c_neighbors[i].len() != 1 || h_neighbors[i].len() != 2 {
+                continue;
+            }
             found_ch2 = true;
             let pos_c = st.positions[i];
             let pos_cc = st.positions[c_neighbors[i][0]];
@@ -1144,7 +1222,10 @@ mod tests {
 
         assert!(found_ch2, "no =CH2 group found in passivated ribbon");
         println!("  max angle deviation from 120°: {max_angle_err:.2}°");
-        assert!(max_angle_err < 5.0, "VSEPR angles not ~120°: max err = {max_angle_err:.2}°");
+        assert!(
+            max_angle_err < 5.0,
+            "VSEPR angles not ~120°: max err = {max_angle_err:.2}°"
+        );
     }
 
     /// Verify that a =CH group (2 C-C bonds, 1 H) has the H at ~120° from
@@ -1168,8 +1249,12 @@ mod tests {
         let mut found_ch = false;
         let mut max_err = 0.0f64;
         for i in 0..st.natom() {
-            if st.elements[i] != Element::C { continue; }
-            if c_neighbors[i].len() != 2 || h_neighbors[i].len() != 1 { continue; }
+            if st.elements[i] != Element::C {
+                continue;
+            }
+            if c_neighbors[i].len() != 2 || h_neighbors[i].len() != 1 {
+                continue;
+            }
             found_ch = true;
             let pos_c = st.positions[i];
             let v_cc1 = normalize3([
@@ -1194,7 +1279,10 @@ mod tests {
         }
         assert!(found_ch, "no =CH group found");
         println!("  max angle deviation from 120°: {max_err:.2}°");
-        assert!(max_err < 5.0, "VSEPR CH angles not ~120°: max err = {max_err:.2}°");
+        assert!(
+            max_err < 5.0,
+            "VSEPR CH angles not ~120°: max err = {max_err:.2}°"
+        );
     }
 }
 

@@ -130,7 +130,9 @@ pub fn hermitian_jacobi_batched(
         .arg(diag)
         .build()
         .map_err(map_ocl_err)?;
-    unsafe { kernel.enq().map_err(map_ocl_err)?; }
+    unsafe {
+        kernel.enq().map_err(map_ocl_err)?;
+    }
     // No rt.finish() — in-order queue; caller syncs at genuine readbacks.
     Ok(())
 }
@@ -186,7 +188,9 @@ pub fn zscale_eigenvectors_batched(
         .arg(&active)
         .build()
         .map_err(map_ocl_err)?;
-    unsafe { kernel.enq().map_err(map_ocl_err)?; }
+    unsafe {
+        kernel.enq().map_err(map_ocl_err)?;
+    }
     Ok(())
 }
 
@@ -229,7 +233,9 @@ pub fn zgemm_batched(
         .arg_local::<Float2>(ZTILE_N * (ZTILE_K + 1))
         .build()
         .map_err(map_ocl_err)?;
-    unsafe { kernel.enq().map_err(map_ocl_err)?; }
+    unsafe {
+        kernel.enq().map_err(map_ocl_err)?;
+    }
     Ok(())
 }
 

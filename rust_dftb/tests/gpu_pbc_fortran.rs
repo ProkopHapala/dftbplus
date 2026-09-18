@@ -19,7 +19,10 @@
 use rust_dftb::qmqm::gpu_pbc::GpuPbc;
 use rust_dftb::qmqm::gpu_runtime::GpuRuntime;
 
-const REF_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/pbc_fortran/reference.txt");
+const REF_PATH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../tests/pbc_fortran/reference.txt"
+);
 
 /// Flat `key = v1 v2 ...` file parser.
 fn parse_reference(path: &str) -> std::collections::HashMap<String, Vec<f64>> {
@@ -29,7 +32,9 @@ fn parse_reference(path: &str) -> std::collections::HashMap<String, Vec<f64>> {
         if ln.is_empty() || ln.starts_with('#') {
             continue;
         }
-        let (k, v) = ln.split_once('=').unwrap_or_else(|| panic!("bad line: {ln}"));
+        let (k, v) = ln
+            .split_once('=')
+            .unwrap_or_else(|| panic!("bad line: {ln}"));
         let vals: Vec<f64> = v.split_whitespace().map(|t| t.parse().unwrap()).collect();
         out.insert(k.trim().to_string(), vals);
     }
@@ -39,12 +44,22 @@ fn parse_reference(path: &str) -> std::collections::HashMap<String, Vec<f64>> {
 fn sk_dir() -> Option<String> {
     let dir = std::env::var("RUST_DFTB_SK_DIR")
         .unwrap_or_else(|_| "/home/prokop/SIMULATIONS/dftbplus/slakos/mio-1-1".to_string());
-    if std::path::Path::new(&dir).is_dir() { Some(dir) } else { None }
+    if std::path::Path::new(&dir).is_dir() {
+        Some(dir)
+    } else {
+        None
+    }
 }
 
 /// Geometry must mirror repo-root tests/pbc_fortran/dftb_in.hsd exactly.
 /// Returns (species, coords Å, lattice Å, k_frac, k_weights).
-fn cchain_input() -> (Vec<String>, Vec<[f64; 3]>, [[f64; 3]; 3], Vec<[f64; 3]>, Vec<f32>) {
+fn cchain_input() -> (
+    Vec<String>,
+    Vec<[f64; 3]>,
+    [[f64; 3]; 3],
+    Vec<[f64; 3]>,
+    Vec<f32>,
+) {
     let species = vec!["C".to_string(), "O".to_string()];
     let coords = vec![[0.0, 0.0, 0.0], [1.2, 0.0, 0.0]];
     let lat = [[3.0, 0.0, 0.0], [0.0, 20.0, 0.0], [0.0, 0.0, 20.0]];
@@ -83,13 +98,20 @@ fn gpu_pbc_fortran_parity() {
 
     let (species, coords, lat, k_frac, kw) = cchain_input();
     let sk = rust_dftb::load_sk_for_species(&dir, &species).unwrap();
-    let mut eng = GpuPbc::new(sk, species.clone(), coords.clone(), lat, &k_frac, &kw, None)
-        .unwrap();
+    let mut eng =
+        GpuPbc::new(sk, species.clone(), coords.clone(), lat, &k_frac, &kw, None).unwrap();
 
     let (ok, hist) = eng.scc(0.3, 1e-7, 40).unwrap();
-    eprintln!("scc rms hist: {:?}", hist.iter().map(|x| format!("{x:.1e}")).collect::<Vec<_>>());
+    eprintln!(
+        "scc rms hist: {:?}",
+        hist.iter().map(|x| format!("{x:.1e}")).collect::<Vec<_>>()
+    );
     assert!(ok.iter().all(|&x| x), "jacobi cert failed");
-    assert!(*hist.last().unwrap() < 1e-6, "SCC did not converge: rms={}", hist.last().unwrap());
+    assert!(
+        *hist.last().unwrap() < 1e-6,
+        "SCC did not converge: rms={}",
+        hist.last().unwrap()
+    );
 
     // --- Mulliken populations: Fortran "gross charge" is q0 − pop ---
     let q0: Vec<f32> = species
@@ -105,7 +127,10 @@ fn gpu_pbc_fortran_parity() {
     for a in 0..n_at {
         let pop_ref = q0[a] as f64 - q_net_ref[a];
         let d = (q[a] as f64 - pop_ref).abs();
-        eprintln!("atom {a}: pop rust={:.6} fortran={pop_ref:.6} (|Δ|={d:.2e})", q[a]);
+        eprintln!(
+            "atom {a}: pop rust={:.6} fortran={pop_ref:.6} (|Δ|={d:.2e})",
+            q[a]
+        );
         dq_max = dq_max.max(d);
     }
     assert!(dq_max < 1e-3, "Mulliken parity failed: max|Δ|={dq_max:e}");
@@ -131,15 +156,33 @@ fn gpu_pbc_fortran_parity() {
             }
         }
     }
-    eprintln!("eig parity: max|Δε|={de_max:.3e} Ha  worst k={} band={} rust={:.6} ref={:.6}",
-        worst.0, worst.1, worst.2, worst.3);
+    eprintln!(
+        "eig parity: max|Δε|={de_max:.3e} Ha  worst k={} band={} rust={:.6} ref={:.6}",
+        worst.0, worst.1, worst.2, worst.3
+    );
     assert!(de_max < 2e-3, "eigenvalue parity failed: {de_max:e} Ha");
 
     // --- energies: e_band and assembled electronic energy ---
-    eprintln!("e_band: rust={:.8} fortran={:.8} (Δ={:.2e})", e_band_rust, e_band_ref,
-        e_band_rust - e_band_ref);
-    eprintln!("e_elec: rust={:.8} fortran={:.8} (Δ={:.2e})", e[0], e_elec_ref,
-        e[0] - e_elec_ref);
-    assert!((e_band_rust - e_band_ref).abs() < 5e-3, "band energy off: {}", e_band_rust - e_band_ref);
-    assert!((e[0] - e_elec_ref).abs() < 5e-3, "electronic energy off: {}", e[0] - e_elec_ref);
+    eprintln!(
+        "e_band: rust={:.8} fortran={:.8} (Δ={:.2e})",
+        e_band_rust,
+        e_band_ref,
+        e_band_rust - e_band_ref
+    );
+    eprintln!(
+        "e_elec: rust={:.8} fortran={:.8} (Δ={:.2e})",
+        e[0],
+        e_elec_ref,
+        e[0] - e_elec_ref
+    );
+    assert!(
+        (e_band_rust - e_band_ref).abs() < 5e-3,
+        "band energy off: {}",
+        e_band_rust - e_band_ref
+    );
+    assert!(
+        (e[0] - e_elec_ref).abs() < 5e-3,
+        "electronic energy off: {}",
+        e[0] - e_elec_ref
+    );
 }

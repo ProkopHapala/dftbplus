@@ -7,11 +7,21 @@ use rust_dftb::{
 fn parity_non_scc_case_from_env() {
     // Generic parity test driven by environment variables.
     // This is intended for sweeps over distances / rotations.
-    let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else { return; };
-    let Ok(ref_h) = std::env::var("RUST_DFTB_REF_H") else { return; };
-    let Ok(ref_s) = std::env::var("RUST_DFTB_REF_S") else { return; };
-    let Ok(species_s) = std::env::var("RUST_DFTB_SPECIES") else { return; };
-    let Ok(coords_s) = std::env::var("RUST_DFTB_COORDS") else { return; };
+    let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else {
+        return;
+    };
+    let Ok(ref_h) = std::env::var("RUST_DFTB_REF_H") else {
+        return;
+    };
+    let Ok(ref_s) = std::env::var("RUST_DFTB_REF_S") else {
+        return;
+    };
+    let Ok(species_s) = std::env::var("RUST_DFTB_SPECIES") else {
+        return;
+    };
+    let Ok(coords_s) = std::env::var("RUST_DFTB_COORDS") else {
+        return;
+    };
 
     let species = parse_species(&species_s);
     let coords = parse_coords(&coords_s);
@@ -46,8 +56,18 @@ fn parity_non_scc_case_from_env() {
                 best = (dh, ds, name);
             }
         }
-        assert!(best.0 < 1e-7, "H0 mismatch best(max diff) = {:e} for {}", best.0, best.2);
-        assert!(best.1 < 1e-7, "S mismatch best(max diff) = {:e} for {}", best.1, best.2);
+        assert!(
+            best.0 < 1e-7,
+            "H0 mismatch best(max diff) = {:e} for {}",
+            best.0,
+            best.2
+        );
+        assert!(
+            best.1 < 1e-7,
+            "S mismatch best(max diff) = {:e} for {}",
+            best.1,
+            best.2
+        );
     } else {
         // s-only: direct comparison
         let dh = max_abs_diff(&ham.h0, &h_ref);

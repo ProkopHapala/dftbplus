@@ -4,14 +4,16 @@
 //! to verify that the qmqm module produces correct Hamiltonians,
 //! shifts, and charges.
 
-use rust_dftb::{load_sk_for_species, max_abs_diff, parse_xyz, DftbOutput, HamiltonianBuilder};
 use rust_dftb::qmqm::{Fragment, FragmentTemplate};
+use rust_dftb::{load_sk_for_species, max_abs_diff, parse_xyz, DftbOutput, HamiltonianBuilder};
 
 /// Test that a single fragment (H2) produces identical H0 and S
 /// to the full-system Hamiltonian builder.
 #[test]
 fn fragment_h2_matches_full_system_non_scc() {
-    let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else { return; };
+    let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else {
+        return;
+    };
 
     let species = vec!["H".to_string(), "H".to_string()];
     let coords = vec![
@@ -46,13 +48,12 @@ fn fragment_h2_matches_full_system_non_scc() {
 /// Neutral H2 has 2 electrons → 1 occupied MO.
 #[test]
 fn fragment_h2_diagonalization() {
-    let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else { return; };
+    let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else {
+        return;
+    };
 
     let species = vec!["H".to_string(), "H".to_string()];
-    let coords = vec![
-        [0.0, 0.0, 0.0],
-        [0.74, 0.0, 0.0],
-    ];
+    let coords = vec![[0.0, 0.0, 0.0], [0.74, 0.0, 0.0]];
 
     let sk = load_sk_for_species(&sk_dir, &species).unwrap();
     let template = FragmentTemplate::new(&sk, species, coords.clone()).unwrap();
@@ -72,7 +73,11 @@ fn fragment_h2_diagonalization() {
     assert!(frag.eigenvalues[0] < frag.eigenvalues[1]);
 
     // Occupied eigenvalue should be negative (bound state)
-    assert!(frag.eigenvalues[0] < 0.0, "Occupied eigenvalue should be negative, got {}", frag.eigenvalues[0]);
+    assert!(
+        frag.eigenvalues[0] < 0.0,
+        "Occupied eigenvalue should be negative, got {}",
+        frag.eigenvalues[0]
+    );
 }
 
 /// Test fixed-charge SCC: inject neutral charges, build H_scc, diagonalize.
@@ -80,13 +85,12 @@ fn fragment_h2_diagonalization() {
 /// and the result should match the non-SCC case.
 #[test]
 fn fragment_h2_fixed_neutral_charges() {
-    let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else { return; };
+    let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else {
+        return;
+    };
 
     let species = vec!["H".to_string(), "H".to_string()];
-    let coords = vec![
-        [0.0, 0.0, 0.0],
-        [0.74, 0.0, 0.0],
-    ];
+    let coords = vec![[0.0, 0.0, 0.0], [0.74, 0.0, 0.0]];
 
     let sk = load_sk_for_species(&sk_dir, &species).unwrap();
     let template = FragmentTemplate::new(&sk, species, coords.clone()).unwrap();
@@ -110,15 +114,24 @@ fn fragment_h2_fixed_neutral_charges() {
 
     let de = max_abs_diff(
         &nalgebra::DMatrix::from_row_slice(frag.template.n_orbs, 1, &frag.eigenvalues.as_slice()),
-        &nalgebra::DMatrix::from_row_slice(frag_ref.template.n_orbs, 1, &frag_ref.eigenvalues.as_slice()),
+        &nalgebra::DMatrix::from_row_slice(
+            frag_ref.template.n_orbs,
+            1,
+            &frag_ref.eigenvalues.as_slice(),
+        ),
     );
-    assert!(de < 1e-12, "Eigenvalues should match for neutral charges, diff = {de:e}");
+    assert!(
+        de < 1e-12,
+        "Eigenvalues should match for neutral charges, diff = {de:e}"
+    );
 }
 
 /// Test N2 fragment: same parity check with more orbitals (sp basis).
 #[test]
 fn fragment_n2_matches_full_system_non_scc() {
-    let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else { return; };
+    let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else {
+        return;
+    };
 
     let species = vec!["N".to_string(), "N".to_string()];
     let coords = vec![
@@ -150,7 +163,9 @@ fn fragment_n2_matches_full_system_non_scc() {
 /// Test HCOOH (formic acid) fragment: multi-atom, multi-species parity.
 #[test]
 fn fragment_hcooh_matches_full_system_non_scc() {
-    let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else { return; };
+    let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else {
+        return;
+    };
 
     // Load HCOOH geometry from data/xyz/HCOOH.xyz
     let xyz_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../data/xyz/HCOOH.xyz");
@@ -187,20 +202,27 @@ fn gamma_self_consistency() {
 
     let u = 0.5;
     let g = gamma_full(0.0, u, u);
-    assert!((g - u).abs() < 1e-12, "gamma(0, U, U) should equal U, got {} vs {}", g, u);
+    assert!(
+        (g - u).abs() < 1e-12,
+        "gamma(0, U, U) should equal U, got {} vs {}",
+        g,
+        u
+    );
 }
 
 /// Test SCC Hamiltonian parity against Fortran DFTB+ reference.
-/// 
+///
 /// Uses fixed charges q = [1.1, 0.9] on H2 (deltaQ = [0.1, -0.1] relative to q0=1.0).
 /// Compares Rust-built H_scc against Fortran reference from `hamsqr1.dat`.
 #[test]
 fn h2_fixed_charge_scc_parity() {
+    use nalgebra::DMatrix;
     use rust_dftb::qmqm::solver::MultiSystemSolver;
     use rust_dftb::qmqm::{FragmentNeighborList, GammaTable, SimpleMixer};
-    use nalgebra::DMatrix;
 
-    let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else { return; };
+    let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else {
+        return;
+    };
 
     let species = vec!["H".to_string(), "H".to_string()];
     let coords = vec![
@@ -213,15 +235,15 @@ fn h2_fixed_charge_scc_parity() {
     // Build fragment template and solver
     let template = FragmentTemplate::new(&sk, species, coords.clone()).unwrap();
     let frag = Fragment::from_template(template.clone(), coords.clone());
-    
+
     // For a single fragment, neighbor list is empty (no inter-fragment interactions)
     // But we still need proper gamma table for intra-fragment SCC
     let centroids = vec![[0.37, 0.0, 0.0]]; // centroid of H2
     let frag_neighbors = FragmentNeighborList::build(&centroids, 10.0); // large cutoff
-    
+
     // Hubbard U for H from mio-1-1 parameters: U = 0.4195 Hartree
     let gamma = GammaTable::from_hubbard_u(vec![0.4195]);
-    
+
     let mixer = SimpleMixer::new(0.3);
     let mut solver = MultiSystemSolver::new(vec![frag], frag_neighbors, gamma, mixer);
 
@@ -233,11 +255,18 @@ fn h2_fixed_charge_scc_parity() {
     // Extract H_scc from fragment
     let h_scc_rust = &solver.fragments[0].h_scc;
     let frag = &solver.fragments[0];
-    
+
     // DEBUG: Print what Rust computed
     eprintln!("Rust q0: {:?}", frag.template.q0);
     eprintln!("Rust charges: {:?}", frag.charges);
-    eprintln!("Rust delta_q: {:?}", frag.charges.iter().zip(frag.template.q0.iter()).map(|(q,q0)| q-q0).collect::<Vec<_>>());
+    eprintln!(
+        "Rust delta_q: {:?}",
+        frag.charges
+            .iter()
+            .zip(frag.template.q0.iter())
+            .map(|(q, q0)| q - q0)
+            .collect::<Vec<_>>()
+    );
     eprintln!("Rust shift: {:?}", frag.shift);
     eprintln!("Rust v_intra: {:?}", frag.v_intra);
     eprintln!("Rust v_ext: {:?}", frag.v_ext);
@@ -249,11 +278,17 @@ fn h2_fixed_charge_scc_parity() {
     // Expected values from ref_h_scc.dat:
     // -2.3435869555627101e-01 -3.2006037343168198e-01
     // -3.2006037343168198e-01 -2.4284210444372889e-01
-    let h_ref = DMatrix::from_row_slice(2, 2, &[
-        -2.3435869555627101e-01, -3.2006037343168198e-01,
-        -3.2006037343168198e-01, -2.4284210444372889e-01,
-    ]);
-    
+    let h_ref = DMatrix::from_row_slice(
+        2,
+        2,
+        &[
+            -2.3435869555627101e-01,
+            -3.2006037343168198e-01,
+            -3.2006037343168198e-01,
+            -2.4284210444372889e-01,
+        ],
+    );
+
     eprintln!("Fortran H_scc:\n{:.16e}", h_ref);
 
     let diff = max_abs_diff(h_scc_rust, &h_ref);
@@ -267,7 +302,7 @@ fn h2_fixed_charge_scc_parity() {
     // Also test diagonalization: eigenvalues should match Fortran
     solver.diagonalize_all().unwrap();
     let eigvals_rust = &solver.fragments[0].eigenvalues;
-    
+
     // Expected eigenvalues from Fortran (computed from H_scc & S via Cholesky).
     // For deltaQ=[0.1,-0.1] at 0.74 Å: one eigenvalue is positive because the
     // fixed charge imbalance creates an unoccupied/unbound state.
@@ -276,7 +311,10 @@ fn h2_fixed_charge_scc_parity() {
     for (i, (r, f)) in eigvals_rust.iter().zip(eig_ref.iter()).enumerate() {
         assert!(
             (r - f).abs() < 1e-7,
-            "Eigenvalue {} mismatch: Rust={}, Fortran={}", i, r, f
+            "Eigenvalue {} mismatch: Rust={}, Fortran={}",
+            i,
+            r,
+            f
         );
     }
 
@@ -284,8 +322,12 @@ fn h2_fixed_charge_scc_parity() {
     // These should differ from input because electrons rearrange
     let charges_rust: Vec<f64> = solver.fragments[0].charges.clone();
     let q0 = vec![1.0, 1.0]; // Reference neutral charges for H
-    let delta_q_rust: Vec<f64> = charges_rust.iter().zip(q0.iter()).map(|(q, q0)| q - q0).collect();
-    
+    let delta_q_rust: Vec<f64> = charges_rust
+        .iter()
+        .zip(q0.iter())
+        .map(|(q, q0)| q - q0)
+        .collect();
+
     // Fixed-charge test: charges will deviate from input due to diagonalization,
     // but we only verify H_scc and eigenvalue parity here.
     // Full SCC convergence parity is tested separately.
@@ -297,9 +339,15 @@ fn n2_fixed_charge_scc_parity() {
     use rust_dftb::qmqm::solver::MultiSystemSolver;
     use rust_dftb::qmqm::{FragmentNeighborList, GammaTable, SimpleMixer};
 
-    let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else { return; };
-    let Ok(ref_h) = std::env::var("RUST_DFTB_REF_H") else { return; };
-    let Ok(ref_s) = std::env::var("RUST_DFTB_REF_S") else { return; };
+    let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else {
+        return;
+    };
+    let Ok(ref_h) = std::env::var("RUST_DFTB_REF_H") else {
+        return;
+    };
+    let Ok(ref_s) = std::env::var("RUST_DFTB_REF_S") else {
+        return;
+    };
 
     let species = vec!["N".to_string(), "N".to_string()];
     let coords = vec![
@@ -329,17 +377,11 @@ fn n2_fixed_charge_scc_parity() {
     let s_ref = DftbOutput::read_square(&ref_s).unwrap();
 
     let diff_h = max_abs_diff(h_scc_rust, &h_ref);
-    assert!(
-        diff_h < 1e-6,
-        "N2 H_scc mismatch (diff = {diff_h:e})"
-    );
+    assert!(diff_h < 1e-6, "N2 H_scc mismatch (diff = {diff_h:e})");
 
     // Verify S matches too (should be identical since same geometry)
     let diff_s = max_abs_diff(&solver.fragments[0].template.s, &s_ref);
-    assert!(
-        diff_s < 1e-7,
-        "N2 S mismatch (diff = {diff_s:e})"
-    );
+    assert!(diff_s < 1e-7, "N2 S mismatch (diff = {diff_s:e})");
 }
 
 /// HCOOH fixed-charge SCC parity against Fortran DFTB+ reference.
@@ -348,9 +390,15 @@ fn hcooh_fixed_charge_scc_parity() {
     use rust_dftb::qmqm::solver::MultiSystemSolver;
     use rust_dftb::qmqm::{FragmentNeighborList, GammaTable, SimpleMixer};
 
-    let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else { return; };
-    let Ok(ref_h) = std::env::var("RUST_DFTB_REF_H") else { return; };
-    let Ok(ref_s) = std::env::var("RUST_DFTB_REF_S") else { return; };
+    let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else {
+        return;
+    };
+    let Ok(ref_h) = std::env::var("RUST_DFTB_REF_H") else {
+        return;
+    };
+    let Ok(ref_s) = std::env::var("RUST_DFTB_REF_S") else {
+        return;
+    };
 
     // Load HCOOH geometry from data/xyz/HCOOH.xyz
     let xyz_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../data/xyz/HCOOH.xyz");
@@ -382,16 +430,10 @@ fn hcooh_fixed_charge_scc_parity() {
     let s_ref = DftbOutput::read_square(&ref_s).unwrap();
 
     let diff_h = max_abs_diff(h_scc_rust, &h_ref);
-    assert!(
-        diff_h < 1e-6,
-        "HCOOH H_scc mismatch (diff = {diff_h:e})"
-    );
+    assert!(diff_h < 1e-6, "HCOOH H_scc mismatch (diff = {diff_h:e})");
 
     let diff_s = max_abs_diff(&solver.fragments[0].template.s, &s_ref);
-    assert!(
-        diff_s < 1e-7,
-        "HCOOH S mismatch (diff = {diff_s:e})"
-    );
+    assert!(diff_s < 1e-7, "HCOOH S mismatch (diff = {diff_s:e})");
 }
 
 // ─── Agent_2: Multi-fragment validation tests ──────────────────────
@@ -490,20 +532,23 @@ fn agent02_build_h2o_solver(
 /// charges as a standalone H2O SCC calculation.
 #[test]
 fn two_fragment_independent_scc() {
-    let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else { return; };
+    let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else {
+        return;
+    };
 
     let (species, base_coords) = agent02_load_h2o();
     let sk = load_sk_for_species(&sk_dir, &species).unwrap();
 
     // Standalone H2O SCC reference
     let builder = HamiltonianBuilder::new(sk.clone());
-    let standalone = builder.build_scc(&species, &base_coords, 200, 1e-9).unwrap();
+    let standalone = builder
+        .build_scc(&species, &base_coords, 200, 1e-9)
+        .unwrap();
     eprintln!("Standalone H2O charges: {:?}", standalone.charges);
     eprintln!("Standalone H2O energy: {:.10e}", standalone.energy);
 
     // Two H2O 20 Å apart, neighbor cutoff 10 Å → not neighbors → v_ext = 0
-    let mut solver =
-        agent02_build_h2o_solver(&sk_dir, &[[0.0, 0.0, 0.0], [20.0, 0.0, 0.0]], 10.0);
+    let mut solver = agent02_build_h2o_solver(&sk_dir, &[[0.0, 0.0, 0.0], [20.0, 0.0, 0.0]], 10.0);
     solver.solve_scc(200, 1e-9).unwrap();
 
     let q0 = &solver.fragments[0].charges;
@@ -556,19 +601,22 @@ fn two_fragment_independent_scc() {
 /// - Total energy differs from 2× standalone (interaction energy)
 #[test]
 fn two_fragment_polarization() {
-    let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else { return; };
+    let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else {
+        return;
+    };
 
     let (species, base_coords) = agent02_load_h2o();
     let sk = load_sk_for_species(&sk_dir, &species).unwrap();
 
     // Standalone reference
     let builder = HamiltonianBuilder::new(sk.clone());
-    let standalone = builder.build_scc(&species, &base_coords, 200, 1e-9).unwrap();
+    let standalone = builder
+        .build_scc(&species, &base_coords, 200, 1e-9)
+        .unwrap();
     let standalone_energy = standalone.energy;
 
     // Two H2O 3 Å apart (centroid separation), neighbor cutoff 30 Å → coupled
-    let mut solver =
-        agent02_build_h2o_solver(&sk_dir, &[[0.0, 0.0, 0.0], [3.0, 0.0, 0.0]], 30.0);
+    let mut solver = agent02_build_h2o_solver(&sk_dir, &[[0.0, 0.0, 0.0], [3.0, 0.0, 0.0]], 30.0);
     solver.solve_scc(200, 1e-9).unwrap();
 
     let q0 = &solver.fragments[0].charges;
@@ -628,7 +676,10 @@ fn two_fragment_polarization() {
     let interaction_energy = multi_energy - 2.0 * standalone_energy;
     eprintln!("Multi-frag total energy = {:.10e}", multi_energy);
     eprintln!("2× standalone energy    = {:.10e}", 2.0 * standalone_energy);
-    eprintln!("Interaction energy      = {:.3e} Hartree", interaction_energy);
+    eprintln!(
+        "Interaction energy      = {:.3e} Hartree",
+        interaction_energy
+    );
     assert!(
         interaction_energy.abs() > 1e-6,
         "Interaction energy should be non-zero, got {}",
@@ -648,11 +699,16 @@ fn two_fragment_polarization() {
 fn charge_conservation_multi_frag() {
     use rust_dftb::qmqm::Mixer;
 
-    let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else { return; };
+    let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else {
+        return;
+    };
 
     // 3 H2O at various separations: 0, 3, 7 Å
-    let mut solver =
-        agent02_build_h2o_solver(&sk_dir, &[[0.0, 0.0, 0.0], [3.0, 0.0, 0.0], [7.0, 0.0, 0.0]], 30.0);
+    let mut solver = agent02_build_h2o_solver(
+        &sk_dir,
+        &[[0.0, 0.0, 0.0], [3.0, 0.0, 0.0], [7.0, 0.0, 0.0]],
+        30.0,
+    );
     let total_q0: f64 = solver.q0.iter().sum();
     eprintln!("Total q0 = {:.10}", total_q0);
 
@@ -733,14 +789,15 @@ fn charge_conservation_multi_frag() {
 /// This test documents the approximation error.
 #[test]
 fn two_fragment_vs_single_combined() {
-    let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else { return; };
+    let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else {
+        return;
+    };
 
     let (species, base_coords) = agent02_load_h2o();
     let sk = load_sk_for_species(&sk_dir, &species).unwrap();
 
     // 2-fragment: two H2O 3 Å apart
-    let mut solver =
-        agent02_build_h2o_solver(&sk_dir, &[[0.0, 0.0, 0.0], [3.0, 0.0, 0.0]], 30.0);
+    let mut solver = agent02_build_h2o_solver(&sk_dir, &[[0.0, 0.0, 0.0], [3.0, 0.0, 0.0]], 30.0);
     solver.solve_scc(200, 1e-9).unwrap();
     let multi_energy = agent02_total_energy(&solver);
     let multi_charges: Vec<f64> = solver

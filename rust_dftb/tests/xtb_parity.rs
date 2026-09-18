@@ -1,16 +1,22 @@
 //! Parity tests: Rust xTB implementation vs tblite C API reference.
 
-use std::process::{Command, Stdio};
-use std::io::Write;
 use rust_dftb::compare_matrices;
 use rust_dftb::compare_vecs;
+use std::io::Write;
+use std::process::{Command, Stdio};
 
 const TBLITE_HELPER: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/tblite_helper");
 
 /// Run tblite C helper on a molecule and return parsed JSON.
 /// method: 1 = GFN1, 2 = GFN2
 /// Returns None if tblite_helper is not available
-fn run_tblite(nat: usize, charge: i32, uhf: i32, method: i32, atoms: &[(usize, [f64; 3])]) -> Option<serde_json::Value> {
+fn run_tblite(
+    nat: usize,
+    charge: i32,
+    uhf: i32,
+    method: i32,
+    atoms: &[(usize, [f64; 3])],
+) -> Option<serde_json::Value> {
     let mut child = Command::new(TBLITE_HELPER)
         .arg(format!("{}", nat))
         .arg(format!("{}", charge))
@@ -33,7 +39,9 @@ fn run_tblite(nat: usize, charge: i32, uhf: i32, method: i32, atoms: &[(usize, [
         }
     }
 
-    let output = child.wait_with_output().expect("Failed to read tblite_helper output");
+    let output = child
+        .wait_with_output()
+        .expect("Failed to read tblite_helper output");
     if !output.status.success() {
         return None;
     }
@@ -60,16 +68,18 @@ fn json_to_dmatrix(json: &serde_json::Value, key: &str, n: usize) -> nalgebra::D
 }
 
 fn json_to_vec(json: &serde_json::Value, key: &str) -> Vec<f64> {
-    json[key].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect()
+    json[key]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_f64().unwrap())
+        .collect()
 }
 
 #[test]
 fn test_h2_gfn1_parity() {
     // H2 at equilibrium: 0.74 Å
-    let atoms = vec![
-        (1, [0.0, 0.0, 0.0]),
-        (1, [0.0, 0.0, 0.74]),
-    ];
+    let atoms = vec![(1, [0.0, 0.0, 0.0]), (1, [0.0, 0.0, 0.74])];
 
     let ref_data = run_tblite(2, 0, 0, 1, &atoms);
     if ref_data.is_none() {
@@ -85,10 +95,7 @@ fn test_h2_gfn1_parity() {
 
     // Build with our Rust code (coordinates in Bohr)
     let aatoau = 1.889726133;
-    let coords = vec![
-        [0.0, 0.0, 0.0],
-        [0.0, 0.0, 0.74 * aatoau],
-    ];
+    let coords = vec![[0.0, 0.0, 0.0], [0.0, 0.0, 0.74 * aatoau]];
     let elem_idx = vec![0usize, 0]; // H = index 0
     let (h_rust, s_rust, _shell_elem, _shell_idx) =
         rust_dftb::methods::xtb::hamiltonian::build_h0_s(&coords, &elem_idx);
@@ -130,10 +137,7 @@ fn test_h2_gfn1_parity() {
 #[test]
 fn test_n2_gfn1_parity() {
     // N2 at equilibrium: 1.10 Å
-    let atoms = vec![
-        (7, [0.0, 0.0, 0.0]),
-        (7, [0.0, 0.0, 1.10]),
-    ];
+    let atoms = vec![(7, [0.0, 0.0, 0.0]), (7, [0.0, 0.0, 1.10])];
 
     let ref_data = run_tblite(2, 0, 0, 1, &atoms);
     if ref_data.is_none() {
@@ -148,10 +152,7 @@ fn test_n2_gfn1_parity() {
     let s_ref = json_to_dmatrix(&ref_data, "overlap", nao);
 
     let aatoau = 1.889726133;
-    let coords = vec![
-        [0.0, 0.0, 0.0],
-        [0.0, 0.0, 1.10 * aatoau],
-    ];
+    let coords = vec![[0.0, 0.0, 0.0], [0.0, 0.0, 1.10 * aatoau]];
     let elem_idx = vec![6usize, 6]; // N = index 6
     let (h_rust, s_rust, _shell_elem, _shell_idx) =
         rust_dftb::methods::xtb::hamiltonian::build_h0_s(&coords, &elem_idx);
@@ -164,10 +165,10 @@ fn test_n2_gfn1_parity() {
 fn test_hcooh_gfn1_parity() {
     // Formic acid (HCOOH) approximate geometry in Angstrom
     let atoms = vec![
-        (1, [-1.55,  1.10, 0.0]), // H (hydroxyl)
-        (8, [-0.66,  1.10, 0.0]), // O (hydroxyl)
-        (6, [ 0.00,  0.00, 0.0]), // C
-        (8, [ 1.20,  0.00, 0.0]), // O (carbonyl)
+        (1, [-1.55, 1.10, 0.0]),  // H (hydroxyl)
+        (8, [-0.66, 1.10, 0.0]),  // O (hydroxyl)
+        (6, [0.00, 0.00, 0.0]),   // C
+        (8, [1.20, 0.00, 0.0]),   // O (carbonyl)
         (1, [-0.36, -0.95, 0.0]), // H (on C)
     ];
 
@@ -184,9 +185,10 @@ fn test_hcooh_gfn1_parity() {
     let s_ref = json_to_dmatrix(&ref_data, "overlap", nao);
 
     let aatoau = 1.889726133;
-    let coords: Vec<[f64; 3]> = atoms.iter().map(|(_, p)| {
-        [p[0] * aatoau, p[1] * aatoau, p[2] * aatoau]
-    }).collect();
+    let coords: Vec<[f64; 3]> = atoms
+        .iter()
+        .map(|(_, p)| [p[0] * aatoau, p[1] * aatoau, p[2] * aatoau])
+        .collect();
     let elem_idx = vec![0usize, 7, 5, 7, 0]; // H=0, O=7, C=5
     let (h_rust, s_rust, _shell_elem, _shell_idx) =
         rust_dftb::methods::xtb::hamiltonian::build_h0_s(&coords, &elem_idx);
@@ -198,10 +200,7 @@ fn test_hcooh_gfn1_parity() {
 #[test]
 fn test_h2_scc_parity() {
     // H2 at equilibrium: 0.74 Å
-    let atoms = vec![
-        (1, [0.0, 0.0, 0.0]),
-        (1, [0.0, 0.0, 0.74]),
-    ];
+    let atoms = vec![(1, [0.0, 0.0, 0.0]), (1, [0.0, 0.0, 0.74])];
 
     let ref_data = run_tblite(2, 0, 0, 1, &atoms);
     if ref_data.is_none() {
@@ -216,17 +215,13 @@ fn test_h2_scc_parity() {
     let emo_ref = json_to_vec(&ref_data, "eigenvalues");
 
     let aatoau = 1.889726133;
-    let coords = vec![
-        [0.0, 0.0, 0.0],
-        [0.0, 0.0, 0.74 * aatoau],
-    ];
+    let coords = vec![[0.0, 0.0, 0.0], [0.0, 0.0, 0.74 * aatoau]];
     let elem_idx = vec![0usize, 0]; // H = index 0
 
     // Run SCC
     let n_electrons = 2; // H2 has 2 electrons
-    let (_density, qsh, emo) = rust_dftb::methods::xtb::scf::run_scf(
-        &coords, &elem_idx, n_electrons, 100, 1e-6
-    );
+    let (_density, qsh, emo) =
+        rust_dftb::methods::xtb::scf::run_scf(&coords, &elem_idx, n_electrons, 100, 1e-6);
 
     // Convert shell charges to atomic charges
     let nshell_per_atom = vec![2, 2]; // H has 2 shells
@@ -244,10 +239,7 @@ fn test_h2_scc_parity() {
 #[test]
 fn test_n2_scc_parity() {
     // N2 at equilibrium: 1.10 Å
-    let atoms = vec![
-        (7, [0.0, 0.0, 0.0]),
-        (7, [0.0, 0.0, 1.10]),
-    ];
+    let atoms = vec![(7, [0.0, 0.0, 0.0]), (7, [0.0, 0.0, 1.10])];
 
     let ref_data = run_tblite(2, 0, 0, 1, &atoms);
     if ref_data.is_none() {
@@ -259,24 +251,29 @@ fn test_n2_scc_parity() {
     let emo_ref = json_to_vec(&ref_data, "eigenvalues");
 
     let aatoau = 1.889726133;
-    let coords = vec![
-        [0.0, 0.0, 0.0],
-        [0.0, 0.0, 1.10 * aatoau],
-    ];
+    let coords = vec![[0.0, 0.0, 0.0], [0.0, 0.0, 1.10 * aatoau]];
     let elem_idx = vec![6usize, 6]; // N = index 6
     let n_electrons = 10; // N2 has 10 electrons
 
     // Compare Rust-computed vs tblite-extracted multipole integrals
-    let (dint_rust, qint_rust) = rust_dftb::methods::xtb::multipole_integrals::build_multipole_integrals_gfn2(&coords, &elem_idx);
+    let (dint_rust, qint_rust) =
+        rust_dftb::methods::xtb::multipole_integrals::build_multipole_integrals_gfn2(
+            &coords, &elem_idx,
+        );
     let dint_ref = json_to_vec(&ref_data, "dipole_integrals");
     let qint_ref = json_to_vec(&ref_data, "quadrupole_integrals");
     println!("Dipole integrals comparison:");
     let mut max_dint_err = 0.0f64;
     for i in 0..dint_rust.len() {
         let err = (dint_rust[i] - dint_ref[i]).abs();
-        if err > max_dint_err { max_dint_err = err; }
+        if err > max_dint_err {
+            max_dint_err = err;
+        }
         if err > 1e-6 && i < 30 {
-            println!("  dint[{}]: rust={:.10e} ref={:.10e} err={:.10e}", i, dint_rust[i], dint_ref[i], err);
+            println!(
+                "  dint[{}]: rust={:.10e} ref={:.10e} err={:.10e}",
+                i, dint_rust[i], dint_ref[i], err
+            );
         }
     }
     println!("  max dipole integral error = {:.6e}", max_dint_err);
@@ -284,18 +281,25 @@ fn test_n2_scc_parity() {
     let mut max_qint_err = 0.0f64;
     for i in 0..qint_rust.len() {
         let err = (qint_rust[i] - qint_ref[i]).abs();
-        if err > max_qint_err { max_qint_err = err; }
+        if err > max_qint_err {
+            max_qint_err = err;
+        }
         if err > 1e-6 && i < 30 {
-            println!("  qint[{}]: rust={:.10e} ref={:.10e} err={:.10e}", i, qint_rust[i], qint_ref[i], err);
+            println!(
+                "  qint[{}]: rust={:.10e} ref={:.10e} err={:.10e}",
+                i, qint_rust[i], qint_ref[i], err
+            );
         }
     }
     println!("  max quadrupole integral error = {:.6e}", max_qint_err);
 
-    let (_density, qsh, emo) = rust_dftb::methods::xtb::scf::run_scf_gfn2(
-        &coords, &elem_idx, n_electrons, 100, 1e-6
-    );
+    let (_density, qsh, emo) =
+        rust_dftb::methods::xtb::scf::run_scf_gfn2(&coords, &elem_idx, n_electrons, 100, 1e-6);
 
-    let nshell_per_atom: Vec<usize> = elem_idx.iter().map(|&z| rust_dftb::methods::xtb::params_gfn2::nshell[z]).collect();
+    let nshell_per_atom: Vec<usize> = elem_idx
+        .iter()
+        .map(|&z| rust_dftb::methods::xtb::params_gfn2::nshell[z])
+        .collect();
     let q_rust = rust_dftb::methods::xtb::mulliken::atomic_charges(&qsh, &nshell_per_atom);
 
     // Also get H0 eigenvalues for diagnosis
@@ -326,10 +330,10 @@ fn test_n2_scc_parity() {
 fn test_hcooh_scc_parity() {
     // Formic acid (HCOOH) approximate geometry in Angstrom
     let atoms = vec![
-        (1, [-1.55,  1.10, 0.0]), // H (hydroxyl)
-        (8, [-0.66,  1.10, 0.0]), // O (hydroxyl)
-        (6, [ 0.00,  0.00, 0.0]), // C
-        (8, [ 1.20,  0.00, 0.0]), // O (carbonyl)
+        (1, [-1.55, 1.10, 0.0]),  // H (hydroxyl)
+        (8, [-0.66, 1.10, 0.0]),  // O (hydroxyl)
+        (6, [0.00, 0.00, 0.0]),   // C
+        (8, [1.20, 0.00, 0.0]),   // O (carbonyl)
         (1, [-0.36, -0.95, 0.0]), // H (on C)
     ];
 
@@ -343,17 +347,20 @@ fn test_hcooh_scc_parity() {
     let emo_ref = json_to_vec(&ref_data, "eigenvalues");
 
     let aatoau = 1.889726133;
-    let coords: Vec<[f64; 3]> = atoms.iter().map(|(_, p)| {
-        [p[0] * aatoau, p[1] * aatoau, p[2] * aatoau]
-    }).collect();
+    let coords: Vec<[f64; 3]> = atoms
+        .iter()
+        .map(|(_, p)| [p[0] * aatoau, p[1] * aatoau, p[2] * aatoau])
+        .collect();
     let elem_idx = vec![0usize, 7, 5, 7, 0]; // H=0, O=7, C=5
     let n_electrons = 18; // HCOOH has 18 electrons
 
-    let (_density, qsh, emo) = rust_dftb::methods::xtb::scf::run_scf_gfn2(
-        &coords, &elem_idx, n_electrons, 100, 1e-6
-    );
+    let (_density, qsh, emo) =
+        rust_dftb::methods::xtb::scf::run_scf_gfn2(&coords, &elem_idx, n_electrons, 100, 1e-6);
 
-    let nshell_per_atom: Vec<usize> = elem_idx.iter().map(|&z| rust_dftb::methods::xtb::params_gfn2::nshell[z]).collect();
+    let nshell_per_atom: Vec<usize> = elem_idx
+        .iter()
+        .map(|&z| rust_dftb::methods::xtb::params_gfn2::nshell[z])
+        .collect();
     let q_rust = rust_dftb::methods::xtb::mulliken::atomic_charges(&qsh, &nshell_per_atom);
 
     // --- Direct Hamiltonian comparison for fixed charges ---
@@ -370,8 +377,13 @@ fn test_hcooh_scc_parity() {
             ang_per_shell.push(rust_dftb::methods::xtb::params_gfn2::ang_shell[z][ish]);
         }
     }
-    let n0sh = rust_dftb::methods::xtb::mulliken::reference_shell_occupations_gfn2(&nshell_per_atom, &elem_idx, &ang_per_shell);
-    let qsh_from_tblite = rust_dftb::methods::xtb::mulliken::shell_charges(&p_tblite, &s_tblite, &ao2sh, &n0sh);
+    let n0sh = rust_dftb::methods::xtb::mulliken::reference_shell_occupations_gfn2(
+        &nshell_per_atom,
+        &elem_idx,
+        &ang_per_shell,
+    );
+    let qsh_from_tblite =
+        rust_dftb::methods::xtb::mulliken::shell_charges(&p_tblite, &s_tblite, &ao2sh, &n0sh);
 
     // Reconstruct tblite SCC Hamiltonian: H1 = S * C * E * C^T * S
     let mut e_diag = nalgebra::DMatrix::zeros(nao, nao);
@@ -381,14 +393,29 @@ fn test_hcooh_scc_parity() {
     let h1_tblite = &s_tblite * &c_tblite * &e_diag * c_tblite.transpose() * &s_tblite;
 
     // Build our H_scc with same qsh
-    let (h0_rust, s_rust, _, _) = rust_dftb::methods::xtb::hamiltonian::build_h0_s(&coords, &elem_idx);
+    let (h0_rust, s_rust, _, _) =
+        rust_dftb::methods::xtb::hamiltonian::build_h0_s(&coords, &elem_idx);
     let ang_per_shell = vec![0, 0, 0, 1, 0, 1, 0, 1, 0, 0];
-    let gamma = rust_dftb::methods::xtb::coulomb::build_coulomb_matrix(&coords, &nshell_per_atom, &elem_idx, &ang_per_shell);
+    let gamma = rust_dftb::methods::xtb::coulomb::build_coulomb_matrix(
+        &coords,
+        &nshell_per_atom,
+        &elem_idx,
+        &ang_per_shell,
+    );
     let h1_rust = rust_dftb::methods::xtb::scf::build_scc_hamiltonian_with_thirdorder(
-        &h0_rust, &s_rust, &gamma, &qsh_from_tblite, &nshell_per_atom, &elem_idx, &ao2sh
+        &h0_rust,
+        &s_rust,
+        &gamma,
+        &qsh_from_tblite,
+        &nshell_per_atom,
+        &elem_idx,
+        &ao2sh,
     );
 
-    println!("HCOOH qsh from tblite density: {:?}", qsh_from_tblite.data.as_vec());
+    println!(
+        "HCOOH qsh from tblite density: {:?}",
+        qsh_from_tblite.data.as_vec()
+    );
     println!("HCOOH charges ref: {:?}", q_ref);
     println!("HCOOH charges rust: {:?}", q_rust.data.as_vec());
     println!("HCOOH eigenvalues ref: {:?}", emo_ref);
@@ -401,7 +428,9 @@ fn test_hcooh_scc_parity() {
         for j in 0..nao {
             let expected = if i == j { 1.0 } else { 0.0 };
             let err = (csc[(i, j)] - expected).abs();
-            if err > csc_max_err { csc_max_err = err; }
+            if err > csc_max_err {
+                csc_max_err = err;
+            }
         }
     }
     println!("C^T * S * C max deviation from I: {:.6e}", csc_max_err);
@@ -435,17 +464,35 @@ fn test_hcooh_scc_parity() {
 
     // Compute our vsh for comparison
     let vsh_rust = &gamma * &qsh_from_tblite;
-    let v3_rust = rust_dftb::methods::xtb::coulomb::thirdorder_potential(&qsh_from_tblite, &nshell_per_atom, &elem_idx);
-    println!("vsh rust (gamma*qsh):          {:?}", vsh_rust.data.as_vec());
+    let v3_rust = rust_dftb::methods::xtb::coulomb::thirdorder_potential(
+        &qsh_from_tblite,
+        &nshell_per_atom,
+        &elem_idx,
+    );
+    println!(
+        "vsh rust (gamma*qsh):          {:?}",
+        vsh_rust.data.as_vec()
+    );
     println!("v3 rust (thirdorder):          {:?}", v3_rust.data.as_vec());
-    println!("vao total rust per AO:         {:?}", (0..nao).map(|iao| vsh_rust[ao2sh[iao]] + v3_rust[ao2sh[iao]]).collect::<Vec<_>>());
+    println!(
+        "vao total rust per AO:         {:?}",
+        (0..nao)
+            .map(|iao| vsh_rust[ao2sh[iao]] + v3_rust[ao2sh[iao]])
+            .collect::<Vec<_>>()
+    );
 
     // Print diagonal elements for first few AOs
     println!("AO | ao2sh | H0_rust | H1_rust | H1_tblite | diff");
     for iao in 0..nao.min(8) {
-        println!("{:2} | {:5} | {:9.6} | {:9.6} | {:9.6} | {:9.6}",
-            iao, ao2sh[iao], h0_rust[(iao,iao)], h1_rust[(iao,iao)], h1_tblite[(iao,iao)],
-            h1_rust[(iao,iao)] - h1_tblite[(iao,iao)]);
+        println!(
+            "{:2} | {:5} | {:9.6} | {:9.6} | {:9.6} | {:9.6}",
+            iao,
+            ao2sh[iao],
+            h0_rust[(iao, iao)],
+            h1_rust[(iao, iao)],
+            h1_tblite[(iao, iao)],
+            h1_rust[(iao, iao)] - h1_tblite[(iao, iao)]
+        );
     }
 
     // Compare H1 matrices directly
@@ -463,10 +510,7 @@ fn test_hcooh_scc_parity() {
 
 #[test]
 fn test_h2_gfn2_parity() {
-    let atoms = vec![
-        (1, [0.0, 0.0, 0.0]),
-        (1, [0.0, 0.0, 0.74]),
-    ];
+    let atoms = vec![(1, [0.0, 0.0, 0.0]), (1, [0.0, 0.0, 0.74])];
     let ref_data = run_tblite(2, 0, 0, 2, &atoms);
     if ref_data.is_none() {
         println!("Skipping test_h2_gfn2_parity: tblite_helper not available");
@@ -480,10 +524,7 @@ fn test_h2_gfn2_parity() {
     let s_ref = json_to_dmatrix(&ref_data, "overlap", nao);
 
     let aatoau = 1.889726133;
-    let coords = vec![
-        [0.0, 0.0, 0.0],
-        [0.0, 0.0, 0.74 * aatoau],
-    ];
+    let coords = vec![[0.0, 0.0, 0.0], [0.0, 0.0, 0.74 * aatoau]];
     let elem_idx = vec![0usize, 0];
     let (h_rust, s_rust, _, _) =
         rust_dftb::methods::xtb::hamiltonian::build_h0_s_gfn2(&coords, &elem_idx);
@@ -494,10 +535,7 @@ fn test_h2_gfn2_parity() {
 
 #[test]
 fn test_n2_gfn2_parity() {
-    let atoms = vec![
-        (7, [0.0, 0.0, 0.0]),
-        (7, [0.0, 0.0, 1.10]),
-    ];
+    let atoms = vec![(7, [0.0, 0.0, 0.0]), (7, [0.0, 0.0, 1.10])];
     let ref_data = run_tblite(2, 0, 0, 2, &atoms);
     if ref_data.is_none() {
         println!("Skipping test_n2_gfn2_parity: tblite_helper not available");
@@ -511,10 +549,7 @@ fn test_n2_gfn2_parity() {
     let s_ref = json_to_dmatrix(&ref_data, "overlap", nao);
 
     let aatoau = 1.889726133;
-    let coords = vec![
-        [0.0, 0.0, 0.0],
-        [0.0, 0.0, 1.10 * aatoau],
-    ];
+    let coords = vec![[0.0, 0.0, 0.0], [0.0, 0.0, 1.10 * aatoau]];
     let elem_idx = vec![6usize, 6];
     let (h_rust, s_rust, _, _) =
         rust_dftb::methods::xtb::hamiltonian::build_h0_s_gfn2(&coords, &elem_idx);
@@ -526,10 +561,10 @@ fn test_n2_gfn2_parity() {
 #[test]
 fn test_hcooh_gfn2_parity() {
     let atoms = vec![
-        (1, [-1.55,  1.10, 0.0]),
-        (8, [-0.66,  1.10, 0.0]),
-        (6, [ 0.00,  0.00, 0.0]),
-        (8, [ 1.20,  0.00, 0.0]),
+        (1, [-1.55, 1.10, 0.0]),
+        (8, [-0.66, 1.10, 0.0]),
+        (6, [0.00, 0.00, 0.0]),
+        (8, [1.20, 0.00, 0.0]),
         (1, [-0.36, -0.95, 0.0]),
     ];
     let ref_data = run_tblite(5, 0, 0, 2, &atoms);
@@ -545,9 +580,10 @@ fn test_hcooh_gfn2_parity() {
     let s_ref = json_to_dmatrix(&ref_data, "overlap", nao);
 
     let aatoau = 1.889726133;
-    let coords: Vec<[f64; 3]> = atoms.iter().map(|(_, p)| {
-        [p[0] * aatoau, p[1] * aatoau, p[2] * aatoau]
-    }).collect();
+    let coords: Vec<[f64; 3]> = atoms
+        .iter()
+        .map(|(_, p)| [p[0] * aatoau, p[1] * aatoau, p[2] * aatoau])
+        .collect();
     let elem_idx = vec![0usize, 7, 5, 7, 0];
     let (h_rust, s_rust, _, _) =
         rust_dftb::methods::xtb::hamiltonian::build_h0_s_gfn2(&coords, &elem_idx);
@@ -560,10 +596,7 @@ fn test_hcooh_gfn2_parity() {
 fn test_h2_gfn2_scc_hamiltonian_parity() {
     // Test SCC Hamiltonian with fixed shell charges from tblite
     // Using method=3 for GFN2 without D4 dispersion
-    let atoms = vec![
-        (1, [0.0, 0.0, 0.0]),
-        (1, [0.0, 0.0, 0.74]),
-    ];
+    let atoms = vec![(1, [0.0, 0.0, 0.0]), (1, [0.0, 0.0, 0.74])];
     let ref_data = run_tblite(2, 0, 0, 3, &atoms);
     if ref_data.is_none() {
         println!("Skipping test_h2_gfn2_scc_hamiltonian_parity: tblite_helper not available");
@@ -591,10 +624,7 @@ fn test_h2_gfn2_scc_hamiltonian_parity() {
 
     // Build Rust H0, S, and gamma for GFN2
     let aatoau = 1.889726133;
-    let coords = vec![
-        [0.0, 0.0, 0.0],
-        [0.0, 0.0, 0.74 * aatoau],
-    ];
+    let coords = vec![[0.0, 0.0, 0.0], [0.0, 0.0, 0.74 * aatoau]];
     let elem_idx = vec![0usize, 0];
 
     let (h0_rust, s_rust, _, _) =
@@ -607,9 +637,10 @@ fn test_h2_gfn2_scc_hamiltonian_parity() {
     compare_matrices(&s_rust, &s_ref, "H2 GFN2 S", 1e-4);
 
     // Build nshell_per_atom and ang_per_shell from params_gfn2 (like SCF code does)
-    let nshell_per_atom: Vec<usize> = elem_idx.iter().map(|&z| {
-        rust_dftb::methods::xtb::params_gfn2::nshell[z]
-    }).collect();
+    let nshell_per_atom: Vec<usize> = elem_idx
+        .iter()
+        .map(|&z| rust_dftb::methods::xtb::params_gfn2::nshell[z])
+        .collect();
 
     let mut ang_per_shell = Vec::new();
     for &z in &elem_idx {
@@ -621,14 +652,21 @@ fn test_h2_gfn2_scc_hamiltonian_parity() {
 
     // Build Coulomb matrix for GFN2
     let gamma = rust_dftb::methods::xtb::coulomb::build_coulomb_matrix_gfn2(
-        &coords, &nshell_per_atom, &elem_idx, &ang_per_shell
+        &coords,
+        &nshell_per_atom,
+        &elem_idx,
+        &ang_per_shell,
     );
 
     println!("Gamma matrix shape: {}x{}", gamma.nrows(), gamma.ncols());
     println!("Gamma matrix:\n{}", gamma);
     println!("nshell_per_atom: {:?}", nshell_per_atom);
     println!("ang_per_shell: {:?}", ang_per_shell);
-    println!("qsh_ref_vec len: {}, values: {:?}", qsh_ref_vec.len(), qsh_ref_vec);
+    println!(
+        "qsh_ref_vec len: {}, values: {:?}",
+        qsh_ref_vec.len(),
+        qsh_ref_vec
+    );
 
     // Compute vsh = gamma * qsh manually to verify
     let mut vsh_manual = vec![0.0; qsh_ref_vec.len()];
@@ -657,7 +695,14 @@ fn test_h2_gfn2_scc_hamiltonian_parity() {
     }
 
     let h_scc_rust = rust_dftb::methods::xtb::scf::build_scc_hamiltonian_with_thirdorder_gfn2(
-        &h0_rust, &s_rust, &gamma, &qsh_ref, &nshell_per_atom, &elem_idx, &ang_per_shell, &ao2sh
+        &h0_rust,
+        &s_rust,
+        &gamma,
+        &qsh_ref,
+        &nshell_per_atom,
+        &elem_idx,
+        &ang_per_shell,
+        &ao2sh,
     );
 
     // Build ao2at mapping for multipole terms
@@ -689,14 +734,19 @@ fn test_h2_gfn2_scc_hamiltonian_parity() {
     println!("tblite effective Hamiltonian (H_scc):\n{}", h_scc_ref);
     println!("Rust SCC Hamiltonian matrix (charge only):\n{}", h_scc_rust);
     println!("Rust SCC Hamiltonian (with multipole):\n{}", h_scc_with_mp);
-    println!("Difference (tblite H_scc - Rust H_scc with mp):\n{}", &h_scc_ref - &h_scc_with_mp);
+    println!(
+        "Difference (tblite H_scc - Rust H_scc with mp):\n{}",
+        &h_scc_ref - &h_scc_with_mp
+    );
 
     // Compute atomic multipoles from density matrix for sanity check
-    let dpat_rust = rust_dftb::methods::xtb::mulliken::atomic_multipoles(
-        &p_ref, &dipole_ints_vec, &ao2at, 3
-    );
+    let dpat_rust =
+        rust_dftb::methods::xtb::mulliken::atomic_multipoles(&p_ref, &dipole_ints_vec, &ao2at, 3);
     let qpat_rust = rust_dftb::methods::xtb::mulliken::atomic_multipoles(
-        &p_ref, &quadrupole_ints_vec, &ao2at, 6
+        &p_ref,
+        &quadrupole_ints_vec,
+        &ao2at,
+        6,
     );
     println!("Rust atomic dipole moments:\n{}", dpat_rust);
     println!("Rust atomic quadrupole moments:\n{}", qpat_rust);
@@ -711,7 +761,12 @@ fn test_h2_gfn2_scc_hamiltonian_parity() {
 
     // Direct comparison of effective Hamiltonian matrices
     println!("H2 GFN2 effective Hamiltonian comparison (with multipole):");
-    compare_matrices(&h_scc_with_mp, &h_scc_ref, "H2 GFN2 SCC Hamiltonian with multipole", 1e-4);
+    compare_matrices(
+        &h_scc_with_mp,
+        &h_scc_ref,
+        "H2 GFN2 SCC Hamiltonian with multipole",
+        1e-4,
+    );
 
     // First, check what H0 eigenvalues should be (standard eigenvalue problem)
     let h0_eigen = h0_rust.clone().symmetric_eigen();
@@ -745,20 +800,23 @@ fn test_h2_gfn2_scc_hamiltonian_parity() {
     println!("H2 GFN2 SCC Hamiltonian eigenvalues rust: {:?}", emo_rust);
 
     // For small charges, SCC eigenvalues should be close to H0 eigenvalues
-    println!("Difference from H0 (ref):  [{}, {}]",
-             emo_ref[0] - emo_h0_gen[0], emo_ref[1] - emo_h0_gen[1]);
-    println!("Difference from H0 (rust): [{}, {}]",
-             emo_rust[0] - emo_h0_gen[0], emo_rust[1] - emo_h0_gen[1]);
+    println!(
+        "Difference from H0 (ref):  [{}, {}]",
+        emo_ref[0] - emo_h0_gen[0],
+        emo_ref[1] - emo_h0_gen[1]
+    );
+    println!(
+        "Difference from H0 (rust): [{}, {}]",
+        emo_rust[0] - emo_h0_gen[0],
+        emo_rust[1] - emo_h0_gen[1]
+    );
 
     compare_vecs(&emo_rust, &emo_ref, "H2 GFN2 SCC eigenvalues", 1e-3);
 }
 
 #[test]
 fn test_n2_gfn2_scc_parity() {
-    let atoms = vec![
-        (7, [0.0, 0.0, 0.0]),
-        (7, [0.0, 0.0, 1.10]),
-    ];
+    let atoms = vec![(7, [0.0, 0.0, 0.0]), (7, [0.0, 0.0, 1.10])];
     let ref_data = run_tblite(2, 0, 0, 2, &atoms);
     if ref_data.is_none() {
         println!("Skipping test_n2_gfn2_scc_parity: tblite_helper not available");
@@ -773,17 +831,13 @@ fn test_n2_gfn2_scc_parity() {
     let h_scc_ref = json_to_dmatrix(&ref_data, "effective_hamiltonian", nao_ref);
 
     let aatoau = 1.889726133;
-    let coords = vec![
-        [0.0, 0.0, 0.0],
-        [0.0, 0.0, 1.10 * aatoau],
-    ];
+    let coords = vec![[0.0, 0.0, 0.0], [0.0, 0.0, 1.10 * aatoau]];
     let elem_idx = vec![6usize, 6];
     let n_electrons = 10;
     let nat = coords.len();
 
-    let (density, qsh, emo) = rust_dftb::methods::xtb::scf::run_scf_gfn2(
-        &coords, &elem_idx, n_electrons, 100, 1e-6
-    );
+    let (density, qsh, emo) =
+        rust_dftb::methods::xtb::scf::run_scf_gfn2(&coords, &elem_idx, n_electrons, 100, 1e-6);
 
     let nshell_per_atom = vec![2, 2]; // GFN2: N has 2 shells
     let q_rust = rust_dftb::methods::xtb::mulliken::atomic_charges(&qsh, &nshell_per_atom);
@@ -824,10 +878,20 @@ fn test_n2_gfn2_scc_parity() {
     }
     let qsh_ref = nalgebra::DVector::from_vec(qsh.data.as_vec().clone());
     let gamma = rust_dftb::methods::xtb::coulomb::build_coulomb_matrix_gfn2(
-        &coords, &nshell_per_atom, &elem_idx, &ang_per_shell
+        &coords,
+        &nshell_per_atom,
+        &elem_idx,
+        &ang_per_shell,
     );
     let mut h_scc_rust = rust_dftb::methods::xtb::scf::build_scc_hamiltonian_with_thirdorder_gfn2(
-        &h0_rust, &s_rust, &gamma, &qsh, &nshell_per_atom, &elem_idx, &ang_per_shell, &ao2sh
+        &h0_rust,
+        &s_rust,
+        &gamma,
+        &qsh,
+        &nshell_per_atom,
+        &elem_idx,
+        &ang_per_shell,
+        &ao2sh,
     );
 
     // Add multipole terms using Rust converged density for fair comparison
@@ -843,38 +907,67 @@ fn test_n2_gfn2_scc_parity() {
             ish += 1;
         }
     }
-    let (dipole_ints, quadrupole_ints) = rust_dftb::methods::xtb::multipole_integrals::build_multipole_integrals_gfn2(&coords, &elem_idx);
+    let (dipole_ints, quadrupole_ints) =
+        rust_dftb::methods::xtb::multipole_integrals::build_multipole_integrals_gfn2(
+            &coords, &elem_idx,
+        );
     let cn = rust_dftb::methods::xtb::scf::compute_coordination_numbers(&coords, &elem_idx);
     let mrad = rust_dftb::methods::xtb::scf::compute_multipole_radii(&cn, &elem_idx);
-    let (amat_sd, amat_dd, amat_sq) = rust_dftb::methods::xtb::scf::build_multipole_interaction_matrices_0d(&coords, &mrad);
-    let dpat_mat = rust_dftb::methods::xtb::mulliken::atomic_multipoles(&density, &dipole_ints, &ao2at, 3);
-    let qpat_mat = rust_dftb::methods::xtb::mulliken::atomic_multipoles(&density, &quadrupole_ints, &ao2at, 6);
+    let (amat_sd, amat_dd, amat_sq) =
+        rust_dftb::methods::xtb::scf::build_multipole_interaction_matrices_0d(&coords, &mrad);
+    let dpat_mat =
+        rust_dftb::methods::xtb::mulliken::atomic_multipoles(&density, &dipole_ints, &ao2at, 3);
+    let qpat_mat =
+        rust_dftb::methods::xtb::mulliken::atomic_multipoles(&density, &quadrupole_ints, &ao2at, 6);
     let mut dpat = vec![0.0f64; 3 * nat];
     let mut qpat = vec![0.0f64; 6 * nat];
     for iat in 0..nat {
-        for cmp in 0..3 { dpat[cmp + 3 * iat] = dpat_mat[(cmp, iat)]; }
-        for cmp in 0..6 { qpat[cmp + 6 * iat] = qpat_mat[(cmp, iat)]; }
+        for cmp in 0..3 {
+            dpat[cmp + 3 * iat] = dpat_mat[(cmp, iat)];
+        }
+        for cmp in 0..6 {
+            qpat[cmp + 6 * iat] = qpat_mat[(cmp, iat)];
+        }
     }
     let qat_vec = rust_dftb::methods::xtb::mulliken::atomic_charges(&qsh_ref, &nshell_per_atom);
     let mut qat = vec![0.0f64; nat];
-    for iat in 0..nat { qat[iat] = qat_vec[iat]; }
+    for iat in 0..nat {
+        qat[iat] = qat_vec[iat];
+    }
     let (vat_computed, vdp, vqp) = rust_dftb::methods::xtb::scf::compute_multipole_potentials(
-        &qat, &dpat, &qpat, &amat_sd, &amat_dd, &amat_sq, &elem_idx
+        &qat, &dpat, &qpat, &amat_sd, &amat_dd, &amat_sq, &elem_idx,
     );
     // Use reference vat (includes D4 dispersion charge-dependent term missing from vat_computed)
     let vat_ref_raw = json_to_vec(&ref_data, "charge_potential");
     let vat: Vec<f64> = (0..nat).map(|i| vat_ref_raw[i]).collect();
-    println!("N2 D4 dispersion contribution to vat[0]: {:.9e}", vat[0] - vat_computed[0]);
-    rust_dftb::methods::xtb::scf::add_multipole_to_h1(&mut h_scc_rust, &s_rust, &dipole_ints, &quadrupole_ints, &vat, &vdp, &vqp, &ao2at);
+    println!(
+        "N2 D4 dispersion contribution to vat[0]: {:.9e}",
+        vat[0] - vat_computed[0]
+    );
+    rust_dftb::methods::xtb::scf::add_multipole_to_h1(
+        &mut h_scc_rust,
+        &s_rust,
+        &dipole_ints,
+        &quadrupole_ints,
+        &vat,
+        &vdp,
+        &vqp,
+        &ao2at,
+    );
 
     // Diagnostic: solve GEVP with reference H and S to check solver accuracy
     let (emo_from_ref, _) = rust_dftb::methods::xtb::scf::solve_gevp(&h_scc_ref, &s_ref);
     let mut max_err_solver = 0.0f64;
     for i in 0..emo_from_ref.len() {
         let err = (emo_from_ref[i] - emo_ref[i]).abs();
-        if err > max_err_solver { max_err_solver = err; }
+        if err > max_err_solver {
+            max_err_solver = err;
+        }
     }
-    println!("N2 GFN2 eigenvalue solver error from ref H: max_err = {:.6e}", max_err_solver);
+    println!(
+        "N2 GFN2 eigenvalue solver error from ref H: max_err = {:.6e}",
+        max_err_solver
+    );
 
     // Diagnostic: print shell charges
     println!("N2 GFN2 shell charges ref: {:?}", qsh_ref.data.as_vec());
@@ -882,13 +975,22 @@ fn test_n2_gfn2_scc_parity() {
 
     // Diagnostic: compare charge-only Hamiltonian with H0
     let h_charge_only = rust_dftb::methods::xtb::scf::build_scc_hamiltonian_with_thirdorder_gfn2(
-        &h0_rust, &s_rust, &gamma, &qsh_ref, &nshell_per_atom, &elem_idx, &ang_per_shell, &ao2sh
+        &h0_rust,
+        &s_rust,
+        &gamma,
+        &qsh_ref,
+        &nshell_per_atom,
+        &elem_idx,
+        &ang_per_shell,
+        &ao2sh,
     );
     let mut max_h0_diff = 0.0f64;
     for i in 0..h0_rust.nrows() {
         for j in 0..h0_rust.ncols() {
-            let diff = (h_charge_only[(i,j)] - h0_rust[(i,j)]).abs();
-            if diff > max_h0_diff { max_h0_diff = diff; }
+            let diff = (h_charge_only[(i, j)] - h0_rust[(i, j)]).abs();
+            if diff > max_h0_diff {
+                max_h0_diff = diff;
+            }
         }
     }
     println!("N2 GFN2 charge-only H - H0 max diff: {:.6e}", max_h0_diff);
@@ -902,52 +1004,119 @@ fn test_n2_gfn2_scc_parity() {
     println!("N2 GFN2 quadrupole potential ref: {:?}", vqp_ref);
 
     // Compute Rust potentials for comparison
-    let (dipole_ints, quadrupole_ints) = rust_dftb::methods::xtb::multipole_integrals::build_multipole_integrals_gfn2(&coords, &elem_idx);
-    let dpat_mat = rust_dftb::methods::xtb::mulliken::atomic_multipoles(&density, &dipole_ints, &ao2at, 3);
-    let qpat_mat = rust_dftb::methods::xtb::mulliken::atomic_multipoles(&density, &quadrupole_ints, &ao2at, 6);
+    let (dipole_ints, quadrupole_ints) =
+        rust_dftb::methods::xtb::multipole_integrals::build_multipole_integrals_gfn2(
+            &coords, &elem_idx,
+        );
+    let dpat_mat =
+        rust_dftb::methods::xtb::mulliken::atomic_multipoles(&density, &dipole_ints, &ao2at, 3);
+    let qpat_mat =
+        rust_dftb::methods::xtb::mulliken::atomic_multipoles(&density, &quadrupole_ints, &ao2at, 6);
     let mut dpat = vec![0.0f64; 3 * nat];
     let mut qpat = vec![0.0f64; 6 * nat];
     for iat in 0..nat {
-        for cmp in 0..3 { dpat[cmp + 3 * iat] = dpat_mat[(cmp, iat)]; }
-        for cmp in 0..6 { qpat[cmp + 6 * iat] = qpat_mat[(cmp, iat)]; }
+        for cmp in 0..3 {
+            dpat[cmp + 3 * iat] = dpat_mat[(cmp, iat)];
+        }
+        for cmp in 0..6 {
+            qpat[cmp + 6 * iat] = qpat_mat[(cmp, iat)];
+        }
     }
     let qat_vec = rust_dftb::methods::xtb::mulliken::atomic_charges(&qsh, &nshell_per_atom);
     let mut qat = vec![0.0f64; nat];
-    for iat in 0..nat { qat[iat] = qat_vec[iat]; }
+    for iat in 0..nat {
+        qat[iat] = qat_vec[iat];
+    }
     let cn = rust_dftb::methods::xtb::scf::compute_coordination_numbers(&coords, &elem_idx);
     let mrad = rust_dftb::methods::xtb::scf::compute_multipole_radii(&cn, &elem_idx);
     println!("N2 mrad: {:?}", mrad);
     println!("N2 cn:   {:?}", cn);
-    let (amat_sd, amat_dd, amat_sq) = rust_dftb::methods::xtb::scf::build_multipole_interaction_matrices_0d(&coords, &mrad);
+    let (amat_sd, amat_dd, amat_sq) =
+        rust_dftb::methods::xtb::scf::build_multipole_interaction_matrices_0d(&coords, &mrad);
     // Diagnostic: print specific amat_sq and amat_sd elements
-    println!("N2 amat_sd[z,0,0] = {:.9e}", amat_sd[2 + 3*0 + 3*nat*0]);
-    println!("N2 amat_sd[z,1,0] = {:.9e}", amat_sd[2 + 3*1 + 3*nat*0]);
-    println!("N2 amat_sd[z,0,1] = {:.9e}", amat_sd[2 + 3*0 + 3*nat*1]);
-    println!("N2 amat_sd[x,0,1] = {:.9e}", amat_sd[0 + 3*0 + 3*nat*1]);
-    println!("N2 amat_sd[y,0,1] = {:.9e}", amat_sd[1 + 3*0 + 3*nat*1]);
-    println!("N2 amat_sd[x,1,0] = {:.9e}", amat_sd[0 + 3*1 + 3*nat*0]);
-    println!("N2 amat_sd[y,1,0] = {:.9e}", amat_sd[1 + 3*1 + 3*nat*0]);
-    println!("N2 amat_sq[zz,0,0] = {:.9e}", amat_sq[5 + 6*0 + 6*nat*0]);
-    println!("N2 amat_sq[zz,1,0] = {:.9e}", amat_sq[5 + 6*1 + 6*nat*0]);
-    println!("N2 amat_sq[zz,0,1] = {:.9e}", amat_sq[5 + 6*0 + 6*nat*1]);
-    println!("N2 amat_sq[zz,1,1] = {:.9e}", amat_sq[5 + 6*1 + 6*nat*1]);
+    println!(
+        "N2 amat_sd[z,0,0] = {:.9e}",
+        amat_sd[2 + 3 * 0 + 3 * nat * 0]
+    );
+    println!(
+        "N2 amat_sd[z,1,0] = {:.9e}",
+        amat_sd[2 + 3 * 1 + 3 * nat * 0]
+    );
+    println!(
+        "N2 amat_sd[z,0,1] = {:.9e}",
+        amat_sd[2 + 3 * 0 + 3 * nat * 1]
+    );
+    println!(
+        "N2 amat_sd[x,0,1] = {:.9e}",
+        amat_sd[0 + 3 * 0 + 3 * nat * 1]
+    );
+    println!(
+        "N2 amat_sd[y,0,1] = {:.9e}",
+        amat_sd[1 + 3 * 0 + 3 * nat * 1]
+    );
+    println!(
+        "N2 amat_sd[x,1,0] = {:.9e}",
+        amat_sd[0 + 3 * 1 + 3 * nat * 0]
+    );
+    println!(
+        "N2 amat_sd[y,1,0] = {:.9e}",
+        amat_sd[1 + 3 * 1 + 3 * nat * 0]
+    );
+    println!(
+        "N2 amat_sq[zz,0,0] = {:.9e}",
+        amat_sq[5 + 6 * 0 + 6 * nat * 0]
+    );
+    println!(
+        "N2 amat_sq[zz,1,0] = {:.9e}",
+        amat_sq[5 + 6 * 1 + 6 * nat * 0]
+    );
+    println!(
+        "N2 amat_sq[zz,0,1] = {:.9e}",
+        amat_sq[5 + 6 * 0 + 6 * nat * 1]
+    );
+    println!(
+        "N2 amat_sq[zz,1,1] = {:.9e}",
+        amat_sq[5 + 6 * 1 + 6 * nat * 1]
+    );
     // Compute reference dpat/qpat from reference density
     let density_ref = json_to_dmatrix(&ref_data, "density", nao_ref);
-    let dpat_ref_mat = rust_dftb::methods::xtb::mulliken::atomic_multipoles(&density_ref, &dipole_ints, &ao2at, 3);
-    let qpat_ref_mat = rust_dftb::methods::xtb::mulliken::atomic_multipoles(&density_ref, &quadrupole_ints, &ao2at, 6);
+    let dpat_ref_mat =
+        rust_dftb::methods::xtb::mulliken::atomic_multipoles(&density_ref, &dipole_ints, &ao2at, 3);
+    let qpat_ref_mat = rust_dftb::methods::xtb::mulliken::atomic_multipoles(
+        &density_ref,
+        &quadrupole_ints,
+        &ao2at,
+        6,
+    );
     let mut dpat_ref = vec![0.0f64; 3 * nat];
     let mut qpat_ref = vec![0.0f64; 6 * nat];
     for iat in 0..nat {
-        for cmp in 0..3 { dpat_ref[cmp + 3 * iat] = dpat_ref_mat[(cmp, iat)]; }
-        for cmp in 0..6 { qpat_ref[cmp + 6 * iat] = qpat_ref_mat[(cmp, iat)]; }
+        for cmp in 0..3 {
+            dpat_ref[cmp + 3 * iat] = dpat_ref_mat[(cmp, iat)];
+        }
+        for cmp in 0..6 {
+            qpat_ref[cmp + 6 * iat] = qpat_ref_mat[(cmp, iat)];
+        }
     }
 
     // Compare dipole/quadrupole integrals directly
     let dint_ref = json_to_vec(&ref_data, "dipole_integrals");
     let qint_ref = json_to_vec(&ref_data, "quadrupole_integrals");
-    println!("N2 dipole int [z,0,4] rust={:.9e} ref={:.9e}", dipole_ints[2 + 3*0 + 3*8*4], dint_ref[2 + 3*0 + 3*8*4]);
-    println!("N2 dipole int [z,4,0] rust={:.9e} ref={:.9e}", dipole_ints[2 + 3*4 + 3*8*0], dint_ref[2 + 3*4 + 3*8*0]);
-    println!("N2 quadrupole int [zz,0,4] rust={:.9e} ref={:.9e}", quadrupole_ints[5 + 6*0 + 6*8*4], qint_ref[5 + 6*0 + 6*8*4]);
+    println!(
+        "N2 dipole int [z,0,4] rust={:.9e} ref={:.9e}",
+        dipole_ints[2 + 3 * 0 + 3 * 8 * 4],
+        dint_ref[2 + 3 * 0 + 3 * 8 * 4]
+    );
+    println!(
+        "N2 dipole int [z,4,0] rust={:.9e} ref={:.9e}",
+        dipole_ints[2 + 3 * 4 + 3 * 8 * 0],
+        dint_ref[2 + 3 * 4 + 3 * 8 * 0]
+    );
+    println!(
+        "N2 quadrupole int [zz,0,4] rust={:.9e} ref={:.9e}",
+        quadrupole_ints[5 + 6 * 0 + 6 * 8 * 4],
+        qint_ref[5 + 6 * 0 + 6 * 8 * 4]
+    );
 
     println!("N2 GFN2 dpat rust: {:?}", dpat);
     println!("N2 GFN2 dpat ref:  {:?}", dpat_ref);
@@ -977,29 +1146,52 @@ fn test_n2_gfn2_scc_parity() {
         }
     }
     println!("N2 manual vat_sq from ref qpat: {:?}", vat_sq_manual);
-    println!("N2 manual vat total (sd+sq): {:?}", vec![vat_sd_manual[0] + vat_sq_manual[0], vat_sd_manual[1] + vat_sq_manual[1]]);
+    println!(
+        "N2 manual vat total (sd+sq): {:?}",
+        vec![
+            vat_sd_manual[0] + vat_sq_manual[0],
+            vat_sd_manual[1] + vat_sq_manual[1]
+        ]
+    );
 
     // Compute Rust potentials using REFERENCE multipole moments for fair comparison
     let qat_ref_vec = json_to_vec(&ref_data, "charges");
     let mut qat_ref = vec![0.0f64; nat];
-    for iat in 0..nat { qat_ref[iat] = qat_ref_vec[iat]; }
-    let (vat_rust_ref_mom, vdp_rust_ref_mom, vqp_rust_ref_mom) = rust_dftb::methods::xtb::scf::compute_multipole_potentials(
-        &qat_ref, &dpat_ref, &qpat_ref, &amat_sd, &amat_dd, &amat_sq, &elem_idx
+    for iat in 0..nat {
+        qat_ref[iat] = qat_ref_vec[iat];
+    }
+    let (vat_rust_ref_mom, vdp_rust_ref_mom, vqp_rust_ref_mom) =
+        rust_dftb::methods::xtb::scf::compute_multipole_potentials(
+            &qat_ref, &dpat_ref, &qpat_ref, &amat_sd, &amat_dd, &amat_sq, &elem_idx,
+        );
+    println!(
+        "N2 GFN2 charge potential rust(ref_mom): {:?}",
+        vat_rust_ref_mom
     );
-    println!("N2 GFN2 charge potential rust(ref_mom): {:?}", vat_rust_ref_mom);
-    println!("N2 GFN2 dipole potential rust(ref_mom):  {:?}", vdp_rust_ref_mom);
-    println!("N2 GFN2 quadrupole potential rust(ref_mom):{:?}", vqp_rust_ref_mom);
+    println!(
+        "N2 GFN2 dipole potential rust(ref_mom):  {:?}",
+        vdp_rust_ref_mom
+    );
+    println!(
+        "N2 GFN2 quadrupole potential rust(ref_mom):{:?}",
+        vqp_rust_ref_mom
+    );
 
     // Also compute with Rust moments for comparison
     let (vat_rust, vdp_rust, vqp_rust) = rust_dftb::methods::xtb::scf::compute_multipole_potentials(
-        &qat, &dpat, &qpat, &amat_sd, &amat_dd, &amat_sq, &elem_idx
+        &qat, &dpat, &qpat, &amat_sd, &amat_dd, &amat_sq, &elem_idx,
     );
     println!("N2 GFN2 charge potential rust: {:?}", vat_rust);
     println!("N2 GFN2 dipole potential rust: {:?}", vdp_rust);
     println!("N2 GFN2 quadrupole potential rust: {:?}", vqp_rust);
 
     println!("N2 GFN2 effective Hamiltonian comparison:");
-    compare_matrices(&h_scc_rust, &h_scc_ref, "N2 GFN2 effective Hamiltonian", 1e-4);
+    compare_matrices(
+        &h_scc_rust,
+        &h_scc_ref,
+        "N2 GFN2 effective Hamiltonian",
+        1e-4,
+    );
 
     compare_vecs(q_rust.data.as_vec(), &q_ref, "N2 GFN2 charges", 1e-3);
     compare_vecs(emo.data.as_vec(), &emo_ref, "N2 GFN2 eigenvalues", 1e-3);
@@ -1011,14 +1203,8 @@ fn test_n_dipole_integrals_parity() {
     // Place two N atoms at 2.0 Bohr to get non-zero off-diagonal p-p integrals
     let bond_length_bohr = 2.0;
     let bond_length_ang = bond_length_bohr / 1.889726133;
-    let atoms_bohr = vec![
-        (7, [0.0, 0.0, 0.0]),
-        (7, [0.0, 0.0, bond_length_bohr]),
-    ];
-    let atoms_angstrom = vec![
-        (7, [0.0, 0.0, 0.0]),
-        (7, [0.0, 0.0, bond_length_ang]),
-    ];
+    let atoms_bohr = vec![(7, [0.0, 0.0, 0.0]), (7, [0.0, 0.0, bond_length_bohr])];
+    let atoms_angstrom = vec![(7, [0.0, 0.0, 0.0]), (7, [0.0, 0.0, bond_length_ang])];
 
     let ref_data = run_tblite(2, 0, 0, 2, &atoms_angstrom);
     if ref_data.is_none() {
@@ -1035,38 +1221,54 @@ fn test_n_dipole_integrals_parity() {
 
     println!("N2 dipole integrals ref (3 x 5 x 5):");
     for cmp in 0..3 {
-        println!("  Component {}: {:?}", cmp, &dint_ref[cmp*nao*nao..(cmp+1)*nao*nao]);
+        println!(
+            "  Component {}: {:?}",
+            cmp,
+            &dint_ref[cmp * nao * nao..(cmp + 1) * nao * nao]
+        );
     }
 
     println!("N2 quadrupole integrals ref (6 x 5 x 5):");
     for cmp in 0..6 {
-        println!("  Component {}: {:?}", cmp, &qint_ref[cmp*nao*nao..(cmp+1)*nao*nao]);
+        println!(
+            "  Component {}: {:?}",
+            cmp,
+            &qint_ref[cmp * nao * nao..(cmp + 1) * nao * nao]
+        );
     }
 
-    println!("N2 overlap ref (5 x 5): {:?}", &smat_ref[0..nao*nao]);
+    println!("N2 overlap ref (5 x 5): {:?}", &smat_ref[0..nao * nao]);
 
     // Compute Rust integrals
-    let coords: Vec<[f64; 3]> = atoms_bohr.iter().map(|(_, p)| {
-        [p[0], p[1], p[2]]
-    }).collect();
+    let coords: Vec<[f64; 3]> = atoms_bohr.iter().map(|(_, p)| [p[0], p[1], p[2]]).collect();
     let elem_idx = vec![6usize, 6]; // N
 
-    let (dipole_rust, quadrupole_rust) = rust_dftb::methods::xtb::multipole_integrals::build_multipole_integrals_gfn2(
-        &coords, &elem_idx
-    );
-    let overlap_rust = rust_dftb::methods::xtb::multipole_integrals::build_overlap_gfn2(&coords, &elem_idx);
+    let (dipole_rust, quadrupole_rust) =
+        rust_dftb::methods::xtb::multipole_integrals::build_multipole_integrals_gfn2(
+            &coords, &elem_idx,
+        );
+    let overlap_rust =
+        rust_dftb::methods::xtb::multipole_integrals::build_overlap_gfn2(&coords, &elem_idx);
 
     println!("N2 dipole integrals rust (3 x 5 x 5):");
     for cmp in 0..3 {
-        println!("  Component {}: {:?}", cmp, &dipole_rust[cmp*nao*nao..(cmp+1)*nao*nao]);
+        println!(
+            "  Component {}: {:?}",
+            cmp,
+            &dipole_rust[cmp * nao * nao..(cmp + 1) * nao * nao]
+        );
     }
 
     println!("N2 quadrupole integrals rust (6 x 5 x 5):");
     for cmp in 0..6 {
-        println!("  Component {}: {:?}", cmp, &quadrupole_rust[cmp*nao*nao..(cmp+1)*nao*nao]);
+        println!(
+            "  Component {}: {:?}",
+            cmp,
+            &quadrupole_rust[cmp * nao * nao..(cmp + 1) * nao * nao]
+        );
     }
 
-    println!("N2 overlap rust (5 x 5): {:?}", &overlap_rust[0..nao*nao]);
+    println!("N2 overlap rust (5 x 5): {:?}", &overlap_rust[0..nao * nao]);
 
     // Compare element-wise
     let mut max_dipole_error = 0.0;
@@ -1118,8 +1320,10 @@ fn test_n_dipole_integrals_parity() {
                 max_overlap_error = error;
             }
             if error > 1e-5 {
-                println!("  OVERLAP MISMATCH: overlap[{},{}] = ref: {:.10e}, rust: {:.10e}, err: {:.2e}",
-                         i, j, ref_val, rust_val, error);
+                println!(
+                    "  OVERLAP MISMATCH: overlap[{},{}] = ref: {:.10e}, rust: {:.10e}, err: {:.2e}",
+                    i, j, ref_val, rust_val, error
+                );
             }
         }
     }
@@ -1128,18 +1332,30 @@ fn test_n_dipole_integrals_parity() {
     println!("Max quadrupole integral error: {:.2e}", max_quad_error);
     println!("Max overlap error: {:.2e}", max_overlap_error);
 
-    assert!(max_dipole_error < 1e-5, "Dipole integral error too large: {:.2e}", max_dipole_error);
-    assert!(max_quad_error < 1e-5, "Quadrupole integral error too large: {:.2e}", max_quad_error);
-    assert!(max_overlap_error < 1e-5, "Overlap error too large: {:.2e}", max_overlap_error);
+    assert!(
+        max_dipole_error < 1e-5,
+        "Dipole integral error too large: {:.2e}",
+        max_dipole_error
+    );
+    assert!(
+        max_quad_error < 1e-5,
+        "Quadrupole integral error too large: {:.2e}",
+        max_quad_error
+    );
+    assert!(
+        max_overlap_error < 1e-5,
+        "Overlap error too large: {:.2e}",
+        max_overlap_error
+    );
 }
 
 #[test]
 fn test_hcooh_gfn2_scc_parity() {
     let atoms = vec![
-        (1, [-1.55,  1.10, 0.0]),
-        (8, [-0.66,  1.10, 0.0]),
-        (6, [ 0.00,  0.00, 0.0]),
-        (8, [ 1.20,  0.00, 0.0]),
+        (1, [-1.55, 1.10, 0.0]),
+        (8, [-0.66, 1.10, 0.0]),
+        (6, [0.00, 0.00, 0.0]),
+        (8, [1.20, 0.00, 0.0]),
         (1, [-0.36, -0.95, 0.0]),
     ];
     let ref_data = run_tblite(5, 0, 0, 2, &atoms);
@@ -1157,16 +1373,16 @@ fn test_hcooh_gfn2_scc_parity() {
     let qsh_ref_vec = json_to_vec(&ref_data, "shell_charges");
 
     let aatoau = 1.889726133;
-    let coords: Vec<[f64; 3]> = atoms.iter().map(|(_, p)| {
-        [p[0] * aatoau, p[1] * aatoau, p[2] * aatoau]
-    }).collect();
+    let coords: Vec<[f64; 3]> = atoms
+        .iter()
+        .map(|(_, p)| [p[0] * aatoau, p[1] * aatoau, p[2] * aatoau])
+        .collect();
     let elem_idx = vec![0usize, 7, 5, 7, 0];
     let n_electrons = 18;
     let nat = coords.len();
 
-    let (_density, qsh, emo) = rust_dftb::methods::xtb::scf::run_scf_gfn2(
-        &coords, &elem_idx, n_electrons, 100, 1e-6
-    );
+    let (_density, qsh, emo) =
+        rust_dftb::methods::xtb::scf::run_scf_gfn2(&coords, &elem_idx, n_electrons, 100, 1e-6);
 
     let nshell_per_atom = vec![1, 2, 2, 2, 1]; // GFN2: H=1, O=2, C=2, O=2, H=1
     let q_rust = rust_dftb::methods::xtb::mulliken::atomic_charges(&qsh, &nshell_per_atom);
@@ -1207,13 +1423,16 @@ fn test_hcooh_gfn2_scc_parity() {
     }
     let qsh_ref = nalgebra::DVector::from_vec(qsh_ref_vec.clone());
     let gamma = rust_dftb::methods::xtb::coulomb::build_coulomb_matrix_gfn2(
-        &coords, &nshell_per_atom, &elem_idx, &ang_per_shell
+        &coords,
+        &nshell_per_atom,
+        &elem_idx,
+        &ang_per_shell,
     );
 
     // Diagnostic: print specific gamma elements for comparison
-    println!("HCOOH gamma[0,0] = {:.9e}", gamma[(0,0)]);
-    println!("HCOOH gamma[0,1] = {:.9e}", gamma[(0,1)]);
-    println!("HCOOH gamma[1,0] = {:.9e}", gamma[(1,0)]);
+    println!("HCOOH gamma[0,0] = {:.9e}", gamma[(0, 0)]);
+    println!("HCOOH gamma[0,1] = {:.9e}", gamma[(0, 1)]);
+    println!("HCOOH gamma[1,0] = {:.9e}", gamma[(1, 0)]);
 
     // Diagnostic: compute shell-resolved potential vsh = gamma * qsh + third_order
     let nshell = qsh_ref.len();
@@ -1224,7 +1443,10 @@ fn test_hcooh_gfn2_scc_parity() {
         }
     }
     let v3 = rust_dftb::methods::xtb::coulomb::thirdorder_potential_gfn2(
-        &qsh_ref, &nshell_per_atom, &elem_idx, &ang_per_shell
+        &qsh_ref,
+        &nshell_per_atom,
+        &elem_idx,
+        &ang_per_shell,
     );
     for ish in 0..nshell {
         vsh_rust[ish] += v3[ish];
@@ -1233,21 +1455,38 @@ fn test_hcooh_gfn2_scc_parity() {
     // Compare with reference vsh if available
     if let Some(vsh_ref_val) = ref_data.get("vsh") {
         let vsh_ref_vec = vsh_ref_val.as_array().unwrap();
-        let vsh_ref = nalgebra::DVector::from_vec(vsh_ref_vec.iter().map(|x| x.as_f64().unwrap()).collect());
+        let vsh_ref =
+            nalgebra::DVector::from_vec(vsh_ref_vec.iter().map(|x| x.as_f64().unwrap()).collect());
         println!("HCOOH vsh comparison:");
-        compare_vecs(vsh_rust.data.as_vec(), vsh_ref.data.as_vec(), "HCOOH vsh", 1e-3);
+        compare_vecs(
+            vsh_rust.data.as_vec(),
+            vsh_ref.data.as_vec(),
+            "HCOOH vsh",
+            1e-3,
+        );
     }
 
     let h_charge_rust = rust_dftb::methods::xtb::scf::build_scc_hamiltonian_with_thirdorder_gfn2(
-        &h0_rust, &s_rust, &gamma, &qsh_ref, &nshell_per_atom, &elem_idx, &ang_per_shell, &ao2sh
+        &h0_rust,
+        &s_rust,
+        &gamma,
+        &qsh_ref,
+        &nshell_per_atom,
+        &elem_idx,
+        &ang_per_shell,
+        &ao2sh,
     );
 
     // Diagnostic: charge-only difference (reference effective - reference H0 vs rust charge - rust H0)
     let mut max_charge_diff = 0.0f64;
     for i in 0..h0_rust.nrows() {
         for j in 0..h0_rust.ncols() {
-            let diff = (h_charge_rust[(i,j)] - h0_rust[(i,j)] - (h_scc_ref[(i,j)] - h0_ref[(i,j)])).abs();
-            if diff > max_charge_diff { max_charge_diff = diff; }
+            let diff =
+                (h_charge_rust[(i, j)] - h0_rust[(i, j)] - (h_scc_ref[(i, j)] - h0_ref[(i, j)]))
+                    .abs();
+            if diff > max_charge_diff {
+                max_charge_diff = diff;
+            }
         }
     }
     println!("HCOOH charge-only term max diff: {:.6e}", max_charge_diff);
@@ -1267,36 +1506,73 @@ fn test_hcooh_gfn2_scc_parity() {
             ish += 1;
         }
     }
-    let (dipole_ints, quadrupole_ints) = rust_dftb::methods::xtb::multipole_integrals::build_multipole_integrals_gfn2(&coords, &elem_idx);
+    let (dipole_ints, quadrupole_ints) =
+        rust_dftb::methods::xtb::multipole_integrals::build_multipole_integrals_gfn2(
+            &coords, &elem_idx,
+        );
     let cn = rust_dftb::methods::xtb::scf::compute_coordination_numbers(&coords, &elem_idx);
     let mrad = rust_dftb::methods::xtb::scf::compute_multipole_radii(&cn, &elem_idx);
-    let (amat_sd, amat_dd, amat_sq) = rust_dftb::methods::xtb::scf::build_multipole_interaction_matrices_0d(&coords, &mrad);
+    let (amat_sd, amat_dd, amat_sq) =
+        rust_dftb::methods::xtb::scf::build_multipole_interaction_matrices_0d(&coords, &mrad);
     // Use reference density from tblite for multipole terms
     let density_ref = json_to_dmatrix(&ref_data, "density", nao_ref);
-    let dpat_mat = rust_dftb::methods::xtb::mulliken::atomic_multipoles(&density_ref, &dipole_ints, &ao2at, 3);
-    let qpat_mat = rust_dftb::methods::xtb::mulliken::atomic_multipoles(&density_ref, &quadrupole_ints, &ao2at, 6);
+    let dpat_mat =
+        rust_dftb::methods::xtb::mulliken::atomic_multipoles(&density_ref, &dipole_ints, &ao2at, 3);
+    let qpat_mat = rust_dftb::methods::xtb::mulliken::atomic_multipoles(
+        &density_ref,
+        &quadrupole_ints,
+        &ao2at,
+        6,
+    );
     let mut dpat = vec![0.0f64; 3 * nat];
     let mut qpat = vec![0.0f64; 6 * nat];
     for iat in 0..nat {
-        for cmp in 0..3 { dpat[cmp + 3 * iat] = dpat_mat[(cmp, iat)]; }
-        for cmp in 0..6 { qpat[cmp + 6 * iat] = qpat_mat[(cmp, iat)]; }
+        for cmp in 0..3 {
+            dpat[cmp + 3 * iat] = dpat_mat[(cmp, iat)];
+        }
+        for cmp in 0..6 {
+            qpat[cmp + 6 * iat] = qpat_mat[(cmp, iat)];
+        }
     }
     let qat_ref_vec = json_to_vec(&ref_data, "charges");
     let mut qat = vec![0.0f64; nat];
-    for iat in 0..nat { qat[iat] = qat_ref_vec[iat]; }
+    for iat in 0..nat {
+        qat[iat] = qat_ref_vec[iat];
+    }
     let (vat_computed, vdp, vqp) = rust_dftb::methods::xtb::scf::compute_multipole_potentials(
-        &qat, &dpat, &qpat, &amat_sd, &amat_dd, &amat_sq, &elem_idx
+        &qat, &dpat, &qpat, &amat_sd, &amat_dd, &amat_sq, &elem_idx,
     );
     // Use reference vat (includes D4 dispersion charge-dependent term)
     let vat_ref_raw = json_to_vec(&ref_data, "charge_potential");
     let vat: Vec<f64> = (0..nat).map(|i| vat_ref_raw[i]).collect();
-    println!("HCOOH D4 dispersion contribution to vat[0]: {:.9e}", vat[0] - vat_computed[0]);
-    rust_dftb::methods::xtb::scf::add_multipole_to_h1(&mut h_scc_rust, &s_rust, &dipole_ints, &quadrupole_ints, &vat, &vdp, &vqp, &ao2at);
+    println!(
+        "HCOOH D4 dispersion contribution to vat[0]: {:.9e}",
+        vat[0] - vat_computed[0]
+    );
+    rust_dftb::methods::xtb::scf::add_multipole_to_h1(
+        &mut h_scc_rust,
+        &s_rust,
+        &dipole_ints,
+        &quadrupole_ints,
+        &vat,
+        &vdp,
+        &vqp,
+        &ao2at,
+    );
 
     println!("HCOOH GFN2 effective Hamiltonian comparison (fixed charges+density):");
     // Print specific element (9, 12) before compare_matrices panics
-    println!("HCOOH H_scc ref[9,12] = {:.16e}, rust[9,12] = {:.16e}", h_scc_ref[(9, 12)], h_scc_rust[(9, 12)]);
-    compare_matrices(&h_scc_rust, &h_scc_ref, "HCOOH GFN2 effective Hamiltonian", 1e-4);
+    println!(
+        "HCOOH H_scc ref[9,12] = {:.16e}, rust[9,12] = {:.16e}",
+        h_scc_ref[(9, 12)],
+        h_scc_rust[(9, 12)]
+    );
+    compare_matrices(
+        &h_scc_rust,
+        &h_scc_ref,
+        "HCOOH GFN2 effective Hamiltonian",
+        1e-4,
+    );
 
     println!("HCOOH shell charges ref: {:?}", qsh_ref_vec);
     compare_vecs(q_rust.data.as_vec(), &q_ref, "HCOOH GFN2 charges", 1e-3);
@@ -1309,14 +1585,8 @@ fn test_single_dipole_integral_h2() {
     // H2 at 0.74 Å bond length (1.4 Bohr)
     let bond_length_bohr = 1.4; // Bohr
     let bond_length_ang = bond_length_bohr / 1.889726133; // Angstrom (C helper expects Angstrom)
-    let atoms_bohr = vec![
-        (1, [0.0, 0.0, 0.0]),
-        (1, [bond_length_bohr, 0.0, 0.0]),
-    ];
-    let atoms_angstrom = vec![
-        (1, [0.0, 0.0, 0.0]),
-        (1, [bond_length_ang, 0.0, 0.0]),
-    ];
+    let atoms_bohr = vec![(1, [0.0, 0.0, 0.0]), (1, [bond_length_bohr, 0.0, 0.0])];
+    let atoms_angstrom = vec![(1, [0.0, 0.0, 0.0]), (1, [bond_length_ang, 0.0, 0.0])];
 
     let ref_data = run_tblite(2, 0, 0, 2, &atoms_angstrom);
     if ref_data.is_none() {
@@ -1331,17 +1601,19 @@ fn test_single_dipole_integral_h2() {
 
     println!("Tblite dipole integrals (3 x 2 x 2):");
     for cmp in 0..3 {
-        println!("  Component {}: {:?}", cmp, &dint_ref[cmp*nao*nao..(cmp+1)*nao*nao]);
+        println!(
+            "  Component {}: {:?}",
+            cmp,
+            &dint_ref[cmp * nao * nao..(cmp + 1) * nao * nao]
+        );
     }
 
     // Also get overlap from tblite for comparison
     let smat_ref = ref_data["overlap"].as_array().unwrap();
-    println!("Tblite overlap (2 x 2): {:?}", &smat_ref[0..nao*nao]);
+    println!("Tblite overlap (2 x 2): {:?}", &smat_ref[0..nao * nao]);
 
     // Compute Rust dipole integrals (coords in Bohr)
-    let coords: Vec<[f64; 3]> = atoms_bohr.iter().map(|(_, p)| {
-        [p[0], p[1], p[2]]
-    }).collect();
+    let coords: Vec<[f64; 3]> = atoms_bohr.iter().map(|(_, p)| [p[0], p[1], p[2]]).collect();
     let elem_idx = vec![0usize, 0]; // Both H
 
     // Debug: print CGTO parameters
@@ -1350,21 +1622,30 @@ fn test_single_dipole_integral_h2() {
     for (i, cgto) in cgtos.iter().enumerate() {
         println!("  Shell {}: ang={}, nprim={}", i, cgto.ang, cgto.nprim);
         for j in 0..cgto.nprim {
-            println!("    Prim {}: alpha={:.10e}, coeff={:.10e}", j, cgto.alpha[j], cgto.coeff[j]);
+            println!(
+                "    Prim {}: alpha={:.10e}, coeff={:.10e}",
+                j, cgto.alpha[j], cgto.coeff[j]
+            );
         }
     }
 
-    let (dipole_rust, _quadrupole_rust) = rust_dftb::methods::xtb::multipole_integrals::build_multipole_integrals_gfn2(
-        &coords, &elem_idx
-    );
+    let (dipole_rust, _quadrupole_rust) =
+        rust_dftb::methods::xtb::multipole_integrals::build_multipole_integrals_gfn2(
+            &coords, &elem_idx,
+        );
 
     // Build overlap from Rust for comparison
-    let overlap_rust = rust_dftb::methods::xtb::multipole_integrals::build_overlap_gfn2(&coords, &elem_idx);
-    println!("Rust overlap (2 x 2): {:?}", &overlap_rust[0..nao*nao]);
+    let overlap_rust =
+        rust_dftb::methods::xtb::multipole_integrals::build_overlap_gfn2(&coords, &elem_idx);
+    println!("Rust overlap (2 x 2): {:?}", &overlap_rust[0..nao * nao]);
 
     println!("Rust dipole integrals (3 x 2 x 2):");
     for cmp in 0..3 {
-        println!("  Component {}: {:?}", cmp, &dipole_rust[cmp*nao*nao..(cmp+1)*nao*nao]);
+        println!(
+            "  Component {}: {:?}",
+            cmp,
+            &dipole_rust[cmp * nao * nao..(cmp + 1) * nao * nao]
+        );
     }
 
     // Compare element-wise
@@ -1379,12 +1660,18 @@ fn test_single_dipole_integral_h2() {
                 if error > max_error {
                     max_error = error;
                 }
-                println!("  dipole[{},{}][{}] = ref: {:.10e}, rust: {:.10e}, err: {:.2e}",
-                         i, j, cmp, ref_val, rust_val, error);
+                println!(
+                    "  dipole[{},{}][{}] = ref: {:.10e}, rust: {:.10e}, err: {:.2e}",
+                    i, j, cmp, ref_val, rust_val, error
+                );
             }
         }
     }
 
     println!("Max dipole integral error: {:.2e}", max_error);
-    assert!(max_error < 1e-6, "Dipole integral error too large: {:.2e}", max_error);
+    assert!(
+        max_error < 1e-6,
+        "Dipole integral error too large: {:.2e}",
+        max_error
+    );
 }

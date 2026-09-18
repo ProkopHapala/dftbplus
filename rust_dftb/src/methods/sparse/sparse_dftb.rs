@@ -47,21 +47,24 @@
 
 use crate::core::error::{DftbError, Result};
 use crate::methods::dftb::forces::{
-    build_pair_block, parse_all_repulsive, repulsive_energy_cached, Forces, RepulsiveSpline,
+    build_pair_block, pack_repulsive_gpu, parse_all_repulsive, repulsive_energy_cached, Forces,
+    RepulsiveSpline,
 };
 use crate::methods::dftb::gamma::GammaTable;
 use crate::methods::dftb::hamiltonian::{HamiltonianBuilder, SystemContext};
 use crate::methods::dftb::sk_data::SkData;
-use crate::methods::sparse::bsr4::{
-    build_full_mask, build_geometric_mask, Bsr4Matrix, BS, BS2,
+use crate::methods::sparse::bsr4::{build_full_mask, build_geometric_mask, Bsr4Matrix, BS, BS2};
+use crate::methods::sparse::gpu_sparse::{
+    tc2_trace_tol, PurifyStatus, SparseBsr4Config, SparseBsr4Gpu,
 };
-use crate::methods::sparse::gpu_sparse::{PurifyStatus, SparseBsr4Config, SparseBsr4Gpu, tc2_trace_tol};
 use crate::methods::sparse::scc::{SparseDftbEnergy, E_DUMMY};
 use crate::methods::sparse::sparse_forces::{
-    hs_pairs_from_mask, hs_taper, sparse_forces_bsr, HsPair, SparseDWWorkspace,
+    build_rep_pairs, hs_pairs_from_mask, hs_taper, pack_sk_gpu, sparse_forces_bsr, HsPair,
+    SparseDWWorkspace,
 };
 use crate::methods::sparse::sparse_system::SparseSystemWorkspace;
 use crate::qmqm::mixer::{DiisMixer, Mixer};
+use ocl::Buffer;
 
 const ANG2BOHR: f64 = 1.889_726_133;
 const SCC_MAX: usize = 100;
@@ -119,6 +122,24 @@ pub struct SparseElectronicState {
     /// seedless tier (VIB_SEED=0) needs no displaced K0/Gershgorin.
     pub emin: f32,
     pub emax: f32,
+}
+
+/// Device-resident mirror of `SparseElectronicState` (manifest §F
+/// residency contract): the same state that `central` keeps on host,
+/// held as device value buffers so `restore_central_state` is a
+/// device→device copy and `forces_frozen` contracts against the
+/// snapshot with ZERO PCIe traffic. Built once inside
+/// `snapshot_electronic_state` — `central` and `central_dev` are
+/// always Some/None together.
+pub struct GpuCentralState {
+    /// Converged K on M_K (what `s.k` holds on host).
+    pub k: Buffer<f32>,
+    /// Converged Z on M_Z.
+    pub z: Buffer<f32>,
+    /// K₀ = f(Z₀, H_scc₀) on M_K — frozen projector.
+    pub k0: Buffer<f32>,
+    /// W₀ = 2(Z₀H₀)K₀ on M_HS — frozen Lagrangian.
+    pub w0: Buffer<f32>,
 }
 
 /// Tunables. `new` uses `Default`. Changing n_atom or mask requires a new engine.
@@ -208,27 +229,45 @@ pub struct SparseDftbConfig {
     /// McWeeny polish (1–5 steps, residual-gated early exit). `None` →
     /// false; `RUST_DFTB_TC2_FF=1` still force-enables for studies.
     pub tc2_hiacc: Option<bool>,
+    /// R17: explicit CPU reference for the pair physics — H/S assembly,
+    /// force contraction, γ/γ′, repulsive. `None` → env
+    /// `RUST_DFTB_SPARSE_CPU` (default off = GPU `sparse_hs.cl` kernels).
+    /// This is a deliberate debug/reference mode, NOT a failure
+    /// fallback: GPU errors propagate, nothing silently downgrades.
+    pub cpu_pair: Option<bool>,
 }
 
 impl Default for SparseDftbConfig {
     fn default() -> Self {
         Self {
-            mix: 0.5, scc_tol: 1e-5, max_scc: 80,
+            mix: 0.5,
+            scc_tol: 1e-5,
+            max_scc: 80,
             // tc2_max=30: the production f32 budget (manifest §4.12.2
             // consolidated) — floor-stop/hiacc make more iters useless.
-            ns_max: 50, ns_tol: 1e-5, tc2_max: 30, tc2_tol: 1e-4,
-            full_mask: None, r_skin_ang: 1.0,
-            r_k_ang: None, r_z_ang: None, r_trunc_ang: None, taper_w_ang: 1.0,
+            ns_max: 50,
+            ns_tol: 1e-5,
+            tc2_max: 30,
+            tc2_tol: 1e-4,
+            full_mask: None,
+            r_skin_ang: 1.0,
+            r_k_ang: None,
+            r_z_ang: None,
+            r_trunc_ang: None,
+            taper_w_ang: 1.0,
             dense_diag: None,
             diis_hist: 8,
             accept_numerical_floor: None,
             purifier_p: None,
             purifier_trs: None,
             force_w_zk: None,
-            max_deg_hs: None, max_deg_k: None, max_deg_z: None,
+            max_deg_hs: None,
+            max_deg_k: None,
+            max_deg_z: None,
             r_zs_halo_ang: 0.0,
             mask_kz: None,
             tc2_hiacc: None,
+            cpu_pair: None,
         }
     }
 }
@@ -258,19 +297,24 @@ pub fn valence_q0(species: &[String]) -> Result<Vec<f64>> {
 pub struct SparseDftb {
     builder: HamiltonianBuilder,
     species: Vec<String>,
-    species_names: Vec<String>,    // unique species, ctx order (repulsive indexing)
+    species_names: Vec<String>, // unique species, ctx order (repulsive indexing)
     species_code: Vec<u8>,
     atom_n_orb: Vec<u8>,
-    onsite_orb: Vec<[f64; 4]>,     // onsite energies expanded to lanes (physical only)
+    onsite_orb: Vec<[f64; 4]>, // onsite energies expanded to lanes (physical only)
     q0: Vec<f64>,
     nocc: f32,
     n_atom: usize,
     n_orbs: usize,
     n_species: usize,
     gamma: GammaTable,
-    /// Dense f64 γ matrix [N×N] — rebuilt per geometry, O(N²) memory/work.
-    /// Transitional (R16): direct γ evaluation until a long-range accelerator.
-    gmat: Vec<f64>,
+    /// Packed (x,y,z Å, u Ha) per atom — uploaded once per geometry for the
+    /// tiled n-body γ/γ′ kernels (replaces the dense f64 gmat, R16 done).
+    xyzu_f32: Vec<f32>,
+    /// Δq scratch for the γ kernels (f32 upload).
+    dq_f32: Vec<f32>,
+    /// γ′ force readback [4·N] and converted scc_dc [N].
+    gf_f32: Vec<f32>,
+    scc_dc_host: Vec<[f64; 3]>,
     /// Pre-parsed repulsive splines (once at `new` — F6).
     repulsive: Vec<Option<RepulsiveSpline>>,
     cfg: SparseDftbConfig,
@@ -286,8 +330,14 @@ pub struct SparseDftb {
     /// Unique off-diagonal pairs of M_HS (i<j) with BSR block indices —
     /// built once, used by H/S assembly AND the force contraction.
     hs_pairs: Vec<HsPair>,
-    hs_diag: Vec<u32>,   // m_hs block index of (i,i)
-    k_diag: Vec<u32>,    // m_k block index of (i,i)
+    hs_diag: Vec<u32>, // m_hs block index of (i,i)
+    k_diag: Vec<u32>,  // m_k block index of (i,i)
+    /// R17: repulsive-range pair list for the GPU `rep_eval` kernel (and
+    /// the GPU-mode coincident-atom guard). Empty under `cpu_pair`.
+    rep_pairs: Vec<(u32, u32)>,
+    /// R17: pair physics on host (CPU reference) vs `sparse_hs.cl`
+    /// kernels. Resolved once at `new` from cfg/env — never a fallback.
+    cpu_pair: bool,
 
     ws: SparseSystemWorkspace,
     dw_ws: SparseDWWorkspace,
@@ -301,18 +351,18 @@ pub struct SparseDftb {
     /// Diagnostic dense pads — only filled when `dense_diag` (test-scale).
     k_pad: Vec<f32>,
     h_scc_pad: Vec<f32>,
-    q: Vec<f64>,       // state charges (consistent with `last` energy/forces)
-    v: Vec<f64>,       // atom potentials V(q_state)
-    v_f32: Vec<f32>,   // upload scratch
+    q: Vec<f64>,     // state charges (consistent with `last` energy/forces)
+    v: Vec<f64>,     // atom potentials V(q_state)
+    v_f32: Vec<f32>, // upload scratch
     /// DIIS charge mixer (None when cfg.diis_hist == 0 → pure linear `mix`).
     /// Linear mixing is unstable on real nanocrystals (Si10H16 oscillates at
     /// rms~1.4 under α=0.5 — charge sloshing); DIIS is the default for a
     /// reason. Preallocated at `new`; reset on set_coords/set_q (the
     /// fixed-point map changed → stale history extrapolates wrongly).
     mixer: Option<DiisMixer>,
-    q_res: Vec<f64>,   // mixer residual scratch q_out − q_in
-    q_snap: Vec<f64>,  // last accepted q_in — SCC rescue restore point
-    res_snap: Vec<f64>,// residual at q_snap — damped retry direction
+    q_res: Vec<f64>,    // mixer residual scratch q_out − q_in
+    q_snap: Vec<f64>,   // last accepted q_in — SCC rescue restore point
+    res_snap: Vec<f64>, // residual at q_snap — damped retry direction
     e_rep: f64,
     last: SparseDftbEnergy,
     /// Z is a converged inverse of the *current* S.
@@ -330,7 +380,14 @@ pub struct SparseDftb {
     /// `snapshot_electronic_state`, used by `restore_central_state` and
     /// the δK0 seed in `scc_fixedq`/`scc` (Phase G3).
     central: Option<SparseElectronicState>,
+    /// Device-resident copy of `central` (manifest §F residency
+    /// contract) — set/cleared together with `central`.
+    central_dev: Option<GpuCentralState>,
     dense_diag: bool,
+    /// GPU path: device h0/s are the source of truth; the host `h_bsr`/
+    /// `s_bsr` mirrors are refreshed lazily by `refresh_hs_mirrors`
+    /// instead of a ~25 MB readback inside every `set_coords`.
+    hs_mirror_stale: bool,
 
     fire_v: Vec<[f64; 3]>,
     fire_dt: f64,
@@ -340,36 +397,59 @@ pub struct SparseDftb {
 
 impl SparseDftb {
     /// Build the engine. Compiles OpenCL and allocates every BSR buffer once.
-    pub fn new(sk: SkData, sk_dir: &str, species: Vec<String>, coords: Vec<[f64; 3]>) -> Result<Self> {
+    pub fn new(
+        sk: SkData,
+        sk_dir: &str,
+        species: Vec<String>,
+        coords: Vec<[f64; 3]>,
+    ) -> Result<Self> {
         Self::with_config(sk, sk_dir, species, coords, SparseDftbConfig::default())
     }
 
-    pub fn with_config(sk: SkData, sk_dir: &str, species: Vec<String>, coords: Vec<[f64; 3]>, cfg: SparseDftbConfig) -> Result<Self> {
+    pub fn with_config(
+        sk: SkData,
+        sk_dir: &str,
+        species: Vec<String>,
+        coords: Vec<[f64; 3]>,
+        cfg: SparseDftbConfig,
+    ) -> Result<Self> {
         let n_atom = species.len();
-        if n_atom == 0 { return Err(DftbError::InvalidInput("SparseDftb: no atoms".into())); }
+        if n_atom == 0 {
+            return Err(DftbError::InvalidInput("SparseDftb: no atoms".into()));
+        }
         if coords.len() != n_atom {
             return Err(DftbError::InvalidInput(format!(
-                "SparseDftb::new: coords.len()={} != n_atom {n_atom}", coords.len()
+                "SparseDftb::new: coords.len()={} != n_atom {n_atom}",
+                coords.len()
             )));
         }
         for (i, c) in coords.iter().enumerate() {
             if !c[0].is_finite() || !c[1].is_finite() || !c[2].is_finite() {
-                return Err(DftbError::InvalidInput(format!("SparseDftb: non-finite coord atom {i} {c:?}")));
+                return Err(DftbError::InvalidInput(format!(
+                    "SparseDftb: non-finite coord atom {i} {c:?}"
+                )));
             }
         }
         let q0 = valence_q0(&species)?;
         let n_elec: f64 = q0.iter().sum();
         let nocc = (n_elec / 2.0).round() as f32;
         if nocc < 0.5 {
-            return Err(DftbError::InvalidInput(format!("SparseDftb: nocc={nocc} from q0={q0:?}")));
+            return Err(DftbError::InvalidInput(format!(
+                "SparseDftb: nocc={nocc} from q0={q0:?}"
+            )));
         }
         let builder = HamiltonianBuilder::new(sk);
         for sp in &species {
-            builder.sk.onsite(sp).map_err(|e| DftbError::InvalidInput(format!("SparseDftb: SK onsite '{sp}': {e}")))?;
+            builder.sk.onsite(sp).map_err(|e| {
+                DftbError::InvalidInput(format!("SparseDftb: SK onsite '{sp}': {e}"))
+            })?;
         }
         let ctx = SystemContext::from_sk_data(&builder.sk, &species)?;
         if ctx.n_atoms != n_atom {
-            return Err(DftbError::InvalidInput(format!("SparseDftb: ctx.n_atoms={} != {n_atom}", ctx.n_atoms)));
+            return Err(DftbError::InvalidInput(format!(
+                "SparseDftb: ctx.n_atoms={} != {n_atom}",
+                ctx.n_atoms
+            )));
         }
         for (i, &n) in ctx.atom_n_orb.iter().enumerate() {
             if n != 1 && n != 4 {
@@ -385,11 +465,14 @@ impl SparseDftb {
         // Unique species names in ctx index order (for repulsive tables).
         let mut species_names: Vec<String> = Vec::new();
         for sp in &species {
-            if !species_names.iter().any(|s| s == sp) { species_names.push(sp.clone()); }
+            if !species_names.iter().any(|s| s == sp) {
+                species_names.push(sp.clone());
+            }
         }
         if species_names.len() != n_species {
             return Err(DftbError::InvalidInput(format!(
-                "SparseDftb: unique species count {} != ctx.n_species {n_species}", species_names.len()
+                "SparseDftb: unique species count {} != ctx.n_species {n_species}",
+                species_names.len()
             )));
         }
         // Onsite energies expanded to padded lanes (physical lanes only).
@@ -399,8 +482,14 @@ impl SparseDftb {
             let p = ctx.species_onsite[si];
             let mut off = 0usize;
             for &l in ctx.species_ang[si] {
-                let e = match l { 0 => p.e_s, 1 => p.e_p, _ => 0.0 };
-                for k in 0..(2 * l + 1) as usize { onsite_orb[i][off + k] = e; }
+                let e = match l {
+                    0 => p.e_s,
+                    1 => p.e_p,
+                    _ => 0.0,
+                };
+                for k in 0..(2 * l + 1) as usize {
+                    onsite_orb[i][off + k] = e;
+                }
                 off += (2 * l + 1) as usize;
             }
         }
@@ -414,12 +503,19 @@ impl SparseDftb {
         // the whole directory, so an unrelated long table (e.g. pbc-0-3's
         // F-O at 620 pts = 6.6 Å) must not inflate M_K/M_Z for an Si+H system
         // (observed: deg_k=95 instead of the true ~56 at the Si/H 5.5 Å range).
-        let cut_bohr = builder.sk.pairs.iter()
-            .filter(|((a, b), _)| species_names.iter().any(|s| s == a) && species_names.iter().any(|s| s == b))
+        let cut_bohr = builder
+            .sk
+            .pairs
+            .iter()
+            .filter(|((a, b), _)| {
+                species_names.iter().any(|s| s == a) && species_names.iter().any(|s| s == b)
+            })
             .map(|(_, t)| t.cutoff())
             .fold(0.0_f64, f64::max);
         if !(cut_bohr > 0.0) {
-            return Err(DftbError::InvalidInput(format!("SparseDftb: SK cutoff {cut_bohr}")));
+            return Err(DftbError::InvalidInput(format!(
+                "SparseDftb: SK cutoff {cut_bohr}"
+            )));
         }
         // M_HS shrinks with r_trunc (H/S physics); M_K/M_Z default to the
         // FULL SK-table radius — K/Z decay is set by the gap, not by the
@@ -430,12 +526,19 @@ impl SparseDftb {
         let r_hs_ang = cfg.r_trunc_ang.unwrap_or(cut_bohr / ANG2BOHR) + cfg.r_skin_ang;
         if cfg.r_trunc_ang.is_some() && !(cfg.taper_w_ang > 0.0) {
             return Err(DftbError::InvalidInput(format!(
-                "SparseDftb: taper_w_ang must be > 0 when r_trunc_ang is set (got {})", cfg.taper_w_ang
+                "SparseDftb: taper_w_ang must be > 0 when r_trunc_ang is set (got {})",
+                cfg.taper_w_ang
             )));
         }
-        let hs_taper = cfg.r_trunc_ang.map(|rt| (rt - cfg.taper_w_ang, cfg.taper_w_ang));
+        let hs_taper = cfg
+            .r_trunc_ang
+            .map(|rt| (rt - cfg.taper_w_ang, cfg.taper_w_ang));
         let full_mask = cfg.full_mask.unwrap_or(n_atom <= FULL_MASK_ATOMS);
-        let m_hs = if full_mask { build_full_mask(n_atom) } else { build_geometric_mask(&coords, r_hs_ang) };
+        let m_hs = if full_mask {
+            build_full_mask(n_atom)
+        } else {
+            build_geometric_mask(&coords, r_hs_ang)
+        };
         let m_k = if let Some(m) = &cfg.mask_kz {
             m.clone()
         } else if full_mask {
@@ -455,53 +558,78 @@ impl SparseDftb {
         // bounded, still measured against a budget, never product support.
         // (Injected masks (L4) carry no halo — M_TZS = M_Z there.)
         let m_tzs = if cfg.mask_kz.is_none() && !full_mask && cfg.r_zs_halo_ang > 0.0 {
-            Some(build_geometric_mask(&coords, cfg.r_z_ang.unwrap_or(r_full_ang) + cfg.r_zs_halo_ang))
-        } else { None };
+            Some(build_geometric_mask(
+                &coords,
+                cfg.r_z_ang.unwrap_or(r_full_ang) + cfg.r_zs_halo_ang,
+            ))
+        } else {
+            None
+        };
         // Injected mask contract: CSR shape + symmetry (plans assume it).
         if let Some(m) = &cfg.mask_kz {
             if m.0.len() != n_atom + 1 || m.0[0] != 0 || m.0[n_atom] as usize != m.1.len() {
                 return Err(DftbError::InvalidInput(format!(
                     "SparseDftb: mask_kz malformed CSR (rows {} vs n_atom+1={}, nnz {})",
-                    m.0.len(), n_atom + 1, m.1.len()
+                    m.0.len(),
+                    n_atom + 1,
+                    m.1.len()
                 )));
             }
         }
         // SC5 (§15.9): a geometric run on ALL-default radii is the
         // permissive regime — say so loudly (it still runs; the degree
         // budgets below are the hard contract).
-        if !full_mask && (cfg.r_trunc_ang.is_none()
-            || (cfg.mask_kz.is_none() && (cfg.r_k_ang.is_none() || cfg.r_z_ang.is_none()))) {
+        if !full_mask
+            && (cfg.r_trunc_ang.is_none()
+                || (cfg.mask_kz.is_none() && (cfg.r_k_ang.is_none() || cfg.r_z_ang.is_none())))
+        {
             eprintln!("[SparseDftb] WARNING: all sparsity radii defaulted (r_trunc/r_k/r_z=None → full SK radius + skin). This is the permissive wide-mask regime — pass explicit radii for production runs (manifest §15.9 SC5).");
         }
-        for (name, m) in [("m_hs", &m_hs), ("m_k", &m_k), ("m_z", &m_z), ("m_tzs", m_tzs.as_ref().unwrap_or(&m_z))] {
+        for (name, m) in [
+            ("m_hs", &m_hs),
+            ("m_k", &m_k),
+            ("m_z", &m_z),
+            ("m_tzs", m_tzs.as_ref().unwrap_or(&m_z)),
+        ] {
             if m.1.is_empty() {
-                return Err(DftbError::InvalidInput(format!("SparseDftb: empty BSR mask {name}")));
+                return Err(DftbError::InvalidInput(format!(
+                    "SparseDftb: empty BSR mask {name}"
+                )));
             }
             for i in 0..n_atom {
                 let (a, b) = (m.0[i] as usize, m.0[i + 1] as usize);
                 if !(a..b).any(|blk| m.1[blk] as usize == i) {
-                    return Err(DftbError::InvalidInput(format!("SparseDftb: mask {name} missing diagonal block atom {i}")));
+                    return Err(DftbError::InvalidInput(format!(
+                        "SparseDftb: mask {name} missing diagonal block atom {i}"
+                    )));
                 }
             }
         }
         // Diagonal block indices + pair list (built once — frozen topology).
-        let hs_diag: Vec<u32> = (0..n_atom).map(|i| {
-            let (a, b) = (m_hs.0[i] as usize, m_hs.0[i + 1] as usize);
-            (a..b).find(|&blk| m_hs.1[blk] as usize == i)
-                .map(|b| b as u32)
-                .expect("checked above")
-        }).collect();
-        let k_diag: Vec<u32> = (0..n_atom).map(|i| {
-            let (a, b) = (m_k.0[i] as usize, m_k.0[i + 1] as usize);
-            (a..b).find(|&blk| m_k.1[blk] as usize == i)
-                .map(|b| b as u32)
-                .expect("checked above")
-        }).collect();
+        let hs_diag: Vec<u32> = (0..n_atom)
+            .map(|i| {
+                let (a, b) = (m_hs.0[i] as usize, m_hs.0[i + 1] as usize);
+                (a..b)
+                    .find(|&blk| m_hs.1[blk] as usize == i)
+                    .map(|b| b as u32)
+                    .expect("checked above")
+            })
+            .collect();
+        let k_diag: Vec<u32> = (0..n_atom)
+            .map(|i| {
+                let (a, b) = (m_k.0[i] as usize, m_k.0[i + 1] as usize);
+                (a..b)
+                    .find(|&blk| m_k.1[blk] as usize == i)
+                    .map(|b| b as u32)
+                    .expect("checked above")
+            })
+            .collect();
         let hs_pairs = hs_pairs_from_mask(&m_hs, &m_k, n_atom);
         for p in &hs_pairs {
             if p.b_ji < 0 {
                 return Err(DftbError::InvalidInput(format!(
-                    "SparseDftb: M_HS not symmetric — ({},{}) present, transpose missing", p.i, p.j
+                    "SparseDftb: M_HS not symmetric — ({},{}) present, transpose missing",
+                    p.i, p.j
                 )));
             }
         }
@@ -516,15 +644,31 @@ impl SparseDftb {
         let deg = |m: &(Vec<u32>, Vec<u32>)| -> u32 {
             (0..n_atom).map(|i| m.0[i + 1] - m.0[i]).max().unwrap_or(0)
         };
-        let deg_hs = deg(&m_hs); let deg_k = deg(&m_k); let deg_z = deg(&m_z);
+        let deg_hs = deg(&m_hs);
+        let deg_k = deg(&m_k);
+        let deg_z = deg(&m_z);
         let deg_tzs = m_tzs.as_ref().map(|m| deg(m)).unwrap_or(deg_z);
         let env_deg = |name: &str, dflt: u32| -> u32 {
-            std::env::var(name).ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(dflt)
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .unwrap_or(dflt)
         };
-        let bud_hs = cfg.max_deg_hs.unwrap_or_else(|| env_deg("RUST_DFTB_MAX_DEG_HS", 512));
-        let bud_k  = cfg.max_deg_k.unwrap_or_else(|| env_deg("RUST_DFTB_MAX_DEG_K", 128));
-        let bud_z  = cfg.max_deg_z.unwrap_or_else(|| env_deg("RUST_DFTB_MAX_DEG_Z", 256));
-        for (name, d, bud) in [("M_HS", deg_hs, bud_hs), ("M_K/M_P", deg_k, bud_k), ("M_Z", deg_z, bud_z), ("M_TZS(halo)", deg_tzs, bud_z)] {
+        let bud_hs = cfg
+            .max_deg_hs
+            .unwrap_or_else(|| env_deg("RUST_DFTB_MAX_DEG_HS", 512));
+        let bud_k = cfg
+            .max_deg_k
+            .unwrap_or_else(|| env_deg("RUST_DFTB_MAX_DEG_K", 128));
+        let bud_z = cfg
+            .max_deg_z
+            .unwrap_or_else(|| env_deg("RUST_DFTB_MAX_DEG_Z", 256));
+        for (name, d, bud) in [
+            ("M_HS", deg_hs, bud_hs),
+            ("M_K/M_P", deg_k, bud_k),
+            ("M_Z", deg_z, bud_z),
+            ("M_TZS(halo)", deg_tzs, bud_z),
+        ] {
             if d > bud {
                 return Err(DftbError::InvalidInput(format!(
                     "SparseDftb: {name} max row degree {d} > budget {bud} (manifest §15.9 SC1 — the sparse solver only wins if masks stay narrow). \
@@ -535,24 +679,54 @@ impl SparseDftb {
         let max_left = deg_hs.max(deg_k).max(deg_z).max(deg_tzs).max(16);
         let max_left_blocks = ((max_left + 15) / 16 * 16) as i32;
         let t_init0 = std::time::Instant::now();
-        let gpu = SparseBsr4Gpu::new(SparseBsr4Config { max_left_blocks, ..Default::default() })?;
+        let gpu = SparseBsr4Gpu::new(SparseBsr4Config {
+            max_left_blocks,
+            ..Default::default()
+        })?;
         let t_init1 = std::time::Instant::now();
         let h_bsr = Bsr4Matrix::from_structure(n_atom, m_hs.0.clone(), m_hs.1.clone())?;
         let s_bsr = Bsr4Matrix::from_structure(n_atom, m_hs.0.clone(), m_hs.1.clone())?;
-        let ws = SparseSystemWorkspace::new(gpu, &h_bsr, &s_bsr, &m_k, &m_z, m_tzs.as_ref(), &atom_n_orb, nocc)?;
-        let dw_ws = SparseDWWorkspace::new(ws.gpu(), ws.k_struct(), ws.hs_struct(), ws.t_zs_struct())?;
-        if std::env::var("RUST_DFTB_PROF").map(|v| !v.is_empty() && v != "0").unwrap_or(false) {
-            eprintln!("[init] gpu_new(program compile)={:.1} ms  ws_new(plans+alloc)={:.1} ms",
+        let ws = SparseSystemWorkspace::new(
+            gpu,
+            &h_bsr,
+            &s_bsr,
+            &m_k,
+            &m_z,
+            m_tzs.as_ref(),
+            &atom_n_orb,
+            nocc,
+        )?;
+        let dw_ws =
+            SparseDWWorkspace::new(ws.gpu(), ws.k_struct(), ws.hs_struct(), ws.t_zs_struct())?;
+        if std::env::var("RUST_DFTB_PROF")
+            .map(|v| !v.is_empty() && v != "0")
+            .unwrap_or(false)
+        {
+            eprintln!(
+                "[init] gpu_new(program compile)={:.1} ms  ws_new(plans+alloc)={:.1} ms",
                 t_init1.duration_since(t_init0).as_secs_f64() * 1e3,
-                t_init1.elapsed().as_secs_f64() * 1e3);
+                t_init1.elapsed().as_secs_f64() * 1e3
+            );
         }
 
         let n_pad = n_atom * BS;
         let n_scc = SparseDftbEnergy {
-            e_h0: 0.0, e_scc: 0.0, e_el: 0.0, e_rep: 0.0, e_tot: 0.0,
-            q: q0.clone(), tr_ks: 0.0, r_i: 0.0, n_scc: 0, tc2_iters: 0,
-            k_pad: vec![], h_scc_pad: vec![], v: vec![0.0; n_atom],
-            r_scc: 0.0, r_h: f32::NAN, purify_status: PurifyStatus::Failed,
+            e_h0: 0.0,
+            e_scc: 0.0,
+            e_el: 0.0,
+            e_rep: 0.0,
+            e_tot: 0.0,
+            q: q0.clone(),
+            tr_ks: 0.0,
+            r_i: 0.0,
+            n_scc: 0,
+            tc2_iters: 0,
+            k_pad: vec![],
+            h_scc_pad: vec![],
+            v: vec![0.0; n_atom],
+            r_scc: 0.0,
+            r_h: f32::NAN,
+            purify_status: PurifyStatus::Failed,
         };
         let dense_diag = cfg.dense_diag.unwrap_or(n_atom <= FULL_MASK_ATOMS);
         let diis_hist = cfg.diis_hist;
@@ -562,38 +736,145 @@ impl SparseDftb {
             m_hs.1.len(), m_k.1.len(), m_z.1.len(), hs_taper,
             max_left_blocks as f64 * 64.0 / 1024.0
         );
+        // R17: pair-physics backend — explicit selection, never a
+        // fallback. `cpu_pair` → the f64 host reference path
+        // (assemble_hs_bsr / sparse_forces_bsr / scc_double_counting_force
+        // / repulsive_*_cached); otherwise the sparse_hs.cl GPU kernels
+        // and any device error propagates.
+        let cpu_pair = cfg.cpu_pair.unwrap_or_else(|| {
+            std::env::var("RUST_DFTB_SPARSE_CPU")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false)
+        });
+        let (pair_pack, rep_pairs) = if cpu_pair {
+            (None, Vec::new())
+        } else {
+            let mut needed = Vec::new();
+            for p in &hs_pairs {
+                let (si, sj) = (species_code[p.i as usize], species_code[p.j as usize]);
+                needed.push((si, sj));
+                needed.push((sj, si));
+            }
+            needed.sort_unstable();
+            needed.dedup();
+            let sk_pack = pack_sk_gpu(&ctx, &needed)?;
+            let rep_pack = pack_repulsive_gpu(&repulsive, n_species, &species_names)?;
+            let rp = build_rep_pairs(
+                &coords,
+                &species_code,
+                &repulsive,
+                n_species,
+                cfg.r_skin_ang,
+            );
+            (Some((sk_pack, rep_pack)), rp)
+        };
         let mut eng = Self {
-            builder, species, species_names, species_code,
-            atom_n_orb, onsite_orb, q0: q0.clone(), nocc, n_atom, n_orbs, n_species,
-            gamma, gmat: vec![0.0; n_atom * n_atom], repulsive, cfg,
-            m_hs, full_mask, hs_taper, coords_build: coords.clone(),
-            hs_pairs, hs_diag, k_diag,
-            ws, dw_ws, h_bsr, s_bsr,
+            builder,
+            species,
+            species_names,
+            species_code,
+            atom_n_orb,
+            onsite_orb,
+            q0: q0.clone(),
+            nocc,
+            n_atom,
+            n_orbs,
+            n_species,
+            gamma,
+            xyzu_f32: vec![0.0; 4 * n_atom],
+            dq_f32: vec![0.0; n_atom],
+            gf_f32: vec![0.0; 4 * n_atom],
+            scc_dc_host: vec![[0.0; 3]; n_atom],
+            repulsive,
+            cfg,
+            m_hs,
+            full_mask,
+            hs_taper,
+            coords_build: coords.clone(),
+            hs_pairs,
+            hs_diag,
+            k_diag,
+            rep_pairs,
+            cpu_pair,
+            ws,
+            dw_ws,
+            h_bsr,
+            s_bsr,
             coords: coords.clone(),
-            k_vals: vec![0.0; 0], w_vals: vec![0.0; 0],
-            k_pad: if dense_diag { vec![0.0; n_pad * n_pad] } else { Vec::new() },
-            h_scc_pad: if dense_diag { vec![0.0; n_pad * n_pad] } else { Vec::new() },
-            q: q0, v: vec![0.0; n_atom], v_f32: vec![0.0; n_atom],
+            k_vals: vec![0.0; 0],
+            w_vals: vec![0.0; 0],
+            k_pad: if dense_diag {
+                vec![0.0; n_pad * n_pad]
+            } else {
+                Vec::new()
+            },
+            h_scc_pad: if dense_diag {
+                vec![0.0; n_pad * n_pad]
+            } else {
+                Vec::new()
+            },
+            q: q0,
+            v: vec![0.0; n_atom],
+            v_f32: vec![0.0; n_atom],
             mixer: if diis_hist > 0 {
                 let mut m = DiisMixer::new(diis_hist, n_atom);
-                m.alpha = mix_alpha;   // linear fallback α = cfg.mix
+                m.alpha = mix_alpha; // linear fallback α = cfg.mix
                 Some(m)
-            } else { None },
+            } else {
+                None
+            },
             q_res: vec![0.0; n_atom],
-            q_snap: vec![0.0; n_atom], res_snap: vec![0.0; n_atom],
-            e_rep: 0.0, last: n_scc, z_valid: false, z_warm: false, k_warm: false, central: None, dense_diag,
-            fire_v: vec![[0.0; 3]; n_atom], fire_dt: 0.1, fire_alpha: 0.1, fire_n_pos: 0,
+            q_snap: vec![0.0; n_atom],
+            res_snap: vec![0.0; n_atom],
+            e_rep: 0.0,
+            last: n_scc,
+            z_valid: false,
+            z_warm: false,
+            k_warm: false,
+            central: None,
+            central_dev: None,
+            dense_diag,
+            hs_mirror_stale: false,
+            fire_v: vec![[0.0; 3]; n_atom],
+            fire_dt: 0.1,
+            fire_alpha: 0.1,
+            fire_n_pos: 0,
         };
         eng.k_vals = vec![0.0; eng.ws.k_struct().nblock * BS2];
         eng.w_vals = vec![0.0; eng.ws.hs_struct().nblock * BS2];
+        if let Some((sk_pack, rep_pack)) = pair_pack {
+            eng.ws.init_pair_data(
+                &eng.hs_pairs,
+                &eng.rep_pairs,
+                &eng.onsite_orb,
+                &eng.species_code,
+                &sk_pack,
+                &rep_pack,
+                eng.hs_taper,
+            )?;
+        }
+        eprintln!(
+            "[SparseDftb] pair physics: {}",
+            if cpu_pair {
+                "CPU reference (explicit)"
+            } else {
+                "GPU sparse_hs.cl"
+            }
+        );
         eng.set_coords(&coords)?;
         Ok(eng)
     }
 
-    pub fn n_atom(&self) -> usize { self.n_atom }
-    pub fn n_orbs(&self) -> usize { self.n_orbs }
+    pub fn n_atom(&self) -> usize {
+        self.n_atom
+    }
+    pub fn n_orbs(&self) -> usize {
+        self.n_orbs
+    }
     /// Physical orbitals per atom (before BSR4 4-lane padding).
-    pub fn atom_n_orb(&self) -> &[u8] { &self.atom_n_orb }
+    pub fn atom_n_orb(&self) -> &[u8] {
+        &self.atom_n_orb
+    }
     /// Relative TC2 tolerance ‖KSK−K‖/‖K‖. The achieved r_I sets the Mulliken
     /// charge noise floor — SCC rms cannot converge below ~r_I (Si10H16:
     /// tc2_tol=1e-4 gives r_I~2e-5 → SCC floor ~3e-6; a 1e-6 SCC target needs
@@ -601,12 +882,16 @@ impl SparseDftb {
     /// Set the Newton–Schulz Z residual tolerance at runtime (f32 floor /
     /// mask-truncation plateau ~1e-5..1e-4 on truncated M_Z).
     pub fn set_ns_tol(&mut self, tol: f32) {
-        if !(tol > 0.0) || !tol.is_finite() { panic!("set_ns_tol: tol={tol}"); }
+        if !(tol > 0.0) || !tol.is_finite() {
+            panic!("set_ns_tol: tol={tol}");
+        }
         self.cfg.ns_tol = tol;
     }
 
     pub fn set_tc2_tol(&mut self, tol: f32) {
-        if !(tol > 0.0) || !tol.is_finite() { panic!("set_tc2_tol: tol={tol}"); }
+        if !(tol > 0.0) || !tol.is_finite() {
+            panic!("set_tc2_tol: tol={tol}");
+        }
         self.cfg.tc2_tol = tol;
     }
 
@@ -614,37 +899,95 @@ impl SparseDftb {
     /// K-TC2, "p" = P=KS purifier, "trs" = TRS4 on P. Explicit cfg beats env.
     pub fn set_purifier(&mut self, mode: &str) {
         match mode {
-            "k"   => { self.cfg.purifier_trs = Some(false); self.cfg.purifier_p = Some(false); }
-            "p"   => { self.cfg.purifier_trs = Some(false); self.cfg.purifier_p = Some(true); }
-            "trs" => { self.cfg.purifier_trs = Some(true);  self.cfg.purifier_p = Some(true); }
+            "k" => {
+                self.cfg.purifier_trs = Some(false);
+                self.cfg.purifier_p = Some(false);
+            }
+            "p" => {
+                self.cfg.purifier_trs = Some(false);
+                self.cfg.purifier_p = Some(true);
+            }
+            "trs" => {
+                self.cfg.purifier_trs = Some(true);
+                self.cfg.purifier_p = Some(true);
+            }
             _ => panic!("set_purifier: mode '{mode}' — expected \"k\"|\"p\"|\"trs\""),
         }
     }
 
     /// L3 (manifest §15.10): `2·Tr(P·Z·H_scc)` — band energy from P
     /// directly, no K=PZ recovery. Err if the last purifier wasn't P-based.
-    pub fn band_energy_p(&mut self) -> Result<f64> { self.ws.band_energy_from_p() }
+    pub fn band_energy_p(&mut self) -> Result<f64> {
+        self.ws.band_energy_from_p()
+    }
     /// Diagnostic dense padded K (only when `dense_diag`; else empty).
-    pub fn k_pad(&self) -> &[f32] { &self.k_pad }
+    pub fn k_pad(&self) -> &[f32] {
+        &self.k_pad
+    }
     /// Diagnostic dense padded H_scc (only when `dense_diag`; else empty).
-    pub fn h_scc_pad(&self) -> &[f32] { &self.h_scc_pad }
-    pub fn coords(&self) -> &[[f64; 3]] { &self.coords }
-    pub fn last_energy(&self) -> &SparseDftbEnergy { &self.last }
-    pub fn q0(&self) -> &[f64] { &self.q0 }
-    pub fn gpu(&self) -> &SparseBsr4Gpu { self.ws.gpu() }
-    /// Host H0 on M_HS (diagnostic/parity — the same values uploaded to the GPU).
-    pub fn h_bsr(&self) -> &Bsr4Matrix { &self.h_bsr }
+    pub fn h_scc_pad(&self) -> &[f32] {
+        &self.h_scc_pad
+    }
+    pub fn coords(&self) -> &[[f64; 3]] {
+        &self.coords
+    }
+    pub fn last_energy(&self) -> &SparseDftbEnergy {
+        &self.last
+    }
+    pub fn q0(&self) -> &[f64] {
+        &self.q0
+    }
+    pub fn gpu(&self) -> &SparseBsr4Gpu {
+        self.ws.gpu()
+    }
+    /// Refresh the host H0/S mirrors from the device (manifest §F:
+    /// mirrors are LAZY — the GPU hot path never pays the ~25 MB
+    /// readback per geometry). No-op when the mirrors are current
+    /// (cpu_pair assembles them on host; GPU `set_coords` marks stale).
+    pub fn refresh_hs_mirrors(&mut self) -> Result<()> {
+        if !self.hs_mirror_stale {
+            return Ok(());
+        }
+        self.ws
+            .gpu()
+            .read_f32(&self.ws.h0().values, &mut self.h_bsr.values)?;
+        self.ws
+            .gpu()
+            .read_f32(&self.ws.s().values, &mut self.s_bsr.values)?;
+        self.hs_mirror_stale = false;
+        Ok(())
+    }
+
+    /// Host H0 on M_HS (diagnostic/parity — the same values as the
+    /// device copy; lazily refreshed from device on the GPU path).
+    pub fn h_bsr(&mut self) -> Result<&Bsr4Matrix> {
+        self.refresh_hs_mirrors()?;
+        Ok(&self.h_bsr)
+    }
+    /// Host S on M_HS — same lazy-mirror contract as `h_bsr`.
+    pub fn s_bsr(&mut self) -> Result<&Bsr4Matrix> {
+        self.refresh_hs_mirrors()?;
+        Ok(&self.s_bsr)
+    }
     /// Host copy of the device K on its BSR structure (diagnostics /
     /// mask screening — not a hot path).
-    pub fn k_bsr(&self) -> Result<Bsr4Matrix> { self.ws.k().to_host(self.ws.gpu()) }
+    pub fn k_bsr(&self) -> Result<Bsr4Matrix> {
+        self.ws.k().to_host(self.ws.gpu())
+    }
     /// Host Z ≈ S⁻¹ (diagnostics).
-    pub fn z_bsr(&self) -> Result<Bsr4Matrix> { self.ws.z().to_host(self.ws.gpu()) }
+    pub fn z_bsr(&self) -> Result<Bsr4Matrix> {
+        self.ws.z().to_host(self.ws.gpu())
+    }
     /// Stage-profiler report (`RUST_DFTB_PROF` gated — no-op when unset).
     pub fn prof_report(&self, ctx: &str) {
-        self.ws.gpu().prof_report(&format!("SparseDftb {ctx} n={}", self.n_atom));
+        self.ws
+            .gpu()
+            .prof_report(&format!("SparseDftb {ctx} n={}", self.n_atom));
     }
     /// Restart the stage clock (e.g. before a measured region).
-    pub fn prof_reset(&self) { self.ws.gpu().prof_reset(); }
+    pub fn prof_reset(&self) {
+        self.ws.gpu().prof_reset();
+    }
 
     /// DIAGNOSTIC: inject host K values (structure must be exactly M_K) —
     /// for frozen-input experiments (§15.12 A3). Mutating K invalidates the
@@ -677,12 +1020,26 @@ impl SparseDftb {
     /// "k"|"p"|"trs" — defaults to "k"). Used to A/B purifier variants
     /// (ACC4/8/16/Kahan, McWeeny endgame, stopping rules) on exactly the
     /// same input.
-    pub fn purify_cold(&mut self, max_iter: usize, tol: f32) -> Result<(PurifyStatus, f32, f64, usize)> {
+    pub fn purify_cold(
+        &mut self,
+        max_iter: usize,
+        tol: f32,
+    ) -> Result<(PurifyStatus, f32, f64, usize)> {
         self.last.n_scc = 0;
         self.last.purify_status = PurifyStatus::Failed;
-        let env_flag = |name: &str| std::env::var(name).map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false);
-        let use_trs = self.cfg.purifier_trs.unwrap_or_else(|| env_flag("RUST_DFTB_TRS"));
-        let use_p = self.cfg.purifier_p.unwrap_or_else(|| env_flag("RUST_DFTB_P_TC2"));
+        let env_flag = |name: &str| {
+            std::env::var(name)
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false)
+        };
+        let use_trs = self
+            .cfg
+            .purifier_trs
+            .unwrap_or_else(|| env_flag("RUST_DFTB_TRS"));
+        let use_p = self
+            .cfg
+            .purifier_p
+            .unwrap_or_else(|| env_flag("RUST_DFTB_P_TC2"));
         self.ws.set_tc2_hiacc(self.cfg.tc2_hiacc.unwrap_or(false));
         if use_trs {
             self.ws.purify_hscc_trs(max_iter, tol)
@@ -702,12 +1059,17 @@ impl SparseDftb {
     /// One-shot diagnostic only — O(n³) host f64, never in a hot path.
     pub fn ri_f64_diag(&mut self) -> Result<(f64, f64, f64, f64)> {
         use nalgebra::DMatrix;
+        self.refresh_hs_mirrors()?;
         let n4 = self.n_atom * 4;
         let mut kd = vec![0.0f32; n4 * n4];
         self.ws.k_to_dense_into(&mut kd)?;
         let mut sd = vec![0.0f32; n4 * n4];
         crate::methods::sparse::bsr4::bsr_values_to_dense(
-            self.n_atom, &self.s_bsr.row_ptr, &self.s_bsr.col_idx, &self.s_bsr.values, &mut sd,
+            self.n_atom,
+            &self.s_bsr.row_ptr,
+            &self.s_bsr.col_idx,
+            &self.s_bsr.values,
+            &mut sd,
         );
         let k = DMatrix::<f64>::from_fn(n4, n4, |i, j| kd[i * n4 + j] as f64);
         let s = DMatrix::<f64>::from_fn(n4, n4, |i, j| sd[i * n4 + j] as f64);
@@ -715,8 +1077,8 @@ impl SparseDftb {
         let ksk = &ks * &k;
         let r = &ksk - &k;
         let mut num = 0.0f64;
-        let mut num_pp = 0.0f64;   // physical×physical block
-        let mut num_dx = 0.0f64;   // any dummy lane involved
+        let mut num_pp = 0.0f64; // physical×physical block
+        let mut num_dx = 0.0f64; // any dummy lane involved
         let mut den = 0.0f64;
         for a in 0..n4 {
             let pa = (a % 4) < self.atom_n_orb[a / 4] as usize;
@@ -724,7 +1086,11 @@ impl SparseDftb {
                 let pb = (b % 4) < self.atom_n_orb[b / 4] as usize;
                 let v = r[(a, b)];
                 num += v * v;
-                if pa && pb { num_pp += v * v; } else { num_dx += v * v; }
+                if pa && pb {
+                    num_pp += v * v;
+                } else {
+                    num_dx += v * v;
+                }
                 den += k[(a, b)] * k[(a, b)];
             }
         }
@@ -736,7 +1102,9 @@ impl SparseDftb {
     /// on the CURRENT device K — all-f32 FMA, ~46-bit intermediates.
     /// Expect ~1e-5 → ~1e-8 per step on a trace-locked state.
     pub fn mcw_ff(&mut self, n: usize) -> Result<()> {
-        for _ in 0..n { self.ws.mcweeny_ff_step()?; }
+        for _ in 0..n {
+            self.ws.mcweeny_ff_step()?;
+        }
         // Debug probe (verbose only — it costs a host round-trip): are
         // the float-float LO parts live? ‖lo‖ ~ eps·‖hi‖ (~1e-7 rel);
         // all-zero means the compensation was optimized away.
@@ -748,7 +1116,9 @@ impl SparseDftb {
     }
     /// FF32 unit check: ff K·S and ff×f32 (KS)·K products vs host-f64
     /// dense references. Returns (e1_hi, e1_ff, e2_hi, e2_ff).
-    pub fn ws_ff_test_ks(&mut self) -> Result<(f64, f64, f64, f64)> { self.ws.ff_test_ks() }
+    pub fn ws_ff_test_ks(&mut self) -> Result<(f64, f64, f64, f64)> {
+        self.ws.ff_test_ks()
+    }
     /// F64-MCW decisive test + A/B storage split (manifest §4.12.2 round
     /// 2, GPT-5.6): downloads the stored device K once, then runs
     /// `n_steps` McWeeny iterations ENTIRELY in host f64:
@@ -766,35 +1136,62 @@ impl SparseDftb {
     /// Rows are appended to RUST_DFTB_MCW_F64_HIST (csv) when set.
     /// Diagnostic only: O(n³) host f64, never in a hot path.
     pub fn mcw_f64_diag(&mut self, n_steps: usize, store_f32: bool) -> Result<()> {
+        self.refresh_hs_mirrors()?;
         let n4 = self.n_atom * 4;
         let mut kd = vec![0.0f32; n4 * n4];
         self.ws.k_to_dense_into(&mut kd)?;
         let mut sd = vec![0.0f32; n4 * n4];
         crate::methods::sparse::bsr4::bsr_values_to_dense(
-            self.n_atom, &self.s_bsr.row_ptr, &self.s_bsr.col_idx, &self.s_bsr.values, &mut sd,
+            self.n_atom,
+            &self.s_bsr.row_ptr,
+            &self.s_bsr.col_idx,
+            &self.s_bsr.values,
+            &mut sd,
         );
         let h_bsr = self.ws.h_scc().to_host(self.ws.gpu())?;
         let mut hd = vec![0.0f32; n4 * n4];
         crate::methods::sparse::bsr4::bsr_values_to_dense(
-            self.n_atom, &h_bsr.row_ptr, &h_bsr.col_idx, &h_bsr.values, &mut hd,
+            self.n_atom,
+            &h_bsr.row_ptr,
+            &h_bsr.col_idx,
+            &h_bsr.values,
+            &mut hd,
         );
         let k: Vec<f64> = kd.iter().map(|&x| x as f64).collect();
         let s: Vec<f64> = sd.iter().map(|&x| x as f64).collect();
         let h: Vec<f64> = hd.iter().map(|&x| x as f64).collect();
         let nocc64 = self.nocc as f64;
 
-        let hist_path = std::env::var("RUST_DFTB_MCW_F64_HIST").ok().filter(|p| !p.is_empty());
+        let hist_path = std::env::var("RUST_DFTB_MCW_F64_HIST")
+            .ok()
+            .filter(|p| !p.is_empty());
         if let Some(p) = &hist_path {
             use std::io::Write;
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
-                let _ = writeln!(f, "# call variant={} n_steps={n_steps} nocc={nocc64}", if store_f32 { "A_f32store" } else { "B_allf64" });
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(p)
+            {
+                let _ = writeln!(
+                    f,
+                    "# call variant={} n_steps={n_steps} nocc={nocc64}",
+                    if store_f32 { "A_f32store" } else { "B_allf64" }
+                );
             }
         }
         let hist_rec = |step: isize, r_i: f64, r_h: f64, tr: f64| {
             if let Some(p) = &hist_path {
                 use std::io::Write;
-                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
-                    let _ = writeln!(f, "{step},{r_i:.6e},{r_h:.6e},{:.6e}", (tr - nocc64).abs() / nocc64);
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(p)
+                {
+                    let _ = writeln!(
+                        f,
+                        "{step},{r_i:.6e},{r_h:.6e},{:.6e}",
+                        (tr - nocc64).abs() / nocc64
+                    );
                 }
             }
         };
@@ -807,30 +1204,48 @@ impl SparseDftb {
             let q = crate::methods::sparse::bsr4::matmul_f64_mt(n4, &t, k);
             let ht = crate::methods::sparse::bsr4::matmul_f64_mt(n4, &h, &t);
             let th = crate::methods::sparse::bsr4::matmul_f64_mt(n4, &t, &h);
-            let mut num = 0.0f64; let mut den = 0.0f64;
-            let mut num_h = 0.0f64; let mut den_h = 0.0f64;
+            let mut num = 0.0f64;
+            let mut den = 0.0f64;
+            let mut num_h = 0.0f64;
+            let mut den_h = 0.0f64;
             for i in 0..n4 * n4 {
                 let r = q[i] - k[i];
-                num += r * r; den += k[i] * k[i];
+                num += r * r;
+                den += k[i] * k[i];
                 let c = ht[i] - th[i];
-                num_h += c * c; den_h += ht[i] * ht[i];
+                num_h += c * c;
+                den_h += ht[i] * ht[i];
             }
             let tr: f64 = (0..n4).map(|a| t[a * n4 + a]).sum();
-            (num.sqrt() / den.sqrt().max(1e-30), num_h.sqrt() / (2.0 * den_h.sqrt().max(1e-30)), tr, t, q)
+            (
+                num.sqrt() / den.sqrt().max(1e-30),
+                num_h.sqrt() / (2.0 * den_h.sqrt().max(1e-30)),
+                tr,
+                t,
+                q,
+            )
         };
 
         let mut k = k;
         for step in 0..n_steps {
             let (r_i, r_h, tr, _t, q) = eval(&k);
-            eprintln!("[mcw_f64] variant={} step {step}: R_I={r_i:.3e} R_H={r_h:.3e} Tr(KS)={tr:.6}",
-                if store_f32 { "A_f32store" } else { "B_allf64" });
+            eprintln!(
+                "[mcw_f64] variant={} step {step}: R_I={r_i:.3e} R_H={r_h:.3e} Tr(KS)={tr:.6}",
+                if store_f32 { "A_f32store" } else { "B_allf64" }
+            );
             hist_rec(step as isize, r_i, r_h, tr);
             // V = Q·S·K, K' = 3Q − 2V  (2 matmuls)
             let u = crate::methods::sparse::bsr4::matmul_f64_mt(n4, &q, &s);
             let v = crate::methods::sparse::bsr4::matmul_f64_mt(n4, &u, &k);
             let mut kn = vec![0.0f64; n4 * n4];
-            for i in 0..n4 * n4 { kn[i] = 3.0 * q[i] - 2.0 * v[i]; }
-            if store_f32 { for x in kn.iter_mut() { *x = *x as f32 as f64; } }
+            for i in 0..n4 * n4 {
+                kn[i] = 3.0 * q[i] - 2.0 * v[i];
+            }
+            if store_f32 {
+                for x in kn.iter_mut() {
+                    *x = *x as f32 as f64;
+                }
+            }
             // FF32-POLISH r3: how much of the exact McWeeny update lives
             // OUTSIDE M_K? That's the storage-truncation floor for any
             // M_K-resident K (device ff path can never beat it).
@@ -842,26 +1257,42 @@ impl SparseDftb {
                         in_mk[i * self.n_atom + mk_ci[b] as usize] = true;
                     }
                 }
-                let mut tail = 0.0f64; let mut tot = 0.0f64;
-                for i in 0..self.n_atom { for j in 0..self.n_atom {
-                    let m = !in_mk[i * self.n_atom + j];
-                    for r in 0..4 { for c in 0..4 {
-                        let x = kn[(i * 4 + r) * n4 + j * 4 + c];
-                        tot += x * x;
-                        if m { tail += x * x; }
-                    }}
-                }}
-                eprintln!("[mcw_f64]   K' tail OUTSIDE M_K: ‖tail‖/‖K'‖={:.3e}", tail.sqrt() / tot.sqrt().max(1e-30));
+                let mut tail = 0.0f64;
+                let mut tot = 0.0f64;
+                for i in 0..self.n_atom {
+                    for j in 0..self.n_atom {
+                        let m = !in_mk[i * self.n_atom + j];
+                        for r in 0..4 {
+                            for c in 0..4 {
+                                let x = kn[(i * 4 + r) * n4 + j * 4 + c];
+                                tot += x * x;
+                                if m {
+                                    tail += x * x;
+                                }
+                            }
+                        }
+                    }
+                }
+                eprintln!(
+                    "[mcw_f64]   K' tail OUTSIDE M_K: ‖tail‖/‖K'‖={:.3e}",
+                    tail.sqrt() / tot.sqrt().max(1e-30)
+                );
             }
             k = kn;
         }
         let (r_i, r_h, tr, _t, _q) = eval(&k);
-        eprintln!("[mcw_f64] variant={} FINAL: R_I={r_i:.3e} R_H={r_h:.3e} Tr(KS)={tr:.6}",
-            if store_f32 { "A_f32store" } else { "B_allf64" });
+        eprintln!(
+            "[mcw_f64] variant={} FINAL: R_I={r_i:.3e} R_H={r_h:.3e} Tr(KS)={tr:.6}",
+            if store_f32 { "A_f32store" } else { "B_allf64" }
+        );
         hist_rec(n_steps as isize, r_i, r_h, tr);
         if let Some(p) = &hist_path {
             use std::io::Write;
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(p)
+            {
                 let _ = writeln!(f, "# end");
             }
         }
@@ -870,11 +1301,11 @@ impl SparseDftb {
     /// Host M_K mask (row_ptr, col_idx) — pairs with `k_bsr` ordering.
     pub fn m_k(&self) -> Result<(Vec<u32>, Vec<u32>)> {
         let g = self.ws.gpu();
-        Ok((self.ws.k_struct().row_ptr_host(g)?, self.ws.k_struct().col_idx_host(g)?))
+        Ok((
+            self.ws.k_struct().row_ptr_host(g)?,
+            self.ws.k_struct().col_idx_host(g)?,
+        ))
     }
-    /// Host S on M_HS.
-    pub fn s_bsr(&self) -> &Bsr4Matrix { &self.s_bsr }
-
     /// Per-geometry update: direct atom-pair→BSR H0/S assembly (no dense
     /// matrices — F2). Fails loud when the frozen topology no longer covers
     /// the geometry (Verlet skin exhausted) — rebuild the engine instead of
@@ -882,12 +1313,16 @@ impl SparseDftb {
     pub fn set_coords(&mut self, coords: &[[f64; 3]]) -> Result<()> {
         if coords.len() != self.n_atom {
             return Err(DftbError::InvalidInput(format!(
-                "set_coords: len {} != n_atom {}", coords.len(), self.n_atom
+                "set_coords: len {} != n_atom {}",
+                coords.len(),
+                self.n_atom
             )));
         }
         for (i, c) in coords.iter().enumerate() {
             if !c[0].is_finite() || !c[1].is_finite() || !c[2].is_finite() {
-                return Err(DftbError::InvalidInput(format!("set_coords: non-finite atom {i} {c:?}")));
+                return Err(DftbError::InvalidInput(format!(
+                    "set_coords: non-finite atom {i} {c:?}"
+                )));
             }
         }
         // Verlet-skin check (F2/R4): M_HS was built at coords_build with
@@ -915,35 +1350,85 @@ impl SparseDftb {
         }
         self.coords.copy_from_slice(coords);
         self.ws.gpu().prof_reset();
-        // SystemContext is O(n_atom + n_species²) table construction per
-        // geometry — cheap vs the O(nnz) assembly/contraction, and not
-        // storable in self (borrows &'a SkData → self-referential).
-        let ctx = SystemContext::from_sk_data(&self.builder.sk, &self.species)?;
-        assemble_hs_bsr(&ctx, &self.coords, &self.hs_pairs, &self.hs_diag, &self.onsite_orb, self.hs_taper, &mut self.h_bsr.values, &mut self.s_bsr.values)?;
-        self.ws.gpu().prof_tick("geom.hs");
-        self.ws.upload_h0(&self.h_bsr)?;
-        self.ws.upload_s(&self.s_bsr)?;
-        self.ws.gpu().prof_tick("geom.ul");
-        // Dense f64 γ matrix (F6/R16): O(N²), rebuilt per geometry.
+        // Packed (x,y,z,u) FIRST — the tiled n-body γ/γ′ kernels AND the
+        // R17 pair kernels (H/S assembly, repulsive) all read xyzu_buf.
         for i in 0..self.n_atom {
-            self.gmat[i * self.n_atom + i] = self.gamma.u(self.species_code[i]);
-            for j in (i + 1)..self.n_atom {
-                let dx = self.coords[i][0] - self.coords[j][0];
-                let dy = self.coords[i][1] - self.coords[j][1];
-                let dz = self.coords[i][2] - self.coords[j][2];
-                let r = (dx * dx + dy * dy + dz * dz).sqrt() * ANG2BOHR;
-                let g = self.gamma.gamma(r, self.species_code[i], self.species_code[j]);
-                self.gmat[i * self.n_atom + j] = g;
-                self.gmat[j * self.n_atom + i] = g;
-            }
+            self.xyzu_f32[4 * i] = self.coords[i][0] as f32;
+            self.xyzu_f32[4 * i + 1] = self.coords[i][1] as f32;
+            self.xyzu_f32[4 * i + 2] = self.coords[i][2] as f32;
+            self.xyzu_f32[4 * i + 3] = self.gamma.u(self.species_code[i]) as f32;
         }
-        self.ws.gpu().prof_tick("geom.gamma");
-        self.e_rep = repulsive_energy_cached(
-            &self.coords, &self.species_code, &self.species_names, &self.repulsive, self.n_species,
-        )?;
+        self.ws.gamma_upload_geometry(&self.xyzu_f32)?;
+        self.ws.gpu().prof_tick("geom.xyzu");
+        if self.cpu_pair {
+            // CPU reference path (explicit cfg.cpu_pair /
+            // RUST_DFTB_SPARSE_CPU): host f64 assembly + upload.
+            // SystemContext is O(n_atom + n_species²) per geometry —
+            // cheap vs the O(nnz) assembly, and not storable in self
+            // (borrows &'a SkData → self-referential).
+            let ctx = SystemContext::from_sk_data(&self.builder.sk, &self.species)?;
+            assemble_hs_bsr(
+                &ctx,
+                &self.coords,
+                &self.hs_pairs,
+                &self.hs_diag,
+                &self.onsite_orb,
+                self.hs_taper,
+                &mut self.h_bsr.values,
+                &mut self.s_bsr.values,
+            )?;
+            self.ws.gpu().prof_tick("geom.hs");
+            self.ws.upload_h0(&self.h_bsr)?;
+            self.ws.upload_s(&self.s_bsr)?;
+            self.ws.gpu().prof_tick("geom.ul");
+            self.e_rep = repulsive_energy_cached(
+                &self.coords,
+                &self.species_code,
+                &self.species_names,
+                &self.repulsive,
+                self.n_species,
+            )?;
+        } else {
+            // R17 GPU pair path (sparse_hs.cl). Coincident-atom guards
+            // mirror the CPU hard errors — the kernels zero such pairs
+            // instead: r²==0 in hs_pairs (DirectionCosines), r²<1e-4 Å²
+            // in rep_pairs (MIN_NEIGH_DIST in repulsive_energy_cached).
+            for p in &self.hs_pairs {
+                let (i, j) = (p.i as usize, p.j as usize);
+                let dx = self.coords[j][0] - self.coords[i][0];
+                let dy = self.coords[j][1] - self.coords[i][1];
+                let dz = self.coords[j][2] - self.coords[i][2];
+                if dx * dx + dy * dy + dz * dz == 0.0 {
+                    return Err(DftbError::InvalidInput(format!(
+                        "set_coords: atoms {i} and {j} coincide (M_HS pair) — DirectionCosines undefined"
+                    )));
+                }
+            }
+            for &(i, j) in &self.rep_pairs {
+                let (i, j) = (i as usize, j as usize);
+                let dx = self.coords[j][0] - self.coords[i][0];
+                let dy = self.coords[j][1] - self.coords[i][1];
+                let dz = self.coords[j][2] - self.coords[i][2];
+                if dx * dx + dy * dy + dz * dz < 1e-4 {
+                    return Err(DftbError::InvalidInput(format!(
+                        "set_coords: atoms {i} and {j} closer than MIN_NEIGH_DIST=0.01 Å (repulsive pair)"
+                    )));
+                }
+            }
+            self.ws.assemble_hs_dev()?;
+            self.ws.gpu().prof_tick("geom.hs");
+            // Residency contract (manifest §F): device h0/s are the source
+            // of truth — host mirrors refresh lazily via
+            // refresh_hs_mirrors instead of a ~25 MB readback per eval.
+            self.hs_mirror_stale = true;
+            self.e_rep = self.ws.rep_eval_dev()?;
+        }
         self.ws.gpu().prof_tick("geom.rep");
         if !self.e_rep.is_finite() {
-            panic!("set_coords: non-finite E_rep={} n_atom={}", self.e_rep, self.n_atom);
+            panic!(
+                "set_coords: non-finite E_rep={} n_atom={}",
+                self.e_rep, self.n_atom
+            );
         }
         self.z_valid = false;
         // S1 state contract: the stored energy/forces describe the OLD
@@ -954,40 +1439,70 @@ impl SparseDftb {
         // Geometry changes the fixed-point map only smoothly; keep the DIIS
         // subspace (reset_iter_only) — warm-started FD/relax columns converge
         // in a few iters instead of re-fighting the unstable sloshing mode.
-        if let Some(m) = &mut self.mixer { m.reset_iter_only(); }
+        if let Some(m) = &mut self.mixer {
+            m.reset_iter_only();
+        }
         Ok(())
     }
 
     /// Warm-start charges (Hessian ±h columns). Length must match n_atom.
     pub fn set_q(&mut self, q: &[f64]) -> Result<()> {
         if q.len() != self.n_atom {
-            return Err(DftbError::InvalidInput(format!("set_q: len {} != n_atom {}", q.len(), self.n_atom)));
+            return Err(DftbError::InvalidInput(format!(
+                "set_q: len {} != n_atom {}",
+                q.len(),
+                self.n_atom
+            )));
         }
         for (i, &qi) in q.iter().enumerate() {
             if !qi.is_finite() {
-                return Err(DftbError::InvalidInput(format!("set_q: non-finite q[{i}]={qi}")));
+                return Err(DftbError::InvalidInput(format!(
+                    "set_q: non-finite q[{i}]={qi}"
+                )));
             }
         }
         self.q.copy_from_slice(q);
         // S1 state contract: `last` was accepted for the previous q_in.
         self.last.n_scc = 0;
         self.last.purify_status = PurifyStatus::Failed;
-        if let Some(m) = &mut self.mixer { m.reset_iter_only(); }  // same map, new point
+        if let Some(m) = &mut self.mixer {
+            m.reset_iter_only();
+        } // same map, new point
         Ok(())
     }
 
-    /// V = γ·Δq via the cached dense f64 γ matrix (O(N²) matvec — same math
-    /// as `compute_intra_shifts`, no per-pair γ re-evaluation).
-    fn compute_v(&mut self) {
-        let n = self.n_atom;
-        self.v.fill(0.0);
-        for i in 0..n {
-            let mut acc = 0.0f64;
-            for j in 0..n {
-                acc += self.gmat[i * n + j] * (self.q[j] - self.q0[j]);
+    /// V = γ·Δq via the tiled n-body GPU kernel (sparse_gamma.cl) — f32
+    /// gather over staged __local tiles, no dense γ matrix. `cpu_pair`
+    /// runs the f64 host reference `GammaTable::gamma` (gamma_full).
+    fn compute_v(&mut self) -> Result<()> {
+        if self.cpu_pair {
+            // CPU reference: V_i = Σ_j γ(r_ij, s_i, s_j)·Δq_j, r in Bohr;
+            // j==i gives γ(0,u,u)=u.
+            for i in 0..self.n_atom {
+                let si = self.species_code[i];
+                let mut v = 0.0f64;
+                for j in 0..self.n_atom {
+                    let dx = self.coords[i][0] - self.coords[j][0];
+                    let dy = self.coords[i][1] - self.coords[j][1];
+                    let dz = self.coords[i][2] - self.coords[j][2];
+                    let r = (dx * dx + dy * dy + dz * dz).sqrt() * ANG2BOHR;
+                    v += self.gamma.gamma(r, si, self.species_code[j]) * (self.q[j] - self.q0[j]);
+                }
+                self.v[i] = v;
+                self.v_f32[i] = v as f32;
             }
-            self.v[i] = acc;
+            return Ok(());
         }
+        for i in 0..self.n_atom {
+            self.dq_f32[i] = (self.q[i] - self.q0[i]) as f32;
+        }
+        // Kernel writes v_buf on device; readback feeds v_f32 (Hscc upload)
+        // and v (f64: E_scc dot + force v_shift).
+        self.ws.gamma_v(&self.dq_f32, &mut self.v_f32)?;
+        for i in 0..self.n_atom {
+            self.v[i] = self.v_f32[i] as f64;
+        }
+        Ok(())
     }
 
     /// Self-consistent charges. Warm-starts from the previous `q`. Z is
@@ -1013,7 +1528,9 @@ impl SparseDftb {
         if !self.z_valid {
             // Warm-start NS from the previous geometry's Z when available —
             // cold fallback on stall/non-finite is built into compute_z.
-            let (rz, z_iters) = self.ws.compute_z(self.cfg.ns_max, self.cfg.ns_tol, 5, self.z_warm)?;
+            let (rz, z_iters) =
+                self.ws
+                    .compute_z(self.cfg.ns_max, self.cfg.ns_tol, 5, self.z_warm)?;
             eprintln!("  [SparseDftb] NS (once per geometry, warm={}): {z_iters} iters, R_Z={rz:.3e} (device ||I−T||_F/√N)", self.z_warm);
             self.z_valid = true;
             self.z_warm = true;
@@ -1022,16 +1539,33 @@ impl SparseDftb {
         let mix = self.cfg.mix;
         let mut rms_prev = f64::INFINITY;
         let mut n_rescue = 0usize;
-        let mut last_info = SparseDftbScc { n_iters: 0, rms: f64::INFINITY, r_scc: 0.0, tr_ks: 0.0, r_i: 0.0, r_h: f32::NAN, purify_status: PurifyStatus::Failed };
+        let mut last_info = SparseDftbScc {
+            n_iters: 0,
+            rms: f64::INFINITY,
+            r_scc: 0.0,
+            tr_ks: 0.0,
+            r_i: 0.0,
+            r_h: f32::NAN,
+            purify_status: PurifyStatus::Failed,
+        };
         for it in 0..cap {
-            self.compute_v();
-            for i in 0..self.n_atom { self.v_f32[i] = self.v[i] as f32; }
+            self.compute_v()?;
             self.ws.gpu().prof_tick("scc.v");
             self.ws.build_hscc_from_v(&self.v_f32)?;
             self.ws.gpu().prof_tick("scc.hscc");
-            let env_flag = |name: &str| std::env::var(name).map(|v| v == "1" || v.eq_ignore_ascii_case("true")).unwrap_or(false);
-            let use_trs = self.cfg.purifier_trs.unwrap_or_else(|| env_flag("RUST_DFTB_TRS"));
-            let use_p = self.cfg.purifier_p.unwrap_or_else(|| env_flag("RUST_DFTB_P_TC2"));
+            let env_flag = |name: &str| {
+                std::env::var(name)
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false)
+            };
+            let use_trs = self
+                .cfg
+                .purifier_trs
+                .unwrap_or_else(|| env_flag("RUST_DFTB_TRS"));
+            let use_p = self
+                .cfg
+                .purifier_p
+                .unwrap_or_else(|| env_flag("RUST_DFTB_P_TC2"));
             // Warm-K TC2 (K path only): the stored K is the converged
             // projector of the previous mix iter / ±h geometry. Opt-in —
             // convergence of a seeded projector is only sound near the
@@ -1050,10 +1584,12 @@ impl SparseDftb {
             };
             let (pstat, r_i, tr, tc2_iters) = r?;
             if pstat != PurifyStatus::Failed {
-                self.k_warm = true;   // device K is a usable warm-start seed
+                self.k_warm = true; // device K is a usable warm-start seed
             }
             self.ws.gpu().prof_tick("scc.purify");
-            if pstat == PurifyStatus::NumericalFloor && !self.cfg.accept_numerical_floor.unwrap_or(true) {
+            if pstat == PurifyStatus::NumericalFloor
+                && !self.cfg.accept_numerical_floor.unwrap_or(true)
+            {
                 return Err(DftbError::InvalidInput(format!(
                     "SparseDftb SCC iter {it}: TC2 reached NumericalFloor (R_I={r_i:e} > tol={}) — energies/forces NOT validated; accept_numerical_floor=false", self.cfg.tc2_tol
                 )));
@@ -1061,7 +1597,8 @@ impl SparseDftb {
             let tol_tr = tc2_trace_tol(self.nocc as f64);
             if (tr - self.nocc as f64).abs() > tol_tr {
                 return Err(DftbError::InvalidInput(format!(
-                    "SparseDftb SCC iter {it}: Tr(KS)={tr} far from Nocc={} (tol={tol_tr})", self.nocc
+                    "SparseDftb SCC iter {it}: Tr(KS)={tr} far from Nocc={} (tol={tol_tr})",
+                    self.nocc
                 )));
             }
             let q_new = self.mulliken_checked(tr, it)?;
@@ -1093,7 +1630,15 @@ impl SparseDftb {
                     self.last.e_el, self.last.e_tot
                 );
             }
-            last_info = SparseDftbScc { n_iters: it + 1, rms, r_scc: rms, tr_ks: tr as f32, r_i, r_h: f32::NAN, purify_status: pstat };
+            last_info = SparseDftbScc {
+                n_iters: it + 1,
+                rms,
+                r_scc: rms,
+                tr_ks: tr as f32,
+                r_i,
+                r_h: f32::NAN,
+                purify_status: pstat,
+            };
             if rms < rms_tol {
                 return self.finalize_scc(&q_new, last_info);
             }
@@ -1114,13 +1659,19 @@ impl SparseDftb {
                     "  [SparseDftb SCC] iter {it}: rms {rms:.3e} >> accepted {rms_prev:.3e} — rescue {n_rescue}/{MAX_SCC_RESCUES}: restore last q, reset mixer, damped retry"
                 );
                 self.q.copy_from_slice(&self.q_snap);
-                if let Some(m) = &mut self.mixer { m.reset(); }
-                for a in 0..self.n_atom { self.q[a] += mix * self.res_snap[a]; }
-                continue;   // rms_prev keeps the last accepted level
+                if let Some(m) = &mut self.mixer {
+                    m.reset();
+                }
+                for a in 0..self.n_atom {
+                    self.q[a] += mix * self.res_snap[a];
+                }
+                continue; // rms_prev keeps the last accepted level
             }
             // Snapshot the accepted (q_in, residual) BEFORE the mixer
             // overwrites q — rescue restores this point.
-            for a in 0..self.n_atom { self.q_res[a] = q_new[a] - self.q[a]; }
+            for a in 0..self.n_atom {
+                self.q_res[a] = q_new[a] - self.q[a];
+            }
             self.q_snap.copy_from_slice(&self.q);
             self.res_snap.copy_from_slice(&self.q_res);
             if let Some(m) = &mut self.mixer {
@@ -1153,8 +1704,10 @@ impl SparseDftb {
         // state still shows r_scc=0 and small r_I (measured: WARM_K
         // gives R_H=1.4e-2, E_tot off 0.13 Ha). Fail loud —
         // `RUST_DFTB_SCC_RHGATE` overrides, =0 disables (study only).
-        let scc_rh_gate = std::env::var("RUST_DFTB_SCC_RHGATE").ok()
-            .and_then(|v| v.parse::<f64>().ok()).unwrap_or(5e-4);
+        let scc_rh_gate = std::env::var("RUST_DFTB_SCC_RHGATE")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(5e-4);
         if scc_rh_gate > 0.0 && r_h > scc_rh_gate {
             return Err(DftbError::InvalidInput(format!(
                 "SparseDftb SCC converged (r_scc={:.3e}) but R_H={r_h:e} > gate={scc_rh_gate:e} — K is idempotent yet NOT the occupied projector of H_scc (wrong subspace). Energies/forces from this state are not valid; see manifest §4.12.1.",
@@ -1164,7 +1717,7 @@ impl SparseDftb {
         if self.dense_diag {
             self.materialize_dense_diag()?;
         }
-        info.r_scc = info.rms;          // rms(q_out − q_in) of the final state
+        info.r_scc = info.rms; // rms(q_out − q_in) of the final state
         info.r_h = r_h as f32;
         self.last.r_h = r_h as f32;
         self.last.q = self.q.clone();
@@ -1172,7 +1725,7 @@ impl SparseDftb {
             "  [SparseDftb] converged  r_scc={:.3e}  Tr(KS)={:.6}  r_I={:.3e}  R_H={:.3e}  E_band={:.6}  E_scc={:.6}  E_rep={:.6}  E_tot={:.8}  (q_out len {})",
             info.r_scc, info.tr_ks, info.r_i, r_h, self.last.e_h0, self.last.e_scc, self.last.e_rep, self.last.e_tot, q_out.len()
         );
-        self.ws.kern_time_report();   // no-op unless RUST_DFTB_KTIME
+        self.ws.kern_time_report(); // no-op unless RUST_DFTB_KTIME
         Ok(info)
     }
 
@@ -1180,6 +1733,7 @@ impl SparseDftb {
     /// dense, and H_scc rebuilt on host as H0 + ½S·(V_i+V_j) → padded dense.
     /// Never on the production path (cfg.dense_diag).
     fn materialize_dense_diag(&mut self) -> Result<()> {
+        self.refresh_hs_mirrors()?;
         self.ws.k_to_dense_into(&mut self.k_pad)?;
         // H_scc BSR on host: h_scc[l] = h0[l] + ½·s[l]·(v_i+v_j) on physical
         // lanes — mirrors the device kernel (R13 mask).
@@ -1204,7 +1758,11 @@ impl SparseDftb {
             }
         }
         crate::methods::sparse::bsr4::bsr_values_to_dense(
-            self.n_atom, &self.m_hs.0, &self.m_hs.1, &hscc, &mut self.h_scc_pad,
+            self.n_atom,
+            &self.m_hs.0,
+            &self.m_hs.1,
+            &hscc,
+            &mut self.h_scc_pad,
         );
         Ok(())
     }
@@ -1212,7 +1770,11 @@ impl SparseDftb {
     fn mulliken_checked(&mut self, tr: f64, it: usize) -> Result<Vec<f64>> {
         let (q_f32, q_dum) = self.ws.mulliken_charges()?;
         if q_f32.len() != self.n_atom {
-            return Err(DftbError::InvalidInput(format!("Mulliken len {} != n_atom {}", q_f32.len(), self.n_atom)));
+            return Err(DftbError::InvalidInput(format!(
+                "Mulliken len {} != n_atom {}",
+                q_f32.len(),
+                self.n_atom
+            )));
         }
         let qd_max: f32 = q_dum.iter().map(|x| x.abs()).fold(0.0, f32::max);
         if qd_max > 1e-4 {
@@ -1244,19 +1806,49 @@ impl SparseDftb {
 
     /// Energy of the consistent state (q, K, V) — sparse masked band energy
     /// `2·Tr(K·H0)` over M_HS on device (R7); no k_to_dense/trace_ab.
-    fn store_energy(&mut self, tr: f64, r_i: f32, n_scc: usize, tc2_iters: usize, r_scc: f64, r_h: f32, pstat: PurifyStatus) -> Result<()> {
+    fn store_energy(
+        &mut self,
+        tr: f64,
+        r_i: f32,
+        n_scc: usize,
+        tc2_iters: usize,
+        r_scc: f64,
+        r_h: f32,
+        pstat: PurifyStatus,
+    ) -> Result<()> {
         let tr_kh0 = self.ws.trace_kh0_dev()?;
         let e_h0 = 2.0 * tr_kh0;
-        let e_scc = 0.5 * self.q.iter().zip(self.q0.iter()).zip(self.v.iter())
-            .map(|((a, b), vi)| (a - b) * vi).sum::<f64>();
+        let e_scc = 0.5
+            * self
+                .q
+                .iter()
+                .zip(self.q0.iter())
+                .zip(self.v.iter())
+                .map(|((a, b), vi)| (a - b) * vi)
+                .sum::<f64>();
         let e_el = e_h0 + e_scc;
         if !e_el.is_finite() || !self.e_rep.is_finite() {
-            panic!("SparseDftb energy non-finite: E_el={e_el} E_rep={} n_scc={n_scc}", self.e_rep);
+            panic!(
+                "SparseDftb energy non-finite: E_el={e_el} E_rep={} n_scc={n_scc}",
+                self.e_rep
+            );
         }
         self.last = SparseDftbEnergy {
-            e_h0, e_scc, e_el, e_rep: self.e_rep, e_tot: e_el + self.e_rep,
-            q: self.q.clone(), tr_ks: tr as f32, r_i, n_scc, tc2_iters,
-            k_pad: vec![], h_scc_pad: vec![], v: self.v.clone(), r_scc, r_h,
+            e_h0,
+            e_scc,
+            e_el,
+            e_rep: self.e_rep,
+            e_tot: e_el + self.e_rep,
+            q: self.q.clone(),
+            tr_ks: tr as f32,
+            r_i,
+            n_scc,
+            tc2_iters,
+            k_pad: vec![],
+            h_scc_pad: vec![],
+            v: self.v.clone(),
+            r_scc,
+            r_h,
             purify_status: pstat,
         };
         Ok(())
@@ -1264,10 +1856,15 @@ impl SparseDftb {
 
     pub fn energy(&self) -> Result<f64> {
         if self.last.n_scc == 0 {
-            return Err(DftbError::InvalidInput("energy: no SCC yet — call scc first".into()));
+            return Err(DftbError::InvalidInput(
+                "energy: no SCC yet — call scc first".into(),
+            ));
         }
         if !self.last.e_tot.is_finite() {
-            return Err(DftbError::InvalidInput(format!("energy: last E_tot={} — call scc first", self.last.e_tot)));
+            return Err(DftbError::InvalidInput(format!(
+                "energy: last E_tot={} — call scc first",
+                self.last.e_tot
+            )));
         }
         Ok(self.last.e_tot)
     }
@@ -1289,15 +1886,24 @@ impl SparseDftb {
     pub fn forces_frozen(&mut self) -> Result<Forces> {
         if self.central.is_none() {
             return Err(DftbError::InvalidInput(
-                "forces_frozen: no snapshot — call snapshot_electronic_state first".into()));
+                "forces_frozen: no snapshot — call snapshot_electronic_state first".into(),
+            ));
         }
-        self.compute_v();   // V = γ(R)·Δq₀ — gmat rebuilt by set_coords
+        self.compute_v()?; // V = γ(R)·Δq₀ — xyzu_buf rebuilt by set_coords
         let s = self.central.as_ref().unwrap();
-        self.k_vals.copy_from_slice(&s.k);
-        self.w_vals.copy_from_slice(&s.w0);
+        if self.cpu_pair {
+            self.k_vals.copy_from_slice(&s.k);
+            self.w_vals.copy_from_slice(&s.w0);
+        }
         self.last.n_scc = 1;
         self.last.purify_status = PurifyStatus::Converged;
-        self.contract_forces()
+        // GPU path: contract directly against the device-resident
+        // snapshot buffers — zero PCIe, zero buffer mutation (manifest §F).
+        let kw = self
+            .central_dev
+            .as_ref()
+            .map(|cd| (cd.k.clone(), cd.w0.clone()));
+        self.contract_forces(kw)
     }
 
     /// Snapshot the converged electronic state (q, K, Z, K0) into
@@ -1307,16 +1913,28 @@ impl SparseDftb {
     /// capture it, then restores the converged K.
     pub fn snapshot_electronic_state(&mut self) -> Result<()> {
         let nb_k = self.ws.k().struct_.nblock * BS2;
+        let nb_z = self.ws.z().struct_.nblock * BS2;
+        // Device-resident captures BEFORE any readback — manifest §F:
+        // restore/contract consume these buffers directly, no PCIe.
+        let k_dev = self.ws.gpu().zero_f32(nb_k)?;
+        self.ws.gpu().copy_f32(&self.ws.k().values, &k_dev, nb_k)?;
+        let z_dev = self.ws.gpu().zero_f32(nb_z)?;
+        self.ws.gpu().copy_f32(&self.ws.z().values, &z_dev, nb_z)?;
         let mut k = vec![0.0f32; nb_k];
         self.ws.gpu().read_f32(&self.ws.k().values, &mut k)?;
-        let mut z = vec![0.0f32; self.ws.z().struct_.nblock * BS2];
+        let mut z = vec![0.0f32; nb_z];
         self.ws.gpu().read_f32(&self.ws.z().values, &mut z)?;
         // K0_center = f(Z_center, H_scc_center) — rebuild in `k`, read
         // to host, restore the converged K.
         let (emin, emax) = self.ws.compute_k0_from_hscc(0.1)?;
+        let k0_dev = self.ws.gpu().zero_f32(nb_k)?;
+        self.ws.gpu().copy_f32(&self.ws.k().values, &k0_dev, nb_k)?;
         let mut k0 = vec![0.0f32; nb_k];
         self.ws.gpu().read_f32(&self.ws.k().values, &mut k0)?;
-        self.ws.inject_k_values(&k)?;
+        // Restore converged K — device→device, no host round-trip
+        // (inject_k_values equivalent: values + T=K·S invalidation).
+        self.ws.gpu().copy_f32(&k_dev, &self.ws.k().values, nb_k)?;
+        self.ws.invalidate_ks();
         // W₀ = 2(Z₀H₀)K₀ on M_HS — explicit frozen-orbital snapshot
         // (b_zh here is central Z·H_scc, just rebuilt by compute_k0).
         let w_zk = self.cfg.force_w_zk.unwrap_or_else(|| {
@@ -1324,13 +1942,40 @@ impl SparseDftb {
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
                 .unwrap_or(true)
         });
-        self.dw_ws.build_dw_into(self.ws.gpu(), self.ws.k(), self.ws.h_scc(), self.ws.b_zh(), w_zk)?;
-        let mut w0 = vec![0.0f32; self.ws.hs_struct().nblock * BS2];
+        self.dw_ws.build_dw_into(
+            self.ws.gpu(),
+            self.ws.k(),
+            self.ws.h_scc(),
+            self.ws.b_zh(),
+            w_zk,
+        )?;
+        let nb_hs = self.ws.hs_struct().nblock * BS2;
+        let w0_dev = self.ws.gpu().zero_f32(nb_hs)?;
+        self.ws
+            .gpu()
+            .copy_f32(&self.dw_ws.w().values, &w0_dev, nb_hs)?;
+        let mut w0 = vec![0.0f32; nb_hs];
         self.ws.gpu().read_f32(&self.dw_ws.w().values, &mut w0)?;
         // Central metric/gradient snapshots for the linear1 tier —
         // 2 products, once per Hessian.
         let (p0, x0) = self.ws.snapshot_p0_x0()?;
-        self.central = Some(SparseElectronicState { q: self.q.clone(), k, z, k0, w0, p0, x0, emin, emax });
+        self.central = Some(SparseElectronicState {
+            q: self.q.clone(),
+            k,
+            z,
+            k0,
+            w0,
+            p0,
+            x0,
+            emin,
+            emax,
+        });
+        self.central_dev = Some(GpuCentralState {
+            k: k_dev,
+            z: z_dev,
+            k0: k0_dev,
+            w0: w0_dev,
+        });
         Ok(())
     }
 
@@ -1341,24 +1986,40 @@ impl SparseDftb {
     /// as the NS warm seed; K stays the central projector; the DIIS
     /// history is fully reset so columns are interchangeable.
     pub fn restore_central_state(&mut self) -> Result<()> {
-        let s = self.central.as_ref().ok_or_else(|| DftbError::InvalidInput(
-            "restore_central_state: no snapshot — call snapshot_electronic_state first".into()))?;
+        let s = self.central.as_ref().ok_or_else(|| {
+            DftbError::InvalidInput(
+                "restore_central_state: no snapshot — call snapshot_electronic_state first".into(),
+            )
+        })?;
         if s.q.len() != self.n_atom {
             return Err(DftbError::InvalidInput(format!(
-                "restore_central_state: q len {} != n_atom {}", s.q.len(), self.n_atom
+                "restore_central_state: q len {} != n_atom {}",
+                s.q.len(),
+                self.n_atom
             )));
         }
         self.q.copy_from_slice(&s.q);
-        self.ws.k().upload_values(self.ws.gpu(), &s.k)?;
-        self.ws.z().upload_values(self.ws.gpu(), &s.z)?;
+        let cd = self.central_dev.as_ref().ok_or_else(|| {
+            DftbError::InvalidInput(
+                "restore_central_state: device snapshot missing — snapshot_electronic_state did not complete".into(),
+            )
+        })?;
+        // Device→device restore (manifest §F residency contract) — the
+        // snapshot buffers never left the GPU, ~52 MB stays off PCIe.
+        self.ws
+            .gpu()
+            .copy_f32(&cd.k, &self.ws.k().values, s.k.len())?;
+        self.ws
+            .gpu()
+            .copy_f32(&cd.z, &self.ws.z().values, s.z.len())?;
         self.ws.invalidate_ks();
-        self.z_valid = false;   // Z was built for the old S — re-NS warm
+        self.z_valid = false; // Z was built for the old S — re-NS warm
         self.z_warm = true;
-        self.k_warm = true;     // device K is a converged projector seed
+        self.k_warm = true; // device K is a converged projector seed
         self.last.n_scc = 0;
         self.last.purify_status = PurifyStatus::Failed;
         if let Some(m) = &mut self.mixer {
-            m.reset();          // identical DIIS start for every column
+            m.reset(); // identical DIIS start for every column
         }
         Ok(())
     }
@@ -1375,54 +2036,69 @@ impl SparseDftb {
         // NS, the δK0 seed, retractions, and ALL per-eval residual gates/
         // measurements — fixed predetermined arithmetic → force. Use only
         // for recipes already validated against cold columns.
-        let linear = std::env::var("RUST_DFTB_VIB_LINEAR").ok()
-            .and_then(|v| v.parse::<usize>().ok()).unwrap_or(0) != 0;
-        let lite = linear || std::env::var("RUST_DFTB_VIB_LITE").ok()
-            .and_then(|v| v.parse::<usize>().ok()).unwrap_or(0) != 0;
+        let linear = std::env::var("RUST_DFTB_VIB_LINEAR")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0)
+            != 0;
+        let lite = linear
+            || std::env::var("RUST_DFTB_VIB_LITE")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0)
+                != 0;
         if !self.z_valid {
             if lite && self.z_warm {
                 // lite tiers default to the central Z as-is (NSMAX=0);
                 // an explicit VIB_NSMAX runs that many warm NS updates
                 // (loose tol — a count cap, not a convergence target).
-                let ns_cap = std::env::var("RUST_DFTB_VIB_NSMAX").ok()
-                    .and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
+                let ns_cap = std::env::var("RUST_DFTB_VIB_NSMAX")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(0);
                 if ns_cap == 0 {
                     self.z_valid = true;
                 } else {
-                    let ns_tol = std::env::var("RUST_DFTB_VIB_NSTOL").ok()
-                        .and_then(|v| v.parse::<f32>().ok()).unwrap_or(1e-3);
+                    let ns_tol = std::env::var("RUST_DFTB_VIB_NSTOL")
+                        .ok()
+                        .and_then(|v| v.parse::<f32>().ok())
+                        .unwrap_or(1e-3);
                     let (rz, z_iters) = self.ws.compute_z(ns_cap, ns_tol, 5, true)?;
                     eprintln!("  [SparseDftb] NS (lite): {z_iters} iters, R_Z={rz:.3e}");
                     self.z_valid = true;
                     self.z_warm = true;
                 }
             } else {
-            // RUST_DFTB_VIB_NSMAX caps warm NS iters for the cheap
-            // response tiers: 1 = exactly the first-order correction
-            // Z₁ = 2Z₀−Z₀S₁Z₀ (R_Z~8.5e-5 on R10 — ample for the DMM
-            // direction); 0 = keep the restored central Z entirely.
-            let ns_cap = std::env::var("RUST_DFTB_VIB_NSMAX").ok()
-                .and_then(|v| v.parse::<usize>().ok()).unwrap_or(self.cfg.ns_max);
-            if ns_cap == 0 && self.z_warm {
-                self.z_valid = true;   // keep central Z (first-order tier)
-            } else {
-                // VIB_NSTOL loosens the NS tolerance for the response
-                // tier — 1 warm step is the first-order inverse
-                // correction; demanding 1e-5 reconvergence wastes ~4
-                // products (GPT-5.6 §4).
-                let ns_tol = std::env::var("RUST_DFTB_VIB_NSTOL").ok()
-                    .and_then(|v| v.parse::<f32>().ok()).unwrap_or(self.cfg.ns_tol);
-                let (rz, z_iters) = self.ws.compute_z(ns_cap, ns_tol, 5, self.z_warm)?;
-                eprintln!("  [SparseDftb] NS (fixedq, warm={}): {z_iters} iters, R_Z={rz:.3e}", self.z_warm);
-                self.z_valid = true;
-                self.z_warm = true;
-            }
+                // RUST_DFTB_VIB_NSMAX caps warm NS iters for the cheap
+                // response tiers: 1 = exactly the first-order correction
+                // Z₁ = 2Z₀−Z₀S₁Z₀ (R_Z~8.5e-5 on R10 — ample for the DMM
+                // direction); 0 = keep the restored central Z entirely.
+                let ns_cap = std::env::var("RUST_DFTB_VIB_NSMAX")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(self.cfg.ns_max);
+                if ns_cap == 0 && self.z_warm {
+                    self.z_valid = true; // keep central Z (first-order tier)
+                } else {
+                    // VIB_NSTOL loosens the NS tolerance for the response
+                    // tier — 1 warm step is the first-order inverse
+                    // correction; demanding 1e-5 reconvergence wastes ~4
+                    // products (GPT-5.6 §4).
+                    let ns_tol = std::env::var("RUST_DFTB_VIB_NSTOL")
+                        .ok()
+                        .and_then(|v| v.parse::<f32>().ok())
+                        .unwrap_or(self.cfg.ns_tol);
+                    let (rz, z_iters) = self.ws.compute_z(ns_cap, ns_tol, 5, self.z_warm)?;
+                    eprintln!(
+                        "  [SparseDftb] NS (fixedq, warm={}): {z_iters} iters, R_Z={rz:.3e}",
+                        self.z_warm
+                    );
+                    self.z_valid = true;
+                    self.z_warm = true;
+                }
             }
         }
-        self.compute_v();
-        for i in 0..self.n_atom {
-            self.v_f32[i] = self.v[i] as f32;
-        }
+        self.compute_v()?;
         self.ws.build_hscc_from_v(&self.v_f32)?;
         // Phase G3 δK0 seed: K_seed = K_conv + (K0_new − K0_center)
         // rotates the occupied subspace to first order; TC2 only
@@ -1437,8 +2113,10 @@ impl SparseDftb {
         // R10/deg330), tol=1e-5 is unreachable and every purify churns
         // to the cap/plateau. Setting tol just above the floor (e.g.
         // 5e-5) converges at ~30 iters — the accepted residual anyway.
-        let tc2_tol = std::env::var("RUST_DFTB_VIB_TC2TOL").ok()
-            .and_then(|v| v.parse::<f32>().ok()).unwrap_or(self.cfg.tc2_tol);
+        let tc2_tol = std::env::var("RUST_DFTB_VIB_TC2TOL")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .unwrap_or(self.cfg.tc2_tol);
         self.ws.set_tc2_hiacc(self.cfg.tc2_hiacc.unwrap_or(false));
         let seeded = dmupd && self.central.is_some();
         let r = if seeded {
@@ -1459,20 +2137,30 @@ impl SparseDftb {
             // enough off-manifold to occupy dummy lanes → loud fail),
             // no post-DMM McWeeny/TC2 — both degrade R_H; DMM's own
             // retracts hold r_I~3e-4, Tr(KS)=Nocc.
-            let n_mcw = std::env::var("RUST_DFTB_VIB_MCPOL").ok()
-                .and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
-            let n_dmm = std::env::var("RUST_DFTB_VIB_DMM").ok()
-                .and_then(|v| v.parse::<usize>().ok()).unwrap_or(6);
-            let eta_sc = std::env::var("RUST_DFTB_VIB_DMM_ETA").ok()
-                .and_then(|v| v.parse::<f32>().ok()).unwrap_or(8.0);
-            let n_ret = std::env::var("RUST_DFTB_VIB_DMM_RET").ok()
-                .and_then(|v| v.parse::<usize>().ok()).unwrap_or(2);
+            let n_mcw = std::env::var("RUST_DFTB_VIB_MCPOL")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0);
+            let n_dmm = std::env::var("RUST_DFTB_VIB_DMM")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(6);
+            let eta_sc = std::env::var("RUST_DFTB_VIB_DMM_ETA")
+                .ok()
+                .and_then(|v| v.parse::<f32>().ok())
+                .unwrap_or(8.0);
+            let n_ret = std::env::var("RUST_DFTB_VIB_DMM_RET")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(2);
             // Post-DMM TC2 fixes r_I/trace drift but its masked f32 map
             // degrades R_H (measured: 5.2e-5→7.8e-5 on R10 col0). Keep
             // it bounded: RUST_DFTB_VIB_TC2MAX=0 skips it entirely —
             // the retraction McWeeny already holds idempotency.
-            let tc2_max = std::env::var("RUST_DFTB_VIB_TC2MAX").ok()
-                .and_then(|v| v.parse::<usize>().ok()).unwrap_or(0);
+            let tc2_max = std::env::var("RUST_DFTB_VIB_TC2MAX")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0);
             // GPT-5.6 tier-1 experiment: VIB_SEED=0 removes the δK0 seed
             // entirely — it is the first-order change of the spectral
             // INITIALIZER (bounds+normalization included), not of the
@@ -1482,10 +2170,15 @@ impl SparseDftb {
             // the DMM X product AND the W=2(ZH)K force), bounds come
             // from the snapshot. VIB_METRIC=1 applies the first-order
             // overlap correction K←2K−KS₁K before the H response.
-            let seed_mode = std::env::var("RUST_DFTB_VIB_SEED").ok()
-                .and_then(|v| v.parse::<usize>().ok()).unwrap_or(1);
-            let metric = std::env::var("RUST_DFTB_VIB_METRIC").ok()
-                .and_then(|v| v.parse::<usize>().ok()).unwrap_or(0) != 0;
+            let seed_mode = std::env::var("RUST_DFTB_VIB_SEED")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(1);
+            let metric = std::env::var("RUST_DFTB_VIB_METRIC")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(0)
+                != 0;
             (|| -> Result<(PurifyStatus, f32, f64, usize)> {
                 let dbg = crate::methods::sparse::gpu_sparse::algebra_verbose();
                 // Stripped tiers — fixed arithmetic, NO residual
@@ -1493,14 +2186,17 @@ impl SparseDftb {
                 // validation benchmark, ~4 products + host syncs each
                 // eval otherwise).
                 if lite {
-                    self.ws.refresh_b_zh()?;                    // B₁ = Z₀·H₁      (1)
+                    self.ws.refresh_b_zh()?; // B₁ = Z₀·H₁      (1)
                     if linear {
                         let s = self.central.as_ref().unwrap();
                         let eta = eta_sc / (s.emax - s.emin).max(1e-6);
-                        self.ws.linear_response(eta, &s.x0, &s.p0)?;    // X,Y,update (3)
+                        self.ws.linear_response(eta, &s.x0, &s.p0)?; // X,Y,update (3)
                     } else if n_dmm > 0 {
-                        let (emin, emax) = { let s = self.central.as_ref().unwrap(); (s.emin, s.emax) };
-                        self.ws.dmm_descend(emin, emax, n_dmm, eta_sc, 0)?;   // 3/step
+                        let (emin, emax) = {
+                            let s = self.central.as_ref().unwrap();
+                            (s.emin, s.emax)
+                        };
+                        self.ws.dmm_descend(emin, emax, n_dmm, eta_sc, 0)?; // 3/step
                     }
                     return Ok((PurifyStatus::Converged, f32::NAN, f64::NAN, 0));
                 }
@@ -1512,24 +2208,54 @@ impl SparseDftb {
                     self.ws.refresh_b_zh()?;
                     (emin_c, emax_c)
                 };
-                if dbg { eprintln!("    [vib] after seed:   R_H={:.3e}", self.ws.rh_stationarity()?); }
+                if dbg {
+                    eprintln!(
+                        "    [vib] after seed:   R_H={:.3e}",
+                        self.ws.rh_stationarity()?
+                    );
+                }
                 if metric {
                     self.ws.metric_transport()?;
-                    if dbg { eprintln!("    [vib] after metric: R_H={:.3e}", self.ws.rh_stationarity()?); }
+                    if dbg {
+                        eprintln!(
+                            "    [vib] after metric: R_H={:.3e}",
+                            self.ws.rh_stationarity()?
+                        );
+                    }
                 }
                 if n_dmm > 0 {
                     self.ws.dmm_descend(emin, emax, n_dmm, eta_sc, n_ret)?;
-                    if dbg { eprintln!("    [vib] after DMM:    R_H={:.3e}", self.ws.rh_stationarity()?); }
+                    if dbg {
+                        eprintln!(
+                            "    [vib] after DMM:    R_H={:.3e}",
+                            self.ws.rh_stationarity()?
+                        );
+                    }
                 }
                 self.ws.mcweeny_polish_planned(n_mcw)?;
-                if dbg { eprintln!("    [vib] after McW:    R_H={:.3e}", self.ws.rh_stationarity()?); }
+                if dbg {
+                    eprintln!(
+                        "    [vib] after McW:    R_H={:.3e}",
+                        self.ws.rh_stationarity()?
+                    );
+                }
                 if tc2_max == 0 {
                     let (r_i, tr) = self.ws.measure_projector_state()?;
-                    if dbg { eprintln!("    [vib] no TC2:     R_H={:.3e} r_I={r_i:.3e} Tr={tr:.6}", self.ws.rh_stationarity()?); }
+                    if dbg {
+                        eprintln!(
+                            "    [vib] no TC2:     R_H={:.3e} r_I={r_i:.3e} Tr={tr:.6}",
+                            self.ws.rh_stationarity()?
+                        );
+                    }
                     return Ok((PurifyStatus::Converged, r_i, tr, 0));
                 }
                 let out = self.ws.tc2_purify(tc2_max, tc2_tol, 1);
-                if dbg { eprintln!("    [vib] after TC2:    R_H={:.3e}", self.ws.rh_stationarity()?); }
+                if dbg {
+                    eprintln!(
+                        "    [vib] after TC2:    R_H={:.3e}",
+                        self.ws.rh_stationarity()?
+                    );
+                }
                 out
             })()
         } else {
@@ -1541,21 +2267,36 @@ impl SparseDftb {
             // e_tot=NaN → energy() refuses loudly; forces() only needs
             // n_scc>0 plus the K/W buffers.
             self.last = SparseDftbEnergy {
-                e_h0: f64::NAN, e_scc: f64::NAN, e_el: f64::NAN,
-                e_rep: self.e_rep, e_tot: f64::NAN,
-                q: self.q.clone(), tr_ks: f32::NAN, r_i: f32::NAN,
-                n_scc: 1, tc2_iters: 0, k_pad: vec![], h_scc_pad: vec![],
-                v: self.v.clone(), r_scc: 0.0, r_h: f32::NAN,
+                e_h0: f64::NAN,
+                e_scc: f64::NAN,
+                e_el: f64::NAN,
+                e_rep: self.e_rep,
+                e_tot: f64::NAN,
+                q: self.q.clone(),
+                tr_ks: f32::NAN,
+                r_i: f32::NAN,
+                n_scc: 1,
+                tc2_iters: 0,
+                k_pad: vec![],
+                h_scc_pad: vec![],
+                v: self.v.clone(),
+                r_scc: 0.0,
+                r_h: f32::NAN,
                 purify_status: PurifyStatus::Converged,
             };
             self.k_warm = true;
             return Ok(SparseDftbScc {
-                n_iters: 1, rms: 0.0, r_scc: 0.0, tr_ks: f32::NAN,
-                r_i: f32::NAN, r_h: f32::NAN,
+                n_iters: 1,
+                rms: 0.0,
+                r_scc: 0.0,
+                tr_ks: f32::NAN,
+                r_i: f32::NAN,
+                r_h: f32::NAN,
                 purify_status: PurifyStatus::Converged,
             });
         }
-        if pstat == PurifyStatus::NumericalFloor && !self.cfg.accept_numerical_floor.unwrap_or(true) {
+        if pstat == PurifyStatus::NumericalFloor && !self.cfg.accept_numerical_floor.unwrap_or(true)
+        {
             return Err(DftbError::InvalidInput(format!(
                 "scc_fixedq: TC2 NumericalFloor (R_I={r_i:e} > tol={}) — forces not validated",
                 tc2_tol
@@ -1564,7 +2305,8 @@ impl SparseDftb {
         let tol_tr = tc2_trace_tol(self.nocc as f64);
         if (tr - self.nocc as f64).abs() > tol_tr {
             return Err(DftbError::InvalidInput(format!(
-                "scc_fixedq: Tr(KS)={tr} far from Nocc={} (tol={tol_tr})", self.nocc
+                "scc_fixedq: Tr(KS)={tr} far from Nocc={} (tol={tol_tr})",
+                self.nocc
             )));
         }
         // R_H gate: a warm seed can produce an idempotent matrix that is
@@ -1580,12 +2322,20 @@ impl SparseDftb {
         // per-column R_H certification (~2 SpGEMMs + host norm). Only for
         // a recipe already validated against cold columns — the gate is
         // the safeguard that catches wrong-subspace states (see above).
-        let gates_on = std::env::var("RUST_DFTB_VIB_GATES").ok()
-            .and_then(|v| v.parse::<usize>().ok()).unwrap_or(1) != 0;
-        let rh_gate = std::env::var("RUST_DFTB_VIB_RHGATE").ok()
+        let gates_on = std::env::var("RUST_DFTB_VIB_GATES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(1)
+            != 0;
+        let rh_gate = std::env::var("RUST_DFTB_VIB_RHGATE")
+            .ok()
             .and_then(|v| v.parse::<f64>().ok())
             .unwrap_or(if seeded { 1e-4 } else { 5e-4 });
-        let r_h = if gates_on { self.ws.rh_stationarity()? } else { f64::NAN };
+        let r_h = if gates_on {
+            self.ws.rh_stationarity()?
+        } else {
+            f64::NAN
+        };
         if r_h > rh_gate {
             return Err(DftbError::InvalidInput(format!(
                 "scc_fixedq: R_H={r_h:e} > gate={rh_gate:e} (seeded={seeded}, r_I={r_i:e}, Tr(KS)={tr:.6}, tc2_iters={tc2_iters}) — K is idempotent on a wrong occupied subspace; density reuse FAILED. Fix the warm update (‖[K,H]‖ descent, tasks G3) — silent cold re-solve removed."
@@ -1594,39 +2344,80 @@ impl SparseDftb {
         self.store_energy(tr, r_i, 1, tc2_iters, 0.0, r_h as f32, pstat)?;
         self.k_warm = true;
         eprintln!("  [SparseDftb] fixedq  Tr(KS)={tr:.6}  r_I={r_i:.3e}  R_H={r_h:.3e}  tc2_iters={tc2_iters}");
-        Ok(SparseDftbScc { n_iters: 1, rms: 0.0, r_scc: 0.0, tr_ks: tr as f32, r_i, r_h: r_h as f32, purify_status: pstat })
+        Ok(SparseDftbScc {
+            n_iters: 1,
+            rms: 0.0,
+            r_scc: 0.0,
+            tr_ks: tr as f32,
+            r_i,
+            r_h: r_h as f32,
+            purify_status: pstat,
+        })
     }
 
     pub fn forces(&mut self) -> Result<Forces> {
         if self.last.n_scc == 0 {
-            return Err(DftbError::InvalidInput("forces: no SCC yet — call scc first".into()));
+            return Err(DftbError::InvalidInput(
+                "forces: no SCC yet — call scc first".into(),
+            ));
         }
         let gpu = self.ws.gpu();
         let w_zk = self.cfg.force_w_zk.unwrap_or_else(|| {
             std::env::var("RUST_DFTB_W_ZK")
                 .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                .unwrap_or(true)   // identity verified — on unless disabled
+                .unwrap_or(true) // identity verified — on unless disabled
         });
-        self.dw_ws.build_dw_into(gpu, self.ws.k(), self.ws.h_scc(), self.ws.b_zh(), w_zk)?;
+        self.dw_ws
+            .build_dw_into(gpu, self.ws.k(), self.ws.h_scc(), self.ws.b_zh(), w_zk)?;
         gpu.prof_tick("f.dw");
-        gpu.read_f32(&self.dw_ws.w().values, &mut self.w_vals)?;
-        gpu.read_f32(&self.ws.k().values, &mut self.k_vals)?;
-        gpu.prof_tick("f.dl");
-        let r = self.contract_forces();
+        if self.cpu_pair {
+            gpu.read_f32(&self.dw_ws.w().values, &mut self.w_vals)?;
+            gpu.read_f32(&self.ws.k().values, &mut self.k_vals)?;
+            gpu.prof_tick("f.dl");
+        }
+        let r = self.contract_forces(None);
         self.ws.gpu().prof_tick("f.contract");
         r
     }
 
-    /// Host force contraction from the current `k_vals`/`w_vals`/`v` —
+    /// Force contraction from the current `k_vals`/`w_vals`/`v` —
     /// shared tail of `forces()` (relaxed state) and `forces_frozen`
-    /// (snapshot state). No device work.
-    fn contract_forces(&mut self) -> Result<Forces> {
-        let ctx = SystemContext::from_sk_data(&self.builder.sk, &self.species)?;
-        sparse_forces_bsr(
-            &ctx, &self.coords, &self.hs_pairs, &self.k_diag,
-            &self.k_vals, &self.w_vals, &self.v, &self.q, &self.q0,
-            &self.gamma, &self.repulsive, self.hs_taper,
-        )
+    /// (snapshot state). `kw` optionally supplies device K/W buffers to
+    /// contract against (frozen: the resident central snapshot); `None`
+    /// uses the live `ws.k()`/`dw_ws.w()` values.
+    fn contract_forces(&mut self, kw: Option<(Buffer<f32>, Buffer<f32>)>) -> Result<Forces> {
+        if self.cpu_pair {
+            // CPU reference: host γ′ n-body inside sparse_forces_bsr
+            // (scc_dc_override=None → scc_double_counting_force).
+            let ctx = SystemContext::from_sk_data(&self.builder.sk, &self.species)?;
+            return sparse_forces_bsr(
+                &ctx,
+                &self.coords,
+                &self.hs_pairs,
+                &self.k_diag,
+                &self.k_vals,
+                &self.w_vals,
+                &self.v,
+                &self.q,
+                &self.q0,
+                &self.gamma,
+                &self.repulsive,
+                self.hs_taper,
+                None,
+            );
+        }
+        for i in 0..self.n_atom {
+            self.dq_f32[i] = (self.q[i] - self.q0[i]) as f32;
+        }
+        // γ′ on device into gf_buf — force_gather consumes it directly.
+        self.ws.gamma_forces_dev(&self.dq_f32)?;
+        self.ws.gpu().prof_tick("f.gamma");
+        // K/W stay on device — clone the Buffer handles (cheap Arc bump)
+        // to split the borrow across ws/dw_ws. `kw` override = the
+        // resident central snapshot (frozen path, zero transfer).
+        let (kb, wb) =
+            kw.unwrap_or_else(|| (self.ws.k().values.clone(), self.dw_ws.w().values.clone()));
+        self.ws.pair_forces_dev(&kb, &wb)
     }
 
     /// One FIRE step. Call `scc` first. Returns max |F|.
@@ -1651,17 +2442,35 @@ impl SparseDftb {
             self.fire_n_pos = 0;
             self.fire_dt *= 0.7;
             self.fire_alpha = 0.1;
-            for v in &mut self.fire_v { *v = [0.0; 3]; }
-        }
-        if max_f < f_tol { return Ok(max_f); }
-        for i in 0..self.n_atom {
-            let fx = f.forces[i][0]; let fy = f.forces[i][1]; let fz = f.forces[i][2];
-            let fnorm = (fx * fx + fy * fy + fz * fz).sqrt();
-            let (hx, hy, hz) = if fnorm > 1e-12 { (fx / fnorm, fy / fnorm, fz / fnorm) } else { (0.0, 0.0, 0.0) };
-            for (c, h) in [hx, hy, hz].iter().enumerate() {
-                self.fire_v[i][c] = (1.0 - self.fire_alpha) * self.fire_v[i][c] + self.fire_alpha * fnorm * h;
+            for v in &mut self.fire_v {
+                *v = [0.0; 3];
             }
-            apply_disp(&mut self.coords[i], &self.fire_v[i], fx, fy, fz, self.fire_dt);
+        }
+        if max_f < f_tol {
+            return Ok(max_f);
+        }
+        for i in 0..self.n_atom {
+            let fx = f.forces[i][0];
+            let fy = f.forces[i][1];
+            let fz = f.forces[i][2];
+            let fnorm = (fx * fx + fy * fy + fz * fz).sqrt();
+            let (hx, hy, hz) = if fnorm > 1e-12 {
+                (fx / fnorm, fy / fnorm, fz / fnorm)
+            } else {
+                (0.0, 0.0, 0.0)
+            };
+            for (c, h) in [hx, hy, hz].iter().enumerate() {
+                self.fire_v[i][c] =
+                    (1.0 - self.fire_alpha) * self.fire_v[i][c] + self.fire_alpha * fnorm * h;
+            }
+            apply_disp(
+                &mut self.coords[i],
+                &self.fire_v[i],
+                fx,
+                fy,
+                fz,
+                self.fire_dt,
+            );
             self.fire_v[i][0] += fx * self.fire_dt;
             self.fire_v[i][1] += fy * self.fire_dt;
             self.fire_v[i][2] += fz * self.fire_dt;
@@ -1674,12 +2483,16 @@ impl SparseDftb {
     /// Velocity-Verlet (mass=1). Call `scc` after. Displacement capped at 0.1 Å.
     pub fn md_step(&mut self, dt: f64) -> Result<f64> {
         if !dt.is_finite() || dt <= 0.0 {
-            return Err(DftbError::InvalidInput(format!("md_step: dt={dt} must be finite and > 0")));
+            return Err(DftbError::InvalidInput(format!(
+                "md_step: dt={dt} must be finite and > 0"
+            )));
         }
         let f = self.forces()?;
         let mut max_f = 0.0f64;
         for i in 0..self.n_atom {
-            let fx = f.forces[i][0]; let fy = f.forces[i][1]; let fz = f.forces[i][2];
+            let fx = f.forces[i][0];
+            let fy = f.forces[i][1];
+            let fz = f.forces[i][2];
             max_f = max_f.max(fx.abs()).max(fy.abs()).max(fz.abs());
             apply_disp(&mut self.coords[i], &self.fire_v[i], fx, fy, fz, dt);
             self.fire_v[i][0] += fx * dt;
@@ -1692,9 +2505,17 @@ impl SparseDftb {
     }
 
     /// SCC + FIRE until max|F|<f_tol or `max_steps`. Prints unbuffered progress.
-    pub fn relax(&mut self, max_steps: usize, f_tol: f64, scc_tol: f64) -> Result<(usize, f64, f64)> {
+    pub fn relax(
+        &mut self,
+        max_steps: usize,
+        f_tol: f64,
+        scc_tol: f64,
+    ) -> Result<(usize, f64, f64)> {
         let scc0 = self.scc(SCC_MAX, scc_tol)?;
-        eprintln!("[SparseDftb] relax start rms={:.3e} iters={} E={:.8}", scc0.rms, scc0.n_iters, self.last.e_tot);
+        eprintln!(
+            "[SparseDftb] relax start rms={:.3e} iters={} E={:.8}",
+            scc0.rms, scc0.n_iters, self.last.e_tot
+        );
         let mut max_f = f64::INFINITY;
         let mut step = 0;
         for s in 0..max_steps {
@@ -1705,7 +2526,9 @@ impl SparseDftb {
                 "[SparseDftb] FIRE {step}/{max_steps} max|F|={max_f:.4e} E={:.8} rms={:.3e} scc_iters={}",
                 self.last.e_tot, scc.rms, scc.n_iters
             );
-            if max_f < f_tol { break; }
+            if max_f < f_tol {
+                break;
+            }
         }
         Ok((step, max_f, scc0.rms))
     }
@@ -1729,7 +2552,7 @@ fn assemble_hs_bsr(
     pairs: &[HsPair],
     hs_diag: &[u32],
     onsite_orb: &[[f64; 4]],
-    taper: Option<(f64, f64)>,   // (r_start_ang, width_ang) — see hs_taper
+    taper: Option<(f64, f64)>, // (r_start_ang, width_ang) — see hs_taper
     h_vals: &mut [f32],
     s_vals: &mut [f32],
 ) -> Result<()> {
@@ -1741,7 +2564,11 @@ fn assemble_hs_bsr(
         let b = hs_diag[i] as usize;
         let ni = ctx.atom_n_orb[i] as usize;
         for d in 0..BS {
-            h_vals[b * BS2 + d * BS + d] = if d < ni { onsite_orb[i][d] as f32 } else { E_DUMMY };
+            h_vals[b * BS2 + d * BS + d] = if d < ni {
+                onsite_orb[i][d] as f32
+            } else {
+                E_DUMMY
+            };
             s_vals[b * BS2 + d * BS + d] = 1.0;
         }
     }
@@ -1753,11 +2580,25 @@ fn assemble_hs_bsr(
         let j = p.j as usize;
         let ni = ctx.atom_n_orb[i] as usize;
         let nj = ctx.atom_n_orb[j] as usize;
-        let d = [coords[j][0] - coords[i][0], coords[j][1] - coords[i][1], coords[j][2] - coords[i][2]];
+        let d = [
+            coords[j][0] - coords[i][0],
+            coords[j][1] - coords[i][1],
+            coords[j][2] - coords[i][2],
+        ];
         let (w, _) = hs_taper(taper, (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt());
-        if w == 0.0 { continue; }   // beyond taper: block stays exactly zero
-        // Same helper as the dense force path (pub(crate) in forces.rs).
-        build_pair_block(ctx, coords[i], coords[j], i, j, &mut hb[..ni * nj], &mut sb[..ni * nj])?;
+        if w == 0.0 {
+            continue;
+        } // beyond taper: block stays exactly zero
+          // Same helper as the dense force path (pub(crate) in forces.rs).
+        build_pair_block(
+            ctx,
+            coords[i],
+            coords[j],
+            i,
+            j,
+            &mut hb[..ni * nj],
+            &mut sb[..ni * nj],
+        )?;
         let bji = p.b_ji as usize;
         let bij = p.b_ij as usize;
         for a in 0..nj {
@@ -1779,6 +2620,13 @@ fn apply_disp(xyz: &mut [f64; 3], v: &[f64; 3], fx: f64, fy: f64, fz: f64, dt: f
     let mut dy = v[1] * dt + 0.5 * fy * dt * dt;
     let mut dz = v[2] * dt + 0.5 * fz * dt * dt;
     let d = (dx * dx + dy * dy + dz * dz).sqrt();
-    if d > MAX_FIRE_DISP { let s = MAX_FIRE_DISP / d; dx *= s; dy *= s; dz *= s; }
-    xyz[0] += dx; xyz[1] += dy; xyz[2] += dz;
+    if d > MAX_FIRE_DISP {
+        let s = MAX_FIRE_DISP / d;
+        dx *= s;
+        dy *= s;
+        dz *= s;
+    }
+    xyz[0] += dx;
+    xyz[1] += dy;
+    xyz[2] += dz;
 }

@@ -1,4 +1,4 @@
-pub mod traits;
 pub mod dftb;
-pub mod xtb;
 pub mod sparse;
+pub mod traits;
+pub mod xtb;

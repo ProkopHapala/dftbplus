@@ -221,7 +221,11 @@ and the lack of a proper LBFGS optimizer (FIRE is inefficient near the minimum).
 |-----------|----------|----------|--------|-------|
 | Jacobi eigensolve | Rust | `nalgebra::SymmetricEigen` | deprecated | 20ms for N=56, do not use for N>20 |
 | LAPACK dsyevd | Rust+FFI | `rust_dftb/src/qmqm/fragment.rs` | active | 0.7ms for N=56, via `lapack` crate + system OpenBLAS |
-| GPU Jacobi eigensolve | OpenCL | `rust_dftb/src/qmqm/gpu_eigen.cl` | experimental | for GPU-resident batched solve, separate path |
+| GPU Jacobi eigensolve (small N≤64) | OpenCL | `rust_dftb/src/qmqm/gpu_eigen.cl` | active | Brent-Luk full-local; per-system workgroup |
+| GPU Jacobi direct (n≤256) | OpenCL | `rust_dftb/src/qmqm/gpu_tiled_jacobi.cl::jacobi_cyclic_global_batched` | active | A/V streamed from global each round — bandwidth-bound (~85% DRAM peak); superseded at n≤96 by resident |
+| GPU Jacobi resident (n≲96) | OpenCL | `gpu_tiled_jacobi.cl::jacobi_resident_batched` | **active, auto-default** | A `__local`-resident all sweeps + per-sweep deferred-V apply via rotlog; ~2.2× vs direct at N=86, bit-identical accuracy. res-AV variant (V also local) gated by 48 KB device cap |
+| GPU block Jacobi (n>128) | OpenCL | `rust_dftb/src/qmqm/gpu_block_jacobi.cl::block_jacobi_1wg` | active | compound-pivot B=32/IMAX=1/ITOL=1e-6 (tuned); ~5× vs direct at N=246 |
+| GPU eigensolver dispatch | Rust | `rust_dftb/src/qmqm/gpu_eigen.rs::eigsolver_kind` | active | auto = resident-if-fits (n≤128) / block (n>128) / direct fallback; `RUST_DFTB_EIGSOLVER`={auto,direct,block,resident,resident_av}, fail-loud |
 | Davidson partial eigensolve | Rust | `rust_dftb/src/methods/sparse/davidson.rs` | experimental | for sparse/large systems, frontier orbitals only. Fails on coronene (diagonal preconditioner). See `davidson_eigensolver.md`. |
 | Chebyshev+Ritz sparse eigensolve | Python | `scripts/sparse_homo_lumo.py` | active | Cholesky-transformed implicit operator + polynomial filter. Converges on coronene, circumcoronene, ribbons to N=1156. 7.5× faster than dense at N=1156. See `chebyshev_ritz_eigensolver.md`. |
 
@@ -244,6 +248,7 @@ and the lack of a proper LBFGS optimizer (FIRE is inefficient near the minimum).
 ## Cross-references
 
 - Session report: `doc/prokop/reports/2025-09-05_hbond_optimization_lapack.md`
+- GPU Jacobi measurements (2026-09-17): `doc/prokop/reports/2026-09-17_resident_jacobi_eigensolver.md` + measured sweep digest `doc/prokop/tasts/HBond_Relaxed_Scan_GPU/Measured_Facts_Jacobi_Sweeps.md` — the GPU-side counterpart: streaming direct kernel is DRAM-bandwidth-bound; resident-A + deferred-V fixes it (~2.2×).
 - Task spec: `doc/prokop/tasts/GPU_MultiSystem/hbond_switching.md`
 - SCC solver: `rust_dftb/src/qmqm/solver.rs`
 - Fragment diagonalize: `rust_dftb/src/qmqm/fragment.rs`

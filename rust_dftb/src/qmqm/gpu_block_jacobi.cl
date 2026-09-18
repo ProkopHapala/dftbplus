@@ -206,9 +206,10 @@ __kernel void block_jacobi_1wg(
     const int init_v,             // 0 → V=I first; 1 → rotate V in place (warm)
     __global const int* active,   // [batch] 0 → replica parked, early-out
     __global float* diag,         // [batch][4] {off, off/‖A‖_F, stop, sweeps}
-    __global float* eig           // [batch][n] eigenvalues out
+    __global float* eig,          // [batch][n] eigenvalues out
+    __global const int* work_ids  // launch-index → physical slot (identity at full batch)
 ) {
-    const int gid = get_group_id(0);
+    const int gid = work_ids[get_group_id(0)];
     const int lid = get_local_id(0);
     const int lsz = get_local_size(0);
     if (gid >= batch || active[gid] == 0) return;

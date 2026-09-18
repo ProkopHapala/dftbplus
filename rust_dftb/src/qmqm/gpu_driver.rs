@@ -35,7 +35,12 @@ const HAM_SOURCE: &str = include_str!("../methods/dftb/dftb_hamiltonian.cl");
 
 impl Default for GpuFragment {
     fn default() -> Self {
-        Self { n_atoms: 0, n_orbs: 0, atom_off: 0, h_base: 0 }
+        Self {
+            n_atoms: 0,
+            n_orbs: 0,
+            atom_off: 0,
+            h_base: 0,
+        }
     }
 }
 impl PartialEq for GpuFragment {
@@ -51,8 +56,15 @@ unsafe impl ocl::OclPrm for GpuFragment {}
 impl Default for GpuPairEntry {
     fn default() -> Self {
         Self {
-            replica: 0, atom_i: 0, atom_j: 0, orb_i: 0, orb_j: 0,
-            r: 0.0, l: 0.0, m: 0.0, n: 0.0,
+            replica: 0,
+            atom_i: 0,
+            atom_j: 0,
+            orb_i: 0,
+            orb_j: 0,
+            r: 0.0,
+            l: 0.0,
+            m: 0.0,
+            n: 0.0,
         }
     }
 }
@@ -100,7 +112,11 @@ impl GpuDriver {
             .src(HAM_SOURCE)
             .build(&context)
             .map_err(map_ocl_err)?;
-        Ok(Self { context, queue, program })
+        Ok(Self {
+            context,
+            queue,
+            program,
+        })
     }
 
     /// Assemble H0/S for an entire batch of replicas in one set of kernel
@@ -185,7 +201,9 @@ impl GpuDriver {
             .arg(total_atoms as i32)
             .build()
             .map_err(map_ocl_err)?;
-        unsafe { k_onsite.enq().map_err(map_ocl_err)?; }
+        unsafe {
+            k_onsite.enq().map_err(map_ocl_err)?;
+        }
 
         // --- Kernel 1: V_A (gamma electrostatics), one workgroup per fragment ---
         let gamma_neigh = &batch.gamma_neigh;
@@ -213,7 +231,9 @@ impl GpuDriver {
             .arg(n_global_species as i32)
             .build()
             .map_err(map_ocl_err)?;
-        unsafe { k_va.enq().map_err(map_ocl_err)?; }
+        unsafe {
+            k_va.enq().map_err(map_ocl_err)?;
+        }
 
         // --- Kernel 2: assemble_pairs, one launch per species-pair bucket ---
         for bucket in &batch.pair_buckets {
@@ -251,7 +271,9 @@ impl GpuDriver {
                 .arg(sk_table.n_sk_cols as i32)
                 .build()
                 .map_err(map_ocl_err)?;
-            unsafe { k_pairs.enq().map_err(map_ocl_err)?; }
+            unsafe {
+                k_pairs.enq().map_err(map_ocl_err)?;
+            }
         }
 
         self.queue.finish().map_err(map_ocl_err)?;

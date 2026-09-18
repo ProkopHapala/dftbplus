@@ -10,10 +10,10 @@
 //! - Mixer history buffers are pre-allocated.
 
 use crate::core::error::{DftbError, Result};
+use crate::qmqm::fragment::Fragment;
 use crate::qmqm::gamma::GammaTable;
 use crate::qmqm::mixer::Mixer;
 use crate::qmqm::neighbor::FragmentNeighborList;
-use crate::qmqm::fragment::Fragment;
 use crate::qmqm::shifts::compute_intra_shifts;
 
 const ANG2BOHR: f64 = 1.889_726_133;
@@ -64,7 +64,11 @@ impl<M: Mixer> MultiSystemSolver<M> {
         mut mixer: M,
     ) -> Self {
         let total_atoms: usize = fragments.iter().map(|f| f.template.n_atoms).sum();
-        let max_atoms_per_frag = fragments.iter().map(|f| f.template.n_atoms).max().unwrap_or(0);
+        let max_atoms_per_frag = fragments
+            .iter()
+            .map(|f| f.template.n_atoms)
+            .max()
+            .unwrap_or(0);
 
         // Flatten q0 and initial charges.
         let mut q0 = Vec::with_capacity(total_atoms);
@@ -101,7 +105,10 @@ impl<M: Mixer> MultiSystemSolver<M> {
     /// Atom offset for fragment `fi` in the global flattened arrays.
     #[inline]
     pub fn atom_offset(&self, fi: usize) -> usize {
-        self.fragments[..fi].iter().map(|f| f.template.n_atoms).sum()
+        self.fragments[..fi]
+            .iter()
+            .map(|f| f.template.n_atoms)
+            .sum()
     }
 
     /// Slice of global arrays belonging to fragment `fi`.
@@ -283,7 +290,10 @@ impl<M: Mixer> MultiSystemSolver<M> {
             self.n_scc_iter = iter + 1;
 
             if verbose || iter % 10 == 0 || iter < 3 {
-                eprintln!("    [scc] iter {:>3}  RMS={:.3e}  max|dq|={:.3e}", iter, rms, max_abs);
+                eprintln!(
+                    "    [scc] iter {:>3}  RMS={:.3e}  max|dq|={:.3e}",
+                    iter, rms, max_abs
+                );
             }
 
             if rms < tol {
@@ -291,7 +301,8 @@ impl<M: Mixer> MultiSystemSolver<M> {
             }
 
             // 6. Mix.
-            self.mixer.mix(&mut self.charges, &self.q_out, &self.residual);
+            self.mixer
+                .mix(&mut self.charges, &self.q_out, &self.residual);
 
             // 7. Scatter new charges back to fragments for next iteration.
             self.scatter_charges();

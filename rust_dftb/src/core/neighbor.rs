@@ -38,6 +38,9 @@ impl NeighborBuilder {
                 }
             }
         }
-        Ok(NeighborList { pairs, cutoff: self.cutoff })
+        Ok(NeighborList {
+            pairs,
+            cutoff: self.cutoff,
+        })
     }
 }

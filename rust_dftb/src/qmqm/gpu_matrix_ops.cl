@@ -194,9 +194,10 @@ __kernel void batched_gemm(
     __global const float* B,
     __global float* C,
     __local float* As,
-    __local float* Bs
+    __local float* Bs,
+    __global const int* work_ids    // launch-index → physical slot (identity at full batch)
 ) {
-    const int ib = get_group_id(2);
+    const int ib = work_ids[get_group_id(2)];
     if (ib >= batch) return;
     const int stride = n * n;
     batched_gemm_core(n, trans_a, trans_b, alpha, beta,
@@ -218,9 +219,10 @@ __kernel void batched_gemm_active(
     __global float* C,
     __local float* As,
     __local float* Bs,
-    __global const int* active
+    __global const int* active,
+    __global const int* work_ids    // launch-index → physical slot (identity at full batch)
 ) {
-    const int ib = get_group_id(2);
+    const int ib = work_ids[get_group_id(2)];
     if (ib >= batch || active[ib] == 0) return;
     const int stride = n * n;
     batched_gemm_core(n, trans_a, trans_b, alpha, beta,
@@ -697,9 +699,10 @@ __kernel void matmul_full_local_batched(
     const int batch,
     __global const float* A,
     __global const float* B,
-    __global float* C
+    __global float* C,
+    __global const int* work_ids    // launch-index → physical slot (identity at full batch)
 ) {
-    const int sid = get_group_id(0);
+    const int sid = work_ids[get_group_id(0)];
     const int lid = get_local_id(0);
     const int lsz = get_local_size(0);
     if (sid >= batch) return;
@@ -758,9 +761,10 @@ __kernel void gamma_matvec_batched(
     const int batch,
     __global const float* G,
     __global const float* dq,
-    __global float* V
+    __global float* V,
+    __global const int* work_ids    // launch-index → physical slot (identity at full batch)
 ) {
-    const int sid = get_group_id(0);
+    const int sid = work_ids[get_group_id(0)];
     const int lid = get_local_id(0);
     if (sid >= batch) return;
     __global const float* Gb  = G  + (size_t)sid * n_atoms * n_atoms;
@@ -797,9 +801,10 @@ __kernel void h_scc_update_batched(
     __global const float* V,
     __global const int* orb_atom,
     __global float* H,
-    __local float* Vloc
+    __local float* Vloc,
+    __global const int* work_ids    // launch-index → physical slot (identity at full batch)
 ) {
-    const int sid = get_group_id(0);
+    const int sid = work_ids[get_group_id(0)];
     const int lid = get_local_id(0);
     const int lsz = get_local_size(0);
     if (sid >= batch) return;
@@ -845,9 +850,10 @@ __kernel void mulliken_charges_batched(
     __global const int* orb_atom,
     __global float* q,
     __local float* diag,
-    __global const int* active      // [batch] 0 → replica frozen, early-out
+    __global const int* active,     // [batch] 0 → replica frozen, early-out
+    __global const int* work_ids    // launch-index → physical slot (identity at full batch)
 ) {
-    const int sid = get_group_id(0);
+    const int sid = work_ids[get_group_id(0)];
     const int lid = get_local_id(0);
     const int lsz = get_local_size(0);
     if (sid >= batch || active[sid] == 0) return;
@@ -894,9 +900,10 @@ __kernel void residual_and_mix_batched(
     __global float* q_mixed,
     __global float* rms,
     __global const int* active,   // [batch] 0 → replica frozen, early-out
-    __local float* scratch
+    __local float* scratch,
+    __global const int* work_ids    // launch-index → physical slot (identity at full batch)
 ) {
-    const int sid = get_group_id(0);
+    const int sid = work_ids[get_group_id(0)];
     const int lid = get_local_id(0);
     const int lsz = get_local_size(0);
     if (sid >= batch || active[sid] == 0) return;
@@ -931,9 +938,10 @@ __kernel void commit_q_batched(
     const int batch,
     __global const float* q_next,
     __global float* q,
-    __global const int* active
+    __global const int* active,
+    __global const int* work_ids    // launch-index → physical slot (identity at full batch)
 ) {
-    const int sid = get_group_id(0);
+    const int sid = work_ids[get_group_id(0)];
     const int lid = get_local_id(0);
     const int lsz = get_local_size(0);
     if (sid >= batch || active[sid] == 0) return;
@@ -966,9 +974,10 @@ __kernel void fused_dq_v_hscc_batched(
     __global float* H,              // [batch*n*n] out
     __local float* ldq,             // [n_atoms] local Δq
     __local float* lv,              // [n_atoms] local V
-    __global const int* active      // [batch] 0 → replica frozen, early-out
+    __global const int* active,     // [batch] 0 → replica frozen, early-out
+    __global const int* work_ids    // launch-index → physical slot (identity at full batch)
 ) {
-    const int sid = get_group_id(0);
+    const int sid = work_ids[get_group_id(0)];
     const int lid = get_local_id(0);
     const int lsz = get_local_size(0);
     if (sid >= batch || active[sid] == 0) return;
@@ -1017,9 +1026,10 @@ __kernel void transpose_batched(
     const int n,
     const int batch,
     __global const float* a,
-    __global float* at
+    __global float* at,
+    __global const int* work_ids    // launch-index → physical slot (identity at full batch)
 ) {
-    const int sid = get_group_id(0);
+    const int sid = work_ids[get_group_id(0)];
     const int lid = get_local_id(0);
     const int lsz = get_local_size(0);
     if (sid >= batch) return;
@@ -1043,9 +1053,10 @@ __kernel void delta_q_batched(
     const int batch,
     __global const float* q,
     __global const float* q0,
-    __global float* dq
+    __global float* dq,
+    __global const int* work_ids    // launch-index → physical slot (identity at full batch)
 ) {
-    const int sid = get_group_id(0);
+    const int sid = work_ids[get_group_id(0)];
     const int lid = get_local_id(0);
     const int lsz = get_local_size(0);
     if (sid >= batch) return;
@@ -1072,9 +1083,10 @@ __kernel void build_density_masked_batched(
     __global const int* occ_mask,
     __global float* D,
     const int use_eig,
-    __global const float* eig
+    __global const float* eig,
+    __global const int* work_ids    // launch-index → physical slot (identity at full batch)
 ) {
-    const int sid = get_group_id(0);
+    const int sid = work_ids[get_group_id(0)];
     const int lid = get_local_id(0);
     const int lsz = get_local_size(0);
     if (sid >= batch) return;
@@ -1118,9 +1130,10 @@ __kernel void build_density_occ_batched(
     __global const float* occ_w, // [batch*n] per-orbital weights f_k
     __local float* lw,      // [n_occ] occupied weights
     __local int*   loi,     // [n_occ] occupied column indices
-    __global const int* active      // [batch] 0 → replica frozen, early-out
+    __global const int* active,     // [batch] 0 → replica frozen, early-out
+    __global const int* work_ids    // launch-index → physical slot (identity at full batch)
 ) {
-    const int sid = get_group_id(0);
+    const int sid = work_ids[get_group_id(0)];
     const int lid = get_local_id(0);
     const int lsz = get_local_size(0);
     if (sid >= batch || active[sid] == 0) return;
@@ -1174,9 +1187,10 @@ __kernel void frobenius_trace_batched(
     __global const float* A,
     __global const float* B,
     __global float* tr,
-    __local float* scratch
+    __local float* scratch,
+    __global const int* work_ids    // launch-index → physical slot (identity at full batch)
 ) {
-    const int sid = get_group_id(0);
+    const int sid = work_ids[get_group_id(0)];
     const int lid = get_local_id(0);
     const int lsz = get_local_size(0);
     if (sid >= batch) return;
@@ -1208,9 +1222,10 @@ __kernel void dot_batched(
     __global const float* x,
     __global const float* y,
     __global float* dot,
-    __local float* scratch
+    __local float* scratch,
+    __global const int* work_ids    // launch-index → physical slot (identity at full batch)
 ) {
-    const int sid = get_group_id(0);
+    const int sid = work_ids[get_group_id(0)];
     const int lid = get_local_id(0);
     const int lsz = get_local_size(0);
     if (sid >= batch) return;
@@ -1241,15 +1256,16 @@ __kernel void extract_diagonal_batched(
     const int batch,
     __global const float* a,
     __global float* diag,
-    __global const int* active      // [batch] 0 → replica frozen, early-out
+    __global const int* active,     // [batch] 0 → replica frozen, early-out
+    __global const int* work_ids    // launch-index → physical slot (identity at full batch)
 ) {
     const int gid = get_global_id(0);
     const int total = n * batch;
     if (gid >= total) return;
-    const int sid = gid / n;
+    const int sid = work_ids[gid / n];
     if (active[sid] == 0) return;
     const int i = gid % n;
-    diag[gid] = a[(size_t)sid * n * n + i * n + i];
+    diag[(size_t)sid * n + i] = a[(size_t)sid * n * n + i * n + i];
 }
 
 // ------------------------------------------------------------------
@@ -1284,9 +1300,10 @@ __kernel void select_occupation_batched(
     __global const float* eig_diag,
     __global int* occ_mask,
     __global int* occ_idx,
-    __global const int* active      // [batch] 0 → replica frozen, early-out
+    __global const int* active,     // [batch] 0 → replica frozen, early-out
+    __global const int* work_ids    // launch-index → physical slot (identity at full batch)
 ) {
-    const int sid = get_group_id(0);
+    const int sid = work_ids[get_group_id(0)];
     const int lid = get_local_id(0);
     const int lsz = get_local_size(0);
     if (sid >= batch || active[sid] == 0) return;
@@ -1364,9 +1381,10 @@ __kernel void fermi_occ_batched(
     __local float* le,          // [n] staged eigenvalues
     __local double* red,        // [lsz] f64 reduction scratch
     __local double* lohi,       // [4] lo, hi, s_mid, mu
-    __global const int* active  // [batch] 0 → replica frozen, early-out
+    __global const int* active, // [batch] 0 → replica frozen, early-out
+    __global const int* work_ids    // launch-index → physical slot (identity at full batch)
 ) {
-    const int sid = get_group_id(0);
+    const int sid = work_ids[get_group_id(0)];
     const int lid = get_local_id(0);
     const int lsz = get_local_size(0);
     if (sid >= batch || active[sid] == 0) return;
@@ -1474,9 +1492,10 @@ __kernel void repulsive_energy_batched(
     __global const int* spline_offsets,  // [n_species*n_species]
     const int n_species,
     __global const float* spline_data,   // flat
-    __global float* e_rep                // [batch]
+    __global float* e_rep,               // [batch]
+    __global const int* work_ids         // launch-index → physical slot (identity at full batch)
 ) {
-    const int sid = get_group_id(0);
+    const int sid = work_ids[get_group_id(0)];
     const int lid = get_local_id(0);
     const int lsz = get_local_size(0);
     if (sid >= batch) return;
@@ -1627,9 +1646,10 @@ __kernel void diis_step_batched(
                                  // convergence so the host can run chunked iterations)
     const float rms_tol,         // SCC convergence tolerance (f32 copy of the host tol)
     __local float* scratch,      // workgroup scratch (≥ lsz)
-    __global double* diis_work   // [batch*DIIS_MAX_HIST*n_atoms] W13: f64 QR working columns
+    __global double* diis_work,  // [batch*DIIS_MAX_HIST*n_atoms] W13: f64 QR working columns
+    __global const int* work_ids // launch-index → physical slot (identity at full batch)
 ) {
-    const int sid = get_group_id(0);
+    const int sid = work_ids[get_group_id(0)];
     const int lid = get_local_id(0);
     const int lsz = get_local_size(0);
     __local int l_diis_ok;
@@ -1829,9 +1849,10 @@ __kernel void energy_reduce_batched(
     const int use_w,
     const int occ_repair,
     __global double* out,           // [batch*4]
-    __local double* scratch         // [lsz]
+    __local double* scratch,        // [lsz]
+    __global const int* work_ids    // launch-index → physical slot (identity at full batch)
 ) {
-    const int sid = get_group_id(0);
+    const int sid = work_ids[get_group_id(0)];
     if (sid >= batch) return;
     const int lid = get_local_id(0);
     const int lsz = get_local_size(0);
@@ -1893,11 +1914,13 @@ __kernel void occ_normalize_batched(
     __local float* scratch,
     __global const int* active,     // [batch] 0 → replica frozen, early-out
     __global const float* occ_w,    // [batch*n] Fermi weights (use_w=1)
-    const int use_w                 // 1 → renorm every column with occ_w[k]>0
+    const int use_w,                // 1 → renorm every column with occ_w[k]>0
+    __global const int* work_ids    // launch-index → physical slot (identity at full batch)
 ) {
     const int gid = get_group_id(0);
-    const int sid = gid / n;
-    const int k = gid - sid * n;
+    const int iw = gid / n;
+    const int sid = work_ids[iw];
+    const int k = gid - iw * n;
     const int lid = get_local_id(0);
     const int lsz = get_local_size(0);
     if (sid >= batch || active[sid] == 0) return;
@@ -1936,11 +1959,13 @@ __kernel void snormalize_batched(
     __global float* C,
     __global const float* S,
     __local float* loc,
-    __global const int* active      // [batch] 0 → replica frozen, early-out
+    __global const int* active,     // [batch] 0 → replica frozen, early-out
+    __global const int* work_ids    // launch-index → physical slot (identity at full batch)
 ) {
     const int gid = get_group_id(0);
-    const int sid = gid / n;
-    const int k = gid - sid * n;
+    const int iw = gid / n;
+    const int sid = work_ids[iw];
+    const int k = gid - iw * n;
     const int lid = get_local_id(0);
     const int lsz = get_local_size(0);
     if (sid >= batch || active[sid] == 0) return;
@@ -1969,6 +1994,124 @@ __kernel void snormalize_batched(
 }
 
 // ------------------------------------------------------------------
+// cs_normalize_batched   (T03)
+//
+// Paired S-metric column renorm using the already-materialized SC = S·C:
+//   g_k = c_kᵀ S c_k = Σ_μ C[μ,k]·SC[μ,k];  C[:,k] ← C[:,k]/√g_k,
+//   SC[:,k] ← SC[:,k]/√g_k — scaling both keeps SC = S·C exactly.
+// Replaces snormalize_batched on the direct-population path: O(N²) reads
+// (two column streams) instead of streaming the whole S per column.
+// A non-finite or non-positive g_k yields a NaN scale → the column goes
+// NaN → the replica fails loudly downstream (never clamped silent).
+// One workgroup per (system, column); arbitrary-WG-safe reduction.
+// ------------------------------------------------------------------
+__kernel void cs_normalize_batched(
+    const int n,
+    const int batch,
+    __global float* C,
+    __global float* SC,
+    __local float* red,
+    __global const int* active,     // [batch] 0 → replica frozen, early-out
+    __global const int* work_ids    // launch-index → physical slot (identity at full batch)
+) {
+    const int gid = get_group_id(0);
+    const int iw = gid / n;
+    const int sid = work_ids[iw];
+    const int k = gid - iw * n;
+    const int lid = get_local_id(0);
+    const int lsz = get_local_size(0);
+    if (sid >= batch || active[sid] == 0) return;
+    const size_t base = (size_t)sid * n * n + k;
+    float acc = 0.0f;
+    for (int r = lid; r < n; r += lsz) {
+        acc = fma(C[base + r * n], SC[base + r * n], acc);
+    }
+    // Arbitrary-workgroup-size-safe tree reduction (bj_wg_sum scheme):
+    // fold the ragged tail onto a power-of-two front first.
+    red[lid] = acc;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    int p2 = 1;
+    while ((p2 << 1) <= lsz) p2 <<= 1;
+    if (lid + p2 < lsz) red[lid] += red[lid + p2];
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int o = p2 >> 1; o > 0; o >>= 1) {
+        if (lid < o) red[lid] += red[lid + o];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    const float g = red[0];
+    const float inv = (isfinite(g) && g > 0.0f) ? rsqrt(g) : (float)NAN;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int r = lid; r < n; r += lsz) {
+        C[base + r * n]  *= inv;
+        SC[base + r * n] *= inv;
+    }
+}
+
+// ------------------------------------------------------------------
+// mulliken_cs_batched   (T03)
+//
+// Direct atomic Mulliken populations from C and SC = S·C:
+//   q_A = 2 Σ_k w_k Σ_{μ∈A} C[μ,k]·SC[μ,k]
+//     = Σ_{μ∈A} (D·S)_μμ  with D = 2·Σ_k w_k C[:,k]·C[:,k]ᵀ — identical
+// algebra to mulliken_charges_batched(D,S) but the O(N²·n_occ) density
+// build and its O(N²) D·S contraction leave the SCC loop entirely.
+// w_k = occ_w[k] under Fermi smearing (use_w=1), else occ_mask[k] (0/1).
+// Same two-phase shape as mulliken_charges_batched: phase 1 computes the
+// per-orbital contraction p[μ] = Σ_k w_k·C[μ,k]·SC[μ,k] (strided lanes),
+// phase 2 reduces p[μ] over each atom's orbitals.
+// One workgroup per system.
+// ------------------------------------------------------------------
+__kernel void mulliken_cs_batched(
+    const int n,
+    const int n_atoms,
+    const int batch,
+    __global const float* C,
+    __global const float* SC,
+    __global const int* orb_atom,
+    __global const int* occ_mask,
+    __global const float* occ_w,
+    const int use_w,
+    __global float* q,
+    __local float* diag,
+    __global const int* active,     // [batch] 0 → replica frozen, early-out
+    __global const int* work_ids    // launch-index → physical slot (identity at full batch)
+) {
+    const int sid = work_ids[get_group_id(0)];
+    const int lid = get_local_id(0);
+    const int lsz = get_local_size(0);
+    if (sid >= batch || active[sid] == 0) return;
+    __global const float* Cb = C  + (size_t)sid * n * n;
+    __global const float* Sb = SC + (size_t)sid * n * n;
+    __global const int*   oa = orb_atom + (size_t)sid * n;
+    __global const int*   mb = occ_mask + (size_t)sid * n;
+    __global const float* wb = occ_w + (size_t)sid * n;
+    __global float* qb = q + (size_t)sid * n_atoms;
+
+    // Phase 1: per-orbital weighted contraction.
+    for (int mu = lid; mu < n; mu += lsz) {
+        __global const float* crow = Cb + mu * n;
+        __global const float* srow = Sb + mu * n;
+        float s = 0.0f;
+        if (use_w != 0) {
+            for (int k = 0; k < n; ++k) s = fma(wb[k] * crow[k], srow[k], s);
+        } else {
+            for (int k = 0; k < n; ++k) s = fma((float)mb[k] * crow[k], srow[k], s);
+        }
+        diag[mu] = s;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    // Phase 2: per-atom population (factor 2 = spin, as in D=2ΣwCCᵀ).
+    if (lid < n_atoms) {
+        float sum = 0.0f;
+        for (int mu = 0; mu < n; ++mu) {
+            if (oa[mu] == lid) sum += diag[mu];
+        }
+        qb[lid] = 2.0f * sum;
+    }
+}
+
+// ------------------------------------------------------------------
 // occ_rayleigh_batched
 //
 // Manifest §12 D3/D4: generalized Rayleigh quotient of the AO eigenvectors,
@@ -1993,11 +2136,13 @@ __kernel void occ_rayleigh_batched(
     __local float* loc,
     __global const int* active,     // [batch] 0 → replica frozen, early-out
     __global const float* occ_w,    // [batch*n] Fermi weights (use_w=1)
-    const int use_w
+    const int use_w,
+    __global const int* work_ids    // launch-index → physical slot (identity at full batch)
 ) {
     const int gid = get_group_id(0);
-    const int sid = gid / n;
-    const int k = gid - sid * n;
+    const int iw = gid / n;
+    const int sid = work_ids[iw];
+    const int k = gid - iw * n;
     const int lid = get_local_id(0);
     const int lsz = get_local_size(0);
     if (sid >= batch || active[sid] == 0) return;
@@ -2054,9 +2199,10 @@ __kernel void lowdin_q_from_m_batched(
     const int n,
     const int batch,
     __global const float* M,
-    __global float* Q
+    __global float* Q,
+    __global const int* work_ids    // launch-index → physical slot (identity at full batch)
 ) {
-    const int sid = get_group_id(0);
+    const int sid = work_ids[get_group_id(0)];
     if (sid >= batch) return;
     const int lid = get_local_id(0);
     const int lsz = get_local_size(0);
@@ -2078,9 +2224,10 @@ __kernel void metric_residual_batched(
     const int batch,
     __global const float* M,
     __global float* res,
-    __local float* scratch
+    __local float* scratch,
+    __global const int* work_ids    // launch-index → physical slot (identity at full batch)
 ) {
-    const int sid = get_group_id(0);
+    const int sid = work_ids[get_group_id(0)];
     if (sid >= batch) return;
     const int lid = get_local_id(0);
     const int lsz = get_local_size(0);
@@ -2109,9 +2256,10 @@ __kernel void lowdin_accept_batched(
     __global const float* e0,
     __global const float* e1,
     __global const float* X1,
-    __global float* X
+    __global float* X,
+    __global const int* work_ids    // launch-index → physical slot (identity at full batch)
 ) {
-    const int sid = get_group_id(0);
+    const int sid = work_ids[get_group_id(0)];
     if (sid >= batch) return;
     if (!(e1[sid] < e0[sid])) return;
     const int lid = get_local_id(0);

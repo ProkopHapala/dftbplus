@@ -17,12 +17,14 @@
 
 use nalgebra::{DMatrix, SymmetricEigen};
 use rust_dftb::methods::sparse::bsr4::{
-    build_full_mask, build_geometric_mask, build_identity, build_product_mask,
-    dense_matmul, dense_max_abs_diff, dense_frobenius, diag_block_map,
-    gershgorin_bounds, inf_norm, symmetrize_host, Bsr4Matrix, BS, BS2,
+    build_full_mask, build_geometric_mask, build_identity, build_product_mask, dense_frobenius,
+    dense_matmul, dense_max_abs_diff, diag_block_map, gershgorin_bounds, inf_norm, symmetrize_host,
+    Bsr4Matrix, BS, BS2,
 };
-use rust_dftb::methods::sparse::gpu_sparse::{SparseBsr4Config, SparseBsr4Gpu, SparsePurifyWorkspace};
 use rust_dftb::methods::sparse::gpu_sparse;
+use rust_dftb::methods::sparse::gpu_sparse::{
+    SparseBsr4Config, SparseBsr4Gpu, SparsePurifyWorkspace,
+};
 use rust_dftb::methods::sparse::harness::require_sparse_gpu;
 
 /// Deterministic LCG for reproducible random-ish data.
@@ -227,9 +229,7 @@ fn test_spgemm_mask_truncation() {
     let n = n_atom * BS;
     // Place atoms on a line with spacing 1.5; cutoff 2.0 -> only nearest
     // neighbors + self are in the mask.
-    let pos: Vec<[f64; 3]> = (0..n_atom)
-        .map(|i| [1.5 * i as f64, 0.0, 0.0])
-        .collect();
+    let pos: Vec<[f64; 3]> = (0..n_atom).map(|i| [1.5 * i as f64, 0.0, 0.0]).collect();
     let mask = build_geometric_mask(&pos, 2.0);
     let mut rng = Rng(0x55aa_55aa_55aa_55aa);
     let a_dense = random_symmetric_dense(n_atom, &mut rng, 1.0);
@@ -407,8 +407,14 @@ fn test_idempotency_exact_kernel() {
     }
     let idem_cpu = dense_frobenius(&diff);
     println!("idempotency exact K: ||KSK-K||_F GPU={idem_gpu:e} CPU={idem_cpu:e}");
-    assert!(idem_gpu < 5e-4, "exact K not idempotent on GPU: {idem_gpu:e}");
-    assert!((idem_gpu - idem_cpu).abs() < 5e-4, "idempotency mismatch GPU vs CPU");
+    assert!(
+        idem_gpu < 5e-4,
+        "exact K not idempotent on GPU: {idem_gpu:e}"
+    );
+    assert!(
+        (idem_gpu - idem_cpu).abs() < 5e-4,
+        "idempotency mismatch GPU vs CPU"
+    );
 
     // Also check Tr(KS) == Nocc.
     let t = gpu.matmul_masked_bsym(&k, &s, &mask).unwrap();
@@ -418,7 +424,10 @@ fn test_idempotency_exact_kernel() {
     let n_orb_buf = gpu.buf_u32(&vec![4u32; n_atom]).unwrap();
     let tr = gpu.trace_ks(n_atom, &diag_buf, &t_buf, &n_orb_buf).unwrap();
     println!("Tr(KS) = {tr:.6} (expected Nocc = {nocc})");
-    assert!((tr - nocc as f32).abs() < 1e-3, "Tr(KS) != Nocc: {tr} vs {nocc}");
+    assert!(
+        (tr - nocc as f32).abs() < 1e-3,
+        "Tr(KS) != Nocc: {tr} vs {nocc}"
+    );
 }
 
 // =====================================================================
@@ -530,18 +539,29 @@ fn test_tc2_convergence() {
         let tr = gpu.trace_ks(n_atom, &diag_buf, &t_buf, &n_orb_buf).unwrap();
         println!("TC2 step {step}: ||KSK-K||_F={idem:e}  Tr(KS)={tr:.5} (Nocc={nocc})");
         // Trace must stay bounded and in [0, 2*Nocc].
-        assert!(tr >= -1.0 && tr <= 2.0 * nocc, "TC2 trace out of bounds at step {step}: {tr}");
+        assert!(
+            tr >= -1.0 && tr <= 2.0 * nocc,
+            "TC2 trace out of bounds at step {step}: {tr}"
+        );
         prev_idem = idem;
         last_tr = tr;
         if idem < 1e-5 {
             break;
         }
-        let (knew, _n) = gpu.tc2_step(&k, &s, nocc, &mask, &mask, &diag_buf, &n_orb_buf).unwrap();
+        let (knew, _n) = gpu
+            .tc2_step(&k, &s, nocc, &mask, &mask, &diag_buf, &n_orb_buf)
+            .unwrap();
         k = gpu.symmetrize_mat(&knew).unwrap();
     }
     println!("TC2 final ||KSK-K||_F = {prev_idem:e}  Tr(KS)={last_tr:.5}");
-    assert!(prev_idem < 1e-5, "TC2 did not converge: {prev_idem:e} (measured ~4e-6; G2)");
-    assert!((last_tr - nocc).abs() < 1e-5, "TC2 trace != Nocc: {last_tr} vs {nocc} (G2)");
+    assert!(
+        prev_idem < 1e-5,
+        "TC2 did not converge: {prev_idem:e} (measured ~4e-6; G2)"
+    );
+    assert!(
+        (last_tr - nocc).abs() < 1e-5,
+        "TC2 trace != Nocc: {last_tr} vs {nocc} (G2)"
+    );
 }
 
 // =====================================================================
@@ -554,9 +574,7 @@ fn test_tc2_convergence() {
 fn test_boolean_product_mask() {
     let n_atom = 5;
     // Place atoms on a line, spacing 1.5.
-    let pos: Vec<[f64; 3]> = (0..n_atom)
-        .map(|i| [1.5 * i as f64, 0.0, 0.0])
-        .collect();
+    let pos: Vec<[f64; 3]> = (0..n_atom).map(|i| [1.5 * i as f64, 0.0, 0.0]).collect();
     // M_HS: cutoff 2.0 -> self + nearest neighbors.
     let s_mask = build_geometric_mask(&pos, 2.0);
     // M_K: cutoff 3.5 -> self + 2 nearest neighbors.
@@ -587,7 +605,11 @@ fn test_boolean_product_mask() {
         for j in 0..n_atom {
             if t_adj[i * n_atom + j] != t_ref[i * n_atom + j] {
                 mismatches += 1;
-                println!("  mismatch ({i},{j}): mask={} ref={}", t_adj[i * n_atom + j], t_ref[i * n_atom + j]);
+                println!(
+                    "  mismatch ({i},{j}): mask={} ref={}",
+                    t_adj[i * n_atom + j],
+                    t_ref[i * n_atom + j]
+                );
             }
         }
     }
@@ -635,15 +657,20 @@ fn test_boolean_product_mask() {
         let full_norm = dense_frobenius(&full_block);
         println!("  omitted block (0,{removed}) full norm = {full_norm:e}");
         // The truncated result should NOT have this block.
-        assert!(t_trunc_res.find(0, removed as usize).is_none(),
-            "truncated mask still contains omitted block");
+        assert!(
+            t_trunc_res.find(0, removed as usize).is_none(),
+            "truncated mask still contains omitted block"
+        );
         // And the full result should have a nonzero block there (otherwise
         // the omission is physically irrelevant for this data).
         assert!(full_norm > 1e-6,
             "omitted block is zero in full result — test data doesn't exercise the omission (full_norm={full_norm:e})");
         let max_diff = full_norm; // the "diff" is the entire missing block
         println!("  omission detected: missing block norm = {max_diff:e}");
-        assert!(max_diff > 1e-6, "omission not detected (max_diff={max_diff:e})");
+        assert!(
+            max_diff > 1e-6,
+            "omission not detected (max_diff={max_diff:e})"
+        );
     }
 }
 
@@ -693,7 +720,10 @@ fn test_newton_schulz_inverse() {
     let err = dense_max_abs_diff(&z_dense, &s_inv_dense);
     println!("  ||Z - S⁻¹||_max = {err:e}");
     assert!(rz < 1e-3, "Newton-Schulz did not converge: R_Z = {rz:e}");
-    assert!(err < 1e-4, "Z != S⁻¹: max|dZ| = {err:e} (host NS measured 1.1e-5; G2)");
+    assert!(
+        err < 1e-4,
+        "Z != S⁻¹: max|dZ| = {err:e} (host NS measured 1.1e-5; G2)"
+    );
 }
 
 // =====================================================================
@@ -717,8 +747,18 @@ fn test_newton_schulz_inverse_dev() {
     // Build device-resident structures.
     let k_struct = Arc::new(GpuBsrStructure::new(&gpu, n_atom, &mask).unwrap());
     let t_struct = Arc::new(GpuBsrStructure::new(&gpu, n_atom, &mask).unwrap());
-    let s_struct = Arc::new(GpuBsrStructure::new(&gpu, n_atom, &(s_host.row_ptr.clone(), s_host.col_idx.clone())).unwrap());
-    let s = GpuBsrMatrix { struct_: s_struct, values: gpu.buf_f32(&s_host.values).unwrap() };
+    let s_struct = Arc::new(
+        GpuBsrStructure::new(
+            &gpu,
+            n_atom,
+            &(s_host.row_ptr.clone(), s_host.col_idx.clone()),
+        )
+        .unwrap(),
+    );
+    let s = GpuBsrMatrix {
+        struct_: s_struct,
+        values: gpu.buf_f32(&s_host.values).unwrap(),
+    };
 
     let (z, rz, iters) = gpu
         .newton_schulz_inverse_dev(&s, &k_struct, &t_struct, 30, 1e-4, 3)
@@ -729,7 +769,9 @@ fn test_newton_schulz_inverse_dev() {
     let s_f64 = row_major_to_dmatrix_f64(&s_dense, n);
     let se = SymmetricEigen::new(s_f64.clone());
     let mut d = DMatrix::<f64>::zeros(n, n);
-    for i in 0..n { d[(i, i)] = 1.0 / se.eigenvalues[i].max(1e-12); }
+    for i in 0..n {
+        d[(i, i)] = 1.0 / se.eigenvalues[i].max(1e-12);
+    }
     let s_inv = &se.eigenvectors * &d * se.eigenvectors.transpose();
     let s_inv_dense = dmatrix_to_row_major_f32(&s_inv);
 
@@ -749,7 +791,10 @@ fn test_newton_schulz_inverse_dev() {
     }
     let rz_f64 = zs_m_i.sqrt() / (n as f64).sqrt();
     println!("  ||Z_dev - S⁻¹||_max = {err:e}  R_Z_kernel={rz:e}  ||ZS−I||_F/√N (f64)={rz_f64:e}");
-    assert!(rz < 1e-3, "Newton-Schulz-dev did not converge: R_Z = {rz:e}");
+    assert!(
+        rz < 1e-3,
+        "Newton-Schulz-dev did not converge: R_Z = {rz:e}"
+    );
     // Residual must track the actual inverse error. Do not treat a historical
     // 100× gap as proven on this tree until this print is inspected. Keep red
     // if inverse error is large.
@@ -757,7 +802,10 @@ fn test_newton_schulz_inverse_dev() {
         err <= 20.0 * rz || err < 1e-4,
         "NS-dev residual lies: R_Z={rz:e} but max|Z-S⁻¹|={err:e}  ||ZS−I||_F/√N={rz_f64:e} (N4)"
     );
-    assert!(err < 1e-4, "Z_dev != S⁻¹: max|dZ| = {err:e} R_Z={rz:e} ||ZS−I||_F/√N={rz_f64:e} (keep red until N4)");
+    assert!(
+        err < 1e-4,
+        "Z_dev != S⁻¹: max|dZ| = {err:e} R_Z={rz:e} ||ZS−I||_F/√N={rz_f64:e} (keep red until N4)"
+    );
 }
 
 // =====================================================================
@@ -822,11 +870,20 @@ fn test_k0_and_tc2_vs_dense_projector() {
     let k_err = dense_max_abs_diff(&k_final_dense, &k_ref_dense);
     println!("  ||K_final - K_ref||_max = {k_err:e}");
     assert!(r_i < 1e-5, "TC2 did not converge: R_I = {r_i:e} (G2)");
-    assert!((tr - nocc_f).abs() < 1e-5, "Tr(KS) != Nocc: {tr} vs {nocc_f} (G2)");
+    assert!(
+        (tr - nocc_f).abs() < 1e-5,
+        "Tr(KS) != Nocc: {tr} vs {nocc_f} (G2)"
+    );
     // The final K should match the dense projector much better than K₀.
-    assert!(k_err < k0_err, "TC2 did not improve over K₀: {k_err:e} vs {k0_err:e}");
+    assert!(
+        k_err < k0_err,
+        "TC2 did not improve over K₀: {k_err:e} vs {k0_err:e}"
+    );
     // With full mask + well-conditioned S, expect good agreement.
-    assert!(k_err < 1e-5, "K_final != K_ref: {k_err:e} (measured 7.7e-7; G2)");
+    assert!(
+        k_err < 1e-5,
+        "K_final != K_ref: {k_err:e} (measured 7.7e-7; G2)"
+    );
 
     // 6. Hamiltonian commutator R_H = ||HKS - SKH||_F.
     let r_h = gpu.hamiltonian_residual(&h, &k_final, &s, &mask).unwrap();
@@ -844,7 +901,10 @@ fn test_k0_and_tc2_vs_dense_projector() {
     let r_h_ref = gpu.hamiltonian_residual(&h, &k_ref_mat, &s, &mask).unwrap();
     let r_h_ref_norm = r_h_ref / (n as f32).sqrt();
     println!("  R_H(K_ref) = {r_h_ref:e}  (normalized {r_h_ref_norm:e})");
-    assert!(r_h_ref_norm < 1e-4, "R_H of exact projector too large: {r_h_ref_norm:e}");
+    assert!(
+        r_h_ref_norm < 1e-4,
+        "R_H of exact projector too large: {r_h_ref_norm:e}"
+    );
 }
 
 // =====================================================================
@@ -886,10 +946,13 @@ fn test_w_zhk_vs_khk_parity() {
     }
     let z = &se.eigenvectors * &dinv * se.eigenvectors.transpose();
 
-    let w_ref = 2.0 * &k_ref * &hf * &k_ref;   // 2KHK — validated convention
-    let w_gpt = 2.0 * &z * &hf * &k_ref;       // 2(ZH)K — GPT-5.6 shortcut
+    let w_ref = 2.0 * &k_ref * &hf * &k_ref; // 2KHK — validated convention
+    let w_gpt = 2.0 * &z * &hf * &k_ref; // 2(ZH)K — GPT-5.6 shortcut
 
-    let elem_diff = (&w_gpt - &w_ref).iter().map(|x| x.abs()).fold(0.0f64, f64::max);
+    let elem_diff = (&w_gpt - &w_ref)
+        .iter()
+        .map(|x| x.abs())
+        .fold(0.0f64, f64::max);
     let w_ref_max = w_ref.iter().map(|x| x.abs()).fold(0.0f64, f64::max);
     println!("W-parity: max|W_gpt−W_ref|={elem_diff:e}  max|W_ref|={w_ref_max:e}");
 
@@ -956,7 +1019,9 @@ fn test_rh_distinguishes_projectors() {
     let (_, q_c) = gpu.ksk(&k_correct, &s, &mask, &mask).unwrap();
     let q_c_buf = gpu.buf_f32(&q_c.values).unwrap();
     let k_c_buf = gpu.buf_f32(&k_correct.values).unwrap();
-    let r_i_c = gpu.idempotency_err(k_correct.nblock(), &q_c_buf, &k_c_buf).unwrap();
+    let r_i_c = gpu
+        .idempotency_err(k_correct.nblock(), &q_c_buf, &k_c_buf)
+        .unwrap();
     let r_h_c = gpu.hamiltonian_residual(&h, &k_correct, &s, &mask).unwrap();
 
     // R_H for the random (non-aligned) matrix.
@@ -969,11 +1034,17 @@ fn test_rh_distinguishes_projectors() {
         r_h_r / sqrt_n
     );
     // Correct projector: R_H ≈ 0 (eigenvector-aligned).
-    assert!(r_h_c / sqrt_n < 1e-3, "R_H of correct projector too large: {:.4e}", r_h_c / sqrt_n);
+    assert!(
+        r_h_c / sqrt_n < 1e-3,
+        "R_H of correct projector too large: {:.4e}",
+        r_h_c / sqrt_n
+    );
     // Random matrix: R_H should be much larger (not eigenvector-aligned).
-    assert!(r_h_r / sqrt_n > 1e-2,
+    assert!(
+        r_h_r / sqrt_n > 1e-2,
         "R_H of random matrix too small (does not distinguish!): {:.4e}",
-        r_h_r / sqrt_n);
+        r_h_r / sqrt_n
+    );
     // And the ratio should be large.
     let ratio = r_h_r / r_h_c.max(1e-30);
     println!("  R_H ratio (random/correct) = {ratio:.1e}");
@@ -994,7 +1065,9 @@ fn test_tc2_dev_resident_convergence() {
     let nocc: f32 = 3.0;
     let mut rng = Rng(0x7e57_c0de_face_cafe);
     let mut h_dense = random_symmetric_dense(n_atom, &mut rng, 0.4);
-    for i in 0..n { h_dense[i * n + i] += 2.0; }
+    for i in 0..n {
+        h_dense[i * n + i] += 2.0;
+    }
     let s_dense = make_overlap_dense(n_atom, &mut rng, 0.25);
     let k_exact_dense = cpu_density_kernel(&h_dense, &s_dense, n, nocc as usize);
     let mask = build_full_mask(n_atom);
@@ -1003,7 +1076,9 @@ fn test_tc2_dev_resident_convergence() {
     // K0 = alpha * K_exact (spectrally valid perturbation, same as test_tc2_convergence).
     let alpha = 0.8f32;
     let mut k0_dense = vec![0.0f32; n * n];
-    for i in 0..n * n { k0_dense[i] = alpha * k_exact_dense[i]; }
+    for i in 0..n * n {
+        k0_dense[i] = alpha * k_exact_dense[i];
+    }
     let mut k0 = bsr4_from_dense(n_atom, &k0_dense, &mask);
     k0 = gpu.symmetrize_mat(&k0).unwrap();
 
@@ -1015,20 +1090,27 @@ fn test_tc2_dev_resident_convergence() {
         .unwrap_or_else(|e| panic!("SparsePurifyWorkspace::new failed (no skip): {e}"));
 
     // Run device-resident TC2 purification.
-    let (k_final, r_i, tr, iters, _history) = ws.tc2_purify_dev(30, 1e-5, 1)
+    let (k_final, r_i, tr, iters, _history) = ws
+        .tc2_purify_dev(30, 1e-5, 1)
         .unwrap_or_else(|e| panic!("tc2_purify_dev failed (no skip): {e}"));
 
     println!("TC2-dev final: R_I={r_i:e}  Tr(KS)={tr:.5}  iters={iters}");
 
     // Same acceptance criteria as test_tc2_convergence.
     assert!(r_i < 1e-5, "TC2-dev did not converge: R_I={r_i:e} (G2)");
-    assert!((tr - nocc).abs() < 1e-5, "TC2-dev trace != Nocc: {tr} vs {nocc} (G2)");
+    assert!(
+        (tr - nocc).abs() < 1e-5,
+        "TC2-dev trace != Nocc: {tr} vs {nocc} (G2)"
+    );
 
     // Compare the device-resident result to the exact density kernel.
     let k_final_dense = k_final.to_dense();
     let max_diff = dense_max_abs_diff(&k_final_dense, &k_exact_dense);
     println!("  TC2-dev max|K_final - K_exact| = {max_diff:e}");
-    assert!(max_diff < 1e-5, "TC2-dev result too far from exact: {max_diff:e} (G2)");
+    assert!(
+        max_diff < 1e-5,
+        "TC2-dev result too far from exact: {max_diff:e} (G2)"
+    );
 
     // The returned diagnostics must describe the returned K, not the K from
     // the preceding iteration.  This catches the old tc2_step_dev contract,
@@ -1037,8 +1119,14 @@ fn test_tc2_dev_resident_convergence() {
     println!(
         "  returned-state reference: Tr(KS)={trace_ref:.8} R_I={residual_ref:e}; API: Tr={tr:.8} R_I={r_i:e}"
     );
-    assert!((tr - trace_ref).abs() < 5e-4, "returned Tr(KS) is not for returned K: API={tr}, reference={trace_ref}");
-    assert!((r_i - residual_ref).abs() < 5e-5, "returned R_I is not for returned K: API={r_i:e}, reference={residual_ref:e}");
+    assert!(
+        (tr - trace_ref).abs() < 5e-4,
+        "returned Tr(KS) is not for returned K: API={tr}, reference={trace_ref}"
+    );
+    assert!(
+        (r_i - residual_ref).abs() < 5e-5,
+        "returned R_I is not for returned K: API={r_i:e}, reference={residual_ref:e}"
+    );
 }
 
 // =====================================================================
@@ -1063,7 +1151,10 @@ fn test_tc2_nonconvergence_is_error() {
         Err(e) => {
             let msg = format!("{e}");
             println!("TC2 non-convergence error (expected): {msg}");
-            assert!(msg.to_ascii_lowercase().contains("converg"), "error lacks convergence context: {msg}");
+            assert!(
+                msg.to_ascii_lowercase().contains("converg"),
+                "error lacks convergence context: {msg}"
+            );
         }
         Ok((_, r_i, _, iters, _)) => panic!(
             "TC2 returned success after {iters} iteration(s) without reaching tol: R_I={r_i:e}"
@@ -1092,11 +1183,14 @@ fn test_newton_schulz_near_identity_nonconvergence_is_not_cancelled() {
         Err(e) => {
             let msg = format!("{e}");
             println!("Newton-Schulz near-identity error (expected): {msg}");
-            assert!(msg.to_ascii_lowercase().contains("converg"), "error lacks convergence context: {msg}");
+            assert!(
+                msg.to_ascii_lowercase().contains("converg"),
+                "error lacks convergence context: {msg}"
+            );
         }
-        Ok((_, r_z, _,)) => panic!(
-            "Newton-Schulz falsely converged after cancellation: R_Z={r_z:e}"
-        ),
+        Ok((_, r_z, _)) => {
+            panic!("Newton-Schulz falsely converged after cancellation: R_Z={r_z:e}")
+        }
     }
 }
 
@@ -1114,7 +1208,9 @@ fn test_tc2_dev_vs_host_parity() {
     let nocc: f32 = 3.0;
     let mut rng = Rng(0xface_b00c_1234_5678);
     let mut h_dense = random_symmetric_dense(n_atom, &mut rng, 0.4);
-    for i in 0..n { h_dense[i * n + i] += 2.0; }
+    for i in 0..n {
+        h_dense[i * n + i] += 2.0;
+    }
     let s_dense = make_overlap_dense(n_atom, &mut rng, 0.25);
     let k_exact_dense = cpu_density_kernel(&h_dense, &s_dense, n, nocc as usize);
     let mask = build_full_mask(n_atom);
@@ -1123,7 +1219,9 @@ fn test_tc2_dev_vs_host_parity() {
     // K0 = 0.8 * K_exact
     let alpha = 0.8f32;
     let mut k0_dense = vec![0.0f32; n * n];
-    for i in 0..n * n { k0_dense[i] = alpha * k_exact_dense[i]; }
+    for i in 0..n * n {
+        k0_dense[i] = alpha * k_exact_dense[i];
+    }
     let mut k0 = bsr4_from_dense(n_atom, &k0_dense, &mask);
     k0 = gpu.symmetrize_mat(&k0).unwrap();
 
@@ -1134,7 +1232,9 @@ fn test_tc2_dev_vs_host_parity() {
     let mut k_host = k0.clone();
     let n_orb_buf = gpu.buf_u32(&vec![4u32; n_atom]).unwrap();
     for step in 0..5 {
-        let (knew, _n) = gpu.tc2_step(&k_host, &s, nocc, &mask, &mask, &diag_buf, &n_orb_buf).unwrap();
+        let (knew, _n) = gpu
+            .tc2_step(&k_host, &s, nocc, &mask, &mask, &diag_buf, &n_orb_buf)
+            .unwrap();
         k_host = gpu.symmetrize_mat(&knew).unwrap();
     }
 
@@ -1174,10 +1274,17 @@ fn test_row_degree_overflow_fail_loud() {
     // records `max_deg` — output/product masks legitimately exceed the cap.
     // The check fires when the structure is used as a SpGEMM LEFT operand
     // (its row is cached in local memory). Test THAT, not construction.
-    let s_struct = rust_dftb::methods::sparse::gpu_sparse::GpuBsrStructure::new(&gpu, n_atom, &mask)
-        .unwrap_or_else(|e| panic!("GpuBsrStructure::new must not fail for a wide output mask: {e}"));
-    assert!(s_struct.max_deg > gpu.config().max_left_blocks as u32,
-        "test setup: expected max_deg {} > {}", s_struct.max_deg, gpu.config().max_left_blocks);
+    let s_struct =
+        rust_dftb::methods::sparse::gpu_sparse::GpuBsrStructure::new(&gpu, n_atom, &mask)
+            .unwrap_or_else(|e| {
+                panic!("GpuBsrStructure::new must not fail for a wide output mask: {e}")
+            });
+    assert!(
+        s_struct.max_deg > gpu.config().max_left_blocks as u32,
+        "test setup: expected max_deg {} > {}",
+        s_struct.max_deg,
+        gpu.config().max_left_blocks
+    );
     let s_arc = std::sync::Arc::new(s_struct);
     let a = rust_dftb::methods::sparse::gpu_sparse::GpuBsrMatrix::zero(&gpu, &s_arc).unwrap();
     let b = rust_dftb::methods::sparse::gpu_sparse::GpuBsrMatrix::zero(&gpu, &s_arc).unwrap();
@@ -1210,9 +1317,15 @@ fn test_sparse_gershgorin_no_densify() {
     let n_atom = 8;
     let mut rng = Rng(0x1234_5678_9abc_def0);
     // Build a random sparse matrix with a geometric mask.
-    let pos: Vec<[f64; 3]> = (0..n_atom).map(|i| {
-        [(i as f64 * 1.5) % 6.0, (i as f64 * 0.7) % 4.0, (i as f64 * 2.3) % 5.0]
-    }).collect();
+    let pos: Vec<[f64; 3]> = (0..n_atom)
+        .map(|i| {
+            [
+                (i as f64 * 1.5) % 6.0,
+                (i as f64 * 0.7) % 4.0,
+                (i as f64 * 2.3) % 5.0,
+            ]
+        })
+        .collect();
     let mask = build_geometric_mask(&pos, 4.0);
     let nblock = mask.1.len();
     assert!(nblock < n_atom * n_atom, "mask should be sparse");
@@ -1235,17 +1348,23 @@ fn test_sparse_gershgorin_no_densify() {
         let diag = dense[mu * n_orb + mu];
         let mut offdiag = 0.0f32;
         for nu in 0..n_orb {
-            if nu != mu { offdiag += dense[mu * n_orb + nu].abs(); }
+            if nu != mu {
+                offdiag += dense[mu * n_orb + nu].abs();
+            }
         }
         emin_dense = emin_dense.min(diag - offdiag);
         emax_dense = emax_dense.max(diag + offdiag);
     }
 
     let tol = 1e-5f32;
-    assert!((emin_sparse - emin_dense).abs() < tol,
-        "gershgorin emin mismatch: sparse={emin_sparse:e} dense={emin_dense:e}");
-    assert!((emax_sparse - emax_dense).abs() < tol,
-        "gershgorin emax mismatch: sparse={emax_sparse:e} dense={emax_dense:e}");
+    assert!(
+        (emin_sparse - emin_dense).abs() < tol,
+        "gershgorin emin mismatch: sparse={emin_sparse:e} dense={emin_dense:e}"
+    );
+    assert!(
+        (emax_sparse - emax_dense).abs() < tol,
+        "gershgorin emax mismatch: sparse={emax_sparse:e} dense={emax_dense:e}"
+    );
     println!("gershgorin (sparse mask, {nblock} blocks): emin={emin_sparse:.4} emax={emax_sparse:.4} — matches dense");
 }
 
@@ -1253,9 +1372,15 @@ fn test_sparse_gershgorin_no_densify() {
 fn test_sparse_inf_norm_no_densify() {
     let n_atom = 8;
     let mut rng = Rng(0xaabb_ccdd_eeff_0011);
-    let pos: Vec<[f64; 3]> = (0..n_atom).map(|i| {
-        [(i as f64 * 1.3) % 5.0, (i as f64 * 1.9) % 3.0, (i as f64 * 0.5) % 7.0]
-    }).collect();
+    let pos: Vec<[f64; 3]> = (0..n_atom)
+        .map(|i| {
+            [
+                (i as f64 * 1.3) % 5.0,
+                (i as f64 * 1.9) % 3.0,
+                (i as f64 * 0.5) % 7.0,
+            ]
+        })
+        .collect();
     let mask = build_geometric_mask(&pos, 3.5);
     let nblock = mask.1.len();
     assert!(nblock < n_atom * n_atom, "mask should be sparse");
@@ -1278,8 +1403,10 @@ fn test_sparse_inf_norm_no_densify() {
     }
 
     let tol = 1e-5f32;
-    assert!((norm_sparse - norm_dense).abs() < tol,
-        "inf_norm mismatch: sparse={norm_sparse:e} dense={norm_dense:e}");
+    assert!(
+        (norm_sparse - norm_dense).abs() < tol,
+        "inf_norm mismatch: sparse={norm_sparse:e} dense={norm_dense:e}"
+    );
     println!("inf_norm (sparse mask, {nblock} blocks): {norm_sparse:.6} — matches dense");
 }
 
@@ -1304,8 +1431,10 @@ fn test_sparse_perf_stats_audit() {
         ..Default::default()
     };
     stats.print_audit();
-    panic!("G1.9: SparsePerfStats dummy construction is not P0. Instrument real counters \
-        (kernel_launches, host_syncs, largest_dense) on an actual NS+TC2 run and assert them.");
+    panic!(
+        "G1.9: SparsePerfStats dummy construction is not P0. Instrument real counters \
+        (kernel_launches, host_syncs, largest_dense) on an actual NS+TC2 run and assert them."
+    );
 }
 
 // =====================================================================
@@ -1325,7 +1454,9 @@ fn test_k0_dev_vs_host() {
     let nocc = 3;
     let mut rng = Rng(0x5a5a_c0de_1234_5678);
     let mut h_dense = random_symmetric_dense(n_atom, &mut rng, 0.4);
-    for i in 0..n { h_dense[i * n + i] += 2.0; }
+    for i in 0..n {
+        h_dense[i * n + i] += 2.0;
+    }
     let s_dense = make_overlap_dense(n_atom, &mut rng, 0.2);
     let mask = build_full_mask(n_atom);
     let h = bsr4_from_dense(n_atom, &h_dense, &mask);
@@ -1349,15 +1480,23 @@ fn test_k0_dev_vs_host() {
     let h_dev = GpuBsrMatrix::from_host(&gpu, &h).unwrap();
     let z_dev = GpuBsrMatrix::from_host(&gpu, &z_host).unwrap();
     let b_dev = GpuBsrMatrix::zero(&gpu, &t_struct).unwrap();
-    let (emin_dev, emax_dev) = gpu.spectral_bounds_dev(&z_dev, &h_dev, &b_dev, 0.1).unwrap();
+    let (emin_dev, emax_dev) = gpu
+        .spectral_bounds_dev(&z_dev, &h_dev, &b_dev, 0.1)
+        .unwrap();
     println!("spectral bounds (dev):  emin={emin_dev:.4} emax={emax_dev:.4}");
 
     // Should match to f32 roundoff (same kernels, same order).
     let emin_err = (emin_host - emin_dev).abs();
     let emax_err = (emax_host - emax_dev).abs();
     println!("spectral bounds diff: emin_err={emin_err:e} emax_err={emax_err:e}");
-    assert!(emin_err < 1e-5, "emin mismatch: host={emin_host:e} dev={emin_dev:e}");
-    assert!(emax_err < 1e-5, "emax mismatch: host={emax_host:e} dev={emax_dev:e}");
+    assert!(
+        emin_err < 1e-5,
+        "emin mismatch: host={emin_host:e} dev={emin_dev:e}"
+    );
+    assert!(
+        emax_err < 1e-5,
+        "emax mismatch: host={emax_host:e} dev={emax_dev:e}"
+    );
 
     // 4. Device K0 construction.
     let a_dev = GpuBsrMatrix::zero(&gpu, &k_struct).unwrap();
@@ -1367,7 +1506,9 @@ fn test_k0_dev_vs_host() {
     let k0_dev_host = k0_dev.to_host(&gpu).unwrap();
 
     // 5. Host K0 construction (reference).
-    let k0_host = gpu.build_k0(&h, &s, &z_host, &mask, &mask, emin_host, emax_host).unwrap();
+    let k0_host = gpu
+        .build_k0(&h, &s, &z_host, &mask, &mask, emin_host, emax_host)
+        .unwrap();
 
     // 6. Compare.
     let k0_diff = dense_max_abs_diff(&k0_host.to_dense(), &k0_dev_host.to_dense());
@@ -1377,9 +1518,14 @@ fn test_k0_dev_vs_host() {
     // 7. Verify K0 leads to correct TC2 convergence.
     let t_mask = mask.clone();
     let all4 = vec![4u8; n_atom];
-    let mut ws = SparsePurifyWorkspace::new(gpu, &k0_dev_host, &s, &mask, &t_mask, &all4, nocc as f32).unwrap();
+    let mut ws =
+        SparsePurifyWorkspace::new(gpu, &k0_dev_host, &s, &mask, &t_mask, &all4, nocc as f32)
+            .unwrap();
     let (k_final, r_i, tr, iters, _) = ws.tc2_purify_dev(40, 1e-5, 1).unwrap();
     println!("TC2 from dev K0: {iters} iters, R_I={r_i:e}, Tr(KS)={tr:.6}");
     assert!(r_i < 1e-5, "TC2 did not converge: R_I={r_i:e} (G2)");
-    assert!((tr - nocc as f32).abs() < 1e-5, "Tr(KS) mismatch: {tr} vs {nocc} (G2)");
+    assert!(
+        (tr - nocc as f32).abs() < 1e-5,
+        "Tr(KS) mismatch: {tr} vs {nocc} (G2)"
+    );
 }

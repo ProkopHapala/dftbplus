@@ -40,9 +40,10 @@ __kernel void cdft_hscc_shift_batched(
     __global const float* lam,      // [batch*nfrag]
     __global float* H,              // [batch*n*n] h_scc, updated in place
     __local float* lw,              // [n_atoms] λw per atom
-    __global const int* active      // [batch] 0 → replica frozen, early-out
+    __global const int* active,     // [batch] 0 → replica frozen, early-out
+    __global const int* work_ids    // [gws] launch index → physical system (T06)
 ) {
-    const int sid = get_group_id(0);
+    const int sid = work_ids[get_group_id(0)];
     const int lid = get_local_id(0);
     const int lsz = get_local_size(0);
     if (sid >= batch || active[sid] == 0) return;

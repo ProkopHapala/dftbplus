@@ -138,6 +138,51 @@ inline int2 cyclic_jacobi_pair(int round, int ipair, int jn) {
     return (int2)((round + ipair) % m, (round + m - ipair) % m);
 }
 
+// Workgroup reductions for ARBITRARY lsz (WG≈N sweeps want 96/160/224 —
+// the naive `lsz>>1` halving requires a power of two and silently drops
+// lanes otherwise). Fold the tail [p2,lsz) onto [0,lsz−p2) first
+// (p2 = largest power of two ≤ lsz), then halve over p2 entries.
+// All work-items must call (workgroup barriers inside); the result is
+// read after the trailing barrier so `r` is reusable by the next call.
+inline float jac_sum_f(__local float* r, float v, const int lid, const int lsz) {
+    r[lid] = v;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    int p2 = 1;
+    while ((p2 << 1) <= lsz) p2 <<= 1;
+    if (lid + p2 < lsz) r[lid] += r[lid + p2];
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int o = p2 >> 1; o > 0; o >>= 1) {
+        if (lid < o) r[lid] += r[lid + o];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    const float s = r[0];
+    barrier(CLK_LOCAL_MEM_FENCE);
+    return s;
+}
+
+// f64 variant with op select: 0=sum, 1=min, 2=max (Fermi bracket+Newton).
+inline double jac_red_d(__local double* r, double v, const int lid, const int lsz, const int op) {
+    r[lid] = v;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    int p2 = 1;
+    while ((p2 << 1) <= lsz) p2 <<= 1;
+    if (lid + p2 < lsz) {
+        const double w = r[lid + p2];
+        r[lid] = (op == 0) ? (r[lid] + w) : ((op == 1) ? fmin(r[lid], w) : fmax(r[lid], w));
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int o = p2 >> 1; o > 0; o >>= 1) {
+        if (lid < o) {
+            const double w = r[lid + o];
+            r[lid] = (op == 0) ? (r[lid] + w) : ((op == 1) ? fmin(r[lid], w) : fmax(r[lid], w));
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    const double s = r[0];
+    barrier(CLK_LOCAL_MEM_FENCE);
+    return s;
+}
+
 __kernel void jacobi_cyclic_global_batched(
     __global float* A,   // [batch][n*n] in/out — eigenvalues on diag at exit
     __global float* V,   // [batch][n*n] in/out — eigenvectors (cols) at exit
@@ -154,9 +199,10 @@ __kernel void jacobi_cyclic_global_batched(
     const int n_occ_fermi,
     const float kT,
     __global float* occ_w,          // [batch*n] out: Fermi weights f_k
-    __global float* mu              // [batch] in/out: μ warm-start in, result out
+    __global float* mu,             // [batch] in/out: μ warm-start in, result out
+    __global const int* work_ids    // launch-index → physical slot (identity at full batch)
 ) {
-    const int gid = get_group_id(0);
+    const int gid = work_ids[get_group_id(0)];
     const int lid = get_local_id(0);
     const int lsz = get_local_size(0);
     if (active[gid] == 0) return;
@@ -171,11 +217,15 @@ __kernel void jacobi_cyclic_global_batched(
     __local int    rot_q[128];
     __local volatile int l_nrot;  // live (non-skipped) rotations this round
     __local float  reduce[WG];
-    // R5 Fermi tail scratch (used only when fermi_tail=1)
+    __local float  red2[WG];      // second column of the packed prologue reduce
+#ifndef JACOBI_NO_TAIL
+    // R5 Fermi tail scratch (used only when fermi_tail=1). JACOBI_NO_TAIL
+    // compiles these out — ~9 KB of local per WG on WG512.
     __local float  le[256];       // staged eigenvalues (diag of A)
     __local double dred[WG];      // f64 reductions: sum
     __local double dred2[WG];     // f64 reductions: derivative
     __local double lmu[4];        // {lo, hi, μ, done} — bracket state
+#endif
 
     // R5: defensive capacity guard — rot_*[] hold jpair ≤ 128 → jn ≤ 256.
     // The host rejects n>256 at plan build; if it ever reaches the kernel,
@@ -207,15 +257,8 @@ __kernel void jacobi_cyclic_global_batched(
         if (r != idx - r * n) fo += v * v;
         if (init_v == 0) gV[idx] = (r == idx - r * n) ? 1.0f : 0.0f;
     }
-    reduce[lid] = fa;
-    dred[lid] = (double)fo;              // second column of the packed reduce
-    barrier(CLK_LOCAL_MEM_FENCE);
-    for (int off = lsz >> 1; off > 0; off >>= 1) {
-        if (lid < off) { reduce[lid] += reduce[lid + off]; dred[lid] += dred[lid + off]; }
-        barrier(CLK_LOCAL_MEM_FENCE);
-    }
-    const float frob = sqrt(fmax(reduce[0], 1.0e-30f));
-    float off_cur = sqrt(fmax((float)dred[0], 0.0f));
+    const float frob = sqrt(fmax(jac_sum_f(reduce, fa, lid, lsz), 1.0e-30f));
+    float off_cur = sqrt(fmax(jac_sum_f(red2, fo, lid, lsz), 0.0f));
     barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
 
     const float off_exit = JACOBI_OFF_TOL * frob;
@@ -319,13 +362,7 @@ __kernel void jacobi_cyclic_global_batched(
             int r = idx / n;
             if (r != idx - r * n) { float v = gA[idx]; fo += v * v; }
         }
-        reduce[lid] = fo;  barrier(CLK_LOCAL_MEM_FENCE);
-        for (int off = lsz >> 1; off > 0; off >>= 1) {
-            if (lid < off) reduce[lid] += reduce[lid + off];
-            barrier(CLK_LOCAL_MEM_FENCE);
-        }
-        off_cur = sqrt(reduce[0]);
-        barrier(CLK_LOCAL_MEM_FENCE);
+        off_cur = sqrt(jac_sum_f(reduce, fo, lid, lsz));
         if (!isfinite(off_cur)) { stop = 4; break; }        // R5: NaN/Inf → report, don't loop on NaN
         if (off_cur <= off_exit) { stop = 0; break; }
         if (off_cur > 0.9f * prev_off) { if (++stall >= 3) { stop = 1; break; } } else { stall = 0; }
@@ -361,6 +398,7 @@ __kernel void jacobi_cyclic_global_batched(
     // on stop==0 alone would certify stale occupations). A non-finite
     // solve (stop=4) can never be certified — its occ_w stays stale and
     // the replica is parked as Failed downstream.
+#ifndef JACOBI_NO_TAIL
     if (fermi_tail != 0 && stop <= 2) {
         const double kt = (double)kT;
         const double want = (double)n_occ_fermi;
@@ -374,22 +412,8 @@ __kernel void jacobi_cyclic_global_batched(
             const double e = (double)le[k];
             elo = fmin(elo, e); ehi = fmax(ehi, e);
         }
-        dred[lid] = elo;
-        barrier(CLK_LOCAL_MEM_FENCE);
-        for (int o = lsz >> 1; o > 0; o >>= 1) {
-            if (lid < o) dred[lid] = fmin(dred[lid], dred[lid + o]);
-            barrier(CLK_LOCAL_MEM_FENCE);
-        }
-        elo = dred[0] - 32.0 * kt;
-        barrier(CLK_LOCAL_MEM_FENCE);
-        dred[lid] = ehi;
-        barrier(CLK_LOCAL_MEM_FENCE);
-        for (int o = lsz >> 1; o > 0; o >>= 1) {
-            if (lid < o) dred[lid] = fmax(dred[lid], dred[lid + o]);
-            barrier(CLK_LOCAL_MEM_FENCE);
-        }
-        ehi = dred[0] + 32.0 * kt;
-        barrier(CLK_LOCAL_MEM_FENCE);
+        elo = jac_red_d(dred, elo, lid, lsz, 1) - 32.0 * kt;
+        ehi = jac_red_d(dred, ehi, lid, lsz, 2) + 32.0 * kt;
 
         if (lid == 0) {
             const double mp = (double)mu[gid];
@@ -408,20 +432,16 @@ __kernel void jacobi_cyclic_global_batched(
                 s += f;
                 ds += (x > 40.0 || x < -40.0) ? 0.0 : f * (1.0 - f);
             }
-            dred[lid] = s; dred2[lid] = ds;
-            barrier(CLK_LOCAL_MEM_FENCE);
-            for (int o = lsz >> 1; o > 0; o >>= 1) {
-                if (lid < o) { dred[lid] += dred[lid + o]; dred2[lid] += dred2[lid + o]; }
-                barrier(CLK_LOCAL_MEM_FENCE);
-            }
+            const double st = jac_red_d(dred, s, lid, lsz, 0);
+            const double dst = jac_red_d(dred2, ds, lid, lsz, 0);
             if (lid == 0) {
-                const double g = dred[0] - want;
+                const double g = st - want;
                 if (fabs(g) < 1.0e-7 * fmax(want, 1.0)) {
                     lmu[3] = 1.0;
                 } else {
-                    if (dred[0] > want) lmu[1] = fmin(lmu[1], m); else lmu[0] = fmax(lmu[0], m);
+                    if (st > want) lmu[1] = fmin(lmu[1], m); else lmu[0] = fmax(lmu[0], m);
                     double mn = m;
-                    if (dred2[0] > 0.0) mn = m - g * kt / dred2[0];   // ds/dμ = Σf(1−f)/kT
+                    if (dst > 0.0) mn = m - g * kt / dst;   // ds/dμ = Σf(1−f)/kT
                     if (!(mn > lmu[0] && mn < lmu[1])) mn = 0.5 * (lmu[0] + lmu[1]);
                     lmu[2] = mn;
                 }
@@ -436,6 +456,336 @@ __kernel void jacobi_cyclic_global_batched(
             occ_w[(size_t)gid * n + k] = (float)((x > 40.0) ? 0.0 : ((x < -40.0) ? 1.0 : 1.0 / (1.0 + exp(x))));
         }
     }
+#else
+    // Fail-loud: the host requested the Fermi tail but this program was
+    // compiled JACOBI_NO_TAIL — occ_w/mu would silently stay stale.
+    // stop=5 marks the solve failed (host check_jacobi reports it).
+    if (fermi_tail != 0 && stop <= 2 && lid == 0) diag[4*gid+2] = 5.0f;
+#endif
+}
+
+// ------------------------------------------------------------------
+// jacobi_resident_batched  (T08b: data-residency experiment)
+//
+// Same Brent–Luk parallel cyclic Jacobi mathematics and diag/tail
+// contract as jacobi_cyclic_global_batched, but A lives in __local for
+// the WHOLE solve — the streaming kernel re-reads/re-writes all of A and
+// V every one of ~n−1 rounds per sweep (~10 MB/sweep/system at n=86 ≈
+// 0.8 TB/s logical traffic ≈ DRAM-bound). Two residency modes:
+//
+//   RESIDENT_V=1  A AND V in local (per-round V update on lV, one
+//                 write-back at exit). ~2×n(n+1)×4 B local/WG — n=86 →
+//                 ~60 KB + scratch ≈ 1 WG/SM on a 100 KB SM.
+//   RESIDENT_V=0  A local, V deferred: rotations are logged to a global
+//                 rotlog (double2 (c,s) per (round,pair); (p,q) is
+//                 deterministic from the Brent–Luk schedule) and applied
+//                 to global V once per SWEEP in an apply epoch — V's
+//                 footprint (~30 KB at n=86) stays L1/L2-resident across
+//                 the epoch, so V global traffic drops ~n× (once per
+//                 sweep instead of once per round). ~n(n+1)×4 B local/WG
+//                 → 2–3 WGs/SM possible.
+//
+// lA/lV are dynamic __local args (row-padded LD=n+1 vs bank conflicts);
+// the host sizes them to the actual n and must check local_mem_size.
+// Same capacity limits: jpair ≤ 128 (rot arrays) → n ≤ 256; A-local
+// practical bound is the device local-mem limit.
+// ------------------------------------------------------------------
+#ifndef RESIDENT_V
+#define RESIDENT_V 0
+#endif
+
+__kernel void jacobi_resident_batched(
+    __global float* A,   // [batch][n*n] in/out — eigenvalues on diag at exit
+    __global float* V,   // [batch][n*n] in/out — eigenvectors (cols) at exit
+    const int n,
+    const int batch,
+    const int init_v,
+    __global const int* active,
+    __global float* diag,              // [batch][4] — same contract as direct kernel
+    // Tail args at the SAME indices as jacobi_cyclic_global_batched (7..11)
+    // so the plan's bind_solve_params set_arg calls work on both kernels.
+    const int fermi_tail,
+    const int n_occ_fermi,
+    const float kT,
+    __global float* occ_w,
+    __global float* mu,
+    __global double2* rotlog,          // [batch][jround*jpair] scratch (RESIDENT_V=0 only; pass any valid buf otherwise)
+    __local float* lA,                 // n*(n+1)
+    __local float* lV,                 // n*(n+1) when RESIDENT_V, else 1-elem dummy
+    __global const int* work_ids       // launch-index → physical slot (identity at full batch)
+) {
+    const int gid = work_ids[get_group_id(0)];
+    const int lid = get_local_id(0);
+    const int lsz = get_local_size(0);
+    if (active[gid] == 0) return;
+
+    const int jn = (n & 1) ? n + 1 : n;
+    const int jpair = jn / 2;
+    const int jround = jn - 1;
+    const int lald = n + 1;                    // padded local leading dim
+    const size_t log_stride = (size_t)jround * jpair;
+
+    __local jrot_t rot_c[128];
+    __local jrot_t rot_s[128];
+    __local int    rot_p[128];
+    __local int    rot_q[128];
+    __local volatile int l_nrot;
+    __local float  reduce[WG];
+    __local float  red2[WG];
+#ifndef JACOBI_NO_TAIL
+    __local float  le[256];
+    __local double dred[WG];
+    __local double dred2[WG];
+    __local double lmu[4];
+#endif
+
+    if (jpair > 128) {
+        if (lid == 0 && diag[4*gid+2] <= 0.0f) {
+            diag[4*gid] = INFINITY; diag[4*gid+1] = INFINITY;
+            diag[4*gid+2] = 3.0f;   diag[4*gid+3] = 0.0f;
+        }
+        return;
+    }
+
+    __global float* gA = A + (size_t)gid * n * n;
+    __global float* gV = V + (size_t)gid * n * n;
+    const int nn = n * n;
+
+    // ---- fused prologue: A→lA (+ ‖A‖_F + off) and V→lV / gV=I, one pass ----
+    float fa = 0.0f, fo = 0.0f;
+    for (int idx = lid; idx < nn; idx += lsz) {
+        int r = idx / n;
+        int c = idx - r * n;
+        float v = gA[idx];
+        lA[r * lald + c] = v;
+        fa += v * v;
+        if (r != c) fo += v * v;
+#if RESIDENT_V
+        lV[r * lald + c] = (init_v == 0) ? ((r == c) ? 1.0f : 0.0f) : gV[idx];
+#else
+        if (init_v == 0) gV[idx] = (r == c) ? 1.0f : 0.0f;
+#endif
+    }
+    const float frob = sqrt(fmax(jac_sum_f(reduce, fa, lid, lsz), 1.0e-30f));
+    float off_cur = sqrt(fmax(jac_sum_f(red2, fo, lid, lsz), 0.0f));
+    barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
+
+    const float off_exit = JACOBI_OFF_TOL * frob;
+    float prev_off = fmax(off_cur, 1.0e-30f);
+    int stall = 0;
+    int stop = 0;
+    int nsw  = 0;
+
+    if (off_cur > off_exit) {
+    stop = 2;
+    for (int sweep = 0; sweep < MAX_CSWEEPS; ++sweep) {
+        nsw = sweep + 1;
+        for (int r = 0; r < jround; ++r) {
+            // ---- Phase 1: rotation params per pair — from lA ----
+            if (lid == 0) l_nrot = 0;
+            barrier(CLK_LOCAL_MEM_FENCE);
+            for (int ip = lid; ip < jpair; ip += lsz) {
+                int2 pq = cyclic_jacobi_pair(r, ip, jn);
+                int p = min(pq.x, pq.y);
+                int q = max(pq.x, pq.y);
+                rot_p[ip] = p; rot_q[ip] = q;
+                float apq = (q < n) ? lA[p * lald + q] : 0.0f;
+                float app = lA[p * lald + p];
+                float aqq = (q < n) ? lA[q * lald + q] : 1.0f;
+                jrot_t c, s;
+                if (!(fabs(apq) > PAIR_SKIP_REL * (fabs(app) + fabs(aqq)))) {
+                    c = (jrot_t)1.0; s = (jrot_t)0.0;
+                } else {
+                    jrot_t aq = (jrot_t)apq;
+                    jrot_t tau = ((jrot_t)aqq - (jrot_t)app) / ((jrot_t)2.0 * aq);
+                    jrot_t t = (tau >= (jrot_t)0.0)
+                        ? (jrot_t)1.0 / (tau + sqrt((jrot_t)1.0 + tau * tau))
+                        : -(jrot_t)1.0 / (-tau + sqrt((jrot_t)1.0 + tau * tau));
+                    c = (jrot_t)1.0 / sqrt((jrot_t)1.0 + t * t);
+                    s = t * c;
+                    atomic_inc(&l_nrot);
+                }
+                rot_c[ip] = c; rot_s[ip] = s;
+#if !RESIDENT_V
+                rotlog[(size_t)gid * log_stride + r * jpair + ip] = (double2)((double)c, (double)s);
+#endif
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
+            if (l_nrot == 0) continue;
+
+            // ---- Phase 2: A 2×2 blocks — entirely in local ----
+            const int nblk = jpair * jpair;
+#if RESIDENT_V
+            const int nvt = n * jpair;
+            for (int it = lid; it < nblk + nvt; it += lsz) {
+#else
+            for (int it = lid; it < nblk; it += lsz) {
+#endif
+                if (it < nblk) {
+                    int a = it / jpair, b = it - a * jpair;
+                    jupd_t sa = (jupd_t)rot_s[a], sb = (jupd_t)rot_s[b];
+                    if (sa == (jupd_t)0.0 && sb == (jupd_t)0.0) continue;
+                    int pa = rot_p[a], qa = rot_q[a];
+                    int pb = rot_p[b], qb = rot_q[b];
+                    jupd_t ca = (jupd_t)rot_c[a], cb = (jupd_t)rot_c[b];
+                    jupd_t apr = (jupd_t)lA[pa * lald + pb];
+                    jupd_t aps = (qb < n) ? (jupd_t)lA[pa * lald + qb] : (jupd_t)0.0;
+                    jupd_t aqr = (qa < n) ? (jupd_t)lA[qa * lald + pb] : (jupd_t)0.0;
+                    jupd_t aqs = (qa < n && qb < n) ? (jupd_t)lA[qa * lald + qb] : (jupd_t)0.0;
+                    jupd_t tpr = fma(cb, apr, -sb * aps);
+                    jupd_t tps = fma(sb, apr, cb * aps);
+                    jupd_t tqr = fma(cb, aqr, -sb * aqs);
+                    jupd_t tqs = fma(sb, aqr, cb * aqs);
+                    lA[pa * lald + pb] = (float)fma(ca, tpr, -sa * tqr);
+                    if (qb < n) lA[pa * lald + qb] = (float)fma(ca, tps, -sa * tqs);
+                    if (qa < n) {
+                        lA[qa * lald + pb] = (float)fma(sa, tpr, ca * tqr);
+                        if (qb < n) lA[qa * lald + qb] = (float)fma(sa, tps, ca * tqs);
+                    }
+                }
+#if RESIDENT_V
+                else {
+                    int t = it - nblk;
+                    int k = t / jpair, a = t - (t / jpair) * jpair;
+                    jupd_t s = (jupd_t)rot_s[a];
+                    if (s == (jupd_t)0.0) continue;
+                    int p = rot_p[a], q = rot_q[a];
+                    jupd_t c = (jupd_t)rot_c[a];
+                    jupd_t vkp = (jupd_t)lV[k * lald + p];
+                    jupd_t vkq = (q < n) ? (jupd_t)lV[k * lald + q] : (jupd_t)0.0;
+                    lV[k * lald + p] = (float)fma(c, vkp, -s * vkq);
+                    if (q < n) lV[k * lald + q] = (float)fma(s, vkp, c * vkq);
+                }
+#endif
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
+        }
+
+#if !RESIDENT_V
+        // ---- Sweep-end deferred V apply ----
+        // All of this sweep's rotations replayed against global V. V's
+        // footprint (n²×4B) stays cache-resident across the epoch so this
+        // is ~n× less global traffic than the per-round update; the log
+        // (jpair double2/round) streams through L2 trivially. Rounds must
+        // apply in order; pairs within a round are disjoint.
+        for (int r = 0; r < jround; ++r) {
+            for (int ip = lid; ip < jpair; ip += lsz) {
+                const double2 cs = rotlog[(size_t)gid * log_stride + r * jpair + ip];
+                int2 pq = cyclic_jacobi_pair(r, ip, jn);
+                rot_c[ip] = (jrot_t)cs.x; rot_s[ip] = (jrot_t)cs.y;
+                rot_p[ip] = min(pq.x, pq.y); rot_q[ip] = max(pq.x, pq.y);
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
+            for (int it = lid; it < n * jpair; it += lsz) {
+                int k = it / jpair, a = it - (it / jpair) * jpair;
+                jupd_t s = (jupd_t)rot_s[a];
+                if (s == (jupd_t)0.0) continue;
+                int p = rot_p[a], q = rot_q[a];
+                jupd_t c = (jupd_t)rot_c[a];
+                jupd_t vkp = (jupd_t)gV[k * n + p];
+                jupd_t vkq = (q < n) ? (jupd_t)gV[k * n + q] : (jupd_t)0.0;
+                gV[k * n + p] = (float)fma(c, vkp, -s * vkq);
+                if (q < n) gV[k * n + q] = (float)fma(s, vkp, c * vkq);
+            }
+            barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
+        }
+#endif
+
+        // ---- Sweep-end off-norm + exit/stagnation tests — from lA ----
+        fo = 0.0f;
+        for (int idx = lid; idx < nn; idx += lsz) {
+            int r = idx / n;
+            int c = idx - r * n;
+            if (r != c) { float v = lA[r * lald + c]; fo += v * v; }
+        }
+        off_cur = sqrt(jac_sum_f(reduce, fo, lid, lsz));
+        if (!isfinite(off_cur)) { stop = 4; break; }
+        if (off_cur <= off_exit) { stop = 0; break; }
+        if (off_cur > 0.9f * prev_off) { if (++stall >= 3) { stop = 1; break; } } else { stall = 0; }
+        prev_off = off_cur;
+    }
+    }
+
+    // ---- Write-back: transformed A (residue on failure = diagnostic
+    // record, same contract as the streaming kernel) and lV → gV ----
+    for (int idx = lid; idx < nn; idx += lsz) {
+        int r = idx / n;
+        int c = idx - r * n;
+        gA[idx] = lA[r * lald + c];
+#if RESIDENT_V
+        gV[idx] = lV[r * lald + c];
+#endif
+    }
+    barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
+
+    // ---- stop-reason + achieved-residual diagnostics (same latch) ----
+    if (lid == 0 && diag[4*gid+2] <= 0.0f) {
+        diag[4*gid]   = off_cur;
+        diag[4*gid+1] = off_cur / frob;
+        diag[4*gid+2] = (float)stop;
+        diag[4*gid+3] = (float)nsw;
+    }
+
+    // ---- R5 tail: Fermi μ + occ_w on the just-solved spectrum ----
+#ifndef JACOBI_NO_TAIL
+    if (fermi_tail != 0 && stop <= 2) {
+        const double kt = (double)kT;
+        const double want = (double)n_occ_fermi;
+        for (int k = lid; k < n; k += lsz) le[k] = lA[k * lald + k];
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        double elo = 1.0e300, ehi = -1.0e300;
+        for (int k = lid; k < n; k += lsz) {
+            const double e = (double)le[k];
+            elo = fmin(elo, e); ehi = fmax(ehi, e);
+        }
+        elo = jac_red_d(dred, elo, lid, lsz, 1) - 32.0 * kt;
+        ehi = jac_red_d(dred, ehi, lid, lsz, 2) + 32.0 * kt;
+
+        if (lid == 0) {
+            const double mp = (double)mu[gid];
+            lmu[0] = elo; lmu[1] = ehi;
+            lmu[2] = (mp > elo && mp < ehi) ? mp : 0.5 * (elo + ehi);
+            lmu[3] = 0.0;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        for (int it = 0; it < 24; ++it) {
+            const double m = lmu[2];
+            double s = 0.0, ds = 0.0;
+            for (int k = lid; k < n; k += lsz) {
+                const double x = ((double)le[k] - m) / kt;
+                const double f = (x > 40.0) ? 0.0 : ((x < -40.0) ? 1.0 : 1.0 / (1.0 + exp(x)));
+                s += f;
+                ds += (x > 40.0 || x < -40.0) ? 0.0 : f * (1.0 - f);
+            }
+            const double st = jac_red_d(dred, s, lid, lsz, 0);
+            const double dst = jac_red_d(dred2, ds, lid, lsz, 0);
+            if (lid == 0) {
+                const double g = st - want;
+                if (fabs(g) < 1.0e-7 * fmax(want, 1.0)) {
+                    lmu[3] = 1.0;
+                } else {
+                    if (st > want) lmu[1] = fmin(lmu[1], m); else lmu[0] = fmax(lmu[0], m);
+                    double mn = m;
+                    if (dst > 0.0) mn = m - g * kt / dst;
+                    if (!(mn > lmu[0] && mn < lmu[1])) mn = 0.5 * (lmu[0] + lmu[1]);
+                    lmu[2] = mn;
+                }
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
+            if (lmu[3] > 0.5) break;
+        }
+        const double muf = lmu[2];
+        if (lid == 0) mu[gid] = (float)muf;
+        for (int k = lid; k < n; k += lsz) {
+            const double x = ((double)le[k] - muf) / kt;
+            occ_w[(size_t)gid * n + k] = (float)((x > 40.0) ? 0.0 : ((x < -40.0) ? 1.0 : 1.0 / (1.0 + exp(x))));
+        }
+    }
+#else
+    if (fermi_tail != 0 && stop <= 2 && lid == 0) diag[4*gid+2] = 5.0f;
+#endif
 }
 
 // ------------------------------------------------------------------
@@ -454,9 +804,10 @@ __kernel void tiled_jacobi_batched(
     __global float* A,   // [batch][N*N] in/out
     __global float* V,    // [batch][N*N] out
     const int n,          // physical dimension
-    const int batch
+    const int batch,
+    __global const int* work_ids    // launch-index → physical slot (identity at full batch)
 ) {
-    const int gid = get_group_id(0);   // system index
+    const int gid = work_ids[get_group_id(0)];   // system index
     const int lid = get_local_id(0);
     const int lsz = get_local_size(0);
 

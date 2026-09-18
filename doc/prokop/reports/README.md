@@ -40,3 +40,12 @@ overcome, and open issues. Chronological order.
   projector. 0.30% ΔF vs cold at ~0.3 s/eval (~25% faster). Bugs fixed: Z=S⁻¹
   (not S⁻¹ᐟ²) ascent-direction root cause; bsym plan on asymmetric operand
   (silent T·Xᵀ). Honest accounting of why warm ≠ 10× yet + open Tier-1 plan.
+- **2026-09-16_dense_gpu_pes_forces_benchmark_UPDATED.md** — updated version of
+  the dense-GPU PES/forces benchmark (post-T03 numbers).
+- **2026-09-17_resident_jacobi_eigensolver.md** — **resident-memory Jacobi
+  kernels** (`jacobi_resident_batched`, T08b): A in `__local` across all
+  sweeps + per-sweep deferred-V apply via a global rotation log. ~2.2× vs
+  best streaming-direct at N=86/batch=400, bit-identical accuracy; GC SCC
+  4.01→2.19 ms/iter end-to-end. Auto-dispatched for n≤128 when lA fits
+  `local_mem_size` (48 KB device → n≲96). Measured facts:
+  `tasts/HBond_Relaxed_Scan_GPU/Measured_Facts_Jacobi_Sweeps.md`.

@@ -29,7 +29,9 @@ fn bench_dftb(
     label: &str,
 ) {
     let mut all_coords = Vec::with_capacity(batch * coords.len());
-    for _ in 0..batch { all_coords.extend_from_slice(coords); }
+    for _ in 0..batch {
+        all_coords.extend_from_slice(coords);
+    }
 
     let mut eng = GpuDftb::new(sk.clone(), sk_dir, species.to_vec(), all_coords, batch)
         .expect("GpuDftb::new failed");
@@ -43,7 +45,10 @@ fn bench_dftb(
         let dt = t0.elapsed().as_secs_f64() * 1e3;
         last_iters = scc.n_iters;
         total_ms += dt;
-        eprintln!("  run {r}: {dt:.2} ms ({} iters, rms={:.3e})", scc.n_iters, scc.rms);
+        eprintln!(
+            "  run {r}: {dt:.2} ms ({} iters, rms={:.3e})",
+            scc.n_iters, scc.rms
+        );
     }
     let avg = total_ms / N_RUNS as f64;
     let per_iter = avg / last_iters.max(1) as f64;
@@ -62,15 +67,24 @@ fn test_gpu_scc_benchmark() {
     let candidates = [
         "data/xyz/formic_dimer.xyz".to_string(),
         format!("{}/data/xyz/formic_dimer.xyz", env!("CARGO_MANIFEST_DIR")),
-        format!("{}/../data/xyz/formic_dimer.xyz", env!("CARGO_MANIFEST_DIR")),
+        format!(
+            "{}/../data/xyz/formic_dimer.xyz",
+            env!("CARGO_MANIFEST_DIR")
+        ),
     ];
     let mut xyz = None;
     for path in &candidates {
-        if let Ok(x) = parse_xyz(path) { xyz = Some(x); break; }
+        if let Ok(x) = parse_xyz(path) {
+            xyz = Some(x);
+            break;
+        }
     }
     let xyz = match xyz {
         Some(x) => x,
-        None => { eprintln!("Skipping: cannot load formic_dimer.xyz"); return; }
+        None => {
+            eprintln!("Skipping: cannot load formic_dimer.xyz");
+            return;
+        }
     };
 
     let sk = load_sk_for_species(&sk_dir, &xyz.species).unwrap();
@@ -78,8 +92,14 @@ fn test_gpu_scc_benchmark() {
 
     eprintln!("\n=== GPU SCC benchmark (production GpuDftb) ===");
     for &batch in &[1usize, 8, 32] {
-        bench_dftb(&sk, &sk_dir, &xyz.species, &xyz.coords, batch,
-            &format!("formic_dimer"));
+        bench_dftb(
+            &sk,
+            &sk_dir,
+            &xyz.species,
+            &xyz.coords,
+            batch,
+            &format!("formic_dimer"),
+        );
     }
 }
 
@@ -116,24 +136,59 @@ struct ScanSystem {
 
 const SCAN_SYSTEMS: &[ScanSystem] = &[
     // H2O: both O–H bond stretches.
-    ScanSystem { name: "H2O",   file: "H2O.xyz",                      j1: (1, 0, 1),  j2: (2, 0, 2) },
+    ScanSystem {
+        name: "H2O",
+        file: "H2O.xyz",
+        j1: (1, 0, 1),
+        j2: (2, 0, 2),
+    },
     // formic dimer: two O–H···O protons (hbond_gpu_scc.rs indices).
-    ScanSystem { name: "formic", file: "formic_dimer.xyz",            j1: (4, 3, 7),  j2: (9, 8, 2) },
+    ScanSystem {
+        name: "formic",
+        file: "formic_dimer.xyz",
+        j1: (4, 3, 7),
+        j2: (9, 8, 2),
+    },
     // 7-azaindole dimer: J1 N6–H21···N10, J2 N15–H27···N1 (scan2d_azaindol.rhai).
-    ScanSystem { name: "azaindol", file: "azaindol_dimer.xyz",        j1: (21, 6, 10), j2: (27, 15, 1) },
+    ScanSystem {
+        name: "azaindol",
+        file: "azaindol_dimer.xyz",
+        j1: (21, 6, 10),
+        j2: (27, 15, 1),
+    },
     // GC: J1 N8–H13···N20 (PT scan), J2 N10–H15···O22 (2nd H-bond).
-    ScanSystem { name: "GC",    file: "guanine-cytosine.xyz",         j1: (13, 8, 20), j2: (15, 10, 22) },
+    ScanSystem {
+        name: "GC",
+        file: "guanine-cytosine.xyz",
+        j1: (13, 8, 20),
+        j2: (15, 10, 22),
+    },
     // AT: J1 T-N3–H26···A-N1, J2 A-N10–H9···T-O21 (Watson-Crick).
-    ScanSystem { name: "AT",    file: "adenine-thymine.xyz",          j1: (26, 19, 6), j2: (9, 10, 21) },
+    ScanSystem {
+        name: "AT",
+        file: "adenine-thymine.xyz",
+        j1: (26, 19, 6),
+        j2: (9, 10, 21),
+    },
     // diazaphenalene dimer: N9–H20···N23, N30–H41···N2.
-    ScanSystem { name: "diazaphen", file: "diazaphenalene_dimer.xyz", j1: (20, 9, 23), j2: (41, 30, 2) },
+    ScanSystem {
+        name: "diazaphen",
+        file: "diazaphenalene_dimer.xyz",
+        j1: (20, 9, 23),
+        j2: (41, 30, 2),
+    },
     // DiTetraceno-helicene: no H-bond — rim C–H stretches (throughput proxy).
-    ScanSystem { name: "DTH",   file: "DiTetraceno_helicene_1a.xyz",  j1: (75, 33, 75), j2: (83, 79, 83) },
+    ScanSystem {
+        name: "DTH",
+        file: "DiTetraceno_helicene_1a.xyz",
+        j1: (75, 33, 75),
+        j2: (83, 79, 83),
+    },
 ];
 
-const NP: usize = 20;          // 20x20 grid → batch 400
-const SCAN_D0: f64 = 1.0;      // Å
-const SCAN_DSTEP: f64 = 0.05;  // Å
+const NP: usize = 20; // 20x20 grid → batch 400
+const SCAN_D0: f64 = 1.0; // Å
+const SCAN_DSTEP: f64 = 0.05; // Å
 
 fn xyz_file(name: &str) -> rust_dftb::io::XyzMolecule {
     for p in [
@@ -141,7 +196,9 @@ fn xyz_file(name: &str) -> rust_dftb::io::XyzMolecule {
         format!("{}/data/xyz/{name}", env!("CARGO_MANIFEST_DIR")),
         format!("{}/../data/xyz/{name}", env!("CARGO_MANIFEST_DIR")),
     ] {
-        if let Ok(x) = parse_xyz(&p) { return x; }
+        if let Ok(x) = parse_xyz(&p) {
+            return x;
+        }
     }
     panic!("cannot load {name}");
 }
@@ -152,12 +209,19 @@ fn scan_geoms(base: &[[f64; 3]], j1: Junction, j2: Junction) -> Vec<[f64; 3]> {
         for i2 in 0..NP {
             let mut g = base.to_vec();
             for &(moved, donor, acc) in &[j1, j2] {
-                let d = if (moved, donor, acc) == j1 { SCAN_D0 + i1 as f64 * SCAN_DSTEP }
-                        else { SCAN_D0 + i2 as f64 * SCAN_DSTEP };
+                let d = if (moved, donor, acc) == j1 {
+                    SCAN_D0 + i1 as f64 * SCAN_DSTEP
+                } else {
+                    SCAN_D0 + i2 as f64 * SCAN_DSTEP
+                };
                 let mut u = [0.0f64; 3];
-                for c in 0..3 { u[c] = base[acc][c] - base[donor][c]; }
+                for c in 0..3 {
+                    u[c] = base[acc][c] - base[donor][c];
+                }
                 let n = (u[0] * u[0] + u[1] * u[1] + u[2] * u[2]).sqrt();
-                for c in 0..3 { g[moved][c] = base[donor][c] + u[c] / n * d; }
+                for c in 0..3 {
+                    g[moved][c] = base[donor][c] + u[c] / n * d;
+                }
             }
             all.extend_from_slice(&g);
         }
@@ -167,9 +231,18 @@ fn scan_geoms(base: &[[f64; 3]], j1: Junction, j2: Junction) -> Vec<[f64; 3]> {
 
 /// Time one CPU f64 point (SCC + repulsive + forces) — the sequential
 /// baseline the GPU batch replaces.
-fn cpu_point_ms(sk: &rust_dftb::SkData, sk_dir: &str, species: &[String], coords: &[[f64; 3]]) -> f64 {
+fn cpu_point_ms(
+    sk: &rust_dftb::SkData,
+    sk_dir: &str,
+    species: &[String],
+    coords: &[[f64; 3]],
+) -> f64 {
     let mut unique: Vec<String> = Vec::new();
-    for s in species { if !unique.contains(s) { unique.push(s.clone()); } }
+    for s in species {
+        if !unique.contains(s) {
+            unique.push(s.clone());
+        }
+    }
     let repulsive = parse_all_repulsive(sk_dir, &unique, unique.len()).unwrap();
     let mut cpu = DftbCpu::new(sk.clone(), species.to_vec()).unwrap();
     cpu.update_geometry(coords).unwrap();
@@ -191,14 +264,34 @@ fn test_gpu_scc_scan400_benchmark() {
         return;
     };
 
-    eprintln!("=== 20x20 scan benchmark (batch={}): production GpuDftb, kT=0.002, tol=1e-6 ===", NP * NP);
+    eprintln!(
+        "=== 20x20 scan benchmark (batch={}): production GpuDftb, kT=0.002, tol=1e-6 ===",
+        NP * NP
+    );
     // §16.D: optional subset filter for A/B runs (comma list of names).
-    let only: Option<Vec<String>> = std::env::var("RUST_DFTB_BENCH_SYSTEMS").ok()
+    let only: Option<Vec<String>> = std::env::var("RUST_DFTB_BENCH_SYSTEMS")
+        .ok()
         .map(|s| s.split(',').map(|x| x.trim().to_string()).collect());
-    eprintln!("{:>11} {:>5} {:>5} {:>7} | {:>9} {:>5} {:>8} {:>9} | {:>8} | {:>9} {:>8}",
-        "system", "atoms", "orbs", "batch", "scc_ms", "iters", "ms/iter", "sys/s", "evalF_ms", "cpu_1pt", "speedup");
+    eprintln!(
+        "{:>11} {:>5} {:>5} {:>7} | {:>9} {:>5} {:>8} {:>9} | {:>8} | {:>9} {:>8}",
+        "system",
+        "atoms",
+        "orbs",
+        "batch",
+        "scc_ms",
+        "iters",
+        "ms/iter",
+        "sys/s",
+        "evalF_ms",
+        "cpu_1pt",
+        "speedup"
+    );
     for sys in SCAN_SYSTEMS {
-        if let Some(o) = &only { if !o.iter().any(|x| x == sys.name) { continue; } }
+        if let Some(o) = &only {
+            if !o.iter().any(|x| x == sys.name) {
+                continue;
+            }
+        }
         let xyz = xyz_file(sys.file);
         let sp = xyz.species.clone();
         let base = xyz.coords.clone();
@@ -220,12 +313,18 @@ fn test_gpu_scc_scan400_benchmark() {
             for _ in 0..N_RUNS {
                 eng.reset_q0().unwrap();
                 let t0 = std::time::Instant::now();
-                let s = eng.scc(100, 1e-6).unwrap_or_else(|e| panic!("scc {} batch={batch}: {e}", sys.name));
+                let s = eng
+                    .scc(100, 1e-6)
+                    .unwrap_or_else(|e| panic!("scc {} batch={batch}: {e}", sys.name));
                 total += t0.elapsed().as_secs_f64() * 1e3;
                 iters = s.n_iters;
                 // Failed replicas are data, not a crash — a stalled replica
                 // costs its 100 iters, which is the production cost anyway.
-                n_failed = s.statuses.iter().filter(|st| **st == SccStatus::Failed).count();
+                n_failed = s
+                    .statuses
+                    .iter()
+                    .filter(|st| **st == SccStatus::Failed)
+                    .count();
             }
             if std::env::var("RUST_DFTB_PROF").is_ok() && batch == NP * NP {
                 eng.prof_report("scan400");

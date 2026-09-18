@@ -19,7 +19,9 @@ use rust_dftb::methods::sparse::harness::{require_sih_sk_dir, require_sparse_gpu
 use rust_dftb::methods::sparse::scc::energy_non_scc;
 use rust_dftb::methods::sparse::sparse_forces::{dw_from_k_padded, unpad_to_physical};
 use rust_dftb::methods::sparse::SparseDftb;
-use rust_dftb::qmqm::{Fragment, FragmentNeighborList, FragmentTemplate, MultiSystemSolver, SimpleMixer};
+use rust_dftb::qmqm::{
+    Fragment, FragmentNeighborList, FragmentTemplate, MultiSystemSolver, SimpleMixer,
+};
 use rust_dftb::{load_sk_for_species, HamiltonianBuilder, SkData};
 
 fn sih4_geom() -> (Vec<String>, Vec<[f64; 3]>, Vec<u8>, f64, usize) {
@@ -81,13 +83,21 @@ fn dense_scc_valence(
         "G3.2 dense n_electrons={} != sum(q0)={n_elec}",
         frag.n_electrons
     );
-    let gamma = GammaTable::from_sk_data(sk, species).unwrap_or_else(|e| panic!("G3.2 dense gamma: {e}"));
+    let gamma =
+        GammaTable::from_sk_data(sk, species).unwrap_or_else(|e| panic!("G3.2 dense gamma: {e}"));
     let n = coords.len() as f64;
-    let centroid = coords.iter().fold([0.0; 3], |acc, c| [acc[0] + c[0], acc[1] + c[1], acc[2] + c[2]]);
-    let frag_neighbors = FragmentNeighborList::build(&vec![[centroid[0] / n, centroid[1] / n, centroid[2] / n]], 10.0);
+    let centroid = coords.iter().fold([0.0; 3], |acc, c| {
+        [acc[0] + c[0], acc[1] + c[1], acc[2] + c[2]]
+    });
+    let frag_neighbors = FragmentNeighborList::build(
+        &vec![[centroid[0] / n, centroid[1] / n, centroid[2] / n]],
+        10.0,
+    );
     let mixer = SimpleMixer::new(mix);
     let mut solver = MultiSystemSolver::new(vec![frag], frag_neighbors, gamma, mixer);
-    solver.solve_scc(max_iter, tol).unwrap_or_else(|e| panic!("G3.2 dense valence SCC failed: {e}"));
+    solver
+        .solve_scc(max_iter, tol)
+        .unwrap_or_else(|e| panic!("G3.2 dense valence SCC failed: {e}"));
     let frag = &solver.fragments[0];
     let n_occ = (frag.n_electrons / 2.0).round() as usize;
     let c_occ = frag.eigenvectors.columns(0, n_occ);
@@ -99,15 +109,28 @@ fn dense_scc_valence(
         edm += (2.0 * eps) * (&c * c.transpose());
     }
     let e_h0 = (&density * &frag.template.h0).trace();
-    let delta_q: Vec<f64> = frag.charges.iter().zip(frag.template.q0.iter()).map(|(q, q0)| q - q0).collect();
-    let e_scc: f64 = 0.5 * delta_q.iter().zip(frag.shift.iter()).map(|(dq, s)| dq * s).sum::<f64>();
+    let delta_q: Vec<f64> = frag
+        .charges
+        .iter()
+        .zip(frag.template.q0.iter())
+        .map(|(q, q0)| q - q0)
+        .collect();
+    let e_scc: f64 = 0.5
+        * delta_q
+            .iter()
+            .zip(frag.shift.iter())
+            .map(|(dq, s)| dq * s)
+            .sum::<f64>();
     DenseSccRef {
-        e_h0, e_scc, e_el: e_h0 + e_scc,
+        e_h0,
+        e_scc,
+        e_el: e_h0 + e_scc,
         q: frag.charges.clone(),
         n_iter: solver.n_scc_iter,
         q0_sk,
         atom_species,
-        density, edm,
+        density,
+        edm,
     }
 }
 
@@ -141,7 +164,9 @@ fn dense_e_h0_non_scc(h0: &DMatrix<f64>, s: &DMatrix<f64>, n_occ: usize) -> f64 
 
 #[test]
 fn test_g3_1_sih4_energy_el_plus_rep() {
-    let Some(gpu) = require_sparse_gpu() else { return };
+    let Some(gpu) = require_sparse_gpu() else {
+        return;
+    };
     let sk_dir = require_sih_sk_dir();
     let (species, coords, atom_n_orb, _n_elec, n_occ) = sih4_geom();
     let sk = load_sk_for_species(&sk_dir, &species).unwrap();
@@ -150,14 +175,32 @@ fn test_g3_1_sih4_energy_el_plus_rep() {
     let e_h0_dense = dense_e_h0_non_scc(&ham.h0, &ham.s, n_occ);
     let e_rep = repulsive_energy(&sk_dir, &species, &coords).unwrap();
     eprintln!("=== G3.1 SiH4 frozen (Si–H = 1.48 Å; not tetrahedral — H–Si–H angles mixed) ===");
-    eprintln!("  dense non-SCC: E_h0={e_h0_dense:.10}  E_rep={e_rep:.10}  E_tot={:.10}", e_h0_dense + e_rep);
-    assert!(e_rep.abs() > 1e-4, "G3.1: E_rep={e_rep:.3e} is ~0 — Spline missing or not evaluated");
-    assert!(e_h0_dense.is_finite() && e_rep.is_finite(), "G3.1 dense energy non-finite");
+    eprintln!(
+        "  dense non-SCC: E_h0={e_h0_dense:.10}  E_rep={e_rep:.10}  E_tot={:.10}",
+        e_h0_dense + e_rep
+    );
+    assert!(
+        e_rep.abs() > 1e-4,
+        "G3.1: E_rep={e_rep:.3e} is ~0 — Spline missing or not evaluated"
+    );
+    assert!(
+        e_h0_dense.is_finite() && e_rep.is_finite(),
+        "G3.1 dense energy non-finite"
+    );
 
     let h0 = flatten(&ham.h0);
     let s = flatten(&ham.s);
-    let sparse = energy_non_scc(&gpu, &h0, &s, &atom_n_orb, n_occ as f32, &sk_dir, &species, &coords)
-        .unwrap_or_else(|e| panic!("G3.1 sparse energy failed: {e}"));
+    let sparse = energy_non_scc(
+        &gpu,
+        &h0,
+        &s,
+        &atom_n_orb,
+        n_occ as f32,
+        &sk_dir,
+        &species,
+        &coords,
+    )
+    .unwrap_or_else(|e| panic!("G3.1 sparse energy failed: {e}"));
     eprintln!(
         "  sparse non-SCC: E_h0={:.10}  E_rep={:.10}  E_tot={:.10}  Tr(KS)={:.6}  R_I={:.3e}",
         sparse.e_h0, sparse.e_rep, sparse.e_tot, sparse.tr_ks, sparse.r_i
@@ -165,16 +208,28 @@ fn test_g3_1_sih4_energy_el_plus_rep() {
     let d_el = (sparse.e_h0 - e_h0_dense).abs();
     let d_rep = (sparse.e_rep - e_rep).abs();
     eprintln!("  |dE_h0|={d_el:.3e}  |dE_rep|={d_rep:.3e}");
-    assert!((sparse.tr_ks - n_occ as f32).abs() < 1e-4, "G3.1 Tr(KS)={} != Nocc={n_occ}", sparse.tr_ks);
-    assert!(d_rep < 1e-12, "G3.1 E_rep must be the same function on both sides: |d|={d_rep:.3e}");
+    assert!(
+        (sparse.tr_ks - n_occ as f32).abs() < 1e-4,
+        "G3.1 Tr(KS)={} != Nocc={n_occ}",
+        sparse.tr_ks
+    );
+    assert!(
+        d_rep < 1e-12,
+        "G3.1 E_rep must be the same function on both sides: |d|={d_rep:.3e}"
+    );
     // f32 purify vs f64 eig. Gate D |dE| on Tr(K H0) was 8.6e-8 → ×2 ≈ 2e-7.
-    assert!(d_el < 1e-5, "G3.1 |E_h0_sparse - E_h0_dense|={d_el:.3e} (target 1e-5)");
+    assert!(
+        d_el < 1e-5,
+        "G3.1 |E_h0_sparse - E_h0_dense|={d_el:.3e} (target 1e-5)"
+    );
     eprintln!("  G3.1: E_tot = E_el + E_rep is a DFTB energy on this frozen geometry.");
 }
 
 #[test]
 fn test_g3_2_sih4_sparse_scc() {
-    let Some(_gpu) = require_sparse_gpu() else { return };
+    let Some(_gpu) = require_sparse_gpu() else {
+        return;
+    };
     let sk_dir = require_sih_sk_dir();
     let (species, coords, _atom_n_orb, n_elec, n_occ) = sih4_geom();
     let q0 = sih4_valence_q0();
@@ -187,18 +242,27 @@ fn test_g3_2_sih4_sparse_scc() {
     let dense = dense_scc_valence(&sk, &species, &coords, &q0, 0.5, 1e-5, 80);
     let e_tot_dense = dense.e_el + e_rep;
     eprintln!("=== G3.2 SiH4 sparse SCC vs dense SCC (valence q0) ===");
-    eprintln!("  SK-parsed q0={:?}  sum={:.4}  (ignored; matsci Si q0 is 0)", dense.q0_sk, dense.q0_sk.iter().sum::<f64>());
+    eprintln!(
+        "  SK-parsed q0={:?}  sum={:.4}  (ignored; matsci Si q0 is 0)",
+        dense.q0_sk,
+        dense.q0_sk.iter().sum::<f64>()
+    );
     eprintln!(
         "  dense: E_h0={:.10}  E_scc={:.10}  E_el={:.10}  E_rep={e_rep:.10}  E_tot={e_tot_dense:.10}  n_iter={}  q0={:?}  q={:?}",
         dense.e_h0, dense.e_scc, dense.e_el, dense.n_iter, q0, dense.q
     );
     assert!(e_rep.abs() > 1e-4, "G3.2: E_rep={e_rep:.3e} ~0");
     let qsum_dense: f64 = dense.q.iter().sum();
-    assert!((qsum_dense - n_elec).abs() < 1e-4, "G3.2 dense sum(q)={qsum_dense} != N_elec={n_elec}");
+    assert!(
+        (qsum_dense - n_elec).abs() < 1e-4,
+        "G3.2 dense sum(q)={qsum_dense} != N_elec={n_elec}"
+    );
 
     let mut eng = SparseDftb::new(sk.clone(), &sk_dir, species.clone(), coords.clone())
         .unwrap_or_else(|e| panic!("G3.2 SparseDftb::new: {e}"));
-    let scc = eng.scc(80, 1e-5).unwrap_or_else(|e| panic!("G3.2 sparse SCC failed: {e}"));
+    let scc = eng
+        .scc(80, 1e-5)
+        .unwrap_or_else(|e| panic!("G3.2 sparse SCC failed: {e}"));
     let sparse = eng.last_energy();
     eprintln!(
         "  sparse: E_el={:.10}  E_h0={:.10}  E_scc={:.10}  E_rep={:.10}  E_tot={:.10}  n_scc={}  rms={:.3e}  q={:?}",
@@ -213,9 +277,16 @@ fn test_g3_2_sih4_sparse_scc() {
         max_dq = max_dq.max((sparse.q[a] - dense.q[a]).abs());
     }
     eprintln!("  |dE_h0|={d_h0:.3e}  |dE_scc|={d_scc:.3e}  |dE_el|={d_el:.3e}  |dE_tot|={d_tot:.3e}  max|dq|={max_dq:.3e}  N_elec={n_elec}  r_scc={:.3e}  R_H={:.3e}", sparse.r_scc, sparse.r_h);
-    assert!((sparse.tr_ks - n_occ as f32).abs() < 1e-4, "G3.2 Tr(KS)={}", sparse.tr_ks);
+    assert!(
+        (sparse.tr_ks - n_occ as f32).abs() < 1e-4,
+        "G3.2 Tr(KS)={}",
+        sparse.tr_ks
+    );
     assert!(d_el < 1e-4, "G3.2 |E_el_sparse - E_el_dense|={d_el:.3e}");
-    assert!(d_tot < 1e-4, "G3.2 |E_tot_sparse - E_tot_dense|={d_tot:.3e}");
+    assert!(
+        d_tot < 1e-4,
+        "G3.2 |E_tot_sparse - E_tot_dense|={d_tot:.3e}"
+    );
     assert!(max_dq < 1e-3, "G3.2 max|q_sparse - q_dense|={max_dq:.3e}");
 }
 
@@ -252,17 +323,23 @@ fn sparse_eng(sk: &SkData, sk_dir: &str, species: &[String], coords: Vec<[f64; 3
 
 #[test]
 fn test_g3_3_analytic_force_and_g3_4_energy_gradient() {
-    let Some(_gpu) = require_sparse_gpu() else { return };
+    let Some(_gpu) = require_sparse_gpu() else {
+        return;
+    };
     let sk_dir = require_sih_sk_dir();
     let (species, coords, atom_n_orb, n_elec, n_occ) = sih4_geom();
     let q0 = sih4_valence_q0();
     let sk = load_sk_for_species(&sk_dir, &species).unwrap();
     let dense = dense_scc_valence(&sk, &species, &coords, &q0, 0.5, 1e-5, 80);
     let mut eng = sparse_eng(&sk, &sk_dir, &species, coords.clone());
-    eng.scc(80, 1e-5).unwrap_or_else(|e| panic!("G3.3 sparse SCC: {e}"));
+    eng.scc(80, 1e-5)
+        .unwrap_or_else(|e| panic!("G3.3 sparse SCC: {e}"));
     let sparse = eng.last_energy().clone();
     eprintln!("=== G3.3 SiH4 analytic force (D=2K, W=2KHK)  [SparseDftb] ===");
-    eprintln!("  sparse E_tot={:.10}  dense E_el={:.10}  N_elec={n_elec}", sparse.e_tot, dense.e_el);
+    eprintln!(
+        "  sparse E_tot={:.10}  dense E_el={:.10}  N_elec={n_elec}",
+        sparse.e_tot, dense.e_el
+    );
 
     let (d_pad, w_pad) = dw_from_k_padded(eng.k_pad(), eng.h_scc_pad(), species.len());
     let d_sp = unpad_to_physical(&d_pad, &atom_n_orb);
@@ -271,9 +348,20 @@ fn test_g3_3_analytic_force_and_g3_4_energy_gradient() {
     let w_err = max_abs_mat(&w_sp, &dense.edm);
     eprintln!("  max|D_sparse-D_dense|={d_err:.3e}  max|W_sparse-W_dense|={w_err:.3e}");
 
-    let f_sp = eng.forces().unwrap_or_else(|e| panic!("G3.3 sparse analytic force failed: {e}"));
-    let f_dn = compute_forces_from_dw(&sk, &species, &coords, &dense.density, &dense.edm, &dense.q, &q0, &sk_dir)
-        .unwrap_or_else(|e| panic!("G3.3 dense analytic force failed: {e}"));
+    let f_sp = eng
+        .forces()
+        .unwrap_or_else(|e| panic!("G3.3 sparse analytic force failed: {e}"));
+    let f_dn = compute_forces_from_dw(
+        &sk,
+        &species,
+        &coords,
+        &dense.density,
+        &dense.edm,
+        &dense.q,
+        &q0,
+        &sk_dir,
+    )
+    .unwrap_or_else(|e| panic!("G3.3 dense analytic force failed: {e}"));
     print_forces("sparse", &f_sp);
     print_forces("dense ", &f_dn);
 
@@ -283,7 +371,9 @@ fn test_g3_3_analytic_force_and_g3_4_energy_gradient() {
     for i in 0..species.len() {
         for c in 0..3 {
             let df = (f_sp.forces[i][c] - f_dn.forces[i][c]).abs();
-            max_f = max_f.max(f_sp.forces[i][c].abs()).max(f_dn.forces[i][c].abs());
+            max_f = max_f
+                .max(f_sp.forces[i][c].abs())
+                .max(f_dn.forces[i][c].abs());
             if df > max_df {
                 max_df = df;
                 worst = (i, c);
@@ -291,22 +381,34 @@ fn test_g3_3_analytic_force_and_g3_4_energy_gradient() {
         }
     }
     let rel_f = max_df / max_f.max(1e-8);
-    eprintln!("  max|dF|={max_df:.3e}  max|F|={max_f:.3e}  rel={rel_f:.3e}  worst=atom {} dir {}", worst.0, worst.1);
-    assert!(max_df < 1e-4 || rel_f < 1e-3, "G3.3 |F_sparse-F_dense| max={max_df:.3e} rel={rel_f:.3e} (target 1e-4 abs or 1e-3 rel)");
+    eprintln!(
+        "  max|dF|={max_df:.3e}  max|F|={max_f:.3e}  rel={rel_f:.3e}  worst=atom {} dir {}",
+        worst.0, worst.1
+    );
+    assert!(
+        max_df < 1e-4 || rel_f < 1e-3,
+        "G3.3 |F_sparse-F_dense| max={max_df:.3e} rel={rel_f:.3e} (target 1e-4 abs or 1e-3 rel)"
+    );
 
     let h = 1e-3f64;
     let mut xyz_p = coords.clone();
     let mut xyz_m = coords.clone();
     xyz_p[0][0] += h;
     xyz_m[0][0] -= h;
-    eprintln!("=== G3.4 energy-gradient (Si x, h={h} Å)  [SparseDftb, q reset to q0 each side] ===");
+    eprintln!(
+        "=== G3.4 energy-gradient (Si x, h={h} Å)  [SparseDftb, q reset to q0 each side] ==="
+    );
     eng.set_q(&q0).unwrap();
-    eng.set_coords(&xyz_p).unwrap_or_else(|e| panic!("G3.4 +h set_coords: {e}"));
-    eng.scc(80, 1e-5).unwrap_or_else(|e| panic!("G3.4 +h SCC: {e}"));
+    eng.set_coords(&xyz_p)
+        .unwrap_or_else(|e| panic!("G3.4 +h set_coords: {e}"));
+    eng.scc(80, 1e-5)
+        .unwrap_or_else(|e| panic!("G3.4 +h SCC: {e}"));
     let e_p = eng.energy().unwrap();
     eng.set_q(&q0).unwrap();
-    eng.set_coords(&xyz_m).unwrap_or_else(|e| panic!("G3.4 -h set_coords: {e}"));
-    eng.scc(80, 1e-5).unwrap_or_else(|e| panic!("G3.4 -h SCC: {e}"));
+    eng.set_coords(&xyz_m)
+        .unwrap_or_else(|e| panic!("G3.4 -h set_coords: {e}"));
+    eng.scc(80, 1e-5)
+        .unwrap_or_else(|e| panic!("G3.4 -h SCC: {e}"));
     let e_m = eng.energy().unwrap();
     let f_fd = -(e_p - e_m) / (2.0 * h);
     let f_ana = f_sp.forces[0][0];
@@ -333,7 +435,9 @@ fn bsr_to_dense_pad(b: &rust_dftb::methods::sparse::bsr4::Bsr4Matrix) -> Vec<f64
 
 #[test]
 fn test_f2_direct_bsr_hs_parity() {
-    let Some(_gpu) = require_sparse_gpu() else { return };
+    let Some(_gpu) = require_sparse_gpu() else {
+        return;
+    };
     let sk_dir = require_sih_sk_dir();
     let (species, coords, atom_n_orb, _, _) = sih4_geom();
     let sk = load_sk_for_species(&sk_dir, &species).unwrap();
@@ -349,18 +453,26 @@ fn test_f2_direct_bsr_hs_parity() {
         full_mask: Some(false),
         ..Default::default()
     };
-    let eng = rust_dftb::methods::sparse::SparseDftb::with_config(
-        sk, &sk_dir, species.clone(), coords.clone(), cfg.clone(),
-    ).unwrap_or_else(|e| panic!("F2 SparseDftb::new: {e}"));
+    let mut eng = rust_dftb::methods::sparse::SparseDftb::with_config(
+        sk,
+        &sk_dir,
+        species.clone(),
+        coords.clone(),
+        cfg.clone(),
+    )
+    .unwrap_or_else(|e| panic!("F2 SparseDftb::new: {e}"));
 
     // Compare on physical orbital indices: padded BSR [i*4+r, j*4+c] ↔
     // dense [off_i+r, off_j+c].
-    let h_pad = bsr_to_dense_pad(eng.h_bsr());
-    let s_pad = bsr_to_dense_pad(eng.s_bsr());
+    let h_pad = bsr_to_dense_pad(eng.h_bsr().unwrap());
+    let s_pad = bsr_to_dense_pad(eng.s_bsr().unwrap());
     let n_pad = species.len() * 4;
     let mut off = vec![0usize; species.len()];
     let mut acc = 0usize;
-    for (a, &n) in atom_n_orb.iter().enumerate() { off[a] = acc; acc += n as usize; }
+    for (a, &n) in atom_n_orb.iter().enumerate() {
+        off[a] = acc;
+        acc += n as usize;
+    }
     let (mut max_h, mut max_s) = (0.0f64, 0.0f64);
     for a in 0..species.len() {
         let na = atom_n_orb[a] as usize;
@@ -371,7 +483,14 @@ fn test_f2_direct_bsr_hs_parity() {
                     let idx = (a * 4 + r) * n_pad + (b * 4 + c);
                     let dh = (h_pad[idx] - dense.h0[(off[a] + r, off[b] + c)]).abs();
                     let ds = (s_pad[idx] - dense.s[(off[a] + r, off[b] + c)]).abs();
-                    if dh > max_h { max_h = dh; eprintln!("  F2 max dH @ ({a},{b},{r},{c}): sparse={:.8} dense={:.8}", h_pad[idx], dense.h0[(off[a] + r, off[b] + c)]); }
+                    if dh > max_h {
+                        max_h = dh;
+                        eprintln!(
+                            "  F2 max dH @ ({a},{b},{r},{c}): sparse={:.8} dense={:.8}",
+                            h_pad[idx],
+                            dense.h0[(off[a] + r, off[b] + c)]
+                        );
+                    }
                     max_s = max_s.max(ds);
                 }
             }
@@ -386,13 +505,25 @@ fn test_f2_direct_bsr_hs_parity() {
         let na = atom_n_orb[a] as usize;
         for d in na..4 {
             let idx = (a * 4 + d) * n_pad + (a * 4 + d);
-            assert!((h_pad[idx] - 2.0).abs() < 1e-7, "F2 dummy H diag atom {a} lane {d}: {}", h_pad[idx]);
-            assert!((s_pad[idx] - 1.0).abs() < 1e-7, "F2 dummy S diag atom {a} lane {d}: {}", s_pad[idx]);
+            assert!(
+                (h_pad[idx] - 2.0).abs() < 1e-7,
+                "F2 dummy H diag atom {a} lane {d}: {}",
+                h_pad[idx]
+            );
+            assert!(
+                (s_pad[idx] - 1.0).abs() < 1e-7,
+                "F2 dummy S diag atom {a} lane {d}: {}",
+                s_pad[idx]
+            );
             for b in 0..species.len() {
                 for c in 0..4 {
                     let x = (a * 4 + d) * n_pad + (b * 4 + c);
                     if b != a || c != d {
-                        assert!(h_pad[x].abs() < 1e-7, "F2 dummy row atom {a} lane {d} col ({b},{c}): {}", h_pad[x]);
+                        assert!(
+                            h_pad[x].abs() < 1e-7,
+                            "F2 dummy row atom {a} lane {d} col ({b},{c}): {}",
+                            h_pad[x]
+                        );
                     }
                 }
             }
@@ -403,8 +534,13 @@ fn test_f2_direct_bsr_hs_parity() {
     let mut moved = coords.clone();
     moved[1][0] += 0.6; // > skin/2 = 0.5 Å (default skin 1.0)
     let mut eng2 = rust_dftb::methods::sparse::SparseDftb::with_config(
-        load_sk_for_species(&sk_dir, &species).unwrap(), &sk_dir, species, coords, cfg.clone(),
-    ).unwrap_or_else(|e| panic!("F2 second engine: {e}"));
+        load_sk_for_species(&sk_dir, &species).unwrap(),
+        &sk_dir,
+        species,
+        coords,
+        cfg.clone(),
+    )
+    .unwrap_or_else(|e| panic!("F2 second engine: {e}"));
     match eng2.set_coords(&moved) {
         Err(e) => eprintln!("F2 skin guard (expected): {e}"),
         Ok(()) => panic!("F2 skin guard failed: set_coords accepted a >skin/2 displacement"),
@@ -421,7 +557,9 @@ fn test_f2_direct_bsr_hs_parity() {
 
 #[test]
 fn test_s1_state_invalidation_contract() {
-    let Some(_gpu) = require_sparse_gpu() else { return };
+    let Some(_gpu) = require_sparse_gpu() else {
+        return;
+    };
     let sk_dir = require_sih_sk_dir();
     let (species, coords, _, _, _) = sih4_geom();
     let sk = load_sk_for_species(&sk_dir, &species).unwrap();
@@ -430,11 +568,19 @@ fn test_s1_state_invalidation_contract() {
         ..Default::default()
     };
     let mut eng = rust_dftb::methods::sparse::SparseDftb::with_config(
-        sk, &sk_dir, species.clone(), coords.clone(), cfg,
-    ).unwrap_or_else(|e| panic!("S1 engine: {e}"));
+        sk,
+        &sk_dir,
+        species.clone(),
+        coords.clone(),
+        cfg,
+    )
+    .unwrap_or_else(|e| panic!("S1 engine: {e}"));
 
     // No solve yet → no energy.
-    assert!(eng.energy().is_err(), "S1: energy() before any scc must fail");
+    assert!(
+        eng.energy().is_err(),
+        "S1: energy() before any scc must fail"
+    );
 
     eng.scc(80, 1e-5).unwrap_or_else(|e| panic!("S1 SCC: {e}"));
     let e1 = eng.energy().unwrap();
@@ -443,19 +589,33 @@ fn test_s1_state_invalidation_contract() {
     // Skin-legal geometry mutation invalidates the accepted state.
     let mut c2 = coords.clone();
     c2[0][0] += 0.05;
-    eng.set_coords(&c2).unwrap_or_else(|e| panic!("S1 set_coords: {e}"));
-    assert!(eng.energy().is_err(), "S1: energy() after set_coords must fail (stale state)");
-    assert!(eng.forces().is_err(), "S1: forces() after set_coords must fail (stale state)");
+    eng.set_coords(&c2)
+        .unwrap_or_else(|e| panic!("S1 set_coords: {e}"));
+    assert!(
+        eng.energy().is_err(),
+        "S1: energy() after set_coords must fail (stale state)"
+    );
+    assert!(
+        eng.forces().is_err(),
+        "S1: forces() after set_coords must fail (stale state)"
+    );
 
-    eng.scc(80, 1e-5).unwrap_or_else(|e| panic!("S1 SCC geom2: {e}"));
+    eng.scc(80, 1e-5)
+        .unwrap_or_else(|e| panic!("S1 SCC geom2: {e}"));
     let e2 = eng.energy().unwrap();
     eprintln!("S1: E after geom2 scc = {e2:.8}");
-    assert!((e2 - e1).abs() > 1e-12, "S1: geometry change must change the energy");
+    assert!(
+        (e2 - e1).abs() > 1e-12,
+        "S1: geometry change must change the energy"
+    );
 
     // Charge mutation invalidates too.
     let q = eng.last_energy().q.clone();
     eng.set_q(&q).unwrap_or_else(|e| panic!("S1 set_q: {e}"));
-    assert!(eng.energy().is_err(), "S1: energy() after set_q must fail (stale state)");
+    assert!(
+        eng.energy().is_err(),
+        "S1: energy() after set_q must fail (stale state)"
+    );
 
     // A failed solve leaves no usable state: cap at 1 iteration with an
     // impossible tolerance → scc errs, energy() must not serve the
@@ -464,13 +624,21 @@ fn test_s1_state_invalidation_contract() {
         Err(e) => eprintln!("S1 expected SCC failure: {e}"),
         Ok(_) => panic!("S1: scc(1, 1e-15) unexpectedly converged"),
     }
-    assert!(eng.energy().is_err(), "S1: energy() after failed scc must fail");
-    assert!(eng.forces().is_err(), "S1: forces() after failed scc must fail");
+    assert!(
+        eng.energy().is_err(),
+        "S1: energy() after failed scc must fail"
+    );
+    assert!(
+        eng.forces().is_err(),
+        "S1: forces() after failed scc must fail"
+    );
 }
 
 #[test]
 fn test_s1_skin_euclidean_diagonal() {
-    let Some(_gpu) = require_sparse_gpu() else { return };
+    let Some(_gpu) = require_sparse_gpu() else {
+        return;
+    };
     let sk_dir = require_sih_sk_dir();
     let (species, coords, _, _, _) = sih4_geom();
     let sk = load_sk_for_species(&sk_dir, &species).unwrap();
@@ -479,8 +647,13 @@ fn test_s1_skin_euclidean_diagonal() {
         ..Default::default()
     };
     let mut eng = rust_dftb::methods::sparse::SparseDftb::with_config(
-        sk, &sk_dir, species.clone(), coords.clone(), cfg,
-    ).unwrap_or_else(|e| panic!("S1-skin engine: {e}"));
+        sk,
+        &sk_dir,
+        species.clone(),
+        coords.clone(),
+        cfg,
+    )
+    .unwrap_or_else(|e| panic!("S1-skin engine: {e}"));
 
     // Component 0.4 < skin/2 = 0.5, but |ΔR| = 0.4·√3 ≈ 0.693 > 0.5.
     // The old per-component check accepted this and silently missed
@@ -498,8 +671,9 @@ fn test_s1_skin_euclidean_diagonal() {
     let mut ok = coords.clone();
     ok[1][0] += 0.2;
     ok[1][1] += 0.2;
-    ok[1][2] += 0.2;   // |ΔR| = 0.346 < 0.5
-    eng.set_coords(&ok).unwrap_or_else(|e| panic!("S1 legal diagonal move rejected: {e}"));
+    ok[1][2] += 0.2; // |ΔR| = 0.346 < 0.5
+    eng.set_coords(&ok)
+        .unwrap_or_else(|e| panic!("S1 legal diagonal move rejected: {e}"));
 }
 
 // ============================================================================
@@ -509,7 +683,9 @@ fn test_s1_skin_euclidean_diagonal() {
 
 #[test]
 fn test_f3_no_device_allocs_in_scc() {
-    let Some(_gpu) = require_sparse_gpu() else { return };
+    let Some(_gpu) = require_sparse_gpu() else {
+        return;
+    };
     let sk_dir = require_sih_sk_dir();
     let (species, coords, _n, _, _) = sih4_geom();
     let sk = load_sk_for_species(&sk_dir, &species).unwrap();
@@ -523,13 +699,30 @@ fn test_f3_no_device_allocs_in_scc() {
     // Second geometry: skin-legal nudge → set_coords + warm-Z + full SCC.
     let mut c2 = coords.clone();
     c2[0][0] += 0.05;
-    eng.set_coords(&c2).unwrap_or_else(|e| panic!("F3 set_coords: {e}"));
-    eng.scc(80, 1e-5).unwrap_or_else(|e| panic!("F3 SCC geom2: {e}"));
+    eng.set_coords(&c2)
+        .unwrap_or_else(|e| panic!("F3 set_coords: {e}"));
+    eng.scc(80, 1e-5)
+        .unwrap_or_else(|e| panic!("F3 SCC geom2: {e}"));
     let a3 = eng.gpu().n_buf_allocs.get();
     eprintln!("F3 device allocs: init={a0} after_scc={a1} after_forces={a2} after_geom2_scc={a3}");
-    assert_eq!(a1, a0, "F3: {a1}-{a0}={} device buffers allocated inside scc()", a1 - a0);
-    assert_eq!(a2, a1, "F3: {} device buffers allocated inside forces()", a2 - a1);
-    assert_eq!(a3, a2, "F3: {} device buffers allocated in geometry-2 scc (warm-Z path)", a3 - a2);
+    assert_eq!(
+        a1,
+        a0,
+        "F3: {a1}-{a0}={} device buffers allocated inside scc()",
+        a1 - a0
+    );
+    assert_eq!(
+        a2,
+        a1,
+        "F3: {} device buffers allocated inside forces()",
+        a2 - a1
+    );
+    assert_eq!(
+        a3,
+        a2,
+        "F3: {} device buffers allocated in geometry-2 scc (warm-Z path)",
+        a3 - a2
+    );
 }
 
 // ============================================================================
@@ -545,19 +738,27 @@ fn test_f3_no_device_allocs_in_scc() {
 #[test]
 #[ignore]
 fn test_k_block_norm_histogram() {
-    let Some(_gpu) = require_sparse_gpu() else { return };
+    let Some(_gpu) = require_sparse_gpu() else {
+        return;
+    };
     let sk_dir = require_sih_sk_dir();
-    let xyz = concat!(env!("CARGO_MANIFEST_DIR"), "/../debug/nanocrystals/si_sphere_R18.xyz");
+    let xyz = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../debug/nanocrystals/si_sphere_R18.xyz"
+    );
     let mol = rust_dftb::io::parse_xyz(xyz).unwrap_or_else(|e| panic!("parse {xyz}: {e}"));
     let (species, coords) = (mol.species, mol.coords);
     let sk = load_sk_for_species(&sk_dir, &species).unwrap();
     let cfg = rust_dftb::methods::sparse::SparseDftbConfig {
-        r_trunc_ang: Some(8.0), r_k_ang: Some(12.0), r_z_ang: Some(12.0),
-        purifier_trs: Some(true), ..Default::default()
+        r_trunc_ang: Some(8.0),
+        r_k_ang: Some(12.0),
+        r_z_ang: Some(12.0),
+        purifier_trs: Some(true),
+        ..Default::default()
     };
-    let mut eng = rust_dftb::methods::sparse::SparseDftb::with_config(
-        sk, &sk_dir, species, coords, cfg,
-    ).unwrap_or_else(|e| panic!("SparseDftb::with_config: {e}"));
+    let mut eng =
+        rust_dftb::methods::sparse::SparseDftb::with_config(sk, &sk_dir, species, coords, cfg)
+            .unwrap_or_else(|e| panic!("SparseDftb::with_config: {e}"));
     eng.scc(100, 1e-5).unwrap_or_else(|e| panic!("SCC: {e}"));
 
     let k = eng.k_bsr().unwrap_or_else(|e| panic!("k_bsr: {e}"));
@@ -568,49 +769,92 @@ fn test_k_block_norm_histogram() {
 
     // Block Frobenius norms per pair + distance bins of 1 Å.
     let n_bins = 14usize;
-    let (mut cnt, mut mass, mut mx) = (vec![0usize; n_bins], vec![0.0f64; n_bins], vec![0.0f64; n_bins]);
+    let (mut cnt, mut mass, mut mx) = (
+        vec![0usize; n_bins],
+        vec![0.0f64; n_bins],
+        vec![0.0f64; n_bins],
+    );
     let mut norms: Vec<(u32, f64)> = Vec::with_capacity(ci.len()); // (row, ||B_ij||_F²)
     for i in 0..n_atom {
         for b in (rp[i] as usize)..(rp[i + 1] as usize) {
             let j = ci[b] as usize;
-            let bn2: f64 = k.values[b * 16..b * 16 + 16].iter().map(|&v| (v as f64) * (v as f64)).sum();
-            let dx = cc[i][0] - cc[j][0]; let dy = cc[i][1] - cc[j][1]; let dz = cc[i][2] - cc[j][2];
+            let bn2: f64 = k.values[b * 16..b * 16 + 16]
+                .iter()
+                .map(|&v| (v as f64) * (v as f64))
+                .sum();
+            let dx = cc[i][0] - cc[j][0];
+            let dy = cc[i][1] - cc[j][1];
+            let dz = cc[i][2] - cc[j][2];
             let d = (dx * dx + dy * dy + dz * dz).sqrt();
             let bin = (d as usize).min(n_bins - 1);
-            cnt[bin] += 1; mass[bin] += bn2; mx[bin] = mx[bin].max(bn2.sqrt());
+            cnt[bin] += 1;
+            mass[bin] += bn2;
+            mx[bin] = mx[bin].max(bn2.sqrt());
             norms.push((i as u32, bn2));
         }
     }
     let tot: f64 = mass.iter().sum();
-    eprintln!("\n=== K block-norm decay ({} atoms, {} blocks, ||K||_F²={tot:.4}) ===", n_atom, ci.len());
+    eprintln!(
+        "\n=== K block-norm decay ({} atoms, {} blocks, ||K||_F²={tot:.4}) ===",
+        n_atom,
+        ci.len()
+    );
     eprintln!("  dist_Å   blocks   mass/row·atom     max||B_ij||");
     for b in 0..n_bins {
-        if cnt[b] == 0 { continue; }
-        eprintln!("  {:>3}-{:<3}  {:>7}  {:>14.4e}  {:>14.4e}", b, b + 1, cnt[b], mass[b] / n_atom as f64, mx[b]);
+        if cnt[b] == 0 {
+            continue;
+        }
+        eprintln!(
+            "  {:>3}-{:<3}  {:>7}  {:>14.4e}  {:>14.4e}",
+            b,
+            b + 1,
+            cnt[b],
+            mass[b] / n_atom as f64,
+            mx[b]
+        );
     }
     // τ table: keep blocks with ||B_ij||_F > τ → nnz + dropped mass fraction.
     eprintln!("  tau        kept_nnz  nbr/atom  dropped_mass_frac");
     for &tau in &[1e-6f64, 3e-6, 1e-5, 3e-5, 1e-4, 3e-4, 1e-3, 3e-3] {
         let t2 = tau * tau;
         let kept = norms.iter().filter(|(_, n2)| *n2 > t2).count();
-        let dropped: f64 = norms.iter().filter(|(_, n2)| *n2 <= t2).map(|(_, n2)| n2).sum();
-        eprintln!("  {tau:>9.0e}  {:>8}  {:>8.1}  {:>15.4e}", kept, kept as f64 / n_atom as f64, dropped / tot);
+        let dropped: f64 = norms
+            .iter()
+            .filter(|(_, n2)| *n2 <= t2)
+            .map(|(_, n2)| n2)
+            .sum();
+        eprintln!(
+            "  {tau:>9.0e}  {:>8}  {:>8.1}  {:>15.4e}",
+            kept,
+            kept as f64 / n_atom as f64,
+            dropped / tot
+        );
     }
     // Per-row error budget ε_row = b·‖row‖_F: drop smallest blocks until
     // cumulative dropped mass hits the budget — nnz the budget buys.
     eprintln!("  row_budget_frac   kept_nnz  nbr/atom");
     for &bf in &[1e-3f64, 3e-3, 1e-2, 3e-2, 1e-1] {
         let mut rows: std::collections::HashMap<u32, Vec<f64>> = std::collections::HashMap::new();
-        for &(i, n2) in &norms { rows.entry(i).or_default().push(n2); }
+        for &(i, n2) in &norms {
+            rows.entry(i).or_default().push(n2);
+        }
         let mut kept = 0usize;
         for v in rows.values_mut() {
             let row_f2: f64 = v.iter().sum();
             let budget = bf * bf * row_f2;
             v.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            let mut acc = 0.0; let mut drop = 0usize;
-            while drop < v.len() && acc + v[drop] <= budget { acc += v[drop]; drop += 1; }
+            let mut acc = 0.0;
+            let mut drop = 0usize;
+            while drop < v.len() && acc + v[drop] <= budget {
+                acc += v[drop];
+                drop += 1;
+            }
             kept += v.len() - drop;
         }
-        eprintln!("  {bf:>14.0e}  {:>8}  {:>8.1}", kept, kept as f64 / n_atom as f64);
+        eprintln!(
+            "  {bf:>14.0e}  {:>8}  {:>8.1}",
+            kept,
+            kept as f64 / n_atom as f64
+        );
     }
 }

@@ -25,9 +25,9 @@
 //! truncation error (~1e-7 at physical r) — energy–force consistent to that
 //! level. Beyond `r_max`: T=0 ⇒ γ=1/r, γ′=−1/r² exactly.
 
-use crate::core::error::{DftbError, Result};
-use super::gamma::gamma_full;
 use super::forces::gamma_prime_full;
+use super::gamma::gamma_full;
+use crate::core::error::{DftbError, Result};
 
 /// Uniform knots over `[0, r_max]`. nk=256 → dr≈0.157 Bohr ≈ 0.083 Å.
 /// Measured (physical range r≥1.2 bohr, mio H/C/N/O pairs):
@@ -91,7 +91,8 @@ impl GammaSpline {
                     }
                     if !t[k].is_finite() || !td[k].is_finite() {
                         return Err(DftbError::InvalidInput(format!(
-                            "GammaSpline::new: non-finite pair {si}-{sj} k={k} r={r:.4} T={} T'={}", t[k], td[k]
+                            "GammaSpline::new: non-finite pair {si}-{sj} k={k} r={r:.4} T={} T'={}",
+                            t[k], td[k]
                         )));
                     }
                 }
@@ -106,7 +107,14 @@ impl GammaSpline {
                 }
             }
         }
-        Ok(Self { hubbard_u: hubbard_u.to_vec(), n_species: nsp, nk, dr, r_max, knots })
+        Ok(Self {
+            hubbard_u: hubbard_u.to_vec(),
+            n_species: nsp,
+            nk,
+            dr,
+            r_max,
+            knots,
+        })
     }
 
     /// Host reference eval (f64): returns (γ, γ′) in Hartree / Hartree·Bohr⁻¹.
@@ -119,8 +127,8 @@ impl GammaSpline {
         if r >= self.r_max {
             return (1.0 / r, -1.0 / (r * r)); // T=0: pure Coulomb
         }
-        let t = self.cubic_val(r, si, sj, 0);   // (T, T″) → T
-        let td = self.cubic_val(r, si, sj, 2);  // (T′, T‴) → T′
+        let t = self.cubic_val(r, si, sj, 0); // (T, T″) → T
+        let td = self.cubic_val(r, si, sj, 2); // (T′, T‴) → T′
         ((1.0 - t) / r, -td / r - (1.0 - t) / (r * r))
     }
 
@@ -175,7 +183,9 @@ mod tests {
     use super::*;
 
     /// mio-1-1 Hubbard U for H,C,N,O (from sk_data onsite; matches GammaTable).
-    fn mio_u() -> Vec<f64> { vec![0.4195, 0.5500, 0.5500, 0.5600] }
+    fn mio_u() -> Vec<f64> {
+        vec![0.4195, 0.5500, 0.5500, 0.5600]
+    }
 
     /// Error vs knot count — pick the smallest table meeting the contract.
     /// Physical range only (r ≥ 1.2 bohr ≈ shortest mio bond); r<1.0 is inside
@@ -197,7 +207,10 @@ mod tests {
                     }
                 }
             }
-            eprintln!("nk={nk:5} dr={:.4} bohr: max|Δγ|={mg:.3e} max|Δγ′|={mgp:.3e}", sp.dr);
+            eprintln!(
+                "nk={nk:5} dr={:.4} bohr: max|Δγ|={mg:.3e} max|Δγ′|={mgp:.3e}",
+                sp.dr
+            );
         }
     }
 
@@ -215,24 +228,46 @@ mod tests {
                 let mut r = 0.05f64;
                 while r < 60.0 {
                     let (g, gp) = sp.eval(r, si, sj);
-                    let ga = if r < 1e-10 { 0.5 * (u[si] + u[sj]) } else { gamma_full(r, u[si], u[sj]) };
-                    let gpa = if r < 1e-10 { 0.0 } else { gamma_prime_full(r, u[si], u[sj]) };
+                    let ga = if r < 1e-10 {
+                        0.5 * (u[si] + u[sj])
+                    } else {
+                        gamma_full(r, u[si], u[sj])
+                    };
+                    let gpa = if r < 1e-10 {
+                        0.0
+                    } else {
+                        gamma_prime_full(r, u[si], u[sj])
+                    };
                     let dg = (g - ga).abs();
                     let dgp = (gp - gpa).abs();
-                    if dg > max_g { max_g = dg; worst = (si, sj, r); }
+                    if dg > max_g {
+                        max_g = dg;
+                        worst = (si, sj, r);
+                    }
                     max_gp = max_gp.max(dgp);
                     // r ≥ 1.0 bohr ≈ 0.53 Å — below that the pair is inside
                     // the repulsive wall (min mio bond ~1.4 bohr); spline
                     // error there (~1e-6 γ) is irrelevant to valid physics.
-                    if r >= 1.0 { max_g_phys = max_g_phys.max(dg); max_gp_phys = max_gp_phys.max(dgp); }
+                    if r >= 1.0 {
+                        max_g_phys = max_g_phys.max(dg);
+                        max_gp_phys = max_gp_phys.max(dgp);
+                    }
                     r += 0.0137;
                 }
             }
         }
-        eprintln!("γ-spline vs analytic: max|Δγ|={max_g:.3e} max|Δγ′|={max_gp:.3e} worst pair {worst:?}");
+        eprintln!(
+            "γ-spline vs analytic: max|Δγ|={max_g:.3e} max|Δγ′|={max_gp:.3e} worst pair {worst:?}"
+        );
         eprintln!("  physical r≥1.0 bohr: max|Δγ|={max_g_phys:.3e} max|Δγ′|={max_gp_phys:.3e}");
-        assert!(max_g_phys < 2e-6, "spline γ error (r≥1.0) {max_g_phys:.3e} too large");
-        assert!(max_gp_phys < 2e-6, "spline γ′ error (r≥1.0) {max_gp_phys:.3e} too large");
+        assert!(
+            max_g_phys < 2e-6,
+            "spline γ error (r≥1.0) {max_g_phys:.3e} too large"
+        );
+        assert!(
+            max_gp_phys < 2e-6,
+            "spline γ′ error (r≥1.0) {max_gp_phys:.3e} too large"
+        );
     }
 
     #[test]
@@ -256,7 +291,10 @@ mod tests {
                     let (g_1, _) = sp.eval(r - h, si, sj);
                     let fd = (g1 - g_1) / (2.0 * h);
                     let rel = ((gp - fd) / gp.abs().max(1e-30)).abs();
-                    if rel > max_rel { max_rel = rel; worst_r = r; }
+                    if rel > max_rel {
+                        max_rel = rel;
+                        worst_r = r;
+                    }
                     max_abs = max_abs.max((gp - fd).abs());
                     r += 0.41;
                 }
@@ -269,6 +307,9 @@ mod tests {
         // Measured 7e-6 at the r=1.0 edge (sum of both splines' truncation at
         // the short-range curvature peak); force contribution dq_i·dq_j·err
         // ~ 6e-7 Ha/Å ≪ the 1.5e-6 force-parity floor. Bound with margin.
-        assert!(max_abs < 2e-5, "spline γ′ inconsistent with spline γ: abs {max_abs:.3e}");
+        assert!(
+            max_abs < 2e-5,
+            "spline γ′ inconsistent with spline γ: abs {max_abs:.3e}"
+        );
     }
 }

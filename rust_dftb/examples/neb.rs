@@ -15,15 +15,12 @@
 //! plus per-image geometry + SCC data under `<data-dir>/img_XX/`.
 
 use rust_dftb::methods::dftb::forces::compute_scc_forces;
-use rust_dftb::{
-    load_sk_for_species, parse_xyz, DftbOutput, HamiltonianBuilder, SccResult,
-};
+use rust_dftb::{load_sk_for_species, parse_xyz, DftbOutput, HamiltonianBuilder, SccResult};
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 
-const DEFAULT_SK_DIR: &str =
-    "/home/prokophapala/git_SW/dftbplus/external/slakos/origin/mio-1-1";
+const DEFAULT_SK_DIR: &str = "/home/prokophapala/git_SW/dftbplus/external/slakos/origin/mio-1-1";
 
 /// Per-image SCC + force evaluation result.
 struct ImageEval {
@@ -189,7 +186,13 @@ fn max_force_norm(forces: &[Vec<[f64; 3]>]) -> f64 {
 
 // ── Per-image data saving ─────────────────────────────────────────────────
 
-fn save_image_data(dir: &Path, idx: usize, species: &[String], coords: &[[f64; 3]], ev: &ImageEval) -> std::io::Result<()> {
+fn save_image_data(
+    dir: &Path,
+    idx: usize,
+    species: &[String],
+    coords: &[[f64; 3]],
+    ev: &ImageEval,
+) -> std::io::Result<()> {
     let img_dir = dir.join(format!("img_{idx:02}"));
     std::fs::create_dir_all(&img_dir)?;
 
@@ -206,8 +209,11 @@ fn save_image_data(dir: &Path, idx: usize, species: &[String], coords: &[[f64; 3
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
     DftbOutput::write_square(img_dir.join("s.dat").to_str().unwrap(), &ev.scc.s)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-    DftbOutput::write_square(img_dir.join("density.dat").to_str().unwrap(), &ev.scc.density)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+    DftbOutput::write_square(
+        img_dir.join("density.dat").to_str().unwrap(),
+        &ev.scc.density,
+    )
+    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
     let mut f = File::create(img_dir.join("eigenvalues.txt"))?;
     writeln!(f, "# orbital eigenvalues (Hartree)")?;
@@ -248,10 +254,12 @@ struct NebArgs {
 }
 
 fn parse_f64(v: &str, flag: &str) -> f64 {
-    v.parse::<f64>().unwrap_or_else(|_| panic!("invalid float for {flag}: {v}"))
+    v.parse::<f64>()
+        .unwrap_or_else(|_| panic!("invalid float for {flag}: {v}"))
 }
 fn parse_usize(v: &str, flag: &str) -> usize {
-    v.parse::<usize>().unwrap_or_else(|_| panic!("invalid integer for {flag}: {v}"))
+    v.parse::<usize>()
+        .unwrap_or_else(|_| panic!("invalid integer for {flag}: {v}"))
 }
 
 fn parse_args() -> NebArgs {
@@ -272,18 +280,54 @@ fn parse_args() -> NebArgs {
     while i < args.len() {
         let a = args[i].as_str();
         match a {
-            "--start" => { start = Some(args[i + 1].clone()); i += 2; }
-            "--end" => { end = Some(args[i + 1].clone()); i += 2; }
-            "--images" => { images = parse_usize(&args[i + 1], "--images"); i += 2; }
-            "--k" => { k = parse_f64(&args[i + 1], "--k"); i += 2; }
-            "--maxiter" => { maxiter = parse_usize(&args[i + 1], "--maxiter"); i += 2; }
-            "--step" => { step = parse_f64(&args[i + 1], "--step"); i += 2; }
-            "--tol" => { tol = parse_f64(&args[i + 1], "--tol"); i += 2; }
-            "--out" => { out = args[i + 1].clone(); i += 2; }
-            "--data-dir" => { data_dir = args[i + 1].clone(); i += 2; }
-            "--scc-max-iter" => { scc_max_iter = parse_usize(&args[i + 1], "--scc-max-iter"); i += 2; }
-            "--scc-tol" => { scc_tol = parse_f64(&args[i + 1], "--scc-tol"); i += 2; }
-            other => { eprintln!("warning: ignoring unknown arg {other}"); i += 1; }
+            "--start" => {
+                start = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--end" => {
+                end = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--images" => {
+                images = parse_usize(&args[i + 1], "--images");
+                i += 2;
+            }
+            "--k" => {
+                k = parse_f64(&args[i + 1], "--k");
+                i += 2;
+            }
+            "--maxiter" => {
+                maxiter = parse_usize(&args[i + 1], "--maxiter");
+                i += 2;
+            }
+            "--step" => {
+                step = parse_f64(&args[i + 1], "--step");
+                i += 2;
+            }
+            "--tol" => {
+                tol = parse_f64(&args[i + 1], "--tol");
+                i += 2;
+            }
+            "--out" => {
+                out = args[i + 1].clone();
+                i += 2;
+            }
+            "--data-dir" => {
+                data_dir = args[i + 1].clone();
+                i += 2;
+            }
+            "--scc-max-iter" => {
+                scc_max_iter = parse_usize(&args[i + 1], "--scc-max-iter");
+                i += 2;
+            }
+            "--scc-tol" => {
+                scc_tol = parse_f64(&args[i + 1], "--scc-tol");
+                i += 2;
+            }
+            other => {
+                eprintln!("warning: ignoring unknown arg {other}");
+                i += 1;
+            }
         }
     }
     NebArgs {
@@ -311,7 +355,8 @@ fn main() {
         DEFAULT_SK_DIR.to_string()
     });
 
-    let mol_start = parse_xyz(&args.start).unwrap_or_else(|e| panic!("parse start {}: {e}", args.start));
+    let mol_start =
+        parse_xyz(&args.start).unwrap_or_else(|e| panic!("parse start {}: {e}", args.start));
     let mol_end = parse_xyz(&args.end).unwrap_or_else(|e| panic!("parse end {}: {e}", args.end));
     assert_eq!(
         mol_start.species, mol_end.species,
@@ -332,7 +377,10 @@ fn main() {
         args.step,
         args.tol
     );
-    eprintln!("[neb] endpoint RMSD = {:.6} Å", rmsd(&mol_start.coords, &mol_end.coords));
+    eprintln!(
+        "[neb] endpoint RMSD = {:.6} Å",
+        rmsd(&mol_start.coords, &mol_end.coords)
+    );
 
     let sk = load_sk_for_species(&sk_dir, species)
         .unwrap_or_else(|e| panic!("failed to load SK from {sk_dir}: {e}"));
@@ -360,14 +408,8 @@ fn main() {
         let mut energies = Vec::with_capacity(args.images);
         let mut real_forces = Vec::with_capacity(args.images);
         for (_i, geom) in images.iter().enumerate() {
-            let ev = eval_scc_with_forces(
-                &builder,
-                species,
-                geom,
-                args.scc_max_iter,
-                args.scc_tol,
-            )
-            .unwrap_or_else(|e| panic!("image eval failed at iter {iter}: {e}"));
+            let ev = eval_scc_with_forces(&builder, species, geom, args.scc_max_iter, args.scc_tol)
+                .unwrap_or_else(|e| panic!("image eval failed at iter {iter}: {e}"));
             energies.push(ev.energy);
             real_forces.push(ev.forces);
         }
@@ -386,14 +428,15 @@ fn main() {
 
         let e_min = energies.iter().cloned().fold(f64::INFINITY, f64::min);
         let e_max = energies.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-        eprintln!(
-            "[neb] iter {iter:>3}  max|F|={max_f:.6e}  E_range=[{e_min:.8}, {e_max:.8}]"
-        );
+        eprintln!("[neb] iter {iter:>3}  max|F|={max_f:.6e}  E_range=[{e_min:.8}, {e_max:.8}]");
         iter += 1;
     }
 
     if max_f <= args.tol {
-        eprintln!("[neb] converged in {iter} iterations (max|F|={max_f:.6e} <= tol={})", args.tol);
+        eprintln!(
+            "[neb] converged in {iter} iterations (max|F|={max_f:.6e} <= tol={})",
+            args.tol
+        );
     } else {
         let maxiter = args.maxiter;
         eprintln!("[neb] reached maxiter={maxiter} (max|F|={max_f:.6e})");
@@ -411,16 +454,27 @@ fn main() {
     }
 
     // Write band CSV.
-    let mut f = File::create(&args.out)
-        .unwrap_or_else(|e| panic!("cannot create {}: {e}", args.out));
+    let mut f =
+        File::create(&args.out).unwrap_or_else(|e| panic!("cannot create {}: {e}", args.out));
     writeln!(f, "# NEB band").unwrap();
-    writeln!(f, "# images={} k={} iterations={}", args.images, args.k, iter).unwrap();
+    writeln!(
+        f,
+        "# images={} k={} iterations={}",
+        args.images, args.k, iter
+    )
+    .unwrap();
     writeln!(f, "image,energy_hartree").unwrap();
     for (i, e) in final_energies.iter().enumerate() {
         writeln!(f, "{i},{e:.16e}").unwrap();
     }
     eprintln!("[neb] wrote band to {} ({} images)", args.out, args.images);
     let e_min = final_energies.iter().cloned().fold(f64::INFINITY, f64::min);
-    let e_max = final_energies.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    eprintln!("[neb] final energy range: [{e_min:.10}, {e_max:.10}] Hartree, barrier ~{:.10}", e_max - e_min);
+    let e_max = final_energies
+        .iter()
+        .cloned()
+        .fold(f64::NEG_INFINITY, f64::max);
+    eprintln!(
+        "[neb] final energy range: [{e_min:.10}, {e_max:.10}] Hartree, barrier ~{:.10}",
+        e_max - e_min
+    );
 }

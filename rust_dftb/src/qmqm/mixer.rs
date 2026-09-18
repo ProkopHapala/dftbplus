@@ -100,8 +100,8 @@ impl DiisMixer {
         let res_bufs = (0..max_history).map(|_| vec![0.0; vector_len]).collect();
         Self {
             max_history,
-            warmup: 0,   // no warmup — DIIS starts immediately (falls back to simple mixing until enough history)
-            alpha: 0.5,  // more aggressive simple mixing for faster convergence
+            warmup: 0, // no warmup — DIIS starts immediately (falls back to simple mixing until enough history)
+            alpha: 0.5, // more aggressive simple mixing for faster convergence
             iter: 0,
             q_in_bufs,
             res_bufs,
@@ -174,7 +174,9 @@ impl Mixer for DiisMixer {
         self.q_in_bufs[idx].copy_from_slice(q_inout);
         self.res_bufs[idx].copy_from_slice(residual);
         self.buf_idx = (self.buf_idx + 1) % self.max_history;
-        if self.n_filled < self.max_history { self.n_filled += 1; }
+        if self.n_filled < self.max_history {
+            self.n_filled += 1;
+        }
 
         let n_hist = self.solve_diis();
         if n_hist == 0 {
@@ -197,7 +199,9 @@ impl Mixer for DiisMixer {
             let c = self.work[i];
             let q_in_i = &self.q_in_bufs[i];
             let res_i = &self.res_bufs[i];
-            for (q, (&q_in_val, &res_val)) in q_inout.iter_mut().zip(q_in_i.iter().zip(res_i.iter())) {
+            for (q, (&q_in_val, &res_val)) in
+                q_inout.iter_mut().zip(q_in_i.iter().zip(res_i.iter()))
+            {
                 *q += c * (q_in_val + res_val);
             }
         }
@@ -208,11 +212,17 @@ impl Mixer for DiisMixer {
         // ‖q_next‖ to ‖r‖ — ‖q‖ is O(√N·valence) ≈ 13 for Si10H16, so DIIS
         // was silently rejected whenever ‖r‖ < ‖q‖/100, i.e. exactly when
         // the iterate was close enough that only DIIS could finish.)
-        let step_norm: f64 = q_inout.iter().zip(self.q_in_bufs[cur].iter())
-            .map(|(a, b)| (a - b) * (a - b)).sum::<f64>().sqrt();
+        let step_norm: f64 = q_inout
+            .iter()
+            .zip(self.q_in_bufs[cur].iter())
+            .map(|(a, b)| (a - b) * (a - b))
+            .sum::<f64>()
+            .sqrt();
         let max_q: f64 = q_inout.iter().fold(0.0f64, |m, &q| m.max(q.abs()));
-        if !q_inout.iter().all(|q| q.is_finite()) || max_q > 10.0
-            || step_norm > 50.0 * prev_norm.max(1e-10) {
+        if !q_inout.iter().all(|q| q.is_finite())
+            || max_q > 10.0
+            || step_norm > 50.0 * prev_norm.max(1e-10)
+        {
             // Reject DIIS, take damped simple mixing step instead.
             // Restore q_inout to the pre-DIIS state (q_in before overwrite).
             q_inout.copy_from_slice(&self.q_in_bufs[cur]);
@@ -331,8 +341,8 @@ mod tests {
 /// 153, 184103 (2020) — "Broyden mixing for DFTB".
 #[derive(Debug, Clone)]
 pub struct BroydenMixer {
-    pub alpha: f64,           // initial mixing parameter (J_inv = -alpha*I)
-    n: usize,                 // vector length
+    pub alpha: f64, // initial mixing parameter (J_inv = -alpha*I)
+    n: usize,       // vector length
     iter: usize,
     /// Inverse Jacobian approximation, row-major n×n.
     j_inv: Vec<f64>,
@@ -341,11 +351,11 @@ pub struct BroydenMixer {
     /// Previous residual F (for computing y = ΔF).
     f_prev: Vec<f64>,
     /// Work vectors.
-    jq: Vec<f64>,             // J_inv · F
-    s: Vec<f64>,              // Δq
-    y: Vec<f64>,              // ΔF
-    jt_y: Vec<f64>,           // J_inv^T · y  (for denominator)
-    js: Vec<f64>,             // J_inv · s
+    jq: Vec<f64>, // J_inv · F
+    s: Vec<f64>,    // Δq
+    y: Vec<f64>,    // ΔF
+    jt_y: Vec<f64>, // J_inv^T · y  (for denominator)
+    js: Vec<f64>,   // J_inv · s
     /// Whether J_inv has been initialized.
     initialized: bool,
 }
@@ -411,7 +421,9 @@ impl BroydenMixer {
         }
         // u = s - J_inv·y = s - js
         let mut u = vec![0.0; n];
-        for i in 0..n { u[i] = self.s[i] - self.js[i]; }
+        for i in 0..n {
+            u[i] = self.s[i] - self.js[i];
+        }
         // w = J_inv^T · s  (row vector for outer product)
         let s = self.s.clone();
         for i in 0..n {

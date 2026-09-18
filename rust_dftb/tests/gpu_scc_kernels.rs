@@ -78,10 +78,7 @@ fn per_atom_u(sk: &rust_dftb::SkData, species: &[String]) -> Vec<f64> {
 
 /// Build the dense gamma matrix G[Na*Na] (row-major) for a fragment.
 /// G[a*Na+b] = gamma_full(r_ab, U_a, U_b)  (r=0 → on-site = (U_a+U_b)/2).
-fn build_gamma_matrix(
-    coords: &[[f64; 3]],
-    u_per_atom: &[f64],
-) -> Vec<f32> {
+fn build_gamma_matrix(coords: &[[f64; 3]], u_per_atom: &[f64]) -> Vec<f32> {
     let n = coords.len();
     let mut g = vec![0.0f32; n * n];
     for a in 0..n {
@@ -168,30 +165,41 @@ fn run_gemm_parity(rt: &mut GpuRuntime, n: usize, batch: usize, label: &str) {
         worst = worst.max(d);
     }
     eprintln!("GEMM {label} (n={n}, batch={batch}): max|dC| = {worst:e}");
-    assert!(worst < 1e-4, "GEMM {label} parity failed: max|dC| = {worst:e}");
+    assert!(
+        worst < 1e-4,
+        "GEMM {label} parity failed: max|dC| = {worst:e}"
+    );
 }
 
 #[test]
 fn test_matmul_full_local_h2() {
-    let Some(mut rt) = try_runtime() else { return; };
+    let Some(mut rt) = try_runtime() else {
+        return;
+    };
     run_gemm_parity(&mut rt, 2, 1, "H2");
 }
 
 #[test]
 fn test_matmul_full_local_n2() {
-    let Some(mut rt) = try_runtime() else { return; };
+    let Some(mut rt) = try_runtime() else {
+        return;
+    };
     run_gemm_parity(&mut rt, 8, 1, "N2");
 }
 
 #[test]
 fn test_matmul_full_local_h2o() {
-    let Some(mut rt) = try_runtime() else { return; };
+    let Some(mut rt) = try_runtime() else {
+        return;
+    };
     run_gemm_parity(&mut rt, 6, 1, "H2O");
 }
 
 #[test]
 fn test_matmul_full_local_batched() {
-    let Some(mut rt) = try_runtime() else { return; };
+    let Some(mut rt) = try_runtime() else {
+        return;
+    };
     // 10× H2O (6×6) in one launch
     run_gemm_parity(&mut rt, 6, 10, "batched-H2O");
 }
@@ -202,7 +210,9 @@ fn test_matmul_full_local_batched() {
 
 #[test]
 fn test_gamma_matvec_h2o() {
-    let Some(mut rt) = try_runtime() else { return; };
+    let Some(mut rt) = try_runtime() else {
+        return;
+    };
     let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else {
         eprintln!("Skipping: RUST_DFTB_SK_DIR not set");
         return;
@@ -242,7 +252,10 @@ fn test_gamma_matvec_h2o() {
     rt.read_buffer(&v_buf, &mut v_gpu).unwrap();
 
     let d = max_abs_diff_slice(&v_gpu, &v_cpu);
-    eprintln!("gamma_matvec H2O: V_cpu = {:?}, V_gpu = {:?}, max|dV| = {d:e}", v_cpu, v_gpu);
+    eprintln!(
+        "gamma_matvec H2O: V_cpu = {:?}, V_gpu = {:?}, max|dV| = {d:e}",
+        v_cpu, v_gpu
+    );
     assert!(d < 1e-4, "gamma_matvec parity failed: max|dV| = {d:e}");
 }
 
@@ -252,7 +265,9 @@ fn test_gamma_matvec_h2o() {
 
 #[test]
 fn test_h_scc_update_h2o() {
-    let Some(mut rt) = try_runtime() else { return; };
+    let Some(mut rt) = try_runtime() else {
+        return;
+    };
     let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else {
         eprintln!("Skipping: RUST_DFTB_SK_DIR not set");
         return;
@@ -292,7 +307,10 @@ fn test_h_scc_update_h2o() {
     let v_buf = rt.buffer_from_slice(&v_atom).unwrap();
     let h_buf = rt.zero_buffer::<f32>(n * n).unwrap();
     let oa_buf = rt.buffer_from_slice(&orb_atom).unwrap();
-    h_scc_update_batched(&mut rt, &h0_buf, &s_buf, &v_buf, &h_buf, &oa_buf, n, n_atoms, 1).unwrap();
+    h_scc_update_batched(
+        &mut rt, &h0_buf, &s_buf, &v_buf, &h_buf, &oa_buf, n, n_atoms, 1,
+    )
+    .unwrap();
     rt.finish().unwrap();
 
     let mut h_gpu = vec![0.0f32; n * n];
@@ -309,7 +327,9 @@ fn test_h_scc_update_h2o() {
 
 #[test]
 fn test_mulliken_charges_h2o() {
-    let Some(mut rt) = try_runtime() else { return; };
+    let Some(mut rt) = try_runtime() else {
+        return;
+    };
     let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else {
         eprintln!("Skipping: RUST_DFTB_SK_DIR not set");
         return;
@@ -341,14 +361,20 @@ fn test_mulliken_charges_h2o() {
     let oa_buf = rt.buffer_from_slice(&orb_atom).unwrap();
     let q_buf = rt.zero_buffer::<f32>(n_atoms).unwrap();
     let ones = rt.buffer_from_slice(&[1i32]).unwrap();
-    mulliken_charges_batched(&mut rt, &d_buf, &s_buf, &q_buf, &oa_buf, n, n_atoms, 1, &ones).unwrap();
+    mulliken_charges_batched(
+        &mut rt, &d_buf, &s_buf, &q_buf, &oa_buf, n, n_atoms, 1, &ones,
+    )
+    .unwrap();
     rt.finish().unwrap();
 
     let mut q_gpu = vec![0.0f32; n_atoms];
     rt.read_buffer(&q_buf, &mut q_gpu).unwrap();
 
     let d = max_abs_diff_slice(&q_gpu, &q_cpu);
-    eprintln!("mulliken H2O: q_cpu = {:?}, q_gpu = {:?}, max|dq| = {d:e}", q_cpu, q_gpu);
+    eprintln!(
+        "mulliken H2O: q_cpu = {:?}, q_gpu = {:?}, max|dq| = {d:e}",
+        q_cpu, q_gpu
+    );
     assert!(d < 1e-4, "mulliken parity failed: max|dq| = {d:e}");
 }
 
@@ -358,7 +384,9 @@ fn test_mulliken_charges_h2o() {
 
 #[test]
 fn test_residual_and_mix() {
-    let Some(mut rt) = try_runtime() else { return; };
+    let Some(mut rt) = try_runtime() else {
+        return;
+    };
     let n_atoms = 5usize;
     let batch = 3usize;
     let alpha = 0.35f32;
@@ -392,8 +420,10 @@ fn test_residual_and_mix() {
     let qm_buf = rt.zero_buffer::<f32>(batch * n_atoms).unwrap();
     let rms_buf = rt.zero_buffer::<f32>(batch).unwrap();
     let act_buf = rt.buffer_from_slice(&vec![1i32; batch]).unwrap();
-    residual_and_mix_batched(&mut rt, &qn_buf, &qo_buf, &qm_buf, &rms_buf, &act_buf, alpha, n_atoms, batch)
-        .unwrap();
+    residual_and_mix_batched(
+        &mut rt, &qn_buf, &qo_buf, &qm_buf, &rms_buf, &act_buf, alpha, n_atoms, batch,
+    )
+    .unwrap();
     rt.finish().unwrap();
 
     let mut qm_gpu = vec![0.0f32; batch * n_atoms];
@@ -421,7 +451,9 @@ fn test_residual_and_mix() {
 
 #[test]
 fn test_batched_scc_kernels() {
-    let Some(mut rt) = try_runtime() else { return; };
+    let Some(mut rt) = try_runtime() else {
+        return;
+    };
     let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else {
         eprintln!("Skipping: RUST_DFTB_SK_DIR not set");
         return;
@@ -467,7 +499,11 @@ fn test_batched_scc_kernels() {
         let v = vec![0.1f32 * (bi as f32 + 1.0) / 10.0, -0.05, 0.02];
         all_v_atom.extend(v.clone());
         all_orb_atom.extend(orb_atom.clone());
-        let dq = vec![0.15f32 - 0.01 * bi as f32, -0.075, -0.075 + 0.005 * bi as f32];
+        let dq = vec![
+            0.15f32 - 0.01 * bi as f32,
+            -0.075,
+            -0.075 + 0.005 * bi as f32,
+        ];
         all_dq.extend(dq.clone());
         all_q_old.extend(vec![0.0f32; n_atoms]);
 
@@ -500,7 +536,11 @@ fn test_batched_scc_kernels() {
         cpu_charges.extend(scc.charges.iter().map(|&q| q as f32));
     }
 
-    let n = builder.build_non_scc(&species, &base_coords).unwrap().h0.nrows();
+    let n = builder
+        .build_non_scc(&species, &base_coords)
+        .unwrap()
+        .h0
+        .nrows();
 
     // --- GPU batched launches ---
     let h0_buf = rt.buffer_from_slice(&all_h0).unwrap();
@@ -514,8 +554,10 @@ fn test_batched_scc_kernels() {
     // 1. gamma matvec → V
     gamma_matvec_batched(&mut rt, &g_buf, &dq_buf, &v_buf, n_atoms, batch).unwrap();
     // 2. h_scc_update using V
-    h_scc_update_batched(&mut rt, &h0_buf, &s_buf, &v_buf, &h_buf, &oa_buf, n, n_atoms, batch)
-        .unwrap();
+    h_scc_update_batched(
+        &mut rt, &h0_buf, &s_buf, &v_buf, &h_buf, &oa_buf, n, n_atoms, batch,
+    )
+    .unwrap();
     rt.finish().unwrap();
 
     let mut v_gpu = vec![0.0f32; batch * n_atoms];
@@ -543,7 +585,10 @@ fn test_batched_scc_kernels() {
     let d_buf = rt.buffer_from_slice(&all_d).unwrap();
     let q_buf = rt.zero_buffer::<f32>(batch * n_atoms).unwrap();
     let ones = rt.buffer_from_slice(&vec![1i32; batch]).unwrap();
-    mulliken_charges_batched(&mut rt, &d_buf, &s_buf, &q_buf, &oa_buf, n, n_atoms, batch, &ones).unwrap();
+    mulliken_charges_batched(
+        &mut rt, &d_buf, &s_buf, &q_buf, &oa_buf, n, n_atoms, batch, &ones,
+    )
+    .unwrap();
     rt.finish().unwrap();
     let mut q_gpu = vec![0.0f32; batch * n_atoms];
     rt.read_buffer(&q_buf, &mut q_gpu).unwrap();
@@ -558,8 +603,10 @@ fn test_batched_scc_kernels() {
     let qm_buf = rt.zero_buffer::<f32>(batch * n_atoms).unwrap();
     let rms_buf = rt.zero_buffer::<f32>(batch).unwrap();
     let act_buf = rt.buffer_from_slice(&vec![1i32; batch]).unwrap();
-    residual_and_mix_batched(&mut rt, &dq_buf, &qo_buf, &qm_buf, &rms_buf, &act_buf, 0.3, n_atoms, batch)
-        .unwrap();
+    residual_and_mix_batched(
+        &mut rt, &dq_buf, &qo_buf, &qm_buf, &rms_buf, &act_buf, 0.3, n_atoms, batch,
+    )
+    .unwrap();
     rt.finish().unwrap();
     let mut qm_gpu = vec![0.0f32; batch * n_atoms];
     let mut rms_gpu = vec![0.0f32; batch];
@@ -594,7 +641,9 @@ fn test_batched_scc_kernels() {
 
 #[test]
 fn bench_gemm_full_local_vs_tiled() {
-    let Some(mut rt) = try_runtime() else { return; };
+    let Some(mut rt) = try_runtime() else {
+        return;
+    };
     use rust_dftb::qmqm::gpu_matrix::{GpuMatrixContext, MatrixKernelConfig, Transpose};
 
     let cfg = MatrixKernelConfig::nvidia_default();
@@ -644,12 +693,32 @@ fn bench_gemm_full_local_vs_tiled() {
             let c_t = ctx.zero_buffer(batch * n * n).unwrap();
             let mut c_t_host = vec![0.0f32; batch * n * n];
 
-            let _ = ctx.batched_gemm(n, batch, Transpose::No, Transpose::No, 1.0, 0.0, &a_t, &b_t, &c_t);
+            let _ = ctx.batched_gemm(
+                n,
+                batch,
+                Transpose::No,
+                Transpose::No,
+                1.0,
+                0.0,
+                &a_t,
+                &b_t,
+                &c_t,
+            );
             let _ = ctx.read_buffer(&c_t, &mut c_t_host);
 
             let t0 = std::time::Instant::now();
             for _ in 0..5 {
-                let _ = ctx.batched_gemm(n, batch, Transpose::No, Transpose::No, 1.0, 0.0, &a_t, &b_t, &c_t);
+                let _ = ctx.batched_gemm(
+                    n,
+                    batch,
+                    Transpose::No,
+                    Transpose::No,
+                    1.0,
+                    0.0,
+                    &a_t,
+                    &b_t,
+                    &c_t,
+                );
             }
             let _ = ctx.read_buffer(&c_t, &mut c_t_host);
             let t_tiled = t0.elapsed().as_secs_f64() / 5.0;

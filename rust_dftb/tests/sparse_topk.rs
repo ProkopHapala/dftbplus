@@ -33,38 +33,70 @@ fn topk_mask_sweep_r14() {
     // sets like pbc-0-3 where the default is narrower than the DM support).
     // Env: RUST_DFTB_SK_DIR selects the SK set; TOPK_R_TRUNC (default 8.0)
     // and TOPK_R_REF (default 0 = full) adapt to pbc.
-    let envf = |name: &str, dflt: f64| std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(dflt);
+    let envf = |name: &str, dflt: f64| {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(dflt)
+    };
     let r_trunc = envf("TOPK_R_TRUNC", 8.0);
     let r_ref = envf("TOPK_R_REF", 0.0);
     let mut cfg = SparseDftbConfig {
-        r_trunc_ang: Some(r_trunc), taper_w_ang: if r_trunc < 8.0 { 0.3 } else { 1.0 },
+        r_trunc_ang: Some(r_trunc),
+        taper_w_ang: if r_trunc < 8.0 { 0.3 } else { 1.0 },
         r_k_ang: if r_ref > 0.0 { Some(r_ref) } else { None },
         r_z_ang: if r_ref > 0.0 { Some(r_ref) } else { None },
-        max_deg_hs: Some(512), max_deg_k: Some(512), max_deg_z: Some(512),
-        tc2_tol: 1e-5, ns_tol: 1e-4, purifier_p: Some(false),
+        max_deg_hs: Some(512),
+        max_deg_k: Some(512),
+        max_deg_z: Some(512),
+        tc2_tol: 1e-5,
+        ns_tol: 1e-4,
+        purifier_p: Some(false),
         ..Default::default()
     };
-    let mut eng = SparseDftb::with_config(sk.clone(), &sk_dir, mol.species.clone(), mol.coords.clone(), cfg.clone())
-        .unwrap_or_else(|e| panic!("ref SparseDftb: {e}"));
+    let mut eng = SparseDftb::with_config(
+        sk.clone(),
+        &sk_dir,
+        mol.species.clone(),
+        mol.coords.clone(),
+        cfg.clone(),
+    )
+    .unwrap_or_else(|e| panic!("ref SparseDftb: {e}"));
     let scc = eng.scc(60, 1e-5).unwrap_or_else(|e| panic!("ref scc: {e}"));
     let e_ref = eng.energy().unwrap();
     let k_ref = eng.k_bsr().unwrap_or_else(|e| panic!("k_bsr: {e}"));
-    let deg_ref = (0..n).map(|i| k_ref.row_ptr[i + 1] - k_ref.row_ptr[i]).max().unwrap_or(0);
-    eprintln!("REF r_k=full deg={deg_ref} E={e_ref:.8} iters={} rms={:.2e}", scc.n_iters, scc.rms);
+    let deg_ref = (0..n)
+        .map(|i| k_ref.row_ptr[i + 1] - k_ref.row_ptr[i])
+        .max()
+        .unwrap_or(0);
+    eprintln!(
+        "REF r_k=full deg={deg_ref} E={e_ref:.8} iters={} rms={:.2e}",
+        scc.n_iters, scc.rms
+    );
 
     for &k in &[32usize, 48, 64, 96, 128] {
         let mask = build_topk_mask(&k_ref, k);
         let deg = max_deg(&mask, n);
         let mut c2 = cfg.clone();
         c2.mask_kz = Some(mask);
-        match SparseDftb::with_config(sk.clone(), &sk_dir, mol.species.clone(), mol.coords.clone(), c2) {
+        match SparseDftb::with_config(
+            sk.clone(),
+            &sk_dir,
+            mol.species.clone(),
+            mol.coords.clone(),
+            c2,
+        ) {
             Err(e) => eprintln!("top{k}: engine build failed: {e}"),
             Ok(mut e2) => match e2.scc(60, 1e-5) {
                 Err(e) => eprintln!("top{k} (deg {deg}): *** SCC FAILED: {e}"),
                 Ok(s) => {
                     let e = e2.energy().unwrap();
                     let f = e2.forces().unwrap_or_else(|e| panic!("top{k} forces: {e}"));
-                    let fmax = f.forces.iter().flatten().fold(0.0f64, |a, &x| a.max(x.abs()));
+                    let fmax = f
+                        .forces
+                        .iter()
+                        .flatten()
+                        .fold(0.0f64, |a, &x| a.max(x.abs()));
                     eprintln!("top{k} (deg {deg}): E={:.8} dE={:+.2} mHa max|F|={:.4} iters={} rms={:.2e}",
                         e, (e - e_ref) * 1e3, fmax, s.n_iters, s.rms);
                 }

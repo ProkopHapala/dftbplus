@@ -11,17 +11,15 @@ const SQRTPI: f64 = 1.7724538509055160272981674833411451827975494561224;
 const SQRTPI3: f64 = SQRTPI * SQRTPI * SQRTPI;
 
 /// Double factorial for normalization (OEIS A001147)
-const DFACTORIAL: [f64; 8] = [
-    1.0, 1.0, 3.0, 15.0, 105.0, 945.0, 10395.0, 135135.0,
-];
+const DFACTORIAL: [f64; 8] = [1.0, 1.0, 3.0, 15.0, 105.0, 945.0, 10395.0, 135135.0];
 
 /// CGTO parameters for a single shell
 #[derive(Clone, Debug)]
 pub struct Cgto {
-    pub ang: usize,       // angular momentum (0=s, 1=p, 2=d)
-    pub nprim: usize,      // number of primitive Gaussians
-    pub alpha: Vec<f64>,   // exponents
-    pub coeff: Vec<f64>,  // contraction coefficients (with normalization)
+    pub ang: usize,      // angular momentum (0=s, 1=p, 2=d)
+    pub nprim: usize,    // number of primitive Gaussians
+    pub alpha: Vec<f64>, // exponents
+    pub coeff: Vec<f64>, // contraction coefficients (with normalization)
 }
 
 /// 1D Gaussian overlap integral: <x^moment | exp(-alpha*x^2)>
@@ -110,7 +108,8 @@ fn multipole_3d(
         for l in 0..=max_l {
             v1d[k][0] += s1d[l] * vv[l];
             v1d[k][1] += (s1d[l + 1] + rpi[k] * s1d[l]) * vv[l];
-            v1d[k][2] += (s1d[l + 2] + 2.0 * rpi[k] * s1d[l + 1] + rpi[k] * rpi[k] * s1d[l]) * vv[l];
+            v1d[k][2] +=
+                (s1d[l + 2] + 2.0 * rpi[k] * s1d[l + 1] + rpi[k] * rpi[k] * s1d[l]) * vv[l];
         }
     }
 
@@ -151,22 +150,44 @@ fn slater_to_gauss(ng: usize, n: usize, l: usize, zeta: f64) -> Cgto {
         (3, 1, 0) => {
             let a = [2.227660584, 4.057711562e-1, 1.098175104e-1];
             let c = [1.543289673e-1, 5.353281423e-1, 4.446345422e-1];
-            for i in 0..3 { alpha[i] = a[i]; coeff[i] = c[i]; }
+            for i in 0..3 {
+                alpha[i] = a[i];
+                coeff[i] = c[i];
+            }
         }
         // 2s with 4 primitives (He-Ne)
         (4, 2, 0) => {
             let a = [1.161525551e1, 2.000243111, 1.607280687e-1, 6.125744532e-2];
-            let c = [-1.198411747e-2, -5.472052539e-2, 5.805587176e-1, 4.770079976e-1];
-            for i in 0..4 { alpha[i] = a[i]; coeff[i] = c[i]; }
+            let c = [
+                -1.198411747e-2,
+                -5.472052539e-2,
+                5.805587176e-1,
+                4.770079976e-1,
+            ];
+            for i in 0..4 {
+                alpha[i] = a[i];
+                coeff[i] = c[i];
+            }
         }
         // 2p with 4 primitives (He-Ne)
         (4, 2, 1) => {
             let a = [1.798260992, 4.662622228e-1, 1.643718620e-1, 6.543927065e-2];
-            let c = [5.713170255e-2, 2.857455515e-1, 5.517873105e-1, 2.632314924e-1];
-            for i in 0..4 { alpha[i] = a[i]; coeff[i] = c[i]; }
+            let c = [
+                5.713170255e-2,
+                2.857455515e-1,
+                5.517873105e-1,
+                2.632314924e-1,
+            ];
+            for i in 0..4 {
+                alpha[i] = a[i];
+                coeff[i] = c[i];
+            }
         }
         _ => {
-            panic!("slater_to_gauss not implemented for ng={}, n={}, l={}", ng, n, l);
+            panic!(
+                "slater_to_gauss not implemented for ng={}, n={}, l={}",
+                ng, n, l
+            );
         }
     }
 
@@ -183,13 +204,17 @@ fn slater_to_gauss(ng: usize, n: usize, l: usize, zeta: f64) -> Cgto {
     // Fortran uses dfactorial(l+1), so Rust must use DFACTORIAL[l]
     let dfact_l = DFACTORIAL[l]; // (2l-1)!!
     for i in 0..ng {
-        let norm = (TOP * alpha[i]).powf(0.75)
-            * (4.0 * alpha[i]).powf(l as f64 / 2.0)
-            / dfact_l.sqrt();
+        let norm =
+            (TOP * alpha[i]).powf(0.75) * (4.0 * alpha[i]).powf(l as f64 / 2.0) / dfact_l.sqrt();
         coeff[i] *= norm;
     }
 
-    Cgto { ang: l, nprim: ng, alpha, coeff }
+    Cgto {
+        ang: l,
+        nprim: ng,
+        alpha,
+        coeff,
+    }
 }
 
 /// Build CGTO basis for GFN2 from element indices
@@ -262,12 +287,16 @@ fn multipole_cgto(
                 continue;
             }
             let pre = (-est).exp() * SQRTPI3 * oab.sqrt().powi(3);
-            let rpi = [-vec[0] * cgtoj.alpha[jp] * oab,
-                        -vec[1] * cgtoj.alpha[jp] * oab,
-                        -vec[2] * cgtoj.alpha[jp] * oab];
-            let rpj = [ vec[0] * cgtoi.alpha[ip] * oab,
-                         vec[1] * cgtoi.alpha[ip] * oab,
-                         vec[2] * cgtoi.alpha[ip] * oab];
+            let rpi = [
+                -vec[0] * cgtoj.alpha[jp] * oab,
+                -vec[1] * cgtoj.alpha[jp] * oab,
+                -vec[2] * cgtoj.alpha[jp] * oab,
+            ];
+            let rpj = [
+                vec[0] * cgtoi.alpha[ip] * oab,
+                vec[1] * cgtoi.alpha[ip] * oab,
+                vec[2] * cgtoi.alpha[ip] * oab,
+            ];
 
             let max_l = cgtoi.ang + cgtoj.ang + 2;
             let mut s1d = vec![0.0f64; max_l + 3];
@@ -281,7 +310,8 @@ fn multipole_cgto(
                 for mlj in 0..ml_j {
                     let li = get_lx(cgtoi.ang, mli);
                     let lj = get_lx(cgtoj.ang, mlj);
-                    let (val, dip, quad) = multipole_3d(&rpj, &rpi, cgtoj.alpha[jp], cgtoi.alpha[ip], &lj, &li, &s1d);
+                    let (val, dip, quad) =
+                        multipole_3d(&rpj, &rpi, cgtoj.alpha[jp], cgtoi.alpha[ip], &lj, &li, &s1d);
 
                     let idx = mlj + ml_j * mli;
                     s3d[idx] += cc * val;
@@ -306,7 +336,8 @@ fn multipole_cgto(
     for mli in 0..nao_i {
         for mlj in 0..nao_j {
             let idx = mlj + nao_j * mli;
-            let tr = 0.5 * (quadrupole[0 + 6 * idx] + quadrupole[2 + 6 * idx] + quadrupole[5 + 6 * idx]);
+            let tr =
+                0.5 * (quadrupole[0 + 6 * idx] + quadrupole[2 + 6 * idx] + quadrupole[5 + 6 * idx]);
             quadrupole[0 + 6 * idx] = 1.5 * quadrupole[0 + 6 * idx] - tr;
             quadrupole[1 + 6 * idx] = 1.5 * quadrupole[1 + 6 * idx];
             quadrupole[2 + 6 * idx] = 1.5 * quadrupole[2 + 6 * idx] - tr;
@@ -368,14 +399,18 @@ pub fn build_multipole_integrals_gfn2(
         let izp = elem_idx[iat];
         let is = {
             let mut off = 0;
-            for jat in 0..iat { off += nshell_per_atom[jat]; }
+            for jat in 0..iat {
+                off += nshell_per_atom[jat];
+            }
             off
         };
         for jat in 0..nat {
             let jzp = elem_idx[jat];
             let js = {
                 let mut off = 0;
-                for kat in 0..jat { off += nshell_per_atom[kat]; }
+                for kat in 0..jat {
+                    off += nshell_per_atom[kat];
+                }
                 off
             };
             let dx = coords[iat][0] - coords[jat][0];
@@ -391,19 +426,20 @@ pub fn build_multipole_integrals_gfn2(
                     let nao_i = nao_per_shell_vec[is + ish];
                     let nao_j = nao_per_shell_vec[js + jsh];
 
-                    let (overlap, dipole, quadrupole) = multipole_cgto(
-                        &cgtos[is + ish], &cgtos[js + jsh], r2, &vec, intcut
-                    );
+                    let (overlap, dipole, quadrupole) =
+                        multipole_cgto(&cgtos[is + ish], &cgtos[js + jsh], r2, &vec, intcut);
 
                     for iao in 0..nao_i {
                         for jao in 0..nao_j {
                             // Fortran column-major order
                             let base_ji = jj + jao + nao * (ii + iao);
                             for cmp in 0..3 {
-                                dipole_ints[cmp + 3 * base_ji] = dipole[cmp + 3 * jao + 3 * nao_j * iao];
+                                dipole_ints[cmp + 3 * base_ji] =
+                                    dipole[cmp + 3 * jao + 3 * nao_j * iao];
                             }
                             for cmp in 0..6 {
-                                quadrupole_ints[cmp + 6 * base_ji] = quadrupole[cmp + 6 * jao + 6 * nao_j * iao];
+                                quadrupole_ints[cmp + 6 * base_ji] =
+                                    quadrupole[cmp + 6 * jao + 6 * nao_j * iao];
                             }
                         }
                     }
@@ -416,10 +452,7 @@ pub fn build_multipole_integrals_gfn2(
 }
 
 /// Build full AO overlap integrals for a molecule using GFN2 basis
-pub fn build_overlap_gfn2(
-    coords: &[[f64; 3]],
-    elem_idx: &[usize],
-) -> Vec<f64> {
+pub fn build_overlap_gfn2(coords: &[[f64; 3]], elem_idx: &[usize]) -> Vec<f64> {
     let nat = coords.len();
     let cgtos = build_cgto_basis(elem_idx);
 
@@ -448,19 +481,23 @@ pub fn build_overlap_gfn2(
     for iat in 0..nat {
         let is = {
             let mut off = 0;
-            for jat in 0..iat { off += nshell_per_atom[jat]; }
+            for jat in 0..iat {
+                off += nshell_per_atom[jat];
+            }
             off
         };
         for jat in 0..nat {
             let js = {
                 let mut off = 0;
-                for kat in 0..jat { off += nshell_per_atom[kat]; }
+                for kat in 0..jat {
+                    off += nshell_per_atom[kat];
+                }
                 off
             };
             let dx = coords[iat][0] - coords[jat][0];
             let dy = coords[iat][1] - coords[jat][1];
             let dz = coords[iat][2] - coords[jat][2];
-            let r2 = dx*dx + dy*dy + dz*dz;
+            let r2 = dx * dx + dy * dy + dz * dz;
             let vec = [dx, dy, dz];
 
             for ish in 0..nshell_per_atom[iat] {
@@ -470,9 +507,8 @@ pub fn build_overlap_gfn2(
                     let nao_i = nao_per_shell_vec[is + ish];
                     let nao_j = nao_per_shell_vec[js + jsh];
 
-                    let (overlap, _, _) = multipole_cgto(
-                        &cgtos[is + ish], &cgtos[js + jsh], r2, &vec, intcut
-                    );
+                    let (overlap, _, _) =
+                        multipole_cgto(&cgtos[is + ish], &cgtos[js + jsh], r2, &vec, intcut);
 
                     for iao in 0..nao_i {
                         for jao in 0..nao_j {

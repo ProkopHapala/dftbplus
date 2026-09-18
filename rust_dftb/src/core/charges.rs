@@ -47,11 +47,7 @@ pub fn mulliken_charges_from_dmat_s(
 ///
 /// Computation: `work = (C_occ · C_occᵀ) · S = C_occ · (C_occᵀ · S)`.
 /// For closed-shell: multiply by 2.0 after the trace.
-pub fn build_dmat_s(
-    c_occ: &DMatrix<f64>,
-    s: &DMatrix<f64>,
-    work: &mut DMatrix<f64>,
-) {
+pub fn build_dmat_s(c_occ: &DMatrix<f64>, s: &DMatrix<f64>, work: &mut DMatrix<f64>) {
     let n_orbs = c_occ.nrows();
     let n_occ = c_occ.ncols();
 

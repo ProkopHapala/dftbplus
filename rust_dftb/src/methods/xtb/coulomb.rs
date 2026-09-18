@@ -4,8 +4,14 @@
 //! - effective_coulomb: Klopman-Ohno kernel with harmonic/arithmetic averaging
 //! - onsite_thirdorder: Third-order Hubbard correction (atom- or shell-resolved)
 
-use crate::methods::xtb::params::{GEXP as GEXP1, hubbard_parameter as hubbard_param1, shell_hubbard as shell_hubbard1, hubbard_derivs as hubbard_derivs1};
-use crate::methods::xtb::params_gfn2::{GEXP as GEXP2, hubbard_parameter as hubbard_param2, shell_hubbard as shell_hubbard2, hubbard_derivs as hubbard_derivs2, shell_hubbard_derivs};
+use crate::methods::xtb::params::{
+    hubbard_derivs as hubbard_derivs1, hubbard_parameter as hubbard_param1,
+    shell_hubbard as shell_hubbard1, GEXP as GEXP1,
+};
+use crate::methods::xtb::params_gfn2::{
+    hubbard_derivs as hubbard_derivs2, hubbard_parameter as hubbard_param2,
+    shell_hubbard as shell_hubbard2, shell_hubbard_derivs, GEXP as GEXP2,
+};
 use nalgebra::{DMatrix, DVector};
 
 /// Harmonic average of two Hubbard parameters (GFN1 convention)
@@ -25,8 +31,12 @@ pub fn build_shell_hubbard_matrix(
     ang_per_shell: &[usize],
 ) -> DMatrix<f64> {
     build_shell_hubbard_matrix_generic(
-        nshell_per_atom, elem_idx, ang_per_shell,
-        &hubbard_param1, &shell_hubbard1, harmonic_average,
+        nshell_per_atom,
+        elem_idx,
+        ang_per_shell,
+        &hubbard_param1,
+        &shell_hubbard1,
+        harmonic_average,
     )
 }
 
@@ -37,8 +47,12 @@ pub fn build_shell_hubbard_matrix_gfn2(
     ang_per_shell: &[usize],
 ) -> DMatrix<f64> {
     build_shell_hubbard_matrix_generic(
-        nshell_per_atom, elem_idx, ang_per_shell,
-        &hubbard_param2, &shell_hubbard2, arithmetic_average,
+        nshell_per_atom,
+        elem_idx,
+        ang_per_shell,
+        &hubbard_param2,
+        &shell_hubbard2,
+        arithmetic_average,
     )
 }
 
@@ -92,8 +106,12 @@ pub fn build_coulomb_matrix(
     ang_per_shell: &[usize],
 ) -> DMatrix<f64> {
     build_coulomb_matrix_generic(
-        coords, nshell_per_atom, elem_idx, ang_per_shell,
-        build_shell_hubbard_matrix, GEXP1,
+        coords,
+        nshell_per_atom,
+        elem_idx,
+        ang_per_shell,
+        build_shell_hubbard_matrix,
+        GEXP1,
     )
 }
 
@@ -105,8 +123,12 @@ pub fn build_coulomb_matrix_gfn2(
     ang_per_shell: &[usize],
 ) -> DMatrix<f64> {
     build_coulomb_matrix_generic(
-        coords, nshell_per_atom, elem_idx, ang_per_shell,
-        build_shell_hubbard_matrix_gfn2, GEXP2,
+        coords,
+        nshell_per_atom,
+        elem_idx,
+        ang_per_shell,
+        build_shell_hubbard_matrix_gfn2,
+        GEXP2,
     )
 }
 
@@ -189,7 +211,9 @@ pub fn thirdorder_potential(
         let ii = shell_offset[iat];
         let deriv = hubbard_derivs1[izp];
 
-        let qat: f64 = (0..nshell_per_atom[iat]).map(|ish| shell_charges[ii + ish]).sum();
+        let qat: f64 = (0..nshell_per_atom[iat])
+            .map(|ish| shell_charges[ii + ish])
+            .sum();
         let vat = qat * qat * deriv;
 
         for ish in 0..nshell_per_atom[iat] {

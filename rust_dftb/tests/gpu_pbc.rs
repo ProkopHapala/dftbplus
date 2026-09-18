@@ -18,8 +18,8 @@ use ocl::prm::{Float4, Int2};
 use ocl::{Kernel, Program};
 use rust_dftb::qmqm::gpu_runtime::{map_ocl_err, GpuRuntime};
 use rust_dftb::qmqm::pbc_cell::{
-    enumerate_image_pairs, erfc_host, ewald_invmat_host, max_g_ewald,
-    max_r_ewald, optimal_alpha, PbcCell,
+    enumerate_image_pairs, erfc_host, ewald_invmat_host, max_g_ewald, max_r_ewald, optimal_alpha,
+    PbcCell,
 };
 
 const HAM_SOURCE: &str = include_str!("../src/methods/dftb/dftb_hamiltonian.cl");
@@ -131,8 +131,11 @@ fn ewald_madelung_nacl() {
     let alpha = optimal_alpha(&cell, tol).unwrap();
     let mr = max_r_ewald(alpha, tol).unwrap();
     let mg = max_g_ewald(alpha, cell.vol, tol).unwrap();
-    eprintln!("NaCl: alpha={alpha:.6} maxR={mr:.2} maxG={mg:.2} nG={} nR={}",
-        cell.g_lattice_points(mg).len(), cell.cell_translations(mr).len());
+    eprintln!(
+        "NaCl: alpha={alpha:.6} maxR={mr:.2} maxG={mg:.2} nG={} nR={}",
+        cell.g_lattice_points(mg).len(),
+        cell.cell_translations(mr).len()
+    );
     let gpts = cell.g_lattice_points(mg);
     let coords = vec![[0.0, 0.0, 0.0], [h, 0.0, 0.0]];
     let rlat = rlat_cover(&cell, &coords, mr);
@@ -147,7 +150,10 @@ fn ewald_madelung_nacl() {
     }
     let r0 = a / 2.0;
     let want = -1.7475645946 / r0;
-    eprintln!("NaCl Madelung: E={e:.10} want {want:.10} (diff {:.3e})", e - want);
+    eprintln!(
+        "NaCl Madelung: E={e:.10} want {want:.10} (diff {:.3e})",
+        e - want
+    );
     assert!((e - want).abs() < 2e-5, "Madelung E={e} vs {want}");
 }
 
@@ -156,7 +162,8 @@ fn ewald_madelung_nacl() {
 // ------------------------------------------------------------------
 
 fn build_prog(rt: &mut GpuRuntime) -> Program {
-    rt.build_program(&format!("{HAM_SOURCE}\n{PBC_SOURCE}")).unwrap()
+    rt.build_program(&format!("{HAM_SOURCE}\n{PBC_SOURCE}"))
+        .unwrap()
 }
 
 /// Build ewald kernel inputs on a skewed (non-cubic) cell, run the GPU
@@ -165,17 +172,8 @@ fn build_prog(rt: &mut GpuRuntime) -> Program {
 fn ewald_invr_gpu_parity() {
     let Some(mut rt) = try_runtime() else { return };
     // skewed triclinic-ish cell + 3 atoms at generic positions
-    let cell = PbcCell::new([
-        [8.0, 0.3, 0.0],
-        [0.4, 9.0, 0.2],
-        [0.1, 0.3, 7.5],
-    ])
-    .unwrap();
-    let coords = vec![
-        [1.0, 1.5, 0.8],
-        [3.4, 0.7, 2.9],
-        [0.5, 4.1, 3.3],
-    ];
+    let cell = PbcCell::new([[8.0, 0.3, 0.0], [0.4, 9.0, 0.2], [0.1, 0.3, 7.5]]).unwrap();
+    let coords = vec![[1.0, 1.5, 0.8], [3.4, 0.7, 2.9], [0.5, 4.1, 3.3]];
     let n = coords.len();
     let tol = 1e-9;
     let alpha = optimal_alpha(&cell, tol).unwrap();
@@ -183,16 +181,27 @@ fn ewald_invr_gpu_parity() {
     let mg = max_g_ewald(alpha, cell.vol, tol).unwrap();
     let gpts = cell.g_lattice_points(mg);
     let rlat = rlat_cover(&cell, &coords, mr);
-    eprintln!("ewald gpu parity: alpha={alpha:.4} maxR={mr:.2} maxG={mg:.2} nG={} nR={}",
-        gpts.len(), rlat.len());
+    eprintln!(
+        "ewald gpu parity: alpha={alpha:.4} maxR={mr:.2} maxG={mg:.2} nG={} nR={}",
+        gpts.len(),
+        rlat.len()
+    );
 
     // host reference (f64)
     let m_ref = ewald_invmat_host(&coords, &cell, alpha, mr, &gpts, &rlat);
 
     // GPU inputs — same CSR list the kernel uses
     let elist = enumerate_image_pairs(&coords, &cell, mr, false, true);
-    let epair: Vec<Int2> = elist.pair_ij.iter().map(|&(i, j)| Int2::new(i as i32, j as i32)).collect();
-    let eslot: Vec<Float4> = elist.rvecs.iter().map(|r| Float4::new(r[0], r[1], r[2], 0.0)).collect();
+    let epair: Vec<Int2> = elist
+        .pair_ij
+        .iter()
+        .map(|&(i, j)| Int2::new(i as i32, j as i32))
+        .collect();
+    let eslot: Vec<Float4> = elist
+        .rvecs
+        .iter()
+        .map(|r| Float4::new(r[0], r[1], r[2], 0.0))
+        .collect();
     let gvec: Vec<Float4> = gpts
         .iter()
         .map(|g| {
@@ -201,7 +210,10 @@ fn ewald_invr_gpu_parity() {
             Float4::new(g[0] as f32, g[1] as f32, g[2] as f32, w as f32)
         })
         .collect();
-    let cflat: Vec<f32> = coords.iter().flat_map(|c| [c[0] as f32, c[1] as f32, c[2] as f32]).collect();
+    let cflat: Vec<f32> = coords
+        .iter()
+        .flat_map(|c| [c[0] as f32, c[1] as f32, c[2] as f32])
+        .collect();
 
     let prog = build_prog(&mut rt);
     let b_coords = rt.buffer_from_slice(&cflat).unwrap();
@@ -222,11 +234,21 @@ fn ewald_invr_gpu_parity() {
         .name("ewald_invr_batched")
         .queue(rt.queue().clone())
         .global_work_size(np)
-        .arg(n as i32).arg(np as i32).arg(1i32)
-        .arg(&b_coords).arg(&b_epair).arg(&b_eoff).arg(&b_eslot)
-        .arg(&b_gvec).arg(gvec.len() as i32)
-        .arg(alpha).arg(rec_fac).arg(c_const).arg(c_self)
-        .arg(&b_invr).arg(&park)
+        .arg(n as i32)
+        .arg(np as i32)
+        .arg(1i32)
+        .arg(&b_coords)
+        .arg(&b_epair)
+        .arg(&b_eoff)
+        .arg(&b_eslot)
+        .arg(&b_gvec)
+        .arg(gvec.len() as i32)
+        .arg(alpha)
+        .arg(rec_fac)
+        .arg(c_const)
+        .arg(c_self)
+        .arg(&b_invr)
+        .arg(&park)
         .build()
         .map_err(map_ocl_err)
         .unwrap();
@@ -245,9 +267,11 @@ fn ewald_invr_gpu_parity() {
         }
     }
     eprintln!("ewald gpu-vs-host max|Δ| = {maxd:.3e}");
-    eprintln!("  invr diag: ref={:?} gpu={:?}",
+    eprintln!(
+        "  invr diag: ref={:?} gpu={:?}",
         (0..n).map(|i| m_ref[i * n + i]).collect::<Vec<_>>(),
-        (0..n).map(|i| m_gpu[i * n + i]).collect::<Vec<_>>());
+        (0..n).map(|i| m_gpu[i * n + i]).collect::<Vec<_>>()
+    );
     // f32 store + f32 slot coords: expect ~1e-5 agreement on ~1e-1 values
     assert!(maxd < 5e-4, "ewald gpu parity failed: {maxd}");
 }
@@ -286,7 +310,13 @@ fn bigbox_gamma_h_parity() {
     let kw = [1.0f32];
 
     let mut eng = rust_dftb::qmqm::gpu_pbc::GpuPbc::new(
-        sk.clone(), species.clone(), coords.clone(), lat, &k_frac, &kw, None,
+        sk.clone(),
+        species.clone(),
+        coords.clone(),
+        lat,
+        &k_frac,
+        &kw,
+        None,
     )
     .unwrap();
     eng.set_geometry(&coords).unwrap();
@@ -295,7 +325,8 @@ fn bigbox_gamma_h_parity() {
     // shifted by the same Ewald background/Madelung term ≈ −2.837297/L
     // (γ_pbc[i,j] ≈ γ_func(r_ij) + C_box for both on/off-diagonal —
     // the off-diagonal does NOT converge to the bare molecular value).
-    let gamma_tbl = rust_dftb::methods::dftb::gamma::GammaTable::from_sk_data(&sk, &species).unwrap();
+    let gamma_tbl =
+        rust_dftb::methods::dftb::gamma::GammaTable::from_sk_data(&sk, &species).unwrap();
     let u = gamma_tbl.u(0);
     let r = 1.4 * ANG2BOHR;
     let gamma_mol = rust_dftb::methods::dftb::gamma::gamma_full(r, u, u);
@@ -307,16 +338,22 @@ fn bigbox_gamma_h_parity() {
         g[0], u as f32 + self_term as f32);
     assert!(
         (g[1] - (gamma_mol + self_term) as f32).abs() < 5e-3,
-        "γ_pbc[0,1]={} vs γ_func+C_box={}", g[1], gamma_mol + self_term
+        "γ_pbc[0,1]={} vs γ_func+C_box={}",
+        g[1],
+        gamma_mol + self_term
     );
     // internal consistency: the Madelung shift cancels in differences
     assert!(
         ((g[0] - g[1]) - (u - gamma_mol) as f32).abs() < 1e-3,
-        "γ_pbc[0,0]−γ_pbc[0,1]={} vs U−γ_func={}", g[0] - g[1], u - gamma_mol
+        "γ_pbc[0,0]−γ_pbc[0,1]={} vs U−γ_func={}",
+        g[0] - g[1],
+        u - gamma_mol
     );
     assert!(
         (g[0] - (u as f32 + self_term as f32)).abs() < 5e-3,
-        "γ_pbc[0,0]={} vs U+self={}", g[0], u as f32 + self_term as f32
+        "γ_pbc[0,0]={} vs U+self={}",
+        g[0],
+        u as f32 + self_term as f32
     );
 
     // H0(Γ)/S(Γ) vs molecular template
@@ -353,10 +390,9 @@ fn bloch_hermiticity_hchain() {
     let k_frac = [[0.21, 0.0, 0.0], [-0.21, 0.0, 0.0]];
     let kw = [0.5f32, 0.5];
 
-    let mut eng = rust_dftb::qmqm::gpu_pbc::GpuPbc::new(
-        sk, species, coords.clone(), lat, &k_frac, &kw, None,
-    )
-    .unwrap();
+    let mut eng =
+        rust_dftb::qmqm::gpu_pbc::GpuPbc::new(sk, species, coords.clone(), lat, &k_frac, &kw, None)
+            .unwrap();
     eng.set_geometry(&coords).unwrap();
     let h0 = eng.read_h0().unwrap();
     let s = eng.read_s().unwrap();
@@ -368,10 +404,14 @@ fn bloch_hermiticity_hchain() {
     for e in 0..nn {
         let a = h0[e];
         let b = h0[nn + e];
-        md_h = md_h.max((a[0] - b[0]).abs() as f64).max((a[1] + b[1]).abs() as f64);
+        md_h = md_h
+            .max((a[0] - b[0]).abs() as f64)
+            .max((a[1] + b[1]).abs() as f64);
         let sa = s[e];
         let sb = s[nn + e];
-        md_s = md_s.max((sa[0] - sb[0]).abs() as f64).max((sa[1] + sb[1]).abs() as f64);
+        md_s = md_s
+            .max((sa[0] - sb[0]).abs() as f64)
+            .max((sa[1] + sb[1]).abs() as f64);
     }
     eprintln!("H(−k)=H(k)*: max defect H={md_h:.3e} S={md_s:.3e}");
     // f32 SK-eval + f32 fold: expect ~1e-5 level
@@ -384,7 +424,9 @@ fn bloch_hermiticity_hchain() {
         for j in 0..n {
             let a = h0[i * n + j];
             let b = h0[j * n + i];
-            md = md.max((a[0] - b[0]).abs() as f64).max((a[1] + b[1]).abs() as f64);
+            md = md
+                .max((a[0] - b[0]).abs() as f64)
+                .max((a[1] + b[1]).abs() as f64);
         }
     }
     eprintln!("H(k) Hermiticity defect: {md:.3e}");
@@ -393,7 +435,10 @@ fn bloch_hermiticity_hchain() {
     // ε(−k)=ε(k): eigenvalues from the plan's S^{-1/2} path are checked
     // implicitly by jacobi certification; run a few SCC steps for smoke.
     let (ok, hist) = eng.scc(0.3, 1e-6, 30).unwrap();
-    eprintln!("hchain scc rms: {:?}", hist.iter().map(|x| format!("{x:.1e}")).collect::<Vec<_>>());
+    eprintln!(
+        "hchain scc rms: {:?}",
+        hist.iter().map(|x| format!("{x:.1e}")).collect::<Vec<_>>()
+    );
     assert!(ok.iter().all(|&x| x), "jacobi cert failed");
     let q = eng.plan.read_charges(&eng.rt).unwrap();
     let qsum: f32 = q[..4].iter().sum();

@@ -9,11 +9,13 @@
 //! Right end: `N_PAD_END` extra zero samples, then the same 4-point stencil.
 
 use crate::core::error::{DftbError, Result};
-use crate::methods::dftb::spline_resample::{bspline3_eval_v_d1_d2, fit_bspline_controls_zero_end, N_PAD_END};
+use crate::methods::dftb::spline_resample::{
+    bspline3_eval_v_d1_d2, fit_bspline_controls_zero_end, N_PAD_END,
+};
 
 pub const DIST_FUDGE: f64 = 1.0;
 
-const MAX_N_INTER: usize = 8;  // max interpolation stencil (kept for Neville fallback)
+const MAX_N_INTER: usize = 8; // max interpolation stencil (kept for Neville fallback)
 const MAX_N_INTEG: usize = 20; // max columns in extended-format SK tables
 const N_INTER: usize = 8;
 const N_RIGHT: usize = 4;
@@ -54,9 +56,16 @@ impl EqGridTable {
         for k in 0..n_integ {
             let col: Vec<f64> = values.iter().map(|r| r[k]).collect();
             let ctrl = fit_bspline_controls_zero_end(&col, N_PAD_END);
-            for i in 0..n_ctrl { controls[i][k] = ctrl[i]; }
+            for i in 0..n_ctrl {
+                controls[i][k] = ctrl[i];
+            }
         }
-        Self { dr, values, derivs, controls }
+        Self {
+            dr,
+            values,
+            derivs,
+            controls,
+        }
     }
 
     pub fn n_grid(&self) -> usize {
@@ -65,6 +74,11 @@ impl EqGridTable {
 
     pub fn n_integ(&self) -> usize {
         self.values.first().map(|r| r.len()).unwrap_or(0)
+    }
+
+    /// B-spline control points `[n_ctrl][n_integ]` — read-only, for GPU packing.
+    pub fn controls(&self) -> &[Vec<f64>] {
+        &self.controls
     }
 
     pub fn r_max(&self) -> f64 {
@@ -96,7 +110,12 @@ impl EqGridTable {
     }
 
     /// Hermite reference path with derivative (C¹). Not used in production.
-    pub fn eval_hermite_with_deriv_into(&self, r: f64, out: &mut [f64], ddr: &mut [f64]) -> Result<()> {
+    pub fn eval_hermite_with_deriv_into(
+        &self,
+        r: f64,
+        out: &mut [f64],
+        ddr: &mut [f64],
+    ) -> Result<()> {
         eval_hermite_with_deriv_into(self, r, out, ddr)
     }
 
@@ -125,11 +144,14 @@ fn compute_hermite_derivs(values: &[Vec<f64>], dr: f64) -> Vec<Vec<f64>> {
             if i >= 2 && i + 2 < n_grid {
                 // 4th-order central difference: O(dr⁴)
                 derivs[i][k] = (-values[i + 2][k] + 8.0 * values[i + 1][k]
-                    - 8.0 * values[i - 1][k] + values[i - 2][k]) * inv_12dr;
+                    - 8.0 * values[i - 1][k]
+                    + values[i - 2][k])
+                    * inv_12dr;
             } else if i == 0 {
                 // Forward difference at start
                 if n_grid > 2 {
-                    derivs[i][k] = (-3.0 * values[0][k] + 4.0 * values[1][k] - values[2][k]) / (2.0 * dr);
+                    derivs[i][k] =
+                        (-3.0 * values[0][k] + 4.0 * values[1][k] - values[2][k]) / (2.0 * dr);
                 } else if n_grid > 1 {
                     derivs[i][k] = (values[1][k] - values[0][k]) / dr;
                 }
@@ -141,7 +163,8 @@ fn compute_hermite_derivs(values: &[Vec<f64>], dr: f64) -> Vec<Vec<f64>> {
             } else if i == n_grid - 1 {
                 // Backward difference at end
                 if n_grid > 2 {
-                    derivs[i][k] = (3.0 * values[i][k] - 4.0 * values[i - 1][k] + values[i - 2][k]) / (2.0 * dr);
+                    derivs[i][k] = (3.0 * values[i][k] - 4.0 * values[i - 1][k] + values[i - 2][k])
+                        / (2.0 * dr);
                 } else if n_grid > 1 {
                     derivs[i][k] = (values[i][k] - values[i - 1][k]) / dr;
                 }
@@ -169,10 +192,15 @@ fn compute_hermite_derivs(values: &[Vec<f64>], dr: f64) -> Vec<Vec<f64>> {
 fn eval_hermite_into(tab: &EqGridTable, r: f64, out: &mut [f64]) -> Result<()> {
     let n_grid = tab.n_grid();
     if n_grid < 2 {
-        return Err(DftbError::Interpolation("not enough SK points for Hermite spline".into()));
+        return Err(DftbError::Interpolation(
+            "not enough SK points for Hermite spline".into(),
+        ));
     }
     let n_integ = tab.n_integ();
-    assert!(out.len() >= n_integ, "eval_hermite_into: output buffer too small");
+    assert!(
+        out.len() >= n_integ,
+        "eval_hermite_into: output buffer too small"
+    );
 
     let dr = tab.dr;
     let r_max = tab.r_max();
@@ -192,8 +220,12 @@ fn eval_hermite_into(tab: &EqGridTable, r: f64, out: &mut [f64]) -> Result<()> {
     let inv_dr = 1.0 / dr;
     // Grid points at x_i = (i+1)*dr. Find interval r ∈ [x_i, x_{i+1}].
     let mut i = ((r * inv_dr).floor() as isize) - 1;
-    if i < 0 { i = 0; }
-    if i as usize >= n_grid - 1 { i = (n_grid - 2) as isize; }
+    if i < 0 {
+        i = 0;
+    }
+    if i as usize >= n_grid - 1 {
+        i = (n_grid - 2) as isize;
+    }
     let i = i as usize;
 
     let x_i = (i + 1) as f64 * dr;
@@ -225,11 +257,15 @@ fn eval_hermite_with_deriv_into(
 ) -> Result<()> {
     let n_grid = tab.n_grid();
     if n_grid < 2 {
-        return Err(DftbError::Interpolation("not enough SK points for Hermite spline".into()));
+        return Err(DftbError::Interpolation(
+            "not enough SK points for Hermite spline".into(),
+        ));
     }
     let n_integ = tab.n_integ();
-    assert!(out.len() >= n_integ && ddr.len() >= n_integ,
-            "eval_hermite_with_deriv_into: buffer too small");
+    assert!(
+        out.len() >= n_integ && ddr.len() >= n_integ,
+        "eval_hermite_with_deriv_into: buffer too small"
+    );
 
     let dr = tab.dr;
     let r_max = tab.r_max();
@@ -247,8 +283,12 @@ fn eval_hermite_with_deriv_into(
 
     let inv_dr = 1.0 / dr;
     let mut i = ((r * inv_dr).floor() as isize) - 1;
-    if i < 0 { i = 0; }
-    if i as usize >= n_grid - 1 { i = (n_grid - 2) as isize; }
+    if i < 0 {
+        i = 0;
+    }
+    if i as usize >= n_grid - 1 {
+        i = (n_grid - 2) as isize;
+    }
     let i = i as usize;
 
     let x_i = (i + 1) as f64 * dr;
@@ -289,10 +329,15 @@ fn eval_hermite_with_deriv_into(
 fn eval_bspline_into(tab: &EqGridTable, r: f64, out: &mut [f64]) -> Result<()> {
     let n_ctrl = tab.controls.len();
     if n_ctrl < 2 {
-        return Err(DftbError::Interpolation("not enough SK points for B-spline".into()));
+        return Err(DftbError::Interpolation(
+            "not enough SK points for B-spline".into(),
+        ));
     }
     let n_integ = tab.n_integ();
-    assert!(out.len() >= n_integ, "eval_bspline_into: output buffer too small");
+    assert!(
+        out.len() >= n_integ,
+        "eval_bspline_into: output buffer too small"
+    );
     let dr = tab.dr;
     let r_max = n_ctrl as f64 * dr;
     if r < 0.0 || r >= r_max {
@@ -317,11 +362,15 @@ fn eval_bspline_with_deriv_into(
 ) -> Result<()> {
     let n_ctrl = tab.controls.len();
     if n_ctrl < 2 {
-        return Err(DftbError::Interpolation("not enough SK points for B-spline".into()));
+        return Err(DftbError::Interpolation(
+            "not enough SK points for B-spline".into(),
+        ));
     }
     let n_integ = tab.n_integ();
-    assert!(out.len() >= n_integ && ddr.len() >= n_integ,
-            "eval_bspline_with_deriv_into: buffer too small");
+    assert!(
+        out.len() >= n_integ && ddr.len() >= n_integ,
+        "eval_bspline_with_deriv_into: buffer too small"
+    );
     let dr = tab.dr;
     let r_max = n_ctrl as f64 * dr;
     if r < 0.0 || r >= r_max {
@@ -344,17 +393,29 @@ fn bspline_interval(n_ctrl: usize, dr: f64, r: f64) -> (usize, f64, f64) {
     let r_shifted = r - dr; // values[0] lives at r=dr
     let x = r_shifted * inv_dr;
     let mut i = x as isize;
-    if i < 0 { i = 0; }
-    if i as usize >= n_ctrl - 1 { i = (n_ctrl - 2) as isize; }
+    if i < 0 {
+        i = 0;
+    }
+    if i as usize >= n_ctrl - 1 {
+        i = (n_ctrl - 2) as isize;
+    }
     let i = i as usize;
     (i, x - i as f64, inv_dr)
 }
 
 fn bspline_four(tab: &EqGridTable, n_ctrl: usize, i: usize, k: usize) -> (f64, f64, f64, f64) {
-    let c0 = if i == 0 { 2.0 * tab.controls[0][k] - tab.controls[1][k] } else { tab.controls[i - 1][k] };
+    let c0 = if i == 0 {
+        2.0 * tab.controls[0][k] - tab.controls[1][k]
+    } else {
+        tab.controls[i - 1][k]
+    };
     let c1 = tab.controls[i][k];
     let c2 = tab.controls[i + 1][k];
-    let c3 = if i + 2 >= n_ctrl { 2.0 * tab.controls[n_ctrl - 1][k] - tab.controls[n_ctrl - 2][k] } else { tab.controls[i + 2][k] };
+    let c3 = if i + 2 >= n_ctrl {
+        2.0 * tab.controls[n_ctrl - 1][k] - tab.controls[n_ctrl - 2][k]
+    } else {
+        tab.controls[i + 2][k]
+    };
     (c0, c1, c2, c3)
 }
 
@@ -461,7 +522,10 @@ fn eval_eqgrid_new_into(tab: &EqGridTable, r: f64, out: &mut [f64]) -> Result<()
     // DFTB+ uses rMax = nGrid * dr + distFudge (not (nGrid-1)*dr)
     let r_max = leng as f64 * tab.dr + DIST_FUDGE;
     let n_integ = tab.n_integ();
-    assert!(out.len() >= n_integ, "eval_eqgrid_new_into: output buffer too small");
+    assert!(
+        out.len() >= n_integ,
+        "eval_eqgrid_new_into: output buffer too small"
+    );
 
     // Hard cutoff: beyond rMax, no interaction (matches DFTB+)
     if r < 0.0 || r >= r_max {
@@ -583,8 +647,10 @@ mod tests {
     fn test_bspline_deriv_c2_continuity() {
         let tab = make_sk_table(50, 0.1, 2.0);
         let n_grid = tab.n_grid();
-        let mut v = [0.0f64]; let mut dv = [0.0f64];
-        let mut v_r = [0.0f64]; let mut dv_r = [0.0f64];
+        let mut v = [0.0f64];
+        let mut dv = [0.0f64];
+        let mut v_r = [0.0f64];
+        let mut dv_r = [0.0f64];
         let mut max_v_jump = 0.0f64;
         let mut max_dv_jump = 0.0f64;
         // Check V' continuity at each interior knot.
@@ -592,9 +658,11 @@ mod tests {
             let r_knot = (i + 1) as f64 * tab.dr;
             let eps = tab.dr * 1e-6;
             // Left limit
-            tab.eval_with_deriv_into(r_knot - eps, &mut v, &mut dv).unwrap();
+            tab.eval_with_deriv_into(r_knot - eps, &mut v, &mut dv)
+                .unwrap();
             // Right limit
-            tab.eval_with_deriv_into(r_knot + eps, &mut v_r, &mut dv_r).unwrap();
+            tab.eval_with_deriv_into(r_knot + eps, &mut v_r, &mut dv_r)
+                .unwrap();
             // V should be continuous
             let v_jump = (v[0] - v_r[0]).abs();
             max_v_jump = max_v_jump.max(v_jump);
@@ -602,7 +670,9 @@ mod tests {
             let dv_jump = (dv[0] - dv_r[0]).abs();
             max_dv_jump = max_dv_jump.max(dv_jump);
         }
-        eprintln!("B-spline C² continuity: max|V jump|={max_v_jump:.3e}, max|V' jump|={max_dv_jump:.3e}");
+        eprintln!(
+            "B-spline C² continuity: max|V jump|={max_v_jump:.3e}, max|V' jump|={max_dv_jump:.3e}"
+        );
         // V should be continuous — tolerance accounts for eps perturbation.
         assert!(max_v_jump < 1e-5, "V jump too large: {max_v_jump:.2e}");
         // V' should be continuous (C¹) — the B-spline is C², so V' is C¹.
@@ -614,11 +684,14 @@ mod tests {
     fn test_bspline_vs_hermite_values() {
         let tab = make_sk_table(50, 0.1, 2.0);
         let n_grid = tab.n_grid();
-        let mut v_bs = [0.0f64]; let mut v_herm = [0.0f64];
+        let mut v_bs = [0.0f64];
+        let mut v_herm = [0.0f64];
         let mut max_diff = 0.0f64;
         for i in 0..200 {
             let r = (i + 1) as f64 * tab.dr * 0.5; // sample at half resolution
-            if r >= tab.r_max() { continue; }
+            if r >= tab.r_max() {
+                continue;
+            }
             tab.eval_into(r, &mut v_bs).unwrap();
             tab.eval_hermite_into(r, &mut v_herm).unwrap();
             max_diff = max_diff.max((v_bs[0] - v_herm[0]).abs());
@@ -626,7 +699,10 @@ mod tests {
         // Both interpolate the same data, so should be close.
         // B-spline is C², Hermite is C¹ — they differ by interpolation method.
         eprintln!("B-spline vs Hermite max|diff| = {max_diff:.3e}");
-        assert!(max_diff < 2e-2, "B-spline vs Hermite too different: {max_diff:.3e}");
+        assert!(
+            max_diff < 2e-2,
+            "B-spline vs Hermite too different: {max_diff:.3e}"
+        );
     }
 
     /// Test: B-spline derivative is smooth (no finite-difference noise).
@@ -639,10 +715,13 @@ mod tests {
         let n_samples = 500;
         let mut prev_dv = 0.0f64;
         let mut max_jump = 0.0f64;
-        let mut v = [0.0f64]; let mut dv = [0.0f64];
+        let mut v = [0.0f64];
+        let mut dv = [0.0f64];
         for i in 0..n_samples {
             let r = (i as f64 + 0.5) * tab.dr * 0.1; // fine sampling
-            if r >= tab.r_max() - 0.01 { continue; }
+            if r >= tab.r_max() - 0.01 {
+                continue;
+            }
             tab.eval_with_deriv_into(r, &mut v, &mut dv).unwrap();
             if i > 0 {
                 let jump = (dv[0] - prev_dv).abs();
@@ -655,7 +734,10 @@ mod tests {
         // Hermite: C¹ → derivative is C⁰ → may have jumps at knots.
         eprintln!("B-spline derivative max jump between samples: {max_jump:.3e}");
         // The jump should be small (proportional to sample spacing × curvature).
-        assert!(max_jump < 1.0, "B-spline derivative too jumpy: {max_jump:.3e}");
+        assert!(
+            max_jump < 1.0,
+            "B-spline derivative too jumpy: {max_jump:.3e}"
+        );
     }
 
     /// Past the last SK sample the spline must land on ~0, not a bonding integral.
@@ -666,12 +748,20 @@ mod tests {
         let last = tab.values[tab.n_grid() - 1][0].abs();
         let mut out = [0.0f64];
         tab.eval_into(r_data + 2.0 * tab.dr, &mut out).unwrap();
-        assert!(out[0].abs() <= last + 1e-8,
-            "tail exploded: V={} last_grid={last} (must decay toward 0, not grow)", out[0]);
+        assert!(
+            out[0].abs() <= last + 1e-8,
+            "tail exploded: V={} last_grid={last} (must decay toward 0, not grow)",
+            out[0]
+        );
         tab.eval_into(tab.r_max() + 0.1, &mut out).unwrap();
-        assert_eq!(out[0], 0.0, "hard cutoff past r_max must be exact 0, got {}", out[0]);
+        assert_eq!(
+            out[0], 0.0,
+            "hard cutoff past r_max must be exact 0, got {}",
+            out[0]
+        );
         let mut dv = [0.0f64];
-        tab.eval_with_deriv_into(tab.r_max() + 0.1, &mut out, &mut dv).unwrap();
+        tab.eval_with_deriv_into(tab.r_max() + 0.1, &mut out, &mut dv)
+            .unwrap();
         assert_eq!(dv[0], 0.0);
     }
 
@@ -680,21 +770,31 @@ mod tests {
     fn test_bspline_analytic_deriv_matches_fd() {
         let tab = make_sk_table(80, 0.05, 1.5);
         let h = 1e-6;
-        let mut vp = [0.0f64]; let mut vm = [0.0f64];
-        let mut v = [0.0f64]; let mut dv = [0.0f64];
+        let mut vp = [0.0f64];
+        let mut vm = [0.0f64];
+        let mut v = [0.0f64];
+        let mut dv = [0.0f64];
         let mut max_rel = 0.0f64;
         let mut worst_r = 0.0f64;
         for i in 5..200 {
             let r = (i as f64 + 0.37) * tab.dr;
-            if r + h >= tab.r_max() - tab.dr { continue; }
+            if r + h >= tab.r_max() - tab.dr {
+                continue;
+            }
             tab.eval_into(r + h, &mut vp).unwrap();
             tab.eval_into(r - h, &mut vm).unwrap();
             tab.eval_with_deriv_into(r, &mut v, &mut dv).unwrap();
             let fd = (vp[0] - vm[0]) / (2.0 * h);
             let rel = (dv[0] - fd).abs() / fd.abs().max(1e-8);
-            if rel > max_rel { max_rel = rel; worst_r = r; }
+            if rel > max_rel {
+                max_rel = rel;
+                worst_r = r;
+            }
         }
         eprintln!("analytic V' vs FD: max rel={max_rel:.3e} at r={worst_r:.4}");
-        assert!(max_rel < 1e-6, "analytic V' disagrees with FD of V: rel={max_rel:.3e} at r={worst_r}");
+        assert!(
+            max_rel < 1e-6,
+            "analytic V' disagrees with FD of V: rel={max_rel:.3e} at r={worst_r}"
+        );
     }
 }

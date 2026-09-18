@@ -52,8 +52,13 @@ impl Rotation {
     ///   cols = 2*ang1+1 (orbitals of shell 1, atom i)
     ///
     /// This matches Fortran rotateH0 with ang1 <= ang2 (direct, no transpose/sign).
-    pub fn rotate_shell_pair(ang1: i32, ang2: i32, h_sk: &[f64], s_sk: &[f64], dc: DirectionCosines)
-        -> Result<(DMatrix<f64>, DMatrix<f64>)> {
+    pub fn rotate_shell_pair(
+        ang1: i32,
+        ang2: i32,
+        h_sk: &[f64],
+        s_sk: &[f64],
+        dc: DirectionCosines,
+    ) -> Result<(DMatrix<f64>, DMatrix<f64>)> {
         let h = Self::rotate_shell_pair_single(ang1, ang2, h_sk, dc)?;
         let s = Self::rotate_shell_pair_single(ang1, ang2, s_sk, dc)?;
         Ok((h, s))
@@ -75,15 +80,21 @@ impl Rotation {
         Ok(())
     }
 
-    fn rotate_shell_pair_single(ang1: i32, ang2: i32, sk: &[f64], dc: DirectionCosines)
-        -> Result<DMatrix<f64>> {
+    fn rotate_shell_pair_single(
+        ang1: i32,
+        ang2: i32,
+        sk: &[f64],
+        dc: DirectionCosines,
+    ) -> Result<DMatrix<f64>> {
         match (ang1, ang2) {
             (0, 0) => Ok(Self::rotate_ss(sk[0])),
             (0, 1) => Ok(Self::rotate_sp(dc, sk[0])),
             (1, 0) => Ok(Self::rotate_sp(dc, sk[0])),
             (1, 1) => Ok(Self::rotate_pp(dc, sk[0], sk[1])),
             _ => Err(DftbError::Rotation(format!(
-                "unsupported shell pair ({}, {})", ang1, ang2))),
+                "unsupported shell pair ({}, {})",
+                ang1, ang2
+            ))),
         }
     }
 
@@ -95,12 +106,26 @@ impl Rotation {
         out: &mut [f64],
     ) -> Result<()> {
         match (ang1, ang2) {
-            (0, 0) => { out[0] = sk[0]; Ok(()) }
-            (0, 1) => { Self::rotate_sp_into(dc, sk[0], out); Ok(()) }
-            (1, 0) => { Self::rotate_sp_into(dc, sk[0], out); Ok(()) }
-            (1, 1) => { Self::rotate_pp_into(dc, sk[0], sk[1], out); Ok(()) }
+            (0, 0) => {
+                out[0] = sk[0];
+                Ok(())
+            }
+            (0, 1) => {
+                Self::rotate_sp_into(dc, sk[0], out);
+                Ok(())
+            }
+            (1, 0) => {
+                Self::rotate_sp_into(dc, sk[0], out);
+                Ok(())
+            }
+            (1, 1) => {
+                Self::rotate_pp_into(dc, sk[0], sk[1], out);
+                Ok(())
+            }
             _ => Err(DftbError::Rotation(format!(
-                "unsupported shell pair ({}, {})", ang1, ang2))),
+                "unsupported shell pair ({}, {})",
+                ang1, ang2
+            ))),
         }
     }
 
@@ -130,20 +155,24 @@ impl Rotation {
         let sk1 = pp_sigma;
         let sk2 = pp_pi;
 
-        DMatrix::from_row_slice(3, 3, &[
-            // py row
-            (1.0 - n * n - l * l) * sk1 + (n * n + l * l) * sk2,
-            n * m * sk1 - n * m * sk2,
-            l * m * sk1 - l * m * sk2,
-            // pz row
-            n * m * sk1 - n * m * sk2,
-            n * n * sk1 + (1.0 - n * n) * sk2,
-            n * l * sk1 - n * l * sk2,
-            // px row
-            l * m * sk1 - l * m * sk2,
-            n * l * sk1 - n * l * sk2,
-            l * l * sk1 + (1.0 - l * l) * sk2,
-        ])
+        DMatrix::from_row_slice(
+            3,
+            3,
+            &[
+                // py row
+                (1.0 - n * n - l * l) * sk1 + (n * n + l * l) * sk2,
+                n * m * sk1 - n * m * sk2,
+                l * m * sk1 - l * m * sk2,
+                // pz row
+                n * m * sk1 - n * m * sk2,
+                n * n * sk1 + (1.0 - n * n) * sk2,
+                n * l * sk1 - n * l * sk2,
+                // px row
+                l * m * sk1 - l * m * sk2,
+                n * l * sk1 - n * l * sk2,
+                l * l * sk1 + (1.0 - l * l) * sk2,
+            ],
+        )
     }
 
     fn rotate_pp_into(dc: DirectionCosines, pp_sigma: f64, pp_pi: f64, out: &mut [f64]) {
@@ -152,14 +181,14 @@ impl Rotation {
         let sk2 = pp_pi;
         // Row-major 3x3, (py,pz,px) ordering
         out[0] = (1.0 - n * n - l * l) * sk1 + (n * n + l * l) * sk2; // py,py
-        out[1] = n * m * sk1 - n * m * sk2;                           // py,pz
-        out[2] = l * m * sk1 - l * m * sk2;                           // py,px
-        out[3] = n * m * sk1 - n * m * sk2;                           // pz,py
-        out[4] = n * n * sk1 + (1.0 - n * n) * sk2;                   // pz,pz
-        out[5] = n * l * sk1 - n * l * sk2;                           // pz,px
-        out[6] = l * m * sk1 - l * m * sk2;                           // px,py
-        out[7] = n * l * sk1 - n * l * sk2;                           // px,pz
-        out[8] = l * l * sk1 + (1.0 - l * l) * sk2;                   // px,px
+        out[1] = n * m * sk1 - n * m * sk2; // py,pz
+        out[2] = l * m * sk1 - l * m * sk2; // py,px
+        out[3] = n * m * sk1 - n * m * sk2; // pz,py
+        out[4] = n * n * sk1 + (1.0 - n * n) * sk2; // pz,pz
+        out[5] = n * l * sk1 - n * l * sk2; // pz,px
+        out[6] = l * m * sk1 - l * m * sk2; // px,py
+        out[7] = n * l * sk1 - n * l * sk2; // px,pz
+        out[8] = l * l * sk1 + (1.0 - l * l) * sk2; // px,px
     }
 
     /// Assemble the full diatomic block for a species pair at distance r.
@@ -180,8 +209,14 @@ impl Rotation {
         let mut h_blk = DMatrix::<f64>::zeros(n_orb2, n_orb1);
         let mut s_blk = DMatrix::<f64>::zeros(n_orb2, n_orb1);
         Self::rotate_diatomic_block_into(
-            tab_fwd, tab_rev, ang1_list, ang2_list, r, dc,
-            h_blk.as_mut_slice(), s_blk.as_mut_slice(),
+            tab_fwd,
+            tab_rev,
+            ang1_list,
+            ang2_list,
+            r,
+            dc,
+            h_blk.as_mut_slice(),
+            s_blk.as_mut_slice(),
         )?;
         Ok((h_blk, s_blk))
     }
@@ -223,8 +258,13 @@ impl Rotation {
                 let n_mm = tab.eval_shell_integrals_into(ang1, ang2, r, &mut sk_h, &mut sk_s)?;
                 let sub_size = n_orb2_sh * n_orb1_sh;
                 Self::rotate_shell_pair_into(
-                    ang1, ang2, &sk_h[..n_mm], &sk_s[..n_mm], dc,
-                    &mut sub_h[..sub_size], &mut sub_s[..sub_size],
+                    ang1,
+                    ang2,
+                    &sk_h[..n_mm],
+                    &sk_s[..n_mm],
+                    dc,
+                    &mut sub_h[..sub_size],
+                    &mut sub_s[..sub_size],
                 )?;
 
                 if ang1 <= ang2 {
@@ -279,15 +319,27 @@ impl Rotation {
         ang2_list: &[i32],
         r: f64,
         dc: DirectionCosines,
-        out_h: &mut [f64], out_s: &mut [f64],
-        dh_dx: &mut [f64], dh_dy: &mut [f64], dh_dz: &mut [f64],
-        ds_dx: &mut [f64], ds_dy: &mut [f64], ds_dz: &mut [f64],
+        out_h: &mut [f64],
+        out_s: &mut [f64],
+        dh_dx: &mut [f64],
+        dh_dy: &mut [f64],
+        dh_dz: &mut [f64],
+        ds_dx: &mut [f64],
+        ds_dy: &mut [f64],
+        ds_dz: &mut [f64],
     ) -> Result<()> {
         let n_orb1: usize = ang1_list.iter().map(|&l| (2 * l + 1) as usize).sum();
         let n_orb2: usize = ang2_list.iter().map(|&l| (2 * l + 1) as usize).sum();
         let block_size = n_orb2 * n_orb1;
         assert!(out_h.len() >= block_size);
-        for buf in [&mut *dh_dx, &mut *dh_dy, &mut *dh_dz, &mut *ds_dx, &mut *ds_dy, &mut *ds_dz] {
+        for buf in [
+            &mut *dh_dx,
+            &mut *dh_dy,
+            &mut *dh_dz,
+            &mut *ds_dx,
+            &mut *ds_dy,
+            &mut *ds_dz,
+        ] {
             assert!(buf.len() >= block_size);
             buf[..block_size].fill(0.0);
         }
@@ -300,8 +352,10 @@ impl Rotation {
         // u_x = l, u_y = m, u_z = n
         // du_i/dR_a = (δ_ia - u_i*u_a) / R
 
-        let mut sk_h = [0.0f64; 4]; let mut sk_s = [0.0f64; 4];
-        let mut dh_dr = [0.0f64; 4]; let mut ds_dr = [0.0f64; 4];
+        let mut sk_h = [0.0f64; 4];
+        let mut sk_s = [0.0f64; 4];
+        let mut dh_dr = [0.0f64; 4];
+        let mut ds_dr = [0.0f64; 4];
 
         let mut i_col = 0;
         for &ang1 in ang1_list {
@@ -316,12 +370,10 @@ impl Rotation {
                 let sub = n2 * n1;
 
                 // Compute sub-block values and derivatives
-                let (sh, sdh_x, sdh_y, sdh_z) = Self::shell_pair_with_derivs(
-                    ang1, ang2, &sk_h[..n_mm], &dh_dr[..n_mm], dc, r,
-                );
-                let (ss_, sds_x, sds_y, sds_z) = Self::shell_pair_with_derivs(
-                    ang1, ang2, &sk_s[..n_mm], &ds_dr[..n_mm], dc, r,
-                );
+                let (sh, sdh_x, sdh_y, sdh_z) =
+                    Self::shell_pair_with_derivs(ang1, ang2, &sk_h[..n_mm], &dh_dr[..n_mm], dc, r);
+                let (ss_, sds_x, sds_y, sds_z) =
+                    Self::shell_pair_with_derivs(ang1, ang2, &sk_s[..n_mm], &ds_dr[..n_mm], dc, r);
 
                 if ang1 <= ang2 {
                     for a in 0..n2 {
@@ -330,8 +382,12 @@ impl Rotation {
                             let sidx = a * n1 + b;
                             out_h[idx] = sh[sidx];
                             out_s[idx] = ss_[sidx];
-                            dh_dx[idx] = sdh_x[sidx]; dh_dy[idx] = sdh_y[sidx]; dh_dz[idx] = sdh_z[sidx];
-                            ds_dx[idx] = sds_x[sidx]; ds_dy[idx] = sds_y[sidx]; ds_dz[idx] = sds_z[sidx];
+                            dh_dx[idx] = sdh_x[sidx];
+                            dh_dy[idx] = sdh_y[sidx];
+                            dh_dz[idx] = sdh_z[sidx];
+                            ds_dx[idx] = sds_x[sidx];
+                            ds_dy[idx] = sds_y[sidx];
+                            ds_dz[idx] = sds_z[sidx];
                         }
                     }
                 } else {
@@ -342,8 +398,12 @@ impl Rotation {
                             let sidx = b * n2 + a; // transpose
                             out_h[idx] = sign * sh[sidx];
                             out_s[idx] = sign * ss_[sidx];
-                            dh_dx[idx] = sign * sdh_x[sidx]; dh_dy[idx] = sign * sdh_y[sidx]; dh_dz[idx] = sign * sdh_z[sidx];
-                            ds_dx[idx] = sign * sds_x[sidx]; ds_dy[idx] = sign * sds_y[sidx]; ds_dz[idx] = sign * sds_z[sidx];
+                            dh_dx[idx] = sign * sdh_x[sidx];
+                            dh_dy[idx] = sign * sdh_y[sidx];
+                            dh_dz[idx] = sign * sdh_z[sidx];
+                            ds_dx[idx] = sign * sds_x[sidx];
+                            ds_dy[idx] = sign * sds_y[sidx];
+                            ds_dz[idx] = sign * sds_z[sidx];
                         }
                     }
                 }
@@ -358,9 +418,12 @@ impl Rotation {
     /// Returns (values[9], dh_dx[9], dh_dy[9], dh_dz[9]) — only first sub elements are valid.
     /// Derivative is w.r.t. atom j position (R_vec = r_j - r_i).
     fn shell_pair_with_derivs(
-        ang1: i32, ang2: i32,
-        sk: &[f64], dsk_dr: &[f64],
-        dc: DirectionCosines, r: f64,
+        ang1: i32,
+        ang2: i32,
+        sk: &[f64],
+        dsk_dr: &[f64],
+        dc: DirectionCosines,
+        r: f64,
     ) -> ([f64; 9], [f64; 9], [f64; 9], [f64; 9]) {
         let (l, m, nn) = (dc.l, dc.m, dc.n);
         let inv_r = if r > 1e-12 { 1.0 / r } else { 0.0 };
@@ -386,33 +449,37 @@ impl Rotation {
             (0, 1) | (1, 0) => {
                 // H_i = u_i * V(r)  (i = y,z,x → indices 0,1,2)
                 // dH_i/dR_a = du_i/dR_a * V + u_i * V' * u_a
-                let v = sk[0]; let vp = dsk_dr[0];
+                let v = sk[0];
+                let vp = dsk_dr[0];
                 // i=y (idx 0): u_y = m
                 val[0] = m * v;
-                dx[0] = (-m*l*inv_r) * v + m * vp * l;
-                dy[0] = ((1.0-m*m)*inv_r) * v + m * vp * m;
-                dz[0] = (-m*nn*inv_r) * v + m * vp * nn;
+                dx[0] = (-m * l * inv_r) * v + m * vp * l;
+                dy[0] = ((1.0 - m * m) * inv_r) * v + m * vp * m;
+                dz[0] = (-m * nn * inv_r) * v + m * vp * nn;
                 // i=z (idx 1): u_z = n
                 val[1] = nn * v;
-                dx[1] = (-nn*l*inv_r) * v + nn * vp * l;
-                dy[1] = (-nn*m*inv_r) * v + nn * vp * m;
-                dz[1] = ((1.0-nn*nn)*inv_r) * v + nn * vp * nn;
+                dx[1] = (-nn * l * inv_r) * v + nn * vp * l;
+                dy[1] = (-nn * m * inv_r) * v + nn * vp * m;
+                dz[1] = ((1.0 - nn * nn) * inv_r) * v + nn * vp * nn;
                 // i=x (idx 2): u_x = l
                 val[2] = l * v;
-                dx[2] = ((1.0-l*l)*inv_r) * v + l * vp * l;
-                dy[2] = (-l*m*inv_r) * v + l * vp * m;
-                dz[2] = (-l*nn*inv_r) * v + l * vp * nn;
+                dx[2] = ((1.0 - l * l) * inv_r) * v + l * vp * l;
+                dy[2] = (-l * m * inv_r) * v + l * vp * m;
+                dz[2] = (-l * nn * inv_r) * v + l * vp * nn;
             }
             (1, 1) => {
                 // H_ij = V_π*δ_ij + (V_σ-V_π)*u_i*u_j
                 // sk[0] = V_σ, sk[1] = V_π
-                let vs = sk[0]; let vp = sk[1];
-                let dvs = dsk_dr[0]; let dvp = dsk_dr[1];
-                let dv = vs - vp; let dvp_total = dvs - dvp;
+                let vs = sk[0];
+                let vp = sk[1];
+                let dvs = dsk_dr[0];
+                let dvp = dsk_dr[1];
+                let dv = vs - vp;
+                let dvp_total = dvs - dvp;
                 let ui = [m, nn, l]; // i=y,z,x (indices 0,1,2)
                 let ua = [l, m, nn]; // a=x,y,z
-                // Orbital i maps to direction a via: i=0(y)→a=1(y), i=1(z)→a=2(z), i=2(x)→a=0(x)
-                // So delta_ia = 1 when a == (i+1)%3
+                                     // Orbital i maps to direction a via: i=0(y)→a=1(y), i=1(z)→a=2(z), i=2(x)→a=0(x)
+                                     // So delta_ia = 1 when a == (i+1)%3
                 for i in 0..3 {
                     for j in 0..3 {
                         let idx = i * 3 + j;
@@ -424,7 +491,9 @@ impl Rotation {
                             let delta_ja = if a == (j + 1) % 3 { 1.0 } else { 0.0 };
                             let dval = dvp * ua_a * delta_ij
                                 + dvp_total * ua_a * ui[i] * ui[j]
-                                + dv * inv_r * ((delta_ia - ui[i]*ua_a) * ui[j] + ui[i] * (delta_ja - ui[j]*ua_a));
+                                + dv * inv_r
+                                    * ((delta_ia - ui[i] * ua_a) * ui[j]
+                                        + ui[i] * (delta_ja - ui[j] * ua_a));
                             match a {
                                 0 => dx[idx] = dval,
                                 1 => dy[idx] = dval,
@@ -464,12 +533,8 @@ mod tests {
         let n_grid = 100;
         let r_max = dr * n_grid as f64;
         // Different decay rates for each integral channel
-        let decay_rates: Vec<f64> = (0..n_integ)
-            .map(|k| 1.0 + 0.3 * k as f64)
-            .collect();
-        let amplitudes: Vec<f64> = (0..n_integ)
-            .map(|k| 0.5 - 0.1 * k as f64)
-            .collect();
+        let decay_rates: Vec<f64> = (0..n_integ).map(|k| 1.0 + 0.3 * k as f64).collect();
+        let amplitudes: Vec<f64> = (0..n_integ).map(|k| 0.5 - 0.1 * k as f64).collect();
         let values: Vec<Vec<f64>> = (0..n_grid)
             .map(|i| {
                 let r = i as f64 * dr;
@@ -523,11 +588,10 @@ mod tests {
         let mut ds_dz = vec![0.0f64; bs];
 
         Rotation::rotate_block_with_derivs_into(
-            tab_fwd, tab_rev, ang1, ang2, r_bohr, dc,
-            &mut h, &mut s,
-            &mut dh_dx, &mut dh_dy, &mut dh_dz,
-            &mut ds_dx, &mut ds_dy, &mut ds_dz,
-        ).unwrap();
+            tab_fwd, tab_rev, ang1, ang2, r_bohr, dc, &mut h, &mut s, &mut dh_dx, &mut dh_dy,
+            &mut dh_dz, &mut ds_dx, &mut ds_dy, &mut ds_dz,
+        )
+        .unwrap();
 
         // Direction vector from dc (unit vector)
         let u = [dc.l, dc.m, dc.n];
@@ -551,17 +615,39 @@ mod tests {
             let dc_minus = DirectionCosines::from_vec(v_minus).unwrap();
 
             Rotation::rotate_diatomic_block_into(
-                tab_fwd, tab_rev, ang1, ang2, r_plus, dc_plus,
-                &mut h_plus, &mut s_plus,
-            ).unwrap();
+                tab_fwd,
+                tab_rev,
+                ang1,
+                ang2,
+                r_plus,
+                dc_plus,
+                &mut h_plus,
+                &mut s_plus,
+            )
+            .unwrap();
             Rotation::rotate_diatomic_block_into(
-                tab_fwd, tab_rev, ang1, ang2, r_minus, dc_minus,
-                &mut h_minus, &mut s_minus,
-            ).unwrap();
+                tab_fwd,
+                tab_rev,
+                ang1,
+                ang2,
+                r_minus,
+                dc_minus,
+                &mut h_minus,
+                &mut s_minus,
+            )
+            .unwrap();
 
             // Central FD: dH/dR_a ≈ (H+ - H-) / (2*delta)
-            let analytic_dh = match dir { 0 => &dh_dx, 1 => &dh_dy, _ => &dh_dz };
-            let analytic_ds = match dir { 0 => &ds_dx, 1 => &ds_dy, _ => &ds_dz };
+            let analytic_dh = match dir {
+                0 => &dh_dx,
+                1 => &dh_dy,
+                _ => &dh_dz,
+            };
+            let analytic_ds = match dir {
+                0 => &ds_dx,
+                1 => &ds_dy,
+                _ => &ds_dz,
+            };
 
             let mut max_err_h = 0.0f64;
             let mut max_err_s = 0.0f64;
@@ -572,10 +658,14 @@ mod tests {
                 max_err_s = max_err_s.max((fd_s - analytic_ds[k]).abs());
             }
             let dir_name = ["x", "y", "z"][dir];
-            assert!(max_err_h < tol,
-                "{label}: dH/d{dir_name} analytic vs FD error {max_err_h:.3e} > tol {tol:.3e}");
-            assert!(max_err_s < tol,
-                "{label}: dS/d{dir_name} analytic vs FD error {max_err_s:.3e} > tol {tol:.3e}");
+            assert!(
+                max_err_h < tol,
+                "{label}: dH/d{dir_name} analytic vs FD error {max_err_h:.3e} > tol {tol:.3e}"
+            );
+            assert!(
+                max_err_s < tol,
+                "{label}: dS/d{dir_name} analytic vs FD error {max_err_s:.3e} > tol {tol:.3e}"
+            );
         }
     }
 
@@ -584,7 +674,11 @@ mod tests {
         // s-s shell pair (e.g., H-H)
         let tab = make_synthetic_table("H", "H", 1);
         let r = 3.0; // Bohr
-        let dc = DirectionCosines { l: 0.6, m: 0.0, n: 0.8 };
+        let dc = DirectionCosines {
+            l: 0.6,
+            m: 0.0,
+            n: 0.8,
+        };
         check_analytic_vs_fd(&tab, &tab, &[0], &[0], r, dc, 1e-5, 1e-6, "ss");
     }
 
@@ -594,7 +688,11 @@ mod tests {
         let tab_hc = make_synthetic_table("H", "C", 4);
         let tab_ch = make_synthetic_table("C", "H", 4);
         let r = 3.0;
-        let dc = DirectionCosines { l: 0.6, m: 0.0, n: 0.8 };
+        let dc = DirectionCosines {
+            l: 0.6,
+            m: 0.0,
+            n: 0.8,
+        };
         check_analytic_vs_fd(&tab_hc, &tab_ch, &[0], &[1], r, dc, 1e-5, 1e-6, "sp");
         // Also test the reverse: p-s
         check_analytic_vs_fd(&tab_ch, &tab_hc, &[1], &[0], r, dc, 1e-5, 1e-6, "ps");
@@ -605,7 +703,11 @@ mod tests {
         // p-p shell pair (e.g., C-C)
         let tab = make_synthetic_table("C", "C", 4);
         let r = 3.0;
-        let dc = DirectionCosines { l: 0.6, m: 0.0, n: 0.8 };
+        let dc = DirectionCosines {
+            l: 0.6,
+            m: 0.0,
+            n: 0.8,
+        };
         check_analytic_vs_fd(&tab, &tab, &[1], &[1], r, dc, 1e-5, 1e-6, "pp");
     }
 
@@ -615,7 +717,11 @@ mod tests {
         let tab = make_synthetic_table("C", "C", 4);
         let r = 2.5;
         // Use a non-trivial direction
-        let dc = DirectionCosines { l: 0.5773502691896258, m: 0.5773502691896258, n: 0.5773502691896258 };
+        let dc = DirectionCosines {
+            l: 0.5773502691896258,
+            m: 0.5773502691896258,
+            n: 0.5773502691896258,
+        };
         check_analytic_vs_fd(&tab, &tab, &[0, 1], &[0, 1], r, dc, 1e-5, 1e-6, "spd-block");
     }
 
@@ -625,15 +731,67 @@ mod tests {
         let tab = make_synthetic_table("C", "C", 4);
         let r = 3.0;
         let directions = [
-            ("x-axis", DirectionCosines { l: 1.0, m: 0.0, n: 0.0 }),
-            ("y-axis", DirectionCosines { l: 0.0, m: 1.0, n: 0.0 }),
-            ("z-axis", DirectionCosines { l: 0.0, m: 0.0, n: 1.0 }),
-            ("xy-diag", DirectionCosines { l: 0.7071067811865476, m: 0.7071067811865476, n: 0.0 }),
-            ("xyz-diag", DirectionCosines { l: 0.5773502691896258, m: 0.5773502691896258, n: 0.5773502691896258 }),
-            ("tilted", DirectionCosines { l: 0.3, m: 0.5, n: 0.8104590383770608 }),
+            (
+                "x-axis",
+                DirectionCosines {
+                    l: 1.0,
+                    m: 0.0,
+                    n: 0.0,
+                },
+            ),
+            (
+                "y-axis",
+                DirectionCosines {
+                    l: 0.0,
+                    m: 1.0,
+                    n: 0.0,
+                },
+            ),
+            (
+                "z-axis",
+                DirectionCosines {
+                    l: 0.0,
+                    m: 0.0,
+                    n: 1.0,
+                },
+            ),
+            (
+                "xy-diag",
+                DirectionCosines {
+                    l: 0.7071067811865476,
+                    m: 0.7071067811865476,
+                    n: 0.0,
+                },
+            ),
+            (
+                "xyz-diag",
+                DirectionCosines {
+                    l: 0.5773502691896258,
+                    m: 0.5773502691896258,
+                    n: 0.5773502691896258,
+                },
+            ),
+            (
+                "tilted",
+                DirectionCosines {
+                    l: 0.3,
+                    m: 0.5,
+                    n: 0.8104590383770608,
+                },
+            ),
         ];
         for (name, dc) in &directions {
-            check_analytic_vs_fd(&tab, &tab, &[0, 1], &[0, 1], r, *dc, 1e-5, 1e-6, &format!("spd-{name}"));
+            check_analytic_vs_fd(
+                &tab,
+                &tab,
+                &[0, 1],
+                &[0, 1],
+                r,
+                *dc,
+                1e-5,
+                1e-6,
+                &format!("spd-{name}"),
+            );
         }
     }
 
@@ -641,9 +799,23 @@ mod tests {
     fn test_analytic_vs_fd_various_distances() {
         // Test at various distances to ensure no distance-dependent bugs
         let tab = make_synthetic_table("C", "C", 4);
-        let dc = DirectionCosines { l: 0.6, m: 0.0, n: 0.8 };
+        let dc = DirectionCosines {
+            l: 0.6,
+            m: 0.0,
+            n: 0.8,
+        };
         for r in [1.5, 2.0, 3.0, 5.0, 8.0] {
-            check_analytic_vs_fd(&tab, &tab, &[0, 1], &[0, 1], r, dc, 1e-5, 1e-6, &format!("r={r}"));
+            check_analytic_vs_fd(
+                &tab,
+                &tab,
+                &[0, 1],
+                &[0, 1],
+                r,
+                dc,
+                1e-5,
+                1e-6,
+                &format!("r={r}"),
+            );
         }
     }
 }

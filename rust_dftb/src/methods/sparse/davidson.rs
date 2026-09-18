@@ -68,7 +68,9 @@ pub fn davidson_homo_lumo(
 ) -> Result<(Vec<f64>, DMatrix<f64>)> {
     let n = h.nrows();
     if h.ncols() != n || s.nrows() != n || s.ncols() != n {
-        return Err(DftbError::InvalidInput("H and S must be square and same size".into()));
+        return Err(DftbError::InvalidInput(
+            "H and S must be square and same size".into(),
+        ));
     }
     if n_occ == 0 || n_occ >= n {
         return Err(DftbError::InvalidInput(format!(
@@ -77,14 +79,14 @@ pub fn davidson_homo_lumo(
     }
     let n_target = n_target.min(n_occ).min(n - n_occ);
     if n_target == 0 {
-        return Err(DftbError::InvalidInput("n_target too small for system".into()));
+        return Err(DftbError::InvalidInput(
+            "n_target too small for system".into(),
+        ));
     }
 
     // Estimate the Fermi level from the diagonal of S^{-1}·H.
     // ε_i ≈ H_ii / S_ii (Rayleigh quotient of diagonal guess).
-    let diag_eigs: Vec<f64> = (0..n)
-        .map(|i| h[(i, i)] / s[(i, i)])
-        .collect();
+    let diag_eigs: Vec<f64> = (0..n).map(|i| h[(i, i)] / s[(i, i)]).collect();
     let mut idx_sorted: Vec<usize> = (0..n).collect();
     idx_sorted.sort_by(|&a, &b| diag_eigs[a].partial_cmp(&diag_eigs[b]).unwrap());
     // Fermi level ≈ midpoint between n_occ-th and (n_occ+1)-th diagonal estimate
@@ -115,8 +117,8 @@ pub fn davidson_homo_lumo(
         let m = v.ncols();
 
         // Project H into the subspace: H_proj = V^T · H · V
-        let hv = h * &v;            // n×m
-        let h_proj = v.transpose() * &hv;  // m×m
+        let hv = h * &v; // n×m
+        let h_proj = v.transpose() * &hv; // m×m
 
         // Diagonalize the small projected matrix.
         let sym = SymmetricEigen::new(h_proj.clone());
@@ -127,22 +129,27 @@ pub fn davidson_homo_lumo(
         let n_return = 2 * n_target;
         let mut sel: Vec<usize> = order.iter().cloned().collect();
         sel.sort_by(|&a, &b| {
-            (sym.eigenvalues[a] - fermi).abs().partial_cmp(&(sym.eigenvalues[b] - fermi).abs()).unwrap()
+            (sym.eigenvalues[a] - fermi)
+                .abs()
+                .partial_cmp(&(sym.eigenvalues[b] - fermi).abs())
+                .unwrap()
         });
         sel.truncate(n_return);
         // Sort selected by eigenvalue (ascending) so HOMO = eigs[n_target-1], LUMO = eigs[n_target]
         sel.sort_by(|&a, &b| sym.eigenvalues[a].partial_cmp(&sym.eigenvalues[b]).unwrap());
         let ritz_vals: Vec<f64> = sel.iter().map(|&i| sym.eigenvalues[i]).collect();
         let ritz_vecs: DMatrix<f64> = DMatrix::from_columns(
-            &sel.iter().map(|&i| sym.eigenvectors.column(i).clone_owned()).collect::<Vec<_>>()
+            &sel.iter()
+                .map(|&i| sym.eigenvectors.column(i).clone_owned())
+                .collect::<Vec<_>>(),
         );
 
         // Ritz vectors in full space: X = V · U
-        let x = &v * &ritz_vecs;  // n×n_guess
+        let x = &v * &ritz_vecs; // n×n_guess
 
         // Residuals: r_i = H·x_i - θ_i·S·x_i
-        let sx = s * &x;          // n×n_guess
-        let hx = h * &x;          // n×n_guess
+        let sx = s * &x; // n×n_guess
+        let hx = h * &x; // n×n_guess
         let mut max_res = 0.0f64;
         let mut corrections: Vec<DVector<f64>> = Vec::new();
         for k in 0..n_return {
@@ -158,7 +165,11 @@ pub fn davidson_homo_lumo(
                 let mut t = DVector::zeros(n);
                 for i in 0..n {
                     let denom = h[(i, i)] - theta * s[(i, i)];
-                    let d = if denom.abs() > eps { denom } else { denom.signum() * eps };
+                    let d = if denom.abs() > eps {
+                        denom
+                    } else {
+                        denom.signum() * eps
+                    };
                     t[i] = r[i] / d;
                 }
                 corrections.push(t);
@@ -168,8 +179,14 @@ pub fn davidson_homo_lumo(
         eigvals = ritz_vals.clone();
         eigvecs = x.clone();
 
-        eprintln!("    Davidson iter {iter}: m={m}, max|res|={max_res:.2e}, eigs near gap: {}",
-            ritz_vals.iter().map(|e| format!("{e:.6}")).collect::<Vec<_>>().join(", "));
+        eprintln!(
+            "    Davidson iter {iter}: m={m}, max|res|={max_res:.2e}, eigs near gap: {}",
+            ritz_vals
+                .iter()
+                .map(|e| format!("{e:.6}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
 
         if max_res < tol {
             eprintln!("    Davidson converged in {iter} iterations");
@@ -197,28 +214,49 @@ pub fn davidson_homo_lumo(
 
         // Subspace restart: if too large, keep only the best n_return Ritz vectors.
         if v.ncols() > max_subspace {
-            eprintln!("    Davidson: subspace restart ({} -> {})", v.ncols(), n_return);
+            eprintln!(
+                "    Davidson: subspace restart ({} -> {})",
+                v.ncols(),
+                n_return
+            );
             // Re-project and keep best Ritz vectors as new starting basis.
             let hv2 = h * &v;
             let h_proj2 = v.transpose() * &hv2;
             let sym2 = SymmetricEigen::new(h_proj2.clone());
             let mut order2: Vec<usize> = (0..v.ncols()).collect();
-            order2.sort_by(|&a, &b| sym2.eigenvalues[a].partial_cmp(&sym2.eigenvalues[b]).unwrap());
+            order2.sort_by(|&a, &b| {
+                sym2.eigenvalues[a]
+                    .partial_cmp(&sym2.eigenvalues[b])
+                    .unwrap()
+            });
             let mut sel2: Vec<usize> = order2;
             sel2.sort_by(|&a, &b| {
-                (sym2.eigenvalues[a] - fermi).abs().partial_cmp(&(sym2.eigenvalues[b] - fermi).abs()).unwrap()
+                (sym2.eigenvalues[a] - fermi)
+                    .abs()
+                    .partial_cmp(&(sym2.eigenvalues[b] - fermi).abs())
+                    .unwrap()
             });
             sel2.truncate(n_return);
-            sel2.sort_by(|&a, &b| sym2.eigenvalues[a].partial_cmp(&sym2.eigenvalues[b]).unwrap());
+            sel2.sort_by(|&a, &b| {
+                sym2.eigenvalues[a]
+                    .partial_cmp(&sym2.eigenvalues[b])
+                    .unwrap()
+            });
             let restart_vecs = DMatrix::from_columns(
-                &sel2.iter().map(|&i| sym2.eigenvectors.column(i).clone_owned()).collect::<Vec<_>>()
+                &sel2
+                    .iter()
+                    .map(|&i| sym2.eigenvectors.column(i).clone_owned())
+                    .collect::<Vec<_>>(),
             );
             v = &v * &restart_vecs;
             s_orthonormalize(&mut v, s, n);
         }
     }
 
-    eprintln!("    Davidson: max_iter ({max_iter}) reached, returning best estimate (max|res|={:.2e})", eigvals.len());
+    eprintln!(
+        "    Davidson: max_iter ({max_iter}) reached, returning best estimate (max|res|={:.2e})",
+        eigvals.len()
+    );
     Ok((eigvals, eigvecs))
 }
 
@@ -256,16 +294,28 @@ mod tests {
         // 20×20 generalized eigenvalue problem
         let n = 20;
         let h = DMatrix::<f64>::from_fn(n, n, |i, j| {
-            if i == j { (i as f64 + 1.0) * 2.0 } else { 0.1 * (i as f64 - j as f64).abs().sin() }
+            if i == j {
+                (i as f64 + 1.0) * 2.0
+            } else {
+                0.1 * (i as f64 - j as f64).abs().sin()
+            }
         });
         let s = DMatrix::<f64>::identity(n, n) * 1.5
-            + DMatrix::<f64>::from_fn(n, n, |i, j| if (i as i32 - j as i32).abs() == 1 { 0.2 } else { 0.0 });
+            + DMatrix::<f64>::from_fn(n, n, |i, j| {
+                if (i as i32 - j as i32).abs() == 1 {
+                    0.2
+                } else {
+                    0.0
+                }
+            });
         let n_occ = 10;
         let n_target = 3;
 
         // Dense reference: S^{-1/2} H S^{-1/2}, then eigh
         let sym_s = SymmetricEigen::new(s.clone());
-        let s_sqrt = &sym_s.eigenvectors * DMatrix::from_diagonal(&sym_s.eigenvalues.map(|e: f64| e.sqrt())) * &sym_s.eigenvectors.transpose();
+        let s_sqrt = &sym_s.eigenvectors
+            * DMatrix::from_diagonal(&sym_s.eigenvalues.map(|e: f64| e.sqrt()))
+            * &sym_s.eigenvectors.transpose();
         let s_inv_sqrt = s_sqrt.try_inverse().unwrap();
         let h_orth = &s_inv_sqrt * &h * &s_inv_sqrt;
         let ref_sym = SymmetricEigen::new(h_orth);
@@ -280,10 +330,22 @@ mod tests {
         let dav_homo = eigs[n_target - 1];
         let dav_lumo = eigs[n_target];
 
-        eprintln!("ref  HOMO={ref_homo:.10}, LUMO={ref_lumo:.10}, gap={:.10}", ref_lumo - ref_homo);
-        eprintln!("dav  HOMO={dav_homo:.10}, LUMO={dav_lumo:.10}, gap={:.10}", dav_lumo - dav_homo);
+        eprintln!(
+            "ref  HOMO={ref_homo:.10}, LUMO={ref_lumo:.10}, gap={:.10}",
+            ref_lumo - ref_homo
+        );
+        eprintln!(
+            "dav  HOMO={dav_homo:.10}, LUMO={dav_lumo:.10}, gap={:.10}",
+            dav_lumo - dav_homo
+        );
 
-        assert!((dav_homo - ref_homo).abs() < 1e-6, "HOMO mismatch: dav={dav_homo} ref={ref_homo}");
-        assert!((dav_lumo - ref_lumo).abs() < 1e-6, "LUMO mismatch: dav={dav_lumo} ref={ref_lumo}");
+        assert!(
+            (dav_homo - ref_homo).abs() < 1e-6,
+            "HOMO mismatch: dav={dav_homo} ref={ref_homo}"
+        );
+        assert!(
+            (dav_lumo - ref_lumo).abs() < 1e-6,
+            "LUMO mismatch: dav={dav_lumo} ref={ref_lumo}"
+        );
     }
 }

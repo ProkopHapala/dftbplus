@@ -23,8 +23,8 @@
 
 use nalgebra::{DMatrix, SymmetricEigen};
 use rust_dftb::methods::sparse::bsr4::{
-    build_geometric_mask, build_full_mask, build_identity, build_product_mask,
-    diag_block_map, inf_norm, Bsr4Matrix, BS,
+    build_full_mask, build_geometric_mask, build_identity, build_product_mask, diag_block_map,
+    inf_norm, Bsr4Matrix, BS,
 };
 use rust_dftb::methods::sparse::gpu_sparse::SparseBsr4Gpu;
 use rust_dftb::methods::sparse::harness::require_sparse_gpu;
@@ -83,7 +83,9 @@ fn random_symmetric_dense(n_atom: usize, rng: &mut Rng, scale: f32) -> Vec<f32> 
 fn make_overlap_dense(n_atom: usize, rng: &mut Rng, offdiag: f32) -> Vec<f32> {
     let n = n_atom * BS;
     let mut d = vec![0.0f32; n * n];
-    for i in 0..n { d[i * n + i] = 1.0; }
+    for i in 0..n {
+        d[i * n + i] = 1.0;
+    }
     for i in 0..n {
         for j in (i + 1)..n {
             let v = offdiag * rng.next() * 0.5;
@@ -116,7 +118,10 @@ fn dmatrix_to_row_major_f32(m: &DMatrix<f64>) -> Vec<f32> {
 }
 
 fn dense_max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max)
+    a.iter()
+        .zip(b.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max)
 }
 
 /// CPU generalized eigensolve H c = S c eps. Returns spinless density kernel
@@ -126,7 +131,9 @@ fn cpu_density_kernel(h: &[f32], s: &[f32], n: usize, nocc: usize) -> Vec<f32> {
     let sf = row_major_to_dmatrix_f64(s, n);
     let se = SymmetricEigen::new(sf.clone());
     let mut d = DMatrix::<f64>::zeros(n, n);
-    for i in 0..n { d[(i, i)] = 1.0 / se.eigenvalues[i].max(1e-12).sqrt(); }
+    for i in 0..n {
+        d[(i, i)] = 1.0 / se.eigenvalues[i].max(1e-12).sqrt();
+    }
     let s_inv_sqrt = &se.eigenvectors * &d * se.eigenvectors.transpose();
     let h_orth = &s_inv_sqrt * &hf * &s_inv_sqrt;
     let he = SymmetricEigen::new(h_orth);
@@ -194,7 +201,7 @@ struct SweepRow {
     r_z: f64,
     energy_err: f64,
     charge_err: f64,
-    tr_err: f64,    // |Tr(KS) - Nocc|
+    tr_err: f64, // |Tr(KS) - Nocc|
     r_in: f32,
     r_leak: f32,
     r_h: f32,
@@ -208,10 +215,18 @@ impl SweepRow {
     fn unconverged(r_k: f64, r_z: f64, why: &str) -> Self {
         eprintln!("  {r_k:5.1}  {r_z:5.1}  UNCONVERGED (recorded as data, not a skip): {why}");
         Self {
-            r_k, r_z,
-            energy_err: f64::INFINITY, charge_err: f64::INFINITY, tr_err: f64::INFINITY,
-            r_in: f32::INFINITY, r_leak: f32::NAN, r_h: f32::NAN,
-            tc2_iters: 0, z_iters: 0, elapsed_ms: 0.0, converged: false,
+            r_k,
+            r_z,
+            energy_err: f64::INFINITY,
+            charge_err: f64::INFINITY,
+            tr_err: f64::INFINITY,
+            r_in: f32::INFINITY,
+            r_leak: f32::NAN,
+            r_h: f32::NAN,
+            tc2_iters: 0,
+            z_iters: 0,
+            elapsed_ms: 0.0,
+            converged: false,
         }
     }
 }
@@ -225,7 +240,7 @@ fn run_one(
     nocc: usize,
     r_k: f64,
     r_z: f64,
-    r_val: f64,  // validation mask radius (generous)
+    r_val: f64, // validation mask radius (generous)
     k_ref_dense: &[f32],
     e_ref: f64,
     q_ref: &[f64],
@@ -234,10 +249,30 @@ fn run_one(
     let t0 = Instant::now();
 
     // Masks
-    let m_hs = build_geometric_mask(&(0..n_atom).map(|i| [1.5 * i as f64, 0.0, 0.0]).collect::<Vec<_>>(), 2.0);
-    let m_k = build_geometric_mask(&(0..n_atom).map(|i| [1.5 * i as f64, 0.0, 0.0]).collect::<Vec<_>>(), r_k);
-    let m_z = build_geometric_mask(&(0..n_atom).map(|i| [1.5 * i as f64, 0.0, 0.0]).collect::<Vec<_>>(), r_z);
-    let m_val = build_geometric_mask(&(0..n_atom).map(|i| [1.5 * i as f64, 0.0, 0.0]).collect::<Vec<_>>(), r_val);
+    let m_hs = build_geometric_mask(
+        &(0..n_atom)
+            .map(|i| [1.5 * i as f64, 0.0, 0.0])
+            .collect::<Vec<_>>(),
+        2.0,
+    );
+    let m_k = build_geometric_mask(
+        &(0..n_atom)
+            .map(|i| [1.5 * i as f64, 0.0, 0.0])
+            .collect::<Vec<_>>(),
+        r_k,
+    );
+    let m_z = build_geometric_mask(
+        &(0..n_atom)
+            .map(|i| [1.5 * i as f64, 0.0, 0.0])
+            .collect::<Vec<_>>(),
+        r_z,
+    );
+    let m_val = build_geometric_mask(
+        &(0..n_atom)
+            .map(|i| [1.5 * i as f64, 0.0, 0.0])
+            .collect::<Vec<_>>(),
+        r_val,
+    );
     // T mask for Z·S (Z on M_Z, S on M_HS)
     let m_t_zs = build_product_mask(n_atom, &m_z, &m_hs);
     // T mask for K·S (K on M_K, S on M_HS)
@@ -265,15 +300,18 @@ fn run_one(
         Ok(k) => k,
         Err(e) => return Err(format!("build_k0 failed: {e}")),
     };
-    let k0 = k0_on_mz.project_to_mask(&m_k).map_err(|e| format!("K0 projection failed: {e}"))?;
+    let k0 = k0_on_mz
+        .project_to_mask(&m_k)
+        .map_err(|e| format!("K0 projection failed: {e}"))?;
 
     // 4. TC2 purification (K·S on m_t_ks). f32 TC2 typically converges to
     // ~1e-3..1e-4; use 1e-4 as the tolerance and 80 max iters.
     let nocc_f = nocc as f32;
-    let (k_final, r_in, tr, tc2_iters, _hist) = match gpu.tc2_purify(&k0, &s, nocc_f, &m_k, &m_t_ks, &vec![4u8; n_atom], 80, 1e-4) {
-        Ok(r) => r,
-        Err(e) => return Err(format!("TC2 failed: {e}")),
-    };
+    let (k_final, r_in, tr, tc2_iters, _hist) =
+        match gpu.tc2_purify(&k0, &s, nocc_f, &m_k, &m_t_ks, &vec![4u8; n_atom], 80, 1e-4) {
+            Ok(r) => r,
+            Err(e) => return Err(format!("TC2 failed: {e}")),
+        };
 
     // 5. Energy: E = Tr(K · H0)
     let k_dense = k_final.to_dense();
@@ -282,13 +320,18 @@ fn run_one(
 
     // 6. Charge error: max |q_sparse - q_ref|
     let q_sparse = cpu_mulliken_charges(&k_dense, s_dense, n_atom);
-    let charge_err = q_sparse.iter().zip(q_ref.iter()).map(|(a, b)| (a - b).abs()).fold(0.0f64, f64::max);
+    let charge_err = q_sparse
+        .iter()
+        .zip(q_ref.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f64, f64::max);
 
     // 7. Tr(KS) - Nocc
     let tr_err = (tr as f64 - nocc as f64).abs();
 
     // 8. R_H = ||HKS - SKH||_F (on validation mask)
-    let r_h = gpu.hamiltonian_residual(&h, &k_final, &s, &m_val)
+    let r_h = gpu
+        .hamiltonian_residual(&h, &k_final, &s, &m_val)
         .map_err(|e| format!("R_H failed: {e}"))?;
     let r_h_norm = r_h / (n as f32).sqrt();
 
@@ -299,8 +342,18 @@ fn run_one(
     let converged = r_in < 1e-3 && tr_err < 5e-2;
 
     Ok(SweepRow {
-        r_k, r_z, energy_err, charge_err, tr_err,
-        r_in, r_leak, r_h: r_h_norm, tc2_iters, z_iters, elapsed_ms, converged,
+        r_k,
+        r_z,
+        energy_err,
+        charge_err,
+        tr_err,
+        r_in,
+        r_leak,
+        r_h: r_h_norm,
+        tc2_iters,
+        z_iters,
+        elapsed_ms,
+        converged,
     })
 }
 
@@ -313,7 +366,8 @@ fn compute_r_leak(
     m_val: &(Vec<u32>, Vec<u32>),
 ) -> Result<f32, String> {
     let m_t_val = build_product_mask(k.n_atom, m_val, m_val);
-    let (_t_val, q_val) = gpu.ksk(k, s, m_val, &m_t_val)
+    let (_t_val, q_val) = gpu
+        .ksk(k, s, m_val, &m_t_val)
         .map_err(|e| format!("R_leak KSK(M_val) failed: {e}"))?;
     let mut in_mk = HashSet::new();
     for i in 0..k.n_atom {
@@ -350,7 +404,7 @@ fn test_locality_sweep_rk_rz() {
     // 5-atom line. A diagonal +2I shift is NOT a HOMO–LUMO gap (G1.1).
     let n_atom = 5;
     let n = n_atom * BS;
-    let nocc = 3;  // 3 occupied orbitals (out of 20)
+    let nocc = 3; // 3 occupied orbitals (out of 20)
     let mut rng = Rng(0x1234_abcd_5678_ef90);
 
     let h_full = random_symmetric_dense(n_atom, &mut rng, 0.4);
@@ -358,10 +412,15 @@ fn test_locality_sweep_rk_rz() {
 
     // Truncate H and S to M_HS (the physical Hamiltonian/overlap locality).
     // The dense reference MUST use the same truncated H/S as the sparse pipeline.
-    let m_hs = build_geometric_mask(&(0..n_atom).map(|i| [1.5 * i as f64, 0.0, 0.0]).collect::<Vec<_>>(), 2.0);
+    let m_hs = build_geometric_mask(
+        &(0..n_atom)
+            .map(|i| [1.5 * i as f64, 0.0, 0.0])
+            .collect::<Vec<_>>(),
+        2.0,
+    );
     let h_bsr = bsr4_from_dense(n_atom, &h_full, &m_hs);
     let s_bsr = bsr4_from_dense(n_atom, &s_full, &m_hs);
-    let h_dense = h_bsr.to_dense();   // truncated to M_HS, zero-padded to full
+    let h_dense = h_bsr.to_dense(); // truncated to M_HS, zero-padded to full
     let s_dense = s_bsr.to_dense();
 
     // Dense reference (using the SAME truncated H/S)
@@ -371,7 +430,7 @@ fn test_locality_sweep_rk_rz() {
     eprintln!("Dense reference: E={e_ref:.6}, Nocc={nocc}, q_ref={q_ref:?}");
 
     // Validation mask: generous (covers everything)
-    let r_val = 10.0;  // larger than the system
+    let r_val = 10.0; // larger than the system
 
     // Phase 1: sweep R_K with R_Z generous
     eprintln!("\n=== Phase 1: Sweep R_K (R_Z = {r_val} generous) ===");
@@ -380,7 +439,19 @@ fn test_locality_sweep_rk_rz() {
     let r_k_values: Vec<f64> = vec![2.0, 3.0, 4.0, 5.0, 7.0, 10.0];
     let mut phase1_rows: Vec<SweepRow> = Vec::new();
     for &r_k in &r_k_values {
-        match run_one(&gpu, &h_dense, &s_dense, n_atom, nocc, r_k, r_z_fixed, r_val, &k_ref_dense, e_ref, &q_ref) {
+        match run_one(
+            &gpu,
+            &h_dense,
+            &s_dense,
+            n_atom,
+            nocc,
+            r_k,
+            r_z_fixed,
+            r_val,
+            &k_ref_dense,
+            e_ref,
+            &q_ref,
+        ) {
             Ok(row) => {
                 eprintln!("  {r_k:5.1}  {r_z_fixed:5.1}  {:.3e}   {:.3e}   {:.3e}   {:.3e}  {:.3e}  {:.3e}  {:3}  {:3}  {:8.1}  {}",
                     row.energy_err, row.charge_err, row.tr_err, row.r_in, row.r_leak, row.r_h,
@@ -392,15 +463,18 @@ fn test_locality_sweep_rk_rz() {
     }
 
     // Plateau only from rows that actually returned metrics (G0.5). No invented R=5.
-    let converged_rk = phase1_rows.iter()
+    let converged_rk = phase1_rows
+        .iter()
         .filter(|r| r.energy_err < 1e-3 && r.converged)
         .map(|r| r.r_k)
         .min_by(|a, b| a.partial_cmp(b).unwrap())
-        .unwrap_or_else(|| panic!(
-            "Gate C: no R_K plateau (no converged row with energy_err<1e-3). \
+        .unwrap_or_else(|| {
+            panic!(
+                "Gate C: no R_K plateau (no converged row with energy_err<1e-3). \
              Truncated-R solver failure is data; inventing R_K=5.0 is not. \
              This 5-atom line is not a locality test of a gapped insulator (review A.2 / G1.1)."
-        ));
+            )
+        });
     eprintln!("\n  → Converged R_K = {converged_rk}");
 
     // Phase 2: fix R_K, sweep R_Z
@@ -409,7 +483,19 @@ fn test_locality_sweep_rk_rz() {
     let r_z_values: Vec<f64> = vec![2.0, 3.0, 4.0, 5.0, 7.0, 10.0];
     let mut phase2_rows: Vec<SweepRow> = Vec::new();
     for &r_z in &r_z_values {
-        match run_one(&gpu, &h_dense, &s_dense, n_atom, nocc, converged_rk, r_z, r_val, &k_ref_dense, e_ref, &q_ref) {
+        match run_one(
+            &gpu,
+            &h_dense,
+            &s_dense,
+            n_atom,
+            nocc,
+            converged_rk,
+            r_z,
+            r_val,
+            &k_ref_dense,
+            e_ref,
+            &q_ref,
+        ) {
             Ok(row) => {
                 eprintln!("  {converged_rk:5.1}  {r_z:5.1}  {:.3e}   {:.3e}   {:.3e}   {:.3e}  {:.3e}  {:.3e}  {:3}  {:3}  {:8.1}  {}",
                     row.energy_err, row.charge_err, row.tr_err, row.r_in, row.r_leak, row.r_h,
@@ -420,19 +506,34 @@ fn test_locality_sweep_rk_rz() {
         }
     }
 
-    let converged_rz = phase2_rows.iter()
+    let converged_rz = phase2_rows
+        .iter()
         .filter(|r| r.energy_err < 1e-3 && r.converged)
         .map(|r| r.r_z)
         .min_by(|a, b| a.partial_cmp(b).unwrap())
-        .unwrap_or_else(|| panic!(
-            "Gate C: no R_Z plateau (no converged row with energy_err<1e-3). \
+        .unwrap_or_else(|| {
+            panic!(
+                "Gate C: no R_Z plateau (no converged row with energy_err<1e-3). \
              Inventing R_Z=5.0 is forbidden (G0.5)."
-        ));
+            )
+        });
     eprintln!("\n  → Converged R_Z = {converged_rz}");
 
     // Phase 3: verify the crossed combination
     eprintln!("\n=== Phase 3: Cross-check (R_K={converged_rk}, R_Z={converged_rz}) ===");
-    match run_one(&gpu, &h_dense, &s_dense, n_atom, nocc, converged_rk, converged_rz, r_val, &k_ref_dense, e_ref, &q_ref) {
+    match run_one(
+        &gpu,
+        &h_dense,
+        &s_dense,
+        n_atom,
+        nocc,
+        converged_rk,
+        converged_rz,
+        r_val,
+        &k_ref_dense,
+        e_ref,
+        &q_ref,
+    ) {
         Ok(row) => {
             eprintln!("  R_K    R_Z    E_err       q_err       |Tr-Nocc|   R_in       R_leak      R_H         TC2  Z   time(ms)  conv");
             eprintln!("  {converged_rk:5.1}  {converged_rz:5.1}  {:.3e}   {:.3e}   {:.3e}   {:.3e}  {:.3e}  {:.3e}  {:3}  {:3}  {:8.1}  {}",
@@ -445,12 +546,16 @@ fn test_locality_sweep_rk_rz() {
             assert!(row.energy_err < 1e-3,
                 "Gate C: energy error {:.3e} too large at plateau (R_K={converged_rk}, R_Z={converged_rz})",
                 row.energy_err);
-            assert!(row.charge_err < 1e-2,
+            assert!(
+                row.charge_err < 1e-2,
                 "Gate C: charge error {:.3e} too large at plateau",
-                row.charge_err);
-            assert!(row.tr_err < 1e-5,
+                row.charge_err
+            );
+            assert!(
+                row.tr_err < 1e-5,
                 "Gate C: trace error {:.3e} too large at plateau (G2: Tr(KS)=Nocc)",
-                row.tr_err);
+                row.tr_err
+            );
             eprintln!("\n  Gate C: plateau numbers printed. A 5-atom line with R≥7 covering the whole system is not a locality proof.");
             let system_span = 1.5 * (n_atom - 1) as f64;
             assert!(

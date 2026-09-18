@@ -12,9 +12,9 @@
 //!
 //! Run with --help for full options.
 
-use std::process::ExitCode;
-use std::f64::consts;
 use rust_dftb::geometry::*;
+use std::f64::consts;
+use std::process::ExitCode;
 
 #[derive(Debug)]
 struct Args {
@@ -36,7 +36,7 @@ struct Args {
 
 fn print_help() {
     eprintln!(
-"graphene-build — generate graphene nanostructure geometries
+        "graphene-build — generate graphene nanostructure geometries
 
 USAGE:
     graphene-build <KIND> [OPTIONS] --out <FILE.xyz>
@@ -70,7 +70,8 @@ EXAMPLES:
     graphene-build sheet --nx 10 --ny 10 --periodic --out sheet10x10.xyz
     graphene-build flake --radius 15 --shape hex --passivate --out flake.xyz
     graphene-build pah --shells 3 --out pah3.xyz
-");
+"
+    );
 }
 
 fn parse_args(argv: &[String]) -> Result<Args, String> {
@@ -96,13 +97,58 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
     while i < argv.len() {
         let a = &argv[i];
         match a.as_str() {
-            "-h" | "--help" => { print_help(); std::process::exit(0); }
-            "--width" => { i += 1; args.width = argv.get(i).ok_or("--width needs value")?.parse().map_err(|e: std::num::ParseIntError| format!("--width: {e}"))?; }
-            "--length" => { i += 1; args.length = argv.get(i).ok_or("--length needs value")?.parse().map_err(|e: std::num::ParseIntError| format!("--length: {e}"))?; }
-            "--nx" => { i += 1; args.nx = argv.get(i).ok_or("--nx needs value")?.parse().map_err(|e: std::num::ParseIntError| format!("--nx: {e}"))?; }
-            "--ny" => { i += 1; args.ny = argv.get(i).ok_or("--ny needs value")?.parse().map_err(|e: std::num::ParseIntError| format!("--ny: {e}"))?; }
-            "--radius" => { i += 1; args.radius = argv.get(i).ok_or("--radius needs value")?.parse().map_err(|e: std::num::ParseFloatError| format!("--radius: {e}"))?; }
-            "--shells" => { i += 1; args.shells = argv.get(i).ok_or("--shells needs value")?.parse().map_err(|e: std::num::ParseIntError| format!("--shells: {e}"))?; }
+            "-h" | "--help" => {
+                print_help();
+                std::process::exit(0);
+            }
+            "--width" => {
+                i += 1;
+                args.width = argv
+                    .get(i)
+                    .ok_or("--width needs value")?
+                    .parse()
+                    .map_err(|e: std::num::ParseIntError| format!("--width: {e}"))?;
+            }
+            "--length" => {
+                i += 1;
+                args.length = argv
+                    .get(i)
+                    .ok_or("--length needs value")?
+                    .parse()
+                    .map_err(|e: std::num::ParseIntError| format!("--length: {e}"))?;
+            }
+            "--nx" => {
+                i += 1;
+                args.nx = argv
+                    .get(i)
+                    .ok_or("--nx needs value")?
+                    .parse()
+                    .map_err(|e: std::num::ParseIntError| format!("--nx: {e}"))?;
+            }
+            "--ny" => {
+                i += 1;
+                args.ny = argv
+                    .get(i)
+                    .ok_or("--ny needs value")?
+                    .parse()
+                    .map_err(|e: std::num::ParseIntError| format!("--ny: {e}"))?;
+            }
+            "--radius" => {
+                i += 1;
+                args.radius = argv
+                    .get(i)
+                    .ok_or("--radius needs value")?
+                    .parse()
+                    .map_err(|e: std::num::ParseFloatError| format!("--radius: {e}"))?;
+            }
+            "--shells" => {
+                i += 1;
+                args.shells = argv
+                    .get(i)
+                    .ok_or("--shells needs value")?
+                    .parse()
+                    .map_err(|e: std::num::ParseIntError| format!("--shells: {e}"))?;
+            }
             "--shape" => {
                 i += 1;
                 let s = argv.get(i).ok_or("--shape needs value")?;
@@ -112,8 +158,18 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
                     _ => return Err(format!("--shape: unknown '{s}' (use circle or hex)")),
                 };
             }
-            "--acc" => { i += 1; args.acc = argv.get(i).ok_or("--acc needs value")?.parse().map_err(|e: std::num::ParseFloatError| format!("--acc: {e}"))?; }
-            "--out" => { i += 1; args.out = argv.get(i).ok_or("--out needs value")?.clone(); }
+            "--acc" => {
+                i += 1;
+                args.acc = argv
+                    .get(i)
+                    .ok_or("--acc needs value")?
+                    .parse()
+                    .map_err(|e: std::num::ParseFloatError| format!("--acc: {e}"))?;
+            }
+            "--out" => {
+                i += 1;
+                args.out = argv.get(i).ok_or("--out needs value")?.clone();
+            }
             "--passivate" => args.passivate = true,
             "--periodic" => args.periodic = true,
             "--recenter" => args.recenter = true,
@@ -130,7 +186,11 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
 
     let valid = ["zigzag", "armchair", "sheet", "flake", "pah"];
     if !valid.contains(&args.kind.as_str()) {
-        return Err(format!("unknown KIND '{}' (use: {})", args.kind, valid.join(", ")));
+        return Err(format!(
+            "unknown KIND '{}' (use: {})",
+            args.kind,
+            valid.join(", ")
+        ));
     }
 
     if args.out.is_empty() {
@@ -142,8 +202,20 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
 
 fn build_structure(args: &Args) -> Result<(NanoStructure, Option<[[f64; 3]; 3]>), String> {
     let mut st = match args.kind.as_str() {
-        "zigzag" => build_zigzag_ribbon(args.width, args.length, args.passivate, args.periodic, args.acc),
-        "armchair" => build_armchair_ribbon(args.width, args.length, args.passivate, args.periodic, args.acc),
+        "zigzag" => build_zigzag_ribbon(
+            args.width,
+            args.length,
+            args.passivate,
+            args.periodic,
+            args.acc,
+        ),
+        "armchair" => build_armchair_ribbon(
+            args.width,
+            args.length,
+            args.passivate,
+            args.periodic,
+            args.acc,
+        ),
         "sheet" => build_sheet(args.nx, args.ny, args.periodic, args.acc),
         "flake" => build_flake(args.radius, args.shape, args.passivate, args.acc),
         "pah" => build_pah(args.shells, args.acc),
@@ -212,7 +284,11 @@ fn main() -> ExitCode {
 
     eprintln!(
         "  atoms: {} (C={}, H={}), bonds: {}, edge C: {}",
-        st.natom(), n_c, n_h, st.nbond(), n_edge
+        st.natom(),
+        n_c,
+        n_h,
+        st.nbond(),
+        n_edge
     );
     eprintln!(
         "  bbox: x=[{:.2}, {:.2}]  y=[{:.2}, {:.2}]  z=[{:.2}, {:.2}]",
@@ -246,7 +322,10 @@ fn main() -> ExitCode {
         eprintln!("\n--- atom list ---");
         for i in 0..st.natom() {
             let [x, y, z] = st.positions[i];
-            eprintln!("  [{i:4}] {}  {x:10.4}  {y:10.4}  {z:10.4}", st.elements[i].symbol());
+            eprintln!(
+                "  [{i:4}] {}  {x:10.4}  {y:10.4}  {z:10.4}",
+                st.elements[i].symbol()
+            );
         }
         eprintln!("--- bonds ---");
         for (b, &[i, j]) in st.bonds.iter().enumerate() {

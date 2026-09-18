@@ -100,7 +100,12 @@ QM/QM fragment solver with OpenCL GPU offload. Python utilities (`pyBall/`,
 - `src/qmqm/` — multi-fragment QM/QM solver + GPU runtime: `fragment.rs`,
   `solver.rs`, `mixer.rs`, `shifts.rs`, `gamma.rs`, `charges.rs`,
   `gpu_driver.rs`, `gpu_runtime.rs`, `gpu_matrix.rs`, `gpu_prep.rs`,
-  `gpu_eigen.rs`/`.cl`, `gpu_matrix_ops.cl`, `gpu_scc.rs` (legacy one-shot SCC;
+  `gpu_eigen.rs` + `gpu_eigen.cl`/`gpu_tiled_jacobi.cl`/`gpu_block_jacobi.cl`
+  (batched Jacobi eigensolvers + `eigsolver_kind` dispatch —
+  `RUST_DFTB_EIGSOLVER`={auto,direct,block,resident,resident_av}; measured
+  digest `doc/prokop/tasts/HBond_Relaxed_Scan_GPU/Measured_Facts_Jacobi_Sweeps.md`,
+  report `doc/prokop/reports/2026-09-17_resident_jacobi_eigensolver.md`),
+  `gpu_matrix_ops.cl`, `gpu_scc.rs` (legacy one-shot SCC;
   do not use for production), `gpu_scc_plan.rs` (persistent SCC inner loop),
   `gpu_dftb.rs` (**production run loop** — `GpuDftb::new` / `set_coords` / `scc` /
   **`eval(want_forces)`** / `fire_step` / `md_step`; compile once, reuse buffers),
@@ -187,7 +192,10 @@ QM/QM fragment solver with OpenCL GPU offload. Python utilities (`pyBall/`,
     constraints on `GpuDftb`). Task specs under `tasts/`: e.g.
     `tasts/HBond_Relaxed_Scan_GPU/` (`*.manifest..md` work orders,
     `*.labbook.md` verified numbers, `Dense_Multi_CDFT.spec.md`,
-    `Dense_Multi_PBC.arch_notes.md`).
+    `Dense_Multi_PBC.arch_notes.md`, `Dense_Multi_GPU_Optimization.tasks.md`
+    optimization roadmap, `Measured_Facts_Jacobi_Sweeps.md` eigensolver
+    measurement digest, `Slot_Pool_Scheduler.design.md` active-slot
+    scheduler design).
 
 ## Folder & artifact policy (concise)
 

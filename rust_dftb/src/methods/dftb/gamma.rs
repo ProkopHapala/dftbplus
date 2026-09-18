@@ -82,9 +82,14 @@ impl GammaTable {
                 unique.push(sp.clone());
             }
         }
-        let hubbard_u: Vec<f64> = unique.iter().map(|sp| {
-            sk.onsite(sp).map(|p| p.u_hubbard).map_err(|e| DftbError::InvalidInput(format!("Hubbard U missing for species {sp}: {e}")))
-        }).collect::<Result<Vec<_>>>()?;
+        let hubbard_u: Vec<f64> = unique
+            .iter()
+            .map(|sp| {
+                sk.onsite(sp).map(|p| p.u_hubbard).map_err(|e| {
+                    DftbError::InvalidInput(format!("Hubbard U missing for species {sp}: {e}"))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
         Ok(Self::from_hubbard_u(hubbard_u))
     }
 
@@ -135,7 +140,10 @@ mod tests {
     #[test]
     fn gamma_onsite() {
         let g = gamma_full(0.0, 0.5, 0.4);
-        assert!((g - 0.45).abs() < 1e-10, "onsite gamma should be average U, got {g}");
+        assert!(
+            (g - 0.45).abs() < 1e-10,
+            "onsite gamma should be average U, got {g}"
+        );
     }
 
     #[test]
@@ -144,8 +152,10 @@ mod tests {
         let u = 0.5;
         let g = gamma_full(r, u, u);
         let coulomb = 1.0 / r;
-        assert!((g - coulomb).abs() < 1e-4,
-            "at 20 Å gamma should be ~1/R = {coulomb}, got {g}");
+        assert!(
+            (g - coulomb).abs() < 1e-4,
+            "at 20 Å gamma should be ~1/R = {coulomb}, got {g}"
+        );
     }
 
     #[test]
@@ -153,7 +163,9 @@ mod tests {
         let r = 0.5;
         let u = 0.5;
         let g = gamma_full(r, u, u);
-        assert!(g > 0.4 && g < 0.55,
-            "at 0.5 Å gamma should be near U=0.5, got {g}");
+        assert!(
+            g > 0.4 && g < 0.55,
+            "at 0.5 Å gamma should be near U=0.5, got {g}"
+        );
     }
 }

@@ -113,9 +113,10 @@ __kernel void jacobi_cyclic_local_batched(
     __global float* A,   // [batch][N*N] in/out
     __global float* V,   // [batch][N*N] out
     const int n,         // original (unpadded) dimension
-    const int batch
+    const int batch,
+    __global const int* work_ids    // launch-index → physical slot (identity at full batch)
 ) {
-    const int gid = get_group_id(0);   // system index
+    const int gid = work_ids[get_group_id(0)];   // system index
     const int lid = get_local_id(0);
     const int lsz = get_local_size(0);
 
@@ -367,9 +368,10 @@ __kernel void build_inv_sqrt_from_eig(
     __global float* X_out,     // [batch][N*N] S^{-1/2}
     __global float* lambda_min_out, // [batch]
     const int n,
-    const int batch
+    const int batch,
+    __global const int* work_ids    // launch-index → physical slot (identity at full batch)
 ) {
-    const int gid = get_group_id(0);
+    const int gid = work_ids[get_group_id(0)];
     const int lid = get_local_id(0);
     const int lsz = get_local_size(0);
 
@@ -449,9 +451,10 @@ __kernel void scale_eigenvectors_batched(
     __global float* V_scaled,       // [batch][N*N] output: V · rsqrt(λ)
     __global float* lambda_min_out, // [batch]
     const int n,
-    const int batch
+    const int batch,
+    __global const int* work_ids    // launch-index → physical slot (identity at full batch)
 ) {
-    const int gid = get_group_id(0);
+    const int gid = work_ids[get_group_id(0)];
     const int lid = get_local_id(0);
     const int lsz = get_local_size(0);
 

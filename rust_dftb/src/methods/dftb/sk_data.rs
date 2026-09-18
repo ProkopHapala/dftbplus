@@ -109,7 +109,11 @@ impl SkTableSp {
         self.h.eval_into(r, &mut h_all)?;
         self.s.eval_into(r, &mut s_all)?;
 
-        let (l_min, l_max) = if ang1 <= ang2 { (ang1, ang2) } else { (ang2, ang1) };
+        let (l_min, l_max) = if ang1 <= ang2 {
+            (ang1, ang2)
+        } else {
+            (ang2, ang1)
+        };
         let n_mm = (l_min + 1) as usize;
 
         let is_extended = h_all.iter().skip(10).any(|&x| x != 0.0);
@@ -156,12 +160,18 @@ impl SkTableSp {
         ds_dr: &mut [f64],
     ) -> Result<usize> {
         // Analytic dV/dr of the production C² B-spline (same controls as V) — no finite diff
-        let mut h_all = [0.0f64; 20]; let mut s_all = [0.0f64; 20];
-        let mut dh_all = [0.0f64; 20]; let mut ds_all = [0.0f64; 20];
+        let mut h_all = [0.0f64; 20];
+        let mut s_all = [0.0f64; 20];
+        let mut dh_all = [0.0f64; 20];
+        let mut ds_all = [0.0f64; 20];
         self.h.eval_with_deriv_into(r, &mut h_all, &mut dh_all)?;
         self.s.eval_with_deriv_into(r, &mut s_all, &mut ds_all)?;
 
-        let (l_min, l_max) = if ang1 <= ang2 { (ang1, ang2) } else { (ang2, ang1) };
+        let (l_min, l_max) = if ang1 <= ang2 {
+            (ang1, ang2)
+        } else {
+            (ang2, ang1)
+        };
         let n_mm = (l_min + 1) as usize;
 
         let is_extended = h_all.iter().skip(10).any(|&x| x != 0.0);
@@ -174,7 +184,10 @@ impl SkTableSp {
                     let mut arr = [0usize; 21];
                     let iSKInterOld: [usize; 10] = [8, 9, 10, 13, 14, 15, 16, 18, 19, 20];
                     let mut i = 0;
-                    while i < 10 { arr[iSKInterOld[i]] = i; i += 1; }
+                    while i < 10 {
+                        arr[iSKInterOld[i]] = i;
+                        i += 1;
+                    }
                     arr
                 };
                 let new_col = sk_map(mm as i32, l_max, l_min) as usize;
@@ -216,7 +229,8 @@ impl SkData {
     pub fn set_species_angular_momenta(&mut self, ang: HashMap<String, Vec<i32>>) {
         self.orbital_info.clear();
         for (sp, shells) in ang {
-            self.orbital_info.insert(sp, SpeciesOrbitals::from_ang_momenta(&shells));
+            self.orbital_info
+                .insert(sp, SpeciesOrbitals::from_ang_momenta(&shells));
         }
     }
 
@@ -234,13 +248,15 @@ impl SkData {
             .ok_or_else(|| DftbError::InvalidInput(format!("missing orbital info for {sp}")))
     }
 
-    pub fn eval_shell_integrals(&self, sp1: &str, sp2: &str, ang1: i32, ang2: i32, r: f64)
-        -> Result<(Vec<f64>, Vec<f64>)> {
-        let (lookup_sp1, lookup_sp2) = if ang1 <= ang2 {
-            (sp1, sp2)
-        } else {
-            (sp2, sp1)
-        };
+    pub fn eval_shell_integrals(
+        &self,
+        sp1: &str,
+        sp2: &str,
+        ang1: i32,
+        ang2: i32,
+        r: f64,
+    ) -> Result<(Vec<f64>, Vec<f64>)> {
+        let (lookup_sp1, lookup_sp2) = if ang1 <= ang2 { (sp1, sp2) } else { (sp2, sp1) };
         let tab = self.get_pair(lookup_sp1, lookup_sp2).ok_or_else(|| {
             DftbError::InvalidInput(format!("missing SK table for {lookup_sp1}-{lookup_sp2}"))
         })?;
@@ -299,7 +315,9 @@ fn sk_read_onsite_sp(path: &Path) -> Result<AtomicParamsSp> {
     let text = fs::read_to_string(path)?;
     let mut lines = text.lines();
 
-    let first = lines.next().ok_or_else(|| DftbError::Parse("empty skf".into()))?;
+    let first = lines
+        .next()
+        .ok_or_else(|| DftbError::Parse("empty skf".into()))?;
     let first_tokens = first.split_whitespace().collect::<Vec<_>>();
     if first_tokens.get(0) == Some(&"@") || first.trim_start().starts_with('@') {
     } else {
@@ -340,17 +358,25 @@ fn sk_read_onsite_sp(path: &Path) -> Result<AtomicParamsSp> {
         0.0
     };
 
-    Ok(AtomicParamsSp { e_s, e_p, q0, u_hubbard })
+    Ok(AtomicParamsSp {
+        e_s,
+        e_p,
+        q0,
+        u_hubbard,
+    })
 }
 
 fn read_skf_all(path: &Path, sp1: &str, sp2: &str) -> Result<SkTableSp> {
     let text = fs::read_to_string(path)?;
     let mut it = text.lines();
 
-    let first = it.next().ok_or_else(|| DftbError::Parse("empty skf".into()))?;
+    let first = it
+        .next()
+        .ok_or_else(|| DftbError::Parse("empty skf".into()))?;
     let extended = first.trim_start().starts_with('@');
     let grid_line = if extended {
-        it.next().ok_or_else(|| DftbError::Parse("missing grid line".into()))?
+        it.next()
+            .ok_or_else(|| DftbError::Parse("missing grid line".into()))?
     } else {
         first
     };
@@ -379,18 +405,24 @@ fn read_skf_all(path: &Path, sp1: &str, sp2: &str) -> Result<SkTableSp> {
     let mut s_vals = Vec::with_capacity(n_grid);
 
     for _ in 0..n_grid {
-        let line = it.next().ok_or_else(|| DftbError::Parse("unexpected EOF in integrals".into()))?;
+        let line = it
+            .next()
+            .ok_or_else(|| DftbError::Parse("unexpected EOF in integrals".into()))?;
         let nums = parse_numbers_loose(line);
 
         if extended {
             if nums.len() < 40 {
-                return Err(DftbError::InvalidSkFormat("extended line needs 40 numbers".into()));
+                return Err(DftbError::InvalidSkFormat(
+                    "extended line needs 40 numbers".into(),
+                ));
             }
             h_vals.push(nums[0..20].to_vec());
             s_vals.push(nums[20..40].to_vec());
         } else {
             if nums.len() < 20 {
-                return Err(DftbError::InvalidSkFormat("old line needs 20 numbers".into()));
+                return Err(DftbError::InvalidSkFormat(
+                    "old line needs 20 numbers".into(),
+                ));
             }
             h_vals.push(nums[0..10].to_vec());
             s_vals.push(nums[10..20].to_vec());
@@ -412,7 +444,11 @@ fn extract_shell_integrals_old(arr10: &[f64], ang1: i32, ang2: i32) -> Vec<f64> 
         new_to_old[new_col] = old_idx;
     }
 
-    let (l_min, l_max) = if ang1 <= ang2 { (ang1, ang2) } else { (ang2, ang1) };
+    let (l_min, l_max) = if ang1 <= ang2 {
+        (ang1, ang2)
+    } else {
+        (ang2, ang1)
+    };
     let n_mm = (l_min + 1) as usize;
     let mut out = Vec::with_capacity(n_mm);
 
@@ -425,7 +461,11 @@ fn extract_shell_integrals_old(arr10: &[f64], ang1: i32, ang2: i32) -> Vec<f64> 
 }
 
 fn extract_shell_integrals_new(arr20: &[f64], ang1: i32, ang2: i32) -> Vec<f64> {
-    let (l_min, l_max) = if ang1 <= ang2 { (ang1, ang2) } else { (ang2, ang1) };
+    let (l_min, l_max) = if ang1 <= ang2 {
+        (ang1, ang2)
+    } else {
+        (ang2, ang1)
+    };
     let n_mm = (l_min + 1) as usize;
     let mut out = Vec::with_capacity(n_mm);
     for mm in 0..=l_min {

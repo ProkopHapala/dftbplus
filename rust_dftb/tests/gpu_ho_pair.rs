@@ -11,7 +11,10 @@ use rust_dftb::{load_sk_for_species, HamiltonianBuilder};
 fn try_gpu() -> Option<GpuDriver> {
     match GpuDriver::new() {
         Ok(d) => Some(d),
-        Err(e) => { eprintln!("Skipping: no OpenCL ({e})"); None }
+        Err(e) => {
+            eprintln!("Skipping: no OpenCL ({e})");
+            None
+        }
     }
 }
 
@@ -21,12 +24,17 @@ fn make_fragment(sk: &rust_dftb::SkData, species: &[String], coords: &[[f64; 3]]
 }
 
 fn max_abs_diff(a: &[f32], b: &[f32]) -> f64 {
-    a.iter().zip(b.iter()).map(|(x, y)| ((*x as f64) - (*y as f64)).abs()).fold(0.0f64, f64::max)
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| ((*x as f64) - (*y as f64)).abs())
+        .fold(0.0f64, f64::max)
 }
 
 #[test]
 fn test_gpu_hs_parity_ho() {
-    let Some(driver) = try_gpu() else { return; };
+    let Some(driver) = try_gpu() else {
+        return;
+    };
     let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else {
         eprintln!("Skipping: RUST_DFTB_SK_DIR not set");
         return;
@@ -50,14 +58,20 @@ fn test_gpu_hs_parity_ho() {
     let (h_flat, s_flat) = driver.gpu_assemble_batched(&batch).unwrap();
 
     // Compare
-    let h_cpu_flat: Vec<f32> = (0..n*n).map(|idx| {
-        let i = idx / n; let j = idx - i*n;
-        ham_cpu.h0[(i,j)] as f32
-    }).collect();
-    let s_cpu_flat: Vec<f32> = (0..n*n).map(|idx| {
-        let i = idx / n; let j = idx - i*n;
-        ham_cpu.s[(i,j)] as f32
-    }).collect();
+    let h_cpu_flat: Vec<f32> = (0..n * n)
+        .map(|idx| {
+            let i = idx / n;
+            let j = idx - i * n;
+            ham_cpu.h0[(i, j)] as f32
+        })
+        .collect();
+    let s_cpu_flat: Vec<f32> = (0..n * n)
+        .map(|idx| {
+            let i = idx / n;
+            let j = idx - i * n;
+            ham_cpu.s[(i, j)] as f32
+        })
+        .collect();
 
     let dh = max_abs_diff(&h_flat, &h_cpu_flat);
     let ds = max_abs_diff(&s_flat, &s_cpu_flat);
@@ -66,22 +80,22 @@ fn test_gpu_hs_parity_ho() {
     // Print full matrices for comparison
     eprintln!("GPU H:");
     for i in 0..n {
-        let row: Vec<f32> = (0..n).map(|j| h_flat[i*n+j]).collect();
+        let row: Vec<f32> = (0..n).map(|j| h_flat[i * n + j]).collect();
         eprintln!("  [{i}] {row:?}");
     }
     eprintln!("CPU H:");
     for i in 0..n {
-        let row: Vec<f64> = (0..n).map(|j| ham_cpu.h0[(i,j)]).collect();
+        let row: Vec<f64> = (0..n).map(|j| ham_cpu.h0[(i, j)]).collect();
         eprintln!("  [{i}] {row:?}");
     }
     eprintln!("GPU S:");
     for i in 0..n {
-        let row: Vec<f32> = (0..n).map(|j| s_flat[i*n+j]).collect();
+        let row: Vec<f32> = (0..n).map(|j| s_flat[i * n + j]).collect();
         eprintln!("  [{i}] {row:?}");
     }
     eprintln!("CPU S:");
     for i in 0..n {
-        let row: Vec<f64> = (0..n).map(|j| ham_cpu.s[(i,j)]).collect();
+        let row: Vec<f64> = (0..n).map(|j| ham_cpu.s[(i, j)]).collect();
         eprintln!("  [{i}] {row:?}");
     }
 
@@ -91,7 +105,9 @@ fn test_gpu_hs_parity_ho() {
 
 #[test]
 fn test_gpu_hs_parity_h2o() {
-    let Some(driver) = try_gpu() else { return; };
+    let Some(driver) = try_gpu() else {
+        return;
+    };
     let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else {
         eprintln!("Skipping: RUST_DFTB_SK_DIR not set");
         return;
@@ -114,14 +130,20 @@ fn test_gpu_hs_parity_h2o() {
     let batch = GpuBatch::from_fragments(&[frag], &sk, &gamma).unwrap();
     let (h_flat, s_flat) = driver.gpu_assemble_batched(&batch).unwrap();
 
-    let h_cpu_flat: Vec<f32> = (0..n*n).map(|idx| {
-        let i = idx / n; let j = idx - i*n;
-        ham_cpu.h0[(i,j)] as f32
-    }).collect();
-    let s_cpu_flat: Vec<f32> = (0..n*n).map(|idx| {
-        let i = idx / n; let j = idx - i*n;
-        ham_cpu.s[(i,j)] as f32
-    }).collect();
+    let h_cpu_flat: Vec<f32> = (0..n * n)
+        .map(|idx| {
+            let i = idx / n;
+            let j = idx - i * n;
+            ham_cpu.h0[(i, j)] as f32
+        })
+        .collect();
+    let s_cpu_flat: Vec<f32> = (0..n * n)
+        .map(|idx| {
+            let i = idx / n;
+            let j = idx - i * n;
+            ham_cpu.s[(i, j)] as f32
+        })
+        .collect();
 
     let dh = max_abs_diff(&h_flat, &h_cpu_flat);
     let ds = max_abs_diff(&s_flat, &s_cpu_flat);
@@ -130,10 +152,13 @@ fn test_gpu_hs_parity_h2o() {
     // Find worst elements
     for i in 0..n {
         for j in 0..n {
-            let d = (h_flat[i*n+j] as f64 - ham_cpu.h0[(i,j)] as f64).abs();
+            let d = (h_flat[i * n + j] as f64 - ham_cpu.h0[(i, j)] as f64).abs();
             if d > 1e-4 {
-                eprintln!("  H[{i},{j}] = GPU {:+.6} vs CPU {:+.6} |d|={d:.2e}",
-                    h_flat[i*n+j], ham_cpu.h0[(i,j)]);
+                eprintln!(
+                    "  H[{i},{j}] = GPU {:+.6} vs CPU {:+.6} |d|={d:.2e}",
+                    h_flat[i * n + j],
+                    ham_cpu.h0[(i, j)]
+                );
             }
         }
     }

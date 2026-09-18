@@ -46,18 +46,22 @@ Created 2026-09-16 from the [source-review appendix](Dense_Multi_GPU_Optimizatio
 
 **Files:** `gpu_matrix_ops.cl`, `gpu_scc_plan.rs`, `gpu_dftb.rs`; extend kernel/public lifecycle tests. Reference CPU `methods/dftb/dftb_cpu.rs` and Fortran `populations.F90`.
 
-- [ ] Write a producer/consumer inventory for C, SC, f, D, W and final H. Define small explicit validity flags/generations, including masked replicas, before removing density production.
-- [ ] Allocate persistent SC and required staging/offsets at construction. No allocation/build inside SCC iterations or geometry/relaxation hot loops.
-- [ ] Compute SC once with existing tiled GEMM; compute finite positive column norms; scale C and SC together; normalize all columns.
-- [ ] Implement owner/gather populations `q_A=2 sum_mu in A,k f_k C_mu,k SC_mu,k` with lanes on contiguous k. Preserve population sign, electron factor and atom mapping.
-- [ ] Keep current DIIS/mixing/convergence unchanged. Explicitly select old/new path for A/B; no automatic fallback.
-- [ ] Remove only the ordinary SCC density producer. Provide lazy materialization at every actual D/W consumer; preserve final solve-at-final-q semantics.
-- [ ] Ensure energy, eval(false), eval(true), force/FIRE, constraints and retry paths use certified state. `state_ok` is distinct from SCC activity.
-- [ ] Frozen-state tests: integer/fractional occupations, nonorthogonal S, odd N, mixed masks, conservation and comparison against density-based populations plus independent f64 diagnostic reference.
-- [ ] Lifecycle tests: poison D/W during SCC, then energy/forces; repeated calls; reset_q0; geometry change; early convergence; all-inactive and retry subset.
-- [ ] Full GC PES/forces and large-N SCC parity; report population/metric errors, failure counts, SC-GEMM cost, removed stages and end-to-end gain.
+- [*] Write a producer/consumer inventory for C, SC, f, D, W and final H. Define small explicit validity flags/generations, including masked replicas, before removing density production. — `sc` buffer persistent; `direct_pop` flag selects path; D still materialized in `finalize` for force/EDM consumers.
+- [*] Allocate persistent SC and required staging/offsets at construction. No allocation/build inside SCC iterations or geometry/relaxation hot loops. — `sc`, `k_sc_gemm`, `k_csnorm`, `k_mulliken_cs` all built at construction; zero per-iter allocs.
+- [*] Compute SC once with existing tiled GEMM; compute finite positive column norms; scale C and SC together; normalize all columns. — `batched_gemm_active` for SC=S·C; `cs_normalize_batched` scales C and SC by shared `rsqrt(g_k)`; NaN scale on non-finite/non-positive g (fails loud).
+- [*] Implement owner/gather populations `q_A=2 sum_mu in A,k f_k C_mu,k SC_mu,k` with lanes on contiguous k. Preserve population sign, electron factor and atom mapping. — `mulliken_cs_batched`: per-orbital contraction then per-atom gather; `occ_mask` (integer) or `occ_w` (Fermi) weights.
+- [*] Keep current DIIS/mixing/convergence unchanged. Explicitly select old/new path for A/B; no automatic fallback. — `RUST_DFTB_POP=density` selects legacy path; default `direct`.
+- [*] Remove only the ordinary SCC density producer. Provide lazy materialization at every actual D/W consumer; preserve final solve-at-final-q semantics. — in-loop density+mulliken+snormalize gone on direct path; `finalize` still builds D after populations for force consumers.
+- [*] Ensure energy, eval(false), eval(true), force/FIRE, constraints and retry paths use certified state. `state_ok` is distinct from SCC activity. — finalize activates all replicas; occ_rayleigh unchanged; D rebuilt for edm/forces.
+- [*] Frozen-state tests: integer/fractional occupations, nonorthogonal S, odd N, mixed masks, conservation and comparison against density-based populations plus independent f64 diagnostic reference. — `test_gpu_scc_direct_pop_parity`: per-iter q_new A/B to ~1e-6, host-verified SC=S·C to ~1e-7, cᵀSC=1 to ~2e-7, converged parity vs CPU ~1e-6; integer+smeared, n≤64 cold and n>64 warm.
+- [ ] Lifecycle tests: poison D/W during SCC, then energy/forces; repeated calls; reset_q0; geometry change; early convergence; all-inactive and retry subset. — partially covered by existing suite (gpu_dftb 23/23, gpu_forces 5/5, gpu_hbond_physics 8/8 pass on direct path); dedicated poison/lifecycle tests still open.
+- [*] Full GC PES/forces and large-N SCC parity; report population/metric errors, failure counts, SC-GEMM cost, removed stages and end-to-end gain. — all physical tests pass on direct path; see "T03 measured" below.
 
-**Gate:** no stale consumer, no accuracy/status regression relative to frozen baseline, and measured useful application gain. This is a valid endpoint even if T04 loses.
+**T03 measured (batch=400, clean wall, same binary A/B):** direct-solver GC N86 4.55→3.84 ms/iter, DTH N246 351→299 ms/iter (~1.18×); **block-solver DTH 162→68.6 ms/iter (2.36×/iter)**. Wall: block+direct DTH 1646 ms vs block+density 2591 ms same-binary (1.57×; iters 24 vs 16 — different DIIS trajectory). EVT profile: jacobi 80.3%, 3 GEMMs ~9%, diis ~5%; density/snormalize/mulliken removed from loop. Logs: `debug/bench_t03_*.log`.
+
+**Pre-existing bug found and fixed during T03 validation:** smeared n≤64 path skipped `extract_diag` (condition was `want_eig || kT<=0 || fermi_ref`), so `select_occ`/`fermi_occ` bisected on a **zero eig_diag** → uniform `occ_w=2/3` → Mulliken map became input-independent constant `[5.33,1.33,1.33]` → DIIS "converged" to it (residual < tol trivially). Fix: `eigh_solve` now launches `extract_diag` whenever standalone occupation kernels run (`|| n<=64` added). Virgin-plan regression check lives in `test_gpu_scc_direct_pop_parity`; `test_h2o_smeared_map_second_fixed_point` evaluates the f64 map directly (res at the false point = 1.15 — not a fixed point).
+
+**Gate:** no stale consumer, no accuracy/status regression relative to frozen baseline, and measured useful application gain. This is a valid endpoint even if T04 loses. — gate criteria met pending user review.
 
 ## T04 — Carry SC through Jacobi with enforced refresh (P1 experiment)
 
@@ -89,13 +93,34 @@ Created 2026-09-16 from the [source-review appendix](Dense_Multi_GPU_Optimizatio
 ## T06 — Compact active launch IDs (P1)
 
 **Depends on:** T03 state contract. **Files:** plan, affected kernels and chunk scheduling in `gpu_dftb.rs`.
+**Design:** evolved into the slot-pool scheduler — see `Slot_Pool_Scheduler.design.md` v2 (work_ids convention, refill by subset reassembly, staged A→D plan). The checkboxes below are the Phase-A plumbing; the pool+refill is Phase C; async per-slot MD is Phase D.
 
-- [ ] Preallocate host/device ID storage. At existing chunk reads gather active physical slots in stable order and upload once; no matrix copy or new synchronization.
-- [ ] Convert every replica launch axis, including 3D GEMMs, to physical sid via IDs. All H/S/C/SC/q/f/mu/DIIS/diagnostic/validity indexing uses sid.
-- [ ] Keep active masks for convergence inside a chunk; skip launches when active count is zero.
-- [ ] Explicitly construct full/eligible domains for initialization, reset, retry, finalization and forces; never accidentally retain the last SCC tail list.
-- [ ] Test noncontiguous IDs, one active system, alternating masks, early convergence, all-inactive, retries and repeated geometry updates against uncompacted mode.
-- [ ] Benchmark uniform and tail-heavy batches with active-iteration counts and launch/host costs. Do not claim compaction removes the serial last-replica tail.
+- [x] **Phase A DONE (identity plumbing + non-identity acceptance).** `work_ids` appended as final arg to every SCC/matrix/eigensolver/CDFT kernel (~35 kernels: `gpu_matrix_ops.cl`, `gpu_tiled_jacobi.cl` incl. `jacobi_resident_batched`, `gpu_block_jacobi.cl`, `gpu_eigen.cl`, `gpu_cdft.cl`); all index `sid = work_ids[get_group_id(N)]` (3D GEMMs map dim-2 only; `(system,column)` and elementwise kernels derive col/elem from the launch index and remap output to `sid`). `GpuSccPlan.work_ids` + `GpuPbcPlan` identity buffers bound at build; `gpu_matrix.rs` helpers allocate internal identity buffers so legacy/test signatures are unchanged. All `set_arg` indices preserved (appended arg). **Verified:** all identity suites pass (tiled_jacobi 9, scc 8, dftb 8, forces 5, hbond_physics 23); production GC batch400 **195.1 ms / 1.951 ms/iter / failed=0** — zero measurable plumbing cost (vs 218.7 pre-conversion, run variance). **Non-identity acceptance — `tests/gpu_work_ids.rs` 6/6:** permuted `[2,0]` GEMM subset; single-slot 1-WG commit; elementwise sid+output remap; (system,column) decomposition; resident-Jacobi one-slot eigensolve to CPU parity with other slots bit-untouched; `active=0` inside compact domain skipped.
+- [x] Preallocate host/device ID storage. At existing chunk reads gather active physical slots in stable order and upload once; no matrix copy or new synchronization. *(Phase B DONE: `GpuSccPlan::{work_ids_host, work_n}` + `set_work_domain` uploads only on list change, inside the existing chunk-end sync; zero new syncs.)*
+- [x] Convert every replica launch axis, including 3D GEMMs, to physical sid via IDs. All H/S/C/SC/q/f/mu/DIIS/diagnostic/validity indexing uses sid. *(Solve-domain surface done; force/assembly/PBC kernels deferred to a later phase by design.)*
+- [x] Keep active masks for convergence inside a chunk; skip launches when active count is zero. *(mask retained + tested; `n_active==0` exits the chunk loop before any compact rebuild.)*
+- [x] Explicitly construct full/eligible domains for initialization, reset, retry, finalization and forces; never accidentally retain the last SCC tail list. *(Phase B DONE: `restore_work_domain` at SCC-loop exit + defensive restore at `finalize`/`scc_step`/`scc_step_diis` entry; retry-mask solves seed the compact domain up front.)*
+- [x] Test noncontiguous IDs, one active system, alternating masks, early convergence, all-inactive, retries and repeated geometry updates against uncompacted mode. *(launch-domain level done in `gpu_work_ids.rs`; SCC-loop-level early-convergence/retry cases belong to Phase B/C verification.)*
+- [x] Benchmark uniform and tail-heavy batches with active-iteration counts and launch/host costs. Do not claim compaction removes the serial last-replica tail. *(First cut below; full SCC-loop A/B is Phase B.)*
+
+**Phase B kernel-level sweep** (`work_ids_saturation_sweep`, `tests/gpu_work_ids.rs`, `#[ignore]` — n=86 resident Jacobi, batch=400, same data, min of 3 reps; both arms include the 11.8 MB A re-upload ≈ 1.7 ms floor, so small-S times are floor-dominated):
+
+| S | compact ms | masked(400-WG) ms | dead-WG |
+|---|---:|---:|---:|
+| 400 | 7.79 | 7.84 | ~0 |
+| 300 | 6.82 | 6.35 | −0.46 |
+| 200 | 4.87 | 4.58 | −0.29 |
+| 100 | 2.82 | 2.85 | ~0 |
+| 50 | 1.83 | 2.79 | +0.96 |
+| 25 | 1.81 | 2.79 | +0.99 |
+| 10 | 1.80 | 2.78 | +0.97 |
+| 1 | 1.78 | 1.78 | ~0 |
+
+Readout: **dead-WG ≈ 1 ms per dominant-kernel launch for S≤50** (~5–25% of a 2 ms/iter SCC step once the tail is sparse — real but bounded, as the design doc predicted); **saturation knee S\* ≈ 128–200** at n=86 (per-slot cost flat 19.5→24.4 µs for S≥200, degrades below ~100). Anomalies: masked slightly *faster* at S=200–300 (dead WGs vacate SMs early / noise); dead-WG cost vanishes at S=1 (floor-dominated, scheduling non-linear).
+
+**Phase B DONE (SCC-loop compact launch domains, 2026-09-17).** Plan-side `LaunchGeom` captures every per-replica kernel's build-time grid factor; in-loop launches use `cmd().global_work_size(work_n×fac)` (1D) / dim-2 override (3D GEMMs) / padded `work_n×n` (`extract_diag`) — no kernel rebuilds, no new args, ~18 sites across `enq_dq_v_hscc`, `eigh_solve`, `eigh_finish`, `populations`, `occupation`, `scc_step`, `scc_step_diis_enq`, `commit_q_next` + CDFT `enq_shift_n`. Driver rebuilds the work list at the existing chunk-end sync **only when `n_active` dropped** (active set shrinks monotonically → unchanged count = free); retry-mask solves seed the compact domain before the first chunk. Env: `RUST_DFTB_SCC_COMPACT=0` A/B, `RUST_DFTB_DEBUG_DOMAIN=1` prints per-chunk domain width.
+
+**Measured engagement (GC N=86 batch=400, `RUST_DFTB_DEBUG_DOMAIN=1`):** the workload IS tail-heavy — domain decays 400→238→88→39→22→11→8→5→3 over iters 16–80, i.e. ~70% of iterations run at ≤22% width. **A/B (best of N_RUNS=3):** compact ON **189.5 / 190.4 ms (1.895–1.904 ms/iter)** vs OFF **194.9 / 195.6 ms (1.949–1.956)** — **≈2.5–3% end-to-end SCC gain**, failed=0, identical all-converged statuses. Unguarded rebuild-every-chunk measured +1.5% (198.6 ms) — the `n_active<prev` guard removed that. Remaining tests under compact default: work_ids 6/6, scc 8/8, dftb 8/8, forces 5/5, hbond_physics 23/23, tiled_jacobi 9/9, pbc 7/7.
 
 **Gate:** identical per-input outputs/statuses with reduced measured scheduling cost. Slot refill is a later ticket requiring per-slot warm/cold lifecycle and complete reset contracts.
 
@@ -116,12 +141,35 @@ Created 2026-09-16 from the [source-review appendix](Dense_Multi_GPU_Optimizatio
 
 **Depends on:** T01/T02 and stable support path. **Files:** Jacobi kernels/renderers/tests only unless interface change is agreed.
 
-- [ ] Save exact per-kernel local/private/max-WG queries; reconcile discrepancies against source/options. Do not equate private bytes with registers or memory requests with DRAM traffic.
-- [ ] Run a small targeted WG sweep after arbitrary-size reduction tests pass. Benchmark B16/B24 with partial pivots and PB48 schedule validation.
-- [ ] Separate probe, actual rotations and Fermi attribution; use full sweep distributions. One WG per system does not imply one WG per SM.
-- [ ] Measure cold and warm workloads at N84/86/87/120/246 and batches spanning underfill/saturation. Add sizes only where needed to locate a crossover.
-- [ ] Use supported hardware counters if available; otherwise clearly label occupancy/bandwidth explanations as hypotheses.
-- [ ] Choose a simple measured construction-time dispatch rule; no silent runtime recovery. Report total SCC/forces gain and numerical/failure parity.
+Post-T03 measured context (block+direct DTH N246 evt profile): jacobi is **80.3%** of device time — this ticket is now the primary lever.
+
+**T08 measured results (RTX-class OpenCL device, batch=400, equal inputs, all configs stop=0/bad=0):**
+
+- [x] **#6 block params** — `block_jacobi_param_sweep` (17 cfgs × {one,cold} × N{86,246}), accuracy-gated (res/orth/eig-parity ≈ baseline): **IMAX=1 is the dominant lever** — converging each 2B pivot to 1e-7 was waste since outer sweeps revisit; outer sweep counts unchanged. N=246: B16/IMAX12/ITOL1e-7 → 254.0/603.1 ms (one/cold); **B32/IMAX1/ITOL1e-6 → 190.7/377.2 ms (1.34×/1.60×)**; B24/IMAX1 ≈ 189.3/438.8. N=86: ~1.5×/2.2×. New defaults: **B=32, IMAX=1, ITOL=1e-6** (`RUST_DFTB_BJ_{B,IMAX,ITOL}` override). Single-pivot guard: n≤2B keeps IMAX≥12 (whole matrix IS the pivot).
+- [x] **#5 direct WG≈N — FALSIFIED.** Arbitrary-WG fold-then-halve reductions ported into `gpu_tiled_jacobi.cl` (`jac_sum_*`; non-PoT legal, env `RUST_DFTB_JACOBI_WG`). Sweep {64…512}: runtime decreases monotonically with WG — **WG512 fastest** at N=86 (34.9→25.3 ms one; 65.5→52.9 cold) and N=246. Kernel is throughput-bound on fused strip updates, not barrier-bound. Default stays `min(512,max_wg)`; the infrastructure + env knob remain for future devices.
+- [x] **Tail-free variant — no gain.** `notail` compile-out halves local mem (16.4→7.2 KB @WG512) but runtime ±3% noise → fused tail kept (saves a separate fermi_occ launch). `RUST_DFTB_JACOBI_NOTAIL=1` kept for A/B.
+- [x] **JACOBI_PREC=0 — rejected at equal accuracy**: not faster AND 10–30× worse eig parity (N246 cold: 7.8e-3 vs 2.6e-4). prec=1 stays.
+- [x] **#7 spilling — mostly falsified** (CL_KERNEL_PRIVATE_MEM_SIZE, ncu does not support OpenCL): block B16 → 0 B, B24 → 16–24 B, B32 → 160–232 B/thread (~58 f32 — real but small; B32 still wins cold). Direct kernel 0 B always. The real B-cost is **local mem** (9.7→20.2→34.8 KB per WG), not private spill.
+- [x] **Measured dispatch rule** — `eigsolver_kind(n, local_mem)`: auto = block for **n>128**; n≤128 → **resident-defV when lA fits local_mem else direct**; `RUST_DFTB_EIGSOLVER` ∈ {auto,direct,block,resident,resident_av} forces (fail-loud on unknown / unfit explicit choice). End-to-end same-binary A/B, DTH N246 batch400, equal work (24 iters) + failed=0: B16-baseline 78.6 ms/iter → tuned 71.4 ms/iter (**1.10×**; per-solve gain is larger but warm probes skip most solves). DTH wall 6358→1715 ms ≈ **3.7× vs original baseline**; GC batch400 401.5→218.7 ms (**1.84×**) after resident dispatch.
+- [ ] Crossover 86<n<246 unmeasured — n>128 threshold errs toward direct (resident can't fit ≥48 KB local anyway above n≈96); refine if mid-size systems appear.
+- [ ] Registers/thread + warp-stall attribution remain hypotheses (no OpenCL counter tool); revisit if a CUDA port or profiling-capable driver appears.
+
+**T08b — occupancy/WG/local-memory balance (from `Dense_Jacobi_Eigen_Tiling_Opt.md` review):**
+
+Reflection on that doc: its headline suggestion — small WG (32–128) for the direct kernel to buy co-residency — is **already falsified** by the batch-400 WG sweep above (WG512 wins monotonically; in the queued regime the 400-WG queue already supplies parallelism, so per-WG lane count wins). What remains open and worth testing:
+
+**Deeper finding — the direct kernel is bandwidth-bound on A/V streaming, not occupancy-bound.** Each of ~jround=85 rounds/sweep re-streams all of A and V through global memory (~10 MB/sweep/system at N=86 → ~20 GB per batch-400 solve ≈ 790 GB/s ≈ 85% of DRAM peak; working set 24 MB >> L2). Larger WG wins because more outstanding loads = more memory-level parallelism — this explains the monotonic WG512 result and means **no WG/tile resizing can fix it; only data residency can**. GPT's framing (threads-per-system) misses this; the user's original intuition (working tile iterated internally in shared memory) was pointing at it all along.
+
+- [x] **Resident Jacobi — CONFIRMED, now auto-default at n≤128-if-fits.** Implemented `jacobi_resident_batched` (`RESIDENT_V` compile switch) in `gpu_tiled_jacobi.cl` + `EigKind::{ResidentDefV,ResidentAV}` dispatch in `gpu_eigen.rs`. **res-defV** (A __local-resident all sweeps + per-sweep deferred V apply via global rotlog — the winning form): N=86 batch400 equal-accuracy (bit-identical res/orth/par): direct-best 21.9/45.7 ms → **11.4/20.0 ms = ~2.2×** (`resident_jacobi_sweep`). WG-insensitive inside res-defV (256≈512) = no longer MLP-starved, consistent with the bandwidth diagnosis. **res-AV** (A+V both local): 59.7 KB > this device's **48 KB local** → skipped; res-defV fits n≲96 only (29.9 KB at 86; 66 KB at 128 fails). End-to-end GC batch400: **401.5→218.7 ms, 4.01→2.19 ms/iter = 1.84×**, failed=0. Dispatch: `RUST_DFTB_EIGSOLVER` ∈ {auto,direct,block,resident,resident_av}; auto = resident when lA+16KB ≤ local_mem else direct (capacity choice at plan build, fail-loud on explicit-but-unfit). rotlog scratch [batch][jround·jpair] double2 ≈ 23 MB at n=86/b400, allocated once.
+- [ ] **res-AV on a larger-local device** (99 KB class would fit n=86 A+V) — expected further gain but untestable on this GPU; keep env-forced.
+- [ ] **A-local/V-global hybrid for mid n** (if full-local doesn't fit: A alone = n²·4B — n≤~96 at 48 KB local, ~160 at 100 KB). res-defV IS this hybrid (V streamed once/sweep instead of per-round); extend coverage if mid-size systems appear.
+- [ ] **Block kernel (n>128) strip-residency variant.** P+U already local; strips still stream global per pivot (~28 MB/sweep/system at n=246 → also bandwidth-bound). Options: hold A-block-row slabs in local across a pivot column pass, or accept DRAM-bound but reduce bytes (skip identity strips — `PAIR_SKIP_REL` already does this partially).
+
+- [ ] **Block kernel WG < n (strided rows).** `block_jacobi_1wg` currently requires WG≥n (thread-per-row). Convert row loops to `for (row=lid; row<n; row+=lsz)` and sweep WG∈{64,96,128} at N=246 — matters specifically in the *small-slot-count scheduler regime* (S≈64–128, no WG queue to hide latency), where resident occupancy becomes binding. Falsified-in-queued-regime ≠ falsified in resident regime.
+- [ ] **Joint (slots × WG) co-optimization.** `N_slots × warps/WG` sets total parallelism — slot-pool size (T06/scheduler doc §6) and Jacobi WG are coupled parameters, not independent. Once the scheduler exists, sweep the product: e.g. {64,128,256} slots × {64,128,256,512} WG on GC+DTH; pick the pair at the throughput knee, not each separately.
+- [ ] **Local-memory-driven co-residency curve for block.** Document WGs/SM vs B (measured local: B16=9.7K, B24=20.2K, B32=34.8K/WG — B32 won anyway because serial-pivot reduction dominated; record the curve so future devices/GPUs can re-derive the optimum rather than re-litigating).
+- [ ] **Direct kernel `rot[128]` cap.** Local rot arrays bound n≤256; if larger n ever appears, either raise the cap (more local) or route to block — note, not urgent.
+- [ ] **Per-atom/tile-kernel sizing sanity check.** Confirm no other in-loop kernel has a WG≈N assumption silently baked in (cs_normalize, occ_renorm/snorm use gid=group(0) strided loops — verify they're already WG-flexible; the small O(n_atoms) kernels are negligible anyway).
 
 **Gate:** improvement at equal accuracy/work with documented resource explanation; no crossover inferred solely from two molecules.
 
@@ -135,6 +183,15 @@ Created 2026-09-16 from the [source-review appendix](Dense_Multi_GPU_Optimizatio
 - [ ] Verify L0 focused Rust/kernel tests, L1 full unfiltered logs, L2 plotted PES/force/relaxation diagnostics for human review. Store artifacts only under debug/.
 - [ ] Final report: exact change/configuration, max/RMS errors with units and worst case, convergence/failures, cold/warm SCC and SCC+forces wall times, active iterations, allocations/builds/syncs, remaining uncertainty.
 - [ ] Update report/manifest and roadmap only with measured implementation status; user review precedes declaring the solver fixed/accepted.
+
+## T10 — Small wins and fusion leftovers (P2)
+
+Items from the review's punch-list that are real but small after T03 (measured device shares at N246 block+direct: hscc 0.5%, fermi 0.7%, select_occ ~0.15-0.26 ms/iter):
+
+- [ ] **Hscc fusion:** synthesize `h = H0_ij + ½ S_ij (V_Ai + V_Aj)` on tile load inside the first projection GEMM; never materialize `h_scc`. Removes an N² write+read+one launch (~0.3 ms/iter device at N246 — small; the review's 21 ms was the PROF=1 host-stall artifact). Split `dq_v_hscc` into a tiny atom-space `dq→V` kernel + fused GEMM.
+- [ ] **Skip `select_occ` under smearing:** `occ_idx`/`occ_mask` are unread when `use_w=1` (density uses `t`, mulliken_cs/occ_rayleigh/occ_renorm use `occ_w`). Guard in `occupation()`.
+- [ ] **Fermi kernel upgrade:** standalone `fermi_occ_batched` is still fixed-40 f64 bisection — replace with warm-μ safeguarded Newton (WG32/64, f32 logistic + f64 scalar count). See T07.
+- [ ] **Alloc-free housekeeping:** `reset_diis` allocates `vec![0i32; batch]` per call; `check_jacobi` allocates temporaries. Preallocate at construction (see T09 audit).
 
 ## Starting tests and handoff format
 

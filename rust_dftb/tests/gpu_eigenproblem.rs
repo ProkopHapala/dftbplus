@@ -125,8 +125,11 @@ fn check_eig_parity(
     let n = a_orig.nrows();
 
     // 1. Eigenvalue comparison
-    let val_diff: f64 = eigvals_cpu.iter().zip(eigvals_gpu.iter())
-        .map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
+    let val_diff: f64 = eigvals_cpu
+        .iter()
+        .zip(eigvals_gpu.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0, f64::max);
     if val_diff > val_tol {
         return Err(format!(
             "Eigenvalue mismatch: max diff = {val_diff:e}\nCPU: {eigvals_cpu:?}\nGPU: {eigvals_gpu:?}"
@@ -138,7 +141,9 @@ fn check_eig_parity(
     let identity = DMatrix::identity(n, n);
     let ortho_diff = max_abs_diff(&vt_v, &identity);
     if ortho_diff > vec_tol {
-        return Err(format!("Eigenvector orthogonality failed: diff = {ortho_diff:e}"));
+        return Err(format!(
+            "Eigenvector orthogonality failed: diff = {ortho_diff:e}"
+        ));
     }
 
     // 3. Reconstruction: A = V_gpu · diag(λ_gpu) · V_gpu^T
@@ -173,9 +178,13 @@ fn check_eig_parity(
             dot += eigvecs_cpu[(row, i)] * eigvecs_gpu[(row, i)];
         }
         let diff = if dot >= 0.0 {
-            (0..n).map(|row| (eigvecs_cpu[(row, i)] - eigvecs_gpu[(row, i)]).abs()).fold(0.0, f64::max)
+            (0..n)
+                .map(|row| (eigvecs_cpu[(row, i)] - eigvecs_gpu[(row, i)]).abs())
+                .fold(0.0, f64::max)
         } else {
-            (0..n).map(|row| (eigvecs_cpu[(row, i)] + eigvecs_gpu[(row, i)]).abs()).fold(0.0, f64::max)
+            (0..n)
+                .map(|row| (eigvecs_cpu[(row, i)] + eigvecs_gpu[(row, i)]).abs())
+                .fold(0.0, f64::max)
         };
         max_vec_diff = max_vec_diff.max(diff);
     }
@@ -210,11 +219,7 @@ fn try_template(species: Vec<String>, coords: Vec<[f64; 3]>) -> Option<FragmentT
 }
 
 /// Run GPU Jacobi on a single matrix and return (sorted eigvals, sorted eigvecs).
-fn gpu_jacobi_single(
-    rt: &mut GpuRuntime,
-    mat_f32: &[f32],
-    n: usize,
-) -> (Vec<f64>, DMatrix<f64>) {
+fn gpu_jacobi_single(rt: &mut GpuRuntime, mat_f32: &[f32], n: usize) -> (Vec<f64>, DMatrix<f64>) {
     let a_buf = rt.buffer_from_slice(mat_f32).unwrap();
     let v_buf = rt.zero_buffer::<f32>(n * n).unwrap();
     jacobi_cyclic_local_batched(rt, &a_buf, &v_buf, n, 1).unwrap();
@@ -234,7 +239,9 @@ fn make_symmetric(n: usize, seed: u64) -> Vec<f32> {
     let mut a = vec![0.0f32; n * n];
     for i in 0..n {
         for j in i..n {
-            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             let val = if i == j {
                 ((state % 900) as f32) / 100.0 + 1.0 // diagonal in [1, 10)
             } else {
@@ -253,11 +260,15 @@ fn make_symmetric(n: usize, seed: u64) -> Vec<f32> {
 
 #[test]
 fn test_jacobi_parity_h2() {
-    let Some(mut rt) = try_rt() else { return; };
+    let Some(mut rt) = try_rt() else {
+        return;
+    };
     let Some(template) = try_template(
         vec!["H".to_string(), "H".to_string()],
         vec![[0.0, 0.0, 0.0], [0.74, 0.0, 0.0]],
-    ) else { return; };
+    ) else {
+        return;
+    };
 
     let n = template.n_orbs;
     assert_eq!(n, 2);
@@ -268,23 +279,32 @@ fn test_jacobi_parity_h2() {
     let (eigvals_gpu, mut eigvecs_gpu) = gpu_jacobi_single(&mut rt, &h0_f32, n);
     align_eigenvector_signs(&eigvecs_cpu, &mut eigvecs_gpu);
 
-    let val_diff: f64 = eigvals_cpu.iter().zip(eigvals_gpu.iter())
-        .map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
+    let val_diff: f64 = eigvals_cpu
+        .iter()
+        .zip(eigvals_gpu.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0, f64::max);
     assert!(val_diff < 1e-4,
         "Jacobi eigenvalue mismatch (H2): max diff = {val_diff:e}\nCPU: {eigvals_cpu:?}\nGPU: {eigvals_gpu:?}");
 
     let vec_diff = max_abs_diff(&eigvecs_cpu, &eigvecs_gpu);
-    assert!(vec_diff < 1e-3,
-        "Jacobi eigenvector mismatch (H2): diff = {vec_diff:e}");
+    assert!(
+        vec_diff < 1e-3,
+        "Jacobi eigenvector mismatch (H2): diff = {vec_diff:e}"
+    );
 }
 
 #[test]
 fn test_jacobi_parity_n2() {
-    let Some(mut rt) = try_rt() else { return; };
+    let Some(mut rt) = try_rt() else {
+        return;
+    };
     let Some(template) = try_template(
         vec!["N".to_string(), "N".to_string()],
         vec![[0.0, 0.0, 0.0], [1.10, 0.0, 0.0]],
-    ) else { return; };
+    ) else {
+        return;
+    };
 
     let n = template.n_orbs;
     assert_eq!(n, 8);
@@ -295,23 +315,30 @@ fn test_jacobi_parity_n2() {
     let (eigvals_gpu, eigvecs_gpu) = gpu_jacobi_single(&mut rt, &h0_f32, n);
 
     // N2 has degenerate eigenvalues (π orbitals) — use degeneracy-robust check.
-    if let Err(e) = check_eig_parity(h0, &eigvals_cpu, &eigvecs_cpu,
-                                     &eigvals_gpu, &eigvecs_gpu, 1e-4, 1e-3) {
+    if let Err(e) = check_eig_parity(
+        h0,
+        &eigvals_cpu,
+        &eigvecs_cpu,
+        &eigvals_gpu,
+        &eigvecs_gpu,
+        1e-4,
+        1e-3,
+    ) {
         panic!("Jacobi parity (N2): {e}");
     }
 }
 
 #[test]
 fn test_jacobi_parity_h2o() {
-    let Some(mut rt) = try_rt() else { return; };
+    let Some(mut rt) = try_rt() else {
+        return;
+    };
     let Some(template) = try_template(
         vec!["O".to_string(), "H".to_string(), "H".to_string()],
-        vec![
-            [0.0, 0.0, 0.0],
-            [0.9572, 0.0, 0.0],
-            [0.2393, 0.9267, 0.0],
-        ],
-    ) else { return; };
+        vec![[0.0, 0.0, 0.0], [0.9572, 0.0, 0.0], [0.2393, 0.9267, 0.0]],
+    ) else {
+        return;
+    };
 
     let n = template.n_orbs;
     assert_eq!(n, 6);
@@ -322,21 +349,34 @@ fn test_jacobi_parity_h2o() {
     let (eigvals_gpu, mut eigvecs_gpu) = gpu_jacobi_single(&mut rt, &h0_f32, n);
     align_eigenvector_signs(&eigvecs_cpu, &mut eigvecs_gpu);
 
-    let val_diff: f64 = eigvals_cpu.iter().zip(eigvals_gpu.iter())
-        .map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
+    let val_diff: f64 = eigvals_cpu
+        .iter()
+        .zip(eigvals_gpu.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0, f64::max);
     assert!(val_diff < 1e-4,
         "Jacobi eigenvalue mismatch (H2O): max diff = {val_diff:e}\nCPU: {eigvals_cpu:?}\nGPU: {eigvals_gpu:?}");
 
     let vec_diff = max_abs_diff(&eigvecs_cpu, &eigvecs_gpu);
-    assert!(vec_diff < 1e-3,
-        "Jacobi eigenvector mismatch (H2O): diff = {vec_diff:e}");
+    assert!(
+        vec_diff < 1e-3,
+        "Jacobi eigenvector mismatch (H2O): diff = {vec_diff:e}"
+    );
 }
 
 #[test]
 fn test_jacobi_parity_ch4() {
-    let Some(mut rt) = try_rt() else { return; };
+    let Some(mut rt) = try_rt() else {
+        return;
+    };
     let Some(template) = try_template(
-        vec!["C".to_string(), "H".to_string(), "H".to_string(), "H".to_string(), "H".to_string()],
+        vec![
+            "C".to_string(),
+            "H".to_string(),
+            "H".to_string(),
+            "H".to_string(),
+            "H".to_string(),
+        ],
         vec![
             [0.0, 0.0, 0.0],
             [0.6294, 0.6294, 0.6294],
@@ -344,7 +384,9 @@ fn test_jacobi_parity_ch4() {
             [-0.6294, 0.6294, -0.6294],
             [0.6294, -0.6294, -0.6294],
         ],
-    ) else { return; };
+    ) else {
+        return;
+    };
 
     let n = template.n_orbs;
     assert_eq!(n, 8);
@@ -355,8 +397,15 @@ fn test_jacobi_parity_ch4() {
     let (eigvals_gpu, eigvecs_gpu) = gpu_jacobi_single(&mut rt, &h0_f32, n);
 
     // CH4 (Td symmetry) has triply-degenerate eigenvalues — use degeneracy-robust check.
-    if let Err(e) = check_eig_parity(h0, &eigvals_cpu, &eigvecs_cpu,
-                                     &eigvals_gpu, &eigvecs_gpu, 1e-4, 1e-3) {
+    if let Err(e) = check_eig_parity(
+        h0,
+        &eigvals_cpu,
+        &eigvecs_cpu,
+        &eigvals_gpu,
+        &eigvecs_gpu,
+        1e-4,
+        1e-3,
+    ) {
         panic!("Jacobi parity (CH4): {e}");
     }
 }
@@ -367,11 +416,15 @@ fn test_jacobi_parity_ch4() {
 
 #[test]
 fn test_inv_sqrt_h2() {
-    let Some(mut rt) = try_rt() else { return; };
+    let Some(mut rt) = try_rt() else {
+        return;
+    };
     let Some(template) = try_template(
         vec!["H".to_string(), "H".to_string()],
         vec![[0.0, 0.0, 0.0], [0.74, 0.0, 0.0]],
-    ) else { return; };
+    ) else {
+        return;
+    };
 
     let n = template.n_orbs;
     let s = &template.s;
@@ -389,23 +442,31 @@ fn test_inv_sqrt_h2() {
     let x_gpu = row_major_f32_to_dmatrix(&x_host, n);
 
     let diff = max_abs_diff(&x_cpu, &x_gpu);
-    assert!(diff < 1e-3,
-        "S^(-1/2) mismatch (H2): diff = {diff:e}\nCPU:\n{x_cpu}\nGPU:\n{x_gpu}");
+    assert!(
+        diff < 1e-3,
+        "S^(-1/2) mismatch (H2): diff = {diff:e}\nCPU:\n{x_cpu}\nGPU:\n{x_gpu}"
+    );
 
     // λ_min should be the smallest eigenvalue of S
     let lambda_min_cpu = eigvals_cpu[0];
     let lm_gpu = lambda_min[0] as f64;
-    assert!((lm_gpu - lambda_min_cpu).abs() < 1e-3,
-        "lambda_min mismatch (H2): GPU={lm_gpu:e}, CPU={lambda_min_cpu:e}");
+    assert!(
+        (lm_gpu - lambda_min_cpu).abs() < 1e-3,
+        "lambda_min mismatch (H2): GPU={lm_gpu:e}, CPU={lambda_min_cpu:e}"
+    );
 }
 
 #[test]
 fn test_inv_sqrt_n2() {
-    let Some(mut rt) = try_rt() else { return; };
+    let Some(mut rt) = try_rt() else {
+        return;
+    };
     let Some(template) = try_template(
         vec!["N".to_string(), "N".to_string()],
         vec![[0.0, 0.0, 0.0], [1.10, 0.0, 0.0]],
-    ) else { return; };
+    ) else {
+        return;
+    };
 
     let n = template.n_orbs;
     let s = &template.s;
@@ -423,26 +484,27 @@ fn test_inv_sqrt_n2() {
     let x_gpu = row_major_f32_to_dmatrix(&x_host, n);
 
     let diff = max_abs_diff(&x_cpu, &x_gpu);
-    assert!(diff < 1e-3,
-        "S^(-1/2) mismatch (N2): diff = {diff:e}");
+    assert!(diff < 1e-3, "S^(-1/2) mismatch (N2): diff = {diff:e}");
 
     let lambda_min_cpu = eigvals_cpu[0];
     let lm_gpu = lambda_min[0] as f64;
-    assert!((lm_gpu - lambda_min_cpu).abs() < 1e-3,
-        "lambda_min mismatch (N2): GPU={lm_gpu:e}, CPU={lambda_min_cpu:e}");
+    assert!(
+        (lm_gpu - lambda_min_cpu).abs() < 1e-3,
+        "lambda_min mismatch (N2): GPU={lm_gpu:e}, CPU={lambda_min_cpu:e}"
+    );
 }
 
 #[test]
 fn test_inv_sqrt_h2o() {
-    let Some(mut rt) = try_rt() else { return; };
+    let Some(mut rt) = try_rt() else {
+        return;
+    };
     let Some(template) = try_template(
         vec!["O".to_string(), "H".to_string(), "H".to_string()],
-        vec![
-            [0.0, 0.0, 0.0],
-            [0.9572, 0.0, 0.0],
-            [0.2393, 0.9267, 0.0],
-        ],
-    ) else { return; };
+        vec![[0.0, 0.0, 0.0], [0.9572, 0.0, 0.0], [0.2393, 0.9267, 0.0]],
+    ) else {
+        return;
+    };
 
     let n = template.n_orbs;
     let s = &template.s;
@@ -460,13 +522,14 @@ fn test_inv_sqrt_h2o() {
     let x_gpu = row_major_f32_to_dmatrix(&x_host, n);
 
     let diff = max_abs_diff(&x_cpu, &x_gpu);
-    assert!(diff < 1e-3,
-        "S^(-1/2) mismatch (H2O): diff = {diff:e}");
+    assert!(diff < 1e-3, "S^(-1/2) mismatch (H2O): diff = {diff:e}");
 
     let lambda_min_cpu = eigvals_cpu[0];
     let lm_gpu = lambda_min[0] as f64;
-    assert!((lm_gpu - lambda_min_cpu).abs() < 1e-3,
-        "lambda_min mismatch (H2O): GPU={lm_gpu:e}, CPU={lambda_min_cpu:e}");
+    assert!(
+        (lm_gpu - lambda_min_cpu).abs() < 1e-3,
+        "lambda_min mismatch (H2O): GPU={lm_gpu:e}, CPU={lambda_min_cpu:e}"
+    );
 }
 
 // ==================================================================
@@ -475,16 +538,19 @@ fn test_inv_sqrt_h2o() {
 
 #[test]
 fn test_lambda_min_reporting() {
-    let Some(mut rt) = try_rt() else { return; };
+    let Some(mut rt) = try_rt() else {
+        return;
+    };
 
     // Use a known 4×4 symmetric matrix with known eigenvalues
     let n = 4;
-    let a = DMatrix::from_row_slice(n, n, &[
-        4.0, 1.0, 0.0, 0.0,
-        1.0, 3.0, 1.0, 0.0,
-        0.0, 1.0, 2.0, 1.0,
-        0.0, 0.0, 1.0, 1.0,
-    ]);
+    let a = DMatrix::from_row_slice(
+        n,
+        n,
+        &[
+            4.0, 1.0, 0.0, 0.0, 1.0, 3.0, 1.0, 0.0, 0.0, 1.0, 2.0, 1.0, 0.0, 0.0, 1.0, 1.0,
+        ],
+    );
     let (eigvals_cpu, _) = cpu_symeig(&a);
     let lambda_min_cpu = eigvals_cpu[0];
 
@@ -499,10 +565,16 @@ fn test_lambda_min_reporting() {
     let mut lambda_min = vec![0.0f32; 1];
     rt.read_buffer(&lambda_min_buf, &mut lambda_min).unwrap();
 
-    assert!(lambda_min[0] > 0.0, "lambda_min should be positive, got {}", lambda_min[0]);
+    assert!(
+        lambda_min[0] > 0.0,
+        "lambda_min should be positive, got {}",
+        lambda_min[0]
+    );
     let lm_gpu = lambda_min[0] as f64;
-    assert!((lm_gpu - lambda_min_cpu).abs() < 1e-3,
-        "lambda_min mismatch: GPU={lm_gpu:e}, CPU={lambda_min_cpu:e}");
+    assert!(
+        (lm_gpu - lambda_min_cpu).abs() < 1e-3,
+        "lambda_min mismatch: GPU={lm_gpu:e}, CPU={lambda_min_cpu:e}"
+    );
     eprintln!("test_lambda_min_reporting: GPU={lm_gpu:e}, CPU={lambda_min_cpu:e}");
 }
 
@@ -512,8 +584,12 @@ fn test_lambda_min_reporting() {
 
 #[test]
 fn test_batched_jacobi() {
-    let Some(mut rt) = try_rt() else { return; };
-    let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else { return; };
+    let Some(mut rt) = try_rt() else {
+        return;
+    };
+    let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else {
+        return;
+    };
 
     let species = vec!["O".to_string(), "H".to_string(), "H".to_string()];
     let sk = load_sk_for_species(&sk_dir, &species).unwrap();
@@ -543,9 +619,8 @@ fn test_batched_jacobi() {
     }
 
     // CPU reference for each
-    let cpu_refs: Vec<(Vec<f64>, DMatrix<f64>)> = templates.iter()
-        .map(|t| cpu_symeig(&t.h0))
-        .collect();
+    let cpu_refs: Vec<(Vec<f64>, DMatrix<f64>)> =
+        templates.iter().map(|t| cpu_symeig(&t.h0)).collect();
 
     // GPU batched diagonalization
     let a_buf = rt.buffer_from_slice(&batched_h0).unwrap();
@@ -562,22 +637,28 @@ fn test_batched_jacobi() {
     let mut max_vec_diff = 0.0f64;
     for b in 0..batch {
         let eigvals = extract_eigvals_from_diagonal(&a_host[b * n * n..], n);
-        let (eigvals_sorted, mut eigvecs_sorted) = sort_gpu_eig(
-            &eigvals, &v_host[b * n * n..], n);
+        let (eigvals_sorted, mut eigvecs_sorted) = sort_gpu_eig(&eigvals, &v_host[b * n * n..], n);
         let (eigvals_cpu, eigvecs_cpu) = &cpu_refs[b];
         align_eigenvector_signs(eigvecs_cpu, &mut eigvecs_sorted);
 
-        let val_diff: f64 = eigvals_cpu.iter().zip(eigvals_sorted.iter())
-            .map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
+        let val_diff: f64 = eigvals_cpu
+            .iter()
+            .zip(eigvals_sorted.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f64::max);
         let vec_diff = max_abs_diff(eigvecs_cpu, &eigvecs_sorted);
         max_val_diff = max_val_diff.max(val_diff);
         max_vec_diff = max_vec_diff.max(vec_diff);
     }
 
-    assert!(max_val_diff < 1e-4,
-        "Batched Jacobi eigenvalue mismatch: max diff = {max_val_diff:e}");
-    assert!(max_vec_diff < 1e-3,
-        "Batched Jacobi eigenvector mismatch: max diff = {max_vec_diff:e}");
+    assert!(
+        max_val_diff < 1e-4,
+        "Batched Jacobi eigenvalue mismatch: max diff = {max_val_diff:e}"
+    );
+    assert!(
+        max_vec_diff < 1e-3,
+        "Batched Jacobi eigenvector mismatch: max diff = {max_vec_diff:e}"
+    );
     eprintln!("test_batched_jacobi: {batch}×H2O, max val diff = {max_val_diff:e}, max vec diff = {max_vec_diff:e}");
 }
 
@@ -587,23 +668,48 @@ fn test_batched_jacobi() {
 
 #[test]
 fn bench_jacobi_vs_old() {
-    let Some(mut rt) = try_rt() else { return; };
+    let Some(mut rt) = try_rt() else {
+        return;
+    };
 
     let config = MatrixKernelConfig::nvidia_default();
     let ctx = match GpuMatrixContext::new(config) {
         Ok(c) => c,
-        Err(e) => { eprintln!("Skipping benchmark: no GpuMatrixContext ({e})"); return; }
+        Err(e) => {
+            eprintln!("Skipping benchmark: no GpuMatrixContext ({e})");
+            return;
+        }
     };
 
-    eprintln!("\n=== Benchmark: Brent-Luk Jacobi (Agent_4) vs local_jacobi_blocks_parallel (Agent_1) ===");
-    eprintln!("{:>6} {:>8} {:>16} {:>16} {:>10}", "N", "batch", "Brent-Luk (µs)", "Old Jacobi (µs)", "speedup");
+    eprintln!(
+        "\n=== Benchmark: Brent-Luk Jacobi (Agent_4) vs local_jacobi_blocks_parallel (Agent_1) ==="
+    );
+    eprintln!(
+        "{:>6} {:>8} {:>16} {:>16} {:>10}",
+        "N", "batch", "Brent-Luk (µs)", "Old Jacobi (µs)", "speedup"
+    );
 
     let configs: &[(usize, usize)] = &[
-        (8, 1), (8, 10), (8, 100), (8, 1000),
-        (16, 1), (16, 10), (16, 100), (16, 1000),
-        (32, 1), (32, 10), (32, 100), (32, 1000),
-        (48, 1), (48, 10), (48, 100), (48, 1000),
-        (64, 1), (64, 10), (64, 100), (64, 1000),
+        (8, 1),
+        (8, 10),
+        (8, 100),
+        (8, 1000),
+        (16, 1),
+        (16, 10),
+        (16, 100),
+        (16, 1000),
+        (32, 1),
+        (32, 10),
+        (32, 100),
+        (32, 1000),
+        (48, 1),
+        (48, 10),
+        (48, 100),
+        (48, 1000),
+        (64, 1),
+        (64, 10),
+        (64, 100),
+        (64, 1000),
     ];
 
     for &(n, batch) in configs {
@@ -634,12 +740,29 @@ fn bench_jacobi_vs_old() {
         let eigvals_buf = ctx.zero_buffer(n * batch).unwrap();
         let eigvecs_buf = ctx.zero_buffer(n * n * batch).unwrap();
         // Warmup
-        let _ = ctx.local_jacobi_blocks_parallel(n, batch, &blocks_buf, &eigvals_buf, &eigvecs_buf, 100, 1e-6);
+        let _ = ctx.local_jacobi_blocks_parallel(
+            n,
+            batch,
+            &blocks_buf,
+            &eigvals_buf,
+            &eigvecs_buf,
+            100,
+            1e-6,
+        );
         let mut dummy = vec![0.0f32; n * batch];
         ctx.read_buffer(&eigvals_buf, &mut dummy).unwrap();
 
         let t0 = Instant::now();
-        ctx.local_jacobi_blocks_parallel(n, batch, &blocks_buf, &eigvals_buf, &eigvecs_buf, 100, 1e-6).unwrap();
+        ctx.local_jacobi_blocks_parallel(
+            n,
+            batch,
+            &blocks_buf,
+            &eigvals_buf,
+            &eigvecs_buf,
+            100,
+            1e-6,
+        )
+        .unwrap();
         ctx.read_buffer(&eigvals_buf, &mut dummy).unwrap();
         let t_old = t0.elapsed();
 
@@ -649,8 +772,10 @@ fn bench_jacobi_vs_old() {
         let per_sys_old = old_us / batch as f64;
         let speedup = old_us / bl_us.max(1e-9);
 
-        eprintln!("{:>6} {:>8} {:>12.1} ({:>5.2}/sys) {:>12.1} ({:>5.2}/sys) {:>9.2}x",
-            n, batch, bl_us, per_sys_bl, old_us, per_sys_old, speedup);
+        eprintln!(
+            "{:>6} {:>8} {:>12.1} ({:>5.2}/sys) {:>12.1} ({:>5.2}/sys) {:>9.2}x",
+            n, batch, bl_us, per_sys_bl, old_us, per_sys_old, speedup
+        );
     }
     eprintln!("=== Benchmark complete ===\n");
 }

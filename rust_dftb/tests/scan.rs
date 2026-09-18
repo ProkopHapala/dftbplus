@@ -16,8 +16,7 @@ use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 
-const DEFAULT_SK_DIR: &str =
-    "/home/prokophapala/git_SW/dftbplus/external/slakos/origin/mio-1-1";
+const DEFAULT_SK_DIR: &str = "/home/prokophapala/git_SW/dftbplus/external/slakos/origin/mio-1-1";
 
 const ANG2BOHR: f64 = 1.889_726_133;
 const MIN_NEIGH_DIST: f64 = 1.0e-2;
@@ -99,7 +98,11 @@ fn h2_bond_scan(sk_dir: &str, from: f64, to: f64, n: usize) -> Vec<(f64, f64)> {
     let base = [[0.0_f64, 0.0, 0.0], [1.0, 0.0, 0.0]]; // arbitrary initial bond, will be reset
     let mut curve = Vec::with_capacity(n);
     for p in 0..n {
-        let t = if n > 1 { p as f64 / (n - 1) as f64 } else { 0.0 };
+        let t = if n > 1 {
+            p as f64 / (n - 1) as f64
+        } else {
+            0.0
+        };
         let r = from + (to - from) * t;
         let mut coords = base.to_vec();
         set_bond_length(&mut coords, 0, 1, r);
@@ -119,7 +122,9 @@ fn h2_bond_scan(sk_dir: &str, from: f64, to: f64, n: usize) -> Vec<(f64, f64)> {
 
 #[test]
 fn test_h2_bond_scan() {
-    let Some(sk_dir) = sk_dir_or_skip() else { return };
+    let Some(sk_dir) = sk_dir_or_skip() else {
+        return;
+    };
 
     let curve = h2_bond_scan(&sk_dir, 0.5, 3.0, 20);
     assert_eq!(curve.len(), 20, "expected 20 scan points");
@@ -154,7 +159,12 @@ fn test_h2_bond_scan() {
     //    neighbor (H2 bond scan is smooth on this scale).
     for w in curve.windows(2) {
         let de = (w[0].1 - w[1].1).abs();
-        assert!(de < 0.5, "energy jump {de:.4} between r={:.4} and r={:.4} too large", w[0].0, w[1].0);
+        assert!(
+            de < 0.5,
+            "energy jump {de:.4} between r={:.4} and r={:.4} too large",
+            w[0].0,
+            w[1].0
+        );
     }
 
     // 5. Monotonic increase away from the minimum toward dissociation.
@@ -170,7 +180,10 @@ fn test_h2_bond_scan() {
         assert!(
             w[1].1 >= w[0].1 - 1e-4,
             "energy decreased after minimum: r={:.4} e={:.8} -> r={:.4} e={:.8}",
-            w[0].0, w[0].1, w[1].0, w[1].1
+            w[0].0,
+            w[0].1,
+            w[1].0,
+            w[1].1
         );
     }
 
@@ -179,7 +192,9 @@ fn test_h2_bond_scan() {
 
 #[test]
 fn test_scan_saves_data() {
-    let Some(sk_dir) = sk_dir_or_skip() else { return };
+    let Some(sk_dir) = sk_dir_or_skip() else {
+        return;
+    };
 
     let species = vec!["H".to_string(), "H".to_string()];
     let sk = load_sk_for_species(&sk_dir, &species).expect("failed to load SK");
@@ -211,7 +226,8 @@ fn test_scan_saves_data() {
         DftbOutput::write_square(rep_dir.join("h0.dat").to_str().unwrap(), &scc.h0).unwrap();
         DftbOutput::write_square(rep_dir.join("h_scc.dat").to_str().unwrap(), &scc.h_scc).unwrap();
         DftbOutput::write_square(rep_dir.join("s.dat").to_str().unwrap(), &scc.s).unwrap();
-        DftbOutput::write_square(rep_dir.join("density.dat").to_str().unwrap(), &scc.density).unwrap();
+        DftbOutput::write_square(rep_dir.join("density.dat").to_str().unwrap(), &scc.density)
+            .unwrap();
         // eigenvalues
         let mut f = File::create(rep_dir.join("eigenvalues.txt")).unwrap();
         writeln!(f, "# orbital eigenvalues (Hartree)").unwrap();
@@ -228,14 +244,32 @@ fn test_scan_saves_data() {
         let e_rep = repulsive_energy(&sk_dir, &species, &coords);
         let e_total = scc.energy + e_rep;
         let mut f = File::create(rep_dir.join("energy.txt")).unwrap();
-        writeln!(f, "# electronic_scc_energy repulsive_energy total_energy n_iter").unwrap();
-        writeln!(f, "{:.16e} {:.16e} {:.16e} {}", scc.energy, e_rep, e_total, scc.n_iter).unwrap();
+        writeln!(
+            f,
+            "# electronic_scc_energy repulsive_energy total_energy n_iter"
+        )
+        .unwrap();
+        writeln!(
+            f,
+            "{:.16e} {:.16e} {:.16e} {}",
+            scc.energy, e_rep, e_total, scc.n_iter
+        )
+        .unwrap();
     }
 
     // Verify files exist and are readable.
     for p in 0..rs.len() {
         let rep_dir = tmp.join(format!("rep_{p:02}"));
-        for name in ["geometry.xyz", "h0.dat", "h_scc.dat", "s.dat", "density.dat", "eigenvalues.txt", "charges.txt", "energy.txt"] {
+        for name in [
+            "geometry.xyz",
+            "h0.dat",
+            "h_scc.dat",
+            "s.dat",
+            "density.dat",
+            "eigenvalues.txt",
+            "charges.txt",
+            "energy.txt",
+        ] {
             let path = rep_dir.join(name);
             assert!(path.exists(), "missing {name} for rep_{p:02}");
             let content = std::fs::read_to_string(&path).unwrap();
@@ -246,7 +280,10 @@ fn test_scan_saves_data() {
         let h0_txt = std::fs::read_to_string(rep_dir.join("h0.dat")).unwrap();
         let mut lines = h0_txt.lines();
         let header = lines.next().unwrap();
-        let dims: Vec<usize> = header.split_whitespace().map(|x| x.parse().unwrap()).collect();
+        let dims: Vec<usize> = header
+            .split_whitespace()
+            .map(|x| x.parse().unwrap())
+            .collect();
         assert_eq!(dims, vec![2, 2], "H0 header should be '2 2'");
         let mut n_rows = 0;
         let mut n_vals = 0;
@@ -255,16 +292,29 @@ fn test_scan_saves_data() {
                 continue;
             }
             n_rows += 1;
-            n_vals += line.split_whitespace().filter(|x| x.parse::<f64>().is_ok()).count();
+            n_vals += line
+                .split_whitespace()
+                .filter(|x| x.parse::<f64>().is_ok())
+                .count();
         }
         assert_eq!(n_rows, 2, "H0 should have 2 data rows");
         assert_eq!(n_vals, 4, "H0 should have 4 values total");
         // Re-read energy.txt and check the total energy value parses & is finite.
         let energy_txt = std::fs::read_to_string(rep_dir.join("energy.txt")).unwrap();
         let val_line = energy_txt.lines().nth(1).unwrap();
-        let toks: Vec<f64> = val_line.split_whitespace().filter_map(|x| x.parse().ok()).collect();
-        assert!(toks.len() >= 3, "energy.txt data line should have >=3 floats");
-        assert!(toks[2].is_finite(), "re-read total energy not finite: {}", toks[2]);
+        let toks: Vec<f64> = val_line
+            .split_whitespace()
+            .filter_map(|x| x.parse().ok())
+            .collect();
+        assert!(
+            toks.len() >= 3,
+            "energy.txt data line should have >=3 floats"
+        );
+        assert!(
+            toks[2].is_finite(),
+            "re-read total energy not finite: {}",
+            toks[2]
+        );
     }
 
     // Cleanup.

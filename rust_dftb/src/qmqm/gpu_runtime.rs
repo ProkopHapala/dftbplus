@@ -10,8 +10,8 @@
 //! `GpuRuntime` instead.
 
 use crate::core::error::{DftbError, Result};
-use ocl::{flags, Buffer, Context, Device, Event, Platform, Program, Queue};
 use ocl::enums::{ProfilingInfo, ProfilingInfoResult};
+use ocl::{flags, Buffer, Context, Device, Event, Platform, Program, Queue};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
 use std::time::Instant;
@@ -54,8 +54,8 @@ pub struct Prof {
     marks: RefCell<Vec<(&'static str, Event)>>,          // pending stage-end markers
     prev_end: Cell<u64>,                                 // last drained marker end (ns)
     prev_ok: Cell<bool>,
-    pub n_finish: Cell<u64>,   // queue.finish() calls (sync count)
-    pub n_read: Cell<u64>,     // blocking device→host reads
+    pub n_finish: Cell<u64>, // queue.finish() calls (sync count)
+    pub n_read: Cell<u64>,   // blocking device→host reads
 }
 
 /// Shared OpenCL runtime. Holds context, queue, device capabilities, and
@@ -86,7 +86,9 @@ impl GpuRuntime {
             .build()
             .map_err(map_ocl_err)?;
         let pv = std::env::var("RUST_DFTB_PROF").unwrap_or_default();
-        let ktime = std::env::var("RUST_DFTB_KTIME").map(|v| v != "0" && !v.is_empty()).unwrap_or(false);
+        let ktime = std::env::var("RUST_DFTB_KTIME")
+            .map(|v| v != "0" && !v.is_empty())
+            .unwrap_or(false);
         // evt mode needs CL_QUEUE_PROFILING_ENABLE at queue creation; the
         // KTIME mode needs it for per-kernel START/END events.
         let qprops = if pv == "evt" || ktime {
@@ -163,7 +165,8 @@ impl GpuRuntime {
 
     /// Allocate a GPU buffer initialized from a host slice.
     pub fn buffer_from_slice<T: ocl::OclPrm>(&self, data: &[T]) -> Result<Buffer<T>> {
-        self.alloc_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.alloc_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Buffer::<T>::builder()
             .queue(self.queue.clone())
             .flags(flags::MEM_READ_WRITE | flags::MEM_COPY_HOST_PTR)
@@ -175,7 +178,8 @@ impl GpuRuntime {
 
     /// Allocate a zero-filled GPU buffer of the given length.
     pub fn zero_buffer<T: ocl::OclPrm + Default>(&self, len: usize) -> Result<Buffer<T>> {
-        self.alloc_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.alloc_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Buffer::<T>::builder()
             .queue(self.queue.clone())
             .flags(flags::MEM_READ_WRITE)
@@ -188,7 +192,8 @@ impl GpuRuntime {
     /// Device-to-device copy: allocate a new buffer and copy `src` into it.
     /// No host roundtrip — uses OpenCL `clEnqueueCopyBuffer`.
     pub fn copy_buffer<T: ocl::OclPrm>(&self, src: &Buffer<T>, len: usize) -> Result<Buffer<T>> {
-        self.alloc_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.alloc_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dst = Buffer::<T>::builder()
             .queue(self.queue.clone())
             .flags(flags::MEM_READ_WRITE)
@@ -200,10 +205,17 @@ impl GpuRuntime {
     }
 
     /// Device-to-device copy into an existing buffer. No allocation.
-    pub fn copy_into<T: ocl::OclPrm>(&self, src: &Buffer<T>, dst: &Buffer<T>, len: usize) -> Result<()> {
+    pub fn copy_into<T: ocl::OclPrm>(
+        &self,
+        src: &Buffer<T>,
+        dst: &Buffer<T>,
+        len: usize,
+    ) -> Result<()> {
         if src.len() < len || dst.len() < len {
             return Err(DftbError::InvalidInput(format!(
-                "copy_into: len={len} exceeds src.len()={} or dst.len()={}", src.len(), dst.len()
+                "copy_into: len={len} exceeds src.len()={} or dst.len()={}",
+                src.len(),
+                dst.len()
             )));
         }
         src.cmd()
@@ -243,15 +255,23 @@ impl GpuRuntime {
     /// prof_report) — never waits on an event; incomplete markers stay
     /// pending for the next sync.
     fn prof_drain_events(&self) {
-        if !self.prof.evt { return; }
+        if !self.prof.evt {
+            return;
+        }
         let mut mk = self.prof.marks.borrow_mut();
-        if mk.is_empty() { return; }
-        let mut prev_end = if self.prof.prev_ok.get() { Some(self.prof.prev_end.get()) } else { None };
+        if mk.is_empty() {
+            return;
+        }
+        let mut prev_end = if self.prof.prev_ok.get() {
+            Some(self.prof.prev_end.get())
+        } else {
+            None
+        };
         let mut i = 0usize;
         for (name, ev) in mk.iter() {
             let end = match ev.profiling_info(ProfilingInfo::End) {
                 Ok(ProfilingInfoResult::End(t)) => t,
-                _ => break,   // marker not complete yet — in-order queue: all later ones aren't either
+                _ => break, // marker not complete yet — in-order queue: all later ones aren't either
             };
             let start = match ev.profiling_info(ProfilingInfo::Start) {
                 Ok(ProfilingInfoResult::Start(t)) => t,
@@ -262,18 +282,26 @@ impl GpuRuntime {
             if !name.is_empty() {
                 let mut dv = self.prof.dev.borrow_mut();
                 let e = dv.entry(*name).or_insert((0, 0.0));
-                e.0 += 1; e.1 += dt;
+                e.0 += 1;
+                e.1 += dt;
             }
             prev_end = Some(end);
             i += 1;
         }
-        if let Some(e) = prev_end { self.prof.prev_end.set(e); self.prof.prev_ok.set(true); }
-        if i > 0 { mk.drain(..i); }
+        if let Some(e) = prev_end {
+            self.prof.prev_end.set(e);
+            self.prof.prev_ok.set(true);
+        }
+        if i > 0 {
+            mk.drain(..i);
+        }
     }
 
     /// Restart the stage clock (no sync). Call once before a measured region.
     pub fn prof_reset(&self) {
-        if !self.prof.enabled { return; }
+        if !self.prof.enabled {
+            return;
+        }
         if self.prof.evt {
             // Baseline marker: the next stage's device time is measured
             // from here (empty name = anchor only, not accumulated).
@@ -290,7 +318,9 @@ impl GpuRuntime {
     /// In `evt` mode: host time + a trailing marker event for GPU time.
     /// No-op when `RUST_DFTB_PROF` is unset.
     pub fn prof_tick(&self, name: &'static str) {
-        if !self.prof.enabled { return; }
+        if !self.prof.enabled {
+            return;
+        }
         if self.prof.finish {
             self.prof.n_finish.set(self.prof.n_finish.get() + 1);
             let _ = self.queue.finish();
@@ -301,10 +331,16 @@ impl GpuRuntime {
                 self.prof.marks.borrow_mut().push((name, ev));
             }
         }
-        let dt = self.prof.tick.get().map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0);
+        let dt = self
+            .prof
+            .tick
+            .get()
+            .map(|t| t.elapsed().as_secs_f64())
+            .unwrap_or(0.0);
         let mut st = self.prof.stages.borrow_mut();
         let e = st.entry(name).or_insert((0, 0.0));
-        e.0 += 1; e.1 += dt;
+        e.0 += 1;
+        e.1 += dt;
         drop(st);
         self.prof.tick.set(Some(Instant::now()));
     }
@@ -317,9 +353,11 @@ impl GpuRuntime {
     /// `RUST_DFTB_PROF_OUT=<path>` additionally appends the same report to
     /// a file (A/B diffing without scraping stderr).
     pub fn prof_report(&self, title: &str) {
-        if !self.prof.enabled { return; }
+        if !self.prof.enabled {
+            return;
+        }
         if self.prof.evt {
-            let _ = self.queue.finish();      // final drain point
+            let _ = self.queue.finish(); // final drain point
             self.prof_drain_events();
         }
         let mut out = String::new();
@@ -327,8 +365,13 @@ impl GpuRuntime {
         let st = self.prof.stages.borrow();
         let mut names: Vec<&'static str> = st.keys().copied().collect();
         let dev_b = self.prof.dev.borrow();
-        for k in dev_b.keys() { if !st.contains_key(*k) { names.push(*k); } }
-        let get = |m: &BTreeMap<&'static str, (u64, f64)>, k: &str| m.get(k).copied().unwrap_or((0, 0.0));
+        for k in dev_b.keys() {
+            if !st.contains_key(*k) {
+                names.push(*k);
+            }
+        }
+        let get =
+            |m: &BTreeMap<&'static str, (u64, f64)>, k: &str| m.get(k).copied().unwrap_or((0, 0.0));
         let host_total: f64 = st.values().map(|v| v.1).sum();
         let dev_total: f64 = dev_b.values().map(|v| v.1).sum();
         names.sort_by(|a, b| {
@@ -336,34 +379,68 @@ impl GpuRuntime {
             let kb = get(&dev_b, b).1.max(get(&st, b).1);
             kb.partial_cmp(&ka).unwrap_or(std::cmp::Ordering::Equal)
         });
-        let _ = writeln!(out, "[prof] {title}: host={:.1} ms  dev={:.1} ms  finishes={} reads={}",
-            host_total * 1e3, dev_total * 1e3, self.prof.n_finish.get(), self.prof.n_read.get());
+        let _ = writeln!(
+            out,
+            "[prof] {title}: host={:.1} ms  dev={:.1} ms  finishes={} reads={}",
+            host_total * 1e3,
+            dev_total * 1e3,
+            self.prof.n_finish.get(),
+            self.prof.n_read.get()
+        );
         if self.prof.evt {
-            let _ = writeln!(out, "[prof]   {:<26} {:>9} {:>9} {:>9} {:>7} {:>9} {:>6}", "stage", "host ms", "dev ms", "n", "h/call", "d/call", "dev%");
+            let _ = writeln!(
+                out,
+                "[prof]   {:<26} {:>9} {:>9} {:>9} {:>7} {:>9} {:>6}",
+                "stage", "host ms", "dev ms", "n", "h/call", "d/call", "dev%"
+            );
             for name in names {
                 let (h_n, h_s) = get(&st, name);
                 let (d_n, d_s) = get(&dev_b, name);
                 let n = h_n.max(d_n);
-                let _ = writeln!(out, "[prof]   {name:<26} {:9.3} {:9.3} {:>9} {:7.4} {:9.4} {:5.1}%",
-                    h_s * 1e3, d_s * 1e3, n,
+                let _ = writeln!(
+                    out,
+                    "[prof]   {name:<26} {:9.3} {:9.3} {:>9} {:7.4} {:9.4} {:5.1}%",
+                    h_s * 1e3,
+                    d_s * 1e3,
+                    n,
                     if n > 0 { h_s * 1e3 / n as f64 } else { 0.0 },
                     if d_n > 0 { d_s * 1e3 / d_n as f64 } else { 0.0 },
-                    if dev_total > 0.0 { 100.0 * d_s / dev_total } else { 0.0 });
+                    if dev_total > 0.0 {
+                        100.0 * d_s / dev_total
+                    } else {
+                        0.0
+                    }
+                );
             }
         } else {
-            let _ = writeln!(out, "[prof]   {:<26} {:>9} {:>9} {:>7} {:>6}", "stage", "host ms", "n", "ms/call", "host%");
+            let _ = writeln!(
+                out,
+                "[prof]   {:<26} {:>9} {:>9} {:>7} {:>6}",
+                "stage", "host ms", "n", "ms/call", "host%"
+            );
             for name in names {
                 let (h_n, h_s) = get(&st, name);
-                let _ = writeln!(out, "[prof]   {name:<26} {:9.3} {:>9} {:7.4} {:5.1}%",
-                    h_s * 1e3, h_n,
+                let _ = writeln!(
+                    out,
+                    "[prof]   {name:<26} {:9.3} {:>9} {:7.4} {:5.1}%",
+                    h_s * 1e3,
+                    h_n,
                     if h_n > 0 { h_s * 1e3 / h_n as f64 } else { 0.0 },
-                    if host_total > 0.0 { 100.0 * h_s / host_total } else { 0.0 });
+                    if host_total > 0.0 {
+                        100.0 * h_s / host_total
+                    } else {
+                        0.0
+                    }
+                );
             }
         }
         eprint!("{out}");
         if let Ok(path) = std::env::var("RUST_DFTB_PROF_OUT") {
             if !path.is_empty() {
-                if let Err(e) = std::fs::OpenOptions::new().create(true).append(true).open(&path)
+                if let Err(e) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
                     .and_then(|mut f| std::io::Write::write_all(&mut f, out.as_bytes()))
                 {
                     eprintln!("[prof] RUST_DFTB_PROF_OUT={path}: write failed: {e}");
@@ -383,14 +460,28 @@ fn query_capabilities(device: &Device) -> GpuCapabilities {
         _ => format!("{device}"),
     };
 
-    let local_mem_size = device.info(DeviceInfo::LocalMemSize)
+    let local_mem_size = device
+        .info(DeviceInfo::LocalMemSize)
         .ok()
-        .and_then(|v| if let ocl::enums::DeviceInfoResult::LocalMemSize(n) = v { Some(n) } else { None })
+        .and_then(|v| {
+            if let ocl::enums::DeviceInfoResult::LocalMemSize(n) = v {
+                Some(n)
+            } else {
+                None
+            }
+        })
         .unwrap_or(48 * 1024);
 
-    let max_work_group_size = device.info(DeviceInfo::MaxWorkGroupSize)
+    let max_work_group_size = device
+        .info(DeviceInfo::MaxWorkGroupSize)
         .ok()
-        .and_then(|v| if let ocl::enums::DeviceInfoResult::MaxWorkGroupSize(n) = v { Some(n as usize) } else { None })
+        .and_then(|v| {
+            if let ocl::enums::DeviceInfoResult::MaxWorkGroupSize(n) = v {
+                Some(n as usize)
+            } else {
+                None
+            }
+        })
         .unwrap_or(1024);
 
     // PreferredWorkGroupSizeMultiple is a kernel property, not a device
@@ -398,14 +489,28 @@ fn query_capabilities(device: &Device) -> GpuCapabilities {
     // should query kernel-specific values via Kernel::wg_info if needed.
     let preferred_wg_multiple = 32;
 
-    let compute_units = device.info(DeviceInfo::MaxComputeUnits)
+    let compute_units = device
+        .info(DeviceInfo::MaxComputeUnits)
         .ok()
-        .and_then(|v| if let ocl::enums::DeviceInfoResult::MaxComputeUnits(n) = v { Some(n) } else { None })
+        .and_then(|v| {
+            if let ocl::enums::DeviceInfoResult::MaxComputeUnits(n) = v {
+                Some(n)
+            } else {
+                None
+            }
+        })
         .unwrap_or(1);
 
-    let global_mem_size = device.info(DeviceInfo::GlobalMemSize)
+    let global_mem_size = device
+        .info(DeviceInfo::GlobalMemSize)
         .ok()
-        .and_then(|v| if let ocl::enums::DeviceInfoResult::GlobalMemSize(n) = v { Some(n) } else { None })
+        .and_then(|v| {
+            if let ocl::enums::DeviceInfoResult::GlobalMemSize(n) = v {
+                Some(n)
+            } else {
+                None
+            }
+        })
         .unwrap_or(0);
 
     GpuCapabilities {
@@ -437,7 +542,10 @@ pub fn map_ocl_err(err: ocl::Error) -> DftbError {
 pub fn require_nvidia_device(caps: &GpuCapabilities) -> Result<()> {
     let allow_cpu = std::env::var("RUST_DFTB_ALLOW_CPU_CL").ok().as_deref() == Some("1");
     if allow_cpu {
-        eprintln!("[gpu] RUST_DFTB_ALLOW_CPU_CL=1 — accepting non-NVIDIA device '{}'", caps.name);
+        eprintln!(
+            "[gpu] RUST_DFTB_ALLOW_CPU_CL=1 — accepting non-NVIDIA device '{}'",
+            caps.name
+        );
         return Ok(());
     }
     if !caps.name.to_uppercase().contains("NVIDIA") {

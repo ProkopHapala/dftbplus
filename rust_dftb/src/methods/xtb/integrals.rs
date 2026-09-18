@@ -66,7 +66,7 @@ pub fn msao(l: usize) -> usize {
 
 /// s-s primitive overlap: S = (π/(α+β))^(3/2) * exp(-αβ/(α+β) * r²)
 fn primitive_overlap_ss(alpha: f64, beta: f64, d: &[f64; 3]) -> f64 {
-    let r2 = d[0]*d[0] + d[1]*d[1] + d[2]*d[2];
+    let r2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
     let gamma = alpha + beta;
     let pref = (std::f64::consts::PI / gamma).powf(1.5);
     let exp_term = (-alpha * beta * r2 / gamma).exp();

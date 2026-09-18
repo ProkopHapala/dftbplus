@@ -88,11 +88,26 @@ impl MatrixKernelConfig {
     /// Render the OpenCL template with this configuration's parameters substituted in.
     pub fn render_source(&self) -> String {
         MATRIX_KERNEL_TEMPLATE
-            .replace("#define TILE_M 16", &format!("#define TILE_M {}", self.tile_m))
-            .replace("#define TILE_N 16", &format!("#define TILE_N {}", self.tile_n))
-            .replace("#define TILE_K 32", &format!("#define TILE_K {}", self.tile_k))
-            .replace("#define WG_REDUCE 256", &format!("#define WG_REDUCE {}", self.reduce_wg))
-            .replace("#define JACOBI_MAX_M 64", &format!("#define JACOBI_MAX_M {}", self.jacobi_max_m))
+            .replace(
+                "#define TILE_M 16",
+                &format!("#define TILE_M {}", self.tile_m),
+            )
+            .replace(
+                "#define TILE_N 16",
+                &format!("#define TILE_N {}", self.tile_n),
+            )
+            .replace(
+                "#define TILE_K 32",
+                &format!("#define TILE_K {}", self.tile_k),
+            )
+            .replace(
+                "#define WG_REDUCE 256",
+                &format!("#define WG_REDUCE {}", self.reduce_wg),
+            )
+            .replace(
+                "#define JACOBI_MAX_M 64",
+                &format!("#define JACOBI_MAX_M {}", self.jacobi_max_m),
+            )
     }
 }
 
@@ -182,12 +197,17 @@ impl GpuMatrixContext {
             .src(source)
             .build(&context)
             .map_err(map_ocl_err)?;
-        Ok(Self { config, context, queue, program })
+        Ok(Self {
+            config,
+            context,
+            queue,
+            program,
+        })
     }
 
     /// Allocate a GPU buffer initialized from a host slice.
-    pub fn buffer_from_slice(&self, data: &[f32]) -> Result<Buffer<f32>> {
-        Buffer::<f32>::builder()
+    pub fn buffer_from_slice<T: ocl::OclPrm>(&self, data: &[T]) -> Result<Buffer<T>> {
+        Buffer::<T>::builder()
             .queue(self.queue.clone())
             .flags(flags::MEM_READ_WRITE | flags::MEM_COPY_HOST_PTR)
             .len(data.len())
@@ -240,7 +260,8 @@ impl GpuMatrixContext {
         );
         let local = SpatialDims::Two(self.config.tile_n, self.config.tile_m);
         let a_local = self.config.tile_m * self.config.tile_k;
-        let b_local = self.config.tile_n * (self.config.tile_k + 1);   // W2: padded Bs for the trans-B layout
+        let b_local = self.config.tile_n * (self.config.tile_k + 1); // W2: padded Bs for the trans-B layout
+        let wids = self.buffer_from_slice(&(0..batch as i32).collect::<Vec<_>>())?; // T06: identity domain
         let kernel = Kernel::builder()
             .program(&self.program)
             .name("batched_gemm")
@@ -258,9 +279,12 @@ impl GpuMatrixContext {
             .arg(c)
             .arg_local::<f32>(a_local)
             .arg_local::<f32>(b_local)
+            .arg(&wids)
             .build()
             .map_err(map_ocl_err)?;
-        unsafe { kernel.enq().map_err(map_ocl_err)?; }
+        unsafe {
+            kernel.enq().map_err(map_ocl_err)?;
+        }
         Ok(())
     }
 
@@ -279,8 +303,28 @@ impl GpuMatrixContext {
         scratch: &Buffer<f32>,
         out: &Buffer<f32>,
     ) -> Result<()> {
-        self.batched_gemm(n, batch, Transpose::Yes, Transpose::No, 1.0, 0.0, x, h, scratch)?;
-        self.batched_gemm(n, batch, Transpose::No, Transpose::No, 1.0, 0.0, scratch, x, out)
+        self.batched_gemm(
+            n,
+            batch,
+            Transpose::Yes,
+            Transpose::No,
+            1.0,
+            0.0,
+            x,
+            h,
+            scratch,
+        )?;
+        self.batched_gemm(
+            n,
+            batch,
+            Transpose::No,
+            Transpose::No,
+            1.0,
+            0.0,
+            scratch,
+            x,
+            out,
+        )
     }
 
     /// Compute the initial density matrix guess for purification.
@@ -309,7 +353,9 @@ impl GpuMatrixContext {
             .arg(bounds)
             .build()
             .map_err(map_ocl_err)?;
-        unsafe { kernel.enq().map_err(map_ocl_err)?; }
+        unsafe {
+            kernel.enq().map_err(map_ocl_err)?;
+        }
         Ok(())
     }
 
@@ -356,7 +402,8 @@ impl GpuMatrixContext {
         if electron_counts.len() != batch {
             return Err(DftbError::InvalidInput(format!(
                 "electron_counts len {} != batch {}",
-                electron_counts.len(), batch
+                electron_counts.len(),
+                batch
             )));
         }
         let mut trace_host = vec![0.0f32; batch];
@@ -365,7 +412,11 @@ impl GpuMatrixContext {
             self.trace(n, batch, d, traces)?;
             self.read_buffer(traces, &mut trace_host)?;
             for ib in 0..batch {
-                let mode = if trace_host[ib] > electron_counts[ib] { 0 } else { 1 };
+                let mode = if trace_host[ib] > electron_counts[ib] {
+                    0
+                } else {
+                    1
+                };
                 self.purify_tc2_single_batch(n, ib, mode, d, d2, d)?;
             }
         }
@@ -376,7 +427,13 @@ impl GpuMatrixContext {
     ///
     /// One workgroup per batch element with tree reduction in local memory.
     /// Result is one f32 per batch written to `traces`.
-    pub fn trace(&self, n: usize, batch: usize, a: &Buffer<f32>, traces: &Buffer<f32>) -> Result<()> {
+    pub fn trace(
+        &self,
+        n: usize,
+        batch: usize,
+        a: &Buffer<f32>,
+        traces: &Buffer<f32>,
+    ) -> Result<()> {
         let kernel = Kernel::builder()
             .program(&self.program)
             .name("trace_reduce")
@@ -390,7 +447,9 @@ impl GpuMatrixContext {
             .arg_local::<f32>(self.config.reduce_wg)
             .build()
             .map_err(map_ocl_err)?;
-        unsafe { kernel.enq().map_err(map_ocl_err)?; }
+        unsafe {
+            kernel.enq().map_err(map_ocl_err)?;
+        }
         Ok(())
     }
 
@@ -421,7 +480,9 @@ impl GpuMatrixContext {
             .arg_local::<f32>(self.config.reduce_wg)
             .build()
             .map_err(map_ocl_err)?;
-        unsafe { kernel.enq().map_err(map_ocl_err)?; }
+        unsafe {
+            kernel.enq().map_err(map_ocl_err)?;
+        }
         Ok(())
     }
 
@@ -466,7 +527,9 @@ impl GpuMatrixContext {
             .arg_local::<f32>(local_elems)
             .build()
             .map_err(map_ocl_err)?;
-        unsafe { kernel.enq().map_err(map_ocl_err)?; }
+        unsafe {
+            kernel.enq().map_err(map_ocl_err)?;
+        }
         Ok(())
     }
 
@@ -513,7 +576,9 @@ impl GpuMatrixContext {
             .arg_local::<f32>(wg)
             .build()
             .map_err(map_ocl_err)?;
-        unsafe { kernel.enq().map_err(map_ocl_err)?; }
+        unsafe {
+            kernel.enq().map_err(map_ocl_err)?;
+        }
         Ok(())
     }
 
@@ -539,7 +604,9 @@ impl GpuMatrixContext {
             .arg(d)
             .build()
             .map_err(map_ocl_err)?;
-        unsafe { kernel.enq().map_err(map_ocl_err)?; }
+        unsafe {
+            kernel.enq().map_err(map_ocl_err)?;
+        }
         Ok(())
     }
 
@@ -566,9 +633,20 @@ impl GpuMatrixContext {
             .arg(out)
             .build()
             .map_err(map_ocl_err)?;
-        unsafe { kernel.enq().map_err(map_ocl_err)?; }
+        unsafe {
+            kernel.enq().map_err(map_ocl_err)?;
+        }
         Ok(())
     }
+}
+
+/// T06 Phase A: identity launch-domain mapping for legacy/test call sites.
+/// Batched kernels index the replica axis through `work_ids[iw]`; the
+/// production plan binds a persistent buffer instead, so this per-call
+/// upload only happens on non-production paths.
+fn identity_work_ids(rt: &GpuRuntime, batch: usize) -> Result<Buffer<i32>> {
+    let ids: Vec<i32> = (0..batch as i32).collect();
+    rt.buffer_from_slice(&ids)
 }
 
 fn div_ceil(a: usize, b: usize) -> usize {
@@ -650,9 +728,12 @@ pub fn matmul_full_local_batched(
         .arg(a_buf)
         .arg(b_buf)
         .arg(c_buf)
+        .arg(&identity_work_ids(rt, batch)?)
         .build()
         .map_err(map_ocl_err)?;
-    unsafe { kernel.enq().map_err(map_ocl_err)?; }
+    unsafe {
+        kernel.enq().map_err(map_ocl_err)?;
+    }
     Ok(())
 }
 
@@ -704,11 +785,7 @@ pub fn matmul_tiled_batched_params(
     let col_groups = div_ceil(n, TILE_N);
     // 3D NDRange: (col_groups*TILE_N, row_groups*TILE_M, batch)
     // Workgroup: (TILE_N, TILE_M) — 2D, 256 threads.
-    let gws = ocl::SpatialDims::Three(
-        col_groups * TILE_N,
-        row_groups * TILE_M,
-        batch,
-    );
+    let gws = ocl::SpatialDims::Three(col_groups * TILE_N, row_groups * TILE_M, batch);
     let lws = ocl::SpatialDims::Two(TILE_N, TILE_M);
     let a_local = TILE_M * TILE_K;
     let b_local = TILE_K * TILE_N;
@@ -731,9 +808,12 @@ pub fn matmul_tiled_batched_params(
         .arg(c_buf)
         .arg_local::<f32>(a_local)
         .arg_local::<f32>(b_local)
+        .arg(&identity_work_ids(rt, batch)?)
         .build()
         .map_err(map_ocl_err)?;
-    unsafe { kernel.enq().map_err(map_ocl_err)?; }
+    unsafe {
+        kernel.enq().map_err(map_ocl_err)?;
+    }
     Ok(())
 }
 
@@ -773,9 +853,7 @@ pub fn gamma_matvec_batched(
     // WG must cover n_atoms (one thread per atom). Round up to a multiple
     // of the preferred WG multiple for occupancy; cap at max workgroup size.
     let caps = rt.caps();
-    let wg = n_atoms
-        .min(caps.max_work_group_size)
-        .max(1);
+    let wg = n_atoms.min(caps.max_work_group_size).max(1);
     // Use the default template (FL_* defaults are irrelevant for this kernel).
     let source = MATRIX_KERNEL_TEMPLATE;
     let program = rt.build_program(source)?;
@@ -790,9 +868,12 @@ pub fn gamma_matvec_batched(
         .arg(g_buf)
         .arg(dq_buf)
         .arg(v_buf)
+        .arg(&identity_work_ids(rt, batch)?)
         .build()
         .map_err(map_ocl_err)?;
-    unsafe { kernel.enq().map_err(map_ocl_err)?; }
+    unsafe {
+        kernel.enq().map_err(map_ocl_err)?;
+    }
     Ok(())
 }
 
@@ -832,9 +913,12 @@ pub fn h_scc_update_batched(
         .arg(orb_atom_buf)
         .arg(h_buf)
         .arg_local::<f32>(n_atoms)
+        .arg(&identity_work_ids(rt, batch)?)
         .build()
         .map_err(map_ocl_err)?;
-    unsafe { kernel.enq().map_err(map_ocl_err)?; }
+    unsafe {
+        kernel.enq().map_err(map_ocl_err)?;
+    }
     Ok(())
 }
 
@@ -876,9 +960,12 @@ pub fn mulliken_charges_batched(
         .arg(q_buf)
         .arg_local::<f32>(n)
         .arg(active)
+        .arg(&identity_work_ids(rt, batch)?)
         .build()
         .map_err(map_ocl_err)?;
-    unsafe { kernel.enq().map_err(map_ocl_err)?; }
+    unsafe {
+        kernel.enq().map_err(map_ocl_err)?;
+    }
     Ok(())
 }
 
@@ -921,9 +1008,12 @@ pub fn residual_and_mix_batched(
         .arg(rms_buf)
         .arg(active_buf)
         .arg_local::<f32>(wg)
+        .arg(&identity_work_ids(rt, batch)?)
         .build()
         .map_err(map_ocl_err)?;
-    unsafe { kernel.enq().map_err(map_ocl_err)?; }
+    unsafe {
+        kernel.enq().map_err(map_ocl_err)?;
+    }
     Ok(())
 }
 
@@ -936,17 +1026,29 @@ pub fn delta_q_batched(
     n_atoms: usize,
     batch: usize,
 ) -> Result<()> {
-    if n_atoms == 0 || batch == 0 { return Ok(()); }
+    if n_atoms == 0 || batch == 0 {
+        return Ok(());
+    }
     let wg = n_atoms.min(256).max(1);
     let source = MATRIX_KERNEL_TEMPLATE;
     let program = rt.build_program(source)?;
     let kernel = Kernel::builder()
-        .program(&program).name("delta_q_batched").queue(rt.queue().clone())
-        .global_work_size(batch * wg).local_work_size(wg)
-        .arg(n_atoms as i32).arg(batch as i32)
-        .arg(q_buf).arg(q0_buf).arg(dq_buf)
-        .build().map_err(map_ocl_err)?;
-    unsafe { kernel.enq().map_err(map_ocl_err)?; }
+        .program(&program)
+        .name("delta_q_batched")
+        .queue(rt.queue().clone())
+        .global_work_size(batch * wg)
+        .local_work_size(wg)
+        .arg(n_atoms as i32)
+        .arg(batch as i32)
+        .arg(q_buf)
+        .arg(q0_buf)
+        .arg(dq_buf)
+        .arg(&identity_work_ids(rt, batch)?)
+        .build()
+        .map_err(map_ocl_err)?;
+    unsafe {
+        kernel.enq().map_err(map_ocl_err)?;
+    }
     Ok(())
 }
 
@@ -962,17 +1064,31 @@ pub fn build_density_masked_batched(
     n: usize,
     batch: usize,
 ) -> Result<()> {
-    if n == 0 || batch == 0 { return Ok(()); }
+    if n == 0 || batch == 0 {
+        return Ok(());
+    }
     let wg = (n * n).min(256).max(1);
     let source = MATRIX_KERNEL_TEMPLATE;
     let program = rt.build_program(source)?;
     let kernel = Kernel::builder()
-        .program(&program).name("build_density_masked_batched").queue(rt.queue().clone())
-        .global_work_size(batch * wg).local_work_size(wg)
-        .arg(n as i32).arg(batch as i32)
-        .arg(c_buf).arg(occ_mask_buf).arg(d_buf).arg(use_eig).arg(eig_buf)
-        .build().map_err(map_ocl_err)?;
-    unsafe { kernel.enq().map_err(map_ocl_err)?; }
+        .program(&program)
+        .name("build_density_masked_batched")
+        .queue(rt.queue().clone())
+        .global_work_size(batch * wg)
+        .local_work_size(wg)
+        .arg(n as i32)
+        .arg(batch as i32)
+        .arg(c_buf)
+        .arg(occ_mask_buf)
+        .arg(d_buf)
+        .arg(use_eig)
+        .arg(eig_buf)
+        .arg(&identity_work_ids(rt, batch)?)
+        .build()
+        .map_err(map_ocl_err)?;
+    unsafe {
+        kernel.enq().map_err(map_ocl_err)?;
+    }
     Ok(())
 }
 
@@ -986,18 +1102,30 @@ pub fn frobenius_trace_batched(
     n: usize,
     batch: usize,
 ) -> Result<()> {
-    if n == 0 || batch == 0 { return Ok(()); }
+    if n == 0 || batch == 0 {
+        return Ok(());
+    }
     let wg = 256usize;
     let source = MATRIX_KERNEL_TEMPLATE;
     let program = rt.build_program(source)?;
     let kernel = Kernel::builder()
-        .program(&program).name("frobenius_trace_batched").queue(rt.queue().clone())
-        .global_work_size(batch * wg).local_work_size(wg)
-        .arg(n as i32).arg(batch as i32)
-        .arg(a_buf).arg(b_buf).arg(tr_buf)
+        .program(&program)
+        .name("frobenius_trace_batched")
+        .queue(rt.queue().clone())
+        .global_work_size(batch * wg)
+        .local_work_size(wg)
+        .arg(n as i32)
+        .arg(batch as i32)
+        .arg(a_buf)
+        .arg(b_buf)
+        .arg(tr_buf)
         .arg_local::<f32>(wg)
-        .build().map_err(map_ocl_err)?;
-    unsafe { kernel.enq().map_err(map_ocl_err)?; }
+        .arg(&identity_work_ids(rt, batch)?)
+        .build()
+        .map_err(map_ocl_err)?;
+    unsafe {
+        kernel.enq().map_err(map_ocl_err)?;
+    }
     Ok(())
 }
 
@@ -1010,18 +1138,30 @@ pub fn dot_batched(
     n: usize,
     batch: usize,
 ) -> Result<()> {
-    if n == 0 || batch == 0 { return Ok(()); }
+    if n == 0 || batch == 0 {
+        return Ok(());
+    }
     let wg = 256usize;
     let source = MATRIX_KERNEL_TEMPLATE;
     let program = rt.build_program(source)?;
     let kernel = Kernel::builder()
-        .program(&program).name("dot_batched").queue(rt.queue().clone())
-        .global_work_size(batch * wg).local_work_size(wg)
-        .arg(n as i32).arg(batch as i32)
-        .arg(x_buf).arg(y_buf).arg(dot_buf)
+        .program(&program)
+        .name("dot_batched")
+        .queue(rt.queue().clone())
+        .global_work_size(batch * wg)
+        .local_work_size(wg)
+        .arg(n as i32)
+        .arg(batch as i32)
+        .arg(x_buf)
+        .arg(y_buf)
+        .arg(dot_buf)
         .arg_local::<f32>(wg)
-        .build().map_err(map_ocl_err)?;
-    unsafe { kernel.enq().map_err(map_ocl_err)?; }
+        .arg(&identity_work_ids(rt, batch)?)
+        .build()
+        .map_err(map_ocl_err)?;
+    unsafe {
+        kernel.enq().map_err(map_ocl_err)?;
+    }
     Ok(())
 }
 
@@ -1036,19 +1176,31 @@ pub fn extract_diagonal_batched(
     batch: usize,
     active: &Buffer<i32>,
 ) -> Result<()> {
-    if n == 0 || batch == 0 { return Ok(()); }
+    if n == 0 || batch == 0 {
+        return Ok(());
+    }
     let total = n * batch;
     // Round up to next multiple of 64 for wave efficiency.
     let gws = ((total + 63) / 64) * 64;
     let source = MATRIX_KERNEL_TEMPLATE;
     let program = rt.build_program(source)?;
     let kernel = Kernel::builder()
-        .program(&program).name("extract_diagonal_batched").queue(rt.queue().clone())
-        .global_work_size(gws).local_work_size(64)
-        .arg(n as i32).arg(batch as i32)
-        .arg(a_buf).arg(diag_buf).arg(active)
-        .build().map_err(map_ocl_err)?;
-    unsafe { kernel.enq().map_err(map_ocl_err)?; }
+        .program(&program)
+        .name("extract_diagonal_batched")
+        .queue(rt.queue().clone())
+        .global_work_size(gws)
+        .local_work_size(64)
+        .arg(n as i32)
+        .arg(batch as i32)
+        .arg(a_buf)
+        .arg(diag_buf)
+        .arg(active)
+        .arg(&identity_work_ids(rt, batch)?)
+        .build()
+        .map_err(map_ocl_err)?;
+    unsafe {
+        kernel.enq().map_err(map_ocl_err)?;
+    }
     Ok(())
 }
 
@@ -1078,7 +1230,13 @@ mod tests {
 
     #[test]
     fn template_replaces_parameters() {
-        let cfg = MatrixKernelConfig { tile_m: 8, tile_n: 16, tile_k: 64, reduce_wg: 128, jacobi_max_m: 32 };
+        let cfg = MatrixKernelConfig {
+            tile_m: 8,
+            tile_n: 16,
+            tile_k: 64,
+            reduce_wg: 128,
+            jacobi_max_m: 32,
+        };
         let src = cfg.render_source();
         assert!(src.contains("#define TILE_M 8"));
         assert!(src.contains("#define TILE_N 16"));

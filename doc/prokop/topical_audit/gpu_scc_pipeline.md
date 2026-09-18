@@ -39,7 +39,7 @@ After convergence: `E = 2 Σ_{occ} ε − ½ Δq·V − q0·V` (algebraically th
 |----------|----------|--------|-------|
 | Rust+OpenCL | `rust_dftb/src/qmqm/gpu_scc.rs` | active | `gpu_solve_scc_batched` (simple mix), `gpu_solve_scc_batched_diis` (DIIS), `gpu_solve_scc_batched_diis_warmstart` (warm-start + best-effort) |
 | OpenCL kernels | `rust_dftb/src/qmqm/gpu_matrix_ops.cl` | active | gamma_matvec, h_scc_update, mulliken, residual_and_mix, build_density_masked, frobenius_trace, dot — all batched |
-| OpenCL eigensolver | `rust_dftb/src/qmqm/gpu_eigen.rs`/`.cl` | active | `jacobi_cyclic_local_batched` (Brent-Luk), `build_inv_sqrt` (S^{-1/2}) |
+| OpenCL eigensolver | `rust_dftb/src/qmqm/gpu_eigen.rs` + `gpu_eigen.cl`/`gpu_tiled_jacobi.cl`/`gpu_block_jacobi.cl` | active | `jacobi_cyclic_local_batched` (Brent-Luk, n≤64), `jacobi_cyclic_global_batched` (direct, n≤256), **`jacobi_resident_batched`** (A `__local` + deferred-V rotlog, n≤128-if-fits — ~2.2× vs direct at n=86), `block_jacobi_1wg` (n>128). Auto dispatch `eigsolver_kind`/`RUST_DFTB_EIGSOLVER`; `build_inv_sqrt` (S^{-1/2}). Measured: `tasts/HBond_Relaxed_Scan_GPU/Measured_Facts_Jacobi_Sweeps.md` |
 | OpenCL forces | `rust_dftb/src/qmqm/gpu_forces.rs`/`.cl` | active | Analytic GPU forces (nonSCC + shift + gamma' + rep). H2O vs CPU rel ~3e-5 (`gpu_hbond_physics.rs`). 1×4 crash fixed (`vload2`). |
 | OpenCL GEMM | `rust_dftb/src/qmqm/gpu_matrix.rs` | active | `matmul_full_local_batched` (both matrices in __local, N ≤ 64) |
 | Rust (CPU ref) | `rust_dftb/src/methods/dftb/hamiltonian.rs` | reference | `HamiltonianBuilder::build_scc` — f64, LAPACK dsyevd, DIIS |
@@ -103,14 +103,16 @@ oscillation between competing charge transfer states. Not a GPU bug.
   Package 2 frozen-H: `max|δε_occ|~1e-6`; `|dE|~3e-5` tracks `E_band−2ΣCᵀHC`.
   Löwdin Newton + f32 GEMM Kahan in; Kahan does not cut `δ_CH`. Honest contract:
   N~90 `|dE|<1e-4` (regression), not `<1e-5`. SSOT: `f32_floor_dense_hbond.md` §3.1.
-- **Kernel objects rebuilt each call** — `Kernel::builder().build()` per
-  iteration. Program cache hits, but Kernel handle creation is a performance
-  TODO. Target: cache Kernel objects in `GpuRuntime`.
-- **Full N² readback for eigenvalues** — `hp` (N² per system) read back to
-  extract diagonal for sorting. For N≤64, batch≤1000 this is ≤256 KB —
-  acceptable but a diagonal-extract kernel would eliminate it.
-- **No active mask** — all systems run all iterations even if some converged.
-  Target: `gpu_scc.rs` active mask early-return.
+- ~~**Kernel objects rebuilt each call**~~ — RESOLVED in `gpu_scc_plan.rs`
+  (persistent bound kernel handles, zero builds in the loop; still true of
+  the legacy `gpu_scc.rs` path, which is deprecated for production).
+- ~~**Full N² readback for eigenvalues**~~ — RESOLVED in the plan path:
+  `extract_diag` kernel + fused Fermi tail inside the Jacobi kernel write
+  eigenvalues/occupations without an N² readback.
+- ~~**No active mask**~~ — RESOLVED in the plan path: per-replica `active`
+  mask freezes converged systems each iteration (straggler tail remains —
+  that's what the slot-pool scheduler
+  `tasts/HBond_Relaxed_Scan_GPU/Slot_Pool_Scheduler.design.md` targets).
 - **2D scan convergence** — 67% of 2D points don't converge (CPU also fails).
   Possible fixes: Broyden mixing, level shifting, smaller alpha for asymmetric
   geometries, strip-by-strip propagation with neighbouring 2D warm-start.

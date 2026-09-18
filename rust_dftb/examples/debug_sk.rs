@@ -8,10 +8,15 @@ fn main() {
     sk.set_species_angular_momenta(ang_map);
 
     let tab = sk.get_pair("H", "H").unwrap();
-    
+
     // Check grid parameters
-    println!("dr: {}, n_grid: {}, n_integ: {}", tab.h.dr, tab.h.n_grid(), tab.h.n_integ());
-    
+    println!(
+        "dr: {}, n_grid: {}, n_integ: {}",
+        tab.h.dr,
+        tab.h.n_grid(),
+        tab.h.n_integ()
+    );
+
     // Compare at different distances
     for &r in &[0.74_f64, 1.3984_f64] {
         let h_all = tab.h.eval(r).unwrap();

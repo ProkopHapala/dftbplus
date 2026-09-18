@@ -8,9 +8,15 @@ fn parity_h0_methane_example() {
     // - RUST_DFTB_REF_H: path to DFTB+ hamsqr1.dat generated with SCC=No
     // - RUST_DFTB_REF_S: path to DFTB+ oversqr.dat generated with SCC=No
 
-    let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else { return; };
-    let Ok(ref_h) = std::env::var("RUST_DFTB_REF_H") else { return; };
-    let Ok(ref_s) = std::env::var("RUST_DFTB_REF_S") else { return; };
+    let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else {
+        return;
+    };
+    let Ok(ref_h) = std::env::var("RUST_DFTB_REF_H") else {
+        return;
+    };
+    let Ok(ref_s) = std::env::var("RUST_DFTB_REF_S") else {
+        return;
+    };
 
     // Load methane geometry from data/xyz/CH4.xyz
     let xyz_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../data/xyz/CH4.xyz");
@@ -37,7 +43,9 @@ fn parity_h0_methane_example() {
 /// build_non_scc for an sp-only system (pure carbon with mio-1-1 SK set).
 #[test]
 fn parity_sp_only_vs_generic() {
-    let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else { return; };
+    let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else {
+        return;
+    };
 
     let species = vec![
         "C".to_string(),
@@ -61,15 +69,23 @@ fn parity_sp_only_vs_generic() {
     let dh = max_abs_diff(&ham_generic.h0, &ham_sp_only.h0);
     let ds = max_abs_diff(&ham_generic.s, &ham_sp_only.s);
 
-    assert!(dh < 1e-14, "sp-only H0 diverges from generic: max diff = {dh:e}");
-    assert!(ds < 1e-14, "sp-only S diverges from generic: max diff = {ds:e}");
+    assert!(
+        dh < 1e-14,
+        "sp-only H0 diverges from generic: max diff = {dh:e}"
+    );
+    assert!(
+        ds < 1e-14,
+        "sp-only S diverges from generic: max diff = {ds:e}"
+    );
 }
 
 /// Parity + performance: sweep 1000 small displacements and rebuild H/S each step.
 /// Uses a pure carbon system so both generic and sp-only paths are valid.
 #[test]
 fn benchmark_parity_sp_only() {
-    let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else { return; };
+    let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else {
+        return;
+    };
 
     let species = vec![
         "C".to_string(),
@@ -114,7 +130,15 @@ fn benchmark_parity_sp_only() {
 
     let ratio = t_generic.as_secs_f64() / t_sp_only.as_secs_f64();
     eprintln!("\n=== benchmark_parity_sp_only ===");
-    eprintln!("  generic : {:?} ({:.3} us/step)", t_generic, t_generic.as_secs_f64() * 1e6 / N_STEPS as f64);
-    eprintln!("  sp-only : {:?} ({:.3} us/step)", t_sp_only, t_sp_only.as_secs_f64() * 1e6 / N_STEPS as f64);
+    eprintln!(
+        "  generic : {:?} ({:.3} us/step)",
+        t_generic,
+        t_generic.as_secs_f64() * 1e6 / N_STEPS as f64
+    );
+    eprintln!(
+        "  sp-only : {:?} ({:.3} us/step)",
+        t_sp_only,
+        t_sp_only.as_secs_f64() * 1e6 / N_STEPS as f64
+    );
     eprintln!("  speedup : {:.2}x", ratio);
 }

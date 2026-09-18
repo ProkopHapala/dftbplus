@@ -22,7 +22,9 @@
 
 use nalgebra::DMatrix;
 use ocl::{Buffer, Kernel};
-use rust_dftb::methods::dftb::forces::{compute_scc_forces, gamma_prime_full, parse_repulsive_spline, RepulsiveSpline};
+use rust_dftb::methods::dftb::forces::{
+    compute_scc_forces, gamma_prime_full, parse_repulsive_spline, RepulsiveSpline,
+};
 use rust_dftb::qmqm::gpu_driver::GpuDriver;
 use rust_dftb::qmqm::gpu_forces::GpuForceDriver;
 use rust_dftb::qmqm::gpu_prep::GpuBatch;
@@ -40,32 +42,43 @@ const DEFAULT_SK: &str = "/home/prokop/SIMULATIONS/dftbplus/slakos/mio-1-1";
 
 // Tight contracts from the review, ~3× measured accuracy where we have numbers.
 const HS_TOL: f64 = 1e-6;
-const E_EL_TOL: f64 = 1e-5;       // H2O / N<80: measured |dE|~3e-7; f32 can do this
+const E_EL_TOL: f64 = 1e-5; // H2O / N<80: measured |dE|~3e-7; f32 can do this
 const E_EL_FLOOR_N90: f64 = 1e-4; // AT/GC N~90: measured |dE|~2.6e-5 (occupied-ε bias). 1e-4 is a regression line (~4× floor, ~2.7 meV), not a claim of f64 parity. See f32_floor_dense_hbond.md
 const E_REP_TOL: f64 = 1e-5;
 const Q_TOL: f64 = 1e-4;
-const FORCE_REL: f64 = 1e-4;      // H2O non-SCC measured 4e-6; AT TOTAL ~4.6e-5
+const FORCE_REL: f64 = 1e-4; // H2O non-SCC measured 4e-6; AT TOTAL ~4.6e-5
 const NEWTON_TOL: f64 = 1e-6;
-const FD_REL: f64 = 1e-3;         // energy-gradient relative
-const FD_STEP: f64 = 1e-3;        // Å
-const SCC_MAX_ITER: usize = 100;  // if not there by 100, it is floor or mixer — more iters is wasted GPU time
+const FD_REL: f64 = 1e-3; // energy-gradient relative
+const FD_STEP: f64 = 1e-3; // Å
+const SCC_MAX_ITER: usize = 100; // if not there by 100, it is floor or mixer — more iters is wasted GPU time
 
 fn require_sk_dir() -> String {
     let dir = std::env::var("RUST_DFTB_SK_DIR").unwrap_or_else(|_| DEFAULT_SK.to_string());
-    assert!(Path::new(&dir).is_dir(),
-        "SK directory missing: {dir}. Set RUST_DFTB_SK_DIR or install mio-1-1 at {DEFAULT_SK}");
-    assert!(Path::new(&dir).join("H-H.skf").is_file(), "H-H.skf missing in {dir}");
-    assert!(Path::new(&dir).join("O-H.skf").is_file() || Path::new(&dir).join("H-O.skf").is_file(),
-        "O-H.skf / H-O.skf missing in {dir}");
+    assert!(
+        Path::new(&dir).is_dir(),
+        "SK directory missing: {dir}. Set RUST_DFTB_SK_DIR or install mio-1-1 at {DEFAULT_SK}"
+    );
+    assert!(
+        Path::new(&dir).join("H-H.skf").is_file(),
+        "H-H.skf missing in {dir}"
+    );
+    assert!(
+        Path::new(&dir).join("O-H.skf").is_file() || Path::new(&dir).join("H-O.skf").is_file(),
+        "O-H.skf / H-O.skf missing in {dir}"
+    );
     dir
 }
 
 fn require_nvidia() -> GpuRuntime {
-    let rt = GpuRuntime::new().unwrap_or_else(|e| panic!(
-        "OpenCL runtime required for gpu_hbond_physics (no skip): {e}"));
+    let rt = GpuRuntime::new()
+        .unwrap_or_else(|e| panic!("OpenCL runtime required for gpu_hbond_physics (no skip): {e}"));
     let name = rt.caps().name.clone();
-    eprintln!("[gpu] NVIDIA required; local_mem={} B  CUs={}  global={} B  caps={name}",
-        rt.caps().local_mem_size, rt.caps().compute_units, rt.caps().global_mem_size);
+    eprintln!(
+        "[gpu] NVIDIA required; local_mem={} B  CUs={}  global={} B  caps={name}",
+        rt.caps().local_mem_size,
+        rt.caps().compute_units,
+        rt.caps().global_mem_size
+    );
     assert!(name.to_uppercase().contains("NVIDIA"),
         "gpu_hbond_physics requires NVIDIA GPU, got '{name}'. PoCL/CPU hides fence/atomic/OOB bugs. \
          Do not treat CPU OpenCL as a GPU.");
@@ -73,54 +86,99 @@ fn require_nvidia() -> GpuRuntime {
 }
 
 fn h2() -> (Vec<String>, Vec<[f64; 3]>) {
-    (vec!["H".into(), "H".into()], vec![[0.0, 0.0, 0.0], [0.74, 0.0, 0.0]])
+    (
+        vec!["H".into(), "H".into()],
+        vec![[0.0, 0.0, 0.0], [0.74, 0.0, 0.0]],
+    )
 }
 fn h2o() -> (Vec<String>, Vec<[f64; 3]>) {
-    (vec!["O".into(), "H".into(), "H".into()],
-     vec![[0.0, 0.0, 0.0], [-0.7580632005, 0.6358101311, 0.0], [0.7580632005, 0.6358101311, 0.0]])
+    (
+        vec!["O".into(), "H".into(), "H".into()],
+        vec![
+            [0.0, 0.0, 0.0],
+            [-0.7580632005, 0.6358101311, 0.0],
+            [0.7580632005, 0.6358101311, 0.0],
+        ],
+    )
 }
 fn load_xyz(file: &str) -> (Vec<String>, Vec<[f64; 3]>) {
     let path = format!("{}/../data/xyz/{file}", env!("CARGO_MANIFEST_DIR"));
     let xyz = rust_dftb::parse_xyz(&path).unwrap_or_else(|e| panic!("cannot read {path}: {e}"));
-    (xyz.species.clone(), xyz.coords.iter().map(|c| [c[0], c[1], c[2]]).collect())
+    (
+        xyz.species.clone(),
+        xyz.coords.iter().map(|c| [c[0], c[1], c[2]]).collect(),
+    )
 }
-fn formic_dimer() -> (Vec<String>, Vec<[f64; 3]>) { load_xyz("formic_dimer.xyz") }
-fn at_pair() -> (Vec<String>, Vec<[f64; 3]>) { load_xyz("adenine-thymine.xyz") }
-fn gc_pair() -> (Vec<String>, Vec<[f64; 3]>) { load_xyz("guanine-cytosine.xyz") }
+fn formic_dimer() -> (Vec<String>, Vec<[f64; 3]>) {
+    load_xyz("formic_dimer.xyz")
+}
+fn at_pair() -> (Vec<String>, Vec<[f64; 3]>) {
+    load_xyz("adenine-thymine.xyz")
+}
+fn gc_pair() -> (Vec<String>, Vec<[f64; 3]>) {
+    load_xyz("guanine-cytosine.xyz")
+}
 
 fn make_frag(sk: &SkData, species: &[String], coords: &[[f64; 3]]) -> Fragment {
-    Fragment::from_template(FragmentTemplate::new(sk, species.to_vec(), coords.to_vec()).unwrap(), coords.to_vec())
+    Fragment::from_template(
+        FragmentTemplate::new(sk, species.to_vec(), coords.to_vec()).unwrap(),
+        coords.to_vec(),
+    )
 }
 fn flatten_mat(m: &DMatrix<f64>) -> Vec<f32> {
     let n = m.nrows();
     let mut out = vec![0.0f32; n * n];
-    for i in 0..n { for j in 0..n { out[i * n + j] = m[(i, j)] as f32; } }
+    for i in 0..n {
+        for j in 0..n {
+            out[i * n + j] = m[(i, j)] as f32;
+        }
+    }
     out
 }
 fn extract_replica(flat: &[f32], r: usize, n: usize) -> DMatrix<f64> {
     let mut m = DMatrix::zeros(n, n);
-    for i in 0..n { for j in 0..n { m[(i, j)] = flat[r * n * n + i * n + j] as f64; } }
+    for i in 0..n {
+        for j in 0..n {
+            m[(i, j)] = flat[r * n * n + i * n + j] as f64;
+        }
+    }
     m
 }
 fn max_abs_mat(a: &DMatrix<f64>, b: &DMatrix<f64>) -> f64 {
-    a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()).fold(0.0, f64::max)
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0, f64::max)
 }
 fn mat_max_abs(m: &DMatrix<f64>) -> f64 {
     m.iter().fold(0.0f64, |a, x| a.max(x.abs()))
 }
 fn unique_species(species: &[String]) -> Vec<String> {
     let mut u = Vec::new();
-    for s in species { if !u.contains(s) { u.push(s.clone()); } }
+    for s in species {
+        if !u.contains(s) {
+            u.push(s.clone());
+        }
+    }
     u
 }
 fn species_idx(species: &[String], unique: &[String]) -> Vec<i32> {
-    species.iter().map(|s| unique.iter().position(|u| u == s).unwrap() as i32).collect()
+    species
+        .iter()
+        .map(|s| unique.iter().position(|u| u == s).unwrap() as i32)
+        .collect()
 }
 fn per_atom_u(sk: &SkData, species: &[String]) -> Vec<f64> {
-    species.iter().map(|sp| sk.onsite(sp).map(|p| p.u_hubbard).unwrap_or(0.4)).collect()
+    species
+        .iter()
+        .map(|sp| sk.onsite(sp).map(|p| p.u_hubbard).unwrap_or(0.4))
+        .collect()
 }
 fn gamma_matrix(coords: &[[f64; 3]], u: &[f64]) -> Vec<f32> {
-    gamma_matrix_f64(coords, u).into_iter().map(|x| x as f32).collect()
+    gamma_matrix_f64(coords, u)
+        .into_iter()
+        .map(|x| x as f32)
+        .collect()
 }
 fn gamma_matrix_f64(coords: &[[f64; 3]], u: &[f64]) -> Vec<f64> {
     let n = coords.len();
@@ -143,30 +201,40 @@ fn frobenius_mix(d_f32: &[f32], h: &DMatrix<f64>) -> f64 {
     let n = h.nrows();
     let mut s = 0.0f64;
     for i in 0..n {
-        for j in 0..n { s += d_f32[i * n + j] as f64 * h[(i, j)]; }
+        for j in 0..n {
+            s += d_f32[i * n + j] as f64 * h[(i, j)];
+        }
     }
     s
 }
 fn e_scc_dq_g(dq: &[f64], g: &[f64], n_atoms: usize) -> f64 {
     let mut acc = 0.0f64;
     for i in 0..n_atoms {
-        for j in 0..n_atoms { acc += dq[i] * g[i * n_atoms + j] * dq[j]; }
+        for j in 0..n_atoms {
+            acc += dq[i] * g[i * n_atoms + j] * dq[j];
+        }
     }
     0.5 * acc
 }
 fn orb_atom_map(atom_orb_off: &[u16], n_orbs: usize) -> Vec<i32> {
     let mut map = vec![0i32; n_orbs];
     for a in 0..atom_orb_off.len() - 1 {
-        for mu in atom_orb_off[a] as usize..atom_orb_off[a + 1] as usize { map[mu] = a as i32; }
+        for mu in atom_orb_off[a] as usize..atom_orb_off[a + 1] as usize {
+            map[mu] = a as i32;
+        }
     }
     map
 }
 fn load_spline(sk_dir: &str, a: &str, b: &str) -> Option<RepulsiveSpline> {
     let p1 = format!("{sk_dir}/{a}-{b}.skf");
     let p2 = format!("{sk_dir}/{b}-{a}.skf");
-    if Path::new(&p1).exists() { parse_repulsive_spline(&p1).ok().flatten() }
-    else if Path::new(&p2).exists() { parse_repulsive_spline(&p2).ok().flatten() }
-    else { None }
+    if Path::new(&p1).exists() {
+        parse_repulsive_spline(&p1).ok().flatten()
+    } else if Path::new(&p2).exists() {
+        parse_repulsive_spline(&p2).ok().flatten()
+    } else {
+        None
+    }
 }
 
 fn cpu_e_rep(sk_dir: &str, species: &[String], coords: &[[f64; 3]]) -> f64 {
@@ -176,13 +244,18 @@ fn cpu_e_rep(sk_dir: &str, species: &[String], coords: &[[f64; 3]]) -> f64 {
     for i in 0..n {
         for j in i + 1..n {
             let key = (species[i].clone(), species[j].clone());
-            let spline = cache.entry(key.clone()).or_insert_with(|| load_spline(sk_dir, &key.0, &key.1)).clone();
+            let spline = cache
+                .entry(key.clone())
+                .or_insert_with(|| load_spline(sk_dir, &key.0, &key.1))
+                .clone();
             let Some(sp) = spline else { continue };
             let dx = coords[j][0] - coords[i][0];
             let dy = coords[j][1] - coords[i][1];
             let dz = coords[j][2] - coords[i][2];
             let r2 = dx * dx + dy * dy + dz * dz;
-            if r2 < MIN_NEIGH * MIN_NEIGH { continue; }
+            if r2 < MIN_NEIGH * MIN_NEIGH {
+                continue;
+            }
             e += sp.eval(r2.sqrt() * ANG2BOHR).0;
         }
     }
@@ -197,7 +270,9 @@ fn pack_splines(sk_dir: &str, unique: &[String]) -> (Vec<i32>, Vec<f32>, usize) 
     for si in unique {
         for sj in unique {
             let s = load_spline(sk_dir, si, sj);
-            if let Some(ref sp) = s { max_int = max_int.max(sp.x_start.len()); }
+            if let Some(ref sp) = s {
+                max_int = max_int.max(sp.x_start.len());
+            }
             splines.push(s);
         }
     }
@@ -213,17 +288,29 @@ fn pack_splines(sk_dir: &str, unique: &[String]) -> (Vec<i32>, Vec<f32>, usize) 
         data.push(sp.exp_coeffs[0] as f32);
         data.push(sp.exp_coeffs[1] as f32);
         data.push(sp.exp_coeffs[2] as f32);
-        for k in 0..max_int { data.push(if k < n_int { sp.x_start[k] as f32 } else { 0.0 }); }
+        for k in 0..max_int {
+            data.push(if k < n_int { sp.x_start[k] as f32 } else { 0.0 });
+        }
         let n_cubic = max_int.saturating_sub(1);
         for k in 0..n_cubic {
             if k < sp.sp_coeffs.len() {
-                for c in 0..4 { data.push(sp.sp_coeffs[k][c] as f32); }
+                for c in 0..4 {
+                    data.push(sp.sp_coeffs[k][c] as f32);
+                }
             } else {
-                for _ in 0..4 { data.push(0.0); }
+                for _ in 0..4 {
+                    data.push(0.0);
+                }
             }
         }
-        for c in 0..6 { data.push(sp.sp_last_coeffs[c] as f32); }
-        assert_eq!(data.len() - offsets[p] as usize, rec, "spline record length mismatch");
+        for c in 0..6 {
+            data.push(sp.sp_last_coeffs[c] as f32);
+        }
+        assert_eq!(
+            data.len() - offsets[p] as usize,
+            rec,
+            "spline record length mismatch"
+        );
     }
     (offsets, data, max_int)
 }
@@ -245,7 +332,12 @@ fn edm_from_scc(scc: &SccResult) -> DMatrix<f64> {
 
 fn flatten_dm(m: &DMatrix<f64>) -> Vec<f32> {
     let n = m.nrows();
-    (0..n * n).map(|idx| { let i = idx / n; m[(i, idx - i * n)] as f32 }).collect()
+    (0..n * n)
+        .map(|idx| {
+            let i = idx / n;
+            m[(i, idx - i * n)] as f32
+        })
+        .collect()
 }
 
 /// Host replica of `gamma_prime_full_f32` in gpu_forces.cl — bisect kernel vs f32 math.
@@ -256,27 +348,30 @@ fn gamma_prime_full_f32_host(r: f32, u1: f32, u2: f32) -> f32 {
     const C2: f32 = 0.0208333333;
     const MIN_DU: f32 = 1e-4;
     const TOL: f32 = 1e-10;
-    if r < TOL { return 0.0; }
+    if r < TOL {
+        return 0.0;
+    }
     let short_prime = if (u1 - u2).abs() < MIN_DU {
         let tau = TAU * 0.5 * (u1 + u2);
         let e = (-tau * r).exp();
-        let poly = 1.0/r + C0*tau + C1*r*tau*tau + C2*r*r*tau*tau*tau;
-        let poly_p = -1.0/(r*r) + C1*tau*tau + 2.0*C2*r*tau*tau*tau;
-        -tau*e*poly + e*poly_p
+        let poly = 1.0 / r + C0 * tau + C1 * r * tau * tau + C2 * r * r * tau * tau * tau;
+        let poly_p = -1.0 / (r * r) + C1 * tau * tau + 2.0 * C2 * r * tau * tau * tau;
+        -tau * e * poly + e * poly_p
     } else {
         let sub = |t1: f32, t2: f32| -> f32 {
-            let dt2 = t1*t1 - t2*t2;
-            let dt2_sq = dt2*dt2;
-            let dt2_cu = dt2_sq*dt2;
+            let dt2 = t1 * t1 - t2 * t2;
+            let dt2_sq = dt2 * dt2;
+            let dt2_cu = dt2_sq * dt2;
             let term_a = 0.5 * t2.powi(4) * t1 / dt2_sq;
-            let term_b = (t2.powi(6) - 3.0*t2.powi(4)*t1*t1) / (r * dt2_cu);
+            let term_b = (t2.powi(6) - 3.0 * t2.powi(4) * t1 * t1) / (r * dt2_cu);
             let e = (-t1 * r).exp();
-            -t1*e*(term_a - term_b) + e*(term_b/r)
+            -t1 * e * (term_a - term_b) + e * (term_b / r)
         };
-        let tau1 = TAU * u1; let tau2 = TAU * u2;
+        let tau1 = TAU * u1;
+        let tau2 = TAU * u2;
         sub(tau1, tau2) + sub(tau2, tau1)
     };
-    -1.0/(r*r) - short_prime
+    -1.0 / (r * r) - short_prime
 }
 
 fn host_gamma_force_f32(coords: &[[f64; 3]], spc: &[i32], dq: &[f32], u_hub: &[f32]) -> Vec<f32> {
@@ -288,25 +383,36 @@ fn host_gamma_force_f32(coords: &[[f64; 3]], spc: &[i32], dq: &[f32], u_hub: &[f
             let dx = (coords[i][0] - coords[j][0]) as f32;
             let dy = (coords[i][1] - coords[j][1]) as f32;
             let dz = (coords[i][2] - coords[j][2]) as f32;
-            let r2 = dx*dx + dy*dy + dz*dz;
-            if r2 < 1e-10 { continue; }
+            let r2 = dx * dx + dy * dy + dz * dz;
+            if r2 < 1e-10 {
+                continue;
+            }
             let r_ang = r2.sqrt();
             let r_bohr = r_ang * A2B;
-            let si = spc[i] as usize; let sj = spc[j] as usize;
+            let si = spc[i] as usize;
+            let sj = spc[j] as usize;
             let gp = gamma_prime_full_f32_host(r_bohr, u_hub[si], u_hub[sj]);
             let coeff = -dq[i] * dq[j] * gp / r_bohr * A2B * A2B;
-            f[3*i] += coeff * dx; f[3*i+1] += coeff * dy; f[3*i+2] += coeff * dz;
-            f[3*j] -= coeff * dx; f[3*j+1] -= coeff * dy; f[3*j+2] -= coeff * dz;
+            f[3 * i] += coeff * dx;
+            f[3 * i + 1] += coeff * dy;
+            f[3 * i + 2] += coeff * dz;
+            f[3 * j] -= coeff * dx;
+            f[3 * j + 1] -= coeff * dy;
+            f[3 * j + 2] -= coeff * dz;
         }
     }
     f
 }
 
 fn vec_max_abs_diff(a: &[f32], b: &[f32]) -> (f32, usize) {
-    let mut m = 0.0f32; let mut k = 0usize;
+    let mut m = 0.0f32;
+    let mut k = 0usize;
     for i in 0..a.len() {
         let e = (a[i] - b[i]).abs();
-        if e > m { m = e; k = i; }
+        if e > m {
+            m = e;
+            k = i;
+        }
     }
     (m, k)
 }
@@ -314,34 +420,58 @@ fn vec_max_abs_diff(a: &[f32], b: &[f32]) -> (f32, usize) {
 fn force_err(cpu: &[[f64; 3]], gpu: &[f32], label: &str) -> (f64, f64, f64) {
     let n = cpu.len();
     assert_eq!(gpu.len(), 3 * n);
-    let mut max_err = 0.0f64; let mut max_f = 0.0f64; let mut worst = (0usize, 0usize);
+    let mut max_err = 0.0f64;
+    let mut max_f = 0.0f64;
+    let mut worst = (0usize, 0usize);
     for i in 0..n {
         for d in 0..3 {
-            let c = cpu[i][d]; let g = gpu[3 * i + d] as f64;
+            let c = cpu[i][d];
+            let g = gpu[3 * i + d] as f64;
             let e = (c - g).abs();
-            if e > max_err { max_err = e; worst = (i, d); }
+            if e > max_err {
+                max_err = e;
+                worst = (i, d);
+            }
             max_f = max_f.max(c.abs()).max(g.abs());
             eprintln!("  {label} atom {i} dir {d}: cpu={c:.6e} gpu={g:.6e} err={e:.3e}");
         }
     }
-    let rel = if max_f > 1e-12 { max_err / max_f } else { max_err };
-    eprintln!("{label}: max|F|={max_f:.3e} max|err|={max_err:.3e} rel={rel:.3e} worst=atom{} dir{}", worst.0, worst.1);
+    let rel = if max_f > 1e-12 {
+        max_err / max_f
+    } else {
+        max_err
+    };
+    eprintln!(
+        "{label}: max|F|={max_f:.3e} max|err|={max_err:.3e} rel={rel:.3e} worst=atom{} dir{}",
+        worst.0, worst.1
+    );
     (max_err, max_f, rel)
 }
 
 fn newton_sum(gpu: &[f32], n_atoms: usize) -> f64 {
     let mut s = [0.0f64; 3];
-    for i in 0..n_atoms { for d in 0..3 { s[d] += gpu[3 * i + d] as f64; } }
+    for i in 0..n_atoms {
+        for d in 0..3 {
+            s[d] += gpu[3 * i + d] as f64;
+        }
+    }
     s[0].abs().max(s[1].abs()).max(s[2].abs())
 }
 
-fn reconstruct_shifts(coords: &[[f64; 3]], ctx: &SystemContext, delta_q: &[f64], gamma: &GammaTable) -> Vec<f64> {
+fn reconstruct_shifts(
+    coords: &[[f64; 3]],
+    ctx: &SystemContext,
+    delta_q: &[f64],
+    gamma: &GammaTable,
+) -> Vec<f64> {
     let n = coords.len();
     let mut out = vec![0.0f64; n];
     for i in 0..n {
         out[i] = gamma.u(ctx.atom_species[i]) * delta_q[i];
         for j in 0..n {
-            if i == j { continue; }
+            if i == j {
+                continue;
+            }
             let dx = coords[i][0] - coords[j][0];
             let dy = coords[i][1] - coords[j][1];
             let dz = coords[i][2] - coords[j][2];
@@ -352,22 +482,41 @@ fn reconstruct_shifts(coords: &[[f64; 3]], ctx: &SystemContext, delta_q: &[f64],
     out
 }
 
-fn gpu_assemble(sk: &SkData, species: &[String], coords: &[[f64; 3]]) -> (Vec<f32>, Vec<f32>, GpuBatch) {
-    let driver = GpuDriver::new().unwrap_or_else(|e| panic!("GpuDriver::new failed (no skip): {e}"));
+fn gpu_assemble(
+    sk: &SkData,
+    species: &[String],
+    coords: &[[f64; 3]],
+) -> (Vec<f32>, Vec<f32>, GpuBatch) {
+    let driver =
+        GpuDriver::new().unwrap_or_else(|e| panic!("GpuDriver::new failed (no skip): {e}"));
     let gamma = GammaTable::from_sk_data(sk, species).unwrap();
     let frag = make_frag(sk, species, coords);
     let batch = GpuBatch::from_fragments(&[frag], sk, &gamma).unwrap();
-    eprintln!("  assemble: n_frags={} buckets={} total_h={} block_types={:?}",
-        batch.n_frags, batch.pair_buckets.len(), batch.total_h_elements,
-        batch.pair_buckets.iter().map(|b| (b.block_type, b.n_pairs)).collect::<Vec<_>>());
-    let (h, s) = driver.gpu_assemble_batched(&batch)
-        .unwrap_or_else(|e| panic!("gpu_assemble_batched FAILED for species={species:?} n_atoms={}: {e}", species.len()));
+    eprintln!(
+        "  assemble: n_frags={} buckets={} total_h={} block_types={:?}",
+        batch.n_frags,
+        batch.pair_buckets.len(),
+        batch.total_h_elements,
+        batch
+            .pair_buckets
+            .iter()
+            .map(|b| (b.block_type, b.n_pairs))
+            .collect::<Vec<_>>()
+    );
+    let (h, s) = driver.gpu_assemble_batched(&batch).unwrap_or_else(|e| {
+        panic!(
+            "gpu_assemble_batched FAILED for species={species:?} n_atoms={}: {e}",
+            species.len()
+        )
+    });
     (h, s, batch)
 }
 
 fn atom_of_orb(atom_orb_off: &[u16], mu: usize) -> usize {
     for a in 0..atom_orb_off.len() - 1 {
-        if mu >= atom_orb_off[a] as usize && mu < atom_orb_off[a + 1] as usize { return a; }
+        if mu >= atom_orb_off[a] as usize && mu < atom_orb_off[a + 1] as usize {
+            return a;
+        }
     }
     atom_orb_off.len() - 2
 }
@@ -382,18 +531,26 @@ fn check_hs_parity(label: &str, sk: &SkData, species: &[String], coords: &[[f64;
     let sg = extract_replica(&s_flat, 0, n);
     // In-range: r < last SK grid point. Tail: r ≥ last grid (zero-pad / cutoff, no Neville).
     // GPU and CPU must both be ~0 in the tail.
-    let mut d_in = 0.0f64; let mut d_tail = 0.0f64; let mut d_s_in = 0.0f64;
+    let mut d_in = 0.0f64;
+    let mut d_tail = 0.0f64;
+    let mut d_s_in = 0.0f64;
     let mut worst_all = (0usize, 0usize);
-    let mut d_all = 0.0f64; let mut n_tail_cpu_big = 0usize;
+    let mut d_all = 0.0f64;
+    let mut n_tail_cpu_big = 0usize;
     for i in 0..n {
         for j in 0..n {
             let eh = (ham.h0[(i, j)] - hg[(i, j)]).abs();
             let es = (ham.s[(i, j)] - sg[(i, j)]).abs();
-            if eh > d_all { d_all = eh; worst_all = (i, j); }
+            if eh > d_all {
+                d_all = eh;
+                worst_all = (i, j);
+            }
             let ai = atom_of_orb(&tmpl.atom_orb_off, i);
             let aj = atom_of_orb(&tmpl.atom_orb_off, j);
             if ai == aj {
-                if eh > d_in { d_in = eh; }
+                if eh > d_in {
+                    d_in = eh;
+                }
                 d_s_in = d_s_in.max(es);
                 continue;
             }
@@ -401,14 +558,20 @@ fn check_hs_parity(label: &str, sk: &SkData, species: &[String], coords: &[[f64;
             let dy = coords[ai][1] - coords[aj][1];
             let dz = coords[ai][2] - coords[aj][2];
             let r_bohr = (dx * dx + dy * dy + dz * dz).sqrt() * ANG2BOHR;
-            let Some(tab) = sk.get_pair(&species[ai], &species[aj]) else { continue };
+            let Some(tab) = sk.get_pair(&species[ai], &species[aj]) else {
+                continue;
+            };
             let r_grid = tab.h.n_grid() as f64 * tab.h.dr;
             if r_bohr < r_grid {
-                if eh > d_in { d_in = eh; }
+                if eh > d_in {
+                    d_in = eh;
+                }
                 d_s_in = d_s_in.max(es);
             } else {
                 d_tail = d_tail.max(eh);
-                if ham.h0[(i, j)].abs() > 1e-3 { n_tail_cpu_big += 1; }
+                if ham.h0[(i, j)].abs() > 1e-3 {
+                    n_tail_cpu_big += 1;
+                }
             }
         }
     }
@@ -422,12 +585,30 @@ fn check_hs_parity(label: &str, sk: &SkData, species: &[String], coords: &[[f64;
         (dx * dx + dy * dy + dz * dz).sqrt()
     };
     eprintln!("{label}: N={n} in-range max|dH|={d_in:.3e} max|dS|={d_s_in:.3e}  tail max|dH|={d_tail:.3e}  all max|dH|={d_all:.3e}");
-    eprintln!("  worst-all orb ({wi},{wj}) atoms {ai}({})-{aj}({}) r={r_ang:.4} Å", species[ai], species[aj]);
-    eprintln!("    H_cpu={:.6e} H_gpu={:.6e}  S_cpu={:.6e} S_gpu={:.6e}", ham.h0[(wi, wj)], hg[(wi, wj)], ham.s[(wi, wj)], sg[(wi, wj)]);
+    eprintln!(
+        "  worst-all orb ({wi},{wj}) atoms {ai}({})-{aj}({}) r={r_ang:.4} Å",
+        species[ai], species[aj]
+    );
+    eprintln!(
+        "    H_cpu={:.6e} H_gpu={:.6e}  S_cpu={:.6e} S_gpu={:.6e}",
+        ham.h0[(wi, wj)],
+        hg[(wi, wj)],
+        ham.s[(wi, wj)],
+        sg[(wi, wj)]
+    );
     eprintln!("    CPU |H|>1e-3 past last SK grid: {n_tail_cpu_big} elements (must be 0; extra zero knots, not Neville)");
-    assert!(d_in.is_finite() && d_s_in.is_finite(), "{label}: non-finite in-range H/S");
-    assert!(d_in < HS_TOL, "{label} in-range H assembly failed: max|dH|={d_in:.3e} > {HS_TOL:.1e}");
-    assert!(d_s_in < HS_TOL, "{label} in-range S assembly failed: max|dS|={d_s_in:.3e} > {HS_TOL:.1e}");
+    assert!(
+        d_in.is_finite() && d_s_in.is_finite(),
+        "{label}: non-finite in-range H/S"
+    );
+    assert!(
+        d_in < HS_TOL,
+        "{label} in-range H assembly failed: max|dH|={d_in:.3e} > {HS_TOL:.1e}"
+    );
+    assert!(
+        d_s_in < HS_TOL,
+        "{label} in-range S assembly failed: max|dS|={d_s_in:.3e} > {HS_TOL:.1e}"
+    );
     if n_tail_cpu_big > 0 {
         panic!("{label} CPU SK interpolator is unphysical past last grid: {n_tail_cpu_big} elements with |H_cpu|>1e-3 (worst |dH|={d_tail:.3e} H_cpu={:.6e} H_gpu={:.6e} at {}-{} r={r_ang:.4} Å). Tail must be ~0 on both CPU and GPU.",
             ham.h0[(wi, wj)], hg[(wi, wj)], species[ai], species[aj]);
@@ -438,59 +619,112 @@ fn check_hs_parity(label: &str, sk: &SkData, species: &[String], coords: &[[f64;
 fn gpu_e_rep(rt: &mut GpuRuntime, sk_dir: &str, species: &[String], coords: &[[f64; 3]]) -> f32 {
     let unique = unique_species(species);
     let (offsets, data, max_int) = pack_splines(sk_dir, &unique);
-    assert!(!data.is_empty(), "no repulsive splines packed for {species:?} from {sk_dir}");
+    assert!(
+        !data.is_empty(),
+        "no repulsive splines packed for {species:?} from {sk_dir}"
+    );
     let n_atoms = species.len();
-    let crd: Vec<f32> = coords.iter().flat_map(|c| c.iter().map(|&x| (x * ANG2BOHR) as f32)).collect();
+    let crd: Vec<f32> = coords
+        .iter()
+        .flat_map(|c| c.iter().map(|&x| (x * ANG2BOHR) as f32))
+        .collect();
     let spc = species_idx(species, &unique);
-    let source = MATRIX_CL.replace("#define REP_MAX_INTERVALS 30", &format!("#define REP_MAX_INTERVALS {max_int}"));
+    let source = MATRIX_CL.replace(
+        "#define REP_MAX_INTERVALS 30",
+        &format!("#define REP_MAX_INTERVALS {max_int}"),
+    );
     let prog = rt.build_program(&source).unwrap();
     let buf_c = rt.buffer_from_slice(&crd).unwrap();
     let buf_s = rt.buffer_from_slice(&spc).unwrap();
     let buf_o = rt.buffer_from_slice(&offsets).unwrap();
     let buf_d = rt.buffer_from_slice(&data).unwrap();
     let buf_e = rt.zero_buffer::<f32>(1).unwrap();
+    let wids = rt.buffer_from_slice(&[0i32]).unwrap(); // T06 identity
     let wg = 256usize;
-    let k = Kernel::builder().program(&prog).name("repulsive_energy_batched").queue(rt.queue().clone())
-        .global_work_size(wg).local_work_size(wg)
-        .arg(n_atoms as i32).arg(1i32).arg(&buf_c).arg(&buf_s).arg(&buf_o)
-        .arg(unique.len() as i32).arg(&buf_d).arg(&buf_e)
-        .build().unwrap();
-    unsafe { k.enq().unwrap(); }
+    let k = Kernel::builder()
+        .program(&prog)
+        .name("repulsive_energy_batched")
+        .queue(rt.queue().clone())
+        .global_work_size(wg)
+        .local_work_size(wg)
+        .arg(n_atoms as i32)
+        .arg(1i32)
+        .arg(&buf_c)
+        .arg(&buf_s)
+        .arg(&buf_o)
+        .arg(unique.len() as i32)
+        .arg(&buf_d)
+        .arg(&buf_e)
+        .arg(&wids)
+        .build()
+        .unwrap();
+    unsafe {
+        k.enq().unwrap();
+    }
     let mut out = vec![0.0f32; 1];
     rt.read_buffer(&buf_e, &mut out).unwrap();
     out[0]
 }
 
 fn scc_stalled(hist: &[f32; 10], n_iters: usize) -> bool {
-    if n_iters < 25 { return false; }
+    if n_iters < 25 {
+        return false;
+    }
     let (mut rmin, mut rmax) = (f32::INFINITY, 0.0f32);
-    for &r in hist { rmin = rmin.min(r); rmax = rmax.max(r); }
+    for &r in hist {
+        rmin = rmin.min(r);
+        rmax = rmax.max(r);
+    }
     rmin > 1e-6 && rmax < 4.0 * rmin // band, not diving toward 1e-6
 }
 
 fn scc_cpu(sk: &SkData, species: &[String], coords: &[[f64; 3]]) -> SccResult {
-    HamiltonianBuilder::new(sk.clone()).build_scc(species, coords, 200, 1e-9).unwrap()
+    HamiltonianBuilder::new(sk.clone())
+        .build_scc(species, coords, 200, 1e-9)
+        .unwrap()
 }
 
-fn plan_scc(rt: &mut GpuRuntime, sk: &SkData, species: &[String], coords: &[[f64; 3]], scc: &SccResult) -> (GpuSccPlan, Buffer<f32>, Buffer<f32>, Buffer<f32>, Buffer<f32>, Buffer<i32>) {
+fn plan_scc(
+    rt: &mut GpuRuntime,
+    sk: &SkData,
+    species: &[String],
+    coords: &[[f64; 3]],
+    scc: &SccResult,
+) -> (
+    GpuSccPlan,
+    Buffer<f32>,
+    Buffer<f32>,
+    Buffer<f32>,
+    Buffer<f32>,
+    Buffer<i32>,
+) {
     let tmpl = FragmentTemplate::new(sk, species.to_vec(), coords.to_vec()).unwrap();
     let n = scc.h0.nrows();
     let n_atoms = species.len();
     let n_occ = (scc.q0.iter().sum::<f64>() / 2.0).round() as usize;
     let h0 = rt.buffer_from_slice(&flatten_mat(&scc.h0)).unwrap();
     let s = rt.buffer_from_slice(&flatten_mat(&scc.s)).unwrap();
-    let g = rt.buffer_from_slice(&gamma_matrix(coords, &per_atom_u(sk, species))).unwrap();
+    let g = rt
+        .buffer_from_slice(&gamma_matrix(coords, &per_atom_u(sk, species)))
+        .unwrap();
     let q0f: Vec<f32> = scc.q0.iter().map(|&q| q as f32).collect();
     let q0 = rt.buffer_from_slice(&q0f).unwrap();
-    let oa = rt.buffer_from_slice(&orb_atom_map(&tmpl.atom_orb_off, n)).unwrap();
-    let mut plan = GpuSccPlan::new(rt, &s, &h0, &g, &q0, &oa, n, n_atoms, 1).expect("GpuSccPlan::new");
+    let oa = rt
+        .buffer_from_slice(&orb_atom_map(&tmpl.atom_orb_off, n))
+        .unwrap();
+    let mut plan =
+        GpuSccPlan::new(rt, &s, &h0, &g, &q0, &oa, n, n_atoms, 1).expect("GpuSccPlan::new");
     plan.set_initial_charges(rt, &q0f).unwrap();
     let mut rms = f32::INFINITY;
     let mut n_iters = 0;
     for iter in 0..SCC_MAX_ITER {
         n_iters = iter + 1;
-        rms = plan.scc_step_diis(rt, n_occ, 0.3, 1e-6).expect("scc_step_diis");
-        if rms < 1e-6 { break; }
+        rms = plan
+            .scc_step_diis(rt, n_occ, 0.3, 1e-6)
+            .expect("scc_step_diis");
+        if rms < 1e-6 {
+            break;
+        }
     }
     assert!(rms < 1e-6, "GPU SCC did not converge: rms={rms:.3e} after {n_iters} iters (cap {SCC_MAX_ITER}; more iters will not help)");
     eprintln!("  GPU SCC converged in {n_iters} iters, rms={rms:.3e}");
@@ -536,7 +770,11 @@ fn test_hs_assembly_formic_mixed() {
     let sk_dir = require_sk_dir();
     let (sp, xyz) = formic_dimer();
     let sk = load_sk_for_species(&sk_dir, &sp).unwrap();
-    eprintln!("formic dimer: n_atoms={} species={:?}", sp.len(), unique_species(&sp));
+    eprintln!(
+        "formic dimer: n_atoms={} species={:?}",
+        sp.len(),
+        unique_species(&sp)
+    );
     check_hs_parity("formic_dimer", &sk, &sp, &xyz);
 }
 
@@ -576,14 +814,18 @@ fn test_hs_assembly_batch200_h2_replica_cap() {
     let mut cpu_h = Vec::with_capacity(n_rep);
     for r in 0..n_rep {
         let bl = 0.70 + 0.002 * (r as f64);
-        let coords = vec![[r as f64 * 20.0, 0.0, 0.0], [r as f64 * 20.0 + bl, 0.0, 0.0]];
+        let coords = vec![
+            [r as f64 * 20.0, 0.0, 0.0],
+            [r as f64 * 20.0 + bl, 0.0, 0.0],
+        ];
         cpu_h.push(builder.build_non_scc(&species, &coords).unwrap().h0);
         frags.push(make_frag(&sk, &species, &coords));
     }
     let batch = GpuBatch::from_fragments(&frags, &sk, &gamma).unwrap();
     assert_eq!(batch.n_frags, n_rep);
     let driver = GpuDriver::new().unwrap_or_else(|e| panic!("GpuDriver::new: {e}"));
-    let (h_flat, _s_flat) = driver.gpu_assemble_batched(&batch)
+    let (h_flat, _s_flat) = driver
+        .gpu_assemble_batched(&batch)
         .unwrap_or_else(|e| panic!("batch=200 H2 assemble failed: {e}"));
     let n = 2;
     let mut worst = 0.0f64;
@@ -592,11 +834,17 @@ fn test_hs_assembly_batch200_h2_replica_cap() {
     for r in [0usize, 127, 128, 199] {
         let dh = max_abs_mat(&cpu_h[r], &extract_replica(&h_flat, r, n));
         eprintln!("  replica {r}: max|dH|={dh:.3e}");
-        if dh > worst { worst = dh; worst_r = r; }
+        if dh > worst {
+            worst = dh;
+            worst_r = r;
+        }
     }
     eprintln!("batch=200 H2 worst replica {worst_r}: max|dH|={worst:.3e}");
-    assert!(worst < HS_TOL, "batch=200 H/S parity failed at replica {worst_r}: max|dH|={worst:.3e} \
-        (if replica≥128 is uniquely bad, this is the l_frags[128] bug)");
+    assert!(
+        worst < HS_TOL,
+        "batch=200 H/S parity failed at replica {worst_r}: max|dH|={worst:.3e} \
+        (if replica≥128 is uniquely bad, this is the l_frags[128] bug)"
+    );
 }
 
 // ==================================================================
@@ -608,17 +856,38 @@ fn test_hs_assembly_batch200_h2_replica_cap() {
 fn test_cpu_sk_tail_hh_near_zero() {
     let sk_dir = require_sk_dir();
     let sk = load_sk_for_species(&sk_dir, &["H".into()]).unwrap();
-    let tab = sk.get_pair("H", "H").unwrap_or_else(|| panic!("missing H-H SK table in {sk_dir}"));
+    let tab = sk
+        .get_pair("H", "H")
+        .unwrap_or_else(|| panic!("missing H-H SK table in {sk_dir}"));
     let r_grid = tab.h.n_grid() as f64 * tab.h.dr;
     let r_max = tab.cutoff();
-    let mut h = [0.0f64; 4]; let mut s = [0.0f64; 4];
-    tab.eval_shell_integrals_into(0, 0, r_grid + 0.02, &mut h, &mut s).unwrap();
-    eprintln!("CPU H-H ss: n_grid={} dr={} r_grid={r_grid:.4} r_max={r_max:.4}", tab.h.n_grid(), tab.h.dr);
-    eprintln!("  in zero-pad r={:.4}  Hss={:.6e} Sss={:.6e}", r_grid + 0.02, h[0], s[0]);
-    assert!(h[0].abs() < 1e-3, "CPU H-H ss just past last grid is unphysical: Hss={:.6e}", h[0]);
+    let mut h = [0.0f64; 4];
+    let mut s = [0.0f64; 4];
+    tab.eval_shell_integrals_into(0, 0, r_grid + 0.02, &mut h, &mut s)
+        .unwrap();
+    eprintln!(
+        "CPU H-H ss: n_grid={} dr={} r_grid={r_grid:.4} r_max={r_max:.4}",
+        tab.h.n_grid(),
+        tab.h.dr
+    );
+    eprintln!(
+        "  in zero-pad r={:.4}  Hss={:.6e} Sss={:.6e}",
+        r_grid + 0.02,
+        h[0],
+        s[0]
+    );
+    assert!(
+        h[0].abs() < 1e-3,
+        "CPU H-H ss just past last grid is unphysical: Hss={:.6e}",
+        h[0]
+    );
     let r_pair = r_grid + 0.41; // 5.50 Å H-H on AT
-    tab.eval_shell_integrals_into(0, 0, r_pair, &mut h, &mut s).unwrap();
-    eprintln!("  AT-pair r={r_pair:.4}  Hss={:.6e} Sss={:.6e} (must be 0 past r_max)", h[0], s[0]);
+    tab.eval_shell_integrals_into(0, 0, r_pair, &mut h, &mut s)
+        .unwrap();
+    eprintln!(
+        "  AT-pair r={r_pair:.4}  Hss={:.6e} Sss={:.6e} (must be 0 past r_max)",
+        h[0], s[0]
+    );
     assert!(h[0].abs() < 1e-12 && s[0].abs() < 1e-12,
         "H-H at r={r_pair:.4} Bohr is past r_max={r_max:.4} and must be exact 0, got Hss={:.6e} Sss={:.6e}", h[0], s[0]);
 }
@@ -628,29 +897,53 @@ fn test_cpu_sk_tail_hh_near_zero() {
 fn test_cpu_sk_analytic_deriv_hh() {
     let sk_dir = require_sk_dir();
     let sk = load_sk_for_species(&sk_dir, &["H".into()]).unwrap();
-    let tab = sk.get_pair("H", "H").unwrap_or_else(|| panic!("missing H-H SK table in {sk_dir}"));
+    let tab = sk
+        .get_pair("H", "H")
+        .unwrap_or_else(|| panic!("missing H-H SK table in {sk_dir}"));
     let h_step = 1e-6f64;
-    let mut vmax = 0.0f64; let mut dmax = 0.0f64; let mut worst_r = 0.0f64;
-    let mut h = [0.0f64; 4]; let mut s = [0.0f64; 4];
-    let mut dh = [0.0f64; 4]; let mut ds = [0.0f64; 4];
-    let mut hp = [0.0f64; 4]; let mut hm = [0.0f64; 4];
-    let mut sp = [0.0f64; 4]; let mut sm = [0.0f64; 4];
+    let mut vmax = 0.0f64;
+    let mut dmax = 0.0f64;
+    let mut worst_r = 0.0f64;
+    let mut h = [0.0f64; 4];
+    let mut s = [0.0f64; 4];
+    let mut dh = [0.0f64; 4];
+    let mut ds = [0.0f64; 4];
+    let mut hp = [0.0f64; 4];
+    let mut hm = [0.0f64; 4];
+    let mut sp = [0.0f64; 4];
+    let mut sm = [0.0f64; 4];
     // Bonding to mid-range: 1.2–8 Bohr. Skip the last original sample (zero-pad BC).
     let r_last = tab.h.n_grid() as f64 * tab.h.dr - 4.0 * tab.h.dr;
     let mut r = 1.2f64;
     while r < r_last {
-        tab.eval_shell_integrals_and_derivs_into(0, 0, r, &mut h, &mut s, &mut dh, &mut ds).unwrap();
-        tab.eval_shell_integrals_into(0, 0, r + h_step, &mut hp, &mut sp).unwrap();
-        tab.eval_shell_integrals_into(0, 0, r - h_step, &mut hm, &mut sm).unwrap();
+        tab.eval_shell_integrals_and_derivs_into(0, 0, r, &mut h, &mut s, &mut dh, &mut ds)
+            .unwrap();
+        tab.eval_shell_integrals_into(0, 0, r + h_step, &mut hp, &mut sp)
+            .unwrap();
+        tab.eval_shell_integrals_into(0, 0, r - h_step, &mut hm, &mut sm)
+            .unwrap();
         let fd = (hp[0] - hm[0]) / (2.0 * h_step);
         let rel = (dh[0] - fd).abs() / fd.abs().max(1e-8);
-        if rel > vmax { vmax = rel; worst_r = r; dmax = (dh[0] - fd).abs(); }
+        if rel > vmax {
+            vmax = rel;
+            worst_r = r;
+            dmax = (dh[0] - fd).abs();
+        }
         r += 0.37;
     }
-    eprintln!("CPU H-H analytic dHss/dr vs FD: max rel={vmax:.3e} |d|={dmax:.3e} at r={worst_r:.4} Bohr");
-    tab.eval_shell_integrals_and_derivs_into(0, 0, 1.4, &mut h, &mut s, &mut dh, &mut ds).unwrap();
-    eprintln!("  at r=1.4 Bohr (H2 bond): Hss={:.6e} dHss/dr={:.6e}", h[0], dh[0]);
-    assert!(vmax < 1e-6, "CPU analytic SK derivative disagrees with FD of V: rel={vmax:.3e} at r={worst_r:.4}");
+    eprintln!(
+        "CPU H-H analytic dHss/dr vs FD: max rel={vmax:.3e} |d|={dmax:.3e} at r={worst_r:.4} Bohr"
+    );
+    tab.eval_shell_integrals_and_derivs_into(0, 0, 1.4, &mut h, &mut s, &mut dh, &mut ds)
+        .unwrap();
+    eprintln!(
+        "  at r=1.4 Bohr (H2 bond): Hss={:.6e} dHss/dr={:.6e}",
+        h[0], dh[0]
+    );
+    assert!(
+        vmax < 1e-6,
+        "CPU analytic SK derivative disagrees with FD of V: rel={vmax:.3e} at r={worst_r:.4}"
+    );
 }
 
 #[test]
@@ -660,10 +953,20 @@ fn test_e_rep_kernel_h2o() {
     let (sp, xyz) = h2o();
     let e_cpu = cpu_e_rep(&sk_dir, &sp, &xyz);
     let e_gpu = gpu_e_rep(&mut rt, &sk_dir, &sp, &xyz) as f64;
-    eprintln!("H2O E_rep: cpu={e_cpu:.8} gpu={e_gpu:.8} |dE|={:.3e}", (e_cpu - e_gpu).abs());
+    eprintln!(
+        "H2O E_rep: cpu={e_cpu:.8} gpu={e_gpu:.8} |dE|={:.3e}",
+        (e_cpu - e_gpu).abs()
+    );
     assert!(e_cpu.is_finite() && e_gpu.is_finite(), "non-finite E_rep");
-    assert!(e_cpu.abs() > 1e-6, "H2O E_rep unexpectedly ~0 ({e_cpu}) — spline packing or SK files wrong");
-    assert!((e_cpu - e_gpu).abs() < E_REP_TOL, "E_rep kernel parity failed: |dE|={:.3e} cpu={e_cpu} gpu={e_gpu}", (e_cpu - e_gpu).abs());
+    assert!(
+        e_cpu.abs() > 1e-6,
+        "H2O E_rep unexpectedly ~0 ({e_cpu}) — spline packing or SK files wrong"
+    );
+    assert!(
+        (e_cpu - e_gpu).abs() < E_REP_TOL,
+        "E_rep kernel parity failed: |dE|={:.3e} cpu={e_cpu} gpu={e_gpu}",
+        (e_cpu - e_gpu).abs()
+    );
 }
 
 #[test]
@@ -678,13 +981,31 @@ fn test_e_rep_in_scc_energy_h2o() {
     let n_occ = (scc.q0.iter().sum::<f64>() / 2.0).round() as usize;
     let unique = unique_species(&sp);
     let (off, data, max_int) = pack_splines(&sk_dir, &unique);
-    let crd: Vec<f32> = xyz.iter().flat_map(|c| c.iter().map(|&x| (x * ANG2BOHR) as f32)).collect();
+    let crd: Vec<f32> = xyz
+        .iter()
+        .flat_map(|c| c.iter().map(|&x| (x * ANG2BOHR) as f32))
+        .collect();
     let (mut plan, h0, s, g, q0, oa) = plan_scc(&mut rt, &sk, &sp, &xyz, &scc);
-    plan.set_repulsive_splines(&mut rt, &crd, &species_idx(&sp, &unique), &off, &data, unique.len(), max_int)
-        .unwrap_or_else(|e| panic!("set_repulsive_splines failed: {e}"));
+    plan.set_repulsive_splines(
+        &mut rt,
+        &crd,
+        &species_idx(&sp, &unique),
+        &off,
+        &data,
+        unique.len(),
+        max_int,
+    )
+    .unwrap_or_else(|e| panic!("set_repulsive_splines failed: {e}"));
     let e_gpu = plan.compute_energy(&mut rt, n_occ).unwrap()[0] as f64;
-    eprintln!("H2O energy: E_el_cpu={:.8} E_rep={:.8} E_tot_cpu={:.8} E_gpu={:.8}", scc.energy, e_rep, e_tot_cpu, e_gpu);
-    eprintln!("  |E_gpu - E_el|={:.3e}  |E_gpu - E_tot|={:.3e}", (e_gpu - scc.energy).abs(), (e_gpu - e_tot_cpu).abs());
+    eprintln!(
+        "H2O energy: E_el_cpu={:.8} E_rep={:.8} E_tot_cpu={:.8} E_gpu={:.8}",
+        scc.energy, e_rep, e_tot_cpu, e_gpu
+    );
+    eprintln!(
+        "  |E_gpu - E_el|={:.3e}  |E_gpu - E_tot|={:.3e}",
+        (e_gpu - scc.energy).abs(),
+        (e_gpu - e_tot_cpu).abs()
+    );
     assert!((e_gpu - e_tot_cpu).abs() < E_EL_TOL.max(E_REP_TOL),
         "GpuSccPlan::compute_energy must equal E_el + E_rep. |dE|={:.3e} (E_el={:.8} E_rep={:.8} E_gpu={:.8}). \
          If |E_gpu-E_el| ≪ |E_rep|, repulsive energy is not actually added.",
@@ -695,7 +1016,13 @@ fn test_e_rep_in_scc_energy_h2o() {
 // G3.2 — four force components
 // ==================================================================
 
-fn run_force_components(label: &str, sk_dir: &str, sk: &SkData, species: &[String], coords: &[[f64; 3]]) {
+fn run_force_components(
+    label: &str,
+    sk_dir: &str,
+    sk: &SkData,
+    species: &[String],
+    coords: &[[f64; 3]],
+) {
     let mut rt = require_nvidia();
     let driver = GpuForceDriver::new(&mut rt).unwrap();
     let builder = HamiltonianBuilder::new(sk.clone());
@@ -705,51 +1032,89 @@ fn run_force_components(label: &str, sk_dir: &str, sk: &SkData, species: &[Strin
     let gamma = GammaTable::from_sk_data(sk, species).unwrap();
     let unique = unique_species(species);
     let n_atoms = species.len();
-    let delta_q: Vec<f64> = scc.charges.iter().zip(scc.q0.iter()).map(|(q, q0)| q - q0).collect();
+    let delta_q: Vec<f64> = scc
+        .charges
+        .iter()
+        .zip(scc.q0.iter())
+        .map(|(q, q0)| q - q0)
+        .collect();
     let shifts = reconstruct_shifts(coords, &ctx, &delta_q, &gamma);
     let edm = edm_from_scc(&scc);
     let dm_f = flatten_dm(&scc.density);
     let edm_f = flatten_dm(&edm);
     let v_shift: Vec<f32> = shifts.iter().map(|&x| x as f32).collect();
     let dq_f: Vec<f32> = delta_q.iter().map(|&x| x as f32).collect();
-    let u_hub: Vec<f32> = unique.iter().map(|s| sk.onsite(s).unwrap().u_hubbard as f32).collect();
-    let crd_ang: Vec<f32> = coords.iter().flat_map(|c| [c[0] as f32, c[1] as f32, c[2] as f32]).collect();
-    let crd_bohr: Vec<f32> = coords.iter().flat_map(|c| [(c[0] * ANG2BOHR) as f32, (c[1] * ANG2BOHR) as f32, (c[2] * ANG2BOHR) as f32]).collect();
+    let u_hub: Vec<f32> = unique
+        .iter()
+        .map(|s| sk.onsite(s).unwrap().u_hubbard as f32)
+        .collect();
+    let crd_ang: Vec<f32> = coords
+        .iter()
+        .flat_map(|c| [c[0] as f32, c[1] as f32, c[2] as f32])
+        .collect();
+    let crd_bohr: Vec<f32> = coords
+        .iter()
+        .flat_map(|c| {
+            [
+                (c[0] * ANG2BOHR) as f32,
+                (c[1] * ANG2BOHR) as f32,
+                (c[2] * ANG2BOHR) as f32,
+            ]
+        })
+        .collect();
     let spc = species_idx(species, &unique);
     let (off, data, max_int) = pack_splines(sk_dir, &unique);
     let frag = make_frag(sk, species, coords);
     let batch = GpuBatch::from_fragments(&[frag], sk, &gamma).unwrap();
 
-    let f_nonscc = driver.gpu_force_batched(&rt, &batch, &dm_f, &edm_f).unwrap();
-    let f_shift = driver.gpu_scc_shift_force_batched(&rt, &batch, &dm_f, &v_shift).unwrap();
-    let f_gamma = driver.gpu_gamma_deriv_force_batched(&rt, n_atoms, 1, &crd_ang, &spc, &dq_f, &u_hub, unique.len()).unwrap();
+    let f_nonscc = driver
+        .gpu_force_batched(&rt, &batch, &dm_f, &edm_f)
+        .unwrap();
+    let f_shift = driver
+        .gpu_scc_shift_force_batched(&rt, &batch, &dm_f, &v_shift)
+        .unwrap();
+    let f_gamma = driver
+        .gpu_gamma_deriv_force_batched(&rt, n_atoms, 1, &crd_ang, &spc, &dq_f, &u_hub, unique.len())
+        .unwrap();
     let f_gamma_host = host_gamma_force_f32(coords, &spc, &dq_f, &u_hub);
     let (d_gpu_host, k_gh) = vec_max_abs_diff(&f_gamma, &f_gamma_host);
-    let mut d_cpu_host = 0.0f64; let mut k_ch = 0usize;
+    let mut d_cpu_host = 0.0f64;
+    let mut k_ch = 0usize;
     for i in 0..n_atoms {
         for d in 0..3 {
-            let e = (cpu.scc_dc[i][d] - f_gamma_host[3*i+d] as f64).abs();
-            if e > d_cpu_host { d_cpu_host = e; k_ch = 3*i+d; }
+            let e = (cpu.scc_dc[i][d] - f_gamma_host[3 * i + d] as f64).abs();
+            if e > d_cpu_host {
+                d_cpu_host = e;
+                k_ch = 3 * i + d;
+            }
         }
     }
     eprintln!("{label}/gamma bisect: max|GPU-host_f32|={d_gpu_host:.3e} at idx {k_gh}  max|CPU-host_f32|={d_cpu_host:.3e} at idx {k_ch}");
     eprintln!("  unique={unique:?} u_hub={u_hub:?}");
     // Pair dump for the worst CPU-vs-GPU atom (H-bond interface on AT/GC).
-    let mut worst_atom = 0usize; let mut worst_e = 0.0f64;
+    let mut worst_atom = 0usize;
+    let mut worst_e = 0.0f64;
     for i in 0..n_atoms {
         for d in 0..3 {
-            let e = (cpu.scc_dc[i][d] - f_gamma[3*i+d] as f64).abs();
-            if e > worst_e { worst_e = e; worst_atom = i; }
+            let e = (cpu.scc_dc[i][d] - f_gamma[3 * i + d] as f64).abs();
+            if e > worst_e {
+                worst_e = e;
+                worst_atom = i;
+            }
         }
     }
     let mut pair_errs: Vec<(f64, usize, f64, f32, f64)> = Vec::new();
     for j in 0..n_atoms {
-        if j == worst_atom { continue; }
+        if j == worst_atom {
+            continue;
+        }
         let dx = coords[worst_atom][0] - coords[j][0];
         let dy = coords[worst_atom][1] - coords[j][1];
         let dz = coords[worst_atom][2] - coords[j][2];
-        let r_ang = (dx*dx + dy*dy + dz*dz).sqrt();
-        if r_ang < 1e-8 { continue; }
+        let r_ang = (dx * dx + dy * dy + dz * dz).sqrt();
+        if r_ang < 1e-8 {
+            continue;
+        }
         let r_bohr = r_ang * ANG2BOHR;
         let ui = u_hub[spc[worst_atom] as usize] as f64;
         let uj = u_hub[spc[j] as usize] as f64;
@@ -758,28 +1123,57 @@ fn run_force_components(label: &str, sk_dir: &str, sk: &SkData, species: &[Strin
         pair_errs.push(((gp64 - gp32 as f64).abs(), j, r_ang, gp32, gp64));
     }
     pair_errs.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
-    eprintln!("  worst atom {worst_atom} ({}) dq={:.4}  top |γ'_f64-γ'_f32| pairs:", species[worst_atom], delta_q[worst_atom]);
+    eprintln!(
+        "  worst atom {worst_atom} ({}) dq={:.4}  top |γ'_f64-γ'_f32| pairs:",
+        species[worst_atom], delta_q[worst_atom]
+    );
     for (e, j, r, g32, g64) in pair_errs.iter().take(5) {
         eprintln!("    vs atom {j} ({}) r={r:.3} Å  γ'64={g64:.6e} γ'32={g32:.6e} |dγ'|={e:.3e} dq_j={:.4}",
             species[*j], delta_q[*j]);
     }
     // 2-atom kernel: match host_f32 → 30-atom accumulation bug; mismatch → OpenCL γ'.
-    let partners = if n_atoms > 21 { vec![(9usize, 10usize, "NH-cov"), (9, 21, "HO-hbond")] } else { Vec::new() };
+    let partners = if n_atoms > 21 {
+        vec![(9usize, 10usize, "NH-cov"), (9, 21, "HO-hbond")]
+    } else {
+        Vec::new()
+    };
     for (ia, ib, tag) in partners {
         let c2 = [coords[ia], coords[ib]];
-        let crd2: Vec<f32> = c2.iter().flat_map(|c| [c[0] as f32, c[1] as f32, c[2] as f32]).collect();
+        let crd2: Vec<f32> = c2
+            .iter()
+            .flat_map(|c| [c[0] as f32, c[1] as f32, c[2] as f32])
+            .collect();
         let spc2 = vec![spc[ia], spc[ib]];
         let dq2 = vec![dq_f[ia], dq_f[ib]];
-        let g = driver.gpu_gamma_deriv_force_batched(&rt, 2, 1, &crd2, &spc2, &dq2, &u_hub, unique.len()).unwrap();
+        let g = driver
+            .gpu_gamma_deriv_force_batched(&rt, 2, 1, &crd2, &spc2, &dq2, &u_hub, unique.len())
+            .unwrap();
         let h = host_gamma_force_f32(&c2, &spc2, &dq2, &u_hub);
-        let de = (g[0]-h[0]).abs().max((g[1]-h[1]).abs()).max((g[2]-h[2]).abs());
+        let de = (g[0] - h[0])
+            .abs()
+            .max((g[1] - h[1]).abs())
+            .max((g[2] - h[2]).abs());
         eprintln!("  2-atom {tag} {ia}-{ib}: GPU=[{:.6e},{:.6e},{:.6e}] host=[{:.6e},{:.6e},{:.6e}] |d|={de:.3e}",
             g[0], g[1], g[2], h[0], h[1], h[2]);
     }
-    let f_rep = driver.gpu_repulsive_force_batched(&mut rt, n_atoms, 1, &crd_bohr, &spc, &off, &data, unique.len(), max_int).unwrap();
+    let f_rep = driver
+        .gpu_repulsive_force_batched(
+            &mut rt,
+            n_atoms,
+            1,
+            &crd_bohr,
+            &spc,
+            &off,
+            &data,
+            unique.len(),
+            max_int,
+        )
+        .unwrap();
 
     let mut f_tot = vec![0.0f32; 3 * n_atoms];
-    for i in 0..3 * n_atoms { f_tot[i] = f_nonscc[i] + f_shift[i] + f_gamma[i] + f_rep[i]; }
+    for i in 0..3 * n_atoms {
+        f_tot[i] = f_nonscc[i] + f_shift[i] + f_gamma[i] + f_rep[i];
+    }
 
     let (_, _, r0) = force_err(&cpu.non_scc, &f_nonscc, &format!("{label}/nonSCC"));
     let (_, _, r1) = force_err(&cpu.scc_shift, &f_shift, &format!("{label}/shift"));
@@ -789,12 +1183,27 @@ fn run_force_components(label: &str, sk_dir: &str, sk: &SkData, species: &[Strin
     let nsum = newton_sum(&f_tot, n_atoms);
     eprintln!("{label} Newton |ΣF|={nsum:.3e}  max|F|={max_f:.3e}");
 
-    assert!(r0 < FORCE_REL, "{label} non-SCC force rel={r0:.3e} > {FORCE_REL:.1e}");
-    assert!(r1 < FORCE_REL, "{label} SCC-shift force rel={r1:.3e} > {FORCE_REL:.1e} (untested kernel until this test)");
+    assert!(
+        r0 < FORCE_REL,
+        "{label} non-SCC force rel={r0:.3e} > {FORCE_REL:.1e}"
+    );
+    assert!(
+        r1 < FORCE_REL,
+        "{label} SCC-shift force rel={r1:.3e} > {FORCE_REL:.1e} (untested kernel until this test)"
+    );
     assert!(r2 < FORCE_REL, "{label} gamma-deriv force rel={r2:.3e} > {FORCE_REL:.1e} (untested kernel until this test)");
-    assert!(r3 < FORCE_REL, "{label} repulsive force rel={r3:.3e} > {FORCE_REL:.1e} (untested kernel until this test)");
-    assert!(rt_tot < FORCE_REL, "{label} TOTAL force rel={rt_tot:.3e} > {FORCE_REL:.1e}");
-    assert!(nsum < NEWTON_TOL, "{label} Newton 3rd law violated: |ΣF|={nsum:.3e}");
+    assert!(
+        r3 < FORCE_REL,
+        "{label} repulsive force rel={r3:.3e} > {FORCE_REL:.1e} (untested kernel until this test)"
+    );
+    assert!(
+        rt_tot < FORCE_REL,
+        "{label} TOTAL force rel={rt_tot:.3e} > {FORCE_REL:.1e}"
+    );
+    assert!(
+        nsum < NEWTON_TOL,
+        "{label} Newton 3rd law violated: |ΣF|={nsum:.3e}"
+    );
 }
 
 #[test]
@@ -828,7 +1237,10 @@ fn test_force_translation_invariance_h2o() {
     let (sp, xyz0) = h2o();
     let sk = load_sk_for_species(&sk_dir, &sp).unwrap();
     let shift = [0.31, -0.17, 0.22];
-    let xyz1: Vec<[f64; 3]> = xyz0.iter().map(|c| [c[0] + shift[0], c[1] + shift[1], c[2] + shift[2]]).collect();
+    let xyz1: Vec<[f64; 3]> = xyz0
+        .iter()
+        .map(|c| [c[0] + shift[0], c[1] + shift[1], c[2] + shift[2]])
+        .collect();
     let builder = HamiltonianBuilder::new(sk.clone());
     let scc0 = builder.build_scc(&sp, &xyz0, 200, 1e-9).unwrap();
     let scc1 = builder.build_scc(&sp, &xyz1, 200, 1e-9).unwrap();
@@ -836,24 +1248,36 @@ fn test_force_translation_invariance_h2o() {
     let f1 = compute_scc_forces(&builder, &sp, &xyz1, &scc1).unwrap();
     let mut max_d = 0.0f64;
     for i in 0..sp.len() {
-        for d in 0..3 { max_d = max_d.max((f0.forces[i][d] - f1.forces[i][d]).abs()); }
+        for d in 0..3 {
+            max_d = max_d.max((f0.forces[i][d] - f1.forces[i][d]).abs());
+        }
     }
     eprintln!("CPU translation invariance: max|ΔF|={max_d:.3e} (shift={shift:?})");
-    assert!(max_d < 1e-5, "CPU forces not translation-invariant: max|ΔF|={max_d:.3e}");
+    assert!(
+        max_d < 1e-5,
+        "CPU forces not translation-invariant: max|ΔF|={max_d:.3e}"
+    );
 
     let mut rt = require_nvidia();
     let driver = GpuForceDriver::new(&mut rt).unwrap();
     let gamma = GammaTable::from_sk_data(&sk, &sp).unwrap();
     let batch0 = GpuBatch::from_fragments(&[make_frag(&sk, &sp, &xyz0)], &sk, &gamma).unwrap();
     let batch1 = GpuBatch::from_fragments(&[make_frag(&sk, &sp, &xyz1)], &sk, &gamma).unwrap();
-    let dm0 = flatten_dm(&scc0.density); let edm0 = flatten_dm(&edm_from_scc(&scc0));
-    let dm1 = flatten_dm(&scc1.density); let edm1 = flatten_dm(&edm_from_scc(&scc1));
+    let dm0 = flatten_dm(&scc0.density);
+    let edm0 = flatten_dm(&edm_from_scc(&scc0));
+    let dm1 = flatten_dm(&scc1.density);
+    let edm1 = flatten_dm(&edm_from_scc(&scc1));
     let g0 = driver.gpu_force_batched(&rt, &batch0, &dm0, &edm0).unwrap();
     let g1 = driver.gpu_force_batched(&rt, &batch1, &dm1, &edm1).unwrap();
     let mut max_g = 0.0f64;
-    for i in 0..g0.len() { max_g = max_g.max((g0[i] as f64 - g1[i] as f64).abs()); }
+    for i in 0..g0.len() {
+        max_g = max_g.max((g0[i] as f64 - g1[i] as f64).abs());
+    }
     eprintln!("GPU non-SCC translation invariance: max|ΔF|={max_g:.3e}");
-    assert!(max_g < 1e-4, "GPU non-SCC forces not translation-invariant: max|ΔF|={max_g:.3e}");
+    assert!(
+        max_g < 1e-4,
+        "GPU non-SCC forces not translation-invariant: max|ΔF|={max_g:.3e}"
+    );
 }
 
 // ==================================================================
@@ -866,14 +1290,26 @@ fn fd_vs_analytic(label: &str, sk_dir: &str, sk: &SkData, species: &[String], co
     let f = compute_scc_forces(&builder, species, coords, &scc0).unwrap();
     let e0 = scc0.energy + cpu_e_rep(sk_dir, species, coords);
     // Probe the largest force component so the FD signal is well above noise.
-    let mut imax = 0usize; let mut dmax = 0usize; let mut amax = 0.0f64;
+    let mut imax = 0usize;
+    let mut dmax = 0usize;
+    let mut amax = 0.0f64;
     for i in 0..species.len() {
-        for d in 0..3 { if f.forces[i][d].abs() > amax { amax = f.forces[i][d].abs(); imax = i; dmax = d; } }
+        for d in 0..3 {
+            if f.forces[i][d].abs() > amax {
+                amax = f.forces[i][d].abs();
+                imax = i;
+                dmax = d;
+            }
+        }
     }
-    let mut xp = coords.to_vec(); let mut xm = coords.to_vec();
-    xp[imax][dmax] += FD_STEP; xm[imax][dmax] -= FD_STEP;
-    let ep = builder.build_scc(species, &xp, 400, 1e-10).unwrap().energy + cpu_e_rep(sk_dir, species, &xp);
-    let em = builder.build_scc(species, &xm, 400, 1e-10).unwrap().energy + cpu_e_rep(sk_dir, species, &xm);
+    let mut xp = coords.to_vec();
+    let mut xm = coords.to_vec();
+    xp[imax][dmax] += FD_STEP;
+    xm[imax][dmax] -= FD_STEP;
+    let ep = builder.build_scc(species, &xp, 400, 1e-10).unwrap().energy
+        + cpu_e_rep(sk_dir, species, &xp);
+    let em = builder.build_scc(species, &xm, 400, 1e-10).unwrap().energy
+        + cpu_e_rep(sk_dir, species, &xm);
     let fd = -(ep - em) / (2.0 * FD_STEP); // dE/dR = -F
     let ana = f.forces[imax][dmax];
     let rel = (fd - ana).abs() / amax.max(1e-8);
@@ -905,44 +1341,110 @@ fn test_gpu_energy_gradient_h2o() {
     let energy_at = |rt: &mut GpuRuntime, coords: &[[f64; 3]]| -> f64 {
         let scc = scc_cpu(&sk, &sp, coords);
         let n_occ = n_occ_fn(&scc);
-        let crd: Vec<f32> = coords.iter().flat_map(|c| c.iter().map(|&x| (x * ANG2BOHR) as f32)).collect();
+        let crd: Vec<f32> = coords
+            .iter()
+            .flat_map(|c| c.iter().map(|&x| (x * ANG2BOHR) as f32))
+            .collect();
         let (mut plan, h0, s, g, q0, oa) = plan_scc(rt, &sk, &sp, coords, &scc);
-        plan.set_repulsive_splines(rt, &crd, &species_idx(&sp, &unique), &off, &data, unique.len(), max_int).unwrap();
+        plan.set_repulsive_splines(
+            rt,
+            &crd,
+            &species_idx(&sp, &unique),
+            &off,
+            &data,
+            unique.len(),
+            max_int,
+        )
+        .unwrap();
         plan.compute_energy(rt, n_occ).unwrap()[0] as f64
     };
 
     let scc0 = scc_cpu(&sk, &sp, &xyz);
     let builder = HamiltonianBuilder::new(sk.clone());
     let cpu_f = compute_scc_forces(&builder, &sp, &xyz, &scc0).unwrap();
-    let mut imax = 0usize; let mut dmax = 0usize; let mut amax = 0.0f64;
+    let mut imax = 0usize;
+    let mut dmax = 0usize;
+    let mut amax = 0.0f64;
     for i in 0..n_atoms {
-        for d in 0..3 { if cpu_f.forces[i][d].abs() > amax { amax = cpu_f.forces[i][d].abs(); imax = i; dmax = d; } }
+        for d in 0..3 {
+            if cpu_f.forces[i][d].abs() > amax {
+                amax = cpu_f.forces[i][d].abs();
+                imax = i;
+                dmax = d;
+            }
+        }
     }
     let driver = GpuForceDriver::new(&mut rt).unwrap();
     let gamma = GammaTable::from_sk_data(&sk, &sp).unwrap();
     let ctx = SystemContext::from_sk_data(&sk, &sp).unwrap();
-    let delta_q: Vec<f64> = scc0.charges.iter().zip(scc0.q0.iter()).map(|(q, q0)| q - q0).collect();
+    let delta_q: Vec<f64> = scc0
+        .charges
+        .iter()
+        .zip(scc0.q0.iter())
+        .map(|(q, q0)| q - q0)
+        .collect();
     let shifts = reconstruct_shifts(&xyz, &ctx, &delta_q, &gamma);
     let batch = GpuBatch::from_fragments(&[make_frag(&sk, &sp, &xyz)], &sk, &gamma).unwrap();
-    let dm = flatten_dm(&scc0.density); let edm = flatten_dm(&edm_from_scc(&scc0));
+    let dm = flatten_dm(&scc0.density);
+    let edm = flatten_dm(&edm_from_scc(&scc0));
     let v_shift: Vec<f32> = shifts.iter().map(|&x| x as f32).collect();
     let dq_f: Vec<f32> = delta_q.iter().map(|&x| x as f32).collect();
-    let u_hub: Vec<f32> = unique.iter().map(|s| sk.onsite(s).unwrap().u_hubbard as f32).collect();
-    let crd_ang: Vec<f32> = xyz.iter().flat_map(|c| [c[0] as f32, c[1] as f32, c[2] as f32]).collect();
-    let crd_bohr: Vec<f32> = xyz.iter().flat_map(|c| [(c[0] * ANG2BOHR) as f32, (c[1] * ANG2BOHR) as f32, (c[2] * ANG2BOHR) as f32]).collect();
+    let u_hub: Vec<f32> = unique
+        .iter()
+        .map(|s| sk.onsite(s).unwrap().u_hubbard as f32)
+        .collect();
+    let crd_ang: Vec<f32> = xyz
+        .iter()
+        .flat_map(|c| [c[0] as f32, c[1] as f32, c[2] as f32])
+        .collect();
+    let crd_bohr: Vec<f32> = xyz
+        .iter()
+        .flat_map(|c| {
+            [
+                (c[0] * ANG2BOHR) as f32,
+                (c[1] * ANG2BOHR) as f32,
+                (c[2] * ANG2BOHR) as f32,
+            ]
+        })
+        .collect();
     let spc = species_idx(&sp, &unique);
     let f0 = driver.gpu_force_batched(&rt, &batch, &dm, &edm).unwrap();
-    let f1 = driver.gpu_scc_shift_force_batched(&rt, &batch, &dm, &v_shift).unwrap();
-    let f2 = driver.gpu_gamma_deriv_force_batched(&rt, n_atoms, 1, &crd_ang, &spc, &dq_f, &u_hub, unique.len()).unwrap();
-    let f3 = driver.gpu_repulsive_force_batched(&mut rt, n_atoms, 1, &crd_bohr, &spc, &off, &data, unique.len(), max_int).unwrap();
-    let f_gpu = f0[3 * imax + dmax] + f1[3 * imax + dmax] + f2[3 * imax + dmax] + f3[3 * imax + dmax];
+    let f1 = driver
+        .gpu_scc_shift_force_batched(&rt, &batch, &dm, &v_shift)
+        .unwrap();
+    let f2 = driver
+        .gpu_gamma_deriv_force_batched(&rt, n_atoms, 1, &crd_ang, &spc, &dq_f, &u_hub, unique.len())
+        .unwrap();
+    let f3 = driver
+        .gpu_repulsive_force_batched(
+            &mut rt,
+            n_atoms,
+            1,
+            &crd_bohr,
+            &spc,
+            &off,
+            &data,
+            unique.len(),
+            max_int,
+        )
+        .unwrap();
+    let f_gpu =
+        f0[3 * imax + dmax] + f1[3 * imax + dmax] + f2[3 * imax + dmax] + f3[3 * imax + dmax];
     let e0 = energy_at(&mut rt, &xyz);
-    eprintln!("H2O GPU energy-gradient: atom {imax} dir {dmax}  E(R)={e0:.8}  F_gpu={:.6e}  F_cpu={:.6e}", f_gpu, cpu_f.forces[imax][dmax]);
-    assert!(e0.is_finite(), "non-finite GPU energy at undisplaced geometry: {e0}");
+    eprintln!(
+        "H2O GPU energy-gradient: atom {imax} dir {dmax}  E(R)={e0:.8}  F_gpu={:.6e}  F_cpu={:.6e}",
+        f_gpu, cpu_f.forces[imax][dmax]
+    );
+    assert!(
+        e0.is_finite(),
+        "non-finite GPU energy at undisplaced geometry: {e0}"
+    );
 
     let fd_at = |rt: &mut GpuRuntime, h: f64| -> (f64, f64, f64) {
-        let mut xp = xyz.clone(); let mut xm = xyz.clone();
-        xp[imax][dmax] += h; xm[imax][dmax] -= h;
+        let mut xp = xyz.clone();
+        let mut xm = xyz.clone();
+        xp[imax][dmax] += h;
+        xm[imax][dmax] -= h;
         let ep = energy_at(rt, &xp);
         let em = energy_at(rt, &xm);
         let fd = -(ep - em) / (2.0 * h);
@@ -956,8 +1458,10 @@ fn test_gpu_energy_gradient_h2o() {
     let rel = (fd - f_gpu as f64).abs() / amax.max(1e-8);
     eprintln!("  h={h_coarse:.1e} Å  E(+h)={ep:.8} E(-h)={em:.8}  F_fd={fd:.6e}  vs F_gpu rel={rel:.3e}  (diagnostic; O(h²)~1e-3)");
     // Same stencil on CPU E: O(h²) truncation at 1e-2 Å is ~1e-3 even for f64 analytic vs FD.
-    let mut xp = xyz.clone(); let mut xm = xyz.clone();
-    xp[imax][dmax] += h_coarse; xm[imax][dmax] -= h_coarse;
+    let mut xp = xyz.clone();
+    let mut xm = xyz.clone();
+    xp[imax][dmax] += h_coarse;
+    xm[imax][dmax] -= h_coarse;
     let e_cpu0 = scc0.energy + cpu_e_rep(&sk_dir, &sp, &xyz);
     let e_cp = scc_cpu(&sk, &sp, &xp).energy + cpu_e_rep(&sk_dir, &sp, &xp);
     let e_cm = scc_cpu(&sk, &sp, &xm).energy + cpu_e_rep(&sk_dir, &sp, &xm);
@@ -965,10 +1469,19 @@ fn test_gpu_energy_gradient_h2o() {
     let rel_cpu = (fd_cpu - cpu_f.forces[imax][dmax]).abs() / amax.max(1e-8);
     let rel_fd = (fd - fd_cpu).abs() / amax.max(1e-8);
     eprintln!("  CPU same h={h_coarse:.1e} Å  F_fd={fd_cpu:.6e}  vs F_ana rel={rel_cpu:.3e}  (truncation)");
-    eprintln!("  GPU vs CPU energy at R0: |dE|={:.3e}  FD-vs-FD rel={rel_fd:.3e}", (e0 - e_cpu0).abs());
-    assert!(ep.is_finite() && em.is_finite(), "non-finite GPU energy in FD stencil");
-    assert!((f_gpu as f64 - cpu_f.forces[imax][dmax]).abs() / amax.max(1e-8) < FORCE_REL,
-        "GPU total force disagrees with CPU: F_gpu={f_gpu} F_cpu={}", cpu_f.forces[imax][dmax]);
+    eprintln!(
+        "  GPU vs CPU energy at R0: |dE|={:.3e}  FD-vs-FD rel={rel_fd:.3e}",
+        (e0 - e_cpu0).abs()
+    );
+    assert!(
+        ep.is_finite() && em.is_finite(),
+        "non-finite GPU energy in FD stencil"
+    );
+    assert!(
+        (f_gpu as f64 - cpu_f.forces[imax][dmax]).abs() / amax.max(1e-8) < FORCE_REL,
+        "GPU total force disagrees with CPU: F_gpu={f_gpu} F_cpu={}",
+        cpu_f.forces[imax][dmax]
+    );
     // Do not assert F vs FD at h=1e-2 against FD_REL: even CPU analytic vs CPU FD is ~1e-3 there.
     // The f32 energy-surface contract is GPU FD vs CPU FD at the same stencil.
     assert!(rel_fd < FD_REL, "GPU energy FD disagrees with CPU energy FD at h={h_coarse}: rel={rel_fd:.3e} F_fd_gpu={fd} F_fd_cpu={fd_cpu}");
@@ -984,7 +1497,10 @@ fn run_full_chain_scc(label: &str, sk: &SkData, sp: &[String], xyz: &[[f64; 3]],
     let n = scc.h0.nrows();
     let n_atoms = sp.len();
     let n_occ = (scc.q0.iter().sum::<f64>() / 2.0).round() as usize;
-    assert!(n >= min_n, "{label} N={n} < {min_n} — this system is supposed to exercise the tiled N>64 path");
+    assert!(
+        n >= min_n,
+        "{label} N={n} < {min_n} — this system is supposed to exercise the tiled N>64 path"
+    );
     eprintln!("{label} full-chain: n_atoms={n_atoms} N={n} n_occ={n_occ}");
     let (h_flat, s_flat, _) = gpu_assemble(sk, sp, xyz);
     let hg = extract_replica(&h_flat, 0, n);
@@ -995,17 +1511,27 @@ fn run_full_chain_scc(label: &str, sk: &SkData, sp: &[String], xyz: &[[f64; 3]],
     let smax = mat_max_abs(&scc.s);
     let hdiag = (0..n).map(|i| scc.h0[(i, i)].abs()).fold(0.0f64, f64::max);
     eprintln!("  assembled max|dH|={dh:.3e} max|dS|={ds:.3e}");
-    eprintln!("  scale max|H0|={hmax:.4} Ha ({:.3} eV)  max|diag H0|={hdiag:.4} Ha  max|S|={smax:.4}", hmax * 27.211386);
+    eprintln!(
+        "  scale max|H0|={hmax:.4} Ha ({:.3} eV)  max|diag H0|={hdiag:.4} Ha  max|S|={smax:.4}",
+        hmax * 27.211386
+    );
     eprintln!("  assembly ulp ~ max|H|*1e-7 = {:.3e} Ha (H/S is not the energy floor; N~90 floor is occupied ε ~2.5e-5)",
         hmax * 1e-7);
-    assert!(dh < HS_TOL && ds < HS_TOL, "{label} GPU H/S feeding SCC already disagrees: dH={dh:.3e} dS={ds:.3e}");
+    assert!(
+        dh < HS_TOL && ds < HS_TOL,
+        "{label} GPU H/S feeding SCC already disagrees: dH={dh:.3e} dS={ds:.3e}"
+    );
     let tmpl = FragmentTemplate::new(sk, sp.to_vec(), xyz.to_vec()).unwrap();
     let h0 = rt.buffer_from_slice(&h_flat).unwrap();
     let s = rt.buffer_from_slice(&s_flat).unwrap();
-    let g = rt.buffer_from_slice(&gamma_matrix(xyz, &per_atom_u(sk, sp))).unwrap();
+    let g = rt
+        .buffer_from_slice(&gamma_matrix(xyz, &per_atom_u(sk, sp)))
+        .unwrap();
     let q0f: Vec<f32> = scc.q0.iter().map(|&q| q as f32).collect();
     let q0 = rt.buffer_from_slice(&q0f).unwrap();
-    let oa = rt.buffer_from_slice(&orb_atom_map(&tmpl.atom_orb_off, n)).unwrap();
+    let oa = rt
+        .buffer_from_slice(&orb_atom_map(&tmpl.atom_orb_off, n))
+        .unwrap();
     let mut plan = GpuSccPlan::new(&mut rt, &s, &h0, &g, &q0, &oa, n, n_atoms, 1).unwrap();
     plan.set_initial_charges(&rt, &q0f).unwrap();
     let mut rms = f32::INFINITY;
@@ -1013,16 +1539,22 @@ fn run_full_chain_scc(label: &str, sk: &SkData, sp: &[String], xyz: &[[f64; 3]],
     let mut rms_hist = [f32::INFINITY; 10];
     for iter in 0..SCC_MAX_ITER {
         n_iters = iter + 1;
-        rms = plan.scc_step_diis(&mut rt, n_occ, 0.3, 1e-6)
+        rms = plan
+            .scc_step_diis(&mut rt, n_occ, 0.3, 1e-6)
             .unwrap_or_else(|e| panic!("{label} scc_step_diis failed at iter {n_iters}: {e}"));
         rms_hist[n_iters % 10] = rms;
         if n_iters <= 3 || n_iters == 10 || n_iters % 10 == 0 {
             eprintln!("  gpu scc iter {n_iters} rms={rms:.3e}");
         }
-        if rms < 1e-6 { break; }
+        if rms < 1e-6 {
+            break;
+        }
         if scc_stalled(&rms_hist, n_iters) {
             let (mut rmin, mut rmax) = (f32::INFINITY, 0.0f32);
-            for &r in &rms_hist { rmin = rmin.min(r); rmax = rmax.max(r); }
+            for &r in &rms_hist {
+                rmin = rmin.min(r);
+                rmax = rmax.max(r);
+            }
             eprintln!("  gpu scc stalled at iter {n_iters}: last-10 rms in [{rmin:.3e},{rmax:.3e}] — floor or mixer, not more iters");
             break;
         }
@@ -1032,7 +1564,11 @@ fn run_full_chain_scc(label: &str, sk: &SkData, sp: &[String], xyz: &[[f64; 3]],
     }
     let e_gpu = plan.compute_energy(&mut rt, n_occ).unwrap()[0] as f64;
     let q_gpu = plan.read_charges(&rt).unwrap();
-    let dq = q_gpu.iter().zip(scc.charges.iter()).map(|(a, b)| (*a as f64 - b).abs()).fold(0.0, f64::max);
+    let dq = q_gpu
+        .iter()
+        .zip(scc.charges.iter())
+        .map(|(a, b)| (*a as f64 - b).abs())
+        .fold(0.0, f64::max);
     let de = (e_gpu - scc.energy).abs();
     let mut e_h0_k = vec![0.0f32; 1];
     let mut e_dot_k = vec![0.0f32; 1];
@@ -1050,19 +1586,35 @@ fn run_full_chain_scc(label: &str, sk: &SkData, sp: &[String], xyz: &[[f64; 3]],
     let h0_gpu = extract_replica(&h_flat, 0, n);
     let mut h0_gpu_f32 = vec![0.0f32; n * n];
     for i in 0..n {
-        for j in 0..n { h0_gpu_f32[i * n + j] = h0_gpu[(i, j)] as f32; }
+        for j in 0..n {
+            h0_gpu_f32[i * n + j] = h0_gpu[(i, j)] as f32;
+        }
     }
     let e_h0_cpu = (&scc.density * &scc.h0).trace();
-    let dq_cpu: Vec<f64> = scc.charges.iter().zip(scc.q0.iter()).map(|(q, q0)| q - q0).collect();
+    let dq_cpu: Vec<f64> = scc
+        .charges
+        .iter()
+        .zip(scc.q0.iter())
+        .map(|(q, q0)| q - q0)
+        .collect();
     let g_f64 = gamma_matrix_f64(xyz, &per_atom_u(sk, sp));
     let e_scc_cpu = e_scc_dq_g(&dq_cpu, &g_f64, n_atoms);
     let dq_gpu_f64: Vec<f64> = dq_gpu_b.iter().map(|&x| x as f64).collect();
     let e_h0_dgpu_hgpu = frobenius_f32_f64(&d_gpu, &h0_gpu_f32);
     let e_h0_dgpu_hcpu = frobenius_mix(&d_gpu, &scc.h0);
     let e_h0_dcpu_hgpu = frobenius_mix(&d_cpu, &h0_gpu);
-    let e_scc_gpu_host = 0.5 * dq_gpu_b.iter().zip(v_gpu.iter()).map(|(a, b)| *a as f64 * *b as f64).sum::<f64>();
+    let e_scc_gpu_host = 0.5
+        * dq_gpu_b
+            .iter()
+            .zip(v_gpu.iter())
+            .map(|(a, b)| *a as f64 * *b as f64)
+            .sum::<f64>();
     let e_scc_qgpu_gf64 = e_scc_dq_g(&dq_gpu_f64, &g_f64, n_atoms);
-    let dmax = d_gpu.iter().zip(d_cpu.iter()).map(|(a, b)| (*a as f64 - *b as f64).abs()).fold(0.0, f64::max);
+    let dmax = d_gpu
+        .iter()
+        .zip(d_cpu.iter())
+        .map(|(a, b)| (*a as f64 - *b as f64).abs())
+        .fold(0.0, f64::max);
     // Host f64 density from GPU C: isolates f32 Σ_k C_ik C_jk vs eigenvector error.
     let mut c_gpu = vec![0.0f32; n * n];
     let mut occ = vec![0i32; n];
@@ -1074,7 +1626,9 @@ fn run_full_chain_scc(label: &str, sk: &SkData, sp: &[String], xyz: &[[f64; 3]],
         for j in 0..n {
             let mut s = 0.0f64;
             for k in 0..n {
-                if occ[k] == 0 { continue; }
+                if occ[k] == 0 {
+                    continue;
+                }
                 s += c_gpu[i * n + k] as f64 * c_gpu[j * n + k] as f64;
             }
             d_f64[i * n + j] = 2.0 * s;
@@ -1092,7 +1646,9 @@ fn run_full_chain_scc(label: &str, sk: &SkData, sp: &[String], xyz: &[[f64; 3]],
     let mut eps_cpu: Vec<f64> = scc.eigenvalues.iter().copied().collect();
     eps_cpu.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let mut max_deps = 0.0f64;
-    for i in 0..n { max_deps = max_deps.max((eps_gpu[i] as f64 - eps_cpu[i]).abs()); }
+    for i in 0..n {
+        max_deps = max_deps.max((eps_gpu[i] as f64 - eps_cpu[i]).abs());
+    }
     let gap_cpu = eps_cpu[n_occ] - eps_cpu[n_occ - 1];
     let gap_gpu = eps_gpu[n_occ] as f64 - eps_gpu[n_occ - 1] as f64;
     // Host f64 density from GPU C: isolates f32 Σ_k C_ik C_jk vs eigenvector error.
@@ -1106,7 +1662,9 @@ fn run_full_chain_scc(label: &str, sk: &SkData, sp: &[String], xyz: &[[f64; 3]],
         for j in 0..n {
             let mut s = 0.0f64;
             for k in 0..n {
-                if occ[k] == 0 { continue; }
+                if occ[k] == 0 {
+                    continue;
+                }
                 s += c_gpu[i * n + k] as f64 * c_gpu[j * n + k] as f64;
             }
             d_f64[i * n + j] = 2.0 * s;
@@ -1114,41 +1672,75 @@ fn run_full_chain_scc(label: &str, sk: &SkData, sp: &[String], xyz: &[[f64; 3]],
     }
     let mut e_h0_cf64 = 0.0f64;
     for i in 0..n {
-        for j in 0..n { e_h0_cf64 += d_f64[i * n + j] * scc.h0[(i, j)]; }
+        for j in 0..n {
+            e_h0_cf64 += d_f64[i * n + j] * scc.h0[(i, j)];
+        }
     }
-    let dmax_cf64 = d_f64.iter().zip(scc.density.iter()).map(|(a, b)| (a - b).abs()).fold(0.0, f64::max);
+    let dmax_cf64 = d_f64
+        .iter()
+        .zip(scc.density.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0, f64::max);
     let mut eps_gpu = plan.read_eigenvalues(&mut rt).unwrap();
     let mut eps_cpu: Vec<f64> = scc.eigenvalues.iter().copied().collect();
     eps_cpu.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let mut max_deps = 0.0f64;
-    for i in 0..n { max_deps = max_deps.max((eps_gpu[i] as f64 - eps_cpu[i]).abs()); }
+    for i in 0..n {
+        max_deps = max_deps.max((eps_gpu[i] as f64 - eps_cpu[i]).abs());
+    }
     let gap_cpu = eps_cpu[n_occ] - eps_cpu[n_occ - 1];
     let gap_gpu = eps_gpu[n_occ] as f64 - eps_gpu[n_occ - 1] as f64;
     eprintln!("  E_cpu={:.8} Ha ({:.4} eV)  E_gpu={:.8} Ha  |dE|={de:.3e} |dq|={dq:.3e} rms={rms:.3e} iters={n_iters}",
         scc.energy, scc.energy * 27.211386, e_gpu);
     eprintln!("  energy split (Ha):");
-    eprintln!("    CPU     E_h0={e_h0_cpu:.8}  E_scc={e_scc_cpu:.8}  sum={:.8}", e_h0_cpu + e_scc_cpu);
-    eprintln!("    GPU ker E_h0={e_h0_kernel:.8}  E_scc={e_scc_kernel:.8}  sum={:.8}", e_h0_kernel + e_scc_kernel);
-    eprintln!("    host f64(D_gpu,H0_gpu)={e_h0_dgpu_hgpu:.8}  |ker-host|={:.3e}", (e_h0_kernel - e_h0_dgpu_hgpu).abs());
+    eprintln!(
+        "    CPU     E_h0={e_h0_cpu:.8}  E_scc={e_scc_cpu:.8}  sum={:.8}",
+        e_h0_cpu + e_scc_cpu
+    );
+    eprintln!(
+        "    GPU ker E_h0={e_h0_kernel:.8}  E_scc={e_scc_kernel:.8}  sum={:.8}",
+        e_h0_kernel + e_scc_kernel
+    );
+    eprintln!(
+        "    host f64(D_gpu,H0_gpu)={e_h0_dgpu_hgpu:.8}  |ker-host|={:.3e}",
+        (e_h0_kernel - e_h0_dgpu_hgpu).abs()
+    );
     eprintln!("    host f64(D_gpu,H0_cpu)={e_h0_dgpu_hcpu:.8}  host f64(D_cpu,H0_gpu)={e_h0_dcpu_hgpu:.8}");
-    eprintln!("    E_scc host(dq_gpu,V_gpu)={e_scc_gpu_host:.8}  host(dq_gpu,G_f64)={e_scc_qgpu_gf64:.8}");
-    eprintln!("    |dE_h0 ker-cpu|={:.3e}  |dE_scc ker-cpu|={:.3e}  max|D_gpu-D_cpu|={dmax:.3e}",
-        (e_h0_kernel - e_h0_cpu).abs(), (e_scc_kernel - e_scc_cpu).abs());
+    eprintln!(
+        "    E_scc host(dq_gpu,V_gpu)={e_scc_gpu_host:.8}  host(dq_gpu,G_f64)={e_scc_qgpu_gf64:.8}"
+    );
+    eprintln!(
+        "    |dE_h0 ker-cpu|={:.3e}  |dE_scc ker-cpu|={:.3e}  max|D_gpu-D_cpu|={dmax:.3e}",
+        (e_h0_kernel - e_h0_cpu).abs(),
+        (e_scc_kernel - e_scc_cpu).abs()
+    );
     eprintln!("    host f64 D from GPU C: E_h0={e_h0_cf64:.8} |dE_h0 vs CPU|={:.3e} max|D-D_cpu|={dmax_cf64:.3e} n_occ_mask={n_occ_mask}/{n_occ}",
         (e_h0_cf64 - e_h0_cpu).abs());
-    eprintln!("    max|ε_gpu-ε_cpu|={max_deps:.3e}  gap HOMO-LUMO cpu={gap_cpu:.4} gpu={gap_gpu:.4} Ha");
+    eprintln!(
+        "    max|ε_gpu-ε_cpu|={max_deps:.3e}  gap HOMO-LUMO cpu={gap_cpu:.4} gpu={gap_gpu:.4} Ha"
+    );
     let e_band_cpu = 2.0 * eps_cpu[..n_occ].iter().sum::<f64>();
     let e_band_gpu = 2.0 * eps_gpu[..n_occ].iter().map(|x| *x as f64).sum::<f64>();
     let mut v_cpu = vec![0.0f64; n_atoms];
     for i in 0..n_atoms {
-        for j in 0..n_atoms { v_cpu[i] += g_f64[i * n_atoms + j] * dq_cpu[j]; }
+        for j in 0..n_atoms {
+            v_cpu[i] += g_f64[i * n_atoms + j] * dq_cpu[j];
+        }
     }
     let q0v_cpu: f64 = scc.q0.iter().zip(v_cpu.iter()).map(|(q0, v)| q0 * v).sum();
-    let q0v_gpu: f64 = scc.q0.iter().zip(v_gpu.iter()).map(|(q0, v)| q0 * *v as f64).sum();
+    let q0v_gpu: f64 = scc
+        .q0
+        .iter()
+        .zip(v_gpu.iter())
+        .map(|(q0, v)| q0 * *v as f64)
+        .sum();
     // E = Tr(D H0)+½Δq·V  and  Tr(D H_scc)=2Σε_occ = Tr(D H0)+q·V  ⇒  E = 2Σε − ½Δq·V − q0·V
     let e_band_id_cpu = e_band_cpu - e_scc_cpu - q0v_cpu;
     let e_band_id_gpu = e_band_gpu - e_scc_gpu_host - q0v_gpu;
-    eprintln!("    2Σε_occ cpu={e_band_cpu:.8} gpu={e_band_gpu:.8} |d|={:.3e}", (e_band_gpu - e_band_cpu).abs());
+    eprintln!(
+        "    2Σε_occ cpu={e_band_cpu:.8} gpu={e_band_gpu:.8} |d|={:.3e}",
+        (e_band_gpu - e_band_cpu).abs()
+    );
     eprintln!("    E from 2Σε−½ΔqV−q0V: cpu={e_band_id_cpu:.8} (|vs E_cpu|={:.3e}) gpu={e_band_id_gpu:.8} (|vs E_cpu|={:.3e})",
         (e_band_id_cpu - scc.energy).abs(), (e_band_id_gpu - scc.energy).abs());
     let e_tol = if n >= 80 { E_EL_FLOOR_N90 } else { E_EL_TOL };
@@ -1156,12 +1748,21 @@ fn run_full_chain_scc(label: &str, sk: &SkData, sp: &[String], xyz: &[[f64; 3]],
     eprintln!("  FLOOR  |dE|={de:.3e} Ha ({:.3} meV)  max|δε|={max_deps:.3e}  |dq|={dq:.3e}  rms={rms:.3e}  max|ΔD|={dmax:.3e}  2Σδε={:.3e}  contract |dE|<{e_tol:.1e} (N={n}; N>=80 is eigen-floor regression, not f64 parity)",
         de * 27_211.386, e_band_gpu - e_band_cpu);
     assert!(de < e_tol, "{label} full-chain |dE|={de:.3e} > {e_tol:.1e} — GPU SCC disagrees with CPU beyond the f32 eigen-floor regression line (rms={rms:.3e} max|δε|={max_deps:.3e}). See f32_floor_dense_hbond.md");
-    assert!(dq < Q_TOL, "{label} full-chain |dq|={dq:.3e} > {Q_TOL:.1e} (rms={rms:.3e})");
+    assert!(
+        dq < Q_TOL,
+        "{label} full-chain |dq|={dq:.3e} > {Q_TOL:.1e} (rms={rms:.3e})"
+    );
     if n >= 80 {
-        assert!(rms < 1e-4, "{label} GPU SCC diverged: rms={rms:.3e} (measured f32 floor ~7e-6, not {rms:.3e})");
+        assert!(
+            rms < 1e-4,
+            "{label} GPU SCC diverged: rms={rms:.3e} (measured f32 floor ~7e-6, not {rms:.3e})"
+        );
         eprintln!("  N>=80 rms contract: <1e-4 (measured plateau ~7e-6); did not require <1e-6. rms={rms:.3e}");
     } else {
-        assert!(rms < 1e-6, "{label} full-chain SCC did not converge: rms={rms:.3e} iters={n_iters} N={n}");
+        assert!(
+            rms < 1e-6,
+            "{label} full-chain SCC did not converge: rms={rms:.3e} iters={n_iters} N={n}"
+        );
     }
 }
 
@@ -1171,7 +1772,9 @@ fn edm_from_c_eps_occ(c: &[f32], eps: &[f32], occ: &[i32], n: usize) -> Vec<f32>
         for j in 0..n {
             let mut s = 0.0f32;
             for k in 0..n {
-                if occ[k] == 0 { continue; }
+                if occ[k] == 0 {
+                    continue;
+                }
                 s += 2.0 * eps[k] * c[i * n + k] * c[j * n + k];
             }
             w[i * n + j] = s;
@@ -1222,18 +1825,27 @@ fn test_full_chain_gpu_p_then_forces_h2o() {
     let tmpl = FragmentTemplate::new(&sk, sp.clone(), xyz.clone()).unwrap();
     let h0 = rt.buffer_from_slice(&h_flat).unwrap();
     let s = rt.buffer_from_slice(&s_flat).unwrap();
-    let g = rt.buffer_from_slice(&gamma_matrix(&xyz, &per_atom_u(&sk, &sp))).unwrap();
+    let g = rt
+        .buffer_from_slice(&gamma_matrix(&xyz, &per_atom_u(&sk, &sp)))
+        .unwrap();
     let q0f: Vec<f32> = scc.q0.iter().map(|&q| q as f32).collect();
     let q0 = rt.buffer_from_slice(&q0f).unwrap();
-    let oa = rt.buffer_from_slice(&orb_atom_map(&tmpl.atom_orb_off, n)).unwrap();
+    let oa = rt
+        .buffer_from_slice(&orb_atom_map(&tmpl.atom_orb_off, n))
+        .unwrap();
     let mut plan = GpuSccPlan::new(&mut rt, &s, &h0, &g, &q0, &oa, n, n_atoms, 1).unwrap();
     plan.set_initial_charges(&rt, &q0f).unwrap();
     let mut rms = f32::INFINITY;
     for _ in 0..SCC_MAX_ITER {
         rms = plan.scc_step_diis(&mut rt, n_occ, 0.3, 1e-6).unwrap();
-        if rms < 1e-6 { break; }
+        if rms < 1e-6 {
+            break;
+        }
     }
-    assert!(rms < 1e-6, "H2O SCC for force chain did not converge: rms={rms:.3e} (cap {SCC_MAX_ITER})");
+    assert!(
+        rms < 1e-6,
+        "H2O SCC for force chain did not converge: rms={rms:.3e} (cap {SCC_MAX_ITER})"
+    );
     let _e = plan.compute_energy(&mut rt, n_occ).unwrap();
     let mut p = vec![0.0f32; n * n];
     let mut c = vec![0.0f32; n * n];
@@ -1250,23 +1862,63 @@ fn test_full_chain_gpu_p_then_forces_h2o() {
     let w = edm_from_c_eps_occ(&c, &eps, &occ, n);
     let n_occ_mask: i32 = occ.iter().sum();
     eprintln!("H2O GPU P/W force chain: N={n} n_occ={n_occ} occ_mask_sum={n_occ_mask}");
-    assert_eq!(n_occ_mask as usize, n_occ, "occupation mask sum {n_occ_mask} != n_occ {n_occ}");
+    assert_eq!(
+        n_occ_mask as usize, n_occ,
+        "occupation mask sum {n_occ_mask} != n_occ {n_occ}"
+    );
     let builder = HamiltonianBuilder::new(sk.clone());
     let cpu_f = compute_scc_forces(&builder, &sp, &xyz, &scc).unwrap();
-    let max_dp = flatten_dm(&scc.density).iter().zip(p.iter()).map(|(a, b)| (*a as f64 - *b as f64).abs()).fold(0.0, f64::max);
+    let max_dp = flatten_dm(&scc.density)
+        .iter()
+        .zip(p.iter())
+        .map(|(a, b)| (*a as f64 - *b as f64).abs())
+        .fold(0.0, f64::max);
     eprintln!("  max|P_gpu - P_cpu|={max_dp:.3e}");
     let driver = GpuForceDriver::new(&mut rt).unwrap();
     let (off, data, max_int) = pack_splines(&sk_dir, &unique);
-    let u_hub: Vec<f32> = unique.iter().map(|s| sk.onsite(s).unwrap().u_hubbard as f32).collect();
-    let crd_ang: Vec<f32> = xyz.iter().flat_map(|c| [c[0] as f32, c[1] as f32, c[2] as f32]).collect();
-    let crd_bohr: Vec<f32> = xyz.iter().flat_map(|c| [(c[0] * ANG2BOHR) as f32, (c[1] * ANG2BOHR) as f32, (c[2] * ANG2BOHR) as f32]).collect();
+    let u_hub: Vec<f32> = unique
+        .iter()
+        .map(|s| sk.onsite(s).unwrap().u_hubbard as f32)
+        .collect();
+    let crd_ang: Vec<f32> = xyz
+        .iter()
+        .flat_map(|c| [c[0] as f32, c[1] as f32, c[2] as f32])
+        .collect();
+    let crd_bohr: Vec<f32> = xyz
+        .iter()
+        .flat_map(|c| {
+            [
+                (c[0] * ANG2BOHR) as f32,
+                (c[1] * ANG2BOHR) as f32,
+                (c[2] * ANG2BOHR) as f32,
+            ]
+        })
+        .collect();
     let spc = species_idx(&sp, &unique);
     let f0 = driver.gpu_force_batched(&rt, &batch, &p, &w).unwrap();
-    let f1 = driver.gpu_scc_shift_force_batched(&rt, &batch, &p, &v_shift).unwrap();
-    let f2 = driver.gpu_gamma_deriv_force_batched(&rt, n_atoms, 1, &crd_ang, &spc, &dq, &u_hub, unique.len()).unwrap();
-    let f3 = driver.gpu_repulsive_force_batched(&mut rt, n_atoms, 1, &crd_bohr, &spc, &off, &data, unique.len(), max_int).unwrap();
+    let f1 = driver
+        .gpu_scc_shift_force_batched(&rt, &batch, &p, &v_shift)
+        .unwrap();
+    let f2 = driver
+        .gpu_gamma_deriv_force_batched(&rt, n_atoms, 1, &crd_ang, &spc, &dq, &u_hub, unique.len())
+        .unwrap();
+    let f3 = driver
+        .gpu_repulsive_force_batched(
+            &mut rt,
+            n_atoms,
+            1,
+            &crd_bohr,
+            &spc,
+            &off,
+            &data,
+            unique.len(),
+            max_int,
+        )
+        .unwrap();
     let mut f_tot = vec![0.0f32; 3 * n_atoms];
-    for i in 0..3 * n_atoms { f_tot[i] = f0[i] + f1[i] + f2[i] + f3[i]; }
+    for i in 0..3 * n_atoms {
+        f_tot[i] = f0[i] + f1[i] + f2[i] + f3[i];
+    }
     let (_, _, rel) = force_err(&cpu_f.forces, &f_tot, "H2O/full-chain TOTAL");
     let nsum = newton_sum(&f_tot, n_atoms);
     eprintln!("  Newton |ΣF|={nsum:.3e}");
@@ -1287,9 +1939,19 @@ fn test_scc_electronic_parity_tight_h2o_cpu_fed() {
     let e = plan.compute_energy(&mut rt, n_occ).unwrap()[0] as f64;
     let q = plan.read_charges(&rt).unwrap();
     let de = (e - scc.energy).abs();
-    let dq = q.iter().zip(scc.charges.iter()).map(|(a, b)| (*a as f64 - b).abs()).fold(0.0, f64::max);
-    eprintln!("CPU-fed H2O SCC: E_cpu={:.8} E_gpu={:.8} |dE|={de:.3e} |dq|={dq:.3e}", scc.energy, e);
-    assert!(de < E_EL_TOL, "CPU-fed SCC |dE|={de:.3e} > {E_EL_TOL:.1e} (old tests allowed 1e-3)");
+    let dq = q
+        .iter()
+        .zip(scc.charges.iter())
+        .map(|(a, b)| (*a as f64 - b).abs())
+        .fold(0.0, f64::max);
+    eprintln!(
+        "CPU-fed H2O SCC: E_cpu={:.8} E_gpu={:.8} |dE|={de:.3e} |dq|={dq:.3e}",
+        scc.energy, e
+    );
+    assert!(
+        de < E_EL_TOL,
+        "CPU-fed SCC |dE|={de:.3e} > {E_EL_TOL:.1e} (old tests allowed 1e-3)"
+    );
     assert!(dq < Q_TOL, "CPU-fed SCC |dq|={dq:.3e} > {Q_TOL:.1e}");
 }
 
@@ -1329,21 +1991,30 @@ fn test_gc_ptscan_pes_forces_vs_cpu() {
 
     // Scan coordinate: donor N8 (idx 8), transferring H13 (idx 13),
     // acceptor N20 (idx 20) — same triplet as test_gpu_ptscan_gc.rhai.
-    assert_eq!(sp[8], "N"); assert_eq!(sp[13], "H"); assert_eq!(sp[20], "N");
+    assert_eq!(sp[8], "N");
+    assert_eq!(sp[13], "H");
+    assert_eq!(sp[20], "N");
     let mut u = [0.0f64; 3];
-    for c in 0..3 { u[c] = base[20][c] - base[8][c]; }
+    for c in 0..3 {
+        u[c] = base[20][c] - base[8][c];
+    }
     let unn = (u[0] * u[0] + u[1] * u[1] + u[2] * u[2]).sqrt();
-    for c in 0..3 { u[c] /= unn; }
+    for c in 0..3 {
+        u[c] /= unn;
+    }
 
     const N_PTS: usize = 19;
     const D0: f64 = 1.0;
     const DSTEP: f64 = 0.05;
     const KT: f32 = 0.002;
     let d_vals: Vec<f64> = (0..N_PTS).map(|i| D0 + i as f64 * DSTEP).collect();
-    let geoms: Vec<Vec<[f64; 3]>> = d_vals.iter()
+    let geoms: Vec<Vec<[f64; 3]>> = d_vals
+        .iter()
         .map(|&d| {
             let mut g = base.clone();
-            for c in 0..3 { g[13][c] = base[8][c] + u[c] * d; }
+            for c in 0..3 {
+                g[13][c] = base[8][c] + u[c] * d;
+            }
             g
         })
         .collect();
@@ -1354,9 +2025,18 @@ fn test_gc_ptscan_pes_forces_vs_cpu() {
     let mut eng = GpuDftb::new(sk.clone(), &dir, sp.clone(), all, N_PTS)
         .unwrap_or_else(|e| panic!("GpuDftb::new: {e}"));
     eng.set_smearing(KT);
-    let s = eng.scc(100, 1e-6).unwrap_or_else(|e| panic!("scan scc: {e}"));
-    eprintln!("[PTSCAN] GPU scc: iters={} rms={:.3e} statuses={:?}", s.n_iters, s.rms, s.statuses);
-    let n_failed = s.statuses.iter().filter(|st| **st == SccStatus::Failed).count();
+    let s = eng
+        .scc(100, 1e-6)
+        .unwrap_or_else(|e| panic!("scan scc: {e}"));
+    eprintln!(
+        "[PTSCAN] GPU scc: iters={} rms={:.3e} statuses={:?}",
+        s.n_iters, s.rms, s.statuses
+    );
+    let n_failed = s
+        .statuses
+        .iter()
+        .filter(|st| **st == SccStatus::Failed)
+        .count();
     assert_eq!(n_failed, 0, "{n_failed}/{N_PTS} scan replicas failed SCC");
     let ev = eng.eval(true).unwrap_or_else(|e| panic!("scan eval: {e}"));
     let f_gpu = ev.forces.as_ref().expect("eval(true) returns forces");
@@ -1364,7 +2044,11 @@ fn test_gc_ptscan_pes_forces_vs_cpu() {
 
     // --- CPU f64 reference per point (independent SCC, same smearing) ---
     let mut unique: Vec<String> = Vec::new();
-    for s_ in &sp { if !unique.contains(s_) { unique.push(s_.clone()); } }
+    for s_ in &sp {
+        if !unique.contains(s_) {
+            unique.push(s_.clone());
+        }
+    }
     let repulsive = parse_all_repulsive(&dir, &unique, unique.len())
         .unwrap_or_else(|e| panic!("parse_all_repulsive: {e}"));
     let mut cpu = DftbCpu::new(sk, sp.clone()).unwrap_or_else(|e| panic!("DftbCpu::new: {e}"));
@@ -1372,7 +2056,8 @@ fn test_gc_ptscan_pes_forces_vs_cpu() {
     let mut e_cpu = Vec::with_capacity(N_PTS);
     let mut f_cpu: Vec<[f64; 3]> = Vec::with_capacity(N_PTS * n_atoms);
     for (i, g) in geoms.iter().enumerate() {
-        cpu.update_geometry(g).unwrap_or_else(|e| panic!("cpu update_geometry pt {i}: {e}"));
+        cpu.update_geometry(g)
+            .unwrap_or_else(|e| panic!("cpu update_geometry pt {i}: {e}"));
         cpu.reset_charges();
         // tol=1e-8: the f64 DIIS hits a limit-cycle floor ~1e-8 rms at the
         // mid-transfer point (measured — see debug/ptscan_conv.log); tighter
@@ -1380,11 +2065,15 @@ fn test_gc_ptscan_pes_forces_vs_cpu() {
         // burn time on the plateau. 1e-8 charge-rms is ~100× below the f32
         // energy/force errors being measured, so the reference is exact for
         // this comparison.
-        cpu.solve_scc(200, 1e-8).unwrap_or_else(|e| panic!("cpu scc pt {i} (d={:.2}): {e}", d_vals[i]));
+        cpu.solve_scc(200, 1e-8)
+            .unwrap_or_else(|e| panic!("cpu scc pt {i} (d={:.2}): {e}", d_vals[i]));
         let scc = cpu.build_result();
-        let e_rep = repulsive_energy(&dir, &sp, g).unwrap_or_else(|e| panic!("cpu e_rep pt {i}: {e}"));
+        let e_rep =
+            repulsive_energy(&dir, &sp, g).unwrap_or_else(|e| panic!("cpu e_rep pt {i}: {e}"));
         e_cpu.push(scc.energy + e_rep);
-        let fo = cpu.compute_forces(&scc, &repulsive).unwrap_or_else(|e| panic!("cpu forces pt {i}: {e}"));
+        let fo = cpu
+            .compute_forces(&scc, &repulsive)
+            .unwrap_or_else(|e| panic!("cpu forces pt {i}: {e}"));
         f_cpu.extend_from_slice(&fo.forces);
     }
 
@@ -1408,11 +2097,23 @@ fn test_gc_ptscan_pes_forces_vs_cpu() {
         }
         let rms_f = (sf / (3 * n_atoms) as f64).sqrt();
         // Projected scan force: F(H13)·û.  dE/dd = −F·û (H moves along û).
-        let fs_g: f64 = (0..3).map(|c| f_gpu[(i * n_atoms + 13) * 3 + c] as f64 * u[c]).sum();
+        let fs_g: f64 = (0..3)
+            .map(|c| f_gpu[(i * n_atoms + 13) * 3 + c] as f64 * u[c])
+            .sum();
         let fs_c: f64 = (0..3).map(|c| f_cpu[i * n_atoms + 13][c] * u[c]).sum();
         let dfs = (fs_g - fs_c).abs();
-        eprintln!("[PTSCAN] d={:.2}  {:+.9}  {:+.9}  {:.3e}  {:+8.3}  {:.3e}  {:.3e}  {:+.5}  {:+.5}",
-            d_vals[i], e_gpu[i], e_cpu[i], de, dde * 27.2114 * 1000.0, mf, rms_f, fs_g, fs_c);
+        eprintln!(
+            "[PTSCAN] d={:.2}  {:+.9}  {:+.9}  {:.3e}  {:+8.3}  {:.3e}  {:.3e}  {:+.5}  {:+.5}",
+            d_vals[i],
+            e_gpu[i],
+            e_cpu[i],
+            de,
+            dde * 27.2114 * 1000.0,
+            mf,
+            rms_f,
+            fs_g,
+            fs_c
+        );
         max_de = max_de.max(de);
         max_dde = max_dde.max(dde);
         rms_dde += dde * dde;
@@ -1425,7 +2126,9 @@ fn test_gc_ptscan_pes_forces_vs_cpu() {
     // vs analytic F(H13)·û, separately for GPU and CPU.
     let (mut fd_g, mut fd_c) = (0.0f64, 0.0f64);
     for i in 1..N_PTS - 1 {
-        let fs_g: f64 = (0..3).map(|c| f_gpu[(i * n_atoms + 13) * 3 + c] as f64 * u[c]).sum();
+        let fs_g: f64 = (0..3)
+            .map(|c| f_gpu[(i * n_atoms + 13) * 3 + c] as f64 * u[c])
+            .sum();
         let fs_c: f64 = (0..3).map(|c| f_cpu[i * n_atoms + 13][c] * u[c]).sum();
         fd_g = fd_g.max((-(e_gpu[i + 1] - e_gpu[i - 1]) / (2.0 * DSTEP) - fs_g).abs());
         fd_c = fd_c.max((-(e_cpu[i + 1] - e_cpu[i - 1]) / (2.0 * DSTEP) - fs_c).abs());
@@ -1442,10 +2145,22 @@ fn test_gc_ptscan_pes_forces_vs_cpu() {
     eprintln!("[PTSCAN] barrier: gpu={:.4} Ha ({:.2} kcal/mol)  cpu={:.4} Ha ({:.2} kcal/mol)  err={:.3} meV",
         bar_g, bar_g * 627.509, bar_c, bar_c * 627.509, (bar_g - bar_c).abs() * 27.2114 * 1000.0);
 
-    assert!(e_gpu.iter().all(|e| e.is_finite()), "non-finite GPU energy in scan");
+    assert!(
+        e_gpu.iter().all(|e| e.is_finite()),
+        "non-finite GPU energy in scan"
+    );
     // Regression lines, ~3–5× the measured f32 floor — not parity claims.
     // GC PT-scan measured max|ΔΔE|≈3.7e-6; GC forces measured ~5e-6.
-    assert!(max_dde < 5e-5, "PES-shape error {max_dde:.3e} Ha — f32 error is NOT a constant offset");
-    assert!(max_df < 1e-3, "force parity failed: max|dF|={max_df:.3e} Ha/Å");
-    assert!(fd_g < 1e-2 && fd_c < 1e-2, "FD-vs-analytic force inconsistency: gpu={fd_g:.3e} cpu={fd_c:.3e} Ha/Å");
+    assert!(
+        max_dde < 5e-5,
+        "PES-shape error {max_dde:.3e} Ha — f32 error is NOT a constant offset"
+    );
+    assert!(
+        max_df < 1e-3,
+        "force parity failed: max|dF|={max_df:.3e} Ha/Å"
+    );
+    assert!(
+        fd_g < 1e-2 && fd_c < 1e-2,
+        "FD-vs-analytic force inconsistency: gpu={fd_g:.3e} cpu={fd_c:.3e} Ha/Å"
+    );
 }

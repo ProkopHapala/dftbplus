@@ -173,7 +173,15 @@ impl GpuBatch {
         let gamma_neigh = build_gamma_neigh(&all_coords, &atom_species, gamma_table, &gpu_frags);
 
         // 6. Pair buckets (cross-fragment, SK cutoff)
-        let pair_buckets = build_pair_buckets(fragments, &gpu_frags, &all_coords, &atom_species, sk_data, &sk_tables, &species_to_global)?;
+        let pair_buckets = build_pair_buckets(
+            fragments,
+            &gpu_frags,
+            &all_coords,
+            &atom_species,
+            sk_data,
+            &sk_tables,
+            &species_to_global,
+        )?;
 
         Ok(Self {
             n_frags: fragments.len(),
@@ -253,7 +261,7 @@ pub(crate) fn pack_sk_tables(
             let n_sk_cols = match block_type {
                 0 => 1,
                 1 => 2,
-                2 => 5,  // (ss, sp, pp_sig, pp_pi, ps) — ps from reverse table
+                2 => 5, // (ss, sp, pp_sig, pp_pi, ps) — ps from reverse table
                 _ => unreachable!(),
             };
 
@@ -393,7 +401,11 @@ fn extract_shell_old_or_new(
 ) -> ([f64; 2], [f64; 2], usize) {
     use crate::methods::dftb::sk_data::sk_map;
 
-    let (l_min, l_max) = if ang1 <= ang2 { (ang1, ang2) } else { (ang2, ang1) };
+    let (l_min, l_max) = if ang1 <= ang2 {
+        (ang1, ang2)
+    } else {
+        (ang2, ang1)
+    };
     let n_mm = (l_min + 1) as usize;
 
     let is_extended = h_all.len() == 20;
@@ -444,7 +456,10 @@ pub(crate) fn determine_block_type(ang_i: &[i32], ang_j: &[i32]) -> u8 {
         (1, 1) => 0,
         (1, 4) | (4, 1) => 1,
         (4, 4) => 2,
-        _ => panic!("gpu_prep: unsupported orbital count ({}, {})", n_orb_i, n_orb_j),
+        _ => panic!(
+            "gpu_prep: unsupported orbital count ({}, {})",
+            n_orb_i, n_orb_j
+        ),
     }
 }
 
@@ -480,7 +495,8 @@ fn build_gamma_neigh(
                 }
                 let gb = off + b;
                 let sp_b = atom_species[gb] as u8;
-                let cutoff = gamma_table.cutoffs[sp_a as usize * gamma_table.n_species + sp_b as usize];
+                let cutoff =
+                    gamma_table.cutoffs[sp_a as usize * gamma_table.n_species + sp_b as usize];
                 let cutoff_sq = cutoff * cutoff;
 
                 let dx = all_coords[gb][0] - pos_a[0];
@@ -552,7 +568,9 @@ fn build_pair_buckets(
     let mut sk_cutoff = 0.0f64;
     for (_, tab) in &sk_data.pairs {
         let c = tab.cutoff();
-        if c > sk_cutoff { sk_cutoff = c; }
+        if c > sk_cutoff {
+            sk_cutoff = c;
+        }
     }
     let sk_cutoff_sq = sk_cutoff * sk_cutoff;
 
@@ -612,15 +630,23 @@ fn build_pair_buckets(
                     if block_type == 1 && n_orb_i == 4 && n_orb_j == 1 {
                         // swap so s is i
                         (
-                            j as u16, i as u16,
-                            orb_off_j, orb_off_i,
-                            (-dx * inv_r) as f32, (-dy * inv_r) as f32, (-dz * inv_r) as f32,
+                            j as u16,
+                            i as u16,
+                            orb_off_j,
+                            orb_off_i,
+                            (-dx * inv_r) as f32,
+                            (-dy * inv_r) as f32,
+                            (-dz * inv_r) as f32,
                         )
                     } else {
                         (
-                            i as u16, j as u16,
-                            orb_off_i, orb_off_j,
-                            (dx * inv_r) as f32, (dy * inv_r) as f32, (dz * inv_r) as f32,
+                            i as u16,
+                            j as u16,
+                            orb_off_i,
+                            orb_off_j,
+                            (dx * inv_r) as f32,
+                            (dy * inv_r) as f32,
+                            (dz * inv_r) as f32,
                         )
                     };
 
@@ -628,7 +654,8 @@ fn build_pair_buckets(
                 let sp_j = global_atom_species[atom_off + atom_j as usize] as u8;
 
                 let bucket_idx = block_type as usize * n_species * n_species
-                    + sp_i as usize * n_species + sp_j as usize;
+                    + sp_i as usize * n_species
+                    + sp_j as usize;
 
                 let entry = GpuPairEntry {
                     replica: fi as u32,
@@ -652,8 +679,8 @@ fn build_pair_buckets(
     for block_type in 0u8..=2 {
         for sp_i in 0..n_species {
             for sp_j in 0..n_species {
-                let bucket_idx = block_type as usize * n_species * n_species
-                    + sp_i * n_species + sp_j;
+                let bucket_idx =
+                    block_type as usize * n_species * n_species + sp_i * n_species + sp_j;
                 let entries = &mut buckets[bucket_idx];
                 if entries.is_empty() {
                     continue;

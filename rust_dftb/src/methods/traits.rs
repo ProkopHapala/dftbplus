@@ -6,8 +6,8 @@
 //! With generics Rust monomorphises at compile time; the hot `fill_pairs`
 //! loop and `compute_shifts` loop have **zero** trait-object overhead.
 
-use nalgebra::DMatrix;
 use crate::core::error::Result;
+use nalgebra::DMatrix;
 
 /// Builds H0 and S.  Both DFTB and xTB implement this.
 pub trait H0Builder: Clone {
@@ -21,7 +21,16 @@ pub trait H0Builder: Clone {
         &self,
         species: Vec<String>,
         coords: Vec<[f64; 3]>,
-    ) -> Result<(DMatrix<f64>, DMatrix<f64>, Vec<u8>, Vec<u8>, Vec<u16>, Vec<Vec<i32>>, Vec<u8>, Vec<f64>)>;
+    ) -> Result<(
+        DMatrix<f64>,
+        DMatrix<f64>,
+        Vec<u8>,
+        Vec<u8>,
+        Vec<u16>,
+        Vec<Vec<i32>>,
+        Vec<u8>,
+        Vec<f64>,
+    )>;
 }
 
 /// Computes SCC shifts.  DFTB and xTB provide different implementations.

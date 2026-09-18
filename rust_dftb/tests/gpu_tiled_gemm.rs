@@ -27,7 +27,9 @@ fn random_matrix(n: usize, batch: usize, seed: u64) -> Vec<f32> {
         for i in 0..n {
             for j in 0..n {
                 // Simple LCG for reproducibility
-                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 let val = ((state >> 33) as f64 / (1u64 << 31) as f64) - 1.0;
                 out[b * n * n + i * n + j] = val as f32;
             }
@@ -64,14 +66,17 @@ fn cpu_matmul(a: &[f32], b: &[f32], n: usize, batch: usize) -> Vec<f32> {
 }
 
 fn max_abs_diff(a: &[f32], b: &[f32]) -> f64 {
-    a.iter().zip(b.iter())
+    a.iter()
+        .zip(b.iter())
         .map(|(x, y)| ((*x as f64) - (*y as f64)).abs())
         .fold(0.0f64, f64::max)
 }
 
 #[test]
 fn test_tiled_gemm_parity() {
-    let Some(mut rt) = try_runtime() else { return; };
+    let Some(mut rt) = try_runtime() else {
+        return;
+    };
     let batch = 3usize;
     // Test across the N=64 boundary and at nucleobase-pair dimensions
     for &n in &[16, 32, 64, 65, 87, 96, 128] {
@@ -93,13 +98,18 @@ fn test_tiled_gemm_parity() {
         eprintln!("tiled GEMM N={n}: max|dC|={diff:.2e}");
         // f32 accumulation on GPU vs f64 on CPU; tolerance scales with N
         let tol = (n as f64 * n as f64 * 1e-5).max(1e-3);
-        assert!(diff < tol, "tiled GEMM N={n} parity failed: max|dC|={diff:.2e} > {tol:.2e}");
+        assert!(
+            diff < tol,
+            "tiled GEMM N={n} parity failed: max|dC|={diff:.2e} > {tol:.2e}"
+        );
     }
 }
 
 #[test]
 fn test_full_local_vs_tiled_n64() {
-    let Some(mut rt) = try_runtime() else { return; };
+    let Some(mut rt) = try_runtime() else {
+        return;
+    };
     let n = 64usize;
     let batch = 10usize;
     let a = random_matrix(n, batch, 42);

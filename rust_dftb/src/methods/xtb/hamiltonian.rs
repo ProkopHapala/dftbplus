@@ -19,8 +19,10 @@ pub fn compute_cn_gfn1(coords: &[[f64; 3]], elem_idx: &[usize]) -> Vec<f64> {
             let dx = coords[i][0] - coords[j][0];
             let dy = coords[i][1] - coords[j][1];
             let dz = coords[i][2] - coords[j][2];
-            let r2 = dx*dx + dy*dy + dz*dz;
-            if r2 < 1.0e-12 { continue; }
+            let r2 = dx * dx + dy * dy + dz * dz;
+            if r2 < 1.0e-12 {
+                continue;
+            }
             let r = r2.sqrt();
             let cov_r = params::cov_rad[elem_idx[i]] + params::cov_rad[elem_idx[j]];
             let cn_ij = exp_count(kcn, r, cov_r);
@@ -46,8 +48,10 @@ pub fn compute_cn_gfn2(coords: &[[f64; 3]], elem_idx: &[usize]) -> Vec<f64> {
             let dx = coords[i][0] - coords[j][0];
             let dy = coords[i][1] - coords[j][1];
             let dz = coords[i][2] - coords[j][2];
-            let r2 = dx*dx + dy*dy + dz*dz;
-            if r2 < 1.0e-12 { continue; }
+            let r2 = dx * dx + dy * dy + dz * dz;
+            if r2 < 1.0e-12 {
+                continue;
+            }
             let r = r2.sqrt();
             let cov_r = params_gfn2::cov_rad[elem_idx[i]] + params_gfn2::cov_rad[elem_idx[j]];
             let cn_ij = exp_count(ka, r, cov_r) * exp_count(kb, r, cov_r + r_shift);
@@ -80,9 +84,9 @@ pub fn build_h0_s(
     let mut nao = 0usize;
     let mut nsh = 0usize;
     let mut shell_elem: Vec<usize> = Vec::new(); // which element each shell belongs to
-    let mut shell_idx: Vec<usize> = Vec::new();  // shell index within element
-    let mut sh_ao_off: Vec<usize> = Vec::new();  // AO offset for each shell
-    let mut atom_sh_off: Vec<usize> = vec![0];   // shell offset for each atom
+    let mut shell_idx: Vec<usize> = Vec::new(); // shell index within element
+    let mut sh_ao_off: Vec<usize> = Vec::new(); // AO offset for each shell
+    let mut atom_sh_off: Vec<usize> = vec![0]; // shell offset for each atom
     for (iat, atom_cgtos) in cgtos_per_atom.iter().enumerate() {
         let mut atom_nao = 0;
         for (ish, cgto) in atom_cgtos.iter().enumerate() {
@@ -135,7 +139,7 @@ pub fn build_h0_s(
                     let dx = coords[iat][0] - coords[jat][0];
                     let dy = coords[iat][1] - coords[jat][1];
                     let dz = coords[iat][2] - coords[jat][2];
-                    let r2 = dx*dx + dy*dy + dz*dz;
+                    let r2 = dx * dx + dy * dy + dz * dz;
 
                     let rr = if r2 > 1e-14 {
                         let r = r2.sqrt();
@@ -151,10 +155,14 @@ pub fn build_h0_s(
 
                     // hscale
                     let hscale = compute_hscale(
-                        eidx_i, eidx_j,
-                        cgto_i.ang, cgto_j.ang,
-                        ish, jsh,
-                        &cgtos_per_atom[iat], &cgtos_per_atom[jat],
+                        eidx_i,
+                        eidx_j,
+                        cgto_i.ang,
+                        cgto_j.ang,
+                        ish,
+                        jsh,
+                        &cgtos_per_atom[iat],
+                        &cgtos_per_atom[jat],
                     );
 
                     let se_i = selfenergy[i_sh_off + ish];
@@ -197,10 +205,14 @@ pub fn build_h0_s(
 
 /// Compute hscale for a shell pair
 fn compute_hscale(
-    eidx_i: usize, eidx_j: usize,
-    li: usize, lj: usize,
-    ish: usize, jsh: usize,
-    cgtos_i: &[Cgto], cgtos_j: &[Cgto],
+    eidx_i: usize,
+    eidx_j: usize,
+    li: usize,
+    lj: usize,
+    ish: usize,
+    jsh: usize,
+    cgtos_i: &[Cgto],
+    cgtos_j: &[Cgto],
 ) -> f64 {
     // Determine valence status: first shell of each angular momentum is valence
     let val_i = is_valence(ish, cgtos_i);
@@ -311,11 +323,12 @@ pub fn build_h0_s_gfn2(
                     let dx = coords[iat][0] - coords[jat][0];
                     let dy = coords[iat][1] - coords[jat][1];
                     let dz = coords[iat][2] - coords[jat][2];
-                    let r2 = dx*dx + dy*dy + dz*dz;
+                    let r2 = dx * dx + dy * dy + dz * dz;
 
                     let rr = if r2 > 1e-14 {
                         let r = r2.sqrt();
-                        let rad_sum = params_gfn2::atomic_rad[eidx_i] + params_gfn2::atomic_rad[eidx_j];
+                        let rad_sum =
+                            params_gfn2::atomic_rad[eidx_i] + params_gfn2::atomic_rad[eidx_j];
                         (r / rad_sum).sqrt()
                     } else {
                         0.0
@@ -327,11 +340,8 @@ pub fn build_h0_s_gfn2(
                     let shpoly = (1.0 + shpoly_i * rr) * (1.0 + shpoly_j * rr);
 
                     // hscale (GFN2 with zij factor)
-                    let hscale = compute_hscale_gfn2(
-                        eidx_i, eidx_j,
-                        cgto_i.ang, cgto_j.ang,
-                        ish, jsh,
-                    );
+                    let hscale =
+                        compute_hscale_gfn2(eidx_i, eidx_j, cgto_i.ang, cgto_j.ang, ish, jsh);
 
                     let se_i = selfenergy[i_sh_off + ish];
                     let se_j = selfenergy[j_sh_off + jsh];
@@ -373,9 +383,12 @@ pub fn build_h0_s_gfn2(
 
 /// Compute hscale for GFN2 shell pair
 fn compute_hscale_gfn2(
-    eidx_i: usize, eidx_j: usize,
-    li: usize, lj: usize,
-    ish: usize, jsh: usize,
+    eidx_i: usize,
+    eidx_j: usize,
+    li: usize,
+    lj: usize,
+    ish: usize,
+    jsh: usize,
 ) -> f64 {
     let zi = params_gfn2::slater_zeta[eidx_i][ish];
     let zj = params_gfn2::slater_zeta[eidx_j][jsh];

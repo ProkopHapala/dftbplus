@@ -8,39 +8,64 @@ fn main() {
 
     let mol = env::var("RUST_DFTB_MOL").unwrap_or("H2".to_string());
     let (species, coords): (Vec<String>, Vec<[f64; 3]>) = match mol.as_str() {
-        "N2" => (vec!["N".to_string(), "N".to_string()], vec![[-1.05, 0.0, 0.0], [1.05, 0.0, 0.0]]),
+        "N2" => (
+            vec!["N".to_string(), "N".to_string()],
+            vec![[-1.05, 0.0, 0.0], [1.05, 0.0, 0.0]],
+        ),
         "HCOOH" => (
-            vec!["C".to_string(), "O".to_string(), "O".to_string(), "H".to_string(), "H".to_string()],
             vec![
-                [ 0.000,  0.000,  0.000],   // C
-                [ 2.300,  0.000,  0.000],   // O (carbonyl)
-                [-1.120,  2.250,  0.000],   // O (hydroxyl)
-                [-2.100,  0.000,  0.000],   // H (formyl)
-                [-2.500,  2.200,  0.000],   // H (hydroxyl)
-            ]
+                "C".to_string(),
+                "O".to_string(),
+                "O".to_string(),
+                "H".to_string(),
+                "H".to_string(),
+            ],
+            vec![
+                [0.000, 0.000, 0.000],  // C
+                [2.300, 0.000, 0.000],  // O (carbonyl)
+                [-1.120, 2.250, 0.000], // O (hydroxyl)
+                [-2.100, 0.000, 0.000], // H (formyl)
+                [-2.500, 2.200, 0.000], // H (hydroxyl)
+            ],
         ),
         "HCONH2" => (
-            vec!["C".to_string(), "O".to_string(), "N".to_string(), "H".to_string(), "H".to_string(), "H".to_string()],
             vec![
-                [ 0.000,  0.000,  0.000],   // C
-                [ 2.300,  0.000,  0.000],   // O
-                [-1.300,  2.300,  0.000],   // N
-                [-2.100,  0.000,  0.000],   // H (formyl)
-                [-2.200,  2.300,  1.800],   // H (amine 1)
-                [-0.800,  3.200,  0.000],   // H (amine 2)
-            ]
+                "C".to_string(),
+                "O".to_string(),
+                "N".to_string(),
+                "H".to_string(),
+                "H".to_string(),
+                "H".to_string(),
+            ],
+            vec![
+                [0.000, 0.000, 0.000],  // C
+                [2.300, 0.000, 0.000],  // O
+                [-1.300, 2.300, 0.000], // N
+                [-2.100, 0.000, 0.000], // H (formyl)
+                [-2.200, 2.300, 1.800], // H (amine 1)
+                [-0.800, 3.200, 0.000], // H (amine 2)
+            ],
         ),
         "HCOOH_rot" => (
-            vec!["C".to_string(), "O".to_string(), "O".to_string(), "H".to_string(), "H".to_string()],
             vec![
-                [ 0.0000,  0.0000,  0.0000],
-                [ 1.4085,  1.6263, -0.8132],
-                [-2.0637,  0.7990,  1.1915],
-                [-1.2860, -1.4849,  0.7425],
-                [-2.8782, -0.2121,  1.6617],
-            ]
+                "C".to_string(),
+                "O".to_string(),
+                "O".to_string(),
+                "H".to_string(),
+                "H".to_string(),
+            ],
+            vec![
+                [0.0000, 0.0000, 0.0000],
+                [1.4085, 1.6263, -0.8132],
+                [-2.0637, 0.7990, 1.1915],
+                [-1.2860, -1.4849, 0.7425],
+                [-2.8782, -0.2121, 1.6617],
+            ],
         ),
-        _ => (vec!["H".to_string(), "H".to_string()], vec![[-0.75, 0.0, 0.0], [0.75, 0.0, 0.0]]),
+        _ => (
+            vec!["H".to_string(), "H".to_string()],
+            vec![[-0.75, 0.0, 0.0], [0.75, 0.0, 0.0]],
+        ),
     };
 
     println!("species.len() = {}", species.len());
@@ -60,10 +85,18 @@ fn main() {
 
     // Debug: print the H-H table header and a few grid points
     if let Some(table) = sk.pairs.get(&("H".to_string(), "H".to_string())) {
-        println!("H-H table: n_grid_h={} n_grid_s={} dr={}", table.h.values.len(), table.s.values.len(), table.h.dr);
+        println!(
+            "H-H table: n_grid_h={} n_grid_s={} dr={}",
+            table.h.values.len(),
+            table.s.values.len(),
+            table.h.dr
+        );
         println!("H-H onsite: {:?}", sk.onsite.get("H"));
         for i in 0..5.min(table.h.values.len()) {
-            println!("  grid[{}] H={:?} S={:?}", i, &table.h.values[i], &table.s.values[i]);
+            println!(
+                "  grid[{}] H={:?} S={:?}",
+                i, &table.h.values[i], &table.s.values[i]
+            );
         }
     } else {
         println!("H-H table NOT FOUND");
@@ -74,9 +107,16 @@ fn main() {
 
     let builder = HamiltonianBuilder::new(sk);
     // inspect neighbor list manually
-    let cutoff = builder.sk.pairs.values().map(|t| t.cutoff()).fold(0.0_f64, f64::max);
+    let cutoff = builder
+        .sk
+        .pairs
+        .values()
+        .map(|t| t.cutoff())
+        .fold(0.0_f64, f64::max);
     println!("cutoff = {}", cutoff);
-    let neigh = rust_dftb::core::neighbor::NeighborBuilder { cutoff }.build(&coords).unwrap();
+    let neigh = rust_dftb::core::neighbor::NeighborBuilder { cutoff }
+        .build(&coords)
+        .unwrap();
     println!("neigh pairs = {:?}", neigh.pairs);
 
     // direct eval of H-H at 1.5

@@ -1,0 +1,59 @@
+# Periodic C-O chain reference for the Rust GPU PBC path (GpuPbc).
+# C at 0, O at 1.2 Ang, lattice 3.0 Ang along x (intercell C-O gap
+# 1.8 Ang -- inside SK cutoff, so real intercell bonding), 20x20 Ang
+# transverse box. 10 electrons -> closed shell, n_occ = 5.
+# Heteropolar cell -> nonzero Mulliken transfer, so the SCC loop
+# actually does work (a homonuclear cell converges trivially).
+# Explicit fractional k-points, weights sum to 1 -- the SAME k list
+# must be passed to GpuPbc in gpu_pbc_fortran.rs.
+#
+# Regenerate reference.txt: ./run_reference.sh  (see README.md)
+
+Geometry = GenFormat {
+    2  S
+  C O
+    1 1    0.0000000000E+00    0.0000000000E+00    0.0000000000E+00
+    2 2    1.2000000000E+00    0.0000000000E+00    0.0000000000E+00
+    0.0000000000E+00    0.0000000000E+00    0.0000000000E+00
+    3.0000000000E+00    0.0000000000E+00    0.0000000000E+00
+    0.0000000000E+00    2.0000000000E+01    0.0000000000E+00
+    0.0000000000E+00    0.0000000000E+00    2.0000000000E+01
+}
+
+Driver = {}
+
+Hamiltonian = DFTB {
+  SCC = Yes
+  SCCTolerance = 1.0E-8
+  MaxSCCIterations = 200
+  MaxAngularMomentum = {
+    C = "p"
+    O = "p"
+  }
+  SlaterKosterFiles = Type2FileNames {
+    Prefix = "/home/prokop/SIMULATIONS/dftbplus/slakos/mio-1-1/"
+    Separator = "-"
+    Suffix = ".skf"
+  }
+  Filling = Fermi {
+    Temperature [Kelvin] = 0.0
+  }
+  KPointsAndWeights = {
+    0.000  0.0  0.0  0.25
+    0.250  0.0  0.0  0.25
+   -0.250  0.0  0.0  0.25
+    0.500  0.0  0.0  0.25
+  }
+}
+
+Options = {
+  WriteDetailedOut = Yes
+}
+
+Analysis = {
+  WriteBandOut = Yes
+}
+
+ParserOptions = {
+  ParserVersion = 4
+}

@@ -2368,3 +2368,385 @@ The GPT-5.6 rebuttal (chat ~line 12800+, 13400+) was executed; it inverted the f
 **Structural findings:** (i) **Z accuracy is the tier discriminator** — central Z (R_Z≈2e-3 at displaced S) caps ALL K-updates at ~6%; ONE actual Newton correction (R_Z→1.4e-5; "NS=2 iters" = 1 update + residual checks = 3 products) unlocks 1–3%; (ii) retractions *hurt* — every McWeeny-retracted variant is worse than its unretracted twin (4.8% vs 3.0%), the map is H-blind; without the δK0 contaminant ≤4 raw steps stay on-manifold (6 steps trip the Tr(KS) gate, loudly); (iii) metric transport alone gives 99% error — refuted; (iv) linear1's single fixed-η response is insufficient (6.7% ≈ frozen at 6× cost) — refuted at tested η.
 
 **Remaining 10× lever:** batch-parallel ±h columns (all 990 share topology/plans). Untested: ±h antisymmetric sharing (`K(−h)≈2K₀−K(+h)`, exact to O(h²)), Chebyshev/BB η schedule, CG on the manifold.
+
+### §15.18 — First R18 (1648-atom) run: two loud guards, tier timings, and the locality rules (2026-09-17)
+
+System: `debug/nanocrystals/si_sphere_R18.xyz` = 18 Å-radius bulk-Si sphere, H-passivated → 1202 Si + 446 H = **1648 atoms, 5254 orbitals** (matsci-0-3, Si sp³=4 orbs, H s=1). Hessian = 4944 columns × 2 evals = 9888 force evaluations.
+
+**Nothing was diverging.** The run hit two sequential loud guards, both correct:
+
+1. `M_TKS = supp(K∘S)` (the FF32-corrected true product support) spans r_k+r_hs ≈ 21 Å → interior rows are **fully dense** (deg→1648) on a 37 Å sphere and exceed `MAX_LEFT_BLOCKS=384`. New env `RUST_DFTB_TRUNC_PRODUCTS=1` stores T on M_K (pre-fix layout; dropped tail ~7e-6 ≪ 5e-4 mask floor); without it the workspace now fails **at init** with an actionable message instead of mid-SCC. Real fix = left-row chunking kernel.
+2. R_H stationarity gate: SCC converged cleanly (13 iters, r_scc=4.4e-6, Tr(KS)=2627.000000, E=−1772.3732 Ha ≈ Sep-12 −1772.3924 at floor) but R_H=4.2e-3 > default 5e-4 — the **mask-floor regime** (R_I(K)≈2.6e-3 sets R_H; no r_k within the local-memory budget reaches 5e-4 at this size). Same for the per-column gate inside `scc_fixedq`. Production overrides: `RUST_DFTB_SCC_RHGATE=1e-2` and `RUST_DFTB_VIB_RHGATE=1e-2` (still rejects the ~1.4e-2 wrong-subspace signature both gates exist for).
+
+**Measured per-eval timings (RTX 3090, r_k=r_z=12 Å, r_trunc=8+1, deg_k=378 saturated at bulk, nnz_k=412k):**
+
+| tier | ms/eval | full Hessian | note |
+|------|--------:|-------------:|------|
+| frozen (clamped K₀,W₀,q₀) | 190 | ~31 min | ~all CPU: geom 86 ms + contract 99 ms; GPU idles |
+| fixq (cold TC2, 27 iters floor-stop 1e-3) | 916 | ~2.5 h | deterministic cold purify per eval |
+| full SCC | ~5–8 s est. | overnight | |
+
+Dense f64 GEVP reference point: ~30–90 s per diagonalization at 5254 orbs → CPU-dense Hessian would be **weeks**. Sparse is ~50–100× ahead already — but this N is the *entry* of the asymptotic regime, not its middle.
+
+**Frozen-mode spectrum validation (si10h16, relaxed, vs Sep-15 SCC reference) — important correction to the "6% column error" marketing:**
+
+- frozen spectrum **bit-identical** to the Sep-14 old-frozen file → inherent clamped-electron physics, not a regression.
+- rms error **157 cm⁻¹**: Si–H band −250 cm⁻¹ soft (expected), mid-band collapse (SCC 420–990 → frozen 760–830, worst +344), 3 of 6 rigid modes land at +120 cm⁻¹.
+- **fixq is the quantitative cheap tier**: rms 5.9 cm⁻¹, Si–H −8 cm⁻¹, rigid modes intact (−16..+1, the SCC residual-force floor).
+- `fixq+dmupd` rms 315 — refuted again.
+
+### §15.19 — Optimization rules for the frozen/local Hessian (user-stated, confirmed)
+
+**R1 — deg_hs is a *basis-set/SK-table* property, not physics.** The number of H/S neighbors (deg_hs) sets assembly cost, every SpGEMM touching M_HS, and the force-contraction pair list. Measured table ranges: matsci-0-3 runs to **10.58 Å** for Si-Si/Si-H/H-H; **pbc-0-3 runs to 5.50 Å**. At bulk density that is deg_hs ≈ 167 (matsci @ r_trunc 8+1) vs ≈ **35 (pbc)** — ~5× cheaper assembly and contraction, and a much sparser M_HS operand, at the price of a different parameterization (must re-relax and re-validate on its own minimum; pbc is the set designed for bulk solids).
+
+**R2 — r_k is set by the band gap; decouple it from r_hs.** Density-kernel decay is exponential with a length fixed by the HOMO-LUMO gap (~12 Å needed for matsci Si); shrinking r_k for speed hits the force-error floor (labbook r_k table). But **nothing couples r_k to r_hs**: H/S sparsity (=multiplication speed) and K range (=accuracy) are independent knobs. Tune r_hs via the SK set/r_trunc for speed, r_k via the measured R_I/force floor for accuracy; validate separately.
+
+**R3 — frozen Hessian columns are local: do NOT contract over all N² pairs.** With δq=δK=δW=0, `dF_i/dR_j ≠ 0` only for atoms i connected to j by an explicit R-dependent term:
+- H0′/S′ band terms: pairs (i,j) within r_hs → **~deg_hs atoms per column** (~167 of 1648 at R18).
+- Repulsion: local spline cutoff — same ball.
+- γ′ term `Σ γ′_iJ Δq_i Δq_J`: formally dense, but a *smooth radial tail* ∝ Δq_iΔq_j/r³ needing no SK evaluation — compute over all pairs in O(N) scalar ops or truncate with a diagnostic.
+⇒ Per-column work should be **O(deg_hs), not O(N)**: restrict the force contraction to the touched pair list and store Hessian columns sparse (~deg_hs of 3N nonzeros). The current `forces_frozen` rebuilds all of H/S/γ (~86 ms) and contracts ~200k pairs (~99 ms) per eval — at 1648 atoms that is ~95% wasted work. Same locality enables **multi-displacement batching**: columns whose response supports are disjoint (graph coloring, support radius r_hs frozen / r_hs+r_k fixq) can share one eval — the real 10–100× lever at N≫10³.
+
+**Validation path:** test on the smaller crystals first — R10 (330 atoms) and R14 (864) — where supports overlap less, before claiming R18.
+
+### §15.20 — pbc-0-3 vs matsci-0-3 on R18: measured mask data + cost projection (2026-09-17)
+
+Bounded run (frozen, `R18_RTRUNC=5.5` = pbc's native table end, MAXCOL=4, timeout 30). Center SCC **failed loudly** at mix-iter 3 — but the mask/timing data needed for the projection was collected:
+
+| quantity | matsci-0-3 @ r_trunc=8 | pbc-0-3 @ r_trunc=5.5 |
+|---|---:|---:|
+| deg_hs (max blocks/row) | 167 | **56** (2.98×) |
+| nnz_hs (H/S pair blocks) | 199 676 | **72 368** (2.76×) |
+| SK table range | 10.58 Å | 5.50 Å (H–H 5.29) |
+| ws_new (plans+alloc) | 11.57 s | 9.34 s |
+| NS iters / R_Z | 7 / 4.2e-5 | 7 / 7.6e-6 |
+| TRS4 floor (purify) | ~4.9e-4 | **~1.1e-3 → stall ~1.7e-2, dies** |
+| center SCC | converges, 13 iters | rms grows 0.08→0.14, `TRS4 exhausted` at iter 3 |
+
+**Physics finding:** pbc-0-3 gives a smaller effective gap on this sphere → slower density-kernel decay → the r_k=12 Å mask floor rises from ~5e-4 to ~1e-2. SCC then death-spirals (floor-limited K → wrong charges → smaller gap → worse purify). Fail-loud worked correctly. To run pbc properly needs r_k≈14–16 Å → deg_k≈600–900 > `MAX_LEFT_BLOCKS`=384 — i.e. **the pbc route requires the left-row-chunking kernel** (same cap that bit M_TKS). Ironically: shorter H/S (good) but longer DM (bad) — the two radii really are independent knobs (R2).
+
+**Projected per-eval cost** (pbc, scaling the measured matsci PROF breakdown by nnz_hs ratio 2.76; γ and K-mask stages unchanged):
+
+| stage | matsci ms | pbc ms | scaling |
+|---|---:|---:|---|
+| H0/S assembly `geom.hs` | 54.9 | ~20 | ∝ nnz_hs |
+| γ build `geom.gamma` | 19.8 | 19.8 | O(N²) — unchanged |
+| repulsion `geom.rep` | 5.6 | ~4 | rep-pairs |
+| H/S upload `geom.ul` | 3.2 | ~1.2 | ∝ nnz_hs |
+| restore K,Z + copies | ~6.5 | ~6.5 | M_K unchanged |
+| `compute_v` γ·Δq | 1.9 | 1.9 | O(N²) |
+| force contract `f.contract` | 98.6 | ~36 | ∝ nnz_hs |
+| **frozen eval total** | **~190** | **~90** | **2.1×** |
+
+- **Frozen Hessian: ~31 min → ~15 min.** Wins are real but bounded: γ's O(N²) build (~22 ms/eval) is untouched and becomes the next wall — at N≈10k it alone would be ~0.8 s/eval.
+- **fixq:** +NS 50 ms + TC2 ~27 iters. Only the `K·S` product sees M_HS (~3× cheaper); `KSK` is M_K×M_K and unchanged → ~26→~17 ms/iter → **~600 ms/eval → ~1.7 h**, *if* it converged — it doesn't at r_k=12 for pbc (floor ~1e-2). Blocked pending chunking + larger r_k.
+- Conclusion: basis-set choice buys ~2× on the cheap tier today; the structural wins remain (a) column-local contraction (O(deg) not O(N) per column), (b) γ tail truncation/approximation, (c) left-row chunking (unlocks both M_TKS correctness AND pbc's needed r_k).
+
+### §15.21 — Band gaps drive r_k; C/diamond particles as the next target (2026-09-17)
+
+**Measured gaps** (dense path, `get_eigenvalues` at correct n_occ; H0 = non-SCC):
+
+| system | SK set | gap |
+|---|---|---:|
+| si10h16 (SCC) | matsci-0-3 | 0.37 eV (SCC state; H0 sphere value below is more relevant) |
+| si_sphere_R10, H0 | matsci-0-3 | **5.66 eV** |
+| si_sphere_R10, H0 | pbc-0-3 | **2.98 eV** |
+| c_sphere_R06, H0 | 3ob-3-1 | **9.25 eV** |
+| c_sphere_R06, H0 | mio-1-1 | **9.06 eV** |
+
+pbc's ~1.9× smaller gap explains the §15.20 purify stall quantitatively (DM decay length ∝ gap⁻¹-ish → r_k=12 floor 5e-4→~1e-2). Note also: **pbc dense SCC diverged on si10h16** (rms 0.1 after 100 iters, no DIIS in the dense path) — the model itself is marginally stable on Si clusters, not only a sparse-mask problem.
+
+**C/diamond spheres generated** (`debug/gen_diamond_sphere.py`, a=3.567 Å, dangling bonds → H at 1.09 Å): c_sphere_R06 (283 at), **R10 (1053)**, R14 (2599), **R18 (5343 atoms — the real large regime)**. BSR4-compatible (C sp³ = 4 orbs, H padded).
+
+**Init-measured mask data** (mask_stats.rhai, `RUST_DFTB_TRUNC_PRODUCTS=1`):
+
+| geometry | SK | r_trunc | r_k | deg_hs | deg_k | nnz_k |
+|---|---|---:|---:|---:|---:|---:|
+| si_sphere_R18 (1648) | matsci | 8+1 | 12 | 167 | 378 | 412k |
+| si_sphere_R18 | pbc | 5.5+1 | 12 | 56 | 378 | 412k (purify fails) |
+| c_sphere_R10 (1053) | 3ob | 6.9+1 | 8 | 376 | 399 | 254k |
+| c_sphere_R10 | mio | 5.3+0.8 | 8 | 179 | 399 | 254k |
+| c_sphere_R18 (5343) | mio | 5.3+0.8 | 7 | ~179 | **283** | **1.18M** |
+
+Key numbers: C packs 3.5× more atoms/Å³ → same-radius masks carry ~3.5× more neighbors per atom. But the ~9 eV gap legitimately allows r_k≈6–8 Å (vs Si's 12): at r_k=7, C-R18's deg_k=283 fits `MAX_LEFT_BLOCKS`=400 **without** chunking. mio-on-C (deg_hs=179) ≈ matsci-on-Si (167) in neighbor count — the per-atom H/S cost is comparable; the cost difference is N itself (5343 vs 1648).
+
+**Cost projection, C-R18 + mio @ r_k=7** (scale Si-R18 measurements by nnz/deg): frozen eval ≈ contract ~320 ms + geom ~210 ms ≈ **0.55 s/eval → Hessian (6·5343·2 ≈ 64k evals) ~9–10 h**; fixq ≈ +TC2 (~55 ms/iter × ~25) ≈ **1.8–2 s/eval → ~30+ h**. Same verdict as Si: the current all-pairs implementation is the bottleneck — column-local contraction + batching (R3) is worth ~10× here, and γ's O(N²) (~0.5 s/eval at N=5.3k) must be truncated next.
+
+**Open C-specific check:** mio vs 3ob parameterization quality for diamond phonons (3ob-freq-1-1 exists — fitted for frequencies; C-C range 6.35 Å). The DM floor at r_k=7 on C must be measured (purify R_I) before claiming a spectrum — bigger gap helps, but verify.
+
+### §15.22 — Diamond-C Hessian cost projection table (2026-09-17)
+
+Anchored to the measured Si-R18 stage costs (frozen eval 190 ms = hs 54.9 + γ 19.8 + rep 5.6 + ul 3.2 + restore/copies ~6.5 + v 1.9 + contract 98.6; fixq adds NS ~50 + TC2 ~26 ms/iter × ~27). Scaling: H/S stages ∝ nnz_hs, γ/v ∝ N², restore ∝ nnz_k, TC2 iter ∝ nnz_k·(deg_k+deg_hs). All rows assume current all-pairs implementation, `TRUNC_PRODUCTS=1`, h=0.02, full 6N×2-eval Hessian.
+
+**Si spheres (matsci-0-3, r_trunc 8+1, r_k=r_z=12):**
+
+| system | N | deg_hs/deg_k | nnz_k | frozen ms/eval | fixq ms/eval | frozen Hessian | fixq Hessian |
+|---|---|---:|---:|---:|---:|---:|---:|
+| si_sphere_R10 | 330 | 167*/378* | ~83k | 5.5 (measured) | ~345 (measured) | ~22 s | ~23 min |
+| si_sphere_R14 | 864 | ~167/378 | ~216k | ~95 | ~620 | ~29 min | ~3.2 h |
+| **si_sphere_R18** | **1648** | **167/378** | **412k** | **190 (measured)** | **916 (measured)** | **~31 min** | **~2.5 h** |
+| si_R18, pbc-0-3 | 1648 | 56/378 | 412k | ~90 (projected) | ~600 (projected) | ~15 min | ~1.7 h — **BLOCKED: purify floor ~1e-2 @ r_k=12, needs r_k≈14+ (deg_k>600) → needs chunking kernel** |
+
+**Diamond-C spheres (mio-1-1, r_trunc 5.3+0.8, r_k=r_z=7–8; gap ~9 eV justifies short r_k):**
+
+| system | N | deg_hs/deg_k | nnz_k | frozen ms/eval | fixq ms/eval | frozen Hessian | fixq Hessian |
+|---|---|---:|---:|---:|---:|---:|---:|
+| c_sphere_R06 | 283 | ~120*/≤283 | ~51k | ~27 | ~90 | ~1.5 min | ~5 min |
+| c_sphere_R10 | 1053 | 179/399@8 (283@7) | 254k | ~120 | ~610 | ~26 min | ~2.1 h |
+| c_sphere_R14 | 2599 | ~179/~283 | ~650k | ~420 | ~1.4 s | ~3.6 h | ~12 h |
+| **c_sphere_R18** | **5343** | **~179/283** | **1.18M** | **~1.0 s** | **~2.8 s** | **~17 h** | **~50 h** |
+| c_R18, 3ob-3-1 | 5343 | ~376/~399 | ~1.8M | ~1.65 s | ~5.8 s | ~29 h | ~100 h |
+
+(*deg_hs at R06 is surface-dominated, ~0.7×bulk.)
+
+**What the table says:**
+
+1. **N² Coulomb is the frozen-tier wall at scale.** γ build + `compute_v` at C-R18 ≈ 230 ms/eval (~23%) — at N=10k it exceeds 1 s/eval. Truncating γ to a real-space cutoff (with diagnostic) or patching only row/col j per displacement is required.
+2. **fixq scaling is deg²-dominated.** TC2 cost ∝ nnz_k·deg — C's density (3.5× Si) makes the same-radius C sphere ~2× pricier per eval than Si at larger N. Warm-seeded purify (G3) is the only big fixq lever (~3×).
+3. **mio > 3ob for cost** (deg_hs 179 vs 376) — and 3ob-freq-1-1 (C-C 6.35 Å) sits between. For spectra, accuracy of mio-vs-3ob on diamond phonons must be checked (mio was fitted for organics; 3ob for solids/vibrations — 3ob-freq is likely the better *physics* choice despite ~2× cost).
+4. **Column-locality (R3) dominates everything:** restricting contraction+assembly to the displaced atom's support turns the frozen eval into O(deg) → C-R18 frozen Hessian ~**15–25 min** instead of 17 h; combined with multi-displacement coloring (support radius r_hs≈6 Å for frozen → ~50–100 columns/eval at N=5k) → **minutes**. This is the difference between "expensive" and "interactive".
+5. Si-R18 remains the practical validation target today: 31 min frozen / 2.5 h fixq. C-R18 is blocked on (a) column-local contraction to be affordable, (b) r_k floor verification, (c) ideally the chunking kernel to lift the deg cap entirely.
+
+### §15.23 — Tiled GPU n-body γ/γ′ implemented; dense gmat eliminated (2026-09-17)
+
+**Before:** `set_coords` rebuilt a dense f64 `gmat[N×N]` on CPU (nested pair loop,
+`geom.gamma` ≈ 20 ms at N=1648); `compute_v` was a CPU O(N²) matvec per SCC
+iteration; the SCC double-counting force `scc_double_counting_force` re-evaluated
+`gamma_prime_full` analytically over all N² pairs on CPU inside every
+`sparse_forces_bsr` call (the dominant share of `f.contract` ≈ 99 ms).
+
+**Now** (`sparse_gamma.cl`, gravity-kernel pattern): each work-item owns ONE
+target atom i and *gathers* over j-tiles staged in `__local` memory
+(GWG = 128 atoms/tile: `float4 xyzu` + `float dq` = 20 B/atom → 2.5 KB/tile).
+No atomics, no scatter, no dense matrix — γ evaluated analytically in f32
+(exact port of `gamma_full`/`gamma_prime_full`: Elstner same-U polynomial and
+different-U `gamma_sub_exprn` branches, on-site r→0 → u_i). Two kernels:
+
+- `gamma_matvec`: `V_i = Σ_j γ_ij·Δq_j` → writes `v_buf` directly (feeds the
+  device H_scc build; host readback only for E_scc/v_shift).
+- `gamma_force`: `F_i = −Δq_i·Σ_j γ′_ij·Δq_j·r̂_ij` in Ha/Å — result enters
+  `sparse_forces_bsr` via a `scc_dc_override` param; `None` keeps the CPU
+  reference path for tests.
+
+Plumbing: persistent `xyzu_buf`/`dq_buf`/`gf_buf` in `SparseSystemWorkspace`
+(allocated once); `set_coords` uploads 4·N floats (O(N)); `compute_v` and
+`contract_forces` upload dq (N floats) + launch + readback per call.
+
+**Parity** (L0, `gamma_kernels_match_cpu`, N=313 random, two U species):
+max|dV| = 7.5e-6 on |V|~5.5; max|dF| = 2.2e-6 on |F|~0.1 — f32 noise.
+
+**Measured on Si-R18 frozen** (MAXCOL=4, matsci, same geometry/params):
+per-eval **~145 ms** (rst+geom 66 + solve+f 78) vs 190 ms before —
+**and the O(N²) terms are gone**: `geom.gamma` 20 ms → ~0 (O(N) upload),
+γ′ analytic loop (~36 ms of contract) → ~2 ms kernel + ~µs readback.
+Center max|F| = 0.13074126361447178 — identical to the CPU path.
+E_tot shifts 1.6e-4 Ha (f32 V vs f64 matvec — inside the f32-architecture
+budget). Projected full frozen Hessian now ~24 min; more importantly the
+γ wall at N=5343 (was ~230 ms/eval) is now ~10–30 ms, and the N→10k
+scaling wall in row 1 of §15.22 is removed.
+
+**Remaining frozen-eval cost at N=1648 (~145 ms):** H/S assembly ~55 ms +
+upload ~10 (all pairs — column-local patch assembly is the next lever, R3),
+K/W snapshot restore copies ~10, pair contraction ~63 (still all nnz_hs
+pairs — R3 again), repulsion ~5. γ/γ′ is no longer the bottleneck.
+
+**Note on Newton's third law:** the gather form computes F_i independently
+per atom — pair forces cancel only to f32 rounding (~1e-7·N), so
+`check_newton` (warning-only diagnostic, tol 1e-6) may print a small |ΣF|
+residual; the CPU reference path keeps exact symmetry for tests.
+
+### §15.24 — GPU pair path: H/S assembly + analytic forces + repulsion on device (2026-09-18)
+
+The remaining all-pairs CPU loops (H/S SK assembly ~55 ms, K/W force
+contraction ~63 ms, repulsive ~5 ms at N=1648) are now GPU-resident via
+`sparse_hs.cl`. Explicit switch: `RUST_DFTB_SPARSE_CPU=1` selects the CPU
+reference everywhere; GPU is default and **never silently falls back**
+(banner prints `pair physics: GPU sparse_hs.cl` / `CPU reference (explicit)`).
+
+Kernels (gather-invariant, no atomics, no scatter):
+
+- `hs_diag` — onsite blocks from packed per-species params (E_DUMMY on
+  padded lanes, S diagonal = 1).
+- `hs_assemble` — one work-item per unique pair; port of
+  `build_pair_block_with_derivs`: B-spline eval (v,d1,d2) of the 8 packed
+  SK channels (H ssσ/spσ/ppσ/ppπ + S), Slater–Koster rotation for s/p
+  shells, taper, writes both BSR4 orientations.
+- `hs_contract` — per-pair analytic dH/dR,dS/dR contracted with K and W
+  blocks + atom-potential term; outputs `pf[2p]` (non-SCC) and `pf[2p+1]`
+  (SCC-shift) forces; line-for-line the `sparse_forces_bsr` formula.
+- `rep_eval` — repulsive spline eval from `pack_repulsive_gpu` records
+  (exp head `exp(-ar+b)+c`, `n_int` via `as_int` bit pattern), per-pair
+  force + energy out.
+- `force_gather` — one work-item per atom reads its CSR adjacency
+  (`pair_gather_adj`, `(pair<<1)|is_j` with ± sign convention), writes each
+  force component exactly once.
+
+Host packing once at init: `SkGpuPack` (meta/parm/ctrl, channel map
+resolved at pack time, unsupported extended-format mixes rejected),
+repulsive spline records, pair meta (i,j,h_blk,s_blk,k_blk,rev_blk),
+atom species/orbital counts, gather CSR. `SparseSystemWorkspace` keeps
+`GpuPairState` with all buffers persistent; `set_coords` uploads only
+xyzu + pair geometry and launches `hs_diag`+`hs_assemble`;
+`contract_forces` runs `gamma_forces_dev` → `hs_contract_dev` →
+`rep_eval_dev` → `force_gather` and reads back component arrays.
+
+**L0 parity** (`sparse_pair_path_parity`, SiH4 + displaced geometry,
+`cpu_pair` explicit on both engines): max|dH0|=4.5e-8, max|dS|=6.0e-8,
+|dE|=3.0e-7 Ha; force components non_scc 1.2e-6, scc_shift 1.7e-7,
+repulsive 1.0e-7, scc_dc 4.7e-8, total 1.2e-6 — displaced-geometry
+total 1.3e-6. f32 floor.
+
+**Measured benchmark** (frozen mode, bounded columns, RTX 3090):
+
+| system | path | rst+geom | solve+f | per eval | speedup |
+|---|---|---:|---:|---:|---:|
+| si R10 (330 at, 31k pairs) | CPU | ~9.6 ms | ~13.5 ms | ~23 ms | — |
+| | GPU | ~1.0 ms | ~0.7 ms | **~1.7 ms** | **~14×** |
+| si R18 (1648 at, 200k pairs) | CPU | ~69 ms | ~134 ms | ~203 ms | — |
+| | GPU | ~6.6 ms | ~4.2 ms | **~10.8 ms** | **~19×** |
+
+R18 parity in the run: E_tot GPU −1772.37331509 vs CPU −1772.37324817
+(|dE|=6.7e-5 Ha across SCC trajectories, ~4e-8/atom); center max|F|
+0.1307415962 vs 0.1307412703.
+
+**Projected frozen Hessian (4944 columns):** ~22 ms/column → **~2 min** of
+column time (was ~31–35 min CPU). Remaining per-eval cost is host-side
+snapshot restore + K/W upload and gather readback — the next step is
+column-local pair subranges into the same kernels (R3), which turns the
+~11 ms all-pairs eval into O(deg_hs) work for force columns.
+
+### §15.25 — Residency audit: ~155 MB/eval of PCIe traffic eliminated (2026-09-18)
+
+FLOP accounting exposed why the GPU pair path showed "only" ~19×: per eval
+is ~0.5–1 GFLOP of pair math (**~30 µs at the 3090's peak**) — the measured
+11 ms was almost entirely transfers and host work, not kernels. A
+single-thread CPU at ~5 GFLOPS explains the ~200 ms CPU figure; an OpenMP
+CPU would indeed be competitive at this size — the GPU path's value is
+residency + scaling + being the substrate for batched column launches.
+
+Leaks found per frozen eval and fixed (manifest §F):
+
+| leak | was | now |
+|---|---|---|
+| `restore_central_state` | `s.k`+`s.z` host upload ~52 MB | `copy_f32` device→device from `GpuCentralState` (~100 µs) |
+| `forces_frozen` | `s.k`+`s.w0` upload ~52 MB | `hs_contract` consumes `cd.k`/`cd.w0` snapshot buffers directly — zero copies |
+| `set_coords` GPU | h0/s readback ~25 MB "for diagnostics" | lazy mirrors — `h_bsr()/s_bsr()` refresh on demand (`&mut` + `Result`), hot path skips |
+| `snapshot_electronic_state` | `inject_k_values` re-upload 26 MB | `copy_f32` + `invalidate_ks()` |
+
+`GpuCentralState{k,z,k0,w0}` — device buffers captured once at snapshot;
+`central`/`central_dev` always Some/None together; restore without a
+device snapshot fails loud. Host `central` vecs retained (cpu_pair path,
+δK0 seed, diagnostics). Diagnostics reading host S
+(`ri_f64_diag`/`mcw_f64_diag`/`materialize_dense_diag`) call
+`refresh_hs_mirrors` first; test call sites updated to the new
+`Result`-returning `&mut` accessors.
+
+Residual per-eval transfers (accepted): xyzu up (4N), dq up (N),
+v/kdummy down (N), pe_rep down (n_rep), 5×3N forces down, plus the
+O(n_pairs) host coincident-atom guards (fail-loud contract).
+
+Verification status (measured, 2026-09-18): lib + all test targets
+compile clean (the unrelated `gpu_scc_plan.rs` refactor settled);
+`test_sparse_pair_gpu_vs_cpu_parity` and `test_sparse_dftb_sih4_reuse_scc_and_fire`
+pass; `sparse_f64check`/`gate_g3_energy` compile.
+
+**Post-fix R18 benchmark (frozen, RTX 3090, full unbounded run — all
+4944 columns):**
+
+| metric | before residency | after |
+|---|---:|---:|
+| rst+geom per eval | ~6.6 ms | **~0.5 ms** |
+| solve+f per eval | ~4.2 ms | **~1.1 ms** |
+| **per eval total** | **~10.8 ms** | **~1.6 ms** (**~7×**) |
+| full 4944-col Hessian wall | est. ~31–35 min | **138.2 s** |
+
+Physics unchanged: center `max|F|=0.130741` (identical to pre-fix),
+`n_imag=1`, `freq_min=−0.32 cm⁻¹` (acoustic floor), `freq_max=2298 cm⁻¹`,
+Hessian asymmetry 6.7e-3, `E_tot=−1772.37331509` matching the converged
+SCC value.
+
+Per-eval profile now (n≈9890 calls): `geom.hs` 0.374 ms + `f.gamma`
+0.360 ms + `geom.xyzu` 0.138 ms + `geom.rep` 0.024 ms — all
+kernel/launch-bound work; the large O(nnz) transfers are gone. The
+~155 MB/eval → ~0 estimate is confirmed by the ~7× eval speedup and the
+collapse of `rst+geom` (which was dominated by the K/Z upload + H/S
+readback).
+
+Note: `VIB_COLS=12` was set but the run executed all 4944 columns — the
+bounded-column env knob is named differently (`maxcol` is a script arg);
+the accidental full run *is* the definitive measurement: 4944×2 evals +
+init + final SCC/diag in 138 s wall.
+
+### §15.26 — CPU-vs-GPU benchmark table + bottleneck census (2026-09-18)
+
+Same runs as §15.24/§15.25, frozen mode, bounded at
+`RUST_DFTB_VIB_MAXCOL=12`, `RUST_DFTB_PROF=mark`. CPU rows use the
+explicit `RUST_DFTB_SPARSE_CPU=1` reference (single thread). R10:
+330 atoms, nnz_hs=13 362, deg_hs≈60, h=0.05 Å, pbc-0-3,
+`si_r10_sparse_relaxed_rk20.xyz`. R18: 1648 atoms, nnz_hs=199 676,
+deg_hs≈121, h=0.02 Å, matsci-0-3, raw `si_sphere_R18.xyz`.
+
+**Per-eval wall time (ms/eval = rst+geom + solve+f):**
+
+| system | stage | CPU ref | GPU | speedup |
+|---|---|---:|---:|---:|
+| R10 (330) | rst+geom | ~3.6 | ~0.1 | |
+| | solve+f | ~7.4 | ~0.3 | |
+| | **total** | **~11.0** | **~0.4** | **~27×** |
+| R18 (1648) | rst+geom | ~62 | ~0.5 | |
+| | solve+f | ~132 | ~1.1 | |
+| | **total** | **~194** | **~1.6** | **~121×** |
+
+Progression of the same measurement (frozen GPU eval): §15.24 pair-port
+1.7 ms (R10) / 10.8 ms (R18) → §15.25 residency **0.4 / 1.6 ms**.
+Projected full Hessians: R18 CPU ≈ 4944×2×0.194 s ≈ **32 min** vs GPU
+**138 s**; R10 CPU ≈ 990×2×0.011 s ≈ **22 s** vs GPU ≈ **0.8 s** of
+column time (measured 0.094 s for 12 cols + fixed overheads).
+
+**R18 GPU per-eval stage census (n=9890 calls, full-run profile):**
+
+| stage | ms/eval | what it is |
+|---|---:|---|
+| `geom.hs` | 0.374 | hs_diag + hs_assemble over 200k pairs + kdummy + s_inf reduce + H_scc build |
+| `f.gamma` | 0.360 | γ′ all-pairs n-body force kernel (1.6M pairs, O(N²)) |
+| `geom.xyzu` | 0.138 | coords pack + upload (O(N)) |
+| `geom.rep` | 0.024 | repulsive spline eval |
+| *unprofiled* | ~0.7 | restore device copies, dq upload, contract+gather launches, O(N) readbacks, host pair-guard loops, ~10 launch latencies |
+| **total** | **~1.6** | |
+
+**Where the remaining time actually goes:**
+
+1. **The Hessian columns are no longer the pipeline bottleneck.** Of the
+   138.2 s R18 wall: ~11.8 s init (plan/alloc), ~7 s central SCC,
+   ~16 s all 9888 frozen evals — and **~100 s dense host
+   `nalgebra::SymmetricEigen` on the mass-weighted 4944×4944 Hessian**.
+   The eigensolve is now ~70% of the total wall and is pure O((3N)³)
+   host work. At N=5k (15k cols) a dense eigh is ~hours — this becomes
+   the new wall before column cost does.
+2. **Per-eval: `geom.hs` + `f.gamma` ≈ 0.73 ms of 1.6 ms** — both are
+   *all-pairs* work for a single-atom displacement. Column-local pair
+   subranges (manifest §F) shrink both to O(deg): the ~167 H/S pairs and
+   the γ′ row touched by the displacement. This is the correct next
+   optimization, not kernel tuning.
+3. **~0.7 ms unprofiled orchestration floor**: ~10 kernel launches
+   (~10–20 µs each on this driver), 5×3N-force + O(N) readbacks,
+   device→device restores, and the **O(n_pairs) host coincident-atom
+   guard loops** in `set_coords` (~200k-iteration CPU scan per geometry
+   — hoistable to once per pair list, or a GPU check). Batched ±h
+   launches amortize all of it across a color class.
+4. **`f.gamma` is the asymptotic risk**: O(N²) tiled n-body. At N=5k it
+   is ~9× today's cost (~3 ms/eval) and would dominate; fine for the
+   frozen column phase if made column-local too (γ′ row of the displaced
+   atom), or eventually a cell-list/tree method.
+
+**Physics parity notes.** Center `max|F|` identical CPU vs GPU
+(0.130741); per-column `max|ΔF|` tracks with ~10–20 % deviation
+(e.g. col 0: 2.66e-2 GPU vs 2.42e-2 CPU; col 2: 3.55e-2 vs 2.86e-2).
+ΔF = F(+h)−F(−h) is a ~5×-cancelling difference of |F|~0.13 forces, so
+this is ~2–3 % f32 accumulated error on the forces themselves — *plus*
+the two runs converged to different SCC states (r_scc 4.4e-6 vs 7.6e-6),
+which shifts the frozen reference at the ~1e-5 level and is amplified by
+the FD difference. Same-state kernel parity is covered by
+`test_sparse_pair_gpu_vs_cpu_parity` (max|dF|=1.2e-6 at small N); a
+component-level R18 parity check remains queued. The outcome-level
+Hessian is unaffected: n_imag=1 at −0.32 cm⁻¹, asymmetry 6.7e-3.

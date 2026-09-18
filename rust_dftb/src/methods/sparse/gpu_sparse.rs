@@ -10,14 +10,19 @@
 //! `GpuRuntime` OpenCL runtime.
 
 use crate::core::error::{DftbError, Result};
-use crate::methods::sparse::bsr4::{
-    dense_max_abs_diff, Bsr4Matrix, SpgemmPlan, BS, BS2,
-};
+use crate::methods::sparse::bsr4::{dense_max_abs_diff, Bsr4Matrix, SpgemmPlan, BS, BS2};
 use crate::qmqm::gpu_runtime::{map_ocl_err, GpuRuntime};
+use ocl::prm::Float4;
 use ocl::{builders::ProgramBuilder, flags, Buffer, Kernel, Program};
 use std::sync::Arc;
 
 const BSR4_KERNEL_SOURCE: &str = include_str!("sparse_bsr4_purification.cl");
+const GAMMA_KERNEL_SOURCE: &str = include_str!("sparse_gamma.cl");
+const HS_KERNEL_SOURCE: &str = include_str!("sparse_hs.cl");
+
+/// Tile size (work-group size) of the n-body γ/γ′ kernels — staged j-atoms
+/// per work-group in __local memory.
+const GAMMA_WG: u32 = 128;
 
 /// Occupation contract for a claimed TC2 projector (second review §3.5).
 /// `||KSK−K||` alone accepts a wrong-rank projector, including K=0.
@@ -99,11 +104,11 @@ pub struct SparsePerfStats {
     pub n_orb_padded: usize,   // n_atom * 4 (BSR4 padded)
 
     // ── Sparsity ──
-    pub nnz_hs: usize,    // H/S block count (physical SK mask + skin)
-    pub nnz_k: usize,     // K/density-kernel block count
-    pub nnz_z: usize,     // Z/S⁻¹ block count
-    pub plan_terms: usize, // symbolic SpGEMM contribution count (P4)
-    pub plan_bytes: usize, // bytes in the symbolic plan (P4)
+    pub nnz_hs: usize,         // H/S block count (physical SK mask + skin)
+    pub nnz_k: usize,          // K/density-kernel block count
+    pub nnz_z: usize,          // Z/S⁻¹ block count
+    pub plan_terms: usize,     // symbolic SpGEMM contribution count (P4)
+    pub plan_bytes: usize,     // bytes in the symbolic plan (P4)
     pub gpu_bytes_peak: usize, // peak GPU memory allocated
 
     // ── Host/device traffic ──
@@ -115,20 +120,20 @@ pub struct SparsePerfStats {
     pub largest_dense: usize,
 
     // ── Stage timings (seconds) ──
-    pub t_mask_plan: f64,  // geometric mask + symbolic plan construction
-    pub t_hs: f64,         // H/S assembly
+    pub t_mask_plan: f64,   // geometric mask + symbolic plan construction
+    pub t_hs: f64,          // H/S assembly
     pub t_gamma_build: f64, // gamma matrix construction (per geometry)
     pub t_gamma_mv: f64,    // gamma matvec (per SCC iteration)
-    pub t_inverse: f64,    // Newton-Schulz approximate inverse
-    pub t_kinit: f64,      // K₀ initialization (Z·H·Z + spectral bounds)
-    pub t_tc2: f64,        // TC2 purification
-    pub t_scc: f64,        // complete SCC loop (gamma + Hscc + TC2 + mixing)
-    pub t_force: f64,      // force evaluation
-    pub t_host_sync: f64,  // time in host synchronization (finish + read)
-    pub t_total: f64,      // total wall time
+    pub t_inverse: f64,     // Newton-Schulz approximate inverse
+    pub t_kinit: f64,       // K₀ initialization (Z·H·Z + spectral bounds)
+    pub t_tc2: f64,         // TC2 purification
+    pub t_scc: f64,         // complete SCC loop (gamma + Hscc + TC2 + mixing)
+    pub t_force: f64,       // force evaluation
+    pub t_host_sync: f64,   // time in host synchronization (finish + read)
+    pub t_total: f64,       // total wall time
 
     // ── Legacy aliases (for backward compatibility with existing callers) ──
-    pub gpu_bytes: usize,   // alias for gpu_bytes_peak
+    pub gpu_bytes: usize,       // alias for gpu_bytes_peak
     pub n_kernel_launch: usize, // alias for kernel_launches
     pub n_host_read: usize,     // alias for host_syncs
     pub t_ns: f64,              // alias for t_inverse
@@ -144,7 +149,9 @@ impl SparsePerfStats {
         eprintln!("N orbs (padded BSR4)    {}", self.n_orb_padded);
         let pad_overhead = if self.n_orb_physical > 0 {
             100.0 * (self.n_orb_padded as f64 / self.n_orb_physical as f64 - 1.0)
-        } else { 0.0 };
+        } else {
+            0.0
+        };
         eprintln!("H-padding overhead      {pad_overhead:.1}%");
         eprintln!("H/S blocks (nnz_hs)     {}", self.nnz_hs);
         eprintln!("K blocks (nnz_k)        {}", self.nnz_k);
@@ -163,7 +170,10 @@ impl SparsePerfStats {
         if self.largest_dense == 0 {
             eprintln!("largest dense alloc     0 bytes (uninstrumented — not a P0 proof)");
         } else {
-            eprintln!("largest dense alloc     {} bytes (must be 0 in production sparse path)", self.largest_dense);
+            eprintln!(
+                "largest dense alloc     {} bytes (must be 0 in production sparse path)",
+                self.largest_dense
+            );
         }
 
         eprintln!();
@@ -179,9 +189,16 @@ impl SparsePerfStats {
         eprintln!("force        {:.6}", self.t_force);
         eprintln!("host sync    {:.6}", self.t_host_sync);
 
-        let accounted = self.t_mask_plan + self.t_hs + self.t_gamma_build
-            + self.t_gamma_mv + self.t_inverse + self.t_kinit
-            + self.t_tc2 + self.t_scc + self.t_force + self.t_host_sync;
+        let accounted = self.t_mask_plan
+            + self.t_hs
+            + self.t_gamma_build
+            + self.t_gamma_mv
+            + self.t_inverse
+            + self.t_kinit
+            + self.t_tc2
+            + self.t_scc
+            + self.t_force
+            + self.t_host_sync;
         let t_misc = self.t_total - accounted;
         eprintln!("misc/other  {:.6}", t_misc);
         eprintln!("TOTAL       {:.6}", self.t_total);
@@ -192,14 +209,18 @@ impl SparsePerfStats {
                 100.0 * self.t_host_sync / self.t_total);
         }
         if t_misc > 0.6 * self.t_total && self.t_total > 0.01 {
-            eprintln!("WARNING: misc/other is {:.0}% of total — kernel speedup may be irrelevant",
-                100.0 * t_misc / self.t_total);
+            eprintln!(
+                "WARNING: misc/other is {:.0}% of total — kernel speedup may be irrelevant",
+                100.0 * t_misc / self.t_total
+            );
         }
         // P0 firewall check: host syncs should be minimal in the hot loop.
         // A typical TC2 run with check_every=5 should have ~max_iter/5 syncs.
         if self.host_syncs > 100 && self.t_total > 0.01 {
-            eprintln!("WARNING: {} host syncs — consider reducing check frequency or fusing diagnostics",
-                self.host_syncs);
+            eprintln!(
+                "WARNING: {} host syncs — consider reducing check frequency or fusing diagnostics",
+                self.host_syncs
+            );
         }
     }
 }
@@ -296,6 +317,18 @@ pub(crate) fn sparse_plans_enabled() -> bool {
     !matches!(std::env::var("RUST_DFTB_SPARSE_PLANS"), Ok(v) if v == "0" || v.eq_ignore_ascii_case("false"))
 }
 
+/// `RUST_DFTB_TRUNC_PRODUCTS=1` stores the T=K·S intermediate on M_K
+/// instead of the true product support M_K∘M_HS (sparse_system.rs).
+/// Needed on large crystals: M_TKS spans r_k+r_hs — on a sphere whose
+/// diameter is < 2·(r_k+r_hs) interior rows are dense (deg→N_atom) and
+/// exceed MAX_LEFT_BLOCKS when T is a left operand. Cost: downstream
+/// products (T·K, T·Q, T·Z, R_H) lose the K·S tail (~7e-6/product —
+/// negligible when the stored-K mask floor is ≫ that). Diagonal blocks
+/// (trace, Mulliken) are identical either way.
+pub(crate) fn trunc_products() -> bool {
+    matches!(std::env::var("RUST_DFTB_TRUNC_PRODUCTS"), Ok(v) if v == "1" || v.eq_ignore_ascii_case("true"))
+}
+
 /// Compiled BSR4 sparse kernel set bound to an OpenCL device.
 pub struct SparseBsr4Gpu {
     rt: GpuRuntime,
@@ -350,6 +383,19 @@ pub struct SparseBsr4Gpu {
     // GPT-5.6 item 2: per-atom trace partials → host f64 reduction for the
     // TC2 trace/branch decision.
     k_trace_atom: Kernel,
+    // Tiled n-body γ/γ′ kernels (sparse_gamma.cl): V = γ·dq and the SCC
+    // double-counting force, both all-pairs gathers — no dense gmat.
+    k_gamma_v: Kernel,
+    k_gamma_f: Kernel,
+    // R17: sparse pair physics (sparse_hs.cl) — H0/S assembly, analytic
+    // derivative contraction vs K/W, repulsive energy+force, per-atom
+    // gather, dummy-lane diagnostic. All write-owned outputs, no atomics.
+    k_hs_diag: Kernel,
+    k_hs_assemble: Kernel,
+    k_hs_contract: Kernel,
+    k_rep_eval: Kernel,
+    k_force_gather: Kernel,
+    k_hs_kdummy: Kernel,
     /// Device-buffer allocation counter (F3): incremented by every
     /// `buf_*`/`zero_*` helper. The persistent-workspace contract requires
     /// this to be flat across an SCC iteration — tests assert zero growth.
@@ -376,7 +422,10 @@ impl SparseBsr4Gpu {
         let mut builder = ProgramBuilder::new();
         builder.devices(device);
         builder.src(BSR4_KERNEL_SOURCE);
+        builder.src(GAMMA_KERNEL_SOURCE);
+        builder.src(HS_KERNEL_SOURCE);
         builder.cmplr_def("WG", config.wg);
+        builder.cmplr_def("GWG", GAMMA_WG as i32);
         builder.cmplr_def("MAX_LEFT_BLOCKS", config.max_left_blocks);
         builder.cmplr_def("REDUCE_WG", config.reduce_wg);
         builder.cmplr_def("ACC8", config.spgemm_acc8 as i32);
@@ -426,13 +475,26 @@ impl SparseBsr4Gpu {
 
         // Helper: build a kernel with dummy args matching the kernel signature.
         // Each kernel's arg count and types must match the .cl definition.
-        let build_k = |name: &str, n_scalar_u32: usize, n_buf_u32: usize, n_buf_f32: usize, n_scalar_f32: usize| -> Result<Kernel> {
+        let build_k = |name: &str,
+                       n_scalar_u32: usize,
+                       n_buf_u32: usize,
+                       n_buf_f32: usize,
+                       n_scalar_f32: usize|
+         -> Result<Kernel> {
             let mut b = Kernel::builder();
             b.program(&program).name(name).queue(queue.clone());
-            for _ in 0..n_scalar_u32 { b.arg(0u32); }
-            for _ in 0..n_buf_u32    { b.arg(&dummy_u32); }
-            for _ in 0..n_buf_f32    { b.arg(&dummy_f32); }
-            for _ in 0..n_scalar_f32 { b.arg(0.0f32); }
+            for _ in 0..n_scalar_u32 {
+                b.arg(0u32);
+            }
+            for _ in 0..n_buf_u32 {
+                b.arg(&dummy_u32);
+            }
+            for _ in 0..n_buf_f32 {
+                b.arg(&dummy_f32);
+            }
+            for _ in 0..n_scalar_f32 {
+                b.arg(0.0f32);
+            }
             b.build().map_err(map_ocl_err)
         };
 
@@ -442,27 +504,44 @@ impl SparseBsr4Gpu {
         //   = 1 scalar_u32, 6 buf_u32, 3 buf_f32
         let k_spgemm_masked = {
             let mut b = Kernel::builder();
-            b.program(&program).name("bsr4_spgemm_masked").queue(queue.clone());
+            b.program(&program)
+                .name("bsr4_spgemm_masked")
+                .queue(queue.clone());
             b.arg(0u32); // nrow
-            b.arg(&dummy_u32); b.arg(&dummy_u32); b.arg(&dummy_f32); // A_row, A_col, A
-            b.arg(&dummy_u32); b.arg(&dummy_u32); b.arg(&dummy_f32); // B_row, B_col, B
-            b.arg(&dummy_u32); b.arg(&dummy_u32); b.arg(&dummy_f32); // C_row, C_col, C
+            b.arg(&dummy_u32);
+            b.arg(&dummy_u32);
+            b.arg(&dummy_f32); // A_row, A_col, A
+            b.arg(&dummy_u32);
+            b.arg(&dummy_u32);
+            b.arg(&dummy_f32); // B_row, B_col, B
+            b.arg(&dummy_u32);
+            b.arg(&dummy_u32);
+            b.arg(&dummy_f32); // C_row, C_col, C
             b.build().map_err(map_ocl_err)?
         };
         let k_spgemm_bsym = {
             let mut b = Kernel::builder();
-            b.program(&program).name("bsr4_spgemm_masked_Bsym").queue(queue.clone());
+            b.program(&program)
+                .name("bsr4_spgemm_masked_Bsym")
+                .queue(queue.clone());
             b.arg(0u32);
-            b.arg(&dummy_u32); b.arg(&dummy_u32); b.arg(&dummy_f32);
-            b.arg(&dummy_u32); b.arg(&dummy_u32); b.arg(&dummy_f32);
-            b.arg(&dummy_u32); b.arg(&dummy_u32); b.arg(&dummy_f32);
+            b.arg(&dummy_u32);
+            b.arg(&dummy_u32);
+            b.arg(&dummy_f32);
+            b.arg(&dummy_u32);
+            b.arg(&dummy_u32);
+            b.arg(&dummy_f32);
+            b.arg(&dummy_u32);
+            b.arg(&dummy_u32);
+            b.arg(&dummy_f32);
             b.build().map_err(map_ocl_err)?
         };
         // bsr4_zero: nblock, A   -> 1 u32 scalar, 1 f32 buf
         let k_zero = {
             let mut b = Kernel::builder();
             b.program(&program).name("bsr4_zero").queue(queue.clone());
-            b.arg(0u32); b.arg(&dummy_f32);
+            b.arg(0u32);
+            b.arg(&dummy_f32);
             b.build().map_err(map_ocl_err)?
         };
         // bsr4_axpby: nblock, alpha, A, beta, B, C  -> 1 u32, 2 f32 buf (A,B are f32, C is f32), 2 f32 scalar
@@ -470,14 +549,24 @@ impl SparseBsr4Gpu {
         let k_axpby = {
             let mut b = Kernel::builder();
             b.program(&program).name("bsr4_axpby").queue(queue.clone());
-            b.arg(0u32); b.arg(0.0f32); b.arg(&dummy_f32); b.arg(0.0f32); b.arg(&dummy_f32); b.arg(&dummy_f32);
+            b.arg(0u32);
+            b.arg(0.0f32);
+            b.arg(&dummy_f32);
+            b.arg(0.0f32);
+            b.arg(&dummy_f32);
+            b.arg(&dummy_f32);
             b.build().map_err(map_ocl_err)?
         };
         // bsr4_mcweeny: nblock, Q, V, Knew  -> 1 u32, 3 f32 buf
         let k_mcweeny = {
             let mut b = Kernel::builder();
-            b.program(&program).name("bsr4_mcweeny").queue(queue.clone());
-            b.arg(0u32); b.arg(&dummy_f32); b.arg(&dummy_f32); b.arg(&dummy_f32);
+            b.program(&program)
+                .name("bsr4_mcweeny")
+                .queue(queue.clone());
+            b.arg(0u32);
+            b.arg(&dummy_f32);
+            b.arg(&dummy_f32);
+            b.arg(&dummy_f32);
             b.build().map_err(map_ocl_err)?
         };
         // bsr4_tc2: nblock, K, Q_KSK, branch(u32, host f64 decision), Knew
@@ -485,14 +574,22 @@ impl SparseBsr4Gpu {
         let k_tc2 = {
             let mut b = Kernel::builder();
             b.program(&program).name("bsr4_tc2").queue(queue.clone());
-            b.arg(0u32); b.arg(&dummy_f32); b.arg(&dummy_f32); b.arg(0u32); b.arg(&dummy_f32);
+            b.arg(0u32);
+            b.arg(&dummy_f32);
+            b.arg(&dummy_f32);
+            b.arg(0u32);
+            b.arg(&dummy_f32);
             b.build().map_err(map_ocl_err)?
         };
         // bsr4_symmetrize: nblock, transpose_block, A -> 1 u32, 1 u32 buf, 1 f32 buf
         let k_symmetrize = {
             let mut b = Kernel::builder();
-            b.program(&program).name("bsr4_symmetrize").queue(queue.clone());
-            b.arg(0u32); b.arg(&dummy_u32); b.arg(&dummy_f32);
+            b.program(&program)
+                .name("bsr4_symmetrize")
+                .queue(queue.clone());
+            b.arg(0u32);
+            b.arg(&dummy_u32);
+            b.arg(&dummy_f32);
             b.build().map_err(map_ocl_err)?
         };
         // bsr4_mulliken_KS (R14): nrow, diag_block, ks, n_orb, q, q_dum
@@ -501,37 +598,63 @@ impl SparseBsr4Gpu {
         //   -> 1 u32, 2 u32 bufs, 2 f32 bufs
         let k_mulliken_ks = {
             let mut b = Kernel::builder();
-            b.program(&program).name("bsr4_mulliken_KS").queue(queue.clone());
-            b.arg(0u32); b.arg(&dummy_u32); b.arg(&dummy_f32); b.arg(&dummy_u32); b.arg(&dummy_f32);
+            b.program(&program)
+                .name("bsr4_mulliken_KS")
+                .queue(queue.clone());
+            b.arg(0u32);
+            b.arg(&dummy_u32);
+            b.arg(&dummy_f32);
+            b.arg(&dummy_u32);
+            b.arg(&dummy_f32);
             b.build().map_err(map_ocl_err)?
         };
         // bsr4_trace_KS_partial (R14): nrow, diag_block, ks, n_orb, partial
         //   -> 1 u32, 2 u32 bufs, 2 f32 bufs
         let k_trace_partial = {
             let mut b = Kernel::builder();
-            b.program(&program).name("bsr4_trace_KS_partial").queue(queue.clone());
-            b.arg(0u32); b.arg(&dummy_u32); b.arg(&dummy_f32); b.arg(&dummy_u32); b.arg(&dummy_f32);
+            b.program(&program)
+                .name("bsr4_trace_KS_partial")
+                .queue(queue.clone());
+            b.arg(0u32);
+            b.arg(&dummy_u32);
+            b.arg(&dummy_f32);
+            b.arg(&dummy_u32);
+            b.arg(&dummy_f32);
             b.build().map_err(map_ocl_err)?
         };
         // reduce_sum_f32: n, input, output -> 1 u32, 2 f32 buf
         let k_reduce = {
             let mut b = Kernel::builder();
-            b.program(&program).name("reduce_sum_f32").queue(queue.clone());
-            b.arg(0u32); b.arg(&dummy_f32); b.arg(&dummy_f32);
+            b.program(&program)
+                .name("reduce_sum_f32")
+                .queue(queue.clone());
+            b.arg(0u32);
+            b.arg(&dummy_f32);
+            b.arg(&dummy_f32);
             b.build().map_err(map_ocl_err)?
         };
         // bsr4_identity_residual_partial: nblock, diag_flag, A, partial
         let k_identity_residual = {
             let mut b = Kernel::builder();
-            b.program(&program).name("bsr4_identity_residual_partial").queue(queue.clone());
-            b.arg(0u32); b.arg(&dummy_u32); b.arg(&dummy_f32); b.arg(&dummy_f32);
+            b.program(&program)
+                .name("bsr4_identity_residual_partial")
+                .queue(queue.clone());
+            b.arg(0u32);
+            b.arg(&dummy_u32);
+            b.arg(&dummy_f32);
+            b.arg(&dummy_f32);
             b.build().map_err(map_ocl_err)?
         };
         // bsr4_idempotency_partial: nblock, q_ksk, k, partial -> 1 u32, 3 f32 buf
         let k_idempotency = {
             let mut b = Kernel::builder();
-            b.program(&program).name("bsr4_idempotency_partial").queue(queue.clone());
-            b.arg(0u32); b.arg(&dummy_f32); b.arg(&dummy_f32); b.arg(&dummy_f32);
+            b.program(&program)
+                .name("bsr4_idempotency_partial")
+                .queue(queue.clone());
+            b.arg(0u32);
+            b.arg(&dummy_f32);
+            b.arg(&dummy_f32);
+            b.arg(&dummy_f32);
             b.build().map_err(map_ocl_err)?
         };
         // P4: bsr4_spgemm_plan_Bsym: nrow, A_row, A, B, plan_ptr, plan_a_idx,
@@ -539,24 +662,36 @@ impl SparseBsr4Gpu {
         //   -> 1 u32 scalar, 5 u32 bufs, 3 f32 bufs
         let k_spgemm_plan_bsym = {
             let mut b = Kernel::builder();
-            b.program(&program).name("bsr4_spgemm_plan_Bsym").queue(queue.clone());
+            b.program(&program)
+                .name("bsr4_spgemm_plan_Bsym")
+                .queue(queue.clone());
             b.arg(0u32); // nrow
-            b.arg(&dummy_u32); b.arg(&dummy_f32); // A_row, A
+            b.arg(&dummy_u32);
+            b.arg(&dummy_f32); // A_row, A
             b.arg(&dummy_f32); // B
-            b.arg(&dummy_u32); b.arg(&dummy_u32); b.arg(&dummy_u32); // plan_ptr, plan_a_idx, plan_b_idx
-            b.arg(&dummy_u32); b.arg(&dummy_f32); // C_row, C
+            b.arg(&dummy_u32);
+            b.arg(&dummy_u32);
+            b.arg(&dummy_u32); // plan_ptr, plan_a_idx, plan_b_idx
+            b.arg(&dummy_u32);
+            b.arg(&dummy_f32); // C_row, C
             b.build().map_err(map_ocl_err)?
         };
         // bsr4_spgemm_plan (generic, GPT-5.6 #4): same signature as the
         // Bsym variant — plan_b_idx indexes B_kj directly.
         let k_spgemm_plan = {
             let mut b = Kernel::builder();
-            b.program(&program).name("bsr4_spgemm_plan").queue(queue.clone());
+            b.program(&program)
+                .name("bsr4_spgemm_plan")
+                .queue(queue.clone());
             b.arg(0u32); // nrow
-            b.arg(&dummy_u32); b.arg(&dummy_f32); // A_row, A
+            b.arg(&dummy_u32);
+            b.arg(&dummy_f32); // A_row, A
             b.arg(&dummy_f32); // B
-            b.arg(&dummy_u32); b.arg(&dummy_u32); b.arg(&dummy_u32); // plan_ptr, plan_a_idx, plan_b_idx
-            b.arg(&dummy_u32); b.arg(&dummy_f32); // C_row, C
+            b.arg(&dummy_u32);
+            b.arg(&dummy_u32);
+            b.arg(&dummy_u32); // plan_ptr, plan_a_idx, plan_b_idx
+            b.arg(&dummy_u32);
+            b.arg(&dummy_f32); // C_row, C
             b.build().map_err(map_ocl_err)?
         };
         // bsr4_spgemm_plan_Bsym_ff (FF32-POLISH): nrow, A_row, A_hi,
@@ -564,13 +699,21 @@ impl SparseBsr4Gpu {
         //   C_hi, C_lo -> 2 u32 scalars, 4 u32 bufs, 5 f32 bufs
         let k_spgemm_plan_bsym_ff = {
             let mut b = Kernel::builder();
-            b.program(&program).name("bsr4_spgemm_plan_Bsym_ff").queue(queue.clone());
+            b.program(&program)
+                .name("bsr4_spgemm_plan_Bsym_ff")
+                .queue(queue.clone());
             b.arg(0u32); // nrow
-            b.arg(&dummy_u32); b.arg(&dummy_f32); b.arg(&dummy_f32); // A_row, A_hi, A_lo
+            b.arg(&dummy_u32);
+            b.arg(&dummy_f32);
+            b.arg(&dummy_f32); // A_row, A_hi, A_lo
             b.arg(0u32); // a_has_lo
             b.arg(&dummy_f32); // B
-            b.arg(&dummy_u32); b.arg(&dummy_u32); b.arg(&dummy_u32); // plan
-            b.arg(&dummy_u32); b.arg(&dummy_f32); b.arg(&dummy_f32); // C_row, C_hi, C_lo
+            b.arg(&dummy_u32);
+            b.arg(&dummy_u32);
+            b.arg(&dummy_u32); // plan
+            b.arg(&dummy_u32);
+            b.arg(&dummy_f32);
+            b.arg(&dummy_f32); // C_row, C_hi, C_lo
             b.build().map_err(map_ocl_err)?
         };
         // bsr4_spgemm_plan_Bsym_ff0: nrow, A_row, A, B, plan_ptr,
@@ -578,12 +721,19 @@ impl SparseBsr4Gpu {
         //   -> 1 u32 scalar, 4 u32 bufs, 4 f32 bufs
         let k_spgemm_plan_bsym_ff0 = {
             let mut b = Kernel::builder();
-            b.program(&program).name("bsr4_spgemm_plan_Bsym_ff0").queue(queue.clone());
+            b.program(&program)
+                .name("bsr4_spgemm_plan_Bsym_ff0")
+                .queue(queue.clone());
             b.arg(0u32); // nrow
-            b.arg(&dummy_u32); b.arg(&dummy_f32); // A_row, A
+            b.arg(&dummy_u32);
+            b.arg(&dummy_f32); // A_row, A
             b.arg(&dummy_f32); // B
-            b.arg(&dummy_u32); b.arg(&dummy_u32); b.arg(&dummy_u32); // plan
-            b.arg(&dummy_u32); b.arg(&dummy_f32); b.arg(&dummy_f32); // C_row, C_hi, C_lo
+            b.arg(&dummy_u32);
+            b.arg(&dummy_u32);
+            b.arg(&dummy_u32); // plan
+            b.arg(&dummy_u32);
+            b.arg(&dummy_f32);
+            b.arg(&dummy_f32); // C_row, C_hi, C_lo
             b.build().map_err(map_ocl_err)?
         };
         // bsr4_spgemm_plan_Bsym_ffb: nrow, A_row, A_hi, A_lo, B_hi, B_lo,
@@ -591,21 +741,35 @@ impl SparseBsr4Gpu {
         //   -> 1 u32 scalar, 4 u32 bufs, 6 f32 bufs
         let k_spgemm_plan_bsym_ffb = {
             let mut b = Kernel::builder();
-            b.program(&program).name("bsr4_spgemm_plan_Bsym_ffb").queue(queue.clone());
+            b.program(&program)
+                .name("bsr4_spgemm_plan_Bsym_ffb")
+                .queue(queue.clone());
             b.arg(0u32); // nrow
-            b.arg(&dummy_u32); b.arg(&dummy_f32); b.arg(&dummy_f32); // A_row, A_hi, A_lo
-            b.arg(&dummy_f32); b.arg(&dummy_f32); // B_hi, B_lo
-            b.arg(&dummy_u32); b.arg(&dummy_u32); b.arg(&dummy_u32); // plan
-            b.arg(&dummy_u32); b.arg(&dummy_f32); b.arg(&dummy_f32); // C_row, C_hi, C_lo
+            b.arg(&dummy_u32);
+            b.arg(&dummy_f32);
+            b.arg(&dummy_f32); // A_row, A_hi, A_lo
+            b.arg(&dummy_f32);
+            b.arg(&dummy_f32); // B_hi, B_lo
+            b.arg(&dummy_u32);
+            b.arg(&dummy_u32);
+            b.arg(&dummy_u32); // plan
+            b.arg(&dummy_u32);
+            b.arg(&dummy_f32);
+            b.arg(&dummy_f32); // C_row, C_hi, C_lo
             b.build().map_err(map_ocl_err)?
         };
         // bsr4_mcw_ff_combine (FF32-POLISH): nblock, Q_hi, Q_lo, V_hi,
         //   V_lo, Knew -> 1 u32 scalar, 5 f32 bufs (elementwise)
         let k_mcw_ff_combine = {
             let mut b = Kernel::builder();
-            b.program(&program).name("bsr4_mcw_ff_combine").queue(queue.clone());
+            b.program(&program)
+                .name("bsr4_mcw_ff_combine")
+                .queue(queue.clone());
             b.arg(0u32); // nblock
-            b.arg(&dummy_f32); b.arg(&dummy_f32); b.arg(&dummy_f32); b.arg(&dummy_f32); // Q,V hi/lo
+            b.arg(&dummy_f32);
+            b.arg(&dummy_f32);
+            b.arg(&dummy_f32);
+            b.arg(&dummy_f32); // Q,V hi/lo
             b.arg(&dummy_f32); // Knew
             b.build().map_err(map_ocl_err)?
         };
@@ -614,15 +778,25 @@ impl SparseBsr4Gpu {
         //   -> 1 u32 scalar, 2 u32 bufs, 2 f32 bufs
         let k_row_abs_sum = {
             let mut b = Kernel::builder();
-            b.program(&program).name("bsr4_row_abs_sum").queue(queue.clone());
-            b.arg(0u32); b.arg(&dummy_u32); b.arg(&dummy_u32); b.arg(&dummy_f32); b.arg(&dummy_f32);
+            b.program(&program)
+                .name("bsr4_row_abs_sum")
+                .queue(queue.clone());
+            b.arg(0u32);
+            b.arg(&dummy_u32);
+            b.arg(&dummy_u32);
+            b.arg(&dummy_f32);
+            b.arg(&dummy_f32);
             b.build().map_err(map_ocl_err)?
         };
         // reduce_max_f32: n, x, out -> 1 u32 scalar, 2 f32 bufs
         let k_reduce_max = {
             let mut b = Kernel::builder();
-            b.program(&program).name("reduce_max_f32").queue(queue.clone());
-            b.arg(0u32); b.arg(&dummy_f32); b.arg(&dummy_f32);
+            b.program(&program)
+                .name("reduce_max_f32")
+                .queue(queue.clone());
+            b.arg(0u32);
+            b.arg(&dummy_f32);
+            b.arg(&dummy_f32);
             b.build().map_err(map_ocl_err)?
         };
         // bsr4_build_identity_dev: nblock, diag_flag, values (writes ALL
@@ -630,15 +804,23 @@ impl SparseBsr4Gpu {
         //   -> 1 u32 scalar, 1 u32 buf, 1 f32 buf
         let k_build_identity = {
             let mut b = Kernel::builder();
-            b.program(&program).name("bsr4_build_identity_dev").queue(queue.clone());
-            b.arg(0u32); b.arg(&dummy_u32); b.arg(&dummy_f32);
+            b.program(&program)
+                .name("bsr4_build_identity_dev")
+                .queue(queue.clone());
+            b.arg(0u32);
+            b.arg(&dummy_u32);
+            b.arg(&dummy_f32);
             b.build().map_err(map_ocl_err)?
         };
         // bsr4_scale_dev: nblock, alpha, values -> 1 u32 scalar, 1 f32 scalar, 1 f32 buf
         let k_scale = {
             let mut b = Kernel::builder();
-            b.program(&program).name("bsr4_scale_dev").queue(queue.clone());
-            b.arg(0u32); b.arg(0.0f32); b.arg(&dummy_f32);
+            b.program(&program)
+                .name("bsr4_scale_dev")
+                .queue(queue.clone());
+            b.arg(0u32);
+            b.arg(0.0f32);
+            b.arg(&dummy_f32);
             b.build().map_err(map_ocl_err)?
         };
         // GPT-5.6 #19: Gershgorin bounds + min reduction
@@ -646,78 +828,273 @@ impl SparseBsr4Gpu {
         //   emin_partial, emax_partial -> 1 u32 scalar, 4 u32 bufs, 3 f32 bufs
         let k_gershgorin_partial = {
             let mut b = Kernel::builder();
-            b.program(&program).name("bsr4_gershgorin_partial").queue(queue.clone());
+            b.program(&program)
+                .name("bsr4_gershgorin_partial")
+                .queue(queue.clone());
             b.arg(0u32); // n_atom
-            b.arg(&dummy_u32); b.arg(&dummy_u32); b.arg(&dummy_f32); // row_ptr, col_idx, values
+            b.arg(&dummy_u32);
+            b.arg(&dummy_u32);
+            b.arg(&dummy_f32); // row_ptr, col_idx, values
             b.arg(&dummy_u32); // diag_flag
-            b.arg(&dummy_f32); b.arg(&dummy_f32); // emin_partial, emax_partial
+            b.arg(&dummy_f32);
+            b.arg(&dummy_f32); // emin_partial, emax_partial
             b.build().map_err(map_ocl_err)?
         };
         // reduce_min_f32: n, x, out -> 1 u32 scalar, 2 f32 bufs
         let k_reduce_min = {
             let mut b = Kernel::builder();
-            b.program(&program).name("reduce_min_f32").queue(queue.clone());
-            b.arg(0u32); b.arg(&dummy_f32); b.arg(&dummy_f32);
+            b.program(&program)
+                .name("reduce_min_f32")
+                .queue(queue.clone());
+            b.arg(0u32);
+            b.arg(&dummy_f32);
+            b.arg(&dummy_f32);
             b.build().map_err(map_ocl_err)?
         };
         // bsr4_build_Hscc (R13): nrow, row_ptr, col_idx, H0, S, V, n_orb, H
         //   -> 1 u32 scalar, 3 u32 bufs, 4 f32 bufs
         let k_build_hscc = {
             let mut b = Kernel::builder();
-            b.program(&program).name("bsr4_build_Hscc").queue(queue.clone());
-            b.arg(0u32); b.arg(&dummy_u32); b.arg(&dummy_u32);
-            b.arg(&dummy_f32); b.arg(&dummy_f32); b.arg(&dummy_f32);
-            b.arg(&dummy_u32); b.arg(&dummy_f32);
+            b.program(&program)
+                .name("bsr4_build_Hscc")
+                .queue(queue.clone());
+            b.arg(0u32);
+            b.arg(&dummy_u32);
+            b.arg(&dummy_u32);
+            b.arg(&dummy_f32);
+            b.arg(&dummy_f32);
+            b.arg(&dummy_f32);
+            b.arg(&dummy_u32);
+            b.arg(&dummy_f32);
             b.build().map_err(map_ocl_err)?
         };
         // bsr4_trace_hk_partial (R7): nblock_hs, H, K, hs_to_kT, partial
         //   -> 1 u32 scalar, 2 f32 bufs, 1 i32 buf, 1 f32 buf
         let k_trace_hk = {
             let mut b = Kernel::builder();
-            b.program(&program).name("bsr4_trace_hk_partial").queue(queue.clone());
-            b.arg(0u32); b.arg(&dummy_f32); b.arg(&dummy_f32); b.arg(&dummy_i32); b.arg(&dummy_f32);
+            b.program(&program)
+                .name("bsr4_trace_hk_partial")
+                .queue(queue.clone());
+            b.arg(0u32);
+            b.arg(&dummy_f32);
+            b.arg(&dummy_f32);
+            b.arg(&dummy_i32);
+            b.arg(&dummy_f32);
             b.build().map_err(map_ocl_err)?
         };
         // bsr4_frobenius_sq_partial (R12): n, x, partial -> 1 u32, 2 f32 bufs
         let k_frob_sq = {
             let mut b = Kernel::builder();
-            b.program(&program).name("bsr4_frobenius_sq_partial").queue(queue.clone());
-            b.arg(0u32); b.arg(&dummy_f32); b.arg(&dummy_f32);
+            b.program(&program)
+                .name("bsr4_frobenius_sq_partial")
+                .queue(queue.clone());
+            b.arg(0u32);
+            b.arg(&dummy_f32);
+            b.arg(&dummy_f32);
             b.build().map_err(map_ocl_err)?
         };
         // bsr4_restrict (R8b): nblock_out, map(i32), in, out
         //   -> 1 u32 scalar, 1 i32 buf, 2 f32 bufs
         let k_restrict = {
             let mut b = Kernel::builder();
-            b.program(&program).name("bsr4_restrict").queue(queue.clone());
-            b.arg(0u32); b.arg(&dummy_i32); b.arg(&dummy_f32); b.arg(&dummy_f32);
+            b.program(&program)
+                .name("bsr4_restrict")
+                .queue(queue.clone());
+            b.arg(0u32);
+            b.arg(&dummy_i32);
+            b.arg(&dummy_f32);
+            b.arg(&dummy_f32);
             b.build().map_err(map_ocl_err)?
         };
         // bsr4_trace_atom (GPT-5.6 #2): nrow, diag_block, T, n_orb, trace_atom
         //   -> 1 u32 scalar, 2 u32 bufs, 2 f32 bufs
         let k_trace_atom = {
             let mut b = Kernel::builder();
-            b.program(&program).name("bsr4_trace_atom").queue(queue.clone());
-            b.arg(0u32); b.arg(&dummy_u32); b.arg(&dummy_f32); b.arg(&dummy_u32); b.arg(&dummy_f32);
+            b.program(&program)
+                .name("bsr4_trace_atom")
+                .queue(queue.clone());
+            b.arg(0u32);
+            b.arg(&dummy_u32);
+            b.arg(&dummy_f32);
+            b.arg(&dummy_u32);
+            b.arg(&dummy_f32);
+            b.build().map_err(map_ocl_err)?
+        };
+        // gamma_matvec / gamma_force (sparse_gamma.cl): n, xyzu, dq, out
+        //   -> 1 u32 scalar, 3 f32 bufs (float4* args take Buffer<f32>)
+        let k_gamma_v = {
+            let mut b = Kernel::builder();
+            b.program(&program)
+                .name("gamma_matvec")
+                .queue(queue.clone());
+            b.arg(0u32);
+            b.arg(&dummy_f32);
+            b.arg(&dummy_f32);
+            b.arg(&dummy_f32);
+            b.build().map_err(map_ocl_err)?
+        };
+        let k_gamma_f = {
+            let mut b = Kernel::builder();
+            b.program(&program).name("gamma_force").queue(queue.clone());
+            b.arg(0u32);
+            b.arg(&dummy_f32);
+            b.arg(&dummy_f32);
+            b.arg(&dummy_f32);
+            b.build().map_err(map_ocl_err)?
+        };
+        // ---- sparse_hs.cl (R17 pair physics) ----
+        // hs_diag: n, hs_diag, n_orb, onsite, h, s
+        let k_hs_diag = {
+            let mut b = Kernel::builder();
+            b.program(&program).name("hs_diag").queue(queue.clone());
+            b.arg(0u32);
+            b.arg(&dummy_u32);
+            b.arg(&dummy_u32);
+            b.arg(&dummy_f32);
+            b.arg(&dummy_f32);
+            b.arg(&dummy_f32);
+            b.build().map_err(map_ocl_err)?
+        };
+        // hs_assemble: npairs, pairs, xyzu, species, n_orb, nsp, sk_meta,
+        //   sk_parm, sk_ctrl, max_ctrl, taper(float4), h, s
+        let k_hs_assemble = {
+            let mut b = Kernel::builder();
+            b.program(&program).name("hs_assemble").queue(queue.clone());
+            b.arg(0u32);
+            b.arg(&dummy_i32);
+            b.arg(&dummy_f32);
+            b.arg(&dummy_u32);
+            b.arg(&dummy_u32);
+            b.arg(0u32);
+            b.arg(&dummy_i32);
+            b.arg(&dummy_f32);
+            b.arg(&dummy_f32);
+            b.arg(0u32);
+            b.arg(Float4::new(0.0, 0.0, 0.0, 0.0));
+            b.arg(&dummy_f32);
+            b.arg(&dummy_f32);
+            b.build().map_err(map_ocl_err)?
+        };
+        // hs_contract: npairs, pairs, pairs_k, xyzu, species, n_orb, nsp,
+        //   sk_meta, sk_parm, sk_ctrl, max_ctrl, taper, k, w, v, pf
+        let k_hs_contract = {
+            let mut b = Kernel::builder();
+            b.program(&program).name("hs_contract").queue(queue.clone());
+            b.arg(0u32);
+            b.arg(&dummy_i32);
+            b.arg(&dummy_i32);
+            b.arg(&dummy_f32);
+            b.arg(&dummy_u32);
+            b.arg(&dummy_u32);
+            b.arg(0u32);
+            b.arg(&dummy_i32);
+            b.arg(&dummy_f32);
+            b.arg(&dummy_f32);
+            b.arg(0u32);
+            b.arg(Float4::new(0.0, 0.0, 0.0, 0.0));
+            b.arg(&dummy_f32);
+            b.arg(&dummy_f32);
+            b.arg(&dummy_f32);
+            b.arg(&dummy_f32);
+            b.build().map_err(map_ocl_err)?
+        };
+        // rep_eval: nrep, rpairs, xyzu, species, nsp, rep_off, rep_max_int,
+        //   rep_data, pf_rep, pe_rep
+        let k_rep_eval = {
+            let mut b = Kernel::builder();
+            b.program(&program).name("rep_eval").queue(queue.clone());
+            b.arg(0u32);
+            b.arg(&dummy_i32);
+            b.arg(&dummy_f32);
+            b.arg(&dummy_u32);
+            b.arg(0u32);
+            b.arg(&dummy_i32);
+            b.arg(0u32);
+            b.arg(&dummy_f32);
+            b.arg(&dummy_f32);
+            b.arg(&dummy_f32);
+            b.build().map_err(map_ocl_err)?
+        };
+        // force_gather: n, fp_ptr, fp_list, pf, rp_ptr, rp_list, pf_rep, gf,
+        //   f_nscc, f_shift, f_rep, f_dc, f_tot
+        let k_force_gather = {
+            let mut b = Kernel::builder();
+            b.program(&program)
+                .name("force_gather")
+                .queue(queue.clone());
+            b.arg(0u32);
+            b.arg(&dummy_u32);
+            b.arg(&dummy_i32);
+            b.arg(&dummy_f32);
+            b.arg(&dummy_u32);
+            b.arg(&dummy_i32);
+            b.arg(&dummy_f32);
+            b.arg(&dummy_f32);
+            b.arg(&dummy_f32);
+            b.arg(&dummy_f32);
+            b.arg(&dummy_f32);
+            b.arg(&dummy_f32);
+            b.arg(&dummy_f32);
+            b.build().map_err(map_ocl_err)?
+        };
+        // hs_kdummy: n, k_diag, k_vals, n_orb, partial
+        let k_hs_kdummy = {
+            let mut b = Kernel::builder();
+            b.program(&program).name("hs_kdummy").queue(queue.clone());
+            b.arg(0u32);
+            b.arg(&dummy_u32);
+            b.arg(&dummy_f32);
+            b.arg(&dummy_u32);
+            b.arg(&dummy_f32);
             b.build().map_err(map_ocl_err)?
         };
 
-        let _ = gws_spgemm; let _ = gws_elem; let _ = gws_reduce; let _ = build_k;
+        let _ = gws_spgemm;
+        let _ = gws_elem;
+        let _ = gws_reduce;
+        let _ = build_k;
 
         Ok(Self {
             rt,
             program,
             config,
-            k_spgemm_masked, k_spgemm_bsym, k_zero, k_axpby, k_mcweeny,
-            k_tc2, k_symmetrize, k_mulliken_ks, k_trace_partial, k_reduce,
+            k_spgemm_masked,
+            k_spgemm_bsym,
+            k_zero,
+            k_axpby,
+            k_mcweeny,
+            k_tc2,
+            k_symmetrize,
+            k_mulliken_ks,
+            k_trace_partial,
+            k_reduce,
             k_identity_residual,
             k_idempotency,
-            k_spgemm_plan_bsym, k_spgemm_plan,
-            k_spgemm_plan_bsym_ff, k_spgemm_plan_bsym_ff0, k_spgemm_plan_bsym_ffb,
+            k_spgemm_plan_bsym,
+            k_spgemm_plan,
+            k_spgemm_plan_bsym_ff,
+            k_spgemm_plan_bsym_ff0,
+            k_spgemm_plan_bsym_ffb,
             k_mcw_ff_combine,
-            k_row_abs_sum, k_reduce_max, k_build_identity, k_scale,
-            k_gershgorin_partial, k_reduce_min,
-            k_build_hscc, k_trace_hk, k_frob_sq, k_restrict, k_trace_atom,
+            k_row_abs_sum,
+            k_reduce_max,
+            k_build_identity,
+            k_scale,
+            k_gershgorin_partial,
+            k_reduce_min,
+            k_build_hscc,
+            k_trace_hk,
+            k_frob_sq,
+            k_restrict,
+            k_trace_atom,
+            k_gamma_v,
+            k_gamma_f,
+            k_hs_diag,
+            k_hs_assemble,
+            k_hs_contract,
+            k_rep_eval,
+            k_force_gather,
+            k_hs_kdummy,
             n_buf_allocs: std::cell::Cell::new(0),
         })
     }
@@ -849,14 +1226,22 @@ impl SparseBsr4Gpu {
     }
 
     /// Block until the in-order queue drains (benchmarks/diagnostics).
-    pub fn finish(&self) -> Result<()> { self.rt.finish() }
+    pub fn finish(&self) -> Result<()> {
+        self.rt.finish()
+    }
 
     /// Stage profiler passthroughs (`RUST_DFTB_PROF` gated; see `GpuRuntime::Prof`).
-    pub fn prof_tick(&self, name: &'static str) { self.rt.prof_tick(name); }
+    pub fn prof_tick(&self, name: &'static str) {
+        self.rt.prof_tick(name);
+    }
     /// Restart the stage clock (evt mode inserts a device anchor marker).
-    pub fn prof_reset(&self) { self.rt.prof_reset(); }
+    pub fn prof_reset(&self) {
+        self.rt.prof_reset();
+    }
     /// Print the accumulated stage table.
-    pub fn prof_report(&self, title: &str) { self.rt.prof_report(title); }
+    pub fn prof_report(&self, title: &str) {
+        self.rt.prof_report(title);
+    }
 
     // ------------------------------------------------------------------
     // Low-level kernel launches
@@ -1306,7 +1691,8 @@ impl SparseBsr4Gpu {
         self.tc2(nblock, &k_buf, &q_buf, branch, &knew_buf)?;
         let mut values = vec![0.0f32; nblock * BS2];
         self.read_f32(&knew_buf, &mut values)?;
-        Bsr4Matrix::from_parts(k.n_atom, k.row_ptr.clone(), k.col_idx.clone(), values).map(|m| (m, n))
+        Bsr4Matrix::from_parts(k.n_atom, k.row_ptr.clone(), k.col_idx.clone(), values)
+            .map(|m| (m, n))
     }
 
     /// Symmetrize a `Bsr4Matrix` on the GPU and return the result.
@@ -1360,7 +1746,9 @@ impl SparseBsr4Gpu {
         // Build diag_flag: 1 for diagonal blocks, 0 otherwise.
         let diag = crate::methods::sparse::bsr4::diag_block_map(a)?;
         let mut diag_flag = vec![0u32; nblock];
-        for &b in &diag { diag_flag[b as usize] = 1; }
+        for &b in &diag {
+            diag_flag[b as usize] = 1;
+        }
         let diag_flag_buf = self.buf_u32(&diag_flag)?;
         // Partial reduction + recursive reduction.
         let reduce_wg = self.config.reduce_wg as usize;
@@ -1500,8 +1888,7 @@ impl SparseBsr4Gpu {
         self.axpby(nblock, alpha_k, &z_buf, beta_k, &a_buf, &k0_buf)?;
         let mut k0_vals = vec![0.0f32; nblock * BS2];
         self.read_f32(&k0_buf, &mut k0_vals)?;
-        let mut k0 =
-            Bsr4Matrix::from_parts(z.n_atom, k_mask.0.clone(), k_mask.1.clone(), k0_vals)?;
+        let mut k0 = Bsr4Matrix::from_parts(z.n_atom, k_mask.0.clone(), k_mask.1.clone(), k0_vals)?;
         k0 = self.symmetrize_mat(&k0)?;
         Ok(k0)
     }
@@ -1592,12 +1979,11 @@ impl SparseBsr4Gpu {
         max_iter: usize,
         tol: f32,
     ) -> Result<(Bsr4Matrix, f32, f32, usize, Vec<(usize, f32, f32)>)> {
-        let diag_dummy =
-            crate::methods::sparse::bsr4::Bsr4Matrix::from_structure(
-                k0.n_atom,
-                t_mask.0.clone(),
-                t_mask.1.clone(),
-            )?;
+        let diag_dummy = crate::methods::sparse::bsr4::Bsr4Matrix::from_structure(
+            k0.n_atom,
+            t_mask.0.clone(),
+            t_mask.1.clone(),
+        )?;
         let diag = crate::methods::sparse::bsr4::diag_block_map(&diag_dummy)?;
         let diag_buf = self.buf_u32(&diag)?;
         let n_orb_u32: Vec<u32> = n_orb.iter().map(|&n| n as u32).collect();
@@ -1670,9 +2056,7 @@ impl SparseBsr4Gpu {
 
         // Exhausted iterations without converging.
         if best_r_i < r_i {
-            println!(
-                "  TC2 exhausted {max_iter} iters, best R_I={best_r_i:e} at iter {best_iter}"
-            );
+            println!("  TC2 exhausted {max_iter} iters, best R_I={best_r_i:e} at iter {best_iter}");
             Err(DftbError::InvalidInput(format!(
                 "TC2 purification did not converge: exhausted {max_iter} iters, best R_I={best_r_i:e} at iter {best_iter} (tol={tol:e})"
             )))
@@ -1693,9 +2077,11 @@ impl SparseBsr4Gpu {
 pub fn compare_to_dense(gpu: &Bsr4Matrix, dense_ref: &[f32]) -> f32 {
     #[cfg(feature = "sparse_firewall")]
     {
-        panic!("P0 SPARSE FIREWALL: compare_to_dense() called from production sparse path. \
+        panic!(
+            "P0 SPARSE FIREWALL: compare_to_dense() called from production sparse path. \
                 This calls to_dense() which allocates an O(Norb²) dense matrix. \
-                Disable the `sparse_firewall` feature for test/reference use.");
+                Disable the `sparse_firewall` feature for test/reference use."
+        );
     }
     #[cfg(not(feature = "sparse_firewall"))]
     {
@@ -1738,15 +2124,25 @@ pub struct GpuBsrStructure {
 
 impl GpuBsrStructure {
     /// Public accessor for the transpose-block map (needed by `symmetrize_dev`).
-    pub fn transpose_block(&self) -> &Buffer<u32> { &self.transpose_block }
+    pub fn transpose_block(&self) -> &Buffer<u32> {
+        &self.transpose_block
+    }
     /// Public accessor for the diagonal-block map (needed by `trace_ks_*`).
-    pub fn diag_block(&self) -> &Buffer<u32> { &self.diag_block }
+    pub fn diag_block(&self) -> &Buffer<u32> {
+        &self.diag_block
+    }
     /// Public accessor for the row pointer buffer.
-    pub fn row_ptr(&self) -> &Buffer<u32> { &self.row_ptr }
+    pub fn row_ptr(&self) -> &Buffer<u32> {
+        &self.row_ptr
+    }
     /// Public accessor for the column index buffer.
-    pub fn col_idx(&self) -> &Buffer<u32> { &self.col_idx }
+    pub fn col_idx(&self) -> &Buffer<u32> {
+        &self.col_idx
+    }
     /// Public accessor for the diagonal-block flag buffer (1 per block).
-    pub fn diag_flag(&self) -> &Buffer<u32> { &self.diag_flag }
+    pub fn diag_flag(&self) -> &Buffer<u32> {
+        &self.diag_flag
+    }
 
     /// Build a device-resident structure from a host CSR mask `(row_ptr,
     /// col_idx)`. Computes `diag_block_map` and `transpose_block_map` on the
@@ -1756,7 +2152,10 @@ impl GpuBsrStructure {
         // the LEFT operand of a row-caching SpGEMM (see check_row_degree at
         // the *_dev entry points). Output/product masks can legitimately be
         // wider than MAX_LEFT_BLOCKS.
-        let max_deg = (0..n_atom).map(|i| mask.0[i + 1] - mask.0[i]).max().unwrap_or(0);
+        let max_deg = (0..n_atom)
+            .map(|i| mask.0[i + 1] - mask.0[i])
+            .max()
+            .unwrap_or(0);
         let nblock = mask.1.len();
         let row_ptr = gpu.buf_u32(&mask.0)?;
         let col_idx = gpu.buf_u32(&mask.1)?;
@@ -1772,11 +2171,24 @@ impl GpuBsrStructure {
         let diag_block = gpu.buf_u32(&diag)?;
         let diag_flag = gpu.buf_u32(&diag_flag)?;
         let transpose_block = gpu.buf_u32(&transpose)?;
-        Ok(Self { n_atom, nblock, max_deg, row_ptr, col_idx, diag_block, diag_flag, transpose_block })
+        Ok(Self {
+            n_atom,
+            nblock,
+            max_deg,
+            row_ptr,
+            col_idx,
+            diag_block,
+            diag_flag,
+            transpose_block,
+        })
     }
 
-    pub fn n_atom(&self) -> usize { self.n_atom }
-    pub fn nblock(&self) -> usize { self.nblock }
+    pub fn n_atom(&self) -> usize {
+        self.n_atom
+    }
+    pub fn nblock(&self) -> usize {
+        self.nblock
+    }
 
     /// Read `row_ptr` back to host (blocking). Used for one-time setup.
     pub fn row_ptr_host(&self, gpu: &SparseBsr4Gpu) -> Result<Vec<u32>> {
@@ -1814,15 +2226,22 @@ impl GpuBsrMatrix {
     /// values once. The structure is built (or reused) from the matrix's CSR
     /// mask.
     pub fn from_host(gpu: &SparseBsr4Gpu, m: &Bsr4Matrix) -> Result<Self> {
-        let structure = GpuBsrStructure::new(gpu, m.n_atom, &(m.row_ptr.clone(), m.col_idx.clone()))?;
+        let structure =
+            GpuBsrStructure::new(gpu, m.n_atom, &(m.row_ptr.clone(), m.col_idx.clone()))?;
         let values = gpu.buf_f32(&m.values)?;
-        Ok(Self { struct_: Arc::new(structure), values })
+        Ok(Self {
+            struct_: Arc::new(structure),
+            values,
+        })
     }
 
     /// Create a zero-filled device-resident matrix on a given structure.
     pub fn zero(gpu: &SparseBsr4Gpu, struct_: &Arc<GpuBsrStructure>) -> Result<Self> {
         let values = gpu.zero_f32(struct_.nblock * BS2)?;
-        Ok(Self { struct_: struct_.clone(), values })
+        Ok(Self {
+            struct_: struct_.clone(),
+            values,
+        })
     }
 
     /// Upload values from a host slice into an existing device buffer
@@ -1831,7 +2250,9 @@ impl GpuBsrMatrix {
         if host.len() != self.struct_.nblock * BS2 {
             return Err(DftbError::InvalidInput(format!(
                 "upload_values: len {} != nblock {} * BS2 {}",
-                host.len(), self.struct_.nblock, BS2
+                host.len(),
+                self.struct_.nblock,
+                BS2
             )));
         }
         gpu.write_f32(&self.values, host)
@@ -1868,6 +2289,314 @@ impl SparseBsr4Gpu {
     /// Write an f32 buffer (non-blocking unless the queue is flushed).
     pub fn write_f32(&self, buf: &Buffer<f32>, data: &[f32]) -> Result<()> {
         buf.write(data).enq().map_err(map_ocl_err)
+    }
+
+    /// Tiled n-body V = γ·dq on device (sparse_gamma.cl::gamma_matvec).
+    /// `xyzu` = 4·n_atom f32 (x,y,z Å, w = Hubbard u Ha); `dq`,`v` = n_atom.
+    /// Each work-item owns one target atom and gathers over GWG-sized
+    /// __local tiles — no atomics, no dense γ matrix.
+    pub fn gamma_v_dev(
+        &self,
+        n_atom: usize,
+        xyzu: &Buffer<f32>,
+        dq: &Buffer<f32>,
+        v: &Buffer<f32>,
+    ) -> Result<()> {
+        let k = &self.k_gamma_v;
+        k.set_arg(0, n_atom as u32).map_err(map_ocl_err)?;
+        k.set_arg(1, xyzu).map_err(map_ocl_err)?;
+        k.set_arg(2, dq).map_err(map_ocl_err)?;
+        k.set_arg(3, v).map_err(map_ocl_err)?;
+        let gws = n_atom.div_ceil(GAMMA_WG as usize) * GAMMA_WG as usize;
+        unsafe {
+            k.cmd()
+                .global_work_size(gws)
+                .local_work_size(GAMMA_WG as usize)
+                .enq()
+                .map_err(map_ocl_err)?;
+        }
+        Ok(())
+    }
+
+    /// Tiled n-body SCC double-counting force (sparse_gamma.cl::gamma_force):
+    /// `f[i] = −dq_i·Σ_j γ′_ij·dq_j·r̂_ij` in Ha/Å — replaces the CPU
+    /// `scc_double_counting_force` O(N²) loop. `f` = 4·n_atom f32 (xyz used).
+    pub fn gamma_f_dev(
+        &self,
+        n_atom: usize,
+        xyzu: &Buffer<f32>,
+        dq: &Buffer<f32>,
+        f: &Buffer<f32>,
+    ) -> Result<()> {
+        let k = &self.k_gamma_f;
+        k.set_arg(0, n_atom as u32).map_err(map_ocl_err)?;
+        k.set_arg(1, xyzu).map_err(map_ocl_err)?;
+        k.set_arg(2, dq).map_err(map_ocl_err)?;
+        k.set_arg(3, f).map_err(map_ocl_err)?;
+        let gws = n_atom.div_ceil(GAMMA_WG as usize) * GAMMA_WG as usize;
+        unsafe {
+            k.cmd()
+                .global_work_size(gws)
+                .local_work_size(GAMMA_WG as usize)
+                .enq()
+                .map_err(map_ocl_err)?;
+        }
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // R17 pair physics (sparse_hs.cl). All launches are enqueue-only —
+    // no finish(), no allocation. Buffer args are f32/i32/u32 views into
+    // the kernel's float4/int4/int2 pointers (layout documented in the .cl).
+    // ------------------------------------------------------------------
+
+    /// Diagonal H/S blocks: onsite (physical lanes), E_DUMMY on padded H
+    /// lanes, identity on S. `h`/`s` must be pre-zeroed (bsr4_zero).
+    pub fn hs_diag_dev(
+        &self,
+        n_atom: usize,
+        hs_diag: &Buffer<u32>,
+        n_orb: &Buffer<u32>,
+        onsite: &Buffer<f32>,
+        h: &Buffer<f32>,
+        s: &Buffer<f32>,
+    ) -> Result<()> {
+        let k = &self.k_hs_diag;
+        k.set_arg(0, n_atom as u32).map_err(map_ocl_err)?;
+        k.set_arg(1, hs_diag).map_err(map_ocl_err)?;
+        k.set_arg(2, n_orb).map_err(map_ocl_err)?;
+        k.set_arg(3, onsite).map_err(map_ocl_err)?;
+        k.set_arg(4, h).map_err(map_ocl_err)?;
+        k.set_arg(5, s).map_err(map_ocl_err)?;
+        unsafe {
+            k.cmd()
+                .global_work_size(n_atom)
+                .enq()
+                .map_err(map_ocl_err)?;
+        }
+        Ok(())
+    }
+
+    /// Off-diagonal H0/S pair assembly over M_HS pairs (one work-item per
+    /// pair, writes both BSR orientations). `pairs` = int4 {i,j,bij,bji};
+    /// `taper` = (r0_ang, w_ang, enabled, 0).
+    pub fn hs_assemble_dev(
+        &self,
+        npairs: usize,
+        pairs: &Buffer<i32>,
+        xyzu: &Buffer<f32>,
+        species: &Buffer<u32>,
+        n_orb: &Buffer<u32>,
+        nsp: u32,
+        sk_meta: &Buffer<i32>,
+        sk_parm: &Buffer<f32>,
+        sk_ctrl: &Buffer<f32>,
+        max_ctrl: u32,
+        taper: [f32; 4],
+        h: &Buffer<f32>,
+        s: &Buffer<f32>,
+    ) -> Result<()> {
+        let k = &self.k_hs_assemble;
+        k.set_arg(0, npairs as u32).map_err(map_ocl_err)?;
+        k.set_arg(1, pairs).map_err(map_ocl_err)?;
+        k.set_arg(2, xyzu).map_err(map_ocl_err)?;
+        k.set_arg(3, species).map_err(map_ocl_err)?;
+        k.set_arg(4, n_orb).map_err(map_ocl_err)?;
+        k.set_arg(5, nsp).map_err(map_ocl_err)?;
+        k.set_arg(6, sk_meta).map_err(map_ocl_err)?;
+        k.set_arg(7, sk_parm).map_err(map_ocl_err)?;
+        k.set_arg(8, sk_ctrl).map_err(map_ocl_err)?;
+        k.set_arg(9, max_ctrl).map_err(map_ocl_err)?;
+        k.set_arg(10, Float4::new(taper[0], taper[1], taper[2], taper[3]))
+            .map_err(map_ocl_err)?;
+        k.set_arg(11, h).map_err(map_ocl_err)?;
+        k.set_arg(12, s).map_err(map_ocl_err)?;
+        unsafe {
+            k.cmd()
+                .global_work_size(npairs)
+                .enq()
+                .map_err(map_ocl_err)?;
+        }
+        Ok(())
+    }
+
+    /// Analytic pair-force contraction: pf[2p] = non_scc force-on-i
+    /// (Ha/Å), pf[2p+1] = scc_shift force-on-i. `pairs_k` = M_K block of
+    /// (i,j) or −1; `v_atom` = device V[N] shifts; `k`/`w` = device
+    /// values on M_K / M_HS.
+    pub fn hs_contract_dev(
+        &self,
+        npairs: usize,
+        pairs: &Buffer<i32>,
+        pairs_k: &Buffer<i32>,
+        xyzu: &Buffer<f32>,
+        species: &Buffer<u32>,
+        n_orb: &Buffer<u32>,
+        nsp: u32,
+        sk_meta: &Buffer<i32>,
+        sk_parm: &Buffer<f32>,
+        sk_ctrl: &Buffer<f32>,
+        max_ctrl: u32,
+        taper: [f32; 4],
+        k_vals: &Buffer<f32>,
+        w_vals: &Buffer<f32>,
+        v_atom: &Buffer<f32>,
+        pf: &Buffer<f32>,
+    ) -> Result<()> {
+        let k = &self.k_hs_contract;
+        k.set_arg(0, npairs as u32).map_err(map_ocl_err)?;
+        k.set_arg(1, pairs).map_err(map_ocl_err)?;
+        k.set_arg(2, pairs_k).map_err(map_ocl_err)?;
+        k.set_arg(3, xyzu).map_err(map_ocl_err)?;
+        k.set_arg(4, species).map_err(map_ocl_err)?;
+        k.set_arg(5, n_orb).map_err(map_ocl_err)?;
+        k.set_arg(6, nsp).map_err(map_ocl_err)?;
+        k.set_arg(7, sk_meta).map_err(map_ocl_err)?;
+        k.set_arg(8, sk_parm).map_err(map_ocl_err)?;
+        k.set_arg(9, sk_ctrl).map_err(map_ocl_err)?;
+        k.set_arg(10, max_ctrl).map_err(map_ocl_err)?;
+        k.set_arg(11, Float4::new(taper[0], taper[1], taper[2], taper[3]))
+            .map_err(map_ocl_err)?;
+        k.set_arg(12, k_vals).map_err(map_ocl_err)?;
+        k.set_arg(13, w_vals).map_err(map_ocl_err)?;
+        k.set_arg(14, v_atom).map_err(map_ocl_err)?;
+        k.set_arg(15, pf).map_err(map_ocl_err)?;
+        unsafe {
+            k.cmd()
+                .global_work_size(npairs)
+                .enq()
+                .map_err(map_ocl_err)?;
+        }
+        Ok(())
+    }
+
+    /// Repulsive energy+force per pair (packed records from
+    /// `pack_repulsive_gpu`). pf_rep[p] = (F_i xyz Ha/Å, E_pair Ha);
+    /// pe_rep[p] = E_pair for the host f64 sum.
+    pub fn rep_eval_dev(
+        &self,
+        nrep: usize,
+        rpairs: &Buffer<i32>,
+        xyzu: &Buffer<f32>,
+        species: &Buffer<u32>,
+        nsp: u32,
+        rep_off: &Buffer<i32>,
+        rep_max_int: u32,
+        rep_data: &Buffer<f32>,
+        pf_rep: &Buffer<f32>,
+        pe_rep: &Buffer<f32>,
+    ) -> Result<()> {
+        let k = &self.k_rep_eval;
+        k.set_arg(0, nrep as u32).map_err(map_ocl_err)?;
+        k.set_arg(1, rpairs).map_err(map_ocl_err)?;
+        k.set_arg(2, xyzu).map_err(map_ocl_err)?;
+        k.set_arg(3, species).map_err(map_ocl_err)?;
+        k.set_arg(4, nsp).map_err(map_ocl_err)?;
+        k.set_arg(5, rep_off).map_err(map_ocl_err)?;
+        k.set_arg(6, rep_max_int).map_err(map_ocl_err)?;
+        k.set_arg(7, rep_data).map_err(map_ocl_err)?;
+        k.set_arg(8, pf_rep).map_err(map_ocl_err)?;
+        k.set_arg(9, pe_rep).map_err(map_ocl_err)?;
+        unsafe {
+            k.cmd()
+                .global_work_size(nrep.max(1))
+                .enq()
+                .map_err(map_ocl_err)?;
+        }
+        Ok(())
+    }
+
+    /// Per-atom gather: each work-item owns one atom, sums its incident
+    /// pair forces (± sign from the packed (p<<1)|is_j list), writes the
+    /// five component buffers exactly once. `gf` = device γ′ force.
+    pub fn force_gather_dev(
+        &self,
+        n_atom: usize,
+        fp_ptr: &Buffer<u32>,
+        fp_list: &Buffer<i32>,
+        pf: &Buffer<f32>,
+        rp_ptr: &Buffer<u32>,
+        rp_list: &Buffer<i32>,
+        pf_rep: &Buffer<f32>,
+        gf: &Buffer<f32>,
+        f_nscc: &Buffer<f32>,
+        f_shift: &Buffer<f32>,
+        f_rep: &Buffer<f32>,
+        f_dc: &Buffer<f32>,
+        f_tot: &Buffer<f32>,
+    ) -> Result<()> {
+        let k = &self.k_force_gather;
+        k.set_arg(0, n_atom as u32).map_err(map_ocl_err)?;
+        k.set_arg(1, fp_ptr).map_err(map_ocl_err)?;
+        k.set_arg(2, fp_list).map_err(map_ocl_err)?;
+        k.set_arg(3, pf).map_err(map_ocl_err)?;
+        k.set_arg(4, rp_ptr).map_err(map_ocl_err)?;
+        k.set_arg(5, rp_list).map_err(map_ocl_err)?;
+        k.set_arg(6, pf_rep).map_err(map_ocl_err)?;
+        k.set_arg(7, gf).map_err(map_ocl_err)?;
+        k.set_arg(8, f_nscc).map_err(map_ocl_err)?;
+        k.set_arg(9, f_shift).map_err(map_ocl_err)?;
+        k.set_arg(10, f_rep).map_err(map_ocl_err)?;
+        k.set_arg(11, f_dc).map_err(map_ocl_err)?;
+        k.set_arg(12, f_tot).map_err(map_ocl_err)?;
+        unsafe {
+            k.cmd()
+                .global_work_size(n_atom)
+                .enq()
+                .map_err(map_ocl_err)?;
+        }
+        Ok(())
+    }
+
+    /// Dummy-orbital occupation diagnostic: per-atom Σ|2·K_dd| over padded
+    /// lanes of the diagonal K block → `partial` (host f64 reduces).
+    pub fn hs_kdummy_dev(
+        &self,
+        n_atom: usize,
+        k_diag: &Buffer<u32>,
+        k_vals: &Buffer<f32>,
+        n_orb: &Buffer<u32>,
+        partial: &Buffer<f32>,
+    ) -> Result<()> {
+        let k = &self.k_hs_kdummy;
+        k.set_arg(0, n_atom as u32).map_err(map_ocl_err)?;
+        k.set_arg(1, k_diag).map_err(map_ocl_err)?;
+        k.set_arg(2, k_vals).map_err(map_ocl_err)?;
+        k.set_arg(3, n_orb).map_err(map_ocl_err)?;
+        k.set_arg(4, partial).map_err(map_ocl_err)?;
+        unsafe {
+            k.cmd()
+                .global_work_size(n_atom)
+                .enq()
+                .map_err(map_ocl_err)?;
+        }
+        Ok(())
+    }
+
+    /// Device-side ||A||_inf into caller-owned buffers (persistent —
+    /// `inf_norm_dev` allocates; this one doesn't). `row_sums` ≥ 4·n_atom,
+    /// `scratch_a`/`scratch_b` ≥ n_groups, `out` ≥ 1.
+    pub fn inf_norm_into_dev(
+        &self,
+        struct_: &GpuBsrStructure,
+        a: &Buffer<f32>,
+        row_sums: &Buffer<f32>,
+        scratch_a: &Buffer<f32>,
+        scratch_b: &Buffer<f32>,
+        out: &Buffer<f32>,
+    ) -> Result<()> {
+        let n_atom = struct_.n_atom;
+        let n_orb = n_atom * BS;
+        let k = &self.k_row_abs_sum;
+        k.set_arg(0, n_atom as u32).map_err(map_ocl_err)?;
+        k.set_arg(1, &struct_.row_ptr).map_err(map_ocl_err)?;
+        k.set_arg(2, &struct_.col_idx).map_err(map_ocl_err)?;
+        k.set_arg(3, a).map_err(map_ocl_err)?;
+        k.set_arg(4, row_sums).map_err(map_ocl_err)?;
+        unsafe {
+            k.cmd().global_work_size(n_orb).enq().map_err(map_ocl_err)?;
+        }
+        self.reduce_minmax_to_dev(n_orb, row_sums, scratch_a, scratch_b, out, true)
     }
 
     /// Device-resident masked SpGEMM with symmetric right operand.
@@ -1958,7 +2687,11 @@ impl SparseBsr4Gpu {
         let plan_ptr = self.rt.buffer_from_slice(&plan.plan_ptr)?;
         let plan_a_idx = self.rt.buffer_from_slice(&plan.plan_a_idx)?;
         let plan_b_idx = self.rt.buffer_from_slice(&plan.plan_b_idx)?;
-        Ok(SpgemmPlanGpu { plan_ptr, plan_a_idx, plan_b_idx })
+        Ok(SpgemmPlanGpu {
+            plan_ptr,
+            plan_a_idx,
+            plan_b_idx,
+        })
     }
 
     /// Device-resident symbolic-plan SpGEMM (Bsym variant).
@@ -2200,7 +2933,9 @@ impl SparseBsr4Gpu {
         k.set_arg(3, v).map_err(map_ocl_err)?;
         k.set_arg(4, v_lo).map_err(map_ocl_err)?;
         k.set_arg(5, knew).map_err(map_ocl_err)?;
-        unsafe { k.cmd().global_work_size(gws).enq().map_err(map_ocl_err)?; }
+        unsafe {
+            k.cmd().global_work_size(gws).enq().map_err(map_ocl_err)?;
+        }
         Ok(())
     }
 
@@ -2259,7 +2994,10 @@ impl SparseBsr4Gpu {
         kern.set_arg(3, branch).map_err(map_ocl_err)?;
         kern.set_arg(4, knew).map_err(map_ocl_err)?;
         unsafe {
-            kern.cmd().global_work_size(total).enq().map_err(map_ocl_err)?;
+            kern.cmd()
+                .global_work_size(total)
+                .enq()
+                .map_err(map_ocl_err)?;
         }
         Ok(())
     }
@@ -2276,7 +3014,10 @@ impl SparseBsr4Gpu {
         k.set_arg(1, transpose_block).map_err(map_ocl_err)?;
         k.set_arg(2, a).map_err(map_ocl_err)?;
         unsafe {
-            k.cmd().global_work_size(nblock).enq().map_err(map_ocl_err)?;
+            k.cmd()
+                .global_work_size(nblock)
+                .enq()
+                .map_err(map_ocl_err)?;
         }
         Ok(())
     }
@@ -2312,12 +3053,7 @@ impl SparseBsr4Gpu {
     }
 
     /// Device-resident `reduce_sum_f32`. No `finish()`.
-    pub fn reduce_dev(
-        &self,
-        n: usize,
-        input: &Buffer<f32>,
-        output: &Buffer<f32>,
-    ) -> Result<()> {
+    pub fn reduce_dev(&self, n: usize, input: &Buffer<f32>, output: &Buffer<f32>) -> Result<()> {
         let reduce_wg = self.config.reduce_wg as usize;
         let n_groups = div_ceil(n, reduce_wg);
         let k = &self.k_reduce;
@@ -2517,7 +3253,12 @@ impl SparseBsr4Gpu {
     /// Device-resident full `Tr(KS)` reduction: enqueues partial + recursive
     /// reduction, returns one f32 to host. This is the **only** host transfer
     /// in the hot loop — a single scalar. `n_orb` masks physical lanes (R14).
-    pub fn trace_ks_dev(&self, struct_: &GpuBsrStructure, ks: &Buffer<f32>, n_orb: &Buffer<u32>) -> Result<f32> {
+    pub fn trace_ks_dev(
+        &self,
+        struct_: &GpuBsrStructure,
+        ks: &Buffer<f32>,
+        n_orb: &Buffer<u32>,
+    ) -> Result<f32> {
         let nrow = struct_.n_atom;
         let reduce_wg = self.config.reduce_wg as usize;
         let n_groups = div_ceil(nrow, reduce_wg);
@@ -2713,7 +3454,9 @@ impl SparseBsr4Gpu {
         if n == 0 {
             return Err(DftbError::InvalidInput("reduction input is empty".into()));
         }
-        if tail.len() < Self::REDUCE_TAIL { tail.resize(Self::REDUCE_TAIL, 0.0); }
+        if tail.len() < Self::REDUCE_TAIL {
+            tail.resize(Self::REDUCE_TAIL, 0.0);
+        }
         let reduce_wg = self.config.reduce_wg as usize;
         let mut current = input;
         let mut use_a = true;
@@ -2872,7 +3615,10 @@ impl SparseBsr4Gpu {
         k.set_arg(2, input).map_err(map_ocl_err)?;
         k.set_arg(3, output).map_err(map_ocl_err)?;
         unsafe {
-            k.cmd().global_work_size(nblock_out * BS2).enq().map_err(map_ocl_err)?;
+            k.cmd()
+                .global_work_size(nblock_out * BS2)
+                .enq()
+                .map_err(map_ocl_err)?;
         }
         Ok(())
     }
@@ -2916,11 +3662,7 @@ impl SparseBsr4Gpu {
 
     /// Compute ||A||_inf on the device (max absolute orbital-level row sum).
     /// Reads 1 scalar to host. Uses two kernels: row_abs_sum + reduce_max.
-    pub fn inf_norm_dev(
-        &self,
-        struct_: &GpuBsrStructure,
-        a: &Buffer<f32>,
-    ) -> Result<f32> {
+    pub fn inf_norm_dev(&self, struct_: &GpuBsrStructure, a: &Buffer<f32>) -> Result<f32> {
         let n_atom = struct_.n_atom;
         let n_orb = n_atom * BS;
         // Step 1: per-orbital absolute row sums.
@@ -2954,7 +3696,9 @@ impl SparseBsr4Gpu {
             }
             current = out;
             n = n_groups;
-            if n <= 1 { break; }
+            if n <= 1 {
+                break;
+            }
         }
         let mut host = [0.0f32; 1];
         self.read_f32(&current, &mut host)?;
@@ -2977,18 +3721,16 @@ impl SparseBsr4Gpu {
         k.set_arg(1, &struct_.diag_flag).map_err(map_ocl_err)?;
         k.set_arg(2, values).map_err(map_ocl_err)?;
         unsafe {
-            k.cmd().global_work_size(nblock * BS2).enq().map_err(map_ocl_err)?;
+            k.cmd()
+                .global_work_size(nblock * BS2)
+                .enq()
+                .map_err(map_ocl_err)?;
         }
         Ok(())
     }
 
     /// Scale all elements of a BSR4 values buffer by `alpha` on the device.
-    pub fn scale_dev(
-        &self,
-        nblock: usize,
-        alpha: f32,
-        values: &Buffer<f32>,
-    ) -> Result<()> {
+    pub fn scale_dev(&self, nblock: usize, alpha: f32, values: &Buffer<f32>) -> Result<()> {
         let total = nblock * BS2;
         let k = &self.k_scale;
         k.set_arg(0, nblock as u32).map_err(map_ocl_err)?;
@@ -3077,12 +3819,22 @@ impl SparseBsr4Gpu {
         is_max: bool,
     ) -> Result<()> {
         let reduce_wg = self.config.reduce_wg as usize;
-        let kern = if is_max { &self.k_reduce_max } else { &self.k_reduce_min };
+        let kern = if is_max {
+            &self.k_reduce_max
+        } else {
+            &self.k_reduce_min
+        };
         let mut current = input;
         let mut use_a = true;
         loop {
             let n_groups = div_ceil(n, reduce_wg);
-            let out = if n_groups == 1 { output } else if use_a { scratch_a } else { scratch_b };
+            let out = if n_groups == 1 {
+                output
+            } else if use_a {
+                scratch_a
+            } else {
+                scratch_b
+            };
             kern.set_arg(0, n as u32).map_err(map_ocl_err)?;
             kern.set_arg(1, current).map_err(map_ocl_err)?;
             kern.set_arg(2, out).map_err(map_ocl_err)?;
@@ -3093,7 +3845,9 @@ impl SparseBsr4Gpu {
                     .enq()
                     .map_err(map_ocl_err)?;
             }
-            if n_groups == 1 { return Ok(()); }
+            if n_groups == 1 {
+                return Ok(());
+            }
             current = out;
             use_a = !use_a;
             n = n_groups;
@@ -3280,9 +4034,7 @@ impl SparseBsr4Gpu {
             // avoids catastrophic cancellation in ||T||² - 2·Tr(T) + N.
             let rz = self.identity_residual_norm_dev(t_struct, &t.values)? / n_orb.sqrt();
 
-            println!(
-                "  Newton-Schulz-dev iter {iter}: R_Z = {rz:e}"
-            );
+            println!("  Newton-Schulz-dev iter {iter}: R_Z = {rz:e}");
 
             if rz < tol {
                 let z_out = z.to_host(self)?;
@@ -3403,7 +4155,9 @@ impl SparsePurifyWorkspace {
     ) -> Result<Self> {
         if n_orb.len() != k0.n_atom {
             return Err(DftbError::InvalidInput(format!(
-                "SparsePurifyWorkspace::new: n_orb len {} != n_atom {}", n_orb.len(), k0.n_atom
+                "SparsePurifyWorkspace::new: n_orb len {} != n_atom {}",
+                n_orb.len(),
+                k0.n_atom
             )));
         }
         let n_orb_u32: Vec<u32> = n_orb.iter().map(|&n| n as u32).collect();
@@ -3415,10 +4169,20 @@ impl SparsePurifyWorkspace {
         // S is the right operand in T=K·S and must have its own structure.
         // However, the SpGEMM kernel reads B's row_ptr/col_idx from B's
         // structure, so S needs its own GpuBsrStructure.
-        let s_struct = Arc::new(GpuBsrStructure::new(&gpu, s.n_atom, &(s.row_ptr.clone(), s.col_idx.clone()))?);
-        let s_mat = GpuBsrMatrix { struct_: s_struct, values: gpu.buf_f32(&s.values)? };
+        let s_struct = Arc::new(GpuBsrStructure::new(
+            &gpu,
+            s.n_atom,
+            &(s.row_ptr.clone(), s.col_idx.clone()),
+        )?);
+        let s_mat = GpuBsrMatrix {
+            struct_: s_struct,
+            values: gpu.buf_f32(&s.values)?,
+        };
 
-        let k = GpuBsrMatrix { struct_: k_struct.clone(), values: gpu.buf_f32(&k0.values)? };
+        let k = GpuBsrMatrix {
+            struct_: k_struct.clone(),
+            values: gpu.buf_f32(&k0.values)?,
+        };
         let knew = GpuBsrMatrix::zero(&gpu, &k_struct)?;
         let t = GpuBsrMatrix::zero(&gpu, &t_struct)?;
         let q = GpuBsrMatrix::zero(&gpu, &k_struct)?;
@@ -3427,10 +4191,7 @@ impl SparsePurifyWorkspace {
         let residual_buf = gpu.zero_f32(1)?;
         let nrow = k0.n_atom;
         let reduce_wg = gpu.config().reduce_wg as usize;
-        let reduce_len = div_ceil(
-            nrow.max(k_struct.nblock * BS2),
-            reduce_wg,
-        );
+        let reduce_len = div_ceil(nrow.max(k_struct.nblock * BS2), reduce_wg);
         let reduce_partial = gpu.zero_f32(reduce_len)?;
         let reduce_a = gpu.zero_f32(reduce_len)?;
         let reduce_b = gpu.zero_f32(reduce_len)?;
@@ -3442,27 +4203,57 @@ impl SparsePurifyWorkspace {
         // intersection kernel) only via the explicit SPARSE_PLANS=0 toggle.
         let plans_on = sparse_plans_enabled();
         let plan_ks = if plans_on {
-            let k_dummy = Bsr4Matrix::from_structure(k0.n_atom, k_mask.0.clone(), k_mask.1.clone())?;
-            let s_dummy = Bsr4Matrix::from_structure(s.n_atom, s.row_ptr.clone(), s.col_idx.clone())?;
+            let k_dummy =
+                Bsr4Matrix::from_structure(k0.n_atom, k_mask.0.clone(), k_mask.1.clone())?;
+            let s_dummy =
+                Bsr4Matrix::from_structure(s.n_atom, s.row_ptr.clone(), s.col_idx.clone())?;
             let plan = crate::methods::sparse::bsr4::build_spgemm_plan_bsym(&k_dummy, &s_dummy, t_mask)
                 .map_err(|e| DftbError::InvalidInput(format!("plan_ks build failed (plans are mandatory in production — fix the mask or set RUST_DFTB_SPARSE_PLANS=0 for diagnostic intersection mode): {e}")))?;
-            Some(gpu.upload_plan(&plan)
-                .map_err(|e| DftbError::InvalidInput(format!("plan_ks upload failed: {e}")))?)
-        } else { None };
+            Some(
+                gpu.upload_plan(&plan)
+                    .map_err(|e| DftbError::InvalidInput(format!("plan_ks upload failed: {e}")))?,
+            )
+        } else {
+            None
+        };
         let plan_tk = if plans_on {
-            let t_dummy = Bsr4Matrix::from_structure(k0.n_atom, t_mask.0.clone(), t_mask.1.clone())?;
-            let k_dummy = Bsr4Matrix::from_structure(k0.n_atom, k_mask.0.clone(), k_mask.1.clone())?;
-            let plan = crate::methods::sparse::bsr4::build_spgemm_plan_bsym(&t_dummy, &k_dummy, k_mask)
-                .map_err(|e| DftbError::InvalidInput(format!("plan_tk build failed (plans are mandatory in production): {e}")))?;
-            Some(gpu.upload_plan(&plan)
-                .map_err(|e| DftbError::InvalidInput(format!("plan_tk upload failed: {e}")))?)
-        } else { None };
+            let t_dummy =
+                Bsr4Matrix::from_structure(k0.n_atom, t_mask.0.clone(), t_mask.1.clone())?;
+            let k_dummy =
+                Bsr4Matrix::from_structure(k0.n_atom, k_mask.0.clone(), k_mask.1.clone())?;
+            let plan =
+                crate::methods::sparse::bsr4::build_spgemm_plan_bsym(&t_dummy, &k_dummy, k_mask)
+                    .map_err(|e| {
+                        DftbError::InvalidInput(format!(
+                            "plan_tk build failed (plans are mandatory in production): {e}"
+                        ))
+                    })?;
+            Some(
+                gpu.upload_plan(&plan)
+                    .map_err(|e| DftbError::InvalidInput(format!("plan_tk upload failed: {e}")))?,
+            )
+        } else {
+            None
+        };
 
         Ok(Self {
-            gpu, k_struct, t_struct, s: s_mat, k, knew, t, q,
-            trace_buf, residual_buf, reduce_partial, reduce_a, reduce_b,
-            n_orb_buf, nocc,
-            plan_ks, plan_tk,
+            gpu,
+            k_struct,
+            t_struct,
+            s: s_mat,
+            k,
+            knew,
+            t,
+            q,
+            trace_buf,
+            residual_buf,
+            reduce_partial,
+            reduce_a,
+            reduce_b,
+            n_orb_buf,
+            nocc,
+            plan_ks,
+            plan_tk,
         })
     }
 
@@ -3484,11 +4275,15 @@ impl SparsePurifyWorkspace {
     fn tc2_products_dev(&mut self, with_residual: bool) -> Result<()> {
         // P4: Use symbolic plan if available; else fall back to intersection kernel.
         match &self.plan_ks {
-            Some(plan) => self.gpu.spgemm_plan_bsym_dev(&self.k, &self.s, plan, &self.t)?,
+            Some(plan) => self
+                .gpu
+                .spgemm_plan_bsym_dev(&self.k, &self.s, plan, &self.t)?,
             None => self.gpu.spgemm_bsym_dev(&self.k, &self.s, &self.t)?,
         }
         match &self.plan_tk {
-            Some(plan) => self.gpu.spgemm_plan_bsym_dev(&self.t, &self.k, plan, &self.q)?,
+            Some(plan) => self
+                .gpu
+                .spgemm_plan_bsym_dev(&self.t, &self.k, plan, &self.q)?,
             None => self.gpu.spgemm_bsym_dev(&self.t, &self.k, &self.q)?,
         }
         self.gpu.trace_ks_to_dev(
@@ -3523,7 +4318,8 @@ impl SparsePurifyWorkspace {
         self.gpu.read_f32(&self.trace_buf, &mut tr)?;
         if !tr[0].is_finite() {
             return Err(DftbError::InvalidInput(format!(
-                "TC2 trace is non-finite before update: Tr(KS)={}", tr[0]
+                "TC2 trace is non-finite before update: Tr(KS)={}",
+                tr[0]
             )));
         }
         let branch = (tr[0] as f64 > self.nocc as f64) as u32;
@@ -3535,11 +4331,8 @@ impl SparsePurifyWorkspace {
             branch,
             &self.knew.values,
         )?;
-        self.gpu.symmetrize_dev(
-            nblock,
-            &self.k_struct.transpose_block,
-            &self.knew.values,
-        )?;
+        self.gpu
+            .symmetrize_dev(nblock, &self.k_struct.transpose_block, &self.knew.values)?;
         std::mem::swap(&mut self.k.values, &mut self.knew.values);
         Ok(tr[0])
     }
@@ -3561,7 +4354,8 @@ impl SparsePurifyWorkspace {
             self.gpu.spgemm_bsym_dev(&self.k, &self.s, &self.t)?;
             self.gpu.spgemm_bsym_dev(&self.t, &self.k, &self.q)?;
         }
-        self.gpu.idempotency_err_dev(nblock, &self.q.values, &self.k.values)
+        self.gpu
+            .idempotency_err_dev(nblock, &self.q.values, &self.k.values)
     }
 
     /// Compute `Tr(KS)` for the current K using the workspace's persistent
@@ -3620,7 +4414,8 @@ impl SparsePurifyWorkspace {
                 self.gpu.read_f32(&self.trace_buf, &mut tr)?;
                 if !tr[0].is_finite() {
                     return Err(DftbError::InvalidInput(format!(
-                        "TC2 trace non-finite at iter {iter}: Tr(KS)={}", tr[0]
+                        "TC2 trace non-finite at iter {iter}: Tr(KS)={}",
+                        tr[0]
                     )));
                 }
                 let mut ri_sq = [0.0f32; 1];
@@ -3628,12 +4423,16 @@ impl SparsePurifyWorkspace {
                 let ri = ri_sq[0].sqrt();
                 if !ri.is_finite() {
                     return Err(DftbError::InvalidInput(format!(
-                        "TC2 residual non-finite at iter {iter}: R_I={}", ri
+                        "TC2 residual non-finite at iter {iter}: R_I={}",
+                        ri
                     )));
                 }
                 last_tr = tr[0];
                 last_r_i = ri;
-                println!("  TC2-dev iter {iter}: R_I={ri:e}  Tr(KS)={:.6}  (Nocc={})", tr[0], self.nocc);
+                println!(
+                    "  TC2-dev iter {iter}: R_I={ri:e}  Tr(KS)={:.6}  (Nocc={})",
+                    tr[0], self.nocc
+                );
                 history.push((iter, ri, tr[0]));
                 if ri < best_r_i {
                     best_r_i = ri;
@@ -3700,7 +4499,9 @@ impl SparsePurifyWorkspace {
     }
 
     /// Borrow the underlying GPU.
-    pub fn gpu(&self) -> &SparseBsr4Gpu { &self.gpu }
+    pub fn gpu(&self) -> &SparseBsr4Gpu {
+        &self.gpu
+    }
 
     /// Read the current K back to host (blocking).
     pub fn k_to_host(&self) -> Result<Bsr4Matrix> {
@@ -3713,6 +4514,91 @@ impl SparsePurifyWorkspace {
     pub fn mulliken_dev(&mut self) -> Result<(Vec<f32>, Vec<f32>)> {
         // T = K·S
         self.gpu.spgemm_bsym_dev(&self.k, &self.s, &self.t)?;
-        self.gpu.mulliken_dev(&self.t_struct, &self.t.values, &self.n_orb_buf)
+        self.gpu
+            .mulliken_dev(&self.t_struct, &self.t.values, &self.n_orb_buf)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::methods::dftb::forces::gamma_prime_full;
+    use crate::methods::dftb::gamma::gamma_full;
+    use crate::methods::sparse::harness::require_sparse_gpu;
+
+    /// GPU tiled n-body γ/γ′ vs the CPU analytic reference (gamma_full /
+    /// gamma_prime_full + scc_double_counting_force coefficient) on random
+    /// atoms with two Hubbard-U species. Odd N exercises tile-tail padding.
+    #[test]
+    fn gamma_kernels_match_cpu() {
+        const A2B: f64 = 1.889_726_133;
+        let Some(gpu) = require_sparse_gpu() else {
+            eprintln!("gamma_kernels_match_cpu: no sparse GPU — skipped");
+            return;
+        };
+        let n = 313usize;
+        let mut st = 0x9e3779b9u64;
+        let mut rnd = || {
+            st = st
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (st >> 33) as f64 / (1u64 << 33) as f64
+        };
+        let coords: Vec<[f64; 3]> = (0..n)
+            .map(|_| [40.0 * rnd(), 40.0 * rnd(), 40.0 * rnd()])
+            .collect();
+        let us = [0.36f64, 0.419f64];
+        let u: Vec<f64> = (0..n).map(|i| us[i % 2]).collect();
+        let dq: Vec<f64> = (0..n).map(|_| 0.4 * (rnd() - 0.5)).collect();
+        let mut xyzu = vec![0.0f32; 4 * n];
+        for i in 0..n {
+            xyzu[4 * i] = coords[i][0] as f32;
+            xyzu[4 * i + 1] = coords[i][1] as f32;
+            xyzu[4 * i + 2] = coords[i][2] as f32;
+            xyzu[4 * i + 3] = u[i] as f32;
+        }
+        let dqf: Vec<f32> = dq.iter().map(|&x| x as f32).collect();
+        let b_xyzu = gpu.buf_f32(&xyzu).unwrap();
+        let b_dq = gpu.buf_f32(&dqf).unwrap();
+        let b_v = gpu.zero_f32(n).unwrap();
+        let b_f = gpu.zero_f32(4 * n).unwrap();
+        gpu.gamma_v_dev(n, &b_xyzu, &b_dq, &b_v).unwrap();
+        gpu.gamma_f_dev(n, &b_xyzu, &b_dq, &b_f).unwrap();
+        let mut v = vec![0.0f32; n];
+        let mut f = vec![0.0f32; 4 * n];
+        gpu.read_f32(&b_v, &mut v).unwrap();
+        gpu.read_f32(&b_f, &mut f).unwrap();
+
+        let (mut ev, mut ef, mut vscale, mut fscale) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+        for i in 0..n {
+            let mut vv = 0.0f64;
+            let mut ff = [0.0f64; 3];
+            for j in 0..n {
+                let dx = coords[i][0] - coords[j][0];
+                let dy = coords[i][1] - coords[j][1];
+                let dz = coords[i][2] - coords[j][2];
+                let r_ang = (dx * dx + dy * dy + dz * dz).sqrt();
+                let r_b = r_ang * A2B;
+                vv += gamma_full(r_b, u[i], u[j]) * dq[j];
+                if r_ang >= 1.0e-2 {
+                    let gp = gamma_prime_full(r_b, u[i], u[j]);
+                    let c = -dq[i] * dq[j] * gp / r_b * A2B * A2B;
+                    ff[0] += c * dx;
+                    ff[1] += c * dy;
+                    ff[2] += c * dz;
+                }
+            }
+            ev = ev.max((v[i] as f64 - vv).abs());
+            vscale = vscale.max(vv.abs());
+            for c in 0..3 {
+                ef = ef.max((f[4 * i + c] as f64 - ff[c]).abs());
+                fscale = fscale.max(ff[c].abs());
+            }
+        }
+        eprintln!(
+            "gamma parity: max|dV|={ev:.3e} (|V|~{vscale:.2e})  max|dF|={ef:.3e} (|F|~{fscale:.2e})"
+        );
+        assert!(ev < 2e-5, "V parity failed: {ev:.3e}");
+        assert!(ef < 1e-5, "F parity failed: {ef:.3e}");
     }
 }

@@ -29,13 +29,15 @@
 
 use crate::core::error::{DftbError, Result};
 use crate::core::neighbor::{NeighborBuilder, NeighborList};
-use crate::methods::dftb::hamiltonian::{Hamiltonian, HamiltonianBuilder, SccResult, SystemContext};
+use crate::methods::dftb::hamiltonian::{
+    Hamiltonian, HamiltonianBuilder, SccResult, SystemContext,
+};
 use crate::methods::dftb::rotation::{DirectionCosines, Rotation};
 use crate::methods::dftb::sk_data::SkData;
 use crate::qmqm::gamma::GammaTable;
 
-use nalgebra::{DMatrix, DVector, SymmetricEigen};
 use nalgebra::linalg::Cholesky;
+use nalgebra::{DMatrix, DVector, SymmetricEigen};
 
 const ANG2BOHR: f64 = 1.889_726_133;
 const BOHR2ANG: f64 = 1.0 / ANG2BOHR;
@@ -71,8 +73,10 @@ const SAME_U_C2: f64 = 0.020_833_333_333_333_333;
 /// and Coulomb contributions in the SCC double-counting force).
 pub fn gamma_prime_full(r: f64, u1: f64, u2: f64) -> f64 {
     assert!(r >= 0.0, "gamma_prime_full: negative distance {r}");
-    assert!(u1 >= MIN_HUB_TOL && u2 >= MIN_HUB_TOL,
-        "gamma_prime_full: Hubbard U too small ({u1}, {u2})");
+    assert!(
+        u1 >= MIN_HUB_TOL && u2 >= MIN_HUB_TOL,
+        "gamma_prime_full: Hubbard U too small ({u1}, {u2})"
+    );
 
     // On-site: derivative is 0 (gamma is flat at R=0).
     if r < TOL_SAME_DIST {
@@ -97,18 +101,22 @@ fn exp_gamma_same_u_prime(r: f64, tau: f64) -> f64 {
     let e = (-tau * r).exp();
     // S(R) = e * (1/R + c0*τ + c1*R*τ² + c2*R²*τ³)
     // S'(R) = -τ*e*(...) + e*(-1/R² + c1*τ² + 2*c2*R*τ³)
-    let poly = 1.0 / r + SAME_U_C0 * tau + SAME_U_C1 * r * tau * tau
-        + SAME_U_C2 * r * r * tau.powi(3);
-    let poly_prime = -1.0 / (r * r) + SAME_U_C1 * tau * tau
-        + 2.0 * SAME_U_C2 * r * tau.powi(3);
+    let poly =
+        1.0 / r + SAME_U_C0 * tau + SAME_U_C1 * r * tau * tau + SAME_U_C2 * r * r * tau.powi(3);
+    let poly_prime = -1.0 / (r * r) + SAME_U_C1 * tau * tau + 2.0 * SAME_U_C2 * r * tau.powi(3);
     -tau * e * poly + e * poly_prime
 }
 
 /// Derivative of `gamma_sub_exprn` (one half of the different-τ screening).
 fn gamma_sub_exprn_prime(r: f64, tau1: f64, tau2: f64) -> f64 {
-    assert!((tau1 - tau2).abs() >= TAU_FACTOR * MIN_HUB_DIFF,
-        "gamma_sub_exprn_prime: degenerate tau ({tau1}, {tau2})");
-    assert!(r >= TOL_SAME_DIST, "gamma_sub_exprn_prime: on-top atoms (r={r})");
+    assert!(
+        (tau1 - tau2).abs() >= TAU_FACTOR * MIN_HUB_DIFF,
+        "gamma_sub_exprn_prime: degenerate tau ({tau1}, {tau2})"
+    );
+    assert!(
+        r >= TOL_SAME_DIST,
+        "gamma_sub_exprn_prime: on-top atoms (r={r})"
+    );
 
     let dt2 = tau1 * tau1 - tau2 * tau2;
     let dt2_sq = dt2 * dt2;
@@ -250,11 +258,14 @@ pub fn parse_repulsive_spline(sk_path: &str) -> Result<Option<RepulsiveSpline>> 
     }
 
     // nint  cutoff
-    let header = lines.next()
+    let header = lines
+        .next()
         .ok_or_else(|| DftbError::Parse("Spline section: missing nint/cutoff line".into()))?;
     let hdr: Vec<f64> = parse_f64_line(header)?;
     if hdr.len() < 2 {
-        return Err(DftbError::Parse("Spline header needs nint and cutoff".into()));
+        return Err(DftbError::Parse(
+            "Spline header needs nint and cutoff".into(),
+        ));
     }
     let nint = hdr[0] as usize;
     let _declared_cutoff = hdr[1];
@@ -263,7 +274,8 @@ pub fn parse_repulsive_spline(sk_path: &str) -> Result<Option<RepulsiveSpline>> 
     }
 
     // expCoeffs(3)
-    let exp_line = lines.next()
+    let exp_line = lines
+        .next()
         .ok_or_else(|| DftbError::Parse("Spline section: missing expCoeffs line".into()))?;
     let exp_vals = parse_f64_line(exp_line)?;
     if exp_vals.len() < 3 {
@@ -278,12 +290,14 @@ pub fn parse_repulsive_spline(sk_path: &str) -> Result<Option<RepulsiveSpline>> 
 
     // Cubic intervals 1..nint-1
     for _ in 0..(nint.saturating_sub(1)) {
-        let line = lines.next()
-            .ok_or_else(|| DftbError::Parse("Spline section: unexpected EOF in cubic intervals".into()))?;
+        let line = lines.next().ok_or_else(|| {
+            DftbError::Parse("Spline section: unexpected EOF in cubic intervals".into())
+        })?;
         let vals = parse_f64_line(line)?;
         if vals.len() < 6 {
             return Err(DftbError::Parse(format!(
-                "cubic interval line needs 6 values, got {}", vals.len()
+                "cubic interval line needs 6 values, got {}",
+                vals.len()
             )));
         }
         x_start.push(vals[0]);
@@ -293,12 +307,14 @@ pub fn parse_repulsive_spline(sk_path: &str) -> Result<Option<RepulsiveSpline>> 
 
     // Final polynomial-tail interval
     {
-        let line = lines.next()
-            .ok_or_else(|| DftbError::Parse("Spline section: missing final polynomial interval".into()))?;
+        let line = lines.next().ok_or_else(|| {
+            DftbError::Parse("Spline section: missing final polynomial interval".into())
+        })?;
         let vals = parse_f64_line(line)?;
         if vals.len() < 8 {
             return Err(DftbError::Parse(format!(
-                "polynomial tail line needs 8 values, got {}", vals.len()
+                "polynomial tail line needs 8 values, got {}",
+                vals.len()
             )));
         }
         x_start.push(vals[0]);
@@ -366,7 +382,10 @@ impl Forces {
 /// Diagonalize the non-SCC generalized eigenproblem H0·c = E·S·c and return
 /// occupied eigenvectors / eigenvalues. Mirrors `Fragment::diagonalize` but
 /// operates on a plain `Hamiltonian` instead of a `Fragment`.
-fn diagonalize_non_scc(ham: &Hamiltonian, n_electrons: f64) -> Result<(DMatrix<f64>, DVector<f64>)> {
+fn diagonalize_non_scc(
+    ham: &Hamiltonian,
+    n_electrons: f64,
+) -> Result<(DMatrix<f64>, DVector<f64>)> {
     let n = ham.h0.nrows();
     assert_eq!(ham.h0.ncols(), n);
     assert_eq!(ham.s.nrows(), n);
@@ -376,9 +395,11 @@ fn diagonalize_non_scc(ham: &Hamiltonian, n_electrons: f64) -> Result<(DMatrix<f
     let l = cholesky.l();
 
     // H' = L^-1 H L^-T
-    let m = l.solve_lower_triangular(&ham.h0)
+    let m = l
+        .solve_lower_triangular(&ham.h0)
         .ok_or_else(|| DftbError::InvalidInput("L·M = H solve failed".into()))?;
-    let n_mat = l.solve_lower_triangular(&m.transpose())
+    let n_mat = l
+        .solve_lower_triangular(&m.transpose())
         .ok_or_else(|| DftbError::InvalidInput("L·N = Mᵀ solve failed".into()))?;
     let h_prime = n_mat.transpose();
 
@@ -393,7 +414,8 @@ fn diagonalize_non_scc(ham: &Hamiltonian, n_electrons: f64) -> Result<(DMatrix<f
     let sorted_c_prime = c_prime.select_columns(&idx);
 
     // Back-transform c = L^-T c'
-    let c = l.tr_solve_lower_triangular(&sorted_c_prime)
+    let c = l
+        .tr_solve_lower_triangular(&sorted_c_prime)
         .ok_or_else(|| DftbError::InvalidInput("Lᵀ·c = c' solve failed".into()))?;
 
     let _ = n_electrons; // n_occ computed by caller
@@ -402,10 +424,7 @@ fn diagonalize_non_scc(ham: &Hamiltonian, n_electrons: f64) -> Result<(DMatrix<f
 
 /// Build the density matrix D = 2 * C_occ * C_occ^T and the energy-weighted
 /// density matrix EDM = 2 * C_occ * diag(eps_occ) * C_occ^T.
-fn build_density_matrices(
-    c_occ: &DMatrix<f64>,
-    eps_occ: &[f64],
-) -> (DMatrix<f64>, DMatrix<f64>) {
+fn build_density_matrices(c_occ: &DMatrix<f64>, eps_occ: &[f64]) -> (DMatrix<f64>, DMatrix<f64>) {
     // D = 2 * C_occ * C_occ^T
     let density = c_occ * c_occ.transpose() * 2.0;
 
@@ -445,12 +464,12 @@ pub(crate) fn build_pair_block(
     let si = ctx.atom_species[i];
     let sj = ctx.atom_species[j];
 
-    let tab_fwd = ctx.pair_table(si, sj).ok_or_else(|| {
-        DftbError::InvalidInput(format!("missing SK table fwd ({si},{sj})"))
-    })?;
-    let tab_rev = ctx.pair_table(sj, si).ok_or_else(|| {
-        DftbError::InvalidInput(format!("missing SK table rev ({sj},{si})"))
-    })?;
+    let tab_fwd = ctx
+        .pair_table(si, sj)
+        .ok_or_else(|| DftbError::InvalidInput(format!("missing SK table fwd ({si},{sj})")))?;
+    let tab_rev = ctx
+        .pair_table(sj, si)
+        .ok_or_else(|| DftbError::InvalidInput(format!("missing SK table rev ({sj},{si})")))?;
 
     let v = [
         coords_j_disp[0] - coords_i[0],
@@ -491,19 +510,24 @@ pub(crate) fn build_pair_block_with_derivs(
     coords: &[[f64; 3]],
     i: usize,
     j: usize,
-    out_h: &mut [f64], out_s: &mut [f64],
-    dh_dx: &mut [f64], dh_dy: &mut [f64], dh_dz: &mut [f64],
-    ds_dx: &mut [f64], ds_dy: &mut [f64], ds_dz: &mut [f64],
+    out_h: &mut [f64],
+    out_s: &mut [f64],
+    dh_dx: &mut [f64],
+    dh_dy: &mut [f64],
+    dh_dz: &mut [f64],
+    ds_dx: &mut [f64],
+    ds_dy: &mut [f64],
+    ds_dz: &mut [f64],
 ) -> Result<()> {
     let si = ctx.atom_species[i];
     let sj = ctx.atom_species[j];
 
-    let tab_fwd = ctx.pair_table(si, sj).ok_or_else(|| {
-        DftbError::InvalidInput(format!("missing SK table fwd ({si},{sj})"))
-    })?;
-    let tab_rev = ctx.pair_table(sj, si).ok_or_else(|| {
-        DftbError::InvalidInput(format!("missing SK table rev ({sj},{si})"))
-    })?;
+    let tab_fwd = ctx
+        .pair_table(si, sj)
+        .ok_or_else(|| DftbError::InvalidInput(format!("missing SK table fwd ({si},{sj})")))?;
+    let tab_rev = ctx
+        .pair_table(sj, si)
+        .ok_or_else(|| DftbError::InvalidInput(format!("missing SK table rev ({sj},{si})")))?;
 
     let v = [
         coords[j][0] - coords[i][0],
@@ -520,9 +544,14 @@ pub(crate) fn build_pair_block_with_derivs(
         ctx.species_ang[sj as usize],
         r_bohr,
         dc,
-        out_h, out_s,
-        dh_dx, dh_dy, dh_dz,
-        ds_dx, ds_dy, ds_dz,
+        out_h,
+        out_s,
+        dh_dx,
+        dh_dy,
+        dh_dz,
+        ds_dx,
+        ds_dy,
+        ds_dz,
     )
 }
 
@@ -617,7 +646,13 @@ pub fn non_scc_electronic_force(
     edm: &DMatrix<f64>,
     forces: &mut [[f64; 3]],
 ) -> Result<()> {
-    let max_n = ctx.species_n_orb.iter().copied().map(|n| n as usize).max().unwrap_or(0);
+    let max_n = ctx
+        .species_n_orb
+        .iter()
+        .copied()
+        .map(|n| n as usize)
+        .max()
+        .unwrap_or(0);
     let max_block = max_n * max_n;
 
     for p in &neigh.pairs {
@@ -640,10 +675,8 @@ pub fn non_scc_electronic_force(
         let mut ds_dz = vec![0.0f64; max_block];
 
         build_pair_block_with_derivs(
-            ctx, coords, i, j,
-            &mut h, &mut s,
-            &mut dh_dx, &mut dh_dy, &mut dh_dz,
-            &mut ds_dx, &mut ds_dy, &mut ds_dz,
+            ctx, coords, i, j, &mut h, &mut s, &mut dh_dx, &mut dh_dy, &mut dh_dz, &mut ds_dx,
+            &mut ds_dy, &mut ds_dz,
         )?;
 
         // Force contribution: F_i += 2 * Σ (DM·dH - EDM·dS) for each direction.
@@ -697,7 +730,13 @@ pub fn scc_shift_force(
     shifts: &[f64],
     forces: &mut [[f64; 3]],
 ) -> Result<()> {
-    let max_n = ctx.species_n_orb.iter().copied().map(|n| n as usize).max().unwrap_or(0);
+    let max_n = ctx
+        .species_n_orb
+        .iter()
+        .copied()
+        .map(|n| n as usize)
+        .max()
+        .unwrap_or(0);
     let max_block = max_n * max_n;
 
     for p in &neigh.pairs {
@@ -723,10 +762,8 @@ pub fn scc_shift_force(
         let mut ds_dz = vec![0.0f64; max_block];
 
         build_pair_block_with_derivs(
-            ctx, coords, i, j,
-            &mut h, &mut s,
-            &mut dh_dx, &mut dh_dy, &mut dh_dz,
-            &mut ds_dx, &mut ds_dy, &mut ds_dz,
+            ctx, coords, i, j, &mut h, &mut s, &mut dh_dx, &mut dh_dy, &mut dh_dz, &mut ds_dx,
+            &mut ds_dy, &mut ds_dz,
         )?;
 
         // shiftSprime[a,b] = 0.5 * ( shift_i * S'[a,b] + shift_j * S'[a,b] )
@@ -816,8 +853,7 @@ pub fn scc_double_counting_force(
             // Convert to Hartree/Å:
             //   F_ang = F_bohr * ANG2BOHR
             //         = -dq_i * dq_j * gprime / r_bohr * (coord_i - coord_j)_ang * ANG2BOHR * ANG2BOHR
-            let coeff = -delta_q[i] * delta_q[j] * gprime_full / r_bohr
-                * ANG2BOHR * ANG2BOHR;
+            let coeff = -delta_q[i] * delta_q[j] * gprime_full / r_bohr * ANG2BOHR * ANG2BOHR;
 
             let fx = coeff * dx;
             let fy = coeff * dy;
@@ -943,18 +979,26 @@ pub fn repulsive_force_cached(
             let dy = coords[j][1] - coords[i][1];
             let dz = coords[j][2] - coords[i][2];
             let r2 = dx * dx + dy * dy + dz * dz;
-            if r2 < MIN_NEIGH_DIST * MIN_NEIGH_DIST { continue; }
+            if r2 < MIN_NEIGH_DIST * MIN_NEIGH_DIST {
+                continue;
+            }
             let r_ang = r2.sqrt();
             let r_bohr = r_ang * ANG2BOHR;
             let (_e, de_bohr) = spline.eval(r_bohr);
-            if de_bohr == 0.0 { continue; }
+            if de_bohr == 0.0 {
+                continue;
+            }
             let de_ang = de_bohr * ANG2BOHR;
             let inv_r = 1.0 / r_ang;
             let fx = de_ang * dx * inv_r;
             let fy = de_ang * dy * inv_r;
             let fz = de_ang * dz * inv_r;
-            forces[i][0] += fx; forces[i][1] += fy; forces[i][2] += fz;
-            forces[j][0] -= fx; forces[j][1] -= fy; forces[j][2] -= fz;
+            forces[i][0] += fx;
+            forces[i][1] += fy;
+            forces[i][2] += fz;
+            forces[j][0] -= fx;
+            forces[j][1] -= fy;
+            forces[j][2] -= fz;
         }
     }
     Ok(())
@@ -990,26 +1034,36 @@ pub fn parse_all_repulsive(
 ///
 /// `tables` is `n_species × n_species` in the same order as GPU `atom_species`.
 /// Fails loud if any species pair has no Spline (silent skip would drop E_rep / F_rep).
-pub fn pack_repulsive_gpu(tables: &[Option<RepulsiveSpline>], n_species: usize, species_names: &[String]) -> Result<(Vec<i32>, Vec<f32>, usize)> {
+pub fn pack_repulsive_gpu(
+    tables: &[Option<RepulsiveSpline>],
+    n_species: usize,
+    species_names: &[String],
+) -> Result<(Vec<i32>, Vec<f32>, usize)> {
     if tables.len() != n_species * n_species {
         return Err(DftbError::InvalidInput(format!(
-            "pack_repulsive_gpu: tables.len()={} != n_species² {n_species}²", tables.len()
+            "pack_repulsive_gpu: tables.len()={} != n_species² {n_species}²",
+            tables.len()
         )));
     }
     if species_names.len() != n_species {
         return Err(DftbError::InvalidInput(format!(
-            "pack_repulsive_gpu: species_names.len()={} != n_species={n_species}", species_names.len()
+            "pack_repulsive_gpu: species_names.len()={} != n_species={n_species}",
+            species_names.len()
         )));
     }
     let mut max_int = 1usize;
     for (p, s) in tables.iter().enumerate() {
         match s {
-            Some(sp) => { max_int = max_int.max(sp.x_start.len()); }
+            Some(sp) => {
+                max_int = max_int.max(sp.x_start.len());
+            }
             None => {
-                let i = p / n_species; let j = p % n_species;
+                let i = p / n_species;
+                let j = p % n_species;
                 if tables[j * n_species + i].is_none() {
                     return Err(DftbError::InvalidInput(format!(
-                        "pack_repulsive_gpu: no Spline for {}-{}", species_names[i], species_names[j]
+                        "pack_repulsive_gpu: no Spline for {}-{}",
+                        species_names[i], species_names[j]
                     )));
                 }
             }
@@ -1027,19 +1081,28 @@ pub fn pack_repulsive_gpu(tables: &[Option<RepulsiveSpline>], n_species: usize, 
         data.push(sp.exp_coeffs[0] as f32);
         data.push(sp.exp_coeffs[1] as f32);
         data.push(sp.exp_coeffs[2] as f32);
-        for k in 0..max_int { data.push(if k < n_int { sp.x_start[k] as f32 } else { 0.0 }); }
+        for k in 0..max_int {
+            data.push(if k < n_int { sp.x_start[k] as f32 } else { 0.0 });
+        }
         let n_cubic = max_int.saturating_sub(1);
         for k in 0..n_cubic {
             if k < sp.sp_coeffs.len() {
-                for c in 0..4 { data.push(sp.sp_coeffs[k][c] as f32); }
+                for c in 0..4 {
+                    data.push(sp.sp_coeffs[k][c] as f32);
+                }
             } else {
-                for _ in 0..4 { data.push(0.0); }
+                for _ in 0..4 {
+                    data.push(0.0);
+                }
             }
         }
-        for c in 0..6 { data.push(sp.sp_last_coeffs[c] as f32); }
+        for c in 0..6 {
+            data.push(sp.sp_last_coeffs[c] as f32);
+        }
         if data.len() - offsets[p] as usize != rec {
             return Err(DftbError::InvalidInput(format!(
-                "pack_repulsive_gpu: record length {} != {rec} at pair {p}", data.len() - offsets[p] as usize
+                "pack_repulsive_gpu: record length {} != {rec} at pair {p}",
+                data.len() - offsets[p] as usize
             )));
         }
     }
@@ -1051,12 +1114,12 @@ pub fn pack_repulsive_gpu(tables: &[Option<RepulsiveSpline>], n_species: usize, 
 /// Fail-loud: a pair that appears in the molecule must have a Spline section
 /// in the SK file. Silent `continue` on a missing spline would drop E_rep
 /// (Gate F collapsed SiH4 to 0.93 Å for exactly that class of omission).
-pub fn repulsive_energy(
-    sk_dir: &str,
-    species: &[String],
-    coords: &[[f64; 3]],
-) -> Result<f64> {
-    assert_eq!(species.len(), coords.len(), "repulsive_energy: species/coords length mismatch");
+pub fn repulsive_energy(sk_dir: &str, species: &[String], coords: &[[f64; 3]]) -> Result<f64> {
+    assert_eq!(
+        species.len(),
+        coords.len(),
+        "repulsive_energy: species/coords length mismatch"
+    );
     let mut names: Vec<String> = Vec::new();
     for s in species {
         if !names.iter().any(|n| n == s) {
@@ -1065,32 +1128,49 @@ pub fn repulsive_energy(
     }
     let n_species = names.len();
     let tables = parse_all_repulsive(sk_dir, &names, n_species)?;
-    let atom_sp: Vec<usize> = species.iter().map(|s| {
-        names.iter().position(|n| n == s).unwrap_or_else(|| panic!("species {s} missing from unique list {names:?}"))
-    }).collect();
+    let atom_sp: Vec<usize> = species
+        .iter()
+        .map(|s| {
+            names
+                .iter()
+                .position(|n| n == s)
+                .unwrap_or_else(|| panic!("species {s} missing from unique list {names:?}"))
+        })
+        .collect();
     let n = coords.len();
     let mut e_rep = 0.0f64;
     for i in 0..n {
         for j in (i + 1)..n {
             let si = atom_sp[i];
             let sj = atom_sp[j];
-            let spline = tables[si * n_species + sj].as_ref()
+            let spline = tables[si * n_species + sj]
+                .as_ref()
                 .or(tables[sj * n_species + si].as_ref())
-                .ok_or_else(|| DftbError::InvalidInput(format!(
-                    "no repulsive Spline for {}-{} in {sk_dir}", species[i], species[j]
-                )))?;
+                .ok_or_else(|| {
+                    DftbError::InvalidInput(format!(
+                        "no repulsive Spline for {}-{} in {sk_dir}",
+                        species[i], species[j]
+                    ))
+                })?;
             let dx = coords[j][0] - coords[i][0];
             let dy = coords[j][1] - coords[i][1];
             let dz = coords[j][2] - coords[i][2];
             let r2 = dx * dx + dy * dy + dz * dz;
             if r2 < MIN_NEIGH_DIST * MIN_NEIGH_DIST {
                 return Err(DftbError::InvalidInput(format!(
-                    "repulsive_energy: atoms {i}-{} on top of each other, |r|={:.3e} Å", j, r2.sqrt()
+                    "repulsive_energy: atoms {i}-{} on top of each other, |r|={:.3e} Å",
+                    j,
+                    r2.sqrt()
                 )));
             }
             let (e, _) = spline.eval(r2.sqrt() * ANG2BOHR);
             if !e.is_finite() {
-                panic!("repulsive_energy: non-finite E_rep for {}-{} at r={:.4} Å: {e}", species[i], species[j], r2.sqrt());
+                panic!(
+                    "repulsive_energy: non-finite E_rep for {}-{} at r={:.4} Å: {e}",
+                    species[i],
+                    species[j],
+                    r2.sqrt()
+                );
             }
             e_rep += e;
         }
@@ -1111,30 +1191,43 @@ pub fn repulsive_energy_cached(
     n_species: usize,
 ) -> Result<f64> {
     let n = coords.len();
-    assert_eq!(species_code.len(), n, "repulsive_energy_cached: len mismatch");
+    assert_eq!(
+        species_code.len(),
+        n,
+        "repulsive_energy_cached: len mismatch"
+    );
     let mut e_rep = 0.0f64;
     for i in 0..n {
         let si = species_code[i] as usize;
         for j in (i + 1)..n {
             let sj = species_code[j] as usize;
-            let spline = repulsive[si * n_species + sj].as_ref()
+            let spline = repulsive[si * n_species + sj]
+                .as_ref()
                 .or(repulsive[sj * n_species + si].as_ref())
-                .ok_or_else(|| DftbError::InvalidInput(format!(
-                    "repulsive_energy_cached: no repulsive Spline for {}-{}",
-                    species_names[si], species_names[sj]
-                )))?;
+                .ok_or_else(|| {
+                    DftbError::InvalidInput(format!(
+                        "repulsive_energy_cached: no repulsive Spline for {}-{}",
+                        species_names[si], species_names[sj]
+                    ))
+                })?;
             let dx = coords[j][0] - coords[i][0];
             let dy = coords[j][1] - coords[i][1];
             let dz = coords[j][2] - coords[i][2];
             let r2 = dx * dx + dy * dy + dz * dz;
             if r2 < MIN_NEIGH_DIST * MIN_NEIGH_DIST {
                 return Err(DftbError::InvalidInput(format!(
-                    "repulsive_energy_cached: atoms {i}-{j} on top of each other, |r|={:.3e} Å", r2.sqrt()
+                    "repulsive_energy_cached: atoms {i}-{j} on top of each other, |r|={:.3e} Å",
+                    r2.sqrt()
                 )));
             }
             let (e, _) = spline.eval(r2.sqrt() * ANG2BOHR);
             if !e.is_finite() {
-                panic!("repulsive_energy_cached: non-finite E_rep for {}-{} at r={:.4} Å: {e}", species_names[si], species_names[sj], r2.sqrt());
+                panic!(
+                    "repulsive_energy_cached: non-finite E_rep for {}-{} at r={:.4} Å: {e}",
+                    species_names[si],
+                    species_names[sj],
+                    r2.sqrt()
+                );
             }
             e_rep += e;
         }
@@ -1167,19 +1260,30 @@ pub fn repulsive_energy_pbc(
                 ];
                 let central = rx == 0 && ry == 0 && rz == 0;
                 // count each pair once: R=0 → i<j; R≠0 → lex-positive half-space
-                let keep = if central { true } else { rx > 0 || (rx == 0 && ry > 0) || (rx == 0 && ry == 0 && rz > 0) };
-                if !keep { continue; }
+                let keep = if central {
+                    true
+                } else {
+                    rx > 0 || (rx == 0 && ry > 0) || (rx == 0 && ry == 0 && rz > 0)
+                };
+                if !keep {
+                    continue;
+                }
                 for i in 0..n {
                     let si = species_code[i] as usize;
                     for j in 0..n {
-                        if central && j <= i { continue; }
+                        if central && j <= i {
+                            continue;
+                        }
                         let sj = species_code[j] as usize;
-                        let spline = repulsive[si * n_species + sj].as_ref()
+                        let spline = repulsive[si * n_species + sj]
+                            .as_ref()
                             .or(repulsive[sj * n_species + si].as_ref())
-                            .ok_or_else(|| DftbError::InvalidInput(format!(
-                                "repulsive_energy_pbc: no repulsive Spline for {}-{}",
-                                species_names[si], species_names[sj]
-                            )))?;
+                            .ok_or_else(|| {
+                                DftbError::InvalidInput(format!(
+                                    "repulsive_energy_pbc: no repulsive Spline for {}-{}",
+                                    species_names[si], species_names[sj]
+                                ))
+                            })?;
                         let dx = coords[j][0] + shift[0] - coords[i][0];
                         let dy = coords[j][1] + shift[1] - coords[i][1];
                         let dz = coords[j][2] + shift[2] - coords[i][2];
@@ -1207,7 +1311,10 @@ pub fn check_finite(forces: &[[f64; 3]], label: &str) {
     for (i, f) in forces.iter().enumerate() {
         for c in 0..3 {
             if !f[c].is_finite() {
-                panic!("Non-finite force in {label}: atom {i} component {c} = {}", f[c]);
+                panic!(
+                    "Non-finite force in {label}: atom {i} component {c} = {}",
+                    f[c]
+                );
             }
         }
     }
@@ -1223,7 +1330,9 @@ pub fn check_newton(forces: &[[f64; 3]], label: &str, tol: f64) {
     }
     let max = sum.iter().map(|x| x.abs()).fold(0.0_f64, f64::max);
     if max > tol {
-        eprintln!("[WARNING] {label}: Newton's third law violated, |ΣF| = {max:.3e} (sum = {sum:?})");
+        eprintln!(
+            "[WARNING] {label}: Newton's third law violated, |ΣF| = {max:.3e} (sum = {sum:?})"
+        );
     }
 }
 
@@ -1253,7 +1362,10 @@ pub fn compute_non_scc_forces(
     let ctx = SystemContext::from_sk_data(&builder.sk, species)?;
 
     // Cutoff for the neighbour list: use the max SK table cutoff.
-    let cutoff = builder.sk.pairs.values()
+    let cutoff = builder
+        .sk
+        .pairs
+        .values()
         .map(|t| t.cutoff())
         .fold(0.0_f64, f64::max);
     let neigh = NeighborBuilder { cutoff }.build(coords)?;
@@ -1273,10 +1385,9 @@ pub fn compute_non_scc_forces(
     // not store the source path, the caller must provide it via env var or
     // we fall back to a heuristic. For the parity tests we read the env var
     // RUST_DFTB_SK_DIR.
-    let sk_dir = std::env::var("RUST_DFTB_SK_DIR")
-        .map_err(|_| DftbError::InvalidInput(
-            "RUST_DFTB_SK_DIR must be set for repulsive forces".into()
-        ))?;
+    let sk_dir = std::env::var("RUST_DFTB_SK_DIR").map_err(|_| {
+        DftbError::InvalidInput("RUST_DFTB_SK_DIR must be set for repulsive forces".into())
+    })?;
     repulsive_force(coords, species, &sk_dir, &mut out.repulsive)?;
 
     // Sum components.
@@ -1323,7 +1434,10 @@ pub fn compute_scc_forces(
 
     let ctx = SystemContext::from_sk_data(&builder.sk, species)?;
 
-    let cutoff = builder.sk.pairs.values()
+    let cutoff = builder
+        .sk
+        .pairs
+        .values()
         .map(|t| t.cutoff())
         .fold(0.0_f64, f64::max);
     let neigh = NeighborBuilder { cutoff }.build(coords)?;
@@ -1347,7 +1461,10 @@ pub fn compute_scc_forces(
     // SCC shift force.
     // Reconstruct atom-resolved shifts from deltaQ and gamma.
     let gamma_tbl = GammaTable::from_sk_data(&builder.sk, species)?;
-    let delta_q: Vec<f64> = scc.charges.iter().zip(scc.q0.iter())
+    let delta_q: Vec<f64> = scc
+        .charges
+        .iter()
+        .zip(scc.q0.iter())
         .map(|(q, q0)| q - q0)
         .collect();
     // shifts[i] = U_i * dq_i + Σ_{j≠i} gamma(r_ij) * dq_j
@@ -1355,22 +1472,25 @@ pub fn compute_scc_forces(
     scc_shift_force(&ctx, &neigh, coords, dm, &shifts, &mut out.scc_shift)?;
 
     // SCC double-counting (Coulomb) force.
-    scc_double_counting_force(coords, &ctx.atom_species, &delta_q, &gamma_tbl, &mut out.scc_dc);
+    scc_double_counting_force(
+        coords,
+        &ctx.atom_species,
+        &delta_q,
+        &gamma_tbl,
+        &mut out.scc_dc,
+    );
 
     // Repulsive force.
-    let sk_dir = std::env::var("RUST_DFTB_SK_DIR")
-        .map_err(|_| DftbError::InvalidInput(
-            "RUST_DFTB_SK_DIR must be set for repulsive forces".into()
-        ))?;
+    let sk_dir = std::env::var("RUST_DFTB_SK_DIR").map_err(|_| {
+        DftbError::InvalidInput("RUST_DFTB_SK_DIR must be set for repulsive forces".into())
+    })?;
     repulsive_force(coords, species, &sk_dir, &mut out.repulsive)?;
 
     // Sum components.
     for i in 0..n_atoms {
         for c in 0..3 {
-            out.forces[i][c] = out.non_scc[i][c]
-                + out.scc_shift[i][c]
-                + out.scc_dc[i][c]
-                + out.repulsive[i][c];
+            out.forces[i][c] =
+                out.non_scc[i][c] + out.scc_shift[i][c] + out.scc_dc[i][c] + out.repulsive[i][c];
         }
     }
 
@@ -1408,16 +1528,24 @@ pub fn compute_forces_from_dw(
     if dm.nrows() != ctx.n_orbs || dm.ncols() != ctx.n_orbs {
         return Err(DftbError::InvalidInput(format!(
             "compute_forces_from_dw: D is {}×{}, ctx.n_orbs={}",
-            dm.nrows(), dm.ncols(), ctx.n_orbs
+            dm.nrows(),
+            dm.ncols(),
+            ctx.n_orbs
         )));
     }
     if edm.nrows() != ctx.n_orbs || edm.ncols() != ctx.n_orbs {
         return Err(DftbError::InvalidInput(format!(
             "compute_forces_from_dw: W is {}×{}, ctx.n_orbs={}",
-            edm.nrows(), edm.ncols(), ctx.n_orbs
+            edm.nrows(),
+            edm.ncols(),
+            ctx.n_orbs
         )));
     }
-    let cutoff = sk.pairs.values().map(|t| t.cutoff()).fold(0.0_f64, f64::max);
+    let cutoff = sk
+        .pairs
+        .values()
+        .map(|t| t.cutoff())
+        .fold(0.0_f64, f64::max);
     let neigh = NeighborBuilder { cutoff }.build(coords)?;
     let mut out = Forces::zeros(n_atoms);
     non_scc_electronic_force(&ctx, &neigh, coords, dm, edm, &mut out.non_scc)?;
@@ -1425,7 +1553,13 @@ pub fn compute_forces_from_dw(
     let delta_q: Vec<f64> = q.iter().zip(q0.iter()).map(|(qi, q0i)| qi - q0i).collect();
     let shifts = compute_atom_shifts(coords, &ctx.atom_species, &delta_q, &gamma_tbl);
     scc_shift_force(&ctx, &neigh, coords, dm, &shifts, &mut out.scc_shift)?;
-    scc_double_counting_force(coords, &ctx.atom_species, &delta_q, &gamma_tbl, &mut out.scc_dc);
+    scc_double_counting_force(
+        coords,
+        &ctx.atom_species,
+        &delta_q,
+        &gamma_tbl,
+        &mut out.scc_dc,
+    );
     let mut names: Vec<String> = Vec::new();
     for s in species {
         if !names.iter().any(|n| n == s) {
@@ -1449,7 +1583,8 @@ pub fn compute_forces_from_dw(
     repulsive_force_cached(coords, &ctx, &repulsive, &mut out.repulsive)?;
     for i in 0..n_atoms {
         for c in 0..3 {
-            out.forces[i][c] = out.non_scc[i][c] + out.scc_shift[i][c] + out.scc_dc[i][c] + out.repulsive[i][c];
+            out.forces[i][c] =
+                out.non_scc[i][c] + out.scc_shift[i][c] + out.scc_dc[i][c] + out.repulsive[i][c];
         }
     }
     check_finite(&out.forces, "forces_from_dw total");
@@ -1458,14 +1593,19 @@ pub fn compute_forces_from_dw(
 }
 
 /// Diagonalize H_scc·c = E·S·c (used to recover eigenvectors for the EDM).
-fn diagonalize_h_scc(h_scc: &DMatrix<f64>, s: &DMatrix<f64>) -> Result<(DMatrix<f64>, DVector<f64>)> {
+fn diagonalize_h_scc(
+    h_scc: &DMatrix<f64>,
+    s: &DMatrix<f64>,
+) -> Result<(DMatrix<f64>, DVector<f64>)> {
     let n = h_scc.nrows();
     let cholesky = Cholesky::new(s.clone())
         .ok_or_else(|| DftbError::InvalidInput("Overlap not positive definite".into()))?;
     let l = cholesky.l();
-    let m = l.solve_lower_triangular(h_scc)
+    let m = l
+        .solve_lower_triangular(h_scc)
         .ok_or_else(|| DftbError::InvalidInput("L·M = H solve failed".into()))?;
-    let n_mat = l.solve_lower_triangular(&m.transpose())
+    let n_mat = l
+        .solve_lower_triangular(&m.transpose())
         .ok_or_else(|| DftbError::InvalidInput("L·N = Mᵀ solve failed".into()))?;
     let h_prime = n_mat.transpose();
     let se = SymmetricEigen::new(h_prime);
@@ -1475,7 +1615,8 @@ fn diagonalize_h_scc(h_scc: &DMatrix<f64>, s: &DMatrix<f64>) -> Result<(DMatrix<
     idx.sort_by(|&a, &b| eigs[a].partial_cmp(&eigs[b]).unwrap());
     let sorted_eigs: Vec<f64> = idx.iter().map(|&i| eigs[i]).collect();
     let sorted_c_prime = c_prime.select_columns(&idx);
-    let c = l.tr_solve_lower_triangular(&sorted_c_prime)
+    let c = l
+        .tr_solve_lower_triangular(&sorted_c_prime)
         .ok_or_else(|| DftbError::InvalidInput("Lᵀ·c = c' solve failed".into()))?;
     Ok((c, DVector::from(sorted_eigs)))
 }
@@ -1492,7 +1633,9 @@ fn compute_atom_shifts(
     for i in 0..n {
         out[i] = gamma_tbl.u(species[i]) * delta_q[i];
         for j in 0..n {
-            if i == j { continue; }
+            if i == j {
+                continue;
+            }
             let dx = coords[i][0] - coords[j][0];
             let dy = coords[i][1] - coords[j][1];
             let dz = coords[i][2] - coords[j][2];
@@ -1512,7 +1655,10 @@ fn compute_atom_shifts(
 /// Hartree/Ångström because the finite-difference step is in Ångström.
 /// Conversion: F_bohr = F_ang * BOHR2ANG.
 pub fn forces_hartree_ang_to_bohr(forces: &[[f64; 3]]) -> Vec<[f64; 3]> {
-    forces.iter().map(|f| [f[0] * BOHR2ANG, f[1] * BOHR2ANG, f[2] * BOHR2ANG]).collect()
+    forces
+        .iter()
+        .map(|f| [f[0] * BOHR2ANG, f[1] * BOHR2ANG, f[2] * BOHR2ANG])
+        .collect()
 }
 
 #[cfg(test)]
@@ -1533,7 +1679,10 @@ mod tests {
         let g = gamma_prime_full(r, 0.5, 0.5);
         let coulomb = -1.0 / (r * r);
         let diff = (g - coulomb).abs();
-        assert!(diff < 1e-6, "gamma_prime(large R) should be ~-1/R^2 = {coulomb}, got {g}, diff {diff}");
+        assert!(
+            diff < 1e-6,
+            "gamma_prime(large R) should be ~-1/R^2 = {coulomb}, got {g}, diff {diff}"
+        );
     }
 
     #[test]
@@ -1548,7 +1697,10 @@ mod tests {
         let num = (g_plus - g_minus) / (2.0 * h);
         let ana = gamma_prime_full(r, u1, u2);
         let diff = (num - ana).abs();
-        assert!(diff < 1e-6, "gamma_prime analytical {ana} vs numerical {num}, diff {diff}");
+        assert!(
+            diff < 1e-6,
+            "gamma_prime analytical {ana} vs numerical {num}, diff {diff}"
+        );
     }
 
     #[test]
@@ -1565,8 +1717,14 @@ mod tests {
         let (e, de) = spline.eval(r);
         let expected_e = (-3.0 * r + 1.0).exp() + 0.5;
         let expected_de = -3.0 * (-3.0 * r + 1.0).exp();
-        assert!((e - expected_e).abs() < 1e-12, "E = {e}, expected {expected_e}");
-        assert!((de - expected_de).abs() < 1e-12, "dE = {de}, expected {expected_de}");
+        assert!(
+            (e - expected_e).abs() < 1e-12,
+            "E = {e}, expected {expected_e}"
+        );
+        assert!(
+            (de - expected_de).abs() < 1e-12,
+            "dE = {de}, expected {expected_de}"
+        );
     }
 
     #[test]
@@ -1618,10 +1776,12 @@ mod tests {
                 let tail = if r > r_max - 1.0 {
                     let t = (r_max - r) / 1.0;
                     t * t
-                } else { 1.0 };
+                } else {
+                    1.0
+                };
                 let v = -0.3 * (-1.0 * r).exp() * tail;
                 let mut row = vec![0.0f64; 20];
-                row[19] = v;  // ss integral (sk_map(0,0,0)=20 → index 19)
+                row[19] = v; // ss integral (sk_map(0,0,0)=20 → index 19)
                 row
             })
             .collect();
@@ -1638,12 +1798,15 @@ mod tests {
         pairs.insert(("H".to_string(), "H".to_string()), hh_table);
 
         let mut onsite = HashMap::new();
-        onsite.insert("H".to_string(), AtomicParamsSp {
-            e_s: -0.4,  // Onsite energy (Hartree)
-            e_p: 0.0,
-            q0: 1.0,    // 1 electron
-            u_hubbard: 0.5,
-        });
+        onsite.insert(
+            "H".to_string(),
+            AtomicParamsSp {
+                e_s: -0.4, // Onsite energy (Hartree)
+                e_p: 0.0,
+                q0: 1.0, // 1 electron
+                u_hubbard: 0.5,
+            },
+        );
 
         let mut orbital_info = HashMap::new();
         orbital_info.insert("H".to_string(), SpeciesOrbitals::from_ang_momenta(&[0]));
@@ -1684,7 +1847,10 @@ mod tests {
 
         // Compute analytic non-SCC electronic force
         let ctx = SystemContext::from_sk_data(&builder.sk, &species).unwrap();
-        let cutoff = builder.sk.pairs.values()
+        let cutoff = builder
+            .sk
+            .pairs
+            .values()
             .map(|t| t.cutoff())
             .fold(0.0_f64, f64::max);
         let neigh = NeighborBuilder { cutoff }.build(&coords).unwrap();
@@ -1709,8 +1875,12 @@ mod tests {
                 coords_plus[atom][dir] += delta;
                 coords_minus[atom][dir] -= delta;
 
-                let e_plus = non_scc_electronic_energy(&builder, &species, &coords_plus, n_electrons).unwrap();
-                let e_minus = non_scc_electronic_energy(&builder, &species, &coords_minus, n_electrons).unwrap();
+                let e_plus =
+                    non_scc_electronic_energy(&builder, &species, &coords_plus, n_electrons)
+                        .unwrap();
+                let e_minus =
+                    non_scc_electronic_energy(&builder, &species, &coords_minus, n_electrons)
+                        .unwrap();
 
                 // F = -dE/dR ≈ -(E+ - E-) / (2*delta)
                 let fd_force = -(e_plus - e_minus) / (2.0 * delta);
@@ -1725,7 +1895,11 @@ mod tests {
         }
         // Relative tolerance: the force should match FD to ~1e-4 relative
         // (limited by FD step size and numerical roundoff in diagonalization).
-        let rel_err = if max_force > 1e-10 { max_err / max_force } else { max_err };
+        let rel_err = if max_force > 1e-10 {
+            max_err / max_force
+        } else {
+            max_err
+        };
         eprintln!("max|F|={max_force:.3e}  max|err|={max_err:.3e}  rel_err={rel_err:.3e}");
         assert!(rel_err < 1e-4,
             "analytic force vs energy FD: rel_err={rel_err:.3e} too large (max|F|={max_force:.3e}, max|err|={max_err:.3e})");
@@ -1742,11 +1916,14 @@ mod tests {
         // Tilted bond: not aligned with any axis
         let coords = vec![
             [0.0, 0.0, 0.0],
-            [0.5, 0.6, 0.7],  // ~1.05 Å bond length
+            [0.5, 0.6, 0.7], // ~1.05 Å bond length
         ];
 
         let ctx = SystemContext::from_sk_data(&builder.sk, &species).unwrap();
-        let cutoff = builder.sk.pairs.values()
+        let cutoff = builder
+            .sk
+            .pairs
+            .values()
             .map(|t| t.cutoff())
             .fold(0.0_f64, f64::max);
         let neigh = NeighborBuilder { cutoff }.build(&coords).unwrap();
@@ -1770,8 +1947,12 @@ mod tests {
                 coords_plus[atom][dir] += delta;
                 coords_minus[atom][dir] -= delta;
 
-                let e_plus = non_scc_electronic_energy(&builder, &species, &coords_plus, n_electrons).unwrap();
-                let e_minus = non_scc_electronic_energy(&builder, &species, &coords_minus, n_electrons).unwrap();
+                let e_plus =
+                    non_scc_electronic_energy(&builder, &species, &coords_plus, n_electrons)
+                        .unwrap();
+                let e_minus =
+                    non_scc_electronic_energy(&builder, &species, &coords_minus, n_electrons)
+                        .unwrap();
 
                 let fd_force = -(e_plus - e_minus) / (2.0 * delta);
                 let analytic_force = forces[atom][dir];
@@ -1780,10 +1961,16 @@ mod tests {
                 max_force = max_force.max(analytic_force.abs());
             }
         }
-        let rel_err = if max_force > 1e-10 { max_err / max_force } else { max_err };
+        let rel_err = if max_force > 1e-10 {
+            max_err / max_force
+        } else {
+            max_err
+        };
         eprintln!("tilted: max|F|={max_force:.3e}  max|err|={max_err:.3e}  rel_err={rel_err:.3e}");
-        assert!(rel_err < 1e-4,
-            "analytic force vs energy FD (tilted): rel_err={rel_err:.3e} too large");
+        assert!(
+            rel_err < 1e-4,
+            "analytic force vs energy FD (tilted): rel_err={rel_err:.3e} too large"
+        );
     }
 
     /// Synthetic 4-orbital (sp) species for a multi-atom test.
@@ -1804,13 +1991,15 @@ mod tests {
                     let tail = if r > r_max - 1.0 {
                         let t = (r_max - r) / 1.0;
                         t * t
-                    } else { 1.0 };
+                    } else {
+                        1.0
+                    };
                     let base = amp * (-decay * r).exp() * tail;
                     let mut row = vec![0.0f64; 20];
-                    row[19] = base;           // ss
-                    row[18] = 0.8 * base;     // sp
-                    row[14] = 0.6 * base;     // pp_sigma
-                    row[15] = 0.3 * base;     // pp_pi
+                    row[19] = base; // ss
+                    row[18] = 0.8 * base; // sp
+                    row[14] = 0.6 * base; // pp_sigma
+                    row[15] = 0.3 * base; // pp_pi
                     row
                 })
                 .collect()
@@ -1829,17 +2018,24 @@ mod tests {
         pairs.insert(("X".to_string(), "X".to_string()), xx_table);
 
         let mut onsite = HashMap::new();
-        onsite.insert("X".to_string(), AtomicParamsSp {
-            e_s: -0.5,
-            e_p: -0.1,
-            q0: 4.0,    // 4 valence electrons
-            u_hubbard: 0.5,
-        });
+        onsite.insert(
+            "X".to_string(),
+            AtomicParamsSp {
+                e_s: -0.5,
+                e_p: -0.1,
+                q0: 4.0, // 4 valence electrons
+                u_hubbard: 0.5,
+            },
+        );
 
         let mut orbital_info = HashMap::new();
         orbital_info.insert("X".to_string(), SpeciesOrbitals::from_ang_momenta(&[0, 1]));
 
-        SkData { onsite, pairs, orbital_info }
+        SkData {
+            onsite,
+            pairs,
+            orbital_info,
+        }
     }
 
     #[test]
@@ -1854,13 +2050,13 @@ mod tests {
         let n_electrons = 8.0; // 2 atoms × 4 electrons
 
         // Tilted bond to exercise all 3 directions
-        let coords = vec![
-            [0.0, 0.0, 0.0],
-            [1.3, 0.4, 0.2],
-        ];
+        let coords = vec![[0.0, 0.0, 0.0], [1.3, 0.4, 0.2]];
 
         let ctx = SystemContext::from_sk_data(&builder.sk, &species).unwrap();
-        let cutoff = builder.sk.pairs.values()
+        let cutoff = builder
+            .sk
+            .pairs
+            .values()
             .map(|t| t.cutoff())
             .fold(0.0_f64, f64::max);
         let neigh = NeighborBuilder { cutoff }.build(&coords).unwrap();
@@ -1884,8 +2080,12 @@ mod tests {
                 coords_plus[atom][dir] += delta;
                 coords_minus[atom][dir] -= delta;
 
-                let e_plus = non_scc_electronic_energy(&builder, &species, &coords_plus, n_electrons).unwrap();
-                let e_minus = non_scc_electronic_energy(&builder, &species, &coords_minus, n_electrons).unwrap();
+                let e_plus =
+                    non_scc_electronic_energy(&builder, &species, &coords_plus, n_electrons)
+                        .unwrap();
+                let e_minus =
+                    non_scc_electronic_energy(&builder, &species, &coords_minus, n_electrons)
+                        .unwrap();
 
                 let fd_force = -(e_plus - e_minus) / (2.0 * delta);
                 let analytic_force = forces[atom][dir];
@@ -1896,7 +2096,11 @@ mod tests {
                 eprintln!("atom {atom} dir {dir}: analytic={analytic_force:.6e} fd={fd_force:.6e} err={err:.3e}");
             }
         }
-        let rel_err = if max_force > 1e-10 { max_err / max_force } else { max_err };
+        let rel_err = if max_force > 1e-10 {
+            max_err / max_force
+        } else {
+            max_err
+        };
         eprintln!("sp3: max|F|={max_force:.3e}  max|err|={max_err:.3e}  rel_err={rel_err:.3e}");
         assert!(rel_err < 1e-4,
             "analytic force vs energy FD (sp3): rel_err={rel_err:.3e} too large (max|F|={max_force:.3e}, max|err|={max_err:.3e})");

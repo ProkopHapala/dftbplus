@@ -53,7 +53,10 @@ fn extract_replica(flat: &[f32], r: usize, n: usize) -> DMatrix<f64> {
 /// Max abs diff between two same-shaped matrices.
 fn max_abs_diff(a: &DMatrix<f64>, b: &DMatrix<f64>) -> f64 {
     assert_eq!(a.shape(), b.shape());
-    a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()).fold(0.0, f64::max)
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0, f64::max)
 }
 
 // ==================================================================
@@ -62,7 +65,9 @@ fn max_abs_diff(a: &DMatrix<f64>, b: &DMatrix<f64>) -> f64 {
 
 #[test]
 fn test_gpu_assemble_pairs_smoke() {
-    let Some(_driver) = try_gpu() else { return; };
+    let Some(_driver) = try_gpu() else {
+        return;
+    };
     let driver = _driver;
     let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else {
         eprintln!("Skipping: RUST_DFTB_SK_DIR not set");
@@ -90,8 +95,18 @@ fn test_gpu_assemble_pairs_smoke() {
     assert!(h[0].abs() > 1e-6, "H[0,0] suspiciously small: {}", h[0]);
     assert!(h[3].abs() > 1e-6, "H[1,1] suspiciously small: {}", h[3]);
     // Off-diagonal should be symmetric
-    assert!((h[1] - h[2]).abs() < 1e-6, "H not symmetric: {} vs {}", h[1], h[2]);
-    assert!((s[1] - s[2]).abs() < 1e-6, "S not symmetric: {} vs {}", s[1], s[2]);
+    assert!(
+        (h[1] - h[2]).abs() < 1e-6,
+        "H not symmetric: {} vs {}",
+        h[1],
+        h[2]
+    );
+    assert!(
+        (s[1] - s[2]).abs() < 1e-6,
+        "S not symmetric: {} vs {}",
+        s[1],
+        s[2]
+    );
 
     eprintln!("smoke OK: H2 H = {:?}", h);
     eprintln!("smoke OK: H2 S = {:?}", s);
@@ -103,7 +118,9 @@ fn test_gpu_assemble_pairs_smoke() {
 
 #[test]
 fn test_gpu_hs_parity_h2() {
-    let Some(_driver) = try_gpu() else { return; };
+    let Some(_driver) = try_gpu() else {
+        return;
+    };
     let driver = _driver;
     let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else {
         eprintln!("Skipping: RUST_DFTB_SK_DIR not set");
@@ -136,8 +153,18 @@ fn test_gpu_hs_parity_h2() {
     // Tolerance 1e-5: GPU f32 + original grid (499 pts) with B-spline control
     // point conversion. Off-by-one grid convention fixed 2026-09-06.
     // Achieved: ~1e-8 for H2 (s-only).
-    assert!(dh < 1e-5, "H2 H parity failed: max|dH| = {dh:e}\nCPU:\n{}\nGPU:\n{}", ham_cpu.h0, h_gpu);
-    assert!(ds < 1e-5, "H2 S parity failed: max|dS| = {ds:e}\nCPU:\n{}\nGPU:\n{}", ham_cpu.s, s_gpu);
+    assert!(
+        dh < 1e-5,
+        "H2 H parity failed: max|dH| = {dh:e}\nCPU:\n{}\nGPU:\n{}",
+        ham_cpu.h0,
+        h_gpu
+    );
+    assert!(
+        ds < 1e-5,
+        "H2 S parity failed: max|dS| = {ds:e}\nCPU:\n{}\nGPU:\n{}",
+        ham_cpu.s,
+        s_gpu
+    );
 }
 
 // ==================================================================
@@ -146,7 +173,9 @@ fn test_gpu_hs_parity_h2() {
 
 #[test]
 fn test_gpu_hs_parity_n2() {
-    let Some(_driver) = try_gpu() else { return; };
+    let Some(_driver) = try_gpu() else {
+        return;
+    };
     let driver = _driver;
     let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else {
         eprintln!("Skipping: RUST_DFTB_SK_DIR not set");
@@ -178,8 +207,18 @@ fn test_gpu_hs_parity_n2() {
     eprintln!("N2 parity: max|dH| = {dh:e}, max|dS| = {ds:e}");
     // Tolerance 1e-5: GPU f32 + original grid with B-spline control points.
     // Achieved: ~1e-7 for N2 (sp-sp, 4-channel).
-    assert!(dh < 1e-5, "N2 H parity failed: max|dH| = {dh:e}\nCPU:\n{}\nGPU:\n{}", ham_cpu.h0, h_gpu);
-    assert!(ds < 1e-5, "N2 S parity failed: max|dS| = {ds:e}\nCPU:\n{}\nGPU:\n{}", ham_cpu.s, s_gpu);
+    assert!(
+        dh < 1e-5,
+        "N2 H parity failed: max|dH| = {dh:e}\nCPU:\n{}\nGPU:\n{}",
+        ham_cpu.h0,
+        h_gpu
+    );
+    assert!(
+        ds < 1e-5,
+        "N2 S parity failed: max|dS| = {ds:e}\nCPU:\n{}\nGPU:\n{}",
+        ham_cpu.s,
+        s_gpu
+    );
 }
 
 // ==================================================================
@@ -188,7 +227,9 @@ fn test_gpu_hs_parity_n2() {
 
 #[test]
 fn test_gpu_multi_replica() {
-    let Some(_driver) = try_gpu() else { return; };
+    let Some(_driver) = try_gpu() else {
+        return;
+    };
     let driver = _driver;
     let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else {
         eprintln!("Skipping: RUST_DFTB_SK_DIR not set");
@@ -235,8 +276,16 @@ fn test_gpu_multi_replica() {
         }
     }
 
-    eprintln!("multi-replica worst: replica {worst_idx}, max|dH|={worst_dh:e}, max|dS|={worst_ds:e}");
+    eprintln!(
+        "multi-replica worst: replica {worst_idx}, max|dH|={worst_dh:e}, max|dS|={worst_ds:e}"
+    );
     // Tolerance 1e-5: GPU f32 + original grid with B-spline control points.
-    assert!(worst_dh < 1e-5, "multi-replica H parity failed: max|dH| = {worst_dh:e}");
-    assert!(worst_ds < 1e-5, "multi-replica S parity failed: max|dS| = {worst_ds:e}");
+    assert!(
+        worst_dh < 1e-5,
+        "multi-replica H parity failed: max|dH| = {worst_dh:e}"
+    );
+    assert!(
+        worst_ds < 1e-5,
+        "multi-replica S parity failed: max|dS| = {worst_ds:e}"
+    );
 }

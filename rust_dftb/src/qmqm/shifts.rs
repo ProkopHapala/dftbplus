@@ -98,7 +98,11 @@ mod tests {
         let gamma = GammaTable::from_hubbard_u(vec![0.5]);
         let mut out = vec![0.0];
         compute_intra_shifts(&coords, &species, &delta_q, &gamma, &mut out);
-        assert!((out[0] - 0.1).abs() < 1e-12, "self shift = U·dq = 0.5·0.2 = 0.1, got {}", out[0]);
+        assert!(
+            (out[0] - 0.1).abs() < 1e-12,
+            "self shift = U·dq = 0.5·0.2 = 0.1, got {}",
+            out[0]
+        );
     }
 
     #[test]

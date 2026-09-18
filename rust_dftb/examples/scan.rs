@@ -17,16 +17,13 @@
 //!       --from 80 --to 120 --n 20
 
 use rust_dftb::methods::dftb::forces::{parse_repulsive_spline, RepulsiveSpline};
-use rust_dftb::{
-    load_sk_for_species, parse_xyz, DftbOutput, HamiltonianBuilder, SccResult,
-};
+use rust_dftb::{load_sk_for_species, parse_xyz, DftbOutput, HamiltonianBuilder, SccResult};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 
-const DEFAULT_SK_DIR: &str =
-    "/home/prokophapala/git_SW/dftbplus/external/slakos/origin/mio-1-1";
+const DEFAULT_SK_DIR: &str = "/home/prokophapala/git_SW/dftbplus/external/slakos/origin/mio-1-1";
 
 const ANG2BOHR: f64 = 1.889_726_133;
 const MIN_NEIGH_DIST: f64 = 1.0e-2;
@@ -191,21 +188,12 @@ fn save_replica_data(dir: &Path, pt: &ScanPoint, e_rep: f64, e_total: f64) -> st
     }
 
     // Matrices in DFTB+ square format.
-    DftbOutput::write_square(
-        rep_dir.join("h0.dat").to_str().unwrap(),
-        &pt.scc.h0,
-    )
-    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-    DftbOutput::write_square(
-        rep_dir.join("h_scc.dat").to_str().unwrap(),
-        &pt.scc.h_scc,
-    )
-    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-    DftbOutput::write_square(
-        rep_dir.join("s.dat").to_str().unwrap(),
-        &pt.scc.s,
-    )
-    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+    DftbOutput::write_square(rep_dir.join("h0.dat").to_str().unwrap(), &pt.scc.h0)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+    DftbOutput::write_square(rep_dir.join("h_scc.dat").to_str().unwrap(), &pt.scc.h_scc)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+    DftbOutput::write_square(rep_dir.join("s.dat").to_str().unwrap(), &pt.scc.s)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
     DftbOutput::write_square(
         rep_dir.join("density.dat").to_str().unwrap(),
         &pt.scc.density,
@@ -228,8 +216,15 @@ fn save_replica_data(dir: &Path, pt: &ScanPoint, e_rep: f64, e_total: f64) -> st
 
     // energy.txt
     let mut f = File::create(rep_dir.join("energy.txt"))?;
-    writeln!(f, "# electronic_scc_energy repulsive_energy total_energy n_iter")?;
-    writeln!(f, "{:.16e} {:.16e} {:.16e} {}", pt.scc.energy, e_rep, e_total, pt.scc.n_iter)?;
+    writeln!(
+        f,
+        "# electronic_scc_energy repulsive_energy total_energy n_iter"
+    )?;
+    writeln!(
+        f,
+        "{:.16e} {:.16e} {:.16e} {}",
+        pt.scc.energy, e_rep, e_total, pt.scc.n_iter
+    )?;
 
     Ok(())
 }
@@ -246,8 +241,21 @@ struct ScanArgs {
 }
 
 enum ScanMode {
-    Bond { i: usize, j: usize, from: f64, to: f64, n: usize },
-    Angle { i: usize, j: usize, k: usize, from: f64, to: f64, n: usize },
+    Bond {
+        i: usize,
+        j: usize,
+        from: f64,
+        to: f64,
+        n: usize,
+    },
+    Angle {
+        i: usize,
+        j: usize,
+        k: usize,
+        from: f64,
+        to: f64,
+        n: usize,
+    },
 }
 
 fn parse_usize(v: &str, flag: &str) -> usize {
@@ -277,14 +285,38 @@ fn parse_args() -> ScanArgs {
     while k < args.len() {
         let a = args[k].as_str();
         match a {
-            "--xyz" => { xyz = Some(args[k + 1].clone()); k += 2; }
-            "--out" => { out = Some(args[k + 1].clone()); k += 2; }
-            "--data-dir" => { data_dir = Some(args[k + 1].clone()); k += 2; }
-            "--max-iter" => { max_iter = Some(parse_usize(&args[k + 1], "--max-iter")); k += 2; }
-            "--tol" => { tol = Some(parse_f64(&args[k + 1], "--tol")); k += 2; }
-            "--n" => { n = Some(parse_usize(&args[k + 1], "--n")); k += 2; }
-            "--from" => { from = Some(parse_f64(&args[k + 1], "--from")); k += 2; }
-            "--to" => { to = Some(parse_f64(&args[k + 1], "--to")); k += 2; }
+            "--xyz" => {
+                xyz = Some(args[k + 1].clone());
+                k += 2;
+            }
+            "--out" => {
+                out = Some(args[k + 1].clone());
+                k += 2;
+            }
+            "--data-dir" => {
+                data_dir = Some(args[k + 1].clone());
+                k += 2;
+            }
+            "--max-iter" => {
+                max_iter = Some(parse_usize(&args[k + 1], "--max-iter"));
+                k += 2;
+            }
+            "--tol" => {
+                tol = Some(parse_f64(&args[k + 1], "--tol"));
+                k += 2;
+            }
+            "--n" => {
+                n = Some(parse_usize(&args[k + 1], "--n"));
+                k += 2;
+            }
+            "--from" => {
+                from = Some(parse_f64(&args[k + 1], "--from"));
+                k += 2;
+            }
+            "--to" => {
+                to = Some(parse_f64(&args[k + 1], "--to"));
+                k += 2;
+            }
             "--bond" => {
                 let i = parse_usize(&args[k + 1], "--bond i");
                 let j = parse_usize(&args[k + 2], "--bond j");
@@ -298,7 +330,10 @@ fn parse_args() -> ScanArgs {
                 angle = Some((i, j, kk));
                 k += 4;
             }
-            other => { eprintln!("warning: ignoring unknown arg {other}"); k += 1; }
+            other => {
+                eprintln!("warning: ignoring unknown arg {other}");
+                k += 1;
+            }
         }
     }
 
@@ -309,7 +344,14 @@ fn parse_args() -> ScanArgs {
     let mode = if let Some((i, j)) = bond {
         ScanMode::Bond { i, j, from, to, n }
     } else if let Some((i, j, kk)) = angle {
-        ScanMode::Angle { i, j, k: kk, from, to, n }
+        ScanMode::Angle {
+            i,
+            j,
+            k: kk,
+            from,
+            to,
+            n,
+        }
     } else {
         panic!("either --bond <i> <j> or --angle <i> <j> <k> is required (with --from/--to/--n)");
     };
@@ -334,8 +376,13 @@ fn main() {
         DEFAULT_SK_DIR.to_string()
     });
 
-    let mol = parse_xyz(&args.xyz).unwrap_or_else(|e| panic!("failed to parse XYZ {}: {e}", args.xyz));
-    eprintln!("[scan] loaded {} atoms from {}", mol.species.len(), args.xyz);
+    let mol =
+        parse_xyz(&args.xyz).unwrap_or_else(|e| panic!("failed to parse XYZ {}: {e}", args.xyz));
+    eprintln!(
+        "[scan] loaded {} atoms from {}",
+        mol.species.len(),
+        args.xyz
+    );
 
     let sk = load_sk_for_species(&sk_dir, &mol.species)
         .unwrap_or_else(|e| panic!("failed to load SK from {sk_dir}: {e}"));
@@ -358,7 +405,11 @@ fn main() {
     let mut curve: Vec<(usize, f64, f64, usize)> = Vec::with_capacity(n_points); // idx, coord, energy, n_iter
 
     for p in 0..n_points {
-        let t = if n_points > 1 { p as f64 / (n_points - 1) as f64 } else { 0.0 };
+        let t = if n_points > 1 {
+            p as f64 / (n_points - 1) as f64
+        } else {
+            0.0
+        };
         let mut coords = mol.coords.clone();
         let coord_value = match &args.mode {
             ScanMode::Bond { i, j, from, to, .. } => {
@@ -366,7 +417,9 @@ fn main() {
                 set_bond_length(&mut coords, *i, *j, r);
                 r
             }
-            ScanMode::Angle { i, j, k, from, to, .. } => {
+            ScanMode::Angle {
+                i, j, k, from, to, ..
+            } => {
                 let th = from + (to - from) * t;
                 set_bond_angle(&mut coords, *i, *j, *k, th);
                 th
@@ -399,15 +452,23 @@ fn main() {
     }
 
     // Write energy curve CSV.
-    let mut f = File::create(&args.out)
-        .unwrap_or_else(|e| panic!("cannot create {}: {e}", args.out));
+    let mut f =
+        File::create(&args.out).unwrap_or_else(|e| panic!("cannot create {}: {e}", args.out));
     writeln!(f, "# scan energy curve").unwrap();
-    writeln!(f, "# coord_label={coord_label} unit={unit} n_points={n_points}").unwrap();
+    writeln!(
+        f,
+        "# coord_label={coord_label} unit={unit} n_points={n_points}"
+    )
+    .unwrap();
     writeln!(f, "index,coord,energy_hartree,n_iter").unwrap();
     for (p, cv, e, ni) in &curve {
         writeln!(f, "{p},{cv:.10},{e:.16e},{ni}").unwrap();
     }
-    eprintln!("[scan] wrote energy curve to {} ({} points)", args.out, curve.len());
+    eprintln!(
+        "[scan] wrote energy curve to {} ({} points)",
+        args.out,
+        curve.len()
+    );
 
     // Report minimum.
     let (min_p, min_cv, min_e, _) = curve

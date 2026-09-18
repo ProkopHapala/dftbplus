@@ -2993,3 +2993,169 @@ Do not develop every branch speculatively. Change one structural feature, remeas
 - [ ] Batch independent ±h states sharing topology/plans, with independent q/Z/K/scratch/status. Choose batch size from measured memory/occupancy; output must not depend on batch order. Include failures/retries and amortize setup over the real workload.
 
 **Agent handoff:** source changes, unfiltered diagnostics under `debug/`, accepted/rejected settings with actual values, wall-time impact and remaining uncertainty. Update this report and the roadmap when implementation status changes. No completion claim without user acceptance.
+
+#### F — Device residency contract + batched column launches (2026-09-18)
+
+Measured motivation (R18 frozen, RTX 3090): the GPU pair path evaluates
+~0.5–1 GFLOP of pair work per displaced eval — **~30 µs at peak** — yet
+took ~11 ms. The gap is not kernel throughput, it is per-eval PCIe
+traffic and host work. **Residency is a hard contract, not an
+optimization:** no buffer that is derivable on device may cross PCIe
+inside a force/Hessian eval. Residual per-eval host traffic is capped at
+O(n_atom) scalars/forces plus explicitly justified diagnostics.
+
+Residency leaks found (fixed 2026-09-18, see report §15.25):
+
+- [x] `restore_central_state` uploaded `s.k` (M_K ≈ 26 MB) + `s.z` (26 MB)
+      host→device **every column** — data that had been downloaded to
+      host at snapshot time. → device-resident `GpuCentralState`
+      (`k/z/k0/w0` value-buffer copies taken once at snapshot) +
+      `copy_f32` device→device restore (~100 µs).
+- [x] `forces_frozen` uploaded `s.k` + `s.w0` (~52 MB) every eval →
+      `hs_contract` now consumes the snapshot buffers directly (zero
+      copies — the kernels only read them).
+- [x] `set_coords` GPU path read back `h0`/`s` value buffers (~25 MB)
+      every eval "for diagnostics" → mirrors now lazy:
+      `h_bsr()/s_bsr()` refresh on demand; hot path skips entirely.
+- [x] `snapshot_electronic_state` restored converged K via
+      `inject_k_values` host upload → `copy_f32` from the device copy.
+
+Remaining per-eval transfers (accepted, O(n_atom) or O(n_rep)): xyzu
+upload 4N f32, dq upload N, v/kdummy readback N, pe_rep readback n_rep,
+5×3N force readback. Coincident-atom guards stay host-side (O(n_pairs)
+compare, fail-loud; the same loops also feed the pair list audit).
+
+Next steps (in order):
+
+- [ ] **F1 — batched column launches.** The point of residency: launch
+      `hs_contract` once per *color class* of independent displacements
+      (atoms ≥ r_full apart can be displaced simultaneously without pair
+      overlap). Batched xyzu/dq/out buffers, one upload + one readback
+      per class → 8–32× more work in flight per launch; the only regime
+      where the 3090's throughput is actually engaged.
+- [ ] **F2 — column-local pair subranges.** Each column's H/S blocks and
+      force contributions touch only the ~deg_hs pairs of the displaced
+      atoms. Precompute per-atom pair sublists at init; pass subrange
+      offsets into the same kernels. Turns the all-pairs eval into
+      O(color_class·deg) work.
+- [ ] **F3 — fuse the frozen-eval launch chain.** Current eval =
+      hs_diag + hs_assemble + gamma_matvec + gamma_force + hs_contract +
+      rep_eval + force_gather ≈ 7 launches + ~6 syncs. Fuse the
+      dq-independent stages and merge readbacks into one mapping.
+- [ ] **F4 — pe_rep reduction on device** (n_rep readback → 1 float) and
+      skip `compute_v` host v in the pure-force path (v_buf already
+      device-resident; host v only needed for energies).
+- [ ] Re-benchmark R18 frozen after F1–F3; update §15.22 projection
+      table. Success metric: frozen eval ≲2 ms at N=1648 and Hessian
+      column time dominated by eigensolve, not forces.
+
+##### F.1 — Batched frozen-eval design study (2026-09-18, pre-implementation)
+
+Ground-truth facts verified in code before designing:
+
+- **`hs_contract` never reads `h0`/`s`.** It recomputes SK splines,
+  rotation, and analytic derivs from `xyzu` + `sk_*` tables per pair and
+  contracts directly against `k_vals`/`w_vals`/`v_atom`
+  (sparse_hs.cl:265–367). `assemble_hs_dev` — `geom.hs` ≈ 0.374 ms/eval,
+  ~23 % of the frozen eval — is **dead work in the frozen path**. The
+  only consumers of assembled H/S are the SCC/purify stages, which
+  frozen columns never run.
+- **Pair topology is static.** `hs_pairs` is built once at construction
+  (`hs_pairs_from_mask`); the Verlet-skin contract guarantees no pair
+  enters/leaves the cutoff within a ±h displacement. The per-geometry
+  O(n_pairs) host coincident-atom guard (~0.2–0.5 ms of the unprofiled
+  floor) is re-validation of a static list — hoistable to init or to a
+  device-side min-r² reduction while keeping the fail-loud semantics.
+- **The central electronic state is shared read-only.** Frozen mode
+  evaluates every displaced geometry against the *same* `k0`/`w0`/`dq₀`.
+  Per-replica state is therefore only geometry + outputs — no per-replica
+  K/W copies, no replica SCC machinery. This is what makes the batch
+  trivially parallel: replicas are independent gather problems over
+  shared inputs.
+- **Frozen force eval consumes:** `xyzu` (geom), `dq₀` (shared),
+  `v_atom` = γ·dq₀ at the displaced geometry (needed by the SCC force
+  term inside `hs_contract`, arg `v_atom`), `k0`/`w0` (shared),
+  repulsive pairs. Emits per-atom forces.
+- **Frozen force eval does NOT need:** `hs_diag`, `hs_assemble`,
+  `hs_kdummy`, `s_inf` reduce, H_scc build, K/Z restore (the live
+  buffers are untouched — contract reads `central_dev` directly; the
+  current `restore_central_state` call in the vib loop is hygiene for
+  the SCC modes, dead work in frozen mode worth auditing).
+
+Options considered:
+
+- **A. One mega-kernel tiled over systems — rejected.** The eval is
+  already a *sequence* of kernels with different work shapes (matvec,
+  pair-contract, n-body force, gather). Fusing systems inside each
+  kernel adds nothing over giving each kernel a replica axis — and
+  couples failure/timing of unrelated stages. Not needed.
+- **B. B independent workspaces, pipelined submissions — rejected.**
+  Zero kernel changes, but the per-eval host orchestration, syncs, and
+  guard loops stay serial; the ~0.7 ms floor is amortized only if the
+  queue never drains, which the current synchronous code structure
+  prevents. Also multiplies full workspaces (h0/s ≈ 26 MB/replica) for
+  buffers the frozen path doesn't even need.
+- **C. Replica axis on the existing 5 kernels — CHOSEN.** Extend each
+  frozen-path kernel's NDRange with `get_global_id(1) = b` (or flat
+  `p + b·npairs`); index per-replica buffers at `b·stride`; shared
+  inputs (`pairs`, `sk_*`, `dq₀`, `k0`, `w0`) read-only, unchanged.
+  Same math, same order, deterministic = bit-identical to sequential.
+  No atomics anywhere (each work-item still owns one output slot).
+- **D. Column-local ΔF evaluation — composes with C, phase F2.**
+  Displacing atom m changes force contributions only on pairs touching
+  m (~deg_hs ≈ 121 at R18) plus the γ′ row (j,m) for all j (O(N), since
+  F_j gets a changed term γ′_{jm}·dq_j·dq_m). Atoms outside the touched
+  set keep central-geometry forces: the eval can return
+  `F⁰ + ΔF` with ΔF computed on the touched set only — ~200k→~121
+  pair-contract items + one O(N) γ′ row per column. Per-atom pair
+  sublists already exist (`pair_gather_adj`); a batched local launch
+  iterates a concatenated touched-pair list with per-replica offsets.
+  ΔV similarly updates only via the (j,m) γ term — an O(N) row vs the
+  full O(N²) matvec.
+
+Memory budget at R18 (per replica): `xyzu` 4N·4 B = 26 KB,
+`v_atom` N·4 B = 6.6 KB, `pf` 2·n_pairs·16 B ≈ 6.4 MB (dominant),
+`pf_rep`+`pe_rep` ≈ n_rep·16 B ≈ 0.5 MB, `f_out` ~4N·4 B = 26 KB ⇒
+≈ **6.9 MB/replica** → B=8 ≈ 55 MB, B=16 ≈ 110 MB, B=32 ≈ 220 MB on a
+25 GB device. With F2 column-local, `pf` shrinks to the concatenated
+touched list (~deg·B) and replicas cost ~0.2 MB each — B limited by
+orchestration, not memory.
+
+Expected per-column cost at R18: F0 alone ~1.6→~1.0 ms (drop dead
+assemble + host guards); +F1 batch B≈8–16 → ~0.5–0.7 ms (floor
+amortized, kernels already near occupancy); +F2 → ~0.05–0.15 ms
+(launch-bound; needs bigger batches to feed the GPU). Caveat: the dense
+4944×4944 eigensolve (~100 s of the 138 s wall) then dominates — see
+report §15.26; batching matters most for N≥3k columns and for any future
+non-frozen (fixq) mode, where the T06 compact-domain pattern from the
+qmqm batched-SCC workstream is the model (replicas there DO need
+per-slot convergence state — deferred, not needed for frozen).
+
+Invariants (same as every GPU path here): gather-only, write-once
+outputs, zero atomics; persistent buffers allocated at init for
+`B_max` (env `RUST_DFTB_VIB_BATCH`, default 8 — B=1 must reduce to
+today's sequential semantics exactly); batch result must equal
+sequential column-by-column **bitwise** (same kernel math per replica);
+CPU reference path untouched; missing `central_dev` still fails loud.
+
+Phased plan + gates:
+
+- [ ] **F0 — frozen-path dead-work removal (no kernel changes).** Skip
+      `assemble_hs_dev`/mirror marking when the caller will only do
+      frozen forces (add a `set_coords_light`/mode arg — do NOT weaken
+      `set_coords`'s SCC contract); hoist the coincident-atom guard to a
+      device min-r² reduction over the static pair lists (fail-loud
+      unchanged); skip the `compute_v` host readback in the force-only
+      path. Gate: parity tests + R18 eval ≲1.0 ms.
+- [ ] **F1 — replica axis + `forces_frozen_batch`.** 2D NDRange on
+      gamma_matvec/gamma_force/hs_contract/rep_eval/force_gather;
+      batched `xyzu`/`v_atom`/`pf`/`pf_rep`/`f_out`; one upload + one
+      readback per batch; `B=1` ≡ sequential. Gate: batch-vs-sequential
+      force columns bitwise equal; R10/R18 bounded bench.
+- [ ] **F2 — column-local subranges.** Concatenated touched-pair list +
+      per-replica offsets from `pair_gather_adj`; O(N) γ′ row kernel and
+      ΔV row update; ΔF added to stored central F⁰ on device; readback
+      touched atoms only. Gate: identical Hessian columns vs F1 output
+      on a bounded column set.
+- [ ] **F3 — fuse + resync.** Merge launches sharing `xyzu[b]` reads;
+      single pe_rep device reduction. Re-benchmark; update report.

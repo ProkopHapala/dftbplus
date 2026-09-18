@@ -12,8 +12,11 @@ implementations of the same concept across Rust, Fortran, Python, and OpenCL.
   and H-passivated ribbons to N=1156. 7.5× faster than dense at N=1156.
   Optimizations: dense BLAS triangular solves, spectral rescaling, adaptive
   parameters.
-- **eigensolver_performance.md** — nalgebra Jacobi vs LAPACK dsyevd performance
-  analysis. Why nalgebra is 29× slower, remaining bottlenecks, optimization plan.
+- **eigensolver_performance.md** — eigensolver performance map. CPU: nalgebra
+  vs LAPACK dsyevd (why nalgebra is 29× slower). GPU: batched Jacobi variants
+  (Brent-Luk n≤64, streaming direct n≤256, resident-A+deferred-V n≲96,
+  block n>128) + `eigsolver_kind` dispatch; measured digest
+  `tasts/HBond_Relaxed_Scan_GPU/Measured_Facts_Jacobi_Sweeps.md`.
 - **sparse_tc2_purification.md** — BSR4 sparse density-matrix purification via
   TC2 on GPU. Rust + OpenCL vs Fortran dense reference.
 - **dftbplus_parity_harness.md** — Python harness running the Fortran DFTB+

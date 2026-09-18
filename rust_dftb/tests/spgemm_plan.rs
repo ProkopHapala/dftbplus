@@ -4,11 +4,9 @@
 //! results to the runtime-intersection kernel, and records plan statistics
 //! (terms, bytes, avg terms/block) as required by the manifest.
 
-use rust_dftb::methods::sparse::bsr4::{
-    build_geometric_mask, build_product_mask, Bsr4Matrix, BS,
-};
-use rust_dftb::methods::sparse::gpu_sparse::{SparseBsr4Gpu, GpuBsrMatrix};
 use rust_dftb::methods::sparse::bsr4::build_spgemm_plan_bsym;
+use rust_dftb::methods::sparse::bsr4::{build_geometric_mask, build_product_mask, Bsr4Matrix, BS};
+use rust_dftb::methods::sparse::gpu_sparse::{GpuBsrMatrix, SparseBsr4Gpu};
 use rust_dftb::methods::sparse::harness::require_sparse_gpu;
 use std::time::Instant;
 
@@ -88,7 +86,11 @@ fn test_spgemm_plan_bsym_parity_and_stats() {
     eprintln!("  |M_S|          = {} blocks", s_mask.1.len());
     eprintln!("  |M_T|          = {} blocks", t_mask.1.len());
     eprintln!("  plan terms     = {}", plan.nterms());
-    eprintln!("  plan bytes     = {} ({:.1} KiB)", plan.bytes(), plan.bytes() as f64 / 1024.0);
+    eprintln!(
+        "  plan bytes     = {} ({:.1} KiB)",
+        plan.bytes(),
+        plan.bytes() as f64 / 1024.0
+    );
     eprintln!("  avg terms/blk  = {:.2}", plan.avg_terms());
 
     // Upload A, B to device.
@@ -96,34 +98,38 @@ fn test_spgemm_plan_bsym_parity_and_stats() {
     let b_gpu = GpuBsrMatrix::from_host(&gpu, &b).unwrap();
 
     // C structure (on t_mask).
-    let c_struct = rust_dftb::methods::sparse::gpu_sparse::GpuBsrStructure::new(
-        &gpu, n_atom, &t_mask,
-    ).unwrap();
+    let c_struct =
+        rust_dftb::methods::sparse::gpu_sparse::GpuBsrStructure::new(&gpu, n_atom, &t_mask)
+            .unwrap();
     let c_struct = std::sync::Arc::new(c_struct);
 
     // --- Reference: runtime-intersection kernel (spgemm_bsym_dev) ---
-    let c_ref = rust_dftb::methods::sparse::gpu_sparse::GpuBsrMatrix::zero(
-        &gpu, &c_struct,
-    ).unwrap();
+    let c_ref =
+        rust_dftb::methods::sparse::gpu_sparse::GpuBsrMatrix::zero(&gpu, &c_struct).unwrap();
     gpu.spgemm_bsym_dev(&a_gpu, &b_gpu, &c_ref).unwrap();
     let c_ref_host = c_ref.to_host(&gpu).unwrap();
 
     // --- Plan kernel (spgemm_plan_bsym_dev) ---
     let plan_gpu = gpu.upload_plan(&plan).unwrap();
-    let c_plan = rust_dftb::methods::sparse::gpu_sparse::GpuBsrMatrix::zero(
-        &gpu, &c_struct,
-    ).unwrap();
-    gpu.spgemm_plan_bsym_dev(&a_gpu, &b_gpu, &plan_gpu, &c_plan).unwrap();
+    let c_plan =
+        rust_dftb::methods::sparse::gpu_sparse::GpuBsrMatrix::zero(&gpu, &c_struct).unwrap();
+    gpu.spgemm_plan_bsym_dev(&a_gpu, &b_gpu, &plan_gpu, &c_plan)
+        .unwrap();
     let c_plan_host = c_plan.to_host(&gpu).unwrap();
 
     // Parity: plan kernel must match intersection kernel exactly (same arithmetic).
-    let max_diff: f32 = c_ref_host.values.iter().zip(c_plan_host.values.iter())
+    let max_diff: f32 = c_ref_host
+        .values
+        .iter()
+        .zip(c_plan_host.values.iter())
         .map(|(a, b)| (a - b).abs())
         .fold(0.0f32, f32::max);
     eprintln!("\n=== Parity ===");
     eprintln!("  ||C_plan - C_intersection||_max = {max_diff:.3e}");
-    assert!(max_diff < 1e-6,
-        "P4 parity failed: plan kernel differs from intersection kernel by {max_diff:.3e}");
+    assert!(
+        max_diff < 1e-6,
+        "P4 parity failed: plan kernel differs from intersection kernel by {max_diff:.3e}"
+    );
     eprintln!("  PASS — plan kernel matches intersection kernel.");
 
     // --- Performance comparison (manifest §4.6: record before/after time) ---
@@ -133,7 +139,8 @@ fn test_spgemm_plan_bsym_parity_and_stats() {
     // Warm up
     for _ in 0..3 {
         gpu.spgemm_bsym_dev(&a_gpu, &b_gpu, &c_ref).unwrap();
-        gpu.spgemm_plan_bsym_dev(&a_gpu, &b_gpu, &plan_gpu, &c_plan).unwrap();
+        gpu.spgemm_plan_bsym_dev(&a_gpu, &b_gpu, &plan_gpu, &c_plan)
+            .unwrap();
     }
 
     // Time intersection kernel
@@ -147,12 +154,16 @@ fn test_spgemm_plan_bsym_parity_and_stats() {
     // Time plan kernel
     let t0 = Instant::now();
     for _ in 0..n_launches {
-        gpu.spgemm_plan_bsym_dev(&a_gpu, &b_gpu, &plan_gpu, &c_plan).unwrap();
+        gpu.spgemm_plan_bsym_dev(&a_gpu, &b_gpu, &plan_gpu, &c_plan)
+            .unwrap();
     }
     gpu.runtime().queue().finish().unwrap();
     let t_plan = t0.elapsed().as_secs_f64() / n_launches as f64;
 
-    eprintln!("  intersection kernel: {:.3} ms/launch", t_intersection * 1e3);
+    eprintln!(
+        "  intersection kernel: {:.3} ms/launch",
+        t_intersection * 1e3
+    );
     eprintln!("  plan kernel:          {:.3} ms/launch", t_plan * 1e3);
     eprintln!("  speedup:              {:.2}x", t_intersection / t_plan);
     eprintln!("\n  P4: PASS — symbolic plan built, parity verified, performance recorded.");

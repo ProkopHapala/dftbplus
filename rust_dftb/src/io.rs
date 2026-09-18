@@ -64,14 +64,19 @@ impl DftbOutput {
         }
 
         if !dim_line_found {
-            return Err(DftbError::Parse("could not find matrix dimension line".into()));
+            return Err(DftbError::Parse(
+                "could not find matrix dimension line".into(),
+            ));
         }
 
         let expected = n_orb * n_orb;
         if values.len() < expected {
             return Err(DftbError::Parse(format!(
                 "not enough data: got {} values, expected {} for {}x{} matrix",
-                values.len(), expected, n_orb, n_orb
+                values.len(),
+                expected,
+                n_orb,
+                n_orb
             )));
         }
 
@@ -131,13 +136,23 @@ pub fn parse_xyz(path: &str) -> Result<XyzMolecule> {
         }
         species.push(capitalize(parts[0]));
         coords.push([
-            parts[1].parse().map_err(|e| DftbError::Parse(format!("bad x: {e}")))?,
-            parts[2].parse().map_err(|e| DftbError::Parse(format!("bad y: {e}")))?,
-            parts[3].parse().map_err(|e| DftbError::Parse(format!("bad z: {e}")))?,
+            parts[1]
+                .parse()
+                .map_err(|e| DftbError::Parse(format!("bad x: {e}")))?,
+            parts[2]
+                .parse()
+                .map_err(|e| DftbError::Parse(format!("bad y: {e}")))?,
+            parts[3]
+                .parse()
+                .map_err(|e| DftbError::Parse(format!("bad z: {e}")))?,
         ]);
     }
 
-    Ok(XyzMolecule { species, coords, comment })
+    Ok(XyzMolecule {
+        species,
+        coords,
+        comment,
+    })
 }
 
 // ─── String parsing helpers (env-var driven tests) ─────────────────
@@ -154,8 +169,15 @@ pub fn parse_species(s: &str) -> Vec<String> {
 pub fn parse_coords(s: &str) -> Vec<[f64; 3]> {
     let vals: Vec<f64> = s
         .split(|c| {
-            c == ',' || c == ' ' || c == ';' || c == '\n' || c == '\t' || c == '[' || c == ']'
-                || c == '(' || c == ')'
+            c == ','
+                || c == ' '
+                || c == ';'
+                || c == '\n'
+                || c == '\t'
+                || c == '['
+                || c == ']'
+                || c == '('
+                || c == ')'
         })
         .filter(|x| !x.is_empty())
         .filter_map(|x| x.parse::<f64>().ok())
@@ -212,7 +234,10 @@ pub fn compare_matrices(a: &DMatrix<f64>, b: &DMatrix<f64>, name: &str, tol: f64
         }
     }
     println!("{name}: max_abs_err = {max_err:.6e}, max_rel_err = {max_rel:.6e} at {max_idx:?}");
-    assert!(max_err < tol, "{name} mismatch too large: max_err={max_err:.6e}");
+    assert!(
+        max_err < tol,
+        "{name} mismatch too large: max_err={max_err:.6e}"
+    );
 }
 
 /// Compare two vectors element-wise, printing max abs/rel error and asserting tolerance.
@@ -230,7 +255,10 @@ pub fn compare_vecs(a: &[f64], b: &[f64], name: &str, tol: f64) {
         }
     }
     println!("{name}: max_abs_err = {max_err:.6e}, max_rel_err = {max_rel:.6e}");
-    assert!(max_err < tol, "{name} mismatch too large: max_err={max_err:.6e}");
+    assert!(
+        max_err < tol,
+        "{name} mismatch too large: max_err={max_err:.6e}"
+    );
 }
 
 // ─── Matrix utilities ──────────────────────────────────────────────
@@ -267,14 +295,13 @@ pub fn permute_sp_per_atom(mat: &DMatrix<f64>, perm_p: [usize; 3]) -> DMatrix<f6
 
 /// Build a default angular-momentum map for common elements in mio-1-1.
 /// H → [s], C/N/O/F/S/P → [s,p], transition metals → [s,p,d].
-pub fn default_ang_map(
-    species: &[String],
-) -> std::collections::HashMap<String, Vec<i32>> {
+pub fn default_ang_map(species: &[String]) -> std::collections::HashMap<String, Vec<i32>> {
     let mut m = std::collections::HashMap::new();
     for sp in species {
         let ang = match sp.as_str() {
             "H" | "He" => vec![0],
-            "C" | "N" | "O" | "F" | "S" | "P" | "Cl" | "Br" | "I" | "B" | "Li" | "Na" | "K" | "Si" => {
+            "C" | "N" | "O" | "F" | "S" | "P" | "Cl" | "Br" | "I" | "B" | "Li" | "Na" | "K"
+            | "Si" => {
                 vec![0, 1]
             }
             _ => vec![0, 1, 2], // fallback: s+p+d

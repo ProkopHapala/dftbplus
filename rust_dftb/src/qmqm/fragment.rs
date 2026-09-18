@@ -9,9 +9,9 @@
 //! 2. Diagonalizing the generalized eigenvalue problem `H·c = E·S·c`.
 //! 3. Returning updated atom-resolved Mulliken charges.
 
-use nalgebra::{DMatrix, DVector};
-use nalgebra::linalg::Cholesky;
 use lapack::dsyevd;
+use nalgebra::linalg::Cholesky;
+use nalgebra::{DMatrix, DVector};
 
 use crate::core::error::{DftbError, Result};
 use crate::methods::dftb::hamiltonian::{HamiltonianBuilder, SystemContext};
@@ -72,14 +72,12 @@ impl FragmentTemplate {
         // Extract q0 from SK file onsite params (valence electron count).
         let q0: Vec<f64> = (0..n_atoms)
             .map(|i| {
-                sk.onsite(&species[i])
-                    .map(|p| p.q0)
-                    .unwrap_or_else(|_| {
-                        // Fallback for species without homonuclear SK file
-                        let si = atom_species[i] as usize;
-                        let ang = &species_ang[si];
-                        ang.iter().map(|&l| 2.0 * (2.0 * l as f64 + 1.0)).sum()
-                    })
+                sk.onsite(&species[i]).map(|p| p.q0).unwrap_or_else(|_| {
+                    // Fallback for species without homonuclear SK file
+                    let si = atom_species[i] as usize;
+                    let ang = &species_ang[si];
+                    ang.iter().map(|&l| 2.0 * (2.0 * l as f64 + 1.0)).sum()
+                })
             })
             .collect();
 
@@ -219,8 +217,9 @@ impl Fragment {
 
         // 1. Cholesky of S (cached — S never changes across SCC iterations)
         if self.cholesky_l.is_none() {
-            let cholesky = Cholesky::new(self.template.s.clone())
-                .ok_or_else(|| DftbError::InvalidInput("Overlap matrix is not positive definite".into()))?;
+            let cholesky = Cholesky::new(self.template.s.clone()).ok_or_else(|| {
+                DftbError::InvalidInput("Overlap matrix is not positive definite".into())
+            })?;
             self.cholesky_l = Some(cholesky.l());
         }
         let l = self.cholesky_l.as_ref().unwrap();
@@ -231,9 +230,11 @@ impl Fragment {
 
         // 2. H' = L⁻¹·H·L⁻ᵀ  (transform generalized → standard eigenproblem)
         let t0 = std::time::Instant::now();
-        let m = l.solve_lower_triangular(&self.h_scc)
+        let m = l
+            .solve_lower_triangular(&self.h_scc)
             .ok_or_else(|| DftbError::InvalidInput("Failed to solve L·M = H".into()))?;
-        let n_mat = l.solve_lower_triangular(&m.transpose())
+        let n_mat = l
+            .solve_lower_triangular(&m.transpose())
             .ok_or_else(|| DftbError::InvalidInput("Failed to solve L·N = Mᵀ".into()))?;
         // h_prime is symmetric: (L⁻¹·H·L⁻ᵀ)ᵀ = L⁻¹·Hᵀ·L⁻ᵀ = L⁻¹·H·L⁻ᵀ
         let mut h_prime = n_mat.transpose();
@@ -249,11 +250,24 @@ impl Fragment {
         let mut iwork = vec![0i32; 1];
         let mut info: i32 = 0;
         unsafe {
-            dsyevd(b'V', b'L', n as i32, h_prime.as_mut_slice(), n as i32,
-                   &mut eigenvalues, &mut work, -1, &mut iwork, -1, &mut info);
+            dsyevd(
+                b'V',
+                b'L',
+                n as i32,
+                h_prime.as_mut_slice(),
+                n as i32,
+                &mut eigenvalues,
+                &mut work,
+                -1,
+                &mut iwork,
+                -1,
+                &mut info,
+            );
         }
         if info != 0 {
-            return Err(DftbError::InvalidInput(format!("dsyevd workspace query failed: info={info}")));
+            return Err(DftbError::InvalidInput(format!(
+                "dsyevd workspace query failed: info={info}"
+            )));
         }
         let lwork = work[0] as i32;
         let liwork = iwork[0];
@@ -261,11 +275,24 @@ impl Fragment {
         let mut iwork = vec![0i32; liwork as usize];
         // Actual eigensolve
         unsafe {
-            dsyevd(b'V', b'L', n as i32, h_prime.as_mut_slice(), n as i32,
-                   &mut eigenvalues, &mut work, lwork, &mut iwork, liwork, &mut info);
+            dsyevd(
+                b'V',
+                b'L',
+                n as i32,
+                h_prime.as_mut_slice(),
+                n as i32,
+                &mut eigenvalues,
+                &mut work,
+                lwork,
+                &mut iwork,
+                liwork,
+                &mut info,
+            );
         }
         if info != 0 {
-            return Err(DftbError::InvalidInput(format!("dsyevd failed: info={info}")));
+            return Err(DftbError::InvalidInput(format!(
+                "dsyevd failed: info={info}"
+            )));
         }
         let t_eigen = t0.elapsed();
 
@@ -274,7 +301,8 @@ impl Fragment {
 
         // 4. Back-transform: c = L⁻ᵀ·c'
         let t0 = std::time::Instant::now();
-        let c = l.tr_solve_lower_triangular(&c_prime)
+        let c = l
+            .tr_solve_lower_triangular(&c_prime)
             .ok_or_else(|| DftbError::InvalidInput("Failed to solve Lᵀ·c = c'".into()))?;
         let t_back = t0.elapsed();
 

@@ -113,7 +113,11 @@ impl PbcCell {
         let mut out = [0i32; 3];
         for i in 0..3 {
             // |n_i|·h_i ≤ dist  →  n_i ≤ dist·|basis_i|/(2π)
-            let basis_len = if reciprocal { norm(self.lat[i]) } else { norm(self.rec[i]) };
+            let basis_len = if reciprocal {
+                norm(self.lat[i])
+            } else {
+                norm(self.rec[i])
+            };
             out[i] = (dist * basis_len / (2.0 * std::f64::consts::PI)).ceil() as i32 + 1;
         }
         out
@@ -484,7 +488,12 @@ pub fn enumerate_image_pairs(
             }
         }
     }
-    ImagePairList { pair_ij, r_off, rvecs, dists }
+    ImagePairList {
+        pair_ij,
+        r_off,
+        rvecs,
+        dists,
+    }
 }
 
 // ------------------------------------------------------------------
@@ -568,8 +577,12 @@ pub fn enumerate_sk_pairs(
     let n = coords.len();
     let mut out: Vec<SkImgBucket> = (0..n_buckets)
         .map(|_| SkImgBucket {
-            block_type: 0, norb_oi: 0, norb_oj: 0,
-            slots: Vec::new(), outs: Vec::new(), sk_table_idx: usize::MAX,
+            block_type: 0,
+            norb_oi: 0,
+            norb_oj: 0,
+            slots: Vec::new(),
+            outs: Vec::new(),
+            sk_table_idx: usize::MAX,
         })
         .collect();
     let _ = cell;
@@ -591,7 +604,11 @@ pub fn enumerate_sk_pairs(
                 let dy = coords[oj][1] + rv[1] - coords[oi][1];
                 let dz = coords[oj][2] + rv[2] - coords[oi][2];
                 if dx * dx + dy * dy + dz * dz <= c2 {
-                    bk.slots.push(GpuImgSlot { oi: oi as u16, oj: oj as u16, cell: ci as i32 });
+                    bk.slots.push(GpuImgSlot {
+                        oi: oi as u16,
+                        oj: oj as u16,
+                        cell: ci as i32,
+                    });
                     cnt += 1;
                 }
             }

@@ -21,8 +21,8 @@
 //!   4. Read eigenvalues from eigenvec.out or band.out
 
 use rust_dftb::{
-    load_sk_for_species, max_abs_diff, max_abs_diff_vec, parse_f64_list, parse_xyz,
-    DftbOutput, HamiltonianBuilder, SccResult,
+    load_sk_for_species, max_abs_diff, max_abs_diff_vec, parse_f64_list, parse_xyz, DftbOutput,
+    HamiltonianBuilder, SccResult,
 };
 
 /// Run SCC on an XYZ file and return the result.
@@ -50,7 +50,15 @@ fn run_scc_from_env(label: &str) -> Option<(SccResult, Vec<String>)> {
     eprintln!("[{label}] SCC converged in {} iterations", result.n_iter);
     eprintln!("  charges: {:?}", result.charges);
     eprintln!("  q0:      {:?}", result.q0);
-    eprintln!("  deltaQ:  {:?}", result.charges.iter().zip(result.q0.iter()).map(|(q, q0)| q - q0).collect::<Vec<_>>());
+    eprintln!(
+        "  deltaQ:  {:?}",
+        result
+            .charges
+            .iter()
+            .zip(result.q0.iter())
+            .map(|(q, q0)| q - q0)
+            .collect::<Vec<_>>()
+    );
     eprintln!("  eigenvalues: {:?}", result.eigenvalues.as_slice());
     eprintln!("  energy: {:.10}", result.energy);
     eprintln!("  density trace: {:.10}", result.density.trace());
@@ -67,28 +75,52 @@ fn check_fortran_parity(label: &str, result: &SccResult) {
 
     if let Ok(ref_charges) = std::env::var("RUST_DFTB_SCC_REF_CHARGES") {
         let ref_q = parse_f64_list(&ref_charges);
-        assert_eq!(ref_q.len(), result.charges.len(),
-            "{label}: charge count mismatch (ref={}, rust={})", ref_q.len(), result.charges.len());
+        assert_eq!(
+            ref_q.len(),
+            result.charges.len(),
+            "{label}: charge count mismatch (ref={}, rust={})",
+            ref_q.len(),
+            result.charges.len()
+        );
         let diff = max_abs_diff_vec(&result.charges, &ref_q);
         eprintln!("  Charge diff vs Fortran: {diff:e}");
-        assert!(diff < tol, "{label} SCC charges mismatch: diff = {diff:e} (tol = {tol:e})");
+        assert!(
+            diff < tol,
+            "{label} SCC charges mismatch: diff = {diff:e} (tol = {tol:e})"
+        );
     }
 
     if let Ok(ref_eigs) = std::env::var("RUST_DFTB_SCC_REF_EIGS") {
         let ref_e = parse_f64_list(&ref_eigs);
-        assert_eq!(ref_e.len(), result.eigenvalues.len(),
-            "{label}: eigenvalue count mismatch (ref={}, rust={})", ref_e.len(), result.eigenvalues.len());
+        assert_eq!(
+            ref_e.len(),
+            result.eigenvalues.len(),
+            "{label}: eigenvalue count mismatch (ref={}, rust={})",
+            ref_e.len(),
+            result.eigenvalues.len()
+        );
         let diff = max_abs_diff_vec(result.eigenvalues.as_slice(), &ref_e);
         eprintln!("  Eigenvalue diff vs Fortran: {diff:e}");
-        assert!(diff < tol * 10.0, "{label} SCC eigenvalues mismatch: diff = {diff:e} (tol = {:.3e})", tol * 10.0);
+        assert!(
+            diff < tol * 10.0,
+            "{label} SCC eigenvalues mismatch: diff = {diff:e} (tol = {:.3e})",
+            tol * 10.0
+        );
     }
 
     // Compare total energy
     if let Ok(ref_energy_s) = std::env::var("RUST_DFTB_SCC_REF_ENERGY") {
         let ref_energy: f64 = ref_energy_s.parse().unwrap();
         let diff = (result.energy - ref_energy).abs();
-        eprintln!("  Energy: rust={:.10}, fortran={:.10}, diff={diff:e}", result.energy, ref_energy);
-        assert!(diff < tol * 100.0, "{label} SCC energy mismatch: diff = {diff:e} (tol = {:.3e})", tol * 100.0);
+        eprintln!(
+            "  Energy: rust={:.10}, fortran={:.10}, diff={diff:e}",
+            result.energy, ref_energy
+        );
+        assert!(
+            diff < tol * 100.0,
+            "{label} SCC energy mismatch: diff = {diff:e} (tol = {:.3e})",
+            tol * 100.0
+        );
     }
 
     // Compare H_scc matrix
@@ -96,7 +128,10 @@ fn check_fortran_parity(label: &str, result: &SccResult) {
         let h_ref = DftbOutput::read_square(&ref_h_scc_path).unwrap();
         let diff = max_abs_diff(&result.h_scc, &h_ref);
         eprintln!("  H_scc diff vs Fortran: {diff:e}");
-        assert!(diff < tol, "{label} H_scc mismatch: diff = {diff:e} (tol = {tol:e})");
+        assert!(
+            diff < tol,
+            "{label} H_scc mismatch: diff = {diff:e} (tol = {tol:e})"
+        );
     }
 
     // Compare S matrix
@@ -104,7 +139,10 @@ fn check_fortran_parity(label: &str, result: &SccResult) {
         let s_ref = DftbOutput::read_square(&ref_s_path).unwrap();
         let diff = max_abs_diff(&result.s, &s_ref);
         eprintln!("  S diff vs Fortran: {diff:e}");
-        assert!(diff < tol, "{label} S mismatch: diff = {diff:e} (tol = {tol:e})");
+        assert!(
+            diff < tol,
+            "{label} S mismatch: diff = {diff:e} (tol = {tol:e})"
+        );
     }
 }
 
@@ -125,7 +163,9 @@ fn check_fortran_parity(label: &str, result: &SccResult) {
 /// ```
 #[test]
 fn scc_convergence_from_xyz() {
-    let Some((result, species)) = run_scc_from_env("scc_from_xyz") else { return; };
+    let Some((result, species)) = run_scc_from_env("scc_from_xyz") else {
+        return;
+    };
 
     // Basic sanity checks:
     // 1. Charge conservation: sum(charges) ≈ sum(q0) = total electrons
@@ -136,10 +176,18 @@ fn scc_convergence_from_xyz() {
 
     // 2. For homonuclear diatomics, check zero charge transfer
     if species.len() == 2 && species[0] == species[1] {
-        let dq: Vec<f64> = result.charges.iter().zip(result.q0.iter()).map(|(q, q0)| q - q0).collect();
+        let dq: Vec<f64> = result
+            .charges
+            .iter()
+            .zip(result.q0.iter())
+            .map(|(q, q0)| q - q0)
+            .collect();
         let max_dq = dq.iter().map(|x| x.abs()).fold(0.0_f64, f64::max);
         eprintln!("  homonuclear check: max |deltaQ| = {max_dq:e}");
-        assert!(max_dq < 1e-8, "Homonuclear diatomic should have zero charge transfer, max |deltaQ| = {max_dq:e}");
+        assert!(
+            max_dq < 1e-8,
+            "Homonuclear diatomic should have zero charge transfer, max |deltaQ| = {max_dq:e}"
+        );
     }
 
     // 3. Fortran parity if reference provided

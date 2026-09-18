@@ -23,11 +23,9 @@
 //! failure.
 
 use ocl::{builders::ProgramBuilder, flags, Buffer, Kernel, Program};
-use rust_dftb::methods::dftb::spline_resample::{
-    bspline3_eval_at, resample_bspline,
-};
-use rust_dftb::qmqm::gpu_runtime::{map_ocl_err, GpuRuntime};
+use rust_dftb::methods::dftb::spline_resample::{bspline3_eval_at, resample_bspline};
 use rust_dftb::methods::sparse::harness::require_nvidia_runtime;
+use rust_dftb::qmqm::gpu_runtime::{map_ocl_err, GpuRuntime};
 
 /// Minimal OpenCL source: just the bspline3_v_d1_d2 function + a test kernel
 /// that evaluates it at N points and writes (V, dV, d²V) to an output buffer.
@@ -104,7 +102,9 @@ fn try_gpu() -> Option<GpuRuntime> {
 
 #[test]
 fn test_gpu_bspline3_v_d1_d2_parity() {
-    let Some(mut rt) = try_gpu() else { return; };
+    let Some(mut rt) = try_gpu() else {
+        return;
+    };
 
     // Build a canonical B-spline from SK-like data (exponential decay)
     let h_orig = 0.01_f64;
@@ -135,18 +135,24 @@ fn test_gpu_bspline3_v_d1_d2_parity() {
         .flags(flags::MEM_READ_ONLY | flags::MEM_COPY_HOST_PTR)
         .len(ctrl_f32.len())
         .copy_host_slice(&ctrl_f32)
-        .build().map_err(map_ocl_err).unwrap();
+        .build()
+        .map_err(map_ocl_err)
+        .unwrap();
     let points_buf = Buffer::<f32>::builder()
         .queue(queue.clone())
         .flags(flags::MEM_READ_ONLY | flags::MEM_COPY_HOST_PTR)
         .len(n_points)
         .copy_host_slice(&points)
-        .build().map_err(map_ocl_err).unwrap();
+        .build()
+        .map_err(map_ocl_err)
+        .unwrap();
     let out_buf = Buffer::<f32>::builder()
         .queue(queue.clone())
         .flags(flags::MEM_WRITE_ONLY)
         .len(n_points * 3)
-        .build().map_err(map_ocl_err).unwrap();
+        .build()
+        .map_err(map_ocl_err)
+        .unwrap();
 
     // Build and launch the kernel
     let kernel = Kernel::builder()
@@ -160,9 +166,13 @@ fn test_gpu_bspline3_v_d1_d2_parity() {
         .arg(&points_buf)
         .arg(&out_buf)
         .global_work_size(n_points)
-        .build().map_err(map_ocl_err).unwrap();
+        .build()
+        .map_err(map_ocl_err)
+        .unwrap();
 
-    unsafe { kernel.enq().map_err(map_ocl_err).unwrap(); }
+    unsafe {
+        kernel.enq().map_err(map_ocl_err).unwrap();
+    }
 
     // Read results
     let mut gpu_out = vec![0.0f32; n_points * 3];
@@ -180,7 +190,9 @@ fn test_gpu_bspline3_v_d1_d2_parity() {
         let ddv_gpu = gpu_out[k * 3 + 2] as f64;
 
         // Skip points outside the valid range (both CPU and GPU return 0)
-        if r < 0.0 || r > r_max { continue; }
+        if r < 0.0 || r > r_max {
+            continue;
+        }
 
         max_err_v = max_err_v.max((v_gpu - v_ref).abs());
         max_err_dv = max_err_dv.max((dv_gpu - dv_ref).abs());

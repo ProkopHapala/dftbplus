@@ -50,7 +50,9 @@ impl Bsr4Matrix {
         for i in 0..n_atom {
             let (a, b) = (row_ptr[i] as usize, row_ptr[i + 1] as usize);
             if a > b {
-                return Err(DftbError::InvalidInput(format!("row {i}: row_ptr not monotonic")));
+                return Err(DftbError::InvalidInput(format!(
+                    "row {i}: row_ptr not monotonic"
+                )));
             }
             for k in a + 1..b {
                 if col_idx[k] <= col_idx[k - 1] {
@@ -127,10 +129,13 @@ impl Bsr4Matrix {
     pub fn to_dense(&self) -> Vec<f32> {
         #[cfg(feature = "sparse_firewall")]
         {
-            panic!("P0 SPARSE FIREWALL: Bsr4Matrix::to_dense() called from production sparse path. \
+            panic!(
+                "P0 SPARSE FIREWALL: Bsr4Matrix::to_dense() called from production sparse path. \
                     This allocates an O(Norb²) dense matrix. \
                     Disable the `sparse_firewall` feature for test/reference use. \
-                    Caller: {}", std::panic::Location::caller());
+                    Caller: {}",
+                std::panic::Location::caller()
+            );
         }
         #[cfg(not(feature = "sparse_firewall"))]
         {
@@ -155,9 +160,9 @@ impl Bsr4Matrix {
     /// Fill block (i,j) from a 4×4 row-major slice. Block must already exist
     /// in the CSR structure.
     pub fn set_block(&mut self, i: usize, j: usize, v: &[f32; BS2]) -> Result<()> {
-        let b = self.find(i, j).ok_or_else(|| {
-            DftbError::InvalidInput(format!("set_block: ({i},{j}) not in mask"))
-        })?;
+        let b = self
+            .find(i, j)
+            .ok_or_else(|| DftbError::InvalidInput(format!("set_block: ({i},{j}) not in mask")))?;
         self.values[b * BS2..(b + 1) * BS2].copy_from_slice(v);
         Ok(())
     }
@@ -168,7 +173,8 @@ impl Bsr4Matrix {
         if dense.len() != n * n {
             return Err(DftbError::InvalidInput(format!(
                 "from_dense: dense len {} != (4*{n_atom})^2={}",
-                dense.len(), n * n
+                dense.len(),
+                n * n
             )));
         }
         let mut m = Self::from_structure(n_atom, mask.0.clone(), mask.1.clone())?;
@@ -191,7 +197,13 @@ impl Bsr4Matrix {
     /// Write this matrix into a preallocated dense `(4 N)×(4 N)` buffer (no alloc).
     pub fn to_dense_into(&self, out: &mut [f32]) {
         let n = self.n_atom * BS;
-        assert_eq!(out.len(), n * n, "to_dense_into: out len {} != (4*{})^2", out.len(), self.n_atom);
+        assert_eq!(
+            out.len(),
+            n * n,
+            "to_dense_into: out len {} != (4*{})^2",
+            out.len(),
+            self.n_atom
+        );
         out.fill(0.0);
         for i in 0..self.n_atom {
             let (a, b) = (self.row_ptr[i] as usize, self.row_ptr[i + 1] as usize);
@@ -221,7 +233,8 @@ impl Bsr4Matrix {
     /// Blocks in `self` but not in `target_mask` are dropped (truncated).
     /// Used to transfer Z from M_Z to M_K for independent R_K/R_Z sweeps.
     pub fn project_to_mask(&self, target_mask: &(Vec<u32>, Vec<u32>)) -> Result<Self> {
-        let mut m = Self::from_structure(self.n_atom, target_mask.0.clone(), target_mask.1.clone())?;
+        let mut m =
+            Self::from_structure(self.n_atom, target_mask.0.clone(), target_mask.1.clone())?;
         for i in 0..self.n_atom {
             let (start, end) = (target_mask.0[i] as usize, target_mask.0[i + 1] as usize);
             for blk in start..end {
@@ -252,8 +265,20 @@ pub fn pad_physical_to_bsr4(
     let n_atom = atom_n_orb.len();
     let n_padded = n_atom * BS;
     let n_phys: usize = atom_n_orb.iter().map(|&n| n as usize).sum();
-    assert_eq!(h0.len(), n_phys * n_phys, "pad: H0 len {} != n_phys² {}", h0.len(), n_phys * n_phys);
-    assert_eq!(s.len(), n_phys * n_phys, "pad: S len {} != n_phys² {}", s.len(), n_phys * n_phys);
+    assert_eq!(
+        h0.len(),
+        n_phys * n_phys,
+        "pad: H0 len {} != n_phys² {}",
+        h0.len(),
+        n_phys * n_phys
+    );
+    assert_eq!(
+        s.len(),
+        n_phys * n_phys,
+        "pad: S len {} != n_phys² {}",
+        s.len(),
+        n_phys * n_phys
+    );
     let mut phys_off = Vec::with_capacity(n_atom);
     let mut padded_off = Vec::with_capacity(n_atom);
     let mut acc_phys = 0usize;
@@ -299,14 +324,45 @@ pub fn pad_physical_to_bsr4(
 }
 
 /// Same as `pad_physical_to_bsr4` but writes into preallocated `h_pad`/`s_pad`.
-pub fn pad_physical_to_bsr4_into(h0: &[f64], s: &[f64], atom_n_orb: &[u8], e_dummy: f32, h_pad: &mut [f32], s_pad: &mut [f32]) {
+pub fn pad_physical_to_bsr4_into(
+    h0: &[f64],
+    s: &[f64],
+    atom_n_orb: &[u8],
+    e_dummy: f32,
+    h_pad: &mut [f32],
+    s_pad: &mut [f32],
+) {
     let n_atom = atom_n_orb.len();
     let n_padded = n_atom * BS;
     let n_phys: usize = atom_n_orb.iter().map(|&n| n as usize).sum();
-    assert_eq!(h0.len(), n_phys * n_phys, "pad_into: H0 len {} != n_phys² {}", h0.len(), n_phys * n_phys);
-    assert_eq!(s.len(), n_phys * n_phys, "pad_into: S len {} != n_phys² {}", s.len(), n_phys * n_phys);
-    assert_eq!(h_pad.len(), n_padded * n_padded, "pad_into: h_pad len {} != n_pad² {}", h_pad.len(), n_padded * n_padded);
-    assert_eq!(s_pad.len(), n_padded * n_padded, "pad_into: s_pad len {} != n_pad² {}", s_pad.len(), n_padded * n_padded);
+    assert_eq!(
+        h0.len(),
+        n_phys * n_phys,
+        "pad_into: H0 len {} != n_phys² {}",
+        h0.len(),
+        n_phys * n_phys
+    );
+    assert_eq!(
+        s.len(),
+        n_phys * n_phys,
+        "pad_into: S len {} != n_phys² {}",
+        s.len(),
+        n_phys * n_phys
+    );
+    assert_eq!(
+        h_pad.len(),
+        n_padded * n_padded,
+        "pad_into: h_pad len {} != n_pad² {}",
+        h_pad.len(),
+        n_padded * n_padded
+    );
+    assert_eq!(
+        s_pad.len(),
+        n_padded * n_padded,
+        "pad_into: s_pad len {} != n_pad² {}",
+        s_pad.len(),
+        n_padded * n_padded
+    );
     h_pad.fill(0.0);
     s_pad.fill(0.0);
     let mut phys_off = Vec::with_capacity(n_atom);
@@ -345,11 +401,33 @@ pub fn pad_physical_to_bsr4_into(h0: &[f64], s: &[f64], atom_n_orb: &[u8], e_dum
 }
 
 /// Pack a dense `(4 N)×(4 N)` matrix onto an existing BSR value buffer (no alloc).
-pub fn fill_bsr_values_from_dense(n_atom: usize, dense: &[f32], row_ptr: &[u32], col_idx: &[u32], out: &mut [f32]) {
+pub fn fill_bsr_values_from_dense(
+    n_atom: usize,
+    dense: &[f32],
+    row_ptr: &[u32],
+    col_idx: &[u32],
+    out: &mut [f32],
+) {
     let n = n_atom * BS;
-    assert_eq!(dense.len(), n * n, "fill_bsr: dense len {} != (4*{n_atom})^2", dense.len());
-    assert_eq!(out.len(), col_idx.len() * BS2, "fill_bsr: out len {} != nblock*16 {}", out.len(), col_idx.len() * BS2);
-    assert_eq!(row_ptr.len(), n_atom + 1, "fill_bsr: row_ptr len {} != n_atom+1", row_ptr.len());
+    assert_eq!(
+        dense.len(),
+        n * n,
+        "fill_bsr: dense len {} != (4*{n_atom})^2",
+        dense.len()
+    );
+    assert_eq!(
+        out.len(),
+        col_idx.len() * BS2,
+        "fill_bsr: out len {} != nblock*16 {}",
+        out.len(),
+        col_idx.len() * BS2
+    );
+    assert_eq!(
+        row_ptr.len(),
+        n_atom + 1,
+        "fill_bsr: row_ptr len {} != n_atom+1",
+        row_ptr.len()
+    );
     for i in 0..n_atom {
         let (a, b) = (row_ptr[i] as usize, row_ptr[i + 1] as usize);
         for blk in a..b {
@@ -365,9 +443,20 @@ pub fn fill_bsr_values_from_dense(n_atom: usize, dense: &[f32], row_ptr: &[u32],
 }
 
 /// Expand BSR values into a preallocated dense `(4 N)×(4 N)` buffer.
-pub fn bsr_values_to_dense(n_atom: usize, row_ptr: &[u32], col_idx: &[u32], values: &[f32], out: &mut [f32]) {
+pub fn bsr_values_to_dense(
+    n_atom: usize,
+    row_ptr: &[u32],
+    col_idx: &[u32],
+    values: &[f32],
+    out: &mut [f32],
+) {
     let n = n_atom * BS;
-    assert_eq!(out.len(), n * n, "bsr_to_dense: out len {} != (4*{n_atom})^2", out.len());
+    assert_eq!(
+        out.len(),
+        n * n,
+        "bsr_to_dense: out len {} != (4*{n_atom})^2",
+        out.len()
+    );
     assert_eq!(values.len(), col_idx.len() * BS2);
     out.fill(0.0);
     for i in 0..n_atom {
@@ -412,7 +501,9 @@ pub fn build_geometric_mask(pos: &[[f64; 3]], cutoff: f64) -> (Vec<u32>, Vec<u32
 /// Build a full (dense) BSR4 mask: every block (i,j) exists.
 pub fn build_full_mask(n_atom: usize) -> (Vec<u32>, Vec<u32>) {
     let row_ptr: Vec<u32> = (0..=n_atom).map(|i| (i * n_atom) as u32).collect();
-    let col_idx: Vec<u32> = (0..n_atom).flat_map(|i| (0..n_atom).map(move |j| j as u32)).collect();
+    let col_idx: Vec<u32> = (0..n_atom)
+        .flat_map(|i| (0..n_atom).map(move |j| j as u32))
+        .collect();
     (row_ptr, col_idx)
 }
 
@@ -431,7 +522,11 @@ pub fn build_topk_mask(src: &Bsr4Matrix, k: usize) -> (Vec<u32>, Vec<u32>) {
     for i in 0..n {
         let (a, b) = (src.row_ptr[i] as usize, src.row_ptr[i + 1] as usize);
         let mut ranked: Vec<usize> = (a..b).collect();
-        ranked.sort_by(|&x, &y| norm2[y].partial_cmp(&norm2[x]).unwrap_or(std::cmp::Ordering::Equal));
+        ranked.sort_by(|&x, &y| {
+            norm2[y]
+                .partial_cmp(&norm2[x])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         for &blk in ranked.iter().take(k) {
             keep[i][src.col_idx[blk] as usize] = true;
         }
@@ -548,7 +643,10 @@ pub fn dense_matmul(n: usize, a: &[f32], b: &[f32]) -> Vec<f32> {
 /// access, auto-vectorizes) + scoped threads over row chunks. Diagnostic
 /// use only (F64-MCW / FF32 tests) — O(n³) host, never a hot path.
 pub fn matmul_f64_mt(n: usize, a: &[f64], b: &[f64]) -> Vec<f64> {
-    let nt = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(4).min(32);
+    let nt = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(4)
+        .min(32);
     let chunk = n.div_ceil(nt);
     let mut c = vec![0.0f64; n * n];
     std::thread::scope(|sc| {
@@ -561,7 +659,9 @@ pub fn matmul_f64_mt(n: usize, a: &[f64], b: &[f64]) -> Vec<f64> {
                     for k in 0..n {
                         let aik = a[i * n + k];
                         let bk = &b[k * n..k * n + n];
-                        for j in 0..n { row[j] += aik * bk[j]; }
+                        for j in 0..n {
+                            row[j] += aik * bk[j];
+                        }
                     }
                 }
             });
@@ -664,12 +764,17 @@ pub struct SpgemmPlan {
 
 impl SpgemmPlan {
     /// Number of plan terms (total intersection entries).
-    pub fn nterms(&self) -> usize { self.plan_a_idx.len() }
+    pub fn nterms(&self) -> usize {
+        self.plan_a_idx.len()
+    }
 
     /// Average terms per output block.
     pub fn avg_terms(&self) -> f64 {
-        if self.nblock_c == 0 { 0.0 }
-        else { self.nterms() as f64 / self.nblock_c as f64 }
+        if self.nblock_c == 0 {
+            0.0
+        } else {
+            self.nterms() as f64 / self.nblock_c as f64
+        }
     }
 
     /// Total bytes consumed by the plan on device:
@@ -748,7 +853,12 @@ pub fn build_spgemm_plan_bsym(
     }
 
     let nblock_c = c_mask.1.len();
-    Ok(SpgemmPlan { plan_ptr, plan_a_idx, plan_b_idx, nblock_c })
+    Ok(SpgemmPlan {
+        plan_ptr,
+        plan_a_idx,
+        plan_b_idx,
+        nblock_c,
+    })
 }
 
 /// Build a symbolic SpGEMM plan for `C = P_M(A·B)` with NO symmetry
@@ -794,7 +904,12 @@ pub fn build_spgemm_plan(
     }
 
     let nblock_c = c_mask.1.len();
-    Ok(SpgemmPlan { plan_ptr, plan_a_idx, plan_b_idx, nblock_c })
+    Ok(SpgemmPlan {
+        plan_ptr,
+        plan_a_idx,
+        plan_b_idx,
+        nblock_c,
+    })
 }
 
 /// Build a Bsr4Matrix representing the identity (4×4 identity on each

@@ -17,31 +17,43 @@ use rust_dftb::methods::dftb::forces::{compute_forces_from_dw, Forces};
 use rust_dftb::methods::dftb::gamma::GammaTable;
 use rust_dftb::methods::sparse::harness::{require_sih_sk_dir, require_sparse_gpu};
 use rust_dftb::methods::sparse::SparseDftb;
-use rust_dftb::qmqm::{Fragment, FragmentNeighborList, FragmentTemplate, MultiSystemSolver, SimpleMixer};
+use rust_dftb::qmqm::{
+    Fragment, FragmentNeighborList, FragmentTemplate, MultiSystemSolver, SimpleMixer,
+};
 use rust_dftb::{load_sk_for_species, SkData};
 use std::io::Write;
 
 /// Sparse Gate F FIRE minimum (NVIDIA, 2026-09-10, **SparseDftb**). Si–H mean 1.477 Å, |F|≈9e-4.
 fn gate_f_sih4_coords() -> Vec<[f64; 3]> {
     vec![
-        [-0.000259,  0.302610, -0.000330],
-        [ 1.463846,  0.107836, -0.013743],
-        [-0.313014,  1.710702,  0.319181],
-        [-0.601402, -0.575463,  1.023930],
+        [-0.000259, 0.302610, -0.000330],
+        [1.463846, 0.107836, -0.013743],
+        [-0.313014, 1.710702, 0.319181],
+        [-0.601402, -0.575463, 1.023930],
         [-0.549074, -0.037178, -1.329038],
     ]
 }
 
 fn sih_bonds(coords: &[[f64; 3]]) -> Vec<f64> {
     let si = coords[0];
-    (1..coords.len()).map(|i| {
-        let d = [coords[i][0] - si[0], coords[i][1] - si[1], coords[i][2] - si[2]];
-        (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
-    }).collect()
+    (1..coords.len())
+        .map(|i| {
+            let d = [
+                coords[i][0] - si[0],
+                coords[i][1] - si[1],
+                coords[i][2] - si[2],
+            ];
+            (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
+        })
+        .collect()
 }
 
 fn f_norm(forces: &[[f64; 3]]) -> f64 {
-    forces.iter().map(|f| f[0] * f[0] + f[1] * f[1] + f[2] * f[2]).sum::<f64>().sqrt()
+    forces
+        .iter()
+        .map(|f| f[0] * f[0] + f[1] * f[1] + f[2] * f[2])
+        .sum::<f64>()
+        .sqrt()
 }
 
 fn flatten_f(f: &[[f64; 3]]) -> Vec<f64> {
@@ -73,23 +85,37 @@ fn dense_scc_valence(
     tmpl.q0 = q0.to_vec();
     let mut frag = Fragment::from_template(tmpl, coords.to_vec());
     if let Some(q) = q_init {
-        assert_eq!(q.len(), frag.charges.len(), "Gate G dense q_init len {} != n_atom {}", q.len(), frag.charges.len());
+        assert_eq!(
+            q.len(),
+            frag.charges.len(),
+            "Gate G dense q_init len {} != n_atom {}",
+            q.len(),
+            frag.charges.len()
+        );
         frag.charges.copy_from_slice(q);
     }
-    let gamma = GammaTable::from_sk_data(sk, species).unwrap_or_else(|e| panic!("Gate G dense gamma: {e}"));
+    let gamma =
+        GammaTable::from_sk_data(sk, species).unwrap_or_else(|e| panic!("Gate G dense gamma: {e}"));
     let n = coords.len() as f64;
-    let centroid = coords.iter().fold([0.0; 3], |acc, c| [acc[0] + c[0], acc[1] + c[1], acc[2] + c[2]]);
-    let frag_neighbors = FragmentNeighborList::build(&vec![[centroid[0] / n, centroid[1] / n, centroid[2] / n]], 10.0);
+    let centroid = coords.iter().fold([0.0; 3], |acc, c| {
+        [acc[0] + c[0], acc[1] + c[1], acc[2] + c[2]]
+    });
+    let frag_neighbors = FragmentNeighborList::build(
+        &vec![[centroid[0] / n, centroid[1] / n, centroid[2] / n]],
+        10.0,
+    );
     let mixer = SimpleMixer::new(mix);
     let mut solver = MultiSystemSolver::new(vec![frag], frag_neighbors, gamma, mixer);
     if let Some(q) = q_init {
         solver.charges.copy_from_slice(q);
         solver.scatter_charges();
     }
-    solver.solve_scc(max_iter, tol).unwrap_or_else(|e| panic!(
-        "Gate G dense valence SCC failed: {e}  |r| mean={:.4} Å",
-        sih_bonds(coords).iter().sum::<f64>() / 4.0
-    ));
+    solver.solve_scc(max_iter, tol).unwrap_or_else(|e| {
+        panic!(
+            "Gate G dense valence SCC failed: {e}  |r| mean={:.4} Å",
+            sih_bonds(coords).iter().sum::<f64>() / 4.0
+        )
+    });
     let frag = &solver.fragments[0];
     let n_occ = (frag.n_electrons / 2.0).round() as usize;
     let c_occ = frag.eigenvectors.columns(0, n_occ);
@@ -100,7 +126,12 @@ fn dense_scc_valence(
         let eps = frag.eigenvalues[k];
         edm += (2.0 * eps) * (&c * c.transpose());
     }
-    DenseSccRef { q: frag.charges.clone(), density, edm, n_iter: solver.n_scc_iter }
+    DenseSccRef {
+        q: frag.charges.clone(),
+        density,
+        edm,
+        n_iter: solver.n_scc_iter,
+    }
 }
 
 fn dense_forces(
@@ -112,8 +143,17 @@ fn dense_forces(
     q_init: Option<&[f64]>,
 ) -> (DenseSccRef, Forces) {
     let scc = dense_scc_valence(sk, species, coords, q0, q_init, 0.5, 1e-5, 80);
-    let f = compute_forces_from_dw(sk, species, coords, &scc.density, &scc.edm, &scc.q, q0, sk_dir)
-        .unwrap_or_else(|e| panic!("Gate G dense force failed: {e}"));
+    let f = compute_forces_from_dw(
+        sk,
+        species,
+        coords,
+        &scc.density,
+        &scc.edm,
+        &scc.q,
+        q0,
+        sk_dir,
+    )
+    .unwrap_or_else(|e| panic!("Gate G dense force failed: {e}"));
     (scc, f)
 }
 
@@ -140,10 +180,17 @@ where
         let fm_f = flatten_f(&fm);
         for j in 0..n_dof {
             let hij = -(fp_f[j] - fm_f[j]) / (2.0 * h);
-            assert!(hij.is_finite(), "Gate G: non-finite H[{j},{a}]={hij}  atom={atom} xyz={xyz} h={h}");
+            assert!(
+                hij.is_finite(),
+                "Gate G: non-finite H[{j},{a}]={hij}  atom={atom} xyz={xyz} h={h}"
+            );
             hess[(j, a)] = hij;
         }
-        let col_rms = (0..n_dof).map(|j| hess[(j, a)] * hess[(j, a)]).sum::<f64>().sqrt() / (n_dof as f64).sqrt();
+        let col_rms = (0..n_dof)
+            .map(|j| hess[(j, a)] * hess[(j, a)])
+            .sum::<f64>()
+            .sqrt()
+            / (n_dof as f64).sqrt();
         eprintln!(
             "    col {a:2} atom {atom} xyz {xyz}  |F+|={:.3e}  |F-|={:.3e}  H_col_rms={col_rms:.4e}",
             f_norm(&fp), f_norm(&fm)
@@ -178,12 +225,18 @@ fn mac(v: &DMatrix<f64>, w: &DMatrix<f64>, i: usize, j: usize) -> f64 {
     let b = w.column(j);
     let num = a.dot(&b).powi(2);
     let den = a.dot(&a) * b.dot(&b);
-    if den < 1e-30 { 0.0 } else { num / den }
+    if den < 1e-30 {
+        0.0
+    } else {
+        num / den
+    }
 }
 
 fn subspace_overlap(v: &DMatrix<f64>, w: &DMatrix<f64>, i0: usize, i1: usize) -> f64 {
     let k = i1 - i0;
-    if k == 0 { return 0.0; }
+    if k == 0 {
+        return 0.0;
+    }
     let mut s = 0.0f64;
     for i in i0..i1 {
         for j in i0..i1 {
@@ -195,7 +248,11 @@ fn subspace_overlap(v: &DMatrix<f64>, w: &DMatrix<f64>, i0: usize, i1: usize) ->
 
 fn lambda_to_cm(l: f64) -> f64 {
     let mag = HA_ANG_AMU_TO_CM * l.abs().sqrt();
-    if l < 0.0 { -mag } else { mag }
+    if l < 0.0 {
+        -mag
+    } else {
+        mag
+    }
 }
 
 fn mass_weighted(h: &DMatrix<f64>, masses: &[f64]) -> DMatrix<f64> {
@@ -210,10 +267,18 @@ fn mass_weighted(h: &DMatrix<f64>, masses: &[f64]) -> DMatrix<f64> {
 }
 
 fn write_hess_csv(path: &std::path::Path, h: &DMatrix<f64>, label: &str) {
-    let mut f = std::fs::File::create(path).unwrap_or_else(|e| panic!("Gate G: cannot write {}: {e}", path.display()));
-    writeln!(f, "# Gate G {label} unsymmetrized force Hessian (Ha/Å²), row-major, n={}", h.nrows()).unwrap();
+    let mut f = std::fs::File::create(path)
+        .unwrap_or_else(|e| panic!("Gate G: cannot write {}: {e}", path.display()));
+    writeln!(
+        f,
+        "# Gate G {label} unsymmetrized force Hessian (Ha/Å²), row-major, n={}",
+        h.nrows()
+    )
+    .unwrap();
     for i in 0..h.nrows() {
-        let row: Vec<String> = (0..h.ncols()).map(|j| format!("{:.10e}", h[(i, j)])).collect();
+        let row: Vec<String> = (0..h.ncols())
+            .map(|j| format!("{:.10e}", h[(i, j)]))
+            .collect();
         writeln!(f, "{}", row.join(",")).unwrap();
     }
 }
@@ -221,7 +286,9 @@ fn write_hess_csv(path: &std::path::Path, h: &DMatrix<f64>, label: &str) {
 #[test]
 fn test_gate_g_sih4_force_hessian_parity() {
     std::env::set_var("RUST_DFTB_SPARSE_ALGEBRA_VERBOSE", "0");
-    let Some(_gpu) = require_sparse_gpu() else { return };
+    let Some(_gpu) = require_sparse_gpu() else {
+        return;
+    };
     let sk_dir = require_sih_sk_dir();
     let species = vec!["Si".into(), "H".into(), "H".into(), "H".into(), "H".into()];
     let coords = gate_f_sih4_coords();
@@ -235,27 +302,47 @@ fn test_gate_g_sih4_force_hessian_parity() {
     let bonds = sih_bonds(&coords);
     eprintln!("=== Gate G: unsymmetrized force Hessian at sparse Gate F geometry [SparseDftb] ===");
     eprintln!("  h = {h} Å  (FD of analytic F; not FD of E; H_raw not filled symmetrically)");
-    eprintln!("  Si–H = {:.4} {:.4} {:.4} {:.4} Å", bonds[0], bonds[1], bonds[2], bonds[3]);
+    eprintln!(
+        "  Si–H = {:.4} {:.4} {:.4} {:.4} Å",
+        bonds[0], bonds[1], bonds[2], bonds[3]
+    );
     for (k, &r) in bonds.iter().enumerate() {
-        assert!((1.40..=1.55).contains(&r), "Gate G: frozen Si–H{} = {r:.4} Å is not the Gate F window", k + 1);
+        assert!(
+            (1.40..=1.55).contains(&r),
+            "Gate G: frozen Si–H{} = {r:.4} Å is not the Gate F window",
+            k + 1
+        );
     }
 
     let mut eng = SparseDftb::new(sk.clone(), &sk_dir, species.clone(), coords.clone())
         .unwrap_or_else(|e| panic!("Gate G SparseDftb::new: {e}"));
-    eng.scc(80, 1e-5).unwrap_or_else(|e| panic!("Gate G sparse center SCC: {e}"));
+    eng.scc(80, 1e-5)
+        .unwrap_or_else(|e| panic!("Gate G sparse center SCC: {e}"));
     let e0 = eng.last_energy().clone();
-    let f0 = eng.forces().unwrap_or_else(|e| panic!("Gate G sparse center forces: {e}"));
+    let f0 = eng
+        .forces()
+        .unwrap_or_else(|e| panic!("Gate G sparse center forces: {e}"));
     let q_center_sp = e0.q.clone();
     let fn0_sp = f_norm(&f0.forces);
     eprintln!("  sparse center: E_tot={:.10}  E_el={:.10}  E_rep={:.10}  |F|={fn0_sp:.3e}  n_scc={}  Tr(KS)={:.6}  r_scc={:.3e}  R_H={:.3e}",
         e0.e_tot, e0.e_el, e0.e_rep, e0.n_scc, e0.tr_ks, e0.r_scc, e0.r_h);
-    assert!(e0.e_rep.abs() > 1e-4, "Gate G: E_rep={:.3e} ~0 — Spline missing", e0.e_rep);
-    assert!(fn0_sp < 2e-3, "Gate G: frozen geometry is not near a sparse stationary point: |F|={fn0_sp:.3e}");
+    assert!(
+        e0.e_rep.abs() > 1e-4,
+        "Gate G: E_rep={:.3e} ~0 — Spline missing",
+        e0.e_rep
+    );
+    assert!(
+        fn0_sp < 2e-3,
+        "Gate G: frozen geometry is not near a sparse stationary point: |F|={fn0_sp:.3e}"
+    );
 
     let (d0, fd0) = dense_forces(&sk, &sk_dir, &species, &coords, &q0, None);
     let q_center_dn = d0.q.clone();
     let fn0_dn = f_norm(&fd0.forces);
-    eprintln!("  dense  center: |F|={fn0_dn:.3e}  n_scc={}  (same coords; Gate H compares own minima)", d0.n_iter);
+    eprintln!(
+        "  dense  center: |F|={fn0_dn:.3e}  n_scc={}  (same coords; Gate H compares own minima)",
+        d0.n_iter
+    );
     let mut max_df0 = 0.0f64;
     for i in 0..n_atom {
         for c in 0..3 {
@@ -264,12 +351,19 @@ fn test_gate_g_sih4_force_hessian_parity() {
     }
     eprintln!("  center max|F_sp − F_dn|={max_df0:.3e}");
 
-    eprintln!("  --- sparse Hessian (30 analytic-F evals, SparseDftb, warm-start from center q) ---");
+    eprintln!(
+        "  --- sparse Hessian (30 analytic-F evals, SparseDftb, warm-start from center q) ---"
+    );
     let h_sp = force_hessian(&coords, h, |xyz, a| {
-        eng.set_q(&q_center_sp).unwrap_or_else(|e| panic!("Gate G set_q dof {a}: {e}"));
-        eng.set_coords(xyz).unwrap_or_else(|e| panic!("Gate G set_coords dof {a}: {e}"));
-        eng.scc(80, 1e-5).unwrap_or_else(|err| panic!("Gate G sparse SCC at dof {a}: {err}"));
-        eng.forces().unwrap_or_else(|err| panic!("Gate G sparse F at dof {a}: {err}")).forces
+        eng.set_q(&q_center_sp)
+            .unwrap_or_else(|e| panic!("Gate G set_q dof {a}: {e}"));
+        eng.set_coords(xyz)
+            .unwrap_or_else(|e| panic!("Gate G set_coords dof {a}: {e}"));
+        eng.scc(80, 1e-5)
+            .unwrap_or_else(|err| panic!("Gate G sparse SCC at dof {a}: {err}"));
+        eng.forces()
+            .unwrap_or_else(|err| panic!("Gate G sparse F at dof {a}: {err}"))
+            .forces
     });
 
     eprintln!("  --- dense Hessian (30 analytic-F evals, warm-start from center q) ---");
@@ -320,7 +414,11 @@ fn test_gate_g_sih4_force_hessian_parity() {
             nsp += asp * asp;
             ndn += adn * adn;
         }
-        eprintln!("  ||H t_{axis}|| sparse={:.4e}  dense={:.4e}  (unit translation; study vs h/SCC)", nsp.sqrt(), ndn.sqrt());
+        eprintln!(
+            "  ||H t_{axis}|| sparse={:.4e}  dense={:.4e}  (unit translation; study vs h/SCC)",
+            nsp.sqrt(),
+            ndn.sqrt()
+        );
     }
 
     let out_dir = {
@@ -343,7 +441,9 @@ fn test_gate_g_sih4_force_hessian_parity() {
         let m = mac(&vec_sp, &vec_dn, i, i);
         eprintln!(
             "    {i:3}  {:+12.4e}  {:+12.4e}  {:+10.2e}  {m:.4}",
-            ev_sp[i], ev_dn[i], ev_sp[i] - ev_dn[i]
+            ev_sp[i],
+            ev_dn[i],
+            ev_sp[i] - ev_dn[i]
         );
     }
 
@@ -353,11 +453,17 @@ fn test_gate_g_sih4_force_hessian_parity() {
         let mut i1 = i0 + 1;
         while i1 < n_dof {
             let scale = ev_dn[i1 - 1].abs().max(ev_dn[i1].abs()).max(1e-4);
-            if (ev_dn[i1] - ev_dn[i1 - 1]).abs() / scale < 0.05 { i1 += 1; } else { break; }
+            if (ev_dn[i1] - ev_dn[i1 - 1]).abs() / scale < 0.05 {
+                i1 += 1;
+            } else {
+                break;
+            }
         }
         if i1 - i0 >= 2 {
             let ov = subspace_overlap(&vec_sp, &vec_dn, i0, i1);
-            eprintln!("  subspace [{i0}..{i1}) overlap={ov:.4}  (near-degenerate; do not pair by index)");
+            eprintln!(
+                "  subspace [{i0}..{i1}) overlap={ov:.4}  (near-degenerate; do not pair by index)"
+            );
         }
         i0 = i1;
     }
@@ -374,11 +480,18 @@ fn test_gate_g_sih4_force_hessian_parity() {
         eprintln!("    {i:3}  {a:9.1}  {b:9.1}  {:+8.1}", a - b);
     }
     eprintln!("  six smallest |λ| of H_sym (rigid leakage diagnostic, not 'n_unstable ≤ 6'):");
-    let mut abs_sp: Vec<(usize, f64)> = ev_sp.iter().enumerate().map(|(i, l)| (i, l.abs())).collect();
+    let mut abs_sp: Vec<(usize, f64)> = ev_sp
+        .iter()
+        .enumerate()
+        .map(|(i, l)| (i, l.abs()))
+        .collect();
     abs_sp.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
     for k in 0..6.min(n_dof) {
         let i = abs_sp[k].0;
-        eprintln!("    sparse λ[{i}]={:+.4e}   dense λ[{i}]={:+.4e}", ev_sp[i], ev_dn[i]);
+        eprintln!(
+            "    sparse λ[{i}]={:+.4e}   dense λ[{i}]={:+.4e}",
+            ev_sp[i], ev_dn[i]
+        );
     }
 
     // Honest asserts. Keep red if the physics disagrees. Do not symmetrize to kill η_asym.

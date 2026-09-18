@@ -60,7 +60,9 @@
 //! Dense_Multi_PBC.arch_notes.md (same task directory).
 
 use crate::core::error::{DftbError, Result};
-use crate::qmqm::gpu_hermitian::{render_hermitian_source, render_zmatrix_source, ZOP_H, ZOP_N, ZTILE_K, ZTILE_M, ZTILE_N};
+use crate::qmqm::gpu_hermitian::{
+    render_hermitian_source, render_zmatrix_source, ZOP_H, ZOP_N, ZTILE_K, ZTILE_M, ZTILE_N,
+};
 use crate::qmqm::gpu_runtime::{map_ocl_err, GpuRuntime};
 use ocl::prm::Float2;
 use ocl::{Buffer, Kernel};
@@ -71,12 +73,19 @@ fn max_finite_f32(xs: &[f32], ctx: &str) -> Result<f32> {
     let mut m = f32::NEG_INFINITY;
     for (i, &x) in xs.iter().enumerate() {
         if !x.is_finite() {
-            return Err(DftbError::InvalidInput(format!("{ctx}[{i}]={x} non-finite")));
+            return Err(DftbError::InvalidInput(format!(
+                "{ctx}[{i}]={x} non-finite"
+            )));
         }
-        if x > m { m = x; }
+        if x > m {
+            m = x;
+        }
     }
     if !m.is_finite() {
-        return Err(DftbError::InvalidInput(format!("{ctx}: no finite values (len={})", xs.len())));
+        return Err(DftbError::InvalidInput(format!(
+            "{ctx}: no finite values (len={})",
+            xs.len()
+        )));
     }
     Ok(m)
 }
@@ -92,7 +101,7 @@ pub struct GpuPbcPlan {
     n_atoms: usize,
     n_rep: usize,
     nk: usize,
-    n_sys: usize,               // n_rep * nk — flat (replica,k) count
+    n_sys: usize, // n_rep * nk — flat (replica,k) count
 
     // ---- complex [n_sys·nn] scratch ----
     h_scc: Buffer<Float2>,      // SCC Hamiltonian H(k)
@@ -107,24 +116,24 @@ pub struct GpuPbcPlan {
     s_v_scaled: Buffer<Float2>, // s_v·rsqrt(λ)
 
     // ---- real per-replica charge state ----
-    pub q_gpu: Buffer<f32>,     // [n_rep*n_atoms] current charges (committed)
-    dq: Buffer<f32>,            // [n_rep*n_atoms] Δq
-    v: Buffer<f32>,             // [n_rep*n_atoms] γ·Δq
-    pub q_new: Buffer<f32>,     // [n_rep*n_atoms] Mulliken output charges
-    q_next: Buffer<f32>,        // [n_rep*n_atoms] simple-mix buffer (mix path)
-    qk: Buffer<f32>,            // [n_sys*n_atoms] per-(rep,k) partial charges
+    pub q_gpu: Buffer<f32>, // [n_rep*n_atoms] current charges (committed)
+    dq: Buffer<f32>,        // [n_rep*n_atoms] Δq
+    v: Buffer<f32>,         // [n_rep*n_atoms] γ·Δq
+    pub q_new: Buffer<f32>, // [n_rep*n_atoms] Mulliken output charges
+    q_next: Buffer<f32>,    // [n_rep*n_atoms] simple-mix buffer (mix path)
+    qk: Buffer<f32>,        // [n_sys*n_atoms] per-(rep,k) partial charges
 
     // ---- real eigensolver state ----
-    eig_diag: Buffer<f32>,      // [n_sys*n] Re(diag hp) eigenvalues
-    occ_w: Buffer<f32>,         // [n_sys*n] occ weights = w_k·f_bk
-    pub mu_out: Buffer<f32>,    // [n_rep] shared chemical potential
-    lambda_min: Buffer<f32>,    // [n_sys] λ_min(S(k))
-    jacobi_diag: Buffer<f32>,   // [n_sys*4] {off, off/‖A‖_F, stop, sweeps}
-    pub active_r: Buffer<i32>,  // [n_rep] THE mask (flat kernels read [sid/nk])
-    ones_r: Buffer<i32>,        // [n_rep] all-ones — S-solve must never gate
-    rms: Buffer<f32>,           // [n_rep] residual RMS
-    kw: Buffer<f32>,            // [nk] k-point weights (Σ_k w_k = 1)
-    e_scal: Buffer<f64>,        // [n_rep*4] {e_band, mts, dq·v, q0·v}
+    eig_diag: Buffer<f32>,     // [n_sys*n] Re(diag hp) eigenvalues
+    occ_w: Buffer<f32>,        // [n_sys*n] occ weights = w_k·f_bk
+    pub mu_out: Buffer<f32>,   // [n_rep] shared chemical potential
+    lambda_min: Buffer<f32>,   // [n_sys] λ_min(S(k))
+    jacobi_diag: Buffer<f32>,  // [n_sys*4] {off, off/‖A‖_F, stop, sweeps}
+    pub active_r: Buffer<i32>, // [n_rep] THE mask (flat kernels read [sid/nk])
+    ones_r: Buffer<i32>,       // [n_rep] all-ones — S-solve must never gate
+    rms: Buffer<f32>,          // [n_rep] residual RMS
+    kw: Buffer<f32>,           // [nk] k-point weights (Σ_k w_k = 1)
+    e_scal: Buffer<f64>,       // [n_rep*4] {e_band, mts, dq·v, q0·v}
 
     // ---- DIIS (per replica — real kernels from gpu_matrix_ops.cl) ----
     pub diis_q_hist: Buffer<f32>,
@@ -138,12 +147,12 @@ pub struct GpuPbcPlan {
     pub diis_max_hist: usize,
 
     // ---- host mirrors ----
-    pub rms_host: Vec<f32>,          // [n_rep]
-    pub active_host: Vec<i32>,       // [n_rep]
-    pub e_scal_host: Vec<f64>,       // [n_rep*4]
-    eig_diag_host: Vec<f32>,         // [n_sys*n]
-    lambda_min_host: Vec<f32>,       // [n_sys]
-    jacobi_diag_h: Vec<f32>,         // [n_sys*4]
+    pub rms_host: Vec<f32>,    // [n_rep]
+    pub active_host: Vec<i32>, // [n_rep]
+    pub e_scal_host: Vec<f64>, // [n_rep*4]
+    eig_diag_host: Vec<f32>,   // [n_sys*n]
+    lambda_min_host: Vec<f32>, // [n_sys]
+    jacobi_diag_h: Vec<f32>,   // [n_sys*4]
 
     // ---- prebuilt kernels (bound once at construction) ----
     k_zdq_v: Kernel,        // zdq_v_batched
@@ -170,8 +179,8 @@ pub struct GpuPbcPlan {
     k_energy_tail: Kernel,  // zkpoint_energy_tail_batched
 
     // ---- per-solve scalars ----
-    n_occ: f32,             // occupied-band equivalents per cell
-    pub kT: f32,            // Fermi smearing kT (Hartree); 0 → integer occ
+    n_occ: f32,  // occupied-band equivalents per cell
+    pub kT: f32, // Fermi smearing kT (Hartree); 0 → integer occ
     /// f64 scalar rotation construction in the Hermitian Jacobi
     /// (HJ_ROT_FP64). Default on — it is off the throughput path; the f32
     /// variant exists for A/B measurement like the real kernel's prec=0.
@@ -210,7 +219,8 @@ impl GpuPbcPlan {
         }
         if kw.len() != nk {
             return Err(DftbError::InvalidInput(format!(
-                "GpuPbcPlan::new: kw len {} != nk {nk}", kw.len()
+                "GpuPbcPlan::new: kw len {} != nk {nk}",
+                kw.len()
             )));
         }
         let wsum: f64 = kw.iter().map(|&w| w as f64).sum();
@@ -249,6 +259,9 @@ impl GpuPbcPlan {
         let jacobi_diag = rt.zero_buffer::<f32>(n_sys * 4)?;
         let active_r = rt.buffer_from_slice(&vec![1i32; n_rep])?;
         let ones_r = rt.buffer_from_slice(&vec![1i32; n_rep])?;
+        // T06 Phase A: shared gpu_matrix_ops kernels now take a launch-domain
+        // work_ids — the PBC plan's domain is n_rep replicas (identity).
+        let wids = rt.buffer_from_slice(&(0..n_rep as i32).collect::<Vec<_>>())?;
         let rms = rt.zero_buffer::<f32>(n_rep)?;
         let kw_buf = rt.buffer_from_slice(kw)?;
         let e_scal = rt.zero_buffer::<f64>(n_rep * 4)?;
@@ -273,9 +286,9 @@ impl GpuPbcPlan {
         let hsrc = render_hermitian_source(wg_jacobi, rot_fp64);
         let h_prog = rt.build_program(&hsrc)?;
         let z_prog = rt.build_program(&render_zmatrix_source())?;
-        let mat_prog = rt.build_program(MATRIX_KERNEL_TEMPLATE)?;   // real kernels (DIIS etc.)
-        // DIIS_MAX_HIST specialization (same as GpuSccPlan — private arrays
-        // in the kernel are compile-time sized).
+        let mat_prog = rt.build_program(MATRIX_KERNEL_TEMPLATE)?; // real kernels (DIIS etc.)
+                                                                  // DIIS_MAX_HIST specialization (same as GpuSccPlan — private arrays
+                                                                  // in the kernel are compile-time sized).
         let diis_src = MATRIX_KERNEL_TEMPLATE.replace(
             "#ifndef DIIS_MAX_HIST\n#define DIIS_MAX_HIST 10\n#endif",
             &format!("#define DIIS_MAX_HIST {diis_max_hist}"),
@@ -287,23 +300,42 @@ impl GpuPbcPlan {
         // zdq_v_batched: [0]n_atoms [1]n_rep [2]q [3]q0 [4]G [5]dq [6]V [7]ldq [8]active
         let wg_rep = 256usize;
         let k_zdq_v = Kernel::builder()
-            .program(&z_prog).name("zdq_v_batched").queue(rt.queue().clone())
-            .global_work_size(n_rep * wg_rep).local_work_size(wg_rep)
-            .arg(n_atoms as i32).arg(n_rep as i32)
-            .arg(&q_gpu).arg(q0_buf).arg(g_buf)
-            .arg(&dq).arg(&v)
+            .program(&z_prog)
+            .name("zdq_v_batched")
+            .queue(rt.queue().clone())
+            .global_work_size(n_rep * wg_rep)
+            .local_work_size(wg_rep)
+            .arg(n_atoms as i32)
+            .arg(n_rep as i32)
+            .arg(&q_gpu)
+            .arg(q0_buf)
+            .arg(g_buf)
+            .arg(&dq)
+            .arg(&v)
             .arg_local::<f32>(n_atoms)
             .arg(&active_r)
-            .build().map_err(map_ocl_err)?;
+            .build()
+            .map_err(map_ocl_err)?;
 
         // zhscc_batched: [0]n [1]n_atoms [2]batch [3]nk [4]H0 [5]S [6]V [7]orb_atom [8]H [9]active
         let k_zhscc = Kernel::builder()
-            .program(&z_prog).name("zhscc_batched").queue(rt.queue().clone())
-            .global_work_size(n_sys * wg_rep).local_work_size(wg_rep)
-            .arg(n as i32).arg(n_atoms as i32).arg(n_sys as i32).arg(nk as i32)
-            .arg(h0_buf).arg(s_buf).arg(&v).arg(orb_atom_buf).arg(&h_scc)
+            .program(&z_prog)
+            .name("zhscc_batched")
+            .queue(rt.queue().clone())
+            .global_work_size(n_sys * wg_rep)
+            .local_work_size(wg_rep)
+            .arg(n as i32)
+            .arg(n_atoms as i32)
+            .arg(n_sys as i32)
+            .arg(nk as i32)
+            .arg(h0_buf)
+            .arg(s_buf)
+            .arg(&v)
+            .arg(orb_atom_buf)
+            .arg(&h_scc)
             .arg(&active_r)
-            .build().map_err(map_ocl_err)?;
+            .build()
+            .map_err(map_ocl_err)?;
 
         // zgemm_active_batched: [0]n [1]batch [2]op_a [3]op_b [4]alpha [5]beta
         //   [6]A [7]B [8]C [9]As [10]Bs [11]nk [12]active
@@ -311,39 +343,66 @@ impl GpuPbcPlan {
         let cg = (n + ZTILE_N - 1) / ZTILE_N;
         let gws = ocl::SpatialDims::Three(cg * ZTILE_N, rg * ZTILE_M, n_sys);
         let lws = ocl::SpatialDims::Two(ZTILE_N, ZTILE_M);
-        let mk_zgemm = |prog: &ocl::Program, op_a: i32, op_b: i32,
-                        a: &Buffer<Float2>, b: &Buffer<Float2>, cbuf: &Buffer<Float2>,
-                        act: &Buffer<i32>| -> Result<Kernel> {
+        let mk_zgemm = |prog: &ocl::Program,
+                        op_a: i32,
+                        op_b: i32,
+                        a: &Buffer<Float2>,
+                        b: &Buffer<Float2>,
+                        cbuf: &Buffer<Float2>,
+                        act: &Buffer<i32>|
+         -> Result<Kernel> {
             Kernel::builder()
-                .program(prog).name("zgemm_active_batched").queue(rt.queue().clone())
-                .global_work_size(gws.clone()).local_work_size(lws.clone())
-                .arg(n as i32).arg(n_sys as i32)
-                .arg(op_a).arg(op_b).arg(1.0f32).arg(0.0f32)
-                .arg(a).arg(b).arg(cbuf)
+                .program(prog)
+                .name("zgemm_active_batched")
+                .queue(rt.queue().clone())
+                .global_work_size(gws.clone())
+                .local_work_size(lws.clone())
+                .arg(n as i32)
+                .arg(n_sys as i32)
+                .arg(op_a)
+                .arg(op_b)
+                .arg(1.0f32)
+                .arg(0.0f32)
+                .arg(a)
+                .arg(b)
+                .arg(cbuf)
                 .arg_local::<Float2>(ZTILE_M * ZTILE_K)
                 .arg_local::<Float2>(ZTILE_N * (ZTILE_K + 1))
-                .arg(nk as i32).arg(act)
-                .build().map_err(map_ocl_err)
+                .arg(nk as i32)
+                .arg(act)
+                .build()
+                .map_err(map_ocl_err)
         };
-        let k_zxh = mk_zgemm(&z_prog, ZOP_H, ZOP_N, &x_buf, &h_scc, &temp, &active_r)?;      // temp = X†·H_scc
-        let k_ztx = mk_zgemm(&z_prog, ZOP_N, ZOP_N, &temp, &x_buf, &hp, &active_r)?;         // hp = temp·X
-        let k_zxc = mk_zgemm(&z_prog, ZOP_N, ZOP_N, &x_buf, &cp, &c, &active_r)?;            // c = X·cp
-        let k_zxh_warm = mk_zgemm(&z_prog, ZOP_H, ZOP_N, &c, &h_scc, &temp, &active_r)?;     // temp = C†·H_scc
-        let k_ztx_warm = mk_zgemm(&z_prog, ZOP_N, ZOP_N, &temp, &c, &hp, &active_r)?;        // hp = temp·C
-        let k_zsc = mk_zgemm(&z_prog, ZOP_N, ZOP_N, s_buf, &c, &sc, &active_r)?;             // sc = S·c
+        let k_zxh = mk_zgemm(&z_prog, ZOP_H, ZOP_N, &x_buf, &h_scc, &temp, &active_r)?; // temp = X†·H_scc
+        let k_ztx = mk_zgemm(&z_prog, ZOP_N, ZOP_N, &temp, &x_buf, &hp, &active_r)?; // hp = temp·X
+        let k_zxc = mk_zgemm(&z_prog, ZOP_N, ZOP_N, &x_buf, &cp, &c, &active_r)?; // c = X·cp
+        let k_zxh_warm = mk_zgemm(&z_prog, ZOP_H, ZOP_N, &c, &h_scc, &temp, &active_r)?; // temp = C†·H_scc
+        let k_ztx_warm = mk_zgemm(&z_prog, ZOP_N, ZOP_N, &temp, &c, &hp, &active_r)?; // hp = temp·C
+        let k_zsc = mk_zgemm(&z_prog, ZOP_N, ZOP_N, s_buf, &c, &sc, &active_r)?; // sc = S·c
         let k_s_xgemm = mk_zgemm(&z_prog, ZOP_N, ZOP_H, &s_v_scaled, &s_v, &x_buf, &ones_r)?; // X = Vs·V†
 
         // Hermitian Jacobi: [0]A [1]V [2]n [3]batch [4]init_v [5]nk [6]active [7]diag
-        let mk_zjacobi = |a: &Buffer<Float2>, v: &Buffer<Float2>, init_v: i32,
-                        act: &Buffer<i32>| -> Result<Kernel> {
+        let mk_zjacobi = |a: &Buffer<Float2>,
+                          v: &Buffer<Float2>,
+                          init_v: i32,
+                          act: &Buffer<i32>|
+         -> Result<Kernel> {
             Kernel::builder()
-                .program(&h_prog).name("jacobi_hermitian_cyclic_global_batched")
+                .program(&h_prog)
+                .name("jacobi_hermitian_cyclic_global_batched")
                 .queue(rt.queue().clone())
-                .global_work_size(n_sys * wg_jacobi).local_work_size(wg_jacobi)
-                .arg(a).arg(v)
-                .arg(n as i32).arg(n_sys as i32).arg(init_v).arg(nk as i32)
-                .arg(act).arg(&jacobi_diag)
-                .build().map_err(map_ocl_err)
+                .global_work_size(n_sys * wg_jacobi)
+                .local_work_size(wg_jacobi)
+                .arg(a)
+                .arg(v)
+                .arg(n as i32)
+                .arg(n_sys as i32)
+                .arg(init_v)
+                .arg(nk as i32)
+                .arg(act)
+                .arg(&jacobi_diag)
+                .build()
+                .map_err(map_ocl_err)
         };
         let k_zjacobi = mk_zjacobi(&hp, &cp, 0, &active_r)?;
         let k_zjacobi_warm = mk_zjacobi(&hp, &c, 1, &active_r)?;
@@ -353,83 +412,159 @@ impl GpuPbcPlan {
         let total_diag = n * n_sys;
         let gws_diag = ((total_diag + 63) / 64) * 64;
         let k_zextract = Kernel::builder()
-            .program(&z_prog).name("zextract_diagonal_batched").queue(rt.queue().clone())
-            .global_work_size(gws_diag).local_work_size(64)
-            .arg(n as i32).arg(n_sys as i32).arg(nk as i32)
-            .arg(&hp).arg(&eig_diag).arg(&active_r)
-            .build().map_err(map_ocl_err)?;
+            .program(&z_prog)
+            .name("zextract_diagonal_batched")
+            .queue(rt.queue().clone())
+            .global_work_size(gws_diag)
+            .local_work_size(64)
+            .arg(n as i32)
+            .arg(n_sys as i32)
+            .arg(nk as i32)
+            .arg(&hp)
+            .arg(&eig_diag)
+            .arg(&active_r)
+            .build()
+            .map_err(map_ocl_err)?;
 
         // kpoint_occ_batched: [0]n [1]nk [2]n_rep [3]n_occ [4]kT [5]eig [6]kw
         //   [7]occ_w [8]mu [9]e_scal [10]le [11]red [12]red2 [13]lohi [14]active
         let wg_occ = 256usize;
         let k_kocc = Kernel::builder()
-            .program(&z_prog).name("kpoint_occ_batched").queue(rt.queue().clone())
-            .global_work_size(n_rep * wg_occ).local_work_size(wg_occ)
-            .arg(n as i32).arg(nk as i32).arg(n_rep as i32)
-            .arg(0.0f32).arg(0.0f32)                     // n_occ, kT — bind_solve_params
-            .arg(&eig_diag).arg(&kw_buf).arg(&occ_w).arg(&mu_out).arg(&e_scal)
-            .arg_local::<f32>(nk * n).arg_local::<f64>(wg_occ).arg_local::<f64>(wg_occ).arg_local::<f64>(4)
+            .program(&z_prog)
+            .name("kpoint_occ_batched")
+            .queue(rt.queue().clone())
+            .global_work_size(n_rep * wg_occ)
+            .local_work_size(wg_occ)
+            .arg(n as i32)
+            .arg(nk as i32)
+            .arg(n_rep as i32)
+            .arg(0.0f32)
+            .arg(0.0f32) // n_occ, kT — bind_solve_params
+            .arg(&eig_diag)
+            .arg(&kw_buf)
+            .arg(&occ_w)
+            .arg(&mu_out)
+            .arg(&e_scal)
+            .arg_local::<f32>(nk * n)
+            .arg_local::<f64>(wg_occ)
+            .arg_local::<f64>(wg_occ)
+            .arg_local::<f64>(4)
             .arg(&active_r)
-            .build().map_err(map_ocl_err)?;
+            .build()
+            .map_err(map_ocl_err)?;
 
         // zsc_mulliken_batched: [0]n [1]n_atoms [2]batch [3]nk [4]C [5]SC
         //   [6]occ_w [7]orb_atom [8]qk [9]diag [10]active
         let wg_mull = n.max(n_atoms).min(256).max(1);
         let k_zmull = Kernel::builder()
-            .program(&z_prog).name("zsc_mulliken_batched").queue(rt.queue().clone())
-            .global_work_size(n_sys * wg_mull).local_work_size(wg_mull)
-            .arg(n as i32).arg(n_atoms as i32).arg(n_sys as i32).arg(nk as i32)
-            .arg(&c).arg(&sc).arg(&occ_w).arg(orb_atom_buf).arg(&qk)
+            .program(&z_prog)
+            .name("zsc_mulliken_batched")
+            .queue(rt.queue().clone())
+            .global_work_size(n_sys * wg_mull)
+            .local_work_size(wg_mull)
+            .arg(n as i32)
+            .arg(n_atoms as i32)
+            .arg(n_sys as i32)
+            .arg(nk as i32)
+            .arg(&c)
+            .arg(&sc)
+            .arg(&occ_w)
+            .arg(orb_atom_buf)
+            .arg(&qk)
             .arg_local::<f32>(n)
             .arg(&active_r)
-            .build().map_err(map_ocl_err)?;
+            .build()
+            .map_err(map_ocl_err)?;
 
         // kpoint_qreduce_batched: [0]n_atoms [1]nk [2]n_rep [3]qk [4]q_new [5]active
         let k_qreduce = Kernel::builder()
-            .program(&z_prog).name("kpoint_qreduce_batched").queue(rt.queue().clone())
-            .global_work_size(n_rep * wg_rep).local_work_size(wg_rep)
-            .arg(n_atoms as i32).arg(nk as i32).arg(n_rep as i32)
-            .arg(&qk).arg(&q_new).arg(&active_r)
-            .build().map_err(map_ocl_err)?;
+            .program(&z_prog)
+            .name("kpoint_qreduce_batched")
+            .queue(rt.queue().clone())
+            .global_work_size(n_rep * wg_rep)
+            .local_work_size(wg_rep)
+            .arg(n_atoms as i32)
+            .arg(nk as i32)
+            .arg(n_rep as i32)
+            .arg(&qk)
+            .arg(&q_new)
+            .arg(&active_r)
+            .build()
+            .map_err(map_ocl_err)?;
 
         // zsnormalize_batched: [0]n [1]batch [2]nk [3]C [4]S [5]loc [6]active — per (sid,col)
         let wg_sn = 128usize;
         let k_zsnorm = Kernel::builder()
-            .program(&z_prog).name("zsnormalize_batched").queue(rt.queue().clone())
-            .global_work_size(n_sys * n * wg_sn).local_work_size(wg_sn)
-            .arg(n as i32).arg(n_sys as i32).arg(nk as i32)
-            .arg(&c).arg(s_buf)
-            .arg_local::<Float2>(n + wg_sn)   // t_s[n] float2 + red[wg] floats (8B slots cover it)
+            .program(&z_prog)
+            .name("zsnormalize_batched")
+            .queue(rt.queue().clone())
+            .global_work_size(n_sys * n * wg_sn)
+            .local_work_size(wg_sn)
+            .arg(n as i32)
+            .arg(n_sys as i32)
+            .arg(nk as i32)
+            .arg(&c)
+            .arg(s_buf)
+            .arg_local::<Float2>(n + wg_sn) // t_s[n] float2 + red[wg] floats (8B slots cover it)
             .arg(&active_r)
-            .build().map_err(map_ocl_err)?;
+            .build()
+            .map_err(map_ocl_err)?;
 
         // zscale_eigenvectors_batched: [0]n [1]batch [2]nk [3]A [4]V [5]Vs [6]lmin [7]active
         let k_s_scale = Kernel::builder()
-            .program(&z_prog).name("zscale_eigenvectors_batched").queue(rt.queue().clone())
-            .global_work_size(n_sys * wg_rep).local_work_size(wg_rep)
-            .arg(n as i32).arg(n_sys as i32).arg(nk as i32)
-            .arg(&s_work).arg(&s_v).arg(&s_v_scaled).arg(&lambda_min)
+            .program(&z_prog)
+            .name("zscale_eigenvectors_batched")
+            .queue(rt.queue().clone())
+            .global_work_size(n_sys * wg_rep)
+            .local_work_size(wg_rep)
+            .arg(n as i32)
+            .arg(n_sys as i32)
+            .arg(nk as i32)
+            .arg(&s_work)
+            .arg(&s_v)
+            .arg(&s_v_scaled)
+            .arg(&lambda_min)
             .arg(&ones_r)
-            .build().map_err(map_ocl_err)?;
+            .build()
+            .map_err(map_ocl_err)?;
 
         // ---- real DIIS/mix kernels reused with batch = n_rep ----
         // residual_and_mix_batched: [0]n_atoms [1]batch [2]alpha [3]q_new
         //   [4]q_old [5]q_mixed [6]rms [7]active [8]scratch
         let k_residual_mix = Kernel::builder()
-            .program(&mat_prog).name("residual_and_mix_batched").queue(rt.queue().clone())
-            .global_work_size(n_rep * wg_rep).local_work_size(wg_rep)
-            .arg(n_atoms as i32).arg(n_rep as i32).arg(0.3f32)
-            .arg(&q_new).arg(&q_gpu).arg(&q_next).arg(&rms).arg(&active_r)
+            .program(&mat_prog)
+            .name("residual_and_mix_batched")
+            .queue(rt.queue().clone())
+            .global_work_size(n_rep * wg_rep)
+            .local_work_size(wg_rep)
+            .arg(n_atoms as i32)
+            .arg(n_rep as i32)
+            .arg(0.3f32)
+            .arg(&q_new)
+            .arg(&q_gpu)
+            .arg(&q_next)
+            .arg(&rms)
+            .arg(&active_r)
             .arg_local::<f32>(wg_rep)
-            .build().map_err(map_ocl_err)?;
+            .arg(&wids)
+            .build()
+            .map_err(map_ocl_err)?;
 
         // commit_q_batched: [0]n_atoms [1]batch [2]q_next [3]q [4]active
         let k_commit = Kernel::builder()
-            .program(&mat_prog).name("commit_q_batched").queue(rt.queue().clone())
-            .global_work_size(n_rep * wg_rep).local_work_size(wg_rep)
-            .arg(n_atoms as i32).arg(n_rep as i32)
-            .arg(&q_next).arg(&q_gpu).arg(&active_r)
-            .build().map_err(map_ocl_err)?;
+            .program(&mat_prog)
+            .name("commit_q_batched")
+            .queue(rt.queue().clone())
+            .global_work_size(n_rep * wg_rep)
+            .local_work_size(wg_rep)
+            .arg(n_atoms as i32)
+            .arg(n_rep as i32)
+            .arg(&q_next)
+            .arg(&q_gpu)
+            .arg(&active_r)
+            .arg(&wids)
+            .build()
+            .map_err(map_ocl_err)?;
 
         // diis_step_batched: [0]n_atoms [1]batch [2]alpha [3]q_new [4]q_old [5]q0
         //   [6]q_next(→q_gpu in place) [7]dq_hist [8]r_hist [9]buf_idx [10]n_filled
@@ -437,53 +572,131 @@ impl GpuPbcPlan {
         //   [17]scratch [18]diis_work
         let wg_diis = 256usize;
         let k_diis = Kernel::builder()
-            .program(&diis_prog).name("diis_step_batched").queue(rt.queue().clone())
-            .global_work_size(n_rep * wg_diis).local_work_size(wg_diis)
-            .arg(n_atoms as i32).arg(n_rep as i32).arg(0.3f32)
-            .arg(&q_new).arg(&q_gpu).arg(q0_buf).arg(&q_gpu)
-            .arg(&diis_q_hist).arg(&diis_r_hist)
-            .arg(&diis_buf_idx).arg(&diis_n_filled)
+            .program(&diis_prog)
+            .name("diis_step_batched")
+            .queue(rt.queue().clone())
+            .global_work_size(n_rep * wg_diis)
+            .local_work_size(wg_diis)
+            .arg(n_atoms as i32)
+            .arg(n_rep as i32)
+            .arg(0.3f32)
+            .arg(&q_new)
+            .arg(&q_gpu)
+            .arg(q0_buf)
+            .arg(&q_gpu)
+            .arg(&diis_q_hist)
+            .arg(&diis_r_hist)
+            .arg(&diis_buf_idx)
+            .arg(&diis_n_filled)
             .arg(&diis_coeffs)
-            .arg(&diis_flag).arg(&diis_reason)
-            .arg(&rms).arg(&active_r)
-            .arg(0.0f32)   // rms_tol — bind_mix_params
+            .arg(&diis_flag)
+            .arg(&diis_reason)
+            .arg(&rms)
+            .arg(&active_r)
+            .arg(0.0f32) // rms_tol — bind_mix_params
             .arg_local::<f32>(wg_diis)
             .arg(&diis_work)
-            .build().map_err(map_ocl_err)?;
+            .arg(&wids)
+            .build()
+            .map_err(map_ocl_err)?;
 
         // zkpoint_energy_tail_batched: [0]n_atoms [1]n_rep [2]dq [3]q0 [4]v
         //   [5]e_scal [6]red [7]red2 [8]active
         let k_energy_tail = Kernel::builder()
-            .program(&z_prog).name("zkpoint_energy_tail_batched").queue(rt.queue().clone())
-            .global_work_size(n_rep * wg_rep).local_work_size(wg_rep)
-            .arg(n_atoms as i32).arg(n_rep as i32)
-            .arg(&dq).arg(q0_buf).arg(&v).arg(&e_scal)
-            .arg_local::<f64>(wg_rep).arg_local::<f64>(wg_rep)
+            .program(&z_prog)
+            .name("zkpoint_energy_tail_batched")
+            .queue(rt.queue().clone())
+            .global_work_size(n_rep * wg_rep)
+            .local_work_size(wg_rep)
+            .arg(n_atoms as i32)
+            .arg(n_rep as i32)
+            .arg(&dq)
+            .arg(q0_buf)
+            .arg(&v)
+            .arg(&e_scal)
+            .arg_local::<f64>(wg_rep)
+            .arg_local::<f64>(wg_rep)
             .arg(&active_r)
-            .build().map_err(map_ocl_err)?;
+            .build()
+            .map_err(map_ocl_err)?;
 
         let mut plan = Self {
-            n, n_atoms, n_rep, nk, n_sys,
-            h_scc, temp, hp, cp, c, sc, x_buf, s_work, s_v, s_v_scaled,
-            q_gpu, dq, v, q_new, q_next, qk,
-            eig_diag, occ_w, mu_out, lambda_min, jacobi_diag, active_r, ones_r, rms, kw: kw_buf, e_scal,
-            diis_q_hist, diis_r_hist, diis_buf_idx, diis_n_filled,
-            diis_coeffs, diis_flag, diis_reason, diis_work, diis_max_hist,
+            n,
+            n_atoms,
+            n_rep,
+            nk,
+            n_sys,
+            h_scc,
+            temp,
+            hp,
+            cp,
+            c,
+            sc,
+            x_buf,
+            s_work,
+            s_v,
+            s_v_scaled,
+            q_gpu,
+            dq,
+            v,
+            q_new,
+            q_next,
+            qk,
+            eig_diag,
+            occ_w,
+            mu_out,
+            lambda_min,
+            jacobi_diag,
+            active_r,
+            ones_r,
+            rms,
+            kw: kw_buf,
+            e_scal,
+            diis_q_hist,
+            diis_r_hist,
+            diis_buf_idx,
+            diis_n_filled,
+            diis_coeffs,
+            diis_flag,
+            diis_reason,
+            diis_work,
+            diis_max_hist,
             rms_host: vec![0.0; n_rep],
             active_host: vec![1; n_rep],
             e_scal_host: vec![0.0; n_rep * 4],
             eig_diag_host: vec![0.0; n_sys * n],
             lambda_min_host: vec![0.0; n_sys],
             jacobi_diag_h: vec![0.0; n_sys * 4],
-            k_zdq_v, k_zhscc,
-            k_zxh, k_ztx, k_zxc, k_zxh_warm, k_ztx_warm, k_zsc,
-            k_zjacobi, k_zjacobi_warm, k_zextract, k_kocc, k_zmull, k_qreduce,
-            k_zsnorm, k_s_jacobi, k_s_scale, k_s_xgemm,
-            k_diis, k_residual_mix, k_commit, k_energy_tail,
-            n_occ: 0.0, kT: 0.0, rot_fp64, b_warm: false,
+            k_zdq_v,
+            k_zhscc,
+            k_zxh,
+            k_ztx,
+            k_zxc,
+            k_zxh_warm,
+            k_ztx_warm,
+            k_zsc,
+            k_zjacobi,
+            k_zjacobi_warm,
+            k_zextract,
+            k_kocc,
+            k_zmull,
+            k_qreduce,
+            k_zsnorm,
+            k_s_jacobi,
+            k_s_scale,
+            k_s_xgemm,
+            k_diis,
+            k_residual_mix,
+            k_commit,
+            k_energy_tail,
+            n_occ: 0.0,
+            kT: 0.0,
+            rot_fp64,
+            b_warm: false,
         };
-        plan.set_geometry(rt, s_buf)
-            .map_err(|e| DftbError::InvalidInput(format!("GpuPbcPlan::new initial X=S^{{-1/2}}: {e}")))?;
+        plan.set_geometry(rt, s_buf).map_err(|e| {
+            DftbError::InvalidInput(format!("GpuPbcPlan::new initial X=S^{{-1/2}}: {e}"))
+        })?;
         Ok(plan)
     }
 
@@ -506,7 +719,9 @@ impl GpuPbcPlan {
     pub fn bind_mix_params(&mut self, alpha: f32, rms_tol: f32) -> Result<()> {
         self.k_diis.set_arg(2u32, alpha).map_err(map_ocl_err)?;
         self.k_diis.set_arg(16u32, rms_tol).map_err(map_ocl_err)?;
-        self.k_residual_mix.set_arg(2u32, alpha).map_err(map_ocl_err)?;
+        self.k_residual_mix
+            .set_arg(2u32, alpha)
+            .map_err(map_ocl_err)?;
         Ok(())
     }
 
@@ -520,7 +735,7 @@ impl GpuPbcPlan {
     /// AO basis is also dropped: it is not S(k_new)-orthonormal).
     /// Fails loud on λ_min ≤ 1e-6 or a Jacobi stop ≠ 0.
     pub fn set_geometry(&mut self, rt: &mut GpuRuntime, s_buf: &Buffer<Float2>) -> Result<()> {
-        self.b_warm = false;   // warm basis is not S_new-orthonormal — cold next solve
+        self.b_warm = false; // warm basis is not S_new-orthonormal — cold next solve
         rt.copy_into(s_buf, &self.s_work, self.n_sys * self.n * self.n)
             .map_err(|e| DftbError::InvalidInput(format!("S→s_work copy for S^{{-1/2}}: {e}")))?;
         unsafe {
@@ -550,18 +765,20 @@ impl GpuPbcPlan {
     fn eigh_solve(&mut self) -> Result<()> {
         if self.b_warm {
             unsafe {
-                self.k_zxh_warm.enq().map_err(map_ocl_err)?;   // temp = C†·H_scc
-                self.k_ztx_warm.enq().map_err(map_ocl_err)?;   // hp = temp·C
+                self.k_zxh_warm.enq().map_err(map_ocl_err)?; // temp = C†·H_scc
+                self.k_ztx_warm.enq().map_err(map_ocl_err)?; // hp = temp·C
                 self.k_zjacobi_warm.enq().map_err(map_ocl_err)?; // rotate c in place
             }
         } else {
             unsafe {
-                self.k_zxh.enq().map_err(map_ocl_err)?;        // temp = X†·H_scc
-                self.k_ztx.enq().map_err(map_ocl_err)?;        // hp = temp·X
-                self.k_zjacobi.enq().map_err(map_ocl_err)?;    // V=I → cp
+                self.k_zxh.enq().map_err(map_ocl_err)?; // temp = X†·H_scc
+                self.k_ztx.enq().map_err(map_ocl_err)?; // hp = temp·X
+                self.k_zjacobi.enq().map_err(map_ocl_err)?; // V=I → cp
             }
         }
-        unsafe { self.k_zextract.enq().map_err(map_ocl_err)?; }  // eig_diag = Re(diag hp)
+        unsafe {
+            self.k_zextract.enq().map_err(map_ocl_err)?;
+        } // eig_diag = Re(diag hp)
         Ok(())
     }
 
@@ -570,9 +787,13 @@ impl GpuPbcPlan {
     /// rotated c (f32 drift repair, same role as real snormalize).
     fn eigh_finish(&mut self) -> Result<()> {
         if self.b_warm {
-            unsafe { self.k_zsnorm.enq().map_err(map_ocl_err)?; }
+            unsafe {
+                self.k_zsnorm.enq().map_err(map_ocl_err)?;
+            }
         } else {
-            unsafe { self.k_zxc.enq().map_err(map_ocl_err)?; }
+            unsafe {
+                self.k_zxc.enq().map_err(map_ocl_err)?;
+            }
             self.b_warm = true;
         }
         Ok(())
@@ -583,26 +804,40 @@ impl GpuPbcPlan {
     /// nonfinite; all flat-system kernels see it via active[sid/nk].
     /// Requires `bind_solve_params` + `bind_mix_params` to have run.
     pub fn scc_step_diis_enq(&mut self, rt: &mut GpuRuntime) -> Result<()> {
-        unsafe { self.k_zdq_v.enq().map_err(map_ocl_err)?; }    // dq, V (rep grid)
+        unsafe {
+            self.k_zdq_v.enq().map_err(map_ocl_err)?;
+        } // dq, V (rep grid)
         rt.prof_tick("pbc.dq_v");
-        unsafe { self.k_zhscc.enq().map_err(map_ocl_err)?; }    // H_scc (flat)
+        unsafe {
+            self.k_zhscc.enq().map_err(map_ocl_err)?;
+        } // H_scc (flat)
         rt.prof_tick("pbc.hscc");
 
-        self.eigh_solve()?;                                     // Jacobi (flat)
+        self.eigh_solve()?; // Jacobi (flat)
         rt.prof_tick("pbc.jacobi");
 
-        unsafe { self.k_kocc.enq().map_err(map_ocl_err)?; }     // shared-μ occ (rep grid)
+        unsafe {
+            self.k_kocc.enq().map_err(map_ocl_err)?;
+        } // shared-μ occ (rep grid)
         rt.prof_tick("pbc.kocc");
 
-        self.eigh_finish()?;                                    // warm renorm / cold X·cp
+        self.eigh_finish()?; // warm renorm / cold X·cp
         rt.prof_tick("pbc.eigh_finish");
 
-        unsafe { self.k_zsc.enq().map_err(map_ocl_err)?; }      // sc = S·c
-        unsafe { self.k_zmull.enq().map_err(map_ocl_err)?; }    // qk (flat)
-        unsafe { self.k_qreduce.enq().map_err(map_ocl_err)?; }  // q_new (rep)
+        unsafe {
+            self.k_zsc.enq().map_err(map_ocl_err)?;
+        } // sc = S·c
+        unsafe {
+            self.k_zmull.enq().map_err(map_ocl_err)?;
+        } // qk (flat)
+        unsafe {
+            self.k_qreduce.enq().map_err(map_ocl_err)?;
+        } // q_new (rep)
         rt.prof_tick("pbc.mulliken");
 
-        unsafe { self.k_diis.enq().map_err(map_ocl_err)?; }     // DIIS + commit in place
+        unsafe {
+            self.k_diis.enq().map_err(map_ocl_err)?;
+        } // DIIS + commit in place
         rt.prof_tick("pbc.diis");
         Ok(())
     }
@@ -610,22 +845,44 @@ impl GpuPbcPlan {
     /// Same pipeline ending in simple mixing (residual_and_mix + commit) —
     /// the non-DIIS reference path.
     pub fn scc_step_enq(&mut self, rt: &mut GpuRuntime) -> Result<()> {
-        unsafe { self.k_zdq_v.enq().map_err(map_ocl_err)?; }
-        unsafe { self.k_zhscc.enq().map_err(map_ocl_err)?; }
+        unsafe {
+            self.k_zdq_v.enq().map_err(map_ocl_err)?;
+        }
+        unsafe {
+            self.k_zhscc.enq().map_err(map_ocl_err)?;
+        }
         self.eigh_solve()?;
-        unsafe { self.k_kocc.enq().map_err(map_ocl_err)?; }
+        unsafe {
+            self.k_kocc.enq().map_err(map_ocl_err)?;
+        }
         self.eigh_finish()?;
-        unsafe { self.k_zsc.enq().map_err(map_ocl_err)?; }
-        unsafe { self.k_zmull.enq().map_err(map_ocl_err)?; }
-        unsafe { self.k_qreduce.enq().map_err(map_ocl_err)?; }
-        unsafe { self.k_residual_mix.enq().map_err(map_ocl_err)?; }
-        unsafe { self.k_commit.enq().map_err(map_ocl_err)?; }
+        unsafe {
+            self.k_zsc.enq().map_err(map_ocl_err)?;
+        }
+        unsafe {
+            self.k_zmull.enq().map_err(map_ocl_err)?;
+        }
+        unsafe {
+            self.k_qreduce.enq().map_err(map_ocl_err)?;
+        }
+        unsafe {
+            self.k_residual_mix.enq().map_err(map_ocl_err)?;
+        }
+        unsafe {
+            self.k_commit.enq().map_err(map_ocl_err)?;
+        }
         Ok(())
     }
 
     /// Synchronous single step (reference/debug path): DIIS step + one
     /// rms readback. The chunked hot loop uses `scc_step_diis_enq`.
-    pub fn scc_step_diis(&mut self, rt: &mut GpuRuntime, n_occ: usize, alpha: f32, rms_tol: f32) -> Result<f32> {
+    pub fn scc_step_diis(
+        &mut self,
+        rt: &mut GpuRuntime,
+        n_occ: usize,
+        alpha: f32,
+        rms_tol: f32,
+    ) -> Result<f32> {
         self.bind_solve_params(n_occ)?;
         self.bind_mix_params(alpha, rms_tol)?;
         self.scc_step_diis_enq(rt)?;
@@ -644,14 +901,19 @@ impl GpuPbcPlan {
 
     /// Upload `active_host` to the device replica mask.
     pub fn set_active(&mut self, rt: &GpuRuntime) -> Result<()> {
-        self.active_r.write(&self.active_host).enq().map_err(map_ocl_err)?;
+        self.active_r
+            .write(&self.active_host)
+            .enq()
+            .map_err(map_ocl_err)?;
         Ok(())
     }
 
     /// Mark every replica active — required before finalize/eval since the
     /// SCC loop's device-side clear may have left zeros.
     pub fn activate_all(&mut self, rt: &GpuRuntime) -> Result<()> {
-        for f in self.active_host.iter_mut() { *f = 1; }
+        for f in self.active_host.iter_mut() {
+            *f = 1;
+        }
         self.set_active(rt)
     }
 
@@ -660,7 +922,9 @@ impl GpuPbcPlan {
         if init_q.len() != self.n_rep * self.n_atoms {
             return Err(DftbError::InvalidInput(format!(
                 "set_initial_charges: len {} != n_rep*n_atoms {}*{}",
-                init_q.len(), self.n_rep, self.n_atoms
+                init_q.len(),
+                self.n_rep,
+                self.n_atoms
             )));
         }
         self.q_gpu.write(init_q).enq().map_err(map_ocl_err)?;
@@ -671,17 +935,28 @@ impl GpuPbcPlan {
     pub fn reset_diis(&mut self, rt: &GpuRuntime) -> Result<()> {
         let zeros = vec![0i32; self.n_rep];
         self.diis_buf_idx.write(&zeros).enq().map_err(map_ocl_err)?;
-        self.diis_n_filled.write(&zeros).enq().map_err(map_ocl_err)?;
+        self.diis_n_filled
+            .write(&zeros)
+            .enq()
+            .map_err(map_ocl_err)?;
         self.diis_flag.write(&zeros).enq().map_err(map_ocl_err)?;
         self.diis_reason.write(&zeros).enq().map_err(map_ocl_err)?;
         Ok(())
     }
 
     /// Read DIIS fallback counters — (fallback_count, last_reason) per replica.
-    pub fn diis_status(&mut self, rt: &GpuRuntime, flag: &mut [i32], reason: &mut [i32]) -> Result<()> {
+    pub fn diis_status(
+        &mut self,
+        rt: &GpuRuntime,
+        flag: &mut [i32],
+        reason: &mut [i32],
+    ) -> Result<()> {
         if flag.len() != self.n_rep || reason.len() != self.n_rep {
             return Err(DftbError::InvalidInput(format!(
-                "diis_status: host len {}/{} != n_rep {}", flag.len(), reason.len(), self.n_rep
+                "diis_status: host len {}/{} != n_rep {}",
+                flag.len(),
+                reason.len(),
+                self.n_rep
             )));
         }
         rt.read_buffer(&self.diis_flag, flag)?;
@@ -699,14 +974,26 @@ impl GpuPbcPlan {
     pub fn finalize(&mut self, rt: &mut GpuRuntime, n_occ: usize) -> Result<()> {
         self.activate_all(rt)?;
         self.bind_solve_params(n_occ)?;
-        unsafe { self.k_zdq_v.enq().map_err(map_ocl_err)?; }
-        unsafe { self.k_zhscc.enq().map_err(map_ocl_err)?; }
+        unsafe {
+            self.k_zdq_v.enq().map_err(map_ocl_err)?;
+        }
+        unsafe {
+            self.k_zhscc.enq().map_err(map_ocl_err)?;
+        }
         self.eigh_solve()?;
-        unsafe { self.k_kocc.enq().map_err(map_ocl_err)?; }
+        unsafe {
+            self.k_kocc.enq().map_err(map_ocl_err)?;
+        }
         self.eigh_finish()?;
-        unsafe { self.k_zsc.enq().map_err(map_ocl_err)?; }
-        unsafe { self.k_zmull.enq().map_err(map_ocl_err)?; }
-        unsafe { self.k_qreduce.enq().map_err(map_ocl_err)?; }
+        unsafe {
+            self.k_zsc.enq().map_err(map_ocl_err)?;
+        }
+        unsafe {
+            self.k_zmull.enq().map_err(map_ocl_err)?;
+        }
+        unsafe {
+            self.k_qreduce.enq().map_err(map_ocl_err)?;
+        }
         Ok(())
     }
 
@@ -716,8 +1003,10 @@ impl GpuPbcPlan {
     /// real charge dots — one launch, one e_scal readback.
     /// Does NOT re-solve; caller must `finalize` (or compute_energy) first.
     pub fn energy_from_state(&mut self, rt: &mut GpuRuntime) -> Result<Vec<f64>> {
-        self.activate_all(rt)?;   // energy is defined for frozen replicas too
-        unsafe { self.k_energy_tail.enq().map_err(map_ocl_err)?; }
+        self.activate_all(rt)?; // energy is defined for frozen replicas too
+        unsafe {
+            self.k_energy_tail.enq().map_err(map_ocl_err)?;
+        }
         rt.read_buffer(&self.e_scal, &mut self.e_scal_host)?;
         let kt = self.kT as f64;
         let mut e = vec![0.0f64; self.n_rep];
@@ -758,11 +1047,15 @@ impl GpuPbcPlan {
         let mut ok = vec![true; self.n_rep];
         rt.read_buffer(&self.jacobi_diag, &mut self.jacobi_diag_h)?;
         for r in 0..self.n_rep {
-            if ran.get(r).copied().unwrap_or(0) == 0 { continue; }
+            if ran.get(r).copied().unwrap_or(0) == 0 {
+                continue;
+            }
             for k in 0..self.nk {
                 let sid = r * self.nk + k;
                 let stop = self.jacobi_diag_h[4 * sid + 2] as i32;
-                if stop == 0 { continue; }
+                if stop == 0 {
+                    continue;
+                }
                 let (off, rel, nsw) = (
                     self.jacobi_diag_h[4 * sid],
                     self.jacobi_diag_h[4 * sid + 1],
@@ -774,7 +1067,9 @@ impl GpuPbcPlan {
                         "Jacobi rep {r} k {k}: n>256 reached the kernel — host capacity guard failed (bug, not data)"
                     )));
                 }
-                if stop == 4 || rel > 1.0e-4 { ok[r] = false; }
+                if stop == 4 || rel > 1.0e-4 {
+                    ok[r] = false;
+                }
             }
         }
         Ok(ok)
@@ -789,7 +1084,9 @@ impl GpuPbcPlan {
 
     /// Read back eigenvalues `[n_sys*n]` (sorted ascending per flat system).
     pub fn read_eigenvalues(&mut self, rt: &mut GpuRuntime) -> Result<Vec<f32>> {
-        unsafe { self.k_zextract.enq().map_err(map_ocl_err)?; }
+        unsafe {
+            self.k_zextract.enq().map_err(map_ocl_err)?;
+        }
         rt.read_buffer(&self.eig_diag, &mut self.eig_diag_host)?;
         let mut out = vec![0.0f32; self.n_sys * self.n];
         for s in 0..self.n_sys {
@@ -806,5 +1103,7 @@ impl GpuPbcPlan {
     }
 
     /// Current warm-basis flag (diagnostics).
-    pub fn is_warm(&self) -> bool { self.b_warm }
+    pub fn is_warm(&self) -> bool {
+        self.b_warm
+    }
 }

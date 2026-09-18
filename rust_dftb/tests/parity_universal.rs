@@ -10,19 +10,32 @@
 //! - RUST_DFTB_DELTA_Q        – optional: comma-separated deltaQ values for SCC
 //! - RUST_DFTB_TOLERANCE      – optional: tolerance (default 1e-7 for H0, 1e-6 for SCC)
 
-use rust_dftb::{load_sk_for_species, max_abs_diff, parse_coords, parse_f64_list, parse_species, DftbOutput, HamiltonianBuilder};
 use rust_dftb::qmqm::{
-    Fragment, FragmentNeighborList, FragmentTemplate, GammaTable, SimpleMixer,
-    solver::MultiSystemSolver,
+    solver::MultiSystemSolver, Fragment, FragmentNeighborList, FragmentTemplate, GammaTable,
+    SimpleMixer,
+};
+use rust_dftb::{
+    load_sk_for_species, max_abs_diff, parse_coords, parse_f64_list, parse_species, DftbOutput,
+    HamiltonianBuilder,
 };
 
 #[test]
 fn parity_universal_from_env() {
-    let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else { return; };
-    let Ok(ref_h) = std::env::var("RUST_DFTB_REF_H") else { return; };
-    let Ok(ref_s) = std::env::var("RUST_DFTB_REF_S") else { return; };
-    let Ok(species_s) = std::env::var("RUST_DFTB_SPECIES") else { return; };
-    let Ok(coords_s) = std::env::var("RUST_DFTB_COORDS") else { return; };
+    let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else {
+        return;
+    };
+    let Ok(ref_h) = std::env::var("RUST_DFTB_REF_H") else {
+        return;
+    };
+    let Ok(ref_s) = std::env::var("RUST_DFTB_REF_S") else {
+        return;
+    };
+    let Ok(species_s) = std::env::var("RUST_DFTB_SPECIES") else {
+        return;
+    };
+    let Ok(coords_s) = std::env::var("RUST_DFTB_COORDS") else {
+        return;
+    };
 
     let tol: f64 = std::env::var("RUST_DFTB_TOLERANCE")
         .ok()
@@ -31,7 +44,11 @@ fn parity_universal_from_env() {
 
     let species = parse_species(&species_s);
     let coords = parse_coords(&coords_s);
-    assert_eq!(species.len(), coords.len(), "species/coords length mismatch");
+    assert_eq!(
+        species.len(),
+        coords.len(),
+        "species/coords length mismatch"
+    );
 
     let sk = load_sk_for_species(&sk_dir, &species).unwrap();
 
@@ -90,8 +107,16 @@ fn parity_universal_from_env() {
                 u_map.insert("F", 0.4500);
                 u_map.insert("S", 0.3200);
                 u_map.insert("P", 0.3500);
-                let unique: Vec<String> = species.iter().cloned().collect::<std::collections::HashSet<_>>().into_iter().collect();
-                unique.iter().map(|sp| *u_map.get(sp.as_str()).unwrap_or(&0.4)).collect()
+                let unique: Vec<String> = species
+                    .iter()
+                    .cloned()
+                    .collect::<std::collections::HashSet<_>>()
+                    .into_iter()
+                    .collect();
+                unique
+                    .iter()
+                    .map(|sp| *u_map.get(sp.as_str()).unwrap_or(&0.4))
+                    .collect()
             });
         let gamma = GammaTable::from_hubbard_u(hubbard_u);
 
@@ -117,9 +142,6 @@ fn parity_universal_from_env() {
             .unwrap_or(1e-6);
 
         let diff_scc = max_abs_diff(h_scc_rust, &h_scc_ref);
-        assert!(
-            diff_scc < tol_scc,
-            "H_scc mismatch max diff = {diff_scc:e}"
-        );
+        assert!(diff_scc < tol_scc, "H_scc mismatch max diff = {diff_scc:e}");
     }
 }

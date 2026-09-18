@@ -718,3 +718,558 @@ DTH has 54 C and 30 H in the inspected XYZ. Neutral mio valences imply 246 elect
 - [ ] Cover N6/28/84/86/87/120/246 plus synthetic odd/tile-boundary sizes, mixed masks, all-inactive, retries and geometry/evaluation sequences.
 - [ ] Run release benchmarks with pinned CPU thread settings. Store full logs under `debug/`, specs here, measured conclusions in reports/manifest. Record commands, hashes, device/driver, compile settings, warm-start policy and all failures.
 - [ ] Promote defaults only after focused tests, application measurements and user review. No tolerance weakening, bulk f64, silent fallback, hot-loop allocation or global atomics.
+
+
+
+
+---
+
+# USR
+
+OK, we implemented some improvement but speedup is still very weak , review the code and report and suggest what we can do 
+
+https://github.com/ProkopHapala/dftbplus/commit/f8c871f04dee331d04dfb9f017ee6de14263971b
+
+---
+
+# Chat GPT 5.6 sol
+
+
+I reviewed the commit, the current kernels, and the updated report. The main conclusion is: **the block-Jacobi experiment is useful, but the weak end-to-end gain is not surprising because most of the expensive SCC plumbing is still unchanged.** This commit is primarily a correctness repair plus a first block eigensolver, not yet the architectural cleanup we discussed.
+
+The good news is that it found and fixed a real bug: the WG96 reduction was dropping lanes, and the old block solver could falsely report convergence. The corrected block solver now gives a real ~3.4× eigensolver improvement at N=246 (243.6 → 72.6 ms in the profiled run).  But the report itself already shows `density + eigh_finish + hscc` becoming roughly half of the remaining DTH block cost. 
+
+## First: I would not trust the current quoted speedup yet
+
+There is a fairly serious benchmark issue I noticed in the code.
+
+The reported T02 timings were collected with:
+
+```text
+RUST_DFTB_PROF=1
+```
+
+But in `GpuRuntime`, that mode makes **every `prof_tick()` call `queue.finish()`**. The SCC loop has profiler ticks after Hscc, eigensolve, occupation, normalization, density, Mulliken, DIIS, etc. So the benchmark deliberately drains the GPU queue after essentially every stage.
+
+That mode is good for isolating stages, but it is **not a valid production wall-time benchmark**.
+
+Use:
+
+```text
+RUST_DFTB_PROF unset   -> production wall time
+RUST_DFTB_PROF=evt     -> device-stage profiling
+```
+
+`evt` was specifically implemented to insert events without inline waits.
+
+There are two more benchmark inconsistencies. The CPU timing is one base geometry at `1e-8` and includes energy + forces, whereas the GPU `speedup` denominator is SCC-only at `1e-6`; and the three GPU timing runs reuse one `GpuDftb`, so `reset_q0()` resets charges but retains the warmed eigenbasis.
+
+So before deciding whether we have 17×, 25× or 40×, I would rerun clean wall timings. The present value can be biased in both directions.
+
+---
+
+## More importantly: the old expensive SCC pipeline is still there
+
+The actual hot loop is still literally:
+
+```text
+Hscc
+C^T H C
+Jacobi
+occupation
+S-normalize
+build D
+Mulliken(D,S)
+DIIS
+```
+
+The source still executes `k_density` and then `k_mulliken` on **every SCC iteration**.
+
+And `eigh_finish()` still calls `k_occ_snorm` every warm iteration.
+
+So the two things we identified previously—
+
+$$
+\boxed{\text{do not build }D\text{ inside SCC}}
+$$
+
+and
+
+$$
+\boxed{\text{do not recompute }SC\text{ separately for every column}}
+$$
+
+—have **not been implemented yet**.
+
+The attached report actually confirms this: after block Jacobi, density + normalization + Hscc are explicitly identified as the next T03 targets. 
+
+That is where I would go next before doing any exotic eigensolver work.
+
+---
+
+# 1. Remove density construction from SCC completely
+
+Currently `build_density_occ_batched` is one WG/system and, under smearing, evaluates
+
+$$
+D_{ij}=2\sum_{k=1}^{N} f_k C_{ik}C_{jk}
+$$
+
+for every triangle element.
+
+At N=246 this is billions of poorly tiled FMAs across batch=400.
+
+But SCC does not need \(D\). It only needs Mulliken atomic populations.
+
+Maintain
+
+$$
+T=SC.
+$$
+
+Then
+
+$$
+q_A
+=
+2\sum_{\mu\in A}\sum_k
+f_k C_{\mu k}T_{\mu k}.
+$$
+
+This is **O(N²)**.
+
+So the inner loop becomes:
+
+```text
+C, SC, occ
+    ↓
+direct atomic populations
+    ↓
+DIIS
+```
+
+No D.
+
+Build D only after convergence when forces/final observables need it.
+
+This is not an approximation; it is the same Mulliken contraction algebraically.
+
+---
+
+# 2. `SC` also kills the expensive S-normalization
+
+The present `eigh_finish` normalization is expensive because it repeatedly applies S to columns.
+
+If you store:
+
+$$
+T=SC,
+$$
+
+then after a Jacobi transformation
+
+$$
+C' = CU
+$$
+
+you simply make
+
+$$
+T' = TU.
+$$
+
+The block Jacobi already has \(U\) in local memory. Transforming one additional row strip of `SC` alongside `C` is cheap.
+
+Then the S-norm of orbital \(k\) is simply
+
+$$
+g_k = \sum_\mu C_{\mu k}T_{\mu k}.
+$$
+
+That's O(N²). If needed:
+
+$$
+C_k\leftarrow C_k/\sqrt{g_k},
+\qquad
+T_k\leftarrow T_k/\sqrt{g_k}.
+$$
+
+So one architectural change, persistent `SC`, removes both:
+
+```text
+scc.density
+scc.eigh_finish / snormalize
+```
+
+as O(N³)-ish hot stages.
+
+I would implement this before trying projector-response/CheFSI alternatives.
+
+---
+
+# 3. Hscc is still much too expensive — don't materialize it
+
+This is the next obvious target.
+
+Currently one WG/system computes
+
+$$
+H^\mathrm{SCC}_{ij}
+=
+H^0_{ij}
++\frac12 S_{ij}(V_{A_i}+V_{A_j})
+$$
+
+for all \(N^2\) elements and writes the full matrix to global memory.
+
+The next operation immediately reads that matrix in
+
+$$
+T=C^T H^\mathrm{SCC}.
+$$
+
+At N=246 the measured `hscc` stage is **21 ms** in block mode, whereas both properly tiled projection GEMMs together are only ~8.6 ms. 
+
+That is a giant red flag.
+
+I would split the current fused kernel:
+
+```text
+dq -> V              tiny atom-space kernel
+```
+
+and eliminate Hscc output entirely.
+
+Make a specialized tiled first projection:
+
+$$
+T=C^T H^\mathrm{SCC}
+$$
+
+where on loading the H tile you synthesize:
+
+```c
+h = H0[i,j]
+  + 0.5f*S[i,j]*(V[atom_i] + V[atom_j]);
+```
+
+Then multiply that tile immediately.
+
+So:
+
+```text
+CURRENT:
+dq/V/Hscc -> global Hscc -> GEMM reads Hscc
+
+TARGET:
+dq/V -> GEMM synthesizes Hscc while loading tile
+```
+
+This removes an \(N^2\) global write plus an \(N^2\) global read and probably most of that 21 ms stage.
+
+This is exactly the sort of fusion I like: **same natural 2D tile geometry, same data immediately consumed.** Very different from the bad Fermi-in-Jacobi fusion.
+
+---
+
+# 4. There is still an outright wasted kernel in block mode
+
+Under Fermi smearing, block mode currently does:
+
+```rust
+k_select_occ
+k_fermi_occ
+```
+
+The first is a full local bitonic sort.
+
+But with smearing the density kernel does:
+
+```c
+k = use_w ? t : oib[t];
+```
+
+so when `use_w=1`, it ignores `occ_idx` completely.
+
+Therefore the integer occupation sort is dead work for the smeared SCC path.
+
+Delete it.
+
+It's only ~0.15 ms GC / ~0.26 ms DTH in these profiled runs, so it won't transform performance, but it is exactly the kind of pointless bookkeeping we should not tolerate.
+
+The standalone Fermi kernel is also still the old **40 fixed bisections in f64 with `exp(double)`**.
+
+Eventually replace that with warm-μ safeguarded Newton, probably WG32/64, f32 logistic + f64 scalar count/decision. But this is now smaller than Hscc/density/snorm, so I would not do it first.
+
+---
+
+# 5. The N≈86 direct solver still has WG512!
+
+This surprised me because we had already identified it.
+
+The current source still does:
+
+```rust
+let wg_max = max_work_group_size.min(512);
+let wg = ...
+```
+
+for the production direct N>64 Jacobi.
+
+The only change was making WG a power of two so its reduction is correct.
+
+So for GC—the system where direct is still clearly better—we have **not yet tested the architectural change you wanted**.
+
+I would create a true tail-free direct kernel and benchmark:
+
+```text
+N=86:
+WG = 64, 96, 128, 256
+```
+
+The direct kernel's current power-of-two reduction prevents WG96, but you just wrote a correct arbitrary-WG reducer for block Jacobi. Reuse it.
+
+And compile Fermi **out of the source**, not just set `fermi_tail=0`, otherwise its local/private resource footprint can remain.
+
+For GC this may be much more useful than the B16 block solver.
+
+---
+
+# 6. B=16 is probably too small for the block solver
+
+This is the biggest thing I would change inside the new block Jacobi itself.
+
+For N=246:
+
+$$
+n_b=\lceil246/16\rceil=16
+$$
+
+so each block sweep executes
+
+$$
+{16\choose2}=120
+$$
+
+**serial block-pair solves**.
+
+Each of those calls `bj_pivot_solve`, which can itself do up to 12 inner sweeps × 31 Brent–Luk rounds, with barriers every round.
+
+That's a huge serial critical path.
+
+Compare:
+
+$$
+B=16:\;120\text{ pivots/sweep}
+$$
+
+$$
+B=24:\;\binom{11}{2}=55
+$$
+
+$$
+B=32:\;\binom8{2}=28.
+$$
+
+For N=86:
+
+$$
+B16:15,\quad
+B24:6,\quad
+B32:3.
+$$
+
+We chose B16 primarily to preserve occupancy. But now the measurement says the block kernel's problem at N=86 is **critical-path latency**, not lack of residency.
+
+So I would definitely benchmark **B24 and B32**.
+
+B32 uses much more local memory, perhaps forcing one WG/SM—but with batch=400 you still have ~5 waves of 82 systems. Trading residency for a 4× reduction in serial pivot count may easily win.
+
+My guess is B24 may be the sweet spot.
+
+---
+
+## The inner pivot is probably also over-solved
+
+You currently use:
+
+```c
+INNER_TOL = 1e-7
+GLOBAL_TOL = 1e-6
+INNER_MAX = 12
+```
+
+So every local 32×32 pivot is being driven **ten times tighter than the requested global eigensolver accuracy**.
+
+I would A/B:
+
+```text
+INNER_TOL = 1e-5, 1e-6, 1e-7
+INNER_MAX = 1, 2, 4, 8, 12
+```
+
+There is no requirement that every block pair be independently converged to 1e-7 on every visit. The outer block sweep revisits these blocks anyway.
+
+A deliberately approximate local pivot that takes one or two inner sweeps may give much lower total time even if the outer solver needs another sweep.
+
+Measure:
+
+$$
+\text{total Brent–Luk rounds per eigensolve}
+$$
+
+rather than only outer sweep count.
+
+---
+
+# 7. I am suspicious of private-array spilling in the block kernel
+
+Each row thread has:
+
+```c
+float x[PB];
+...
+float xv[PB];
+```
+
+and both are dynamically indexed inside unrolled matrix-vector products.
+
+At PB=32 that's potentially 64 floats of private state per thread, before all other registers.
+
+On WG256 this can become a significant register footprint or spill to private memory.
+
+This could explain why the supposedly cache-friendly block kernel is still expensive.
+
+At minimum change the code to reuse **one** `float x[PB]` buffer:
+
+```text
+load A strip -> transform
+reuse same x[]
+load V strip -> transform
+```
+
+with explicit non-overlapping scope.
+
+More importantly, get `ncu` numbers for:
+
+```text
+registers/thread
+local-memory load/store
+local/global memory throughput
+achieved occupancy
+warp stalls: barrier / memory dependency / execution dependency
+```
+
+The OpenCL `CL_KERNEL_PRIVATE_MEM_SIZE=0` result you saw earlier is not useful.
+
+I would run `ncu` before doing further low-level block-kernel surgery.
+
+---
+
+# 8. Active-slot compaction still isn't implemented
+
+The current kernels are still constructed with global sizes based on full `batch`, and simply test:
+
+```c
+if (active[sid] == 0) return;
+```
+
+The GEMMs likewise have the batch dimension baked into their launch grid.
+
+So the `active_ids[]` design we discussed remains only in the report, not the code. 
+
+That should still be done:
+
+```text
+active mask:
+    immediate convergence inside an 8-step chunk
+
+active_ids:
+    compact launch domain at chunk boundaries
+```
+
+For GC, where only a handful of difficult scan corners survive late, this matters a lot.
+
+And once that works, I would make chunk length adaptive:
+
+```text
+many active -> 8
+medium      -> 4
+few         -> 2
+```
+
+Then later go to refillable scan slots.
+
+---
+
+# 9. There are still small architectural violations worth cleaning
+
+For example `reset_diis()` still does:
+
+```rust
+let zeros_i = vec![0i32; batch];
+```
+
+every reset.
+
+`check_jacobi()` similarly creates temporary vectors.
+
+These aren't your factor-of-5 bottleneck, but the rule should remain:
+
+> once the plan exists, solving and resetting should not allocate.
+
+Fix them while working on active-ID scratch anyway.
+
+---
+
+## The order I would implement things now
+
+1. **Rerun trustworthy timings first**: PROF unset for wall time, `PROF=evt` separately for profiling. Same 400 CPU geometries, one BLAS thread, same work/tolerance. Right now the quoted speedup is not trustworthy.
+
+2. **Implement T03 before more eigensolver cleverness**:
+   persistent `SC`, direct O(N²) Mulliken, remove in-loop D, remove expensive S-normalization.
+
+3. **Fuse Hscc generation into the first tiled projection GEMM.**
+   I think this is likely another surprisingly large win at N246.
+
+4. **Fix the easy waste**:
+   no `select_occ` under smearing; proper WG32/64 Fermi later.
+
+5. **Optimize the two eigensolver regimes independently**:
+
+   * N≈80–100: direct solver, Fermi compiled out, WG≈N.
+   * N≈120–256: block solver, benchmark B24/B32 and much cheaper inner pivot solves.
+
+6. **Add logical `active_ids` compaction** and adaptive chunk size.
+
+7. Only after these exact-equivalent changes consider projector/DMM/CheFSI or multi-WG block transformations.
+
+The architecture I would aim for is therefore:
+
+```text
+dq -> V                         O(Natom²)
+        |
+        v
+tiled C^T * Hscc-on-the-fly     O(N³), efficient GEMM
+        |
+        v
+      * C                       O(N³), efficient GEMM
+        |
+        v
+Jacobi direct/block             actual eigensolver work
+        |
+        +---- C  <- C U
+        +---- SC <- SC U
+        |
+        v
+Fermi                           tiny
+        |
+        v
+direct Mulliken(C,SC,f)         O(N²)
+        |
+        v
+DIIS                            tiny
+```
+
+There should be **no density matrix, no full S-normalization, and no materialized Hscc in the SCC hot loop**.
+
+That is the point where I would expect the performance picture to become much more satisfying. Right now the block-Jacobi optimization has made one expensive stage faster, but the pipeline surrounding it is still architecturally much closer to the old CPU-style formulation than to the GPU multisolver you actually want.

@@ -24,8 +24,8 @@ use crate::qmqm::gpu_pbc_plan::GpuPbcPlan;
 use crate::qmqm::gpu_prep::{pack_sk_tables, GpuSkTable};
 use crate::qmqm::gpu_runtime::{map_ocl_err, GpuRuntime};
 use crate::qmqm::pbc_cell::{
-    enumerate_image_pairs, enumerate_sk_pairs, max_g_ewald, max_r_ewald, optimal_alpha, GpuFoldPair,
-    GpuImgSlot, PbcCell, TOL_EWALD_DEFAULT,
+    enumerate_image_pairs, enumerate_sk_pairs, max_g_ewald, max_r_ewald, optimal_alpha,
+    GpuFoldPair, GpuImgSlot, PbcCell, TOL_EWALD_DEFAULT,
 };
 use ocl::prm::{Float2, Float4, Int2};
 use ocl::{Buffer, Kernel, Program};
@@ -72,12 +72,12 @@ pub struct GpuPbc {
     n_rep: usize,
     nk: usize,
 
-    buf_coords: Buffer<f32>,     // [n_rep·n_at·3] Bohr
-    buf_h0: Buffer<Float2>,      // [n_rep·nk·n²] — plan input
-    buf_s: Buffer<Float2>,       // [n_rep·nk·n²]
-    buf_g: Buffer<f32>,          // [n_rep·n_at²] γ_pbc — plan input
-    buf_invr: Buffer<f32>,       // [n_rep·n_at²]
-    park: Buffer<i32>,           // [n_rep] all-1 (parking wired later)
+    buf_coords: Buffer<f32>, // [n_rep·n_at·3] Bohr
+    buf_h0: Buffer<Float2>,  // [n_rep·nk·n²] — plan input
+    buf_s: Buffer<Float2>,   // [n_rep·nk·n²]
+    buf_g: Buffer<f32>,      // [n_rep·n_at²] γ_pbc — plan input
+    buf_invr: Buffer<f32>,   // [n_rep·n_at²]
+    park: Buffer<i32>,       // [n_rep] all-1 (parking wired later)
 
     buckets: Vec<PbcSkBucket>,
     k_ewald: Kernel,
@@ -99,9 +99,9 @@ pub struct GpuPbc {
     _q0: Buffer<f32>,
     _oa: Buffer<i32>,
 
-    q0_host: Vec<f32>,           // [n_rep·n_at]
-    coords: Vec<[f64; 3]>,       // [n_rep·n_at] Å
-    scratch_bohr: Vec<f32>,      // [n_rep·n_at·3]
+    q0_host: Vec<f32>,      // [n_rep·n_at]
+    coords: Vec<[f64; 3]>,  // [n_rep·n_at] Å
+    scratch_bohr: Vec<f32>, // [n_rep·n_at·3]
 
     n_occ: usize,
     _prog: Program,
@@ -236,7 +236,9 @@ impl GpuPbc {
 
         // ---- shared integer-cell table for the SK slots ----
         let gamma_cut = gamma_tbl.max_cutoff();
-        let big_cut = (sk_cut_max + PAIR_MARGIN).max(max_r + PAIR_MARGIN).max(gamma_cut + PAIR_MARGIN);
+        let big_cut = (sk_cut_max + PAIR_MARGIN)
+            .max(max_r + PAIR_MARGIN)
+            .max(gamma_cut + PAIR_MARGIN);
         let extent = {
             let mut e = 0.0f64;
             for a in &c0 {
@@ -268,7 +270,11 @@ impl GpuPbc {
             PAIR_MARGIN,
             &|a, b| {
                 // s-atom first in the oriented eval (SK tables are (s,p))
-                if no[a] == 4 && no[b] == 1 { (b, a) } else { (a, b) }
+                if no[a] == 4 && no[b] == 1 {
+                    (b, a)
+                } else {
+                    (a, b)
+                }
             },
             &|oi, oj| pair_cut[atom_gsp[oi] * nsp + atom_gsp[oj]],
             &|oi, oj| sk_lookup[atom_gsp[oi] * nsp + atom_gsp[oj]],
@@ -372,7 +378,12 @@ impl GpuPbc {
         let n_sys = n_rep * nk;
         let buf_h0 = rt.zero_buffer::<Float2>(n_sys * n * n)?;
         let buf_s = rt.zero_buffer::<Float2>(n_sys * n * n)?;
-        let q0_host: Vec<f32> = tmpl.q0.iter().map(|&q| q as f32).collect::<Vec<_>>().repeat(n_rep);
+        let q0_host: Vec<f32> = tmpl
+            .q0
+            .iter()
+            .map(|&q| q as f32)
+            .collect::<Vec<_>>()
+            .repeat(n_rep);
         let buf_q0 = rt.buffer_from_slice(&q0_host)?;
         let mut oa = vec![0i32; n_rep * n];
         for a in 0..n_atoms {
@@ -528,8 +539,16 @@ impl GpuPbc {
         // First assembly: plan construction runs the S^{-1/2} pipeline
         // and certifies λ_min — buf_s must hold valid S(k), not zeros.
         // buf_coords already contains the initial geometry.
-        buf_h0.cmd().fill(Float2::new(0.0, 0.0), None).enq().map_err(map_ocl_err)?;
-        buf_s.cmd().fill(Float2::new(0.0, 0.0), None).enq().map_err(map_ocl_err)?;
+        buf_h0
+            .cmd()
+            .fill(Float2::new(0.0, 0.0), None)
+            .enq()
+            .map_err(map_ocl_err)?;
+        buf_s
+            .cmd()
+            .fill(Float2::new(0.0, 0.0), None)
+            .enq()
+            .map_err(map_ocl_err)?;
         unsafe {
             for b in &buckets {
                 b.k_img.enq().map_err(map_ocl_err)?;
@@ -543,8 +562,7 @@ impl GpuPbc {
         rt.finish()?;
 
         let plan = GpuPbcPlan::new(
-            &mut rt, &buf_s, &buf_h0, &buf_g, &buf_q0, &buf_oa,
-            n, n_atoms, n_rep, nk, kw,
+            &mut rt, &buf_s, &buf_h0, &buf_g, &buf_q0, &buf_oa, n, n_atoms, n_rep, nk, kw,
         )?;
 
         Ok(Self {
@@ -595,7 +613,9 @@ impl GpuPbc {
         if coords.len() != self.n_rep * self.n_atoms {
             return Err(DftbError::InvalidInput(format!(
                 "GpuPbc::set_geometry: coords {} != {}·{}",
-                coords.len(), self.n_rep, self.n_atoms
+                coords.len(),
+                self.n_rep,
+                self.n_atoms
             )));
         }
         for (i, c) in coords.iter().enumerate() {
@@ -604,8 +624,7 @@ impl GpuPbc {
             self.scratch_bohr[3 * i + 2] = (c[2] * ANG2BOHR) as f32;
         }
         self.coords.copy_from_slice(coords);
-        self.rt
-            .write_buffer(&self.buf_coords, &self.scratch_bohr)?;
+        self.rt.write_buffer(&self.buf_coords, &self.scratch_bohr)?;
 
         // H0(k)/S(k) zero-fill (out-pairs with no slots stay zero)
         self.buf_h0
@@ -621,13 +640,13 @@ impl GpuPbc {
 
         unsafe {
             for b in &self.buckets {
-                b.k_img.enq().map_err(map_ocl_err)?;   // per-slot SK blocks
+                b.k_img.enq().map_err(map_ocl_err)?; // per-slot SK blocks
             }
             for b in &self.buckets {
-                b.k_fold.enq().map_err(map_ocl_err)?;  // Bloch fold → H0(k),S(k)
+                b.k_fold.enq().map_err(map_ocl_err)?; // Bloch fold → H0(k),S(k)
             }
-            self.k_ewald.enq().map_err(map_ocl_err)?;  // invRMat
-            self.k_gamma.enq().map_err(map_ocl_err)?;  // γ_pbc = invr − Σ expGamma
+            self.k_ewald.enq().map_err(map_ocl_err)?; // invRMat
+            self.k_gamma.enq().map_err(map_ocl_err)?; // γ_pbc = invr − Σ expGamma
         }
         // S(k)^{-1/2} pipeline + λ_min/Jacobi certification
         self.plan.set_geometry(&mut self.rt, &self.buf_s)?;
@@ -637,12 +656,19 @@ impl GpuPbc {
     /// Convenience: initial charges + DIIS reset, then synchronous SCC
     /// loop until rms < tol or max_iter. Returns per-replica converged
     /// flags and the rms history (diagnostic).
-    pub fn scc(&mut self, alpha: f32, rms_tol: f32, max_iter: usize) -> Result<(Vec<bool>, Vec<f32>)> {
+    pub fn scc(
+        &mut self,
+        alpha: f32,
+        rms_tol: f32,
+        max_iter: usize,
+    ) -> Result<(Vec<bool>, Vec<f32>)> {
         self.plan.set_initial_charges(&self.rt, &self.q0_host)?;
         self.plan.reset_diis(&self.rt)?;
         let mut hist = Vec::with_capacity(max_iter);
         for _ in 0..max_iter {
-            let r = self.plan.scc_step_diis(&mut self.rt, self.n_occ, alpha, rms_tol)?;
+            let r = self
+                .plan
+                .scc_step_diis(&mut self.rt, self.n_occ, alpha, rms_tol)?;
             hist.push(r);
             if r < rms_tol {
                 break;

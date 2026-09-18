@@ -159,11 +159,7 @@ pub fn fit_bspline_controls_zero_end(f: &[f64], n_pad: usize) -> Vec<f64> {
 /// the original function exactly (to f32 precision).
 ///
 /// Returns (bspline_control_points, new_dr).
-pub fn resample_bspline(
-    y_orig: &[f64],
-    dr_orig: f64,
-    n_target: usize,
-) -> (Vec<f32>, f32) {
+pub fn resample_bspline(y_orig: &[f64], dr_orig: f64, n_target: usize) -> (Vec<f32>, f32) {
     let n_orig = y_orig.len();
     if n_orig == 0 {
         return (vec![], 0.0);
@@ -194,11 +190,7 @@ pub fn resample_bspline(
 
 /// Resample a single SK integral column.
 /// Returns (resampled_values, new_dr).
-pub fn resample_sk_column(
-    values: &[f64],
-    dr_orig: f64,
-    n_target: usize,
-) -> (Vec<f32>, f32) {
+pub fn resample_sk_column(values: &[f64], dr_orig: f64, n_target: usize) -> (Vec<f32>, f32) {
     resample_bspline(values, dr_orig, n_target)
 }
 
@@ -226,8 +218,12 @@ pub fn resample_sk_column(
 /// Partition of unity: `Σ B_k = 1`, `Σ B'_k = 0`, `Σ B''_k = 0` — tested in
 /// `test_bspline3_partition_of_unity`.
 pub fn bspline3_eval_v_d1_d2(
-    c0: f64, c1: f64, c2: f64, c3: f64,
-    t: f64, inv_dr: f64,
+    c0: f64,
+    c1: f64,
+    c2: f64,
+    c3: f64,
+    t: f64,
+    inv_dr: f64,
 ) -> (f64, f64, f64) {
     let t2 = t * t;
     let t3 = t2 * t;
@@ -276,15 +272,27 @@ pub fn bspline3_eval_at(controls: &[f64], dr: f64, r: f64) -> (f64, f64, f64) {
     }
     let inv_dr = 1.0 / dr;
     let x = r / dr;
-    let i = if x >= (n - 1) as f64 { n - 2 } else { x as usize };
+    let i = if x >= (n - 1) as f64 {
+        n - 2
+    } else {
+        x as usize
+    };
     let t = x - i as f64;
 
     // Four controls: c[i-1], c[i], c[i+1], c[i+2].
     // Phantom points at boundaries enforce natural spline (d²=0 at endpoints).
-    let c0 = if i == 0 { 2.0 * controls[0] - controls[1] } else { controls[i - 1] };
+    let c0 = if i == 0 {
+        2.0 * controls[0] - controls[1]
+    } else {
+        controls[i - 1]
+    };
     let c1 = controls[i];
     let c2 = controls[i + 1];
-    let c3 = if i + 2 >= n { 2.0 * controls[n - 1] - controls[n - 2] } else { controls[i + 2] };
+    let c3 = if i + 2 >= n {
+        2.0 * controls[n - 1] - controls[n - 2]
+    } else {
+        controls[i + 2]
+    };
 
     bspline3_eval_v_d1_d2(c0, c1, c2, c3, t, inv_dr)
 }
@@ -363,9 +371,7 @@ mod tests {
         let n_tests = 1000;
         for k in 0..n_tests {
             let t = (k as f64 + 0.5) / n_tests as f64; // (0, 1)
-            let (v, dv, ddv) = bspline3_eval_v_d1_d2(
-                ctrl[0], ctrl[1], ctrl[2], ctrl[3], t, inv_dr,
-            );
+            let (v, dv, ddv) = bspline3_eval_v_d1_d2(ctrl[0], ctrl[1], ctrl[2], ctrl[3], t, inv_dr);
             assert!((v - 1.0).abs() < 1e-12, "ΣB_k != 1 at t={t}: got V={v}");
             assert!(dv.abs() < 1e-12, "ΣB'_k != 0 at t={t}: got dV={dv}");
             assert!(ddv.abs() < 1e-12, "ΣB''_k != 0 at t={t}: got d²V={ddv}");
@@ -396,24 +402,26 @@ mod tests {
         // Check at each interior knot (between intervals i and i+1)
         for i in 1..(n - 3) {
             // Left limit of interval i: t = 1.0 (end of interval)
-            let (v_left, dv_left, ddv_left) = bspline3_eval_v_d1_d2(
-                ctrl[i - 1], ctrl[i], ctrl[i + 1], ctrl[i + 2],
-                1.0, inv_dr,
-            );
+            let (v_left, dv_left, ddv_left) =
+                bspline3_eval_v_d1_d2(ctrl[i - 1], ctrl[i], ctrl[i + 1], ctrl[i + 2], 1.0, inv_dr);
             // Right limit of interval i+1: t = 0.0 (start of interval)
-            let (v_right, dv_right, ddv_right) = bspline3_eval_v_d1_d2(
-                ctrl[i], ctrl[i + 1], ctrl[i + 2], ctrl[i + 3],
-                0.0, inv_dr,
-            );
+            let (v_right, dv_right, ddv_right) =
+                bspline3_eval_v_d1_d2(ctrl[i], ctrl[i + 1], ctrl[i + 2], ctrl[i + 3], 0.0, inv_dr);
             // V, V', V'' should be continuous to machine precision for a
             // cardinal cubic B-spline (it is exactly C² at knots).
             let tol = 1e-12;
-            assert!((v_left - v_right).abs() < tol,
-                "V discontinuous at knot {i}: left={v_left}, right={v_right}");
-            assert!((dv_left - dv_right).abs() < tol,
-                "V' discontinuous at knot {i}: left={dv_left}, right={dv_right}");
-            assert!((ddv_left - ddv_right).abs() < tol,
-                "V'' discontinuous at knot {i}: left={ddv_left}, right={ddv_right}");
+            assert!(
+                (v_left - v_right).abs() < tol,
+                "V discontinuous at knot {i}: left={v_left}, right={v_right}"
+            );
+            assert!(
+                (dv_left - dv_right).abs() < tol,
+                "V' discontinuous at knot {i}: left={dv_left}, right={dv_right}"
+            );
+            assert!(
+                (ddv_left - ddv_right).abs() < tol,
+                "V'' discontinuous at knot {i}: left={ddv_left}, right={ddv_right}"
+            );
         }
     }
 
@@ -462,12 +470,20 @@ mod tests {
             let v_ref = cubic_spline_eval(&y_new, &d2_new, dr_new, r);
             // V' from natural cubic spline
             let x = r / dr_new;
-            let i = if x >= (n_target - 1) as f64 { n_target - 2 } else { x as usize };
+            let i = if x >= (n_target - 1) as f64 {
+                n_target - 2
+            } else {
+                x as usize
+            };
             let t = x - i as f64;
             let a = 1.0 - t;
-            let dv_ref = (-y_new[i] + y_new[i + 1]
+            let dv_ref = (-y_new[i]
+                + y_new[i + 1]
                 + ((-3.0 * a * a + 1.0) * d2_new[i] + (3.0 * t * t - 1.0) * d2_new[i + 1])
-                    * dr_new * dr_new / 6.0) / dr_new;
+                    * dr_new
+                    * dr_new
+                    / 6.0)
+                / dr_new;
             // V'' from natural cubic spline
             let ddv_ref = a * d2_new[i] + t * d2_new[i + 1];
 

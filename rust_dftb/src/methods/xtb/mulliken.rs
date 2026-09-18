@@ -30,10 +30,7 @@ pub fn shell_charges(
 }
 
 /// Compute atomic Mulliken charges from shell charges
-pub fn atomic_charges(
-    shell_charges: &DVector<f64>,
-    nshell_per_atom: &[usize],
-) -> DVector<f64> {
+pub fn atomic_charges(shell_charges: &DVector<f64>, nshell_per_atom: &[usize]) -> DVector<f64> {
     let nat = nshell_per_atom.len();
     let mut qat = DVector::zeros(nat);
 
@@ -129,7 +126,13 @@ pub fn reference_shell_occupations(
     elem_idx: &[usize],
     ang_per_shell: &[usize],
 ) -> DVector<f64> {
-    reference_shell_occupations_generic(nshell_per_atom, elem_idx, ang_per_shell, &params::reference_occ, true)
+    reference_shell_occupations_generic(
+        nshell_per_atom,
+        elem_idx,
+        ang_per_shell,
+        &params::reference_occ,
+        true,
+    )
 }
 
 /// Compute reference shell occupations for GFN2 (no valence filter)
@@ -138,5 +141,11 @@ pub fn reference_shell_occupations_gfn2(
     elem_idx: &[usize],
     ang_per_shell: &[usize],
 ) -> DVector<f64> {
-    reference_shell_occupations_generic(nshell_per_atom, elem_idx, ang_per_shell, &params_gfn2::reference_occ, false)
+    reference_shell_occupations_generic(
+        nshell_per_atom,
+        elem_idx,
+        ang_per_shell,
+        &params_gfn2::reference_occ,
+        false,
+    )
 }

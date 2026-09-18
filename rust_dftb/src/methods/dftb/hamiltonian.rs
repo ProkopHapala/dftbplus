@@ -1,11 +1,11 @@
 use crate::core::error::{DftbError, Result};
 use crate::core::neighbor::{NeighborBuilder, NeighborList};
+use crate::methods::dftb::gamma::GammaTable;
 use crate::methods::dftb::rotation::{DirectionCosines, Rotation};
 use crate::methods::dftb::sk_data::{AtomicParamsSp, SkData, SkTableSp};
-use crate::methods::dftb::gamma::GammaTable;
 use crate::qmqm::fragment::{Fragment, FragmentTemplate};
-use crate::qmqm::neighbor::FragmentNeighborList;
 use crate::qmqm::mixer::DiisMixer;
+use crate::qmqm::neighbor::FragmentNeighborList;
 use crate::qmqm::solver::MultiSystemSolver;
 use nalgebra::{DMatrix, DVector};
 use std::collections::HashMap;
@@ -150,7 +150,12 @@ impl HWorkspace {
     }
 
     pub fn slices(&mut self, size: usize) -> (&mut [f64], &mut [f64]) {
-        assert!(size <= self.max_block, "block size {} exceeds max {}", size, self.max_block);
+        assert!(
+            size <= self.max_block,
+            "block size {} exceeds max {}",
+            size,
+            self.max_block
+        );
         (&mut self.block_h[..size], &mut self.block_s[..size])
     }
 }
@@ -197,7 +202,11 @@ impl HamiltonianBuilder {
         Ok(Hamiltonian { h0, s })
     }
 
-    pub fn build_non_scc_sp_only(&self, species: &[String], coords: &[[f64; 3]]) -> Result<Hamiltonian> {
+    pub fn build_non_scc_sp_only(
+        &self,
+        species: &[String],
+        coords: &[[f64; 3]],
+    ) -> Result<Hamiltonian> {
         if species.len() != coords.len() {
             return Err(DftbError::InvalidInput(
                 "species and coords length mismatch".into(),
@@ -222,9 +231,10 @@ impl HamiltonianBuilder {
         for i in 0..ctx.n_atoms {
             let ang = ctx.species_ang[ctx.atom_species[i] as usize];
             if ang != &[0, 1] {
-                return Err(DftbError::InvalidInput(
-                    format!("sp_only: atom {i} has shells {:?}, expected [0, 1]", ang)
-                ));
+                return Err(DftbError::InvalidInput(format!(
+                    "sp_only: atom {i} has shells {:?}, expected [0, 1]",
+                    ang
+                )));
             }
         }
 
@@ -370,8 +380,13 @@ impl HamiltonianBuilder {
             // --- Shell (0,1): sp (direct) ---
             tab_fwd.eval_shell_integrals_into(0, 1, p.r, &mut sk_h[..1], &mut sk_s[..1])?;
             Rotation::rotate_shell_pair_into(
-                0, 1, &sk_h[..1], &sk_s[..1], dc,
-                &mut sub_h[..3], &mut sub_s[..3],
+                0,
+                1,
+                &sk_h[..1],
+                &sk_s[..1],
+                dc,
+                &mut sub_h[..3],
+                &mut sub_s[..3],
             )?;
             block_h[4] = sub_h[0];
             block_h[8] = sub_h[1];
@@ -383,8 +398,13 @@ impl HamiltonianBuilder {
             // --- Shell (1,0): ps (transpose, sign = -1) ---
             tab_rev.eval_shell_integrals_into(1, 0, p.r, &mut sk_h[..1], &mut sk_s[..1])?;
             Rotation::rotate_shell_pair_into(
-                1, 0, &sk_h[..1], &sk_s[..1], dc,
-                &mut sub_h[..3], &mut sub_s[..3],
+                1,
+                0,
+                &sk_h[..1],
+                &sk_s[..1],
+                dc,
+                &mut sub_h[..3],
+                &mut sub_s[..3],
             )?;
             block_h[1] = -sub_h[0];
             block_h[2] = -sub_h[1];
@@ -396,8 +416,13 @@ impl HamiltonianBuilder {
             // --- Shell (1,1): pp (direct) ---
             tab_fwd.eval_shell_integrals_into(1, 1, p.r, &mut sk_h[..2], &mut sk_s[..2])?;
             Rotation::rotate_shell_pair_into(
-                1, 1, &sk_h[..2], &sk_s[..2], dc,
-                &mut sub_h[..9], &mut sub_s[..9],
+                1,
+                1,
+                &sk_h[..2],
+                &sk_s[..2],
+                dc,
+                &mut sub_h[..9],
+                &mut sub_s[..9],
             )?;
             for a in 0..3 {
                 for b in 0..3 {
@@ -461,9 +486,9 @@ impl HamiltonianBuilder {
 
         // 4. For a single fragment, neighbor list is just self
         let t0 = std::time::Instant::now();
-        let centroid = coords
-            .iter()
-            .fold([0.0, 0.0, 0.0], |acc, c| [acc[0] + c[0], acc[1] + c[1], acc[2] + c[2]]);
+        let centroid = coords.iter().fold([0.0, 0.0, 0.0], |acc, c| {
+            [acc[0] + c[0], acc[1] + c[1], acc[2] + c[2]]
+        });
         let n = coords.len() as f64;
         let centroids = vec![[centroid[0] / n, centroid[1] / n, centroid[2] / n]];
         let frag_neighbors = FragmentNeighborList::build(&centroids, 10.0);

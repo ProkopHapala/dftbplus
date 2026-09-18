@@ -59,13 +59,19 @@ fn test_bspline_ho_ss() {
     // Convert to B-spline control points (same as gpu_prep)
     let (ss_ctrl, dr_new) = resample_bspline(&ss_col, dr, n_grid);
     let (sp_ctrl, _) = resample_bspline(&sp_col, dr, n_grid);
-    eprintln!("After resample_bspline: dr_new={dr_new}, n_ctrl={}", ss_ctrl.len());
+    eprintln!(
+        "After resample_bspline: dr_new={dr_new}, n_ctrl={}",
+        ss_ctrl.len()
+    );
 
     // Print control points around the same region
     eprintln!("B-spline control points (ss) around k=90-95:");
     for k in 88..98 {
         if k < ss_ctrl.len() {
-            eprintln!("  k={k} ctrl_ss={:.6} ctrl_sp={:.6}", ss_ctrl[k], sp_ctrl[k]);
+            eprintln!(
+                "  k={k} ctrl_ss={:.6} ctrl_sp={:.6}",
+                ss_ctrl[k], sp_ctrl[k]
+            );
         }
     }
 
@@ -93,10 +99,10 @@ fn test_bspline_ho_ss() {
 
     // Read float2 values (ss, sp) from the table
     let ss_val = interp_bspline_4pt(&sk_h[0..], base * n_sk_cols, w); // wrong — need stride
-    // Actually the table is interleaved: [ss_0, sp_0, ss_1, sp_1, ...]
-    // For interp_sk_2, it casts to float2 and reads tab2[base], tab2[base+1], etc.
-    // tab2[k] = (sk_h[2*k], sk_h[2*k+1])
-    // So we need to read with stride 2:
+                                                                      // Actually the table is interleaved: [ss_0, sp_0, ss_1, sp_1, ...]
+                                                                      // For interp_sk_2, it casts to float2 and reads tab2[base], tab2[base+1], etc.
+                                                                      // tab2[k] = (sk_h[2*k], sk_h[2*k+1])
+                                                                      // So we need to read with stride 2:
     let mut ss_interp = 0.0f32;
     let mut sp_interp = 0.0f32;
     for j in 0..4 {
