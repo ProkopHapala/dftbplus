@@ -28,11 +28,22 @@ for batched DFTB on many independent systems.
   workgroup per system; fused step kernel computes D², idempotency error,
   trace, branch decision (contract `D←D²` / expand `D←2D−D²`), and a
   device-side `done[]` freeze per launch — zero host syncs inside the
-  iteration loop. Palser–Gershgorin init (`tc2_init_batched`).
-  `RUST_DFTB_PURIFY_WG` / `RUST_DFTB_PURIFY_TILE` (tile path currently
-  broken — do not use) knobs. Warm-start + δK0 occupied-subspace rotation
-  (sparse `k_seed_shift` recipe) is the designed next step for SCC.
-  Design + measured status:
+  iteration loop. Palser–Gershgorin init (`tc2_init_batched`). GEMM
+  interior: `RUST_DFTB_PURIFY_GEMM`=2 register-tiled symmetric-square
+  (default — 22×11thr × 8×4reg, As_t staging serves both operands,
+  6.7 TFLOPS ≈ 19 % peak isolated; fused branch/write from `acc`
+  registers → **8.46 ms/solve at n=86/b400 cold**, beats Jacobi warm
+  9.7 ms); =0 row·row reference; =1 tiled (broken — do not use).
+  `RUST_DFTB_PURIFY_WG` / `_TILE` / `_TK` knobs. Warm-start + δK0
+  occupied-subspace rotation (sparse `k_seed_shift` recipe) is the
+  designed next step for SCC. Design + measured status:
   `doc/prokop/tasts/HBond_Relaxed_Scan_GPU/Alternative_Dense_Multi_Eigensolve.md`;
-  parity/bench: `tests/gpu_purify.rs`.
+  parity/bench: `tests/gpu_purify.rs`; GEMM sweep: `tests/gpu_gemm.rs`.
+- **gpu_gemm.rs** + **gpu_gemm.cl** — standalone batched-GEMM variant
+  sweep + bench. Kernels `gemm_regtile` (register-tiled, compile-time
+  `GEMM_{TX,TY,RTX,RTY,TK,SPLIT_M,SPLIT_N,SQ}` shape — split workgroups
+  + symmetric-square `/sq` mode), `gemm_1elem` (floor), `gemm_fulla`.
+  `GemmVariant` enum → `gemm_kernel` builder. Best: reg22x11/r8x4
+  /sq = 6.2–7.8 TFLOPS ≈ 17–22 % peak (batch-scaled). The purify GEMM
+  interior was tuned here first; parity + bench: `tests/gpu_gemm.rs`.
 - **gpu_matrix_ops.cl** — OpenCL kernels: GEMM, Jacobi, density purification.

@@ -331,8 +331,23 @@ with an f64 CPU reference ≤ ~6e-6 at every iteration count, batch 1–400.
    (span ~2–5 instead of ~90 → D₀ blowup ~1e30, Tr ~ −1700, random victim
    per run, mostly high workgroup indices). Fixed: copy `red[0]` to a
    register, barrier, then return. Deterministic ever since.
-4. Kernel-side `PURIFY_DEBUG_INIT`/`PURIFY_DEBUG` env-gated diagnostics
-   remain in the wrapper — they found (3) in minutes.
+4. **`pur_reduce` silently dropped contributions for non-power-of-2 lsz**
+   (found when fusing the branch/write pass — a red herring: the write
+   itself was never wrong). The fold used `h = floor(s/2)` with
+   `lid < h` — for odd `s` the LAST element is never folded (e.g.
+   lsz=242 drops lids 120,241). The row·row path ran wg=256/512 (PoT →
+   correct) and the original regtile pass accumulated `trn` over a
+   *strided* element map where the dropped lids happened to own zero
+   diagonal elements — so the bug was latent until the fused write moved
+   `trn` accumulation to tile ownership (lids 120/241 own diagonals
+   40–43,84–85 ≈ 3.1 of the trace → under-counted `trn` → wrong TC2
+   branch at iter 7 → wrong-rank projector rank-46, ΔE≈64). Same drop
+   also corrupted `pur_reduce_min/max` bounds at wg=242. Fixed:
+   `h = ceil(s/2)`, pairs `(i, i+h)` for `i < s−h` — every element
+   counted exactly once, no dest/source overlap. Verified: trn exact at
+   every iteration, parity restored.
+5. Kernel-side `PURIFY_DEBUG_INIT`/`PURIFY_DEBUG` env-gated diagnostics
+   remain in the wrapper — they found (3) and (4) in minutes.
 
 ### 7.3 Measured performance (n=86, batch=400, seeds 2000+, cold)
 
@@ -343,19 +358,142 @@ with an f64 CPU reference ≤ ~6e-6 at every iteration count, batch 1–400.
 | row·row WG512 | **34.2** | 0.57 | yes |
 | row·row WG1024 | 33.6 | 0.56 | yes |
 | tiled T16 WG256 | 31.7 | — | **broken** (errs never written; not debugged — secondary path) |
+| **regtile-sq two-pass** (22×11thr × 8×4reg, T→C then branch pass) | 10.25 | 0.171 | yes |
+| **regtile-sq fused** (same GEMM; branch applied from acc regs — no raw-T round-trip) | **8.46** | 0.141 | yes |
+
+#### 7.3.1 Isolated batched-GEMM variant sweep (n=86, batch=400, 508.84 MFLOP/call, bug-fixed code, 2026-09-19)
+
+`tests/gpu_gemm.rs` — `gemm_bench` (42 configs, CPU f64 parity-verified).
+Naming: `reg{TX}x{TY}/r{RTY}x{RTX}/tk{TK}/s{SM}x{SN}[/sq]` = TX×TY thread
+grid × RTY×RTX register micro-tile per thread, TK-deep `__local`
+k-staging, SM×SN workgroups per system, `/sq` = symmetric-square mode
+(B ≡ A — `As_t` transposed staging serves both operand fragments).
+
+**Floors (naive / production baselines):**
+
+| variant | ms/call | TFLOPS | % of ~36T |
+|---|---:|---:|---:|
+| fulla/wg64 (whole A in `__local`, 29.6 KB) | 1.491 | 0.34 | 0.9 % |
+| batched32x32/tk8 (production tile-per-WG) | 0.858 | 0.59 | 1.6 % |
+| batched16x16/tk16 | 0.666 | 0.76 | 2.1 % |
+| batched8x8/tk16 | 0.603 | 0.84 | 2.3 % |
+| batched16x16/tk32 | 0.524 | 0.97 | 2.7 % |
+| fulla/wg128 | 0.838 | 0.61 | 1.7 % |
+| reg16x16/r1x1/tk16 (tiled 1-elem) | 0.498 | 1.02 | 2.8 % |
+| **1elem/wg256** (row·col dot, no tiling) | 0.417 | 1.22 | 3.4 % |
+| **1elem/wg512** | 0.280 | 1.82 | 5.0 % |
+
+**Register-tiled, non-sq (C = A·B, both operands staged):**
+
+| variant | ms/call | TFLOPS | % of ~36T |
+|---|---:|---:|---:|
+| reg4x11/r8x8/tk16/s1x3 (3 WGs/sys) | 0.278 | 1.83 | 5.1 % |
+| reg6x11/r8x8/tk16/s1x2 | 0.248 | 2.05 | 5.7 % |
+| reg11x4/r8x8/tk16/s3x1 | 0.248 | 2.05 | 5.7 % |
+| reg6x6/r8x8/tk16/s2x2 (4 WGs/sys) | 0.245 | 2.08 | 5.8 % |
+| reg16x16/r4x4/tk16/s1x1 (256 thr) | 0.228 | 2.23 | 6.2 % |
+| reg8x16/r4x8/tk16/s2x2 | 0.218 | 2.33 | 6.5 % |
+| reg11x11/r8x8/tk32/s1x1 | 0.192 | 2.66 | 7.4 % |
+| reg16x16/r4x4/tk16/s2x2 | 0.190 | 2.68 | 7.4 % |
+| reg8x16/r4x8/tk16/s1x1 | 0.181 | 2.82 | 7.8 % |
+| reg16x8/r8x4/tk16/s2x2 | 0.172 | 2.97 | 8.2 % |
+| reg8x8/r4x8/tk16/s3x2 | 0.171 | 2.98 | 8.3 % |
+| reg8x8/r8x8/tk16/s1x1 (64 thr, user-spec shape) | 0.168 | 3.04 | 8.4 % |
+| reg8x16/r4x8/tk16/s2x2 | 0.157 | 3.24 | 9.0 % |
+| reg11x11/r4x8/tk16/s1x1 | 0.148 | 3.44 | 9.6 % |
+| reg8x16/r8x8/tk16/s1x1 (128 thr) | 0.142 | 3.58 | 9.9 % |
+| reg8x8/r8x8/tk16/s2x2 | 0.142 | 3.59 | 10.0 % |
+| reg8x8/r4x4/tk16/s3x2 | 0.132 | 3.85 | 10.7 % |
+| reg8x8/r4x4/tk16/s3x3 (9 WGs/sys) | 0.163 | 3.13 | 8.7 % |
+| **reg11x11/r8x8/tk16/s1x1** (88×88 cover, 121 thr) | 0.138 | 3.68 | 10.2 % |
+
+**Symmetric-square (`/sq`, B ≡ A — the purify D² case; requires a
+single full-coverage tile):**
+
+| variant | ms/call | TFLOPS | % of ~36T |
+|---|---:|---:|---:|
+| reg22x44/r2x4/tk16/s1x1/sq (968 thr) | 0.193 | 2.64 | 7.3 % |
+| reg44x22/r4x2/tk16/s1x1/sq | 0.157 | 3.23 | 9.0 % |
+| reg11x11/r8x8/tk32/s1x1/sq | 0.136 | 3.74 | 10.4 % |
+| reg44x11/r8x2/tk16/s1x1/sq (484 thr) | 0.134 | 3.80 | 10.6 % |
+| reg11x11/r8x8/tk88/s1x1/sq (whole A, 30 KB) | 0.127 | 4.01 | 11.1 % |
+| reg11x22/r4x8/tk16/s1x1/sq | 0.122 | 4.18 | 11.6 % |
+| reg22x22/r4x4/tk16/s1x1/sq (484 thr) | 0.123 | 4.13 | 11.5 % |
+| reg11x11/r8x8/tk16/s1x1/sq | 0.113 | 4.51 | 12.5 % |
+| reg11x11/r8x8/tk44/s1x1/sq | 0.089 | 5.70 | 15.8 % |
+| reg22x11/r8x4/tk44/s1x1/sq | 0.090 | 5.68 | 15.8 % |
+| reg22x11/r8x4/tk22/s1x1/sq | 0.087 | 5.85 | 16.3 % |
+| reg22x11/r8x4/tk8/s1x1/sq | 0.087 | 5.82 | 16.2 % |
+| reg22x11/r8x4/tk32/s1x1/sq | 0.085 | 5.99 | 16.6 % |
+| **reg22x11/r8x4/tk16/s1x1/sq** | **0.082** | **6.21** | **17.3 %** |
+
+(Best-ever single measurement in this family: **0.075–0.076 ms = 6.7–6.8
+TFLOPS ≈ 18.7–18.9 % of peak** — run-to-run variance ±10 %; the
+22×11thr × 8×4reg / sq shape is consistently the winner.)
+
+**Reading the sweep:**
+
+- **Floors:** 1-elem global dot ≈ 1.2–1.8 TFLOPS; production
+  tile-per-WG `batched_gemm` ≈ 0.6–1.0 TFLOPS (re-staging traffic
+  dominates at 400 tiny systems); whole-A-in-local ≈ 0.3–0.6 TFLOPS.
+- **Register-tiled non-sq:** rises to ~3.7 TFLOPS at the
+  coverage-optimal 88×88 tile — occupancy (400 WGs × 121 thr ≈ 48 K
+  threads) and per-WG traffic are the levers; split-WG configs help at
+  small tiles but lose to the coverage-optimal single tile.
+- **`/sq` is the big win:** `As_t` serves both operands (B ≡ A for
+  symmetric D) — halves staging + B traffic → +40–80 % over the same
+  shape non-sq.
+- **Sweet spot = 242 thr × 32 accums (r8x4)**: more threads at fewer
+  accums (484/968-thr shapes) regress — the staging/barrier cost
+  outweighs occupancy; fewer accums per thread also cuts ILP.
+- **Residual overhead vs isolated GEMM:** fused purify step =
+  0.141 ms/iter vs 0.082 ms isolated — ~0.06 ms of barriers/reduces/
+  branch bookkeeping per iteration (the next target if worth it).
+
+#### 7.3.2 Batch-size saturation sweep (2026-09-19)
+
+400 systems × 242 thr ≈ 97 K threads vs ~168 K GPU slots — mild
+under-occupancy. Scaling batch 400 → 1600 (≈ 390 K threads, WGs queue):
+
+**Isolated GEMM, winner family reg22x11/r8x4/sq (TFLOPS):**
+
+| tk | b400 | b900 | b1600 |
+|---:|---:|---:|---:|
+| 8 | 5.82 | 6.25 | 6.87 |
+| 16 | 6.21 | 5.72 | 7.02 |
+| **22** | 5.85 | 6.18 | **7.83 — 21.7 % of peak** |
+| 32 | 5.99 | 6.23 | 6.73 |
+| 44 | 5.68 | 6.85 | 6.74 |
+
+**Full solve (`purify_bench`, 60 iters, conv=true everywhere):**
+
+| batch | ms/solve | ms/iter | µs/sys/iter |
+|---:|---:|---:|---:|
+| 400 | 8.97 | 0.150 | 0.37 |
+| 900 | 17.72 | 0.295 | 0.33 |
+| 1600 | 28.20 | 0.470 | 0.29 |
+
+**Reading it:** the GEMM interior gains ~20–30 % throughput from
+b400→b1600 (occupancy was genuinely the limiter at 400); **tk22/sq at
+b1600 = 7.83 TFLOPS ≈ 22 % of peak**. The full solve gains ~20 %
+per-system (the barrier/reduce overhead benefits less than the GEMM
+interior). Floors (1elem, batched_gemm, fulla) are traffic/latency-bound
+— flat vs batch. So the ~19 % figure at b400 is not the kernel's
+ceiling — ~22 % is the realistic shape ceiling at full occupancy;
+beyond that the barriers + reduces + non-GEMM bookkeeping dominate.
 
 - ~60 iters for these random matrices (worst case: tiny Fermi gaps);
   `iters=60 conv=true`.
-- Row·row GEMM ≈ 0.9 TFLOPS at WG512 — ~2.5 % of peak, latency-bound on
-  86-fma serial dots. Same utilization class as Jacobi so far — **the
-  GEMM interior is now the bottleneck to attack** (register blocking /
-  better tiling), NOT the surrounding machinery (zero syncs, zero
-  allocs, 1 launch/iter — the harness is already clean).
-- Jacobi reference: ~9.7 ms warm / ~17 ms cold. Purify at 34 ms loses on
-  *this* benchmark — BUT random matrices are TC2's worst case; the SCC
-  use case is warm-start K (~5–15 iters → ~3–9 ms) where it already
-  wins, and the GEMM interior has real headroom left (target 5–15×,
-  see §6.4).
+- Register-tiled symmetric-square GEMM (As_t transposed staging serves
+  both operands — B ≡ A) measured **6.7 TFLOPS ≈ 19 % of 36 T peak** in
+  isolation (see `tests/gpu_gemm.rs` sweep); inside the fused TC2 step
+  the effective 0.141 ms/iter vs 0.075 ms isolated GEMM leaves ~0.066 ms
+  for staging barriers + reduces + bookkeeping — the next target.
+- **Purify now beats Jacobi even on the COLD worst case:** 8.46 ms vs
+  ~9.7 ms warm-resident / ~17 ms cold Jacobi. With warm-start K
+  (~5–15 iters) it projects to ~0.7–2.1 ms — >5× faster than Jacobi.
+- Row·row kept as `RUST_DFTB_PURIFY_GEMM=0` reference path (0.9 TFLOPS,
+  latency-bound serial dots).
 - Warm-start input (initial K instead of Palser D₀) is the designed
   next step for the SCC path — not yet wired in the standalone wrapper.
 
@@ -404,9 +542,14 @@ single small systems cannot saturate the GPU and stay on Jacobi/LAPACK.
 
 ### 7.5 Next steps (priority order)
 
-1. **GEMM interior:** register-tiled variant (8×8 thread tiles, 64
-   threads/WG, small local-memory staging tiles) — the 0.9 TFLOPS
-   row·row is a floor, not a ceiling; target ≥5 TFLOPS batched n=86.
+1. ~~**GEMM interior:** register-tiled variant~~ **DONE** — regtile-sq
+   (22×11thr × 8×4reg, 88×88 cover, As_t serves both operands) = 6.7
+   TFLOPS ≈ 19 % of peak isolated; fused branch/write (no raw-T
+   round-trip) → **8.46 ms/solve**, beats warm-resident Jacobi on the
+   cold worst-case benchmark. Residual: ~0.066 ms/iter of
+   barrier/reduce/bookkeeping overhead vs the 0.075 ms isolated GEMM —
+   optional further fusion (e.g. fold the `er` reduce into the GEMM's
+   last staging barrier) if worth it.
 2. **Warm-start input** — `purify_tc2_batched` accepting previous D
    (+ saved K0) instead of Palser init; implement the δK0 seed shift +
    McWeeny polish per §7.4-B; benchmark equal-accuracy vs Jacobi on real
@@ -417,4 +560,78 @@ single small systems cannot saturate the GPU and stay on Jacobi/LAPACK.
    makes the sparse `k_seed_shift` recipe directly portable.
 5. Debug or delete the broken `PURIFY_TILE>0` path — currently writes
    no diagnostics; do not let a broken config silently pass.
+
+---
+
+## 8. Key code locations (file:line relevance map)
+
+For code review / LLM-assisted discussion — every kernel and entry
+point of this path, exact locations (2026-09-19, will drift with edits):
+
+### GPU kernels — `rust_dftb/src/qmqm/gpu_purify.cl`
+
+| lines | symbol | role |
+|---:|---|---|
+| 57–103 | `pur_reduce` / `pur_reduce_min` / `pur_reduce_max` | workgroup fold-reduce; **the non-PoT-lsz fix lives here** (`h = ceil(s/2)` fold — see §7.2 #4) |
+| 111–148 | `__kernel tc2_init_batched` | Palser–Gershgorin init: Gershgorin row bounds → `D0 = (λmax I − H)/span`, writes `traces[sys] = Tr(D0)` |
+| 157–346 | `__kernel tc2_step_batched` | **the fused step — everything per iteration**: done-mirror early-return (183–186), regtile-sq GEMM interior (188–254, `As_t` serves both operands), `er` reduce + `l_trd`/`l_frozen` broadcast (305–315), branch `contract` (317), fused branch/write from `acc` regs (319–335), `trn` reduce → `traces` (344–345) |
+| 257–336 | `#elif PURIFY_TILE` / `#else` | broken tiled variant + row·row reference GEMM (kept for A/B) |
+
+### GPU kernels — `rust_dftb/src/qmqm/gpu_gemm.cl`
+
+| lines | symbol | role |
+|---:|---|---|
+| 40 | `__kernel gemm_1elem` | 1-thread-per-element row·col dot — the floor |
+| 82 | `__kernel gemm_regtile` | **the tuned kernel**: `GEMM_{TX,TY,RTX,RTY,TK,SPLIT_M,SPLIT_N,SQ}` compile-time shape; TX×TY thread grid × RTY×RTX register micro-tile, `As_t`/`Bs` local k-staging, `/sq` mode stages only `As_t` (B ≡ A) |
+| 198 | `__kernel gemm_fulla` | whole-A-in-`__local` variant (traffic-bound, loses) |
+
+### Rust wrapper — `rust_dftb/src/qmqm/gpu_purify.rs`
+
+| lines | symbol | role |
+|---:|---|---|
+| 29–38 | `enum PurifyGemm` | GEMM interior selector (`RUST_DFTB_PURIFY_GEMM`) |
+| 45–57 | `regtile_shape` | derives (tx,ty,rtx,rty,tk) from `n` — the 8×4 micro-tile choice |
+| 61–80 | `render_purify_source` | template `#define` substitution (wg/tile/gemm/shape) |
+| 83–93 | `struct PurifyDiag` | errs/traces/iters/converged result |
+| 100–260 | `purify_tc2_batched` | **the entry point**: buffer alloc, kernel build (moved to plan-level later), init launch, chunked ping-pong loop (223–235), convergence check (250–253), final-buffer select (257) |
+| 264 | `trace_tol` | `max(2e-5·Nocc, 1e-4)` — same as sparse path |
+
+### Rust wrapper — `rust_dftb/src/qmqm/gpu_gemm.rs`
+
+| lines | symbol | role |
+|---:|---|---|
+| 23–36 | `enum GemmVariant` | `OneElem` / `RegTile{tx,ty,rtx,rty,tk,split_m,split_n,sq}` / `FullA` |
+| 59–82 | `render_source` | `#define` substitution per variant |
+| 86–142 | `gemm_kernel` | builds the `Kernel` (global = batch·split·wg; sq needs full-coverage tile → fail-loud at 125–130) |
+
+### Tests / benchmarks
+
+| file | symbol | role |
+|---|---|---|
+| `tests/gpu_purify.rs:56` | `test_purify_tc2_parity` | parity vs sorted CPU eig (ΔE, ‖D−Dref‖, ‖D²−D‖, asym, ‖HD−DH‖) |
+| `tests/gpu_purify.rs:201` | `purify_step_probe` | per-iteration element-wise bisect tool (`PURIFY_PROBE_{ITERS,BATCH,TOL,SEED,REPS}`) |
+| `tests/gpu_purify.rs:304` | `purify_bench` | solve-level bench (`PURIFY_BENCH_BATCH`, µs/sys/iter) |
+| `tests/gpu_gemm.rs:54` | `variants()` | the 42-config sweep list |
+| `tests/gpu_gemm.rs:124` | `test_gemm_variants_parity` | all variants vs f64 CPU |
+| `tests/gpu_gemm.rs:183` | `gemm_bench` | isolated ms/TFLOPS/%peak table (`GEMM_{N,BATCH,REPS}`) |
+
+### Semantics sources (outside this path)
+
+| file | symbol | role |
+|---|---|---|
+| `src/methods/sparse/gpu_sparse.rs:~1701` | `tc2_step` | sparse metric-TC2 — the branch semantics this mirrors (`Tr(KS)>Nocc → KSK else 2K−KSK`; acceptance needs idempotency AND trace) |
+| `src/methods/sparse/sparse_system.rs` | `k_seed_shift` (Phase G3), `mcweeny_polish`, `dmm_descend` | the warm-start recipe to port: δK0 subspace rotation + McWeeny polish + TC2 floor-walk (§7.4-B) |
+| `src/qmqm/gpu_eigen.rs` | `eigsolver_kind`, Jacobi kernels | the default eigensolve path this is an *alternative* to — untouched |
+| `src/qmqm/gpu_scc_plan.rs` | SCC plan | future `SolveKind::{Eigen,Purify}` dispatch site |
+
+### Reproduce
+
+```bash
+cd rust_dftb
+cargo test --release --test gpu_purify                    # parity + probe
+cargo test --release --test gpu_purify purify_bench -- --ignored --nocapture
+cargo test --release --test gpu_gemm gemm_bench -- --ignored --nocapture
+GEMM_BATCH=1600 GEMM_REPS=30 cargo test --release --test gpu_gemm gemm_bench -- --ignored --nocapture
+PURIFY_BENCH_BATCH=1600 cargo test --release --test gpu_purify purify_bench -- --ignored --nocapture
+```
 

@@ -2559,8 +2559,10 @@ findings that REVISE the 16.A–16.E plan:
 
 **Files (new, separate path — Jacobi untouched):**
 `rust_dftb/src/qmqm/gpu_purify.rs` + `gpu_purify.cl`,
-`rust_dftb/tests/gpu_purify.rs`. Design + bring-up bug analysis:
-`Alternative_Dense_Multi_Eigensolve.md` §6–§7. Tasks entry: T11.
+`rust_dftb/tests/gpu_purify.rs`; GEMM sweep `gpu_gemm.rs` +
+`gpu_gemm.cl`, `tests/gpu_gemm.rs`. Design + bring-up bug analysis +
+**file:line code map (`Alternative_Dense_Multi_Eigensolve.md` §8)**.
+Tasks entry: T11.
 
 **Why:** Jacobi is round-latency-bound — measured ceiling ~5 % of GPU
 peak (Measured_Facts §8). Purification expresses the whole solve as
@@ -2580,14 +2582,38 @@ density-build kernel, no Fermi bisection inside the solve.
   others iterate; **`pur_reduce` barrier-before-return race** — the
   nondeterministic spectral-bounds corruption).
 
-### 17.2 Measured performance — first pass, honest
+### 17.2 Measured performance — regtile-sq fused (2026-09-19)
 
 n=86, batch=400, cold random matrices (TC2's worst case — tiny gaps →
-60 iters): **34.2 ms/solve at WG512** (0.57 ms/iter ≈ 0.9 TFLOPS ≈
-2.5 % peak) vs Jacobi ~17 ms cold / ~9.7 ms warm. Purify loses on this
-benchmark as-is; the deficit is the row·row GEMM interior, NOT the
-harness (already 1 launch/iter, 0 syncs, 0 allocs, ping-pong buffers,
-max occupancy — zero local memory).
+60 iters):
+
+| variant | ms/solve | ms/iter | notes |
+|---|---:|---:|---|
+| **regtile-sq fused (default)** | **8.46** | 0.141 | conv=true, max_err=9.9e-6 — **beats Jacobi warm (9.7) on the COLD benchmark** |
+| regtile-sq two-pass | 10.25 | 0.171 | T→C write + separate branch pass |
+| row·row WG512 | 34.2 | 0.57 | 0.9 TFLOPS — latency-bound serial dots |
+| row·row WG1024 | 33.6 | 0.56 | |
+| Jacobi ref | ~9.7 warm / ~17 cold | — | resident-batched |
+
+GEMM interior: 22×11thr × 8×4reg = 88×88 cover, As_t transposed staging
+serves both operands (D symmetric ⇒ B ≡ A) — **6.7 TFLOPS ≈ 19 % of
+36 T peak** isolated (`tests/gpu_gemm.rs` sweep, 31 variants). Fused
+branch/write applies the TC2 update directly from `acc` registers —
+eliminates a full raw-T global write + re-read per iteration
+(10.25 → 8.46 ms). Residual overhead 0.066 ms/iter = barriers +
+reduces + bookkeeping.
+
+Batch saturation (§7.3.2): b400 ≈ 97 K threads is mildly
+occupancy-limited — the same GEMM hits **7.83 TFLOPS ≈ 22 % of peak at
+b1600** (tk22/sq); per-system solve cost drops 0.37 → 0.29 µs/sys/iter.
+The ~19 % figure is the b400 operating point, not the kernel ceiling.
+
+Four bring-up bugs fixed — see §7.2 of the design doc: test-side
+nalgebra sort; mandatory device-side freeze; `pur_reduce`
+barrier-before-return race; **`pur_reduce` non-PoT-lsz fold drop** —
+the fused-write "regression" was this latent bug (lsz=242 dropped lids
+120,241 ≈ 3.1 trace → wrong branch → wrong-rank projector), exposed
+when `trn` accumulation moved from strided to tile ownership.
 
 ### 17.3 User-confirmed design directions (2026-09-18)
 
@@ -2612,8 +2638,13 @@ max occupancy — zero local memory).
 
 ### 17.4 Work order (priority)
 
-- [ ] Register-tiled GEMM interior per §17.3.1 (8×8 thread tiles,
-      64 thr/WG, small local staging tiles); A/B vs row·row at WG 256/512.
+- [x] Register-tiled GEMM interior — **DONE, exceeded spec**: winning
+      shape is 22×11thr × 8×4reg (not 8×8/64thr — measured optimum),
+      As_t serves both operands (symmetric square) → 6.7 TFLOPS ≈ 19 %
+      of peak isolated, 8.46 ms/solve fused in the TC2 step. See §17.5.
+- [ ] Optional: shave the residual 0.066 ms/iter (barriers + reduces +
+      bookkeeping vs 0.075 ms isolated GEMM) — e.g. fold the `er`
+      reduce into the GEMM's last staging barrier.
 - [ ] Warm-start API: accept previous D + saved K0; δK0 shift + McWeeny
       polish per §17.3.2; equal-accuracy bench vs Jacobi on real GC
       Hamiltonians (random matrices are TC2's worst case).
@@ -2625,3 +2656,39 @@ max occupancy — zero local memory).
       diagnostics — must not silently pass).
 - [ ] Finite-T caveat: TC2 gives the 0 K projector; kT=0.002 Ha smearing
       needs eigen path or Chebyshev-FOE later.
+
+### 17.5 GEMM-first checklist (2026-09-19 — do in this order)
+
+Standalone batched GEMM before touching purify: `C[i]=A[i]·B[i]` over
+`[batch=400][n²]` device buffers, distinct random matrices per replica,
+correctness vs CPU f64 + ms/GEMM + TFLOPS per variant.
+
+- [x] Bench harness `tests/gpu_gemm.rs`: one A,B,C buffer each,
+      CPU f64 reference check, timed `iters`-loop per variant.
+- [x] Variant: existing `batched_gemm` (tile-per-WG 16×16, TILE_K=32)
+      — 0.85 TFLOPS, loses (re-staging traffic dominates).
+- [x] Variant: 1-elem-per-thread row·col dot — 1.69 TFLOPS floor.
+- [x] Variant: register-tiled family — swept 31 configs (micro-tile
+      8×8/8×4/4×8/4×4/2×4/4×2/2×2/1×4/4×1, thread grids, split 1×1–2×2,
+      TK 8/16/44, sq on/off). Winning shape: **22×11thr × 8×4reg,
+      TK=8/44, sq** = 88×88 cover, 242 thr/WG, 1 system/WG.
+- [x] Variant: whole-A-in-`__local` (tk=44 ≈ 15 KB staged) — included
+      in the sweep (tk44 configs).
+- [x] Report table — done in `tests/gpu_gemm.rs` header + §7.3 of the
+      design doc. Winner: **reg22x11/r8x4/tk44/sq = 0.075 ms = 6.74
+      TFLOPS ≈ 18.7 % of ~36 T peak** (vs 1.69 TFLOPS 1-elem floor,
+      0.85 production batched_gemm). Symmetric-square mode (B ≡ A via
+      As_t) skips B staging entirely.
+- [x] Fuse winner into `tc2_step_batched` — done + fused branch/write
+      (TC2 update applied directly from `acc` registers — no raw-T
+      global round-trip): **10.25 → 8.46 ms/solve**.
+      One launch/iter, fused trace/err/branch/freeze all preserved.
+      Caught + fixed the latent `pur_reduce` non-PoT-lsz fold bug
+      (§17.2) during integration.
+- [ ] Warm start (sparse Phase-G3 recipe, `sparse_system.rs`):
+      δK0 seed `K_seed = K_conv + (K0_new − K0_old)` → McWeeny polish
+      `K←3K²−2K³` (orthogonal basis) → TC2 floor-walk. Optional DMM/LNV
+      subspace rotation `δD = −η(DH+HD−2DHD)` for geometry moves
+      (2 dense GEMMs + elementwise — `X=HD`, `Y=DX`).
+- [ ] `SolveKind::{Eigen, Purify}` opt-in dispatch + equal-accuracy
+      SCC bench vs Jacobi on real GC Hamiltonians.

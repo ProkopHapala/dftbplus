@@ -255,15 +255,32 @@ fn purify_step_probe() {
         let db = &d[b * n * n..(b + 1) * n * n];
         let mut worst = (0.0f64, 0usize, 0.0f64, 0.0f64);
         let mut tr_gpu = 0.0f64;
+        let mut tr_cpu = 0.0f64;
+        let (mut dmax, mut omax) = (0.0f64, 0.0f64); // diagonal / off-diagonal err
         for i in 0..n {
             for j in 0..n {
                 let diff = (db[i * n + j] as f64 - dc[(i, j)]).abs();
                 if diff > worst.0 { worst = (diff, i * n + j, dc[(i, j)], db[i * n + j] as f64); }
+                if i == j { dmax = dmax.max(diff); } else { omax = omax.max(diff); }
             }
             tr_gpu += db[i * n + i] as f64;
+            tr_cpu += dc[(i, i)];
         }
         eprintln!("[probe] sys{b} iters={probe_iters} max|D_gpu−D_cpu|={:.3e} idx {} (cpu={:.6} gpu={:.6}) Tr={:.5}",
             worst.0, worst.1, worst.2, worst.3, tr_gpu);
+        eprintln!("[probe] sys{b}   diag_err={:.3e} offdiag_err={:.3e} Tr_cpu={:.5} dTr={:.4e}",
+            dmax, omax, tr_cpu, tr_gpu - tr_cpu);
+        // per-diagonal-element dump: which (i,i) are corrupted, and how
+        let mut bad = Vec::new();
+        for i in 0..n {
+            let diff = (db[i * n + i] as f64 - dc[(i, i)]).abs();
+            if diff > 1e-4 { bad.push((i, diff, dc[(i, i)], db[i * n + i] as f64)); }
+        }
+        if !bad.is_empty() {
+            let s: Vec<String> = bad.iter().take(16)
+                .map(|(i, d, c, g)| format!("{i}:{d:.2}({c:.3}/{g:.3})")).collect();
+            eprintln!("[probe] sys{b}   bad-diag {}: {}", bad.len(), s.join(" "));
+        }
         // ‖D−Dref‖ with the true lowest-43 projector + variational energy
         let (eigs, vecs) = cpu_eig(hb, n);
         let mut pd = 0.0f64;
@@ -293,7 +310,8 @@ fn purify_bench() {
         }
     };
     let n = 86usize;
-    let batch = 400usize;
+    let batch: usize = std::env::var("PURIFY_BENCH_BATCH")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(400);
     let nocc = 43f32;
 
     let mut h = Vec::with_capacity(batch * n * n);
@@ -313,7 +331,9 @@ fn purify_bench() {
     }
     let dt = t0.elapsed().as_secs_f64() * 1e3 / reps as f64;
     eprintln!(
-        "[purify-bench] n={n} batch={batch}: {dt:.2} ms/solve (iters={}, conv={}, max_err={:.2e})",
+        "[purify-bench] n={n} batch={batch}: {dt:.2} ms/solve = {:.4} ms/iter = {:.2} µs/sys/iter (iters={}, conv={}, max_err={:.2e})",
+        dt / diag.iters as f64,
+        dt / diag.iters as f64 / batch as f64 * 1e3,
         diag.iters,
         diag.converged,
         diag.errs.iter().cloned().fold(0.0f32, f32::max)

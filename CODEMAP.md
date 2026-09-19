@@ -120,11 +120,21 @@ QM/QM fragment solver with OpenCL GPU offload. Python utilities (`pyBall/`,
   digest `doc/prokop/tasts/HBond_Relaxed_Scan_GPU/Measured_Facts_Jacobi_Sweeps.md`,
   report `doc/prokop/reports/2026-09-17_resident_jacobi_eigensolver.md`),
   `gpu_purify.rs` + `gpu_purify.cl` (batched dense TC2 density-matrix
-  purification — alternative eigensolve path, one WG/system, fused
-  step kernel + device-side freeze; `RUST_DFTB_PURIFY_{WG,TILE}` knobs;
-  correctness verified, GEMM interior still first-pass; design+status
+  purification — alternative eigensolve path, one WG/system. Kernels:
+  `tc2_init_batched` Palser–Gershgorin init, `tc2_step_batched` fused
+  step = D² GEMM + ‖D²−D‖ + trace + device branch + `done[]` freeze, one
+  launch/iter, zero syncs; `pur_reduce{,_min,_max}` workgroup reduces
+  (non-PoT-lsz fold — fixed). Wrapper `purify_tc2_batched`; knobs
+  `RUST_DFTB_PURIFY_{GEMM,WG,TILE,TK}` (GEMM=2 regtile-sq default, =0
+  row·row ref, =1 tiled broken). **8.46 ms/solve n=86/b400 cold — beats
+  Jacobi warm 9.7 ms**; design+status
   `doc/prokop/tasts/HBond_Relaxed_Scan_GPU/Alternative_Dense_Multi_Eigensolve.md`,
   tests `tests/gpu_purify.rs`),
+  `gpu_gemm.rs` + `gpu_gemm.cl` (standalone batched-GEMM variant sweep —
+  kernels `gemm_1elem`, `gemm_regtile` (register-tiled + WG-split +
+  symmetric-square `/sq` mode), `gemm_fulla`; `GemmVariant` enum +
+  `gemm_kernel` builder; the purify GEMM interior was tuned here —
+  6.2–7.8 TFLOPS ≈ 17–22 % peak, tests `tests/gpu_gemm.rs`),
   `gpu_matrix_ops.cl`, `gpu_scc.rs` (legacy one-shot SCC;
   do not use for production), `gpu_scc_plan.rs` (persistent SCC inner loop),
   `gpu_dftb.rs` (**production run loop** — `GpuDftb::new` / `set_coords` / `scc` /

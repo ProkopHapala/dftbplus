@@ -27,6 +27,7 @@ pub mod shifts;
 // See doc/prokop/tasts/HBond_Relaxed_Scan_GPU/Dense_Multi_PBC.arch_notes.md.
 pub mod gpu_dftb;
 pub mod gpu_forces;
+pub mod gpu_gemm;
 pub mod gpu_hermitian;
 pub mod gpu_pbc;
 pub mod gpu_pbc_plan;

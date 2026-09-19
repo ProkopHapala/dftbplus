@@ -241,18 +241,29 @@ iteration, zero host syncs inside the loop, one workgroup per system.
 - [x] Race found+fixed in `pur_reduce*` (missing barrier before
       `return red[0]` → next reduce's first write clobbered the result;
       corrupted spectral bounds, random victim). Deterministic since.
-- [ ] **Perf: row·row WG512 = 34.2 ms/solve (0.57 ms/iter ≈ 0.9 TFLOPS,
-      ~2.5 % peak) vs Jacobi ~17 ms cold** — currently behind on the
-      cold random-matrix benchmark; the GEMM interior is latency-bound,
-      not the harness (already 1 launch/iter, 0 syncs, 0 allocs).
+- [x] **Perf — regtile-sq fused = 8.46 ms/solve (0.141 ms/iter), beats
+      Jacobi warm (9.7) on the COLD worst-case benchmark** (2026-09-19).
+      Register-tiled symmetric-square GEMM (22×11thr × 8×4reg, 88×88
+      cover, As_t staging serves both operands) = 6.7 TFLOPS ≈ 19 % of
+      36 T peak isolated; fused branch/write from `acc` registers
+      (no raw-T round-trip). Row·row kept as `PURIFY_GEMM=0` reference.
+- [x] `pur_reduce` non-PoT-lsz fold bug found+fixed during the fusion:
+      fold dropped the last element for odd `s` (lsz=242 → lost lids
+      120,241 ≈ 3.1 of the trace → wrong TC2 branch → wrong-rank
+      projector). `h = ceil(s/2)` now. Latent since the first commit —
+      exposed only because the fused write moved `trn` accumulation
+      from strided to tile ownership.
+- [ ] Residual overhead: 0.066 ms/iter (barriers + reduces + bookkeeping
+      vs 0.075 ms isolated GEMM) — optional further fusion.
       Tiled T16 path exists but is broken (errs unwritten) — not debugged.
 
 **User-confirmed directions (2026-09-18):**
 
-- [ ] **GEMM interior = register-tiled small-GEMM** (user direction):
-      8×8 output tiles/thread, 64 threads/WG (8×8 grid → 64×64/pass,
-      2 passes at n=86), A/B staged via *small* `__local` blocks so many
-      WGs stay resident per CU. Target ≥5 TFLOPS batched at n=86.
+- [x] **GEMM interior = register-tiled small-GEMM** (user direction):
+      measured optimum is 22×11thr × 8×4reg (not the 8×8/64thr first
+      guess — the accumulator-vs-threadcount balance won), small
+      `__local` k-staging (TK=8), many WGs resident. **6.7 TFLOPS ≈
+      19 % peak — inside the 10–20 % target.**
 - [ ] **Warm start for the whole SCC** (user direction): payoff is
       hot-start across geometry steps, not one cold solve. Mandatory
       ingredient — copy sparse Phase-G3 (`sparse_system.rs::k_seed_shift`

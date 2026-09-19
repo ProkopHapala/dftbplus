@@ -24,12 +24,59 @@ const PURIFY_WG_DEFAULT: usize = 256;
 /// iterations (not per iteration: zero syncs inside the chunk).
 const PURIFY_CHUNK: usize = 4;
 
-/// Render the purify source: `wg` = workgroup size, `tile` = PURIFY_TILE
-/// (0 → barrier-free row·row GEMM; 16/32 → cooperative local tiles).
-pub fn render_purify_source(wg: usize, tile: usize) -> String {
-    GPU_PURIFY_TEMPLATE
+/// GEMM interior selector for the fused TC2 step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PurifyGemm {
+    /// row·row global dots — barrier-free, ~0.9 TFLOPS at n=86/b400.
+    RowRow,
+    /// cooperative local tiles (PURIFY_TILE) — BROKEN, kept for reference.
+    Tiled(usize),
+    /// register-tiled symmetric-square (measured best: 6.7 TFLOPS).
+    /// Requires the WG tile (ty·RTY)×(tx·RTX) to cover n×n — shape is
+    /// derived from `n` by `regtile_shape`.
+    RegTileSq,
+}
+
+/// Register-tile shape for `RegTileSq`: fixed micro-tile RTY×RTX = 8×4
+/// (measured optimum at n=86 — 32 accums, 242 threads); the thread grid
+/// is derived so the WG tile covers n×n. Returns (tx, ty, rtx, rty, tk)
+/// or None when infeasible (tx·ty > 1024 → needs a bigger micro-tile or
+/// the split path — fail loud, pick RowRow).
+fn regtile_shape(n: usize) -> Option<(usize, usize, usize, usize, usize)> {
+    let (rtx, rty) = (4usize, 8usize);
+    let tx = n.div_ceil(rtx);
+    let ty = n.div_ceil(rty);
+    if tx * ty > 1024 {
+        return None;
+    }
+    // k-staging depth: 44 ≈ n/2 measured marginally fastest at n=86 but
+    // costs 4× the local memory of tk=8 for ~equal perf → prefer tk=8;
+    // local = tk·WM·4 B must stay small for WG residency.
+    let tk = if 8 * ty * rty * 4 <= 48 * 1024 { 8 } else { 4 };
+    Some((tx, ty, rtx, rty, tk))
+}
+
+/// Render the purify source with the given workgroup size, GEMM
+/// interior, and (for RegTileSq) register-tile shape.
+pub fn render_purify_source(
+    wg: usize,
+    tile: usize,
+    gemm: usize,
+    shape: Option<(usize, usize, usize, usize, usize)>,
+) -> String {
+    let mut src = GPU_PURIFY_TEMPLATE
         .replace("#define PURIFY_WG 256", &format!("#define PURIFY_WG {wg}"))
         .replace("#define PURIFY_TILE 0", &format!("#define PURIFY_TILE {tile}"))
+        .replace("#define PURIFY_GEMM 0", &format!("#define PURIFY_GEMM {gemm}"));
+    if let Some((tx, ty, rtx, rty, tk)) = shape {
+        src = src
+            .replace("#define PURIFY_TX 22", &format!("#define PURIFY_TX {tx}"))
+            .replace("#define PURIFY_TY 11", &format!("#define PURIFY_TY {ty}"))
+            .replace("#define PURIFY_RTX 4", &format!("#define PURIFY_RTX {rtx}"))
+            .replace("#define PURIFY_RTY 8", &format!("#define PURIFY_RTY {rty}"))
+            .replace("#define PURIFY_TK 8", &format!("#define PURIFY_TK {tk}"));
+    }
+    src
 }
 
 /// Per-system result of a batched TC2 purification.
@@ -69,13 +116,42 @@ pub fn purify_tc2_batched(
     if batch == 0 {
         return Ok(PurifyDiag { errs: vec![], traces: vec![], iters: 0, converged: true });
     }
-    // Tuning knobs (same convention as RUST_DFTB_JACOBI_*): workgroup size
-    // and GEMM interior (0 = barrier-free row·row; 16/32 = local tiles).
-    let wg: usize = std::env::var("RUST_DFTB_PURIFY_WG")
+    // Tuning knobs (same convention as RUST_DFTB_JACOBI_*):
+    //   RUST_DFTB_PURIFY_GEMM  2 = register-tiled symmetric-square
+    //     (default; measured 6.7 TFLOPS vs 0.9 row·row at n=86/b400);
+    //     1 = cooperative local tiles (BROKEN — kept for reference);
+    //     0 = row·row reference path.
+    //   RUST_DFTB_PURIFY_WG    workgroup size for GEMM 0/1 (GEMM 2
+    //     derives wg = tx·ty from the register-tile shape).
+    //   RUST_DFTB_PURIFY_TILE  local tile size for GEMM 1 only.
+    //   RUST_DFTB_PURIFY_TK    k-staging depth for GEMM 2 (default 8).
+    let gemm_sel: usize = std::env::var("RUST_DFTB_PURIFY_GEMM")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(2);
+    let wg_env: usize = std::env::var("RUST_DFTB_PURIFY_WG")
         .ok().and_then(|s| s.parse().ok()).unwrap_or(PURIFY_WG_DEFAULT);
-    let tile: usize = std::env::var("RUST_DFTB_PURIFY_TILE")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(0);
-    let source = render_purify_source(wg, tile);
+    let (wg, tile, gemm, shape) = match gemm_sel {
+        2 => {
+            let mut sh = regtile_shape(n).ok_or_else(|| {
+                DftbError::InvalidInput(format!(
+                    "purify regtile GEMM infeasible for n={n} (thread grid > 1024) — \
+                     set RUST_DFTB_PURIFY_GEMM=0 for the row·row path"
+                ))
+            })?;
+            if let Some(tk) = std::env::var("RUST_DFTB_PURIFY_TK")
+                .ok().and_then(|s| s.parse::<usize>().ok())
+            {
+                sh.4 = tk;
+            }
+            (sh.0 * sh.1, 0usize, 2usize, Some(sh))
+        }
+        1 => {
+            let tile: usize = std::env::var("RUST_DFTB_PURIFY_TILE")
+                .ok().and_then(|s| s.parse().ok()).unwrap_or(16);
+            (wg_env, tile, 0usize, None)
+        }
+        _ => (wg_env, 0usize, 0usize, None),
+    };
+    let source = render_purify_source(wg, tile, gemm, shape);
     let program = rt.build_program(&source)?;
     let d_a = rt.zero_buffer::<f32>(batch * n * n)?;
     let d_b = rt.zero_buffer::<f32>(batch * n * n)?;
