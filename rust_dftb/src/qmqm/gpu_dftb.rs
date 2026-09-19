@@ -1101,6 +1101,7 @@ impl GpuDftb {
 
     pub fn reset_q0(&mut self) -> Result<()> {
         self.plan.reset_diis(&self.rt)?;
+        self.plan.reset_purify(); // §17.6: fresh solve → cold purify start
         self.state_fresh = false;
         self.plan.set_initial_charges(&self.rt, &self.q0)
     }

@@ -159,6 +159,58 @@ struct LaunchGeom {
     diis: usize,        // diis_step: batch*wg_diis
 }
 
+/// §17.6: persistent TC2-purification solver — built only under
+/// `EigKind::Purify` (RUST_DFTB_EIGSOLVER=purify). The in-loop solve is
+/// hp = Xᵀ·H_scc·X (existing cold GEMM handles) → warm-seeded TC2 steps
+/// on the d_a/d_b ping-pong → d = X·K·Xᵀ → mulliken(d,S). K persists
+/// across SCC iterations: the previous iteration's converged projector
+/// is the warm seed for the next H_scc (same geometry ⇒ same metric);
+/// `set_geometry` clears `seeded` → Palser re-init.
+/// NOT an eigensolver: produces no C/occ/μ — eval/finalize stay on the
+/// Jacobi path; purify yields the T=0 projector (kT smearing ignored).
+struct PurifyScc {
+    k_init_a: Kernel,      // tc2_init_batched — Palser D0 (hp → d_a)
+    k_step: Kernel,        // tc2_step_batched — fused D² + trace-branch + freeze
+    k_xk_a: Kernel,        // batched_gemm_active: temp = X·d_a
+    k_xk_b: Kernel,        // batched_gemm_active: temp = X·d_b (other ping-pong side)
+    k_txd: Kernel,         // batched_gemm_active: d = temp·x_t (D = X·K·Xᵀ)
+    // ---- DMM warm update (sparse-proven recipe, §7.6.4) ----
+    k_span: Kernel,        // spec_span_batched — Gershgorin Δε of hp → spans
+    g_hk: Kernel,          // batched_gemm_active: t_buf = hp·K  (B arg 7 = K side)
+    g_kx: Kernel,          // batched_gemm_active: y_buf = K·t_buf (A arg 6 = K side)
+    g_kk: Kernel,          // batched_gemm_active: t_buf = K·K   (A,B = K side; retract)
+    g_tk: Kernel,          // batched_gemm_active: y_buf = t_buf·K (B arg 7 = K side)
+    k_dmm_upd: Kernel,     // dmm_update_batched — K ← sym(K) − (η/Δε)(T+Tᵀ−2Y)
+    k_mcweeny: Kernel,     // mcweeny_combine_batched — K ← 3·t_buf − 2·y_buf
+    k_comm: Kernel,        // comm_gate_batched — rh = ‖T−Tᵀ‖/2‖T‖ on final T=hp·K
+    d_a: Buffer<f32>,      // K ping-pong A [batch*nn]
+    d_b: Buffer<f32>,      // K ping-pong B [batch*nn]
+    #[allow(dead_code)]    // bound into kernel args at build; keep-alive only
+    t_buf: Buffer<f32>,    // DMM/retract scratch A (H′K, K²) [batch*nn]
+    #[allow(dead_code)]
+    y_buf: Buffer<f32>,    // DMM/retract scratch B (K·T, K²·K) [batch*nn]
+    #[allow(dead_code)]
+    spans: Buffer<f32>,    // per-replica Gershgorin Δε of hp [batch]
+    rh: Buffer<f32>,       // per-replica commutator certificate [batch]
+    nocc: Buffer<f32>,     // per-system occ count (Tr target)
+    nocc_host: Vec<f32>,
+    #[allow(dead_code)]    // device-only for now; read when convergence is host-checked
+    traces: Buffer<f32>,
+    #[allow(dead_code)]
+    errs: Buffer<f32>,
+    done: Buffer<i32>,     // per-replica TC2-converged flags — cleared per SCC iter
+    swapped: bool,         // false → current K in d_a; true → d_b
+    seeded: bool,          // K holds last iter's state vs needs Palser init
+    warm: bool,            // RUST_DFTB_PURIFY_WARM=0 → cold-init every iter
+    dmm_steps: usize,      // DMM descent steps per warm solve (sparse: ~6)
+    dmm_retract: usize,    // McWeeny retract every k-th DMM step (sparse: 2)
+    #[allow(dead_code)]    // baked into the dmm_update kernel arg at build
+    dmm_eta: f32,          // η_scale — s = η/Δε per replica (sparse: 8)
+    tc2_tail: usize,       // optional TC2 steps after DMM (sparse: 0 — degrades R_H)
+    steps_cold: usize,     // TC2 steps right after Palser init
+    gxy: (usize, usize),   // tiled-GEMM (x, y) extents for the back-transform
+}
+
 /// - The Löwdin transform `X = S^{-1/2}` (recomputed per geometry via `set_geometry`)
 ///
 /// Does NOT own:
@@ -280,6 +332,11 @@ pub struct GpuSccPlan {
     k_residual_mix: Kernel,           // residual_and_mix_batched (simple mixing fallback)
     k_diis: Kernel,                   // diis_step_batched (R9b: GPU-side DIIS)
     k_commit: Kernel,                 // commit_q_batched (q ← q_next for active replicas)
+    /// §17.6: TC2-purification solver — `Some` only under
+    /// `EigKind::Purify` (RUST_DFTB_EIGSOLVER=purify). Replaces the
+    /// eigh_solve→occupation→eigh_finish→populations block inside the
+    /// SCC iteration; eval/finalize stay on the Jacobi path.
+    purify: Option<PurifyScc>,
     // Energy kernels:
     k_frobenius_trace: Kernel, // frobenius_trace_batched
     k_dot: Kernel,             // dot_batched (dq·v → dot)
@@ -1291,6 +1348,196 @@ impl GpuSccPlan {
             .build()
             .map_err(map_ocl_err)?;
 
+        // §17.6: EigKind::Purify — persistent TC2 solver. In-loop solve:
+        // hp = Xᵀ·H_scc·X (existing cold GEMM handles) → warm-seeded TC2
+        // steps on d_a/d_b → d = X·K·Xᵀ → mulliken(d,S). K stays in
+        // d_a/d_b across SCC iterations — the previous iteration's
+        // converged projector is the warm seed for the next H_scc (same
+        // geometry ⇒ same X); set_geometry clears `seeded`.
+        let purify = if eig_kind == crate::qmqm::gpu_eigen::EigKind::Purify {
+            let (pwg, ptile, pgemm, pshape) =
+                crate::qmqm::gpu_purify::purify_shape_config(n)?;
+            let psrc = crate::qmqm::gpu_purify::render_purify_source(pwg, ptile, pgemm, pshape);
+            let pprog = rt.build_program(&psrc)?;
+            let d_a = rt.zero_buffer::<f32>(batch * nn)?;
+            let d_b = rt.zero_buffer::<f32>(batch * nn)?;
+            let nocc = rt.zero_buffer::<f32>(batch)?;
+            let traces = rt.zero_buffer::<f32>(batch)?;
+            let errs = rt.zero_buffer::<f32>(batch)?;
+            let done = rt.zero_buffer::<i32>(batch)?;
+            let ptol: f32 = std::env::var("RUST_DFTB_PURIFY_TOL")
+                .ok().and_then(|s| s.parse().ok()).unwrap_or(1e-5);
+            let steps_cold: usize = std::env::var("RUST_DFTB_PURIFY_COLD_STEPS")
+                .ok().and_then(|s| s.parse().ok()).unwrap_or(60);
+            let k_init_a = Kernel::builder()
+                .program(&pprog)
+                .name("tc2_init_batched")
+                .queue(rt.queue().clone())
+                .global_work_size(batch * pwg)
+                .local_work_size(pwg)
+                .arg(&hp)
+                .arg(&d_a)
+                .arg(&traces)
+                .arg(n as i32)
+                .arg(batch as i32)
+                .build()
+                .map_err(map_ocl_err)?;
+            // DMM warm-update scratch + knobs (sparse-proven recipe —
+            // replaces the refuted δK0-shift / XL-extrapolation seeds).
+            let t_buf = rt.zero_buffer::<f32>(batch * nn)?;
+            let y_buf = rt.zero_buffer::<f32>(batch * nn)?;
+            let spans = rt.zero_buffer::<f32>(batch)?;
+            let rh = rt.zero_buffer::<f32>(batch)?;
+            // Defaults verified on GC/H2O (2026-09): η=1/Δε is the stable
+            // descent step (sparse's η=8/Δε diverges at SCC-scale ΔH —
+            // measured comm 5e-7→0.72→NaN); cap=10 is inactive except on
+            // pathological gradients. 16 steps + 4-step TC2 tail →
+            // failed=0 on H2O, E0 exact on GC.
+            let dmm_steps: usize = std::env::var("RUST_DFTB_PURIFY_DMM_STEPS")
+                .ok().and_then(|s| s.parse().ok()).unwrap_or(16);
+            let dmm_retract: usize = std::env::var("RUST_DFTB_PURIFY_DMM_RETRACT")
+                .ok().and_then(|s| s.parse().ok()).unwrap_or(2);
+            let dmm_eta: f32 = std::env::var("RUST_DFTB_PURIFY_DMM_ETA")
+                .ok().and_then(|s| s.parse().ok()).unwrap_or(1.0);
+            let tc2_tail: usize = std::env::var("RUST_DFTB_PURIFY_TC2_TAIL")
+                .ok().and_then(|s| s.parse().ok()).unwrap_or(4);
+            // Trust region per DMM step: s_eff = min(η/Δε, cap/‖G‖_F).
+            let dmm_cap: f32 = std::env::var("RUST_DFTB_PURIFY_DMM_CAP")
+                .ok().and_then(|s| s.parse().ok()).unwrap_or(10.0);
+            let k_step = Kernel::builder()
+                .program(&pprog)
+                .name("tc2_step_batched")
+                .queue(rt.queue().clone())
+                .global_work_size(batch * pwg)
+                .local_work_size(pwg)
+                .arg(&d_a)
+                .arg(&d_b)
+                .arg(&nocc)
+                .arg(&traces)
+                .arg(&errs)
+                .arg(&done)
+                .arg(ptol)
+                .arg(n as i32)
+                .arg(batch as i32)
+                .build()
+                .map_err(map_ocl_err)?;
+            // Back-transform GEMM handles — batched_gemm_active honours
+            // the compact work domain like the other in-loop GEMMs.
+            // temp = X·K (one handle per ping-pong side), d = temp·x_t.
+            const PT_K: usize = 32;
+            let pgws = ocl::SpatialDims::Three(
+                ((n + MAT_TILE_N - 1) / MAT_TILE_N) * MAT_TILE_N,
+                ((n + MAT_TILE_M - 1) / MAT_TILE_M) * MAT_TILE_M,
+                batch,
+            );
+            let plws = ocl::SpatialDims::Two(MAT_TILE_N, MAT_TILE_M);
+            let pa_loc = MAT_TILE_M * PT_K;
+            let pb_loc = MAT_TILE_N * (PT_K + 1);
+            let mut mk_pg = |a: &Buffer<f32>, b: &Buffer<f32>, co: &Buffer<f32>, alpha: f32| {
+                Kernel::builder()
+                    .program(&mat_prog)
+                    .name("batched_gemm_active")
+                    .queue(rt.queue().clone())
+                    .global_work_size(pgws.clone())
+                    .local_work_size(plws.clone())
+                    .arg(n as i32)
+                    .arg(batch as i32)
+                    .arg(0i32)
+                    .arg(0i32)
+                    .arg(alpha)
+                    .arg(0.0f32)
+                    .arg(a)
+                    .arg(b)
+                    .arg(co)
+                    .arg_local::<f32>(pa_loc)
+                    .arg_local::<f32>(pb_loc)
+                    .arg(&active)
+                    .arg(&work_ids)
+                    .build()
+                    .map_err(map_ocl_err)
+            };
+            // D = 2·X·K·Xᵀ — the production density convention carries the
+            // closed-shell ×2 (build_density_occ_batched folds it in);
+            // mulliken(D,S) then yields Ne electrons, not nocc.
+            let k_xk_a = mk_pg(&x_buf, &d_a, &temp, 2.0)?;
+            let k_xk_b = mk_pg(&x_buf, &d_b, &temp, 2.0)?;
+            let k_txd = mk_pg(&temp, &x_t, &d, 1.0)?;
+            // DMM GEMM handles — the K operand sits on the solve-time
+            // ping-pong side, so those args are rebound per solve via
+            // set_arg (built against d_a as the placeholder).
+            //   T = hp·K → t_buf      Y = K·T → y_buf
+            //   K² = K·K → t_buf      K³ = t_buf·K → y_buf   (retract)
+            let g_hk = mk_pg(&hp, &d_a, &t_buf, 1.0)?;
+            let g_kx = mk_pg(&d_a, &t_buf, &y_buf, 1.0)?;
+            let g_kk = mk_pg(&d_a, &d_a, &t_buf, 1.0)?;
+            let g_tk = mk_pg(&t_buf, &d_a, &y_buf, 1.0)?;
+            let k_span = Kernel::builder()
+                .program(&pprog).name("spec_span_batched")
+                .queue(rt.queue().clone())
+                .global_work_size(batch * pwg).local_work_size(pwg)
+                .arg(&hp).arg(&spans).arg(n as i32).arg(batch as i32)
+                .build().map_err(map_ocl_err)?;
+            let k_dmm_upd = Kernel::builder()
+                .program(&pprog).name("dmm_update_batched")
+                .queue(rt.queue().clone())
+                .global_work_size(batch * pwg).local_work_size(pwg)
+                .arg(&d_a).arg(&t_buf).arg(&y_buf).arg(&spans)
+                .arg(dmm_eta).arg(dmm_cap).arg(n as i32).arg(batch as i32)
+                .build().map_err(map_ocl_err)?;
+            let k_mcweeny = Kernel::builder()
+                .program(&pprog).name("mcweeny_combine_batched")
+                .queue(rt.queue().clone())
+                .global_work_size(batch * pwg).local_work_size(pwg)
+                .arg(&d_a).arg(&t_buf).arg(&y_buf).arg(n as i32).arg(batch as i32)
+                .build().map_err(map_ocl_err)?;
+            let k_comm = Kernel::builder()
+                .program(&pprog).name("comm_gate_batched")
+                .queue(rt.queue().clone())
+                .global_work_size(batch * pwg).local_work_size(pwg)
+                .arg(&t_buf).arg(&rh).arg(n as i32).arg(batch as i32)
+                .build().map_err(map_ocl_err)?;
+            Some(PurifyScc {
+                k_init_a,
+                k_step,
+                k_xk_a,
+                k_xk_b,
+                k_txd,
+                k_span,
+                g_hk,
+                g_kx,
+                g_kk,
+                g_tk,
+                k_dmm_upd,
+                k_mcweeny,
+                k_comm,
+                d_a,
+                d_b,
+                t_buf,
+                y_buf,
+                spans,
+                rh,
+                nocc,
+                nocc_host: vec![0.0; batch],
+                traces,
+                errs,
+                done,
+                swapped: false,
+                seeded: false,
+                warm: std::env::var("RUST_DFTB_PURIFY_WARM").ok().as_deref() != Some("0"),
+                dmm_steps,
+                dmm_retract,
+                dmm_eta,
+                tc2_tail,
+                steps_cold,
+                gxy: (
+                    ((n + MAT_TILE_N - 1) / MAT_TILE_N) * MAT_TILE_N,
+                    ((n + MAT_TILE_M - 1) / MAT_TILE_M) * MAT_TILE_M,
+                ),
+            })
+        } else {
+            None
+        };
+
         let mut plan = Self {
             n,
             n_atoms,
@@ -1375,6 +1622,7 @@ impl GpuSccPlan {
             k_residual_mix,
             k_diis,
             k_commit,
+            purify,
             k_frobenius_trace,
             k_dot,
             k_dot_q0,
@@ -1473,6 +1721,13 @@ impl GpuSccPlan {
             }
         }
         self.n_occ = n_occ;
+        // §17.6: purify path — upload the Tr target (nocc per system).
+        if let Some(pur) = self.purify.as_mut() {
+            for x in pur.nocc_host.iter_mut() {
+                *x = n_occ as f32;
+            }
+            pur.nocc.write(&pur.nocc_host).enq().map_err(map_ocl_err)?;
+        }
         Ok(())
     }
 
@@ -1569,6 +1824,153 @@ impl GpuSccPlan {
     /// chunk loop, `batch` otherwise). Diagnostic.
     pub fn work_n(&self) -> usize {
         self.work_n
+    }
+
+    /// §17.6: purify-path in-loop solve — hp = Xᵀ·H_scc·X → warm-seeded
+    /// TC2 steps → d = X·K·Xᵀ → mulliken(d,S). Replaces
+    /// eigh_solve→occupation→eigh_finish→populations inside the SCC
+    /// iteration. Fixed step budget (errs/traces/done are device-side
+    /// diagnostics — no host convergence readback inside the chunk).
+    /// Purify kernels launch the full domain: SCC-converged replicas
+    /// still burn WGs (they freeze via done[] only within an iter).
+    fn purify_solve_enq(&mut self, rt: &mut GpuRuntime) -> Result<()> {
+        // Orthogonalize: hp = Xᵀ·H_scc·X — cold GEMM handles are always
+        // geometry-current (x_buf/x_t refreshed by set_geometry).
+        self.enq_mm(&self.k_matmul_xh)?;
+        self.enq_mm(&self.k_matmul_tx)?;
+        rt.prof_tick("scc.pur_ortho");
+        let work_n = self.work_n;
+        let swapped = {
+            let pur = self.purify.as_mut().ok_or_else(|| {
+                DftbError::InvalidInput("purify_solve_enq: purify plan not built".into())
+            })?;
+            // Re-arm the freeze flags EVERY iteration — a latched done[s]=1
+            // makes tc2_step a no-op for that replica (both cold and warm).
+            pur.done.cmd().fill(0i32, None).enq().map_err(map_ocl_err)?;
+            let gxy = pur.gxy;
+            let g3 = |k: &Kernel| unsafe {
+                k.cmd()
+                    .global_work_size(ocl::SpatialDims::Three(gxy.0, gxy.1, work_n))
+                    .enq()
+                    .map_err(map_ocl_err)
+            };
+            if pur.seeded && pur.warm {
+                // ---- warm: DMM commutator descent (§7.6.4) ----
+                // Seed = last converged K IN PLACE (no δK0 shift, no
+                // extrapolation — both measured to drift/diverge). Each
+                // step: T=H′K, Y=KT, K ← sym(K)−(η/Δε)(T+Tᵀ−2Y) — the
+                // occ–virt coupling rotates the subspace downhill on
+                // Tr(KH′); McWeeny retracts hold idempotency.
+                unsafe { pur.k_span.enq().map_err(map_ocl_err)?; }
+                let kbuf = if pur.swapped { &pur.d_b } else { &pur.d_a };
+                pur.g_hk.set_arg(7u32, kbuf).map_err(map_ocl_err)?;
+                pur.g_kx.set_arg(6u32, kbuf).map_err(map_ocl_err)?;
+                pur.g_kk.set_arg(6u32, kbuf).map_err(map_ocl_err)?;
+                pur.g_kk.set_arg(7u32, kbuf).map_err(map_ocl_err)?;
+                pur.g_tk.set_arg(7u32, kbuf).map_err(map_ocl_err)?;
+                pur.k_dmm_upd.set_arg(0u32, kbuf).map_err(map_ocl_err)?;
+                pur.k_mcweeny.set_arg(0u32, kbuf).map_err(map_ocl_err)?;
+                for st in 0..pur.dmm_steps {
+                    g3(&pur.g_hk)?;   // T = H′·K
+                    g3(&pur.g_kx)?;   // Y = K·T
+                    unsafe { pur.k_dmm_upd.enq().map_err(map_ocl_err)?; }
+                    if pur.dmm_retract > 0 && (st + 1) % pur.dmm_retract == 0 {
+                        g3(&pur.g_kk)?;   // t_buf = K·K
+                        g3(&pur.g_tk)?;   // y_buf = t_buf·K
+                        unsafe { pur.k_mcweeny.enq().map_err(map_ocl_err)?; }
+                    }
+                }
+                // Optional TC2 tail (sparse default 0 — post-DMM TC2 can
+                // degrade R_H; knob kept for trace enforcement).
+                for _ in 0..pur.tc2_tail {
+                    if pur.swapped {
+                        pur.k_step.set_arg(0u32, &pur.d_b).map_err(map_ocl_err)?;
+                        pur.k_step.set_arg(1u32, &pur.d_a).map_err(map_ocl_err)?;
+                    } else {
+                        pur.k_step.set_arg(0u32, &pur.d_a).map_err(map_ocl_err)?;
+                        pur.k_step.set_arg(1u32, &pur.d_b).map_err(map_ocl_err)?;
+                    }
+                    unsafe { pur.k_step.enq().map_err(map_ocl_err)?; }
+                    pur.swapped = !pur.swapped;
+                }
+            } else {
+                // Cold: Palser–Gershgorin init hp → d_a, then TC2.
+                unsafe { pur.k_init_a.enq().map_err(map_ocl_err)?; }
+                pur.swapped = false;
+                pur.seeded = true;
+                for _ in 0..pur.steps_cold {
+                    if pur.swapped {
+                        pur.k_step.set_arg(0u32, &pur.d_b).map_err(map_ocl_err)?;
+                        pur.k_step.set_arg(1u32, &pur.d_a).map_err(map_ocl_err)?;
+                    } else {
+                        pur.k_step.set_arg(0u32, &pur.d_a).map_err(map_ocl_err)?;
+                        pur.k_step.set_arg(1u32, &pur.d_b).map_err(map_ocl_err)?;
+                    }
+                    unsafe { pur.k_step.enq().map_err(map_ocl_err)?; }
+                    pur.swapped = !pur.swapped;
+                }
+            }
+            // ---- R_H certificate on the FINAL K (both paths) ----
+            // T = H′·K → t_buf, then rh = ‖T−Tᵀ‖_F/(2‖T‖_F). One extra
+            // GEMM; comm≈0 certifies the occupied subspace (trace +
+            // idempotency alone accept wrong-subspace projectors).
+            {
+                let kbuf = if pur.swapped { &pur.d_b } else { &pur.d_a };
+                pur.g_hk.set_arg(7u32, kbuf).map_err(map_ocl_err)?;
+                g3(&pur.g_hk)?;
+                unsafe { pur.k_comm.enq().map_err(map_ocl_err)?; }
+            }
+            if std::env::var_os("RUST_DFTB_PURIFY_DEBUG").is_some() {
+                let mut tr_h = vec![0.0f32; self.batch.min(4)];
+                let mut er_h = vec![0.0f32; self.batch.min(4)];
+                let mut rh_h = vec![0.0f32; self.batch.min(4)];
+                rt.read_buffer(&pur.traces, &mut tr_h)?;
+                rt.read_buffer(&pur.errs, &mut er_h)?;
+                rt.read_buffer(&pur.rh, &mut rh_h)?;
+                eprintln!("[purify] tr={tr_h:?} er={er_h:?} rh={rh_h:?} seeded={}", pur.seeded);
+                // Certificate: ‖H'K − KH'‖_F on replica 0 (host f64). The
+                // correct occupied projector commutes with H'; an
+                // idempotent wrong-subspace projector passes tr/er but
+                // fails this.
+                let n = self.n;
+                let mut h_h = vec![0.0f32; n * n];
+                let mut k_h = vec![0.0f32; n * n];
+                rt.read_buffer(&self.hp, &mut h_h)?;
+                let kbuf = if pur.swapped { &pur.d_b } else { &pur.d_a };
+                rt.read_buffer(kbuf, &mut k_h)?;
+                let mut c2 = 0.0f64;
+                for i in 0..n {
+                    for j in 0..n {
+                        let mut c = 0.0f64;
+                        for l in 0..n {
+                            c += h_h[i * n + l] as f64 * k_h[l * n + j] as f64
+                                - k_h[i * n + l] as f64 * h_h[l * n + j] as f64;
+                        }
+                        c2 += c * c;
+                    }
+                }
+                eprintln!("[purify] comm=‖H'K−KH'‖_F={:.3e}", c2.sqrt());
+            }
+            pur.swapped
+        };
+        rt.prof_tick("scc.purify");
+        // D = X·K·Xᵀ — `swapped` mirrors purify_tc2_batched: the newest K
+        // lives in d_b when swapped. These handles are batched_gemm_active
+        // → enq3 with the tiled extents honours the compact work domain.
+        let pur = self.purify.as_ref().unwrap();
+        self.enq3(if swapped { &pur.k_xk_b } else { &pur.k_xk_a }, pur.gxy)?;
+        self.enq3(&pur.k_txd, pur.gxy)?;
+        rt.prof_tick("scc.pur_back");
+        self.enq1(&self.k_mulliken, self.lg.mull)?;
+        rt.prof_tick("scc.mulliken");
+        if std::env::var_os("RUST_DFTB_PURIFY_DEBUG").is_some() {
+            let mut q_h = vec![0.0f32; self.n_atoms.min(4)];
+            rt.read_buffer(&self.q_new, &mut q_h)?;
+            let mut q_in = vec![0.0f32; self.n_atoms.min(4)];
+            rt.read_buffer(&self.q_gpu, &mut q_in)?;
+            eprintln!("[purify] q_in={q_in:?} q_out={q_h:?}");
+        }
+        Ok(())
     }
 
     /// D10/R18: one fused launch for Δq → V=γΔq → H_scc. Replaces the
@@ -1862,6 +2264,11 @@ impl GpuSccPlan {
         // i.e. when B repair fails or was never warm. This is not a silent
         // fallback: the cold path is the certified primary route; the warm
         // basis is an accelerator that must pass the same metric check.
+        // §17.6: geometry changed ⇒ the purifier's K lives in the OLD X
+        // basis — next purify solve re-inits from Palser.
+        if let Some(pur) = self.purify.as_mut() {
+            pur.seeded = false;
+        }
         let mut b_ok = false;
         if self.b_warm {
             let e = self.repair_basis_c(rt, s_buf)?;
@@ -2170,18 +2577,24 @@ impl GpuSccPlan {
         // 1-3. Δq → V=γΔq → H_scc = H0+½S(V_A+V_B) — one fused launch (D10/R18)
         self.enq_dq_v_hscc()?;
 
-        // 4-6. Eigenproblem: warm A=cᵀH_scc c + in-place Jacobi, or cold
-        //      A=XᵀH_sccX + Jacobi(V=I) → cp. Eigenvalues on diag(hp).
-        self.eigh_solve(rt, false)?;
-        self.occupation(rt)?;
+        if self.purify.is_some() {
+            // §17.6: purify path — Xᵀ·H_scc·X → warm-seeded TC2 →
+            // D = X·K·Xᵀ → mulliken(D,S). No eigensolve/occupation.
+            self.purify_solve_enq(rt)?;
+        } else {
+            // 4-6. Eigenproblem: warm A=cᵀH_scc c + in-place Jacobi, or cold
+            //      A=XᵀH_sccX + Jacobi(V=I) → cp. Eigenvalues on diag(hp).
+            self.eigh_solve(rt, false)?;
+            self.occupation(rt)?;
 
-        // 6b-7. Column renorm (S-metric on c warm / plain on cp cold) and
-        //       cold-path c = X·cp.
-        self.eigh_finish(rt, self.occ_repair_scc)?;
+            // 6b-7. Column renorm (S-metric on c warm / plain on cp cold) and
+            //       cold-path c = X·cp.
+            self.eigh_finish(rt, self.occ_repair_scc)?;
 
-        // 8-9. T03: populations — direct path: SC=S·C + paired renorm +
-        //      Mulliken(C,SC); legacy: D build + Mulliken(D,S).
-        self.populations(rt, self.occ_repair_scc)?;
+            // 8-9. T03: populations — direct path: SC=S·C + paired renorm +
+            //      Mulliken(C,SC); legacy: D build + Mulliken(D,S).
+            self.populations(rt, self.occ_repair_scc)?;
+        }
 
         // R6: no in-loop occ_rayleigh — ρ_k feeds only E_band/W, both
         // computed on the certified finalize state. A committed step leaves
@@ -2260,15 +2673,28 @@ impl GpuSccPlan {
         self.enq_dq_v_hscc()?;
         rt.prof_tick("scc.hscc");
 
-        self.eigh_solve(rt, false)?;
-        rt.prof_tick("scc.eigh");
-        self.occupation(rt)?;
-        rt.prof_tick("scc.occ");
-        self.eigh_finish(rt, self.occ_repair_scc)?;
-        rt.prof_tick("scc.eigh_finish");
+        if self.purify.is_some() {
+            // §17.6: purify path — Xᵀ·H_scc·X → warm-seeded TC2 →
+            // D = X·K·Xᵀ → mulliken(D,S). No eigensolve/occupation.
+            self.purify_solve_enq(rt)?;
+        } else {
+            self.eigh_solve(rt, false)?;
+            rt.prof_tick("scc.eigh");
+            self.occupation(rt)?;
+            rt.prof_tick("scc.occ");
+            self.eigh_finish(rt, self.occ_repair_scc)?;
+            rt.prof_tick("scc.eigh_finish");
 
-        // T03: populations — direct path builds no density matrix.
-        self.populations(rt, self.occ_repair_scc)?;
+            // T03: populations — direct path builds no density matrix.
+            self.populations(rt, self.occ_repair_scc)?;
+            if std::env::var_os("RUST_DFTB_PURIFY_DEBUG").is_some() {
+                let mut q_h = vec![0.0f32; self.n_atoms.min(4)];
+                rt.read_buffer(&self.q_new, &mut q_h)?;
+                let mut q_in = vec![0.0f32; self.n_atoms.min(4)];
+                rt.read_buffer(&self.q_gpu, &mut q_in)?;
+                eprintln!("[eigh] q_in={q_in:?} q_out={q_h:?}");
+            }
+        }
 
         // R6: in-loop occ_rayleigh removed — ρ_k is consumed only by
         // energy_from_state / build_edm, both on the finalized state.
@@ -2354,6 +2780,15 @@ impl GpuSccPlan {
             .enq()
             .map_err(map_ocl_err)?;
         Ok(())
+    }
+
+    /// §17.6: a fresh SCC solve (reset_q0) must start the purifier cold —
+    /// warm-seeding a converged K is a no-op that freezes the projector
+    /// regardless of the new q0 (the original warm-seed bug).
+    pub fn reset_purify(&mut self) {
+        if let Some(pur) = self.purify.as_mut() {
+            pur.seeded = false;
+        }
     }
 
     /// Read DIIS fallback counters set by the kernel (replaces printf, D9).
@@ -2967,7 +3402,10 @@ fn build_jacobi_kernel(
                     work_ids,
                 )
             }
-            EigKind::Direct | EigKind::Block => {
+            // §17.6: EigKind::Purify still needs a real Jacobi kernel —
+            // finalize/eval run the certified cold eigh path; the in-loop
+            // solve is the only thing purify replaces.
+            EigKind::Direct | EigKind::Block | EigKind::Purify => {
                 if n > 256 {
                     return Err(DftbError::InvalidInput(format!(
                         "jacobi_cyclic_global_batched: n={n} exceeds capacity 256 (jn/2 pair rotations fit __local rot[128]) — no safe path yet"

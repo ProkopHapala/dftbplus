@@ -497,6 +497,64 @@ beyond that the barriers + reduces + non-GEMM bookkeeping dominate.
 - Warm-start input (initial K instead of Palser D₀) is the designed
   next step for the SCC path — not yet wired in the standalone wrapper.
 
+#### 7.3.3 Production SCC stage profile — where purify lands (2026-09-19)
+
+`tests/gpu_scc_bench.rs::test_gpu_scc_scan400_benchmark` with
+`RUST_DFTB_PROF=evt` (true per-stage GPU time) + `=mark` (pure host
+enqueue time). GC n=86, batch=400 (20×20 scan), kT=0.002, tol=1e-6,
+DIIS hist=10, ~80–92 iters/solve:
+
+**Solve-level:** scc = **208.8 ms/call → 2.61 ms/iter**, 1916 sys/s,
+24.8× vs CPU f64 point. `eval(true)` forces = **5.98 ms ≈ 2.8 % of
+scc** — forces are already cheap. `finishes=91, reads=91` over 3
+solves ≈ ~30 syncs/solve (chunk ~7 iters) — **the harness is already
+clean: GPU busy 639.5 ms ≈ wall 626 ms → GPU-bound, not sync-bound.**
+
+**Device time per SCC iteration** (dev ms/276 calls ≈ ms/iter):
+
+| stage | ms/iter | % dev | what |
+|---|---:|---:|---|
+| `scc.jacobi` | **1.76** | **76 %** | warm in-place Jacobi (`eigh_solve`) |
+| `scc.diis` | 0.19 | 8 % | GPU DIIS mix (`diis_step_batched`) |
+| `scc.gemm_th` | 0.11 | 4.5 % | Cᵀ·H_scc (orthonormalize) |
+| `scc.sc_gemm` | 0.10 | 4.3 % | S·C (direct Mulliken input) |
+| `scc.gemm_th2` | 0.09 | 3.8 % | (CᵀH)·C → hp |
+| `scc.hscc` | 0.03 | 1.4 % | fused dq→V→H_scc kernel |
+| eigh_finish/occ/extract_diag | ~0.02 | ~1 % | smalls |
+| `scc.chunkend` | ~0.03 | 1.3 % | chunk-end sync (dev side) |
+| **launch-gap residual** | **~0.3** | **~13 %** | wall 2.61 − Σdev 2.31; ~11 launches/iter ≈ ~27 µs bubble each |
+
+**Host side** (`=mark`): enqueues are ~3 µs each — all stages ≤ 0.02
+ms/call except `scc.hscc` at **0.43 ms host/call**, which is driver
+backpressure (first kernel of each iter; the host stalls there when
+the command queue is full), not CPU work — `enq_dq_v_hscc` is a single
+prebound launch. `scc.chunkend` host = 612 ms = the blocking waits —
+the host just waits on the GPU.
+
+**What this means for purify integration:**
+
+- The eigensolve block (jacobi + extract/occ/finish ≈ 1.78 ms) is the
+  76 % target — but the *warm* Jacobi already runs 1.76 ms/iter, so
+  purify wins only via **warm-start K** (δK0 shift + McWeeny + ~5–15
+  TC2 steps ≈ 0.7–2 ms/solve-section, i.e. ~0.7–1.4 ms/iter replacing
+  1.78 → SCC iter ~2.6 → ~1.5–1.9 ms ⇒ **~1.4–1.7× end-to-end**, not
+  10×). The 10×-per-iter dream requires the eigensolve to become ~free
+  AND the surrounding stages to shrink.
+- **Production runs kT=0.002 smearing** — TC2 as implemented gives the
+  T=0 projector only. The Jacobi tail currently produces occ_w+μ
+  fused. For production-parity benchmarking, purify needs the
+  finite-T path (Chebyshev/FOE) or a T=0 comparison mode. This is the
+  real blocker for `SolveKind::Purify` on the scan workload.
+- Generalized-metric purify (K·S·K on H,S directly) would ALSO remove
+  `gemm_th`+`gemm_th2` (0.19 ms) and the whole Löwdin X path — the
+  bigger architectural win.
+- After the eigensolve shrinks, the next targets are: DIIS (0.19),
+  the ~0.3 ms/iter launch-gap (≈11 launches/iter — kernel fusion or
+  a single fat SCC-iteration kernel), and `sc_gemm` (skippable —
+  Mulliken can be computed from D·S directly).
+- DIIS fallbacks observed (~50–74/solve, reason=2 nonfinite at
+  sid=19) — data point, not benchmark-blocking.
+
 ### 7.4 User-confirmed design directions (2026-09-18)
 
 **A. GEMM interior — register-tiled, not row·row.** The user confirms the
@@ -550,16 +608,370 @@ single small systems cannot saturate the GPU and stay on Jacobi/LAPACK.
    barrier/reduce/bookkeeping overhead vs the 0.075 ms isolated GEMM —
    optional further fusion (e.g. fold the `er` reduce into the GEMM's
    last staging barrier) if worth it.
-2. **Warm-start input** — `purify_tc2_batched` accepting previous D
-   (+ saved K0) instead of Palser init; implement the δK0 seed shift +
-   McWeeny polish per §7.4-B; benchmark equal-accuracy vs Jacobi on real
-   GC Hamiltonians.
-3. `SolveKind::{Eigen, Purify}` opt-in dispatch in `gpu_scc_plan.rs`
-   (Jacobi stays default; purify for batched warm SCC).
+2. ~~**Warm-start input**~~ — implemented, then **measured refuted in
+   all three variants** — see §7.6. The correct warm update is the
+   sparse solver's DMM commutator descent, not any K-only seed.
+3. ~~`SolveKind::{Eigen, Purify}`~~ — **DONE** (`RUST_DFTB_EIGSOLVER=
+   purify`, `EigKind::Purify`, `PurifyScc` state in `gpu_scc_plan.rs`;
+   in-loop ortho → TC2 → `D = 2·X·K·Xᵀ` → Mulliken → DIIS). Jacobi stays
+   default and is still used by `finalize`/`eval`.
 4. Generalized metric form (K·S·K, Tr(KS)) — drops the Löwdin X and
-   makes the sparse `k_seed_shift` recipe directly portable.
+   makes the sparse `k_seed_shift`/`dmm_descend` recipes directly
+   portable.
 5. Debug or delete the broken `PURIFY_TILE>0` path — currently writes
    no diagnostics; do not let a broken config silently pass.
+6. ~~**Implement the DMM commutator-descent warm update + R_H gate**~~
+   — **DONE, verified** (§7.6.7): DMM descent + McWeeny retracts +
+   device R_H certificate on the final K every solve. The certificate
+   is computed per replica into `rh[]` every iteration (1 extra GEMM +
+   reduce); a hard gate/restart policy on top of it is the remaining
+   piece.
+7. **PRIORITY — wire the fast GEMM interior into the DMM/back-transform
+   products** (generic `batched_gemm_active` ~0.45 ms → regtile/sq
+   ~0.05 ms at n=86 b400, ~9×). Without this the §7.6.7 numbers are
+   meaningless. Coordinate with the in-flight `gpu_gemm` work (tri-SYRK
+   for the K² retracts; general regtile for H′K products).
+8. **Amortized mini-update (§7.6.10)**: 1–2 DMM + 2–4 TC2 per SCC iter
+   + rh-driven early exit + full certified solve only at the end /
+   gate failures → explicit cold restart.
+9. Realistic warm benchmark: cross-geometry reuse in the relax/FIRE
+   path (small displacement), not the cold-start SCC trajectory.
+
+### 7.6 Warm-start inside SCC — measured failure modes and the fix that already exists
+
+Purify was wired into the real SCC loop (`EigKind::Purify`) and every
+warm-seed idea was benchmarked on GC (n=86, batch=400, kT=0.002) and
+H2O, with a per-iteration **commutator certificate**
+`comm = ‖H′K − KH′‖_F` read back on host (debug-only,
+`RUST_DFTB_PURIFY_DEBUG=1`). For the true occupied projector comm = 0;
+trace and idempotency alone **cannot** detect a wrong subspace.
+
+#### 7.6.1 Measured results
+
+| warm seed | replica-0 outcome | comm at "convergence" | verdict |
+|---|---|---|---|
+| none (always cold, 60 TC2 steps) | E = −44.918316 = Jacobi **exactly**, 16 iters | 4e-6 | **correct baseline** |
+| reuse K_old (no rotation) | frozen: q_out constant for any q_in | ~0 but wrong — never responds to ΔH | no-op (K²=K is a hard fixed point) |
+| β·D0 blend (β=0.3) | right basin on replica 0, but residual floor: er~1e-2, 379/400 replicas never reach rms<1e-6 | — | residual floor kills convergence |
+| δK0 shift K+(D0′−D0) + Gershgorin renorm | converges to a **spurious fixed point**: q_O off by 0.23e, E = −44.976 vs −44.918 | **0.238** | wrong-subspace projector, self-consistent under the purify map but not the true map |
+| XL extrapolation 2K₁−K₂ | diverges (extrapolation doubles the per-iter error) | grows monotonically → 3.6 | unstable |
+
+Also measured: cold-path GC at kT=0 is *better* than cold Jacobi at
+kT=0 (7.9 vs 10.1 ms/iter, 207 vs 231 failed/400 — GC at T=0 is just
+hard; ~half the replicas exceed 100 SCC iters under BOTH solvers).
+
+#### 7.6.2 The structural reason
+
+TC2 (and McWeeny, and every polynomial in K) **preserves eigenvectors** —
+it converges to the rank-n_occ projector of the *seed's* eigenbasis, not
+of H′. Only seeds that are functions of H′ itself (the Palser seed
+D0 = (λmax I − H′)/span) carry the correct occupied-subspace ordering.
+Any seed built from old projectors alone must approximate the rotation,
+and approximation errors do not self-correct under TC2 — they lock in
+(idempotent, right trace, wrong subspace) or accumulate (extrapolation
+divergence). Iterating on **H** (sign/Newton–Schulz, FOE/Chebyshev)
+can never land on a wrong subspace but forfeits the warm-start advantage
+entirely — every solve is ~25–60 full GEMM steps.
+
+#### 7.6.3 The sparse solver already solved this (Phase G3, verified)
+
+`sparse_dftb.rs` `scc_fixedq` / `sparse_system.rs` — the geometry-
+displacement warm update, tuned and validated on R10/330Si:
+
+1. `compute_k0_from_hscc` — Palser seed of the NEW H (+ bounds, b_zh)
+2. `k_seed_shift` — K ← K_conv + (K0_new − K0_center) — the δ-shift.
+   **Itself refuted there** (`RUST_DFTB_VIB_SEED=0`: "the first-order
+   change of the spectral *initializer*, not of the occupied projector —
+   pushes the good central K off-manifold"). Consistent with our
+   comm=0.238 measurement.
+3. `metric_transport` — K ← 2K − K·S₁·K (first-order overlap change;
+   N/A inside one geometry — S fixed during SCC).
+4. **`dmm_descend` — the actual corrector.** n≈6 steps of the
+   Riemannian gradient descent on Tr(KH′) over the Grassmannian:
+   δK = −η·Sym[(S⁻¹−K)H K], η ≈ 8/(emax−emin), McWeeny retraction
+   (3K²−2K³) every 2 steps to hold idempotency. Because the step
+   *multiplies K by H*, it rotates the occupied subspace — the piece
+   every K-polynomial lacks.
+5. Optional final TC2 — default OFF (measured: post-DMM TC2 *degrades*
+   R_H; the masked-map branch re-breaks stationarity).
+6. **R_H gate** — `rh_stationarity` = ‖A−Aᵀ‖_F/(2‖A‖_F) with
+   A = H·(K·S) — i.e. the normalized commutator. Gate: 1e-4 seeded /
+   5e-4 cold. Exceeds → **fail loud**, silent re-solve deliberately
+   removed ("K is idempotent on a wrong occupied subspace").
+
+#### 7.6.4 Translation to the dense orthogonal-basis path
+
+Our purify already works in the Löwdin basis (H′ = XᵀH_sccX, S = I), so
+the recipe simplifies — S⁻¹ = I, Z = I:
+
+- **DMM step (2 GEMMs, not 3):** T = H′·K; Y = K·T;
+  K ← K − (η/Δε)·(T + Tᵀ − 2Y); symmetrize K.
+  `T + Tᵀ − 2Y = (I−K)H′K + KH′(I−K)` — the occ–virt coupling block.
+- **McWeeny retract:** K ← 3K² − 2K³ (2 GEMMs: T=K² then T·K, or one
+  fused kernel) every ~2 DMM steps.
+- **R_H certificate is free at the last DMM step:** comm = ‖T−Tᵀ‖ since
+  (H′K)ᵀ = KH′ — one elementwise kernel + reduce on the already-computed
+  T, then gate per replica: fail loud or mark for explicit cold restart.
+- **Bounds:** η = η_scale/(emax−emin) — emax/emin from the Palser init's
+  Gershgorin bounds (tc2_init already computes them; keep them).
+
+Cost model (n=86, batch=400, sq-GEMM ≈ 0.08 ms): 6 DMM steps ×2 GEMMs +
+3 retracts ×2 GEMMs ≈ 18 GEMMs ≈ 1.5 ms/iter — comparable to warm
+Jacobi (1.76 ms/iter) at THIS size; the win is the O(GEMM) scaling vs
+Jacobi sweeps at larger n and the resident/fused kernels (SqIter work)
+collapsing launches. Fewer DMM steps when ΔH small should amortize
+further — to be tuned, not assumed.
+
+#### 7.6.5 Design options for the dense SCC path (for discussion)
+
+- **A — DMM warm update (recommended, sparse-proven):**
+  seed = K_old (NO shift — refuted in both codes) → ~6 DMM steps →
+  interleaved McWeeny retracts → R_H gate per replica. Fail loud /
+  explicit cold restart on gate failure. Iterates on H′ → can never
+  converge to a wrong subspace *if converged*.
+- **B — certificate + cold restart only:** warm TC2 attempt, comm check,
+  flagged replicas redo Palser+60 steps. Cheaper per iter but reactive —
+  a drifted replica emits a wrong q that iter (DIIS pollution), and the
+  recovery needs the full cold cost.
+- **C — always-cold:** verified correct today; ~7.9 ms/iter on GC
+  (vs 1.76 warm Jacobi) — loses at n=86, wins vs cold Jacobi.
+- **D — Newton–Schulz sign on (H′−μI):** correct by construction
+  (iterates on H′), but ~25–30 cubic steps/solve — strictly cold.
+- **E — extrapolation/δ-shift seeds:** measured refuted (§7.6.1).
+
+#### 7.6.6 Open questions for the design discussion
+
+1. η calibration: sparse used η=8/Δε tuned on geometry deltas (~mHa);
+   early SCC iterations have ΔH ~0.1–0.5 eV-scale charge swings — likely
+   needs a smaller η_scale or a step-size schedule, plus the renorm
+   guard we added for seed kernels.
+2. Per-replica vs per-launch policy: the batch launch shares the step
+   count; flagged replicas needing cold restart need ~60 steps vs ~6 —
+   escalate the whole launch or park-and-retry like `scc_retry_failed`?
+3. Is DMM alone (no TC2 at all) the right in-loop map — matching the
+   sparse lite tier — with idempotency held only by retracts?
+4. Whether the comm certificate should also gate *convergence credit*:
+   a replica whose rms is small but comm large is spuriously converged —
+   should it count as Failed for the certify path?
+5. The kT=0.002 smearing parity issue is still open (purify produces the
+   T=0 projector; Jacobi tail writes Fermi occupations) — GC showed
+   Jacobi kT=0 vs 0.002 differ negligibly in E (−44.9183 both) but this
+   needs a per-system check before equal-physics claims.
+
+#### 7.6.7 Implementation status (2026-09, dense DMM landed)
+
+**Wired in `purify_solve_enq`** (`gpu_scc_plan.rs`, `EigKind::Purify`).
+Warm solve = seed K in place → `dmm_steps` DMM descent steps
+(2 generic GEMMs + 1 update kernel each) → McWeeny retract every
+`dmm_retract` steps (2 GEMMs + combine) → `tc2_tail` optional TC2 steps
+→ **R_H certificate every solve** (T = H′·K_final GEMM +
+`comm_gate_batched` → `rh[]` per replica). Cold path = Palser +
+`steps_cold` TC2 + same certificate.
+
+New kernels (`gpu_purify.cl`): `spec_span_batched` (Gershgorin Δε),
+`dmm_update_batched` (pair-owner symmetrizing update + ‖G‖ reduce for
+the trust region), `mcweeny_combine_batched` (3K²−2K³, symmetrized),
+`comm_gate_batched` (rh = ‖T−Tᵀ‖/(2‖T‖)). Extrapolation machinery
+(`tc2_extrap_batched`, K-history buffers) removed from the Rust side.
+
+**The one deviation from the sparse recipe — and why:** sparse uses the
+fixed step s = η/Δε with η=8, which was tuned on geometry-perturbation
+ΔH (~mHa gradients). Inside SCC the first iterations have O(1) charge
+swings → O(1) gradients → η=8 diverges hard (measured: comm 4.6e-7 →
+0.72 → NaN in 2 iters). Gradient descent on the quartic manifold is
+stable only for s ≲ 1/Δε, so the dense default is **η=1** plus a
+trust-region cap s_eff = min(η/Δε, cap/‖G‖_F) (default cap=10 —
+inactive except on pathological gradients). With that, DMM is stable
+and correct.
+
+**Measured performance — three solver variants, same binary, same
+settings** (`test_gpu_scc_scan400_benchmark`, kT=0.002 Fermi smearing,
+charge-rms tolerance 1e-6, DIIS history 10, 20×20 scan = batch 400;
+columns: total SCC wall time per solve, number of SCC iterations,
+milliseconds per iteration, replicas that failed to converge within
+100 iterations, converged band-structure energy of replica 0).
+
+**H2O — 3 atoms, n=6 orbitals, batch=400:**
+
+| solver path (in-loop eigensolve) | SCC total (ms) | SCC iters | ms per SCC iter | failed replicas | E0 (Ha) |
+|---|---:|---:|---:|---:|---:|
+| Jacobi (production default)      | 1.92   | 16  | 0.120 | 0   | −4.075284 |
+| DM-purify, cold (Palser+60 TC2)  | 5.96   | 16  | 0.373 | 0   | −4.075284 |
+| DM-purify, warm (16 DMM + 4 TC2) | 36.51  | 88  | 0.415 | 0   | −4.075284 |
+
+**GC — 29 atoms, n=86 orbitals, batch=400:**
+
+| solver path (in-loop eigensolve) | SCC total (ms) | SCC iters | ms per SCC iter | failed replicas | E0 (Ha) |
+|---|---:|---:|---:|---:|---:|
+| Jacobi (production default)      | 221.2  | 80  | 2.77  | 0   | −44.918315 |
+| DM-purify, cold (Palser+60 TC2)  | 753.6  | 100 | 7.54  | 207 | −44.918316 |
+| DM-purify, warm (16 DMM + 4 TC2) | 2360.6 | 100 | 23.6  | 236 | −44.918315 |
+
+**What this table says, in plain terms:**
+
+- **Correctness: the warm-DMM path is verified.** Replica-0 energy is
+  bit-for-bit the Jacobi energy (−44.918315 Ha) on every row, and the
+  per-iteration commutator certificate rh ≈ 2e-7 proves the projector
+  sits on the correct occupied subspace — not merely idempotent.
+- **Speed: the warm-DMM path is currently ~8.5× SLOWER per iteration
+  than Jacobi on GC** (23.6 ms vs 2.77 ms per SCC iteration), and ~3.5×
+  slower on H2O. It is correct but not yet competitive.
+- The reason is arithmetic volume, not overhead: one warm iteration
+  runs ~47 dense products through the generic `batched_gemm_active`
+  tiled GEMM (~0.4–0.5 ms each at n=86, batch=400): 16 DMM steps × 2
+  GEMMs + 8 McWeeny retracts × 2 GEMMs + ortho (2) + back-transform (2)
+  + certificate (1). The dedicated regtile/sq GEMM measured ~0.05 ms at
+  this size — roughly 8–9× faster per product — so swapping the GEMM
+  interior is the single biggest lever (that work is in progress in
+  `gpu_gemm.cl` by a parallel effort; the DMM path deliberately still
+  uses the production GEMM to avoid interference).
+- **GC convergence failures are a physics gap, not a solver bug:** the
+  purify path produces the T=0 projector while production runs
+  kT=0.002 Fermi smearing. The scan contains near-gapless geometries
+  where the T=0 SCC map is ill-conditioned — Jacobi at kT=0 shows the
+  same ~200/400 failure regime, and Jacobi at kT=0.002 gets failed=0.
+  Finite-T occupations (FOE/Chebyshev) are required for production
+  parity on GC-like systems.
+- Cold purify converges in the same 16 iterations as Jacobi on easy
+  replicas but ~2.7× slower per iteration on GC (60 fused TC2 steps at
+  ~0.08 ms + ortho/back-transform GEMMs); on H2O it is ~3× slower per
+  iteration.
+
+**Knobs:** `PURIFY_DMM_{STEPS,ETA,CAP,RETRACT}`, `PURIFY_TC2_TAIL`,
+`PURIFY_WARM`, `PURIFY_COLD_STEPS`, `PURIFY_TOL`, `PURIFY_DEBUG`
+(per-iter tr/er/rh + host comm on replica 0).
+
+#### 7.6.8 Why the current warm-vs-cold numbers are misleading — hypotheses
+
+The table above must NOT be read as "warm purify is 10× slower" — three
+separate artifacts stack in this measurement, none of which is the
+warm-start idea itself:
+
+1. **This benchmark is the worst case for warm start, not the intended
+   one.** Every SCC iteration rebuilds H_scc from a DIIS-mixed charge
+   update — early iterations move q by O(0.5 e), i.e. ΔH is O(eV) —
+   huge. The sparse-proven DMM recipe is designed for (and verified on)
+   *small* perturbations: a converged projector + a small geometry step
+   (relaxation/MD) or a nearly-converged charge update. The intended
+   dense benchmark is: converge SCC at geometry A → move atoms slightly
+   → reuse K across the geometry boundary (the `relax`/FIRE path), or
+   at minimum the late-SCC regime where ΔH is already small. Measuring
+   warm cost averaged over the full cold-start trajectory conflates the
+   hard early iterations (where warm should arguably not even run —
+   cold purify or Jacobi does the same work more cheaply) with the
+   regime it was built for.
+2. **Fixed step budget, no early exit.** The warm path currently runs a
+   FIXED 16 DMM steps + 4 TC2 every iteration regardless of need. Near
+   convergence (ΔH→0) the seed is already correct — rh is computable
+   per step almost for free (T = H′K is already the step-1 product, and
+   comm = ‖T−Tᵀ‖ needs one elementwise pass). Early-exit on rh < gate
+   would collapse late iterations to ~1–2 products and should also fix
+   the iteration COUNT: 88 vs 16 iters on H2O means the bounded budget
+   leaves residual comm that perturbs the q-map; exiting on the
+   certificate (not a step count) makes the warm map exact again.
+3. **Unoptimized interior.** DMM products run on the generic
+   `batched_gemm_active` tiled GEMM (~0.45 ms each at n=86/b400) while
+   the dedicated regtile/sq GEMM measures ~0.05 ms (~9×). The DMM path
+   deliberately avoided the in-flight GEMM work; wiring it in cuts the
+   warm iteration from ~23.6 ms toward ~2.6 ms before any early-exit
+   savings. Per-iter cost also scales with step count — the certificate
+   should drive it.
+4. **Rotation cadence.** Strictly, a subspace rotation is only needed
+   when H (or S) *changes* — i.e. once per iteration here since charges
+   update every iteration, but with size ∝ ΔH. The certificate gives
+   exactly that signal for free: rh small ⇒ skip/shorten the descent.
+   For the geometry-displacement use case (the sparse design point),
+   the rotation runs once per geometry step, not per SCC iter — and a
+   converged K needs no TC2 at all inside the subsequent SCC if the
+   charge map is evaluated directly off K.
+5. **GC failures are orthogonal** — the T=0-vs-kT=0.002 smearing gap
+   (§7.3.3), shared with Jacobi at kT=0.
+
+**Bottom line:** the warm-DMM mechanism is implemented and certified
+correct (E0 exact, rh≈2e-7); its current cost numbers measure a
+worst-case scenario with an unoptimized interior and a fixed step
+budget. **The §7.6.7 timings are therefore NOT the deliverable
+performance numbers** — they measure the generic GEMM, not the
+algorithm. Absolute priority next iteration: wire the fast sq/regtile
+GEMM interior (measured ~0.05 ms/product at n=86 b400 vs 0.45 ms
+generic) into the DMM products, then re-measure.
+
+#### 7.6.9 What actually runs per SCC iteration — pseudocode + constants
+
+Current implementation (v1 — "full certified solve every iteration"):
+
+```
+every SCC iteration (charge update via DIIS):
+    hp  = Xᵀ·H_scc·X                      # 2 GEMMs   (orthogonalize)
+    if seeded (warm):
+        spans = Gershgorin(hp)            # 1 small kernel
+        repeat N_DMM = 16 times:          # per step: 2 GEMMs + 1 update
+            T = hp·K ; Y = K·T            #   (generic tiled GEMM ~0.45 ms)
+            K ← sym(K) − s·(T+Tᵀ−2Y)      #   s = min(η/Δε, cap/‖G‖),
+                                          #   η=1.0, cap=10
+            every 2nd step: retract       # +2 GEMMs + combine:
+                K ← 3K²−2K³               #   (McWeeny, 8 retracts total)
+        repeat N_TAIL = 4 TC2 steps       # fused sq steps ~0.08 ms
+    else (cold):
+        K ← Palser(hp) ; N_COLD = 60 TC2 steps
+    cert: T = hp·K_final ; rh = ‖T−Tᵀ‖/2‖T‖   # 1 GEMM + 1 kernel
+    D = 2·X·K·Xᵀ                          # 2 GEMMs (back-transform)
+    q_new = Mulliken(D, S)                # 1 kernel
+    DIIS mix → next iteration
+    ≈ 47 generic GEMMs + ~10 small kernels per iteration (warm)
+```
+
+So: **16 DMM steps run every SCC iteration** — every time the charge
+mix produces a new H. That is exactly the unaffordable structure; the
+fix is below.
+
+#### 7.6.10 Proposed v2 — amortized mini-update (the design to test)
+
+The user's proposal — a few cheap steps per iteration, letting the SCC
+loop itself amortize the projector convergence — is sound, because at
+the SCC fixed point q stops changing → H′ freezes → the mini-updates
+still drive K to the *exact* stationary projector of the final H′. The
+in-loop projector may be approximate mid-flight; **correctness is
+enforced by the certificate at the end** (rh gate on the last solve
+before accepting charges/forces), not by per-iteration exactness.
+
+```
+every SCC iteration:
+    hp = Xᵀ·H_scc·X                       # 2 GEMMs (ortho — unavoidable)
+    if seeded:
+        N_DMM_ITER = 1–2 descent steps    # 2–4 GEMMs — H-tracking only
+        McWeeny retract every 2nd SCC iter # 2 GEMMs
+        N_TC2_ITER = 2–4 cheap sq steps   # ~0.08 ms each, idempotency/trace
+    else:
+        cold: Palser + N_COLD TC2
+    D = 2·X·K·Xᵀ ; q_new = Mulliken ; DIIS
+final iteration (or when rms < tighter tol):
+    full certified solve: DMM until rh < gate (early exit) → accept
+    replicas failing the gate → explicit cold restart (fail-loud)
+```
+
+Per-iteration cost at the fast GEMM (~0.05 ms/product): ~6–10 products
+≈ **0.3–0.5 ms/iter** — already below Jacobi's 1.76 ms/iter at n=86.
+The ortho GEMMs (2) and back-transform (2) then dominate — the
+generalized-metric form (K·S·K on raw H,S) removes the ortho pair.
+
+Cheaper/riskier rotation candidates to try under the same cert gate
+(even if only approximate — the certificate keeps them honest):
+
+- **single-step linear response** (sparse `linear_response` tier — the
+  lite path): exactly ONE gradient step = 2 GEMMs/iter.
+- **η scheduling**: larger step early (rotation far), ~η/Δε late.
+- **skip-when-stationary**: if rh(K vs new hp) < gate before stepping,
+  skip DMM entirely that iteration (T from the cert doubles as the
+  gradient input).
+- **geometry-mode**: across a relaxation step, rotate once (the sparse
+  use case), then pure TC2 inside the new SCC — needs the
+  `set_geometry` hook to run DMM once instead of clearing the seed.
+
+**Still open:** hard gating of `rh` into the replica status (currently
+computed but only read under DEBUG); finite-T occupations for purify;
+faster GEMM interior; adaptive step count; `PURIFY_TILE>0` path is still
+broken/silent.
 
 ---
 

@@ -480,6 +480,10 @@ pub enum EigKind {
     ResidentAV,
     /// block_jacobi_1wg — pivot+U local, strips global. For n>128.
     Block,
+    /// Density-matrix purification (TC2) — not an eigensolver: produces
+    /// the density matrix directly in the orthogonal basis. The SCC plan
+    /// branches to `purify_solve_enq` instead of eigh_solve/populations.
+    Purify,
 }
 
 /// Headroom reserved for the resident kernel's static __local scratch
@@ -535,8 +539,9 @@ pub fn eigsolver_kind(n: usize, local_cap: u64) -> EigKind {
                 n * (n + 1) / 2 * 4 + n * (n + 1) * 4);
             EigKind::ResidentAV
         }
+        Some("purify") => EigKind::Purify,
         Some(v) => {
-            panic!("RUST_DFTB_EIGSOLVER={v}: expected auto|direct|block|resident|resident_av")
+            panic!("RUST_DFTB_EIGSOLVER={v}: expected auto|direct|block|resident|resident_av|purify")
         }
     }
 }

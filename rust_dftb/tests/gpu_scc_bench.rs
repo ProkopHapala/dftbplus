@@ -251,8 +251,9 @@ fn cpu_point_ms(
     cpu.reset_charges();
     cpu.solve_scc(200, 1e-8).unwrap();
     let scc = cpu.build_result();
-    let _e = scc.energy + repulsive_energy(sk_dir, species, coords).unwrap();
+    let e = scc.energy + repulsive_energy(sk_dir, species, coords).unwrap();
     let _f = cpu.compute_forces(&scc, &repulsive).unwrap();
+    eprintln!("  CPU ref: E={e:.6} q={:?}", scc.charges);
     t0.elapsed().as_secs_f64() * 1e3
 }
 
@@ -306,7 +307,11 @@ fn test_gpu_scc_scan400_benchmark() {
             let coords = &geoms[..batch * n_atoms];
             let mut eng = GpuDftb::new(sk.clone(), &sk_dir, sp.clone(), coords.to_vec(), batch)
                 .unwrap_or_else(|e| panic!("GpuDftb::new {} batch={batch}: {e}", sys.name));
-            eng.set_smearing(0.002);
+            let kt: f32 = std::env::var("RUST_DFTB_BENCH_KT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0.002);
+            eng.set_smearing(kt);
             let mut total = 0.0f64;
             let mut iters = 0usize;
             let mut n_failed = 0usize;
@@ -330,15 +335,20 @@ fn test_gpu_scc_scan400_benchmark() {
                 eng.prof_report("scan400");
             }
             let t0 = std::time::Instant::now();
-            eng.eval(true).unwrap();
+            let ev = eng.eval(true).unwrap();
             let eval_ms = t0.elapsed().as_secs_f64() * 1e3;
+            if std::env::var("RUST_DFTB_BENCH_Q").is_ok() {
+                let mut q = vec![0.0f32; n_atoms];
+                eng.rt.read_buffer(&eng.plan.q_gpu, &mut q).unwrap();
+                eprintln!("  q0(replica0): {q:?}");
+            }
             let scc_ms = total / N_RUNS as f64;
             let speedup = cpu_ms * batch as f64 / scc_ms;
             let n_orbs = eng.n();
-            eprintln!("{:>11} {:>5} {:>5} {:>7} | {:>9.2} {:>5} {:>8.3} {:>9.1} | {:>8.2} | {:>9.2} {:>7.1}x  failed={n_failed}",
+            eprintln!("{:>11} {:>5} {:>5} {:>7} | {:>9.2} {:>5} {:>8.3} {:>9.1} | {:>8.2} | {:>9.2} {:>7.1}x  failed={n_failed} E0={:.6}",
                 sys.name, n_atoms, n_orbs, batch, scc_ms, iters,
                 scc_ms / iters.max(1) as f64, batch as f64 / (scc_ms / 1e3), eval_ms,
-                cpu_ms, speedup);
+                cpu_ms, speedup, ev.energy[0]);
         }
     }
 }

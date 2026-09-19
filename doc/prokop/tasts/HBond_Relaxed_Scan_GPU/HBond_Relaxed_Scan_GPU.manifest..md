@@ -2608,6 +2608,18 @@ occupancy-limited — the same GEMM hits **7.83 TFLOPS ≈ 22 % of peak at
 b1600** (tk22/sq); per-system solve cost drops 0.37 → 0.29 µs/sys/iter.
 The ~19 % figure is the b400 operating point, not the kernel ceiling.
 
+**Production SCC stage profile** (design doc §7.3.3,
+`RUST_DFTB_PROF=evt`, GC n=86 b400, kT=0.002, ~80 iters): scc =
+208.8 ms → 2.61 ms/iter; **GPU busy ≈ wall → already GPU-bound**
+(harness/syncs amortized: ~30 reads per solve). Per-iter dev:
+**jacobi 1.76 ms (76 %)**, diis 0.19, orthonormalize GEMMs 0.19,
+sc_gemm 0.10, hscc 0.03, launch-gap residual ~0.3 (13 %, ~11
+launches/iter). Forces eval = 5.98 ms (2.8 %). → Purify must win on
+*warm-start K* vs warm Jacobi (1.76 ms/iter); realistic end-to-end
+~1.4–1.7× unless generalized-metric form also removes the
+orthogonalization GEMMs. **Production uses kT=0.002 — finite-T FOE
+(or T=0 mode) required for purify parity.**
+
 Four bring-up bugs fixed — see §7.2 of the design doc: test-side
 nalgebra sort; mandatory device-side freeze; `pur_reduce`
 barrier-before-return race; **`pur_reduce` non-PoT-lsz fold drop** —
@@ -2685,10 +2697,52 @@ correctness vs CPU f64 + ms/GEMM + TFLOPS per variant.
       One launch/iter, fused trace/err/branch/freeze all preserved.
       Caught + fixed the latent `pur_reduce` non-PoT-lsz fold bug
       (§17.2) during integration.
-- [ ] Warm start (sparse Phase-G3 recipe, `sparse_system.rs`):
-      δK0 seed `K_seed = K_conv + (K0_new − K0_old)` → McWeeny polish
-      `K←3K²−2K³` (orthogonal basis) → TC2 floor-walk. Optional DMM/LNV
-      subspace rotation `δD = −η(DH+HD−2DHD)` for geometry moves
-      (2 dense GEMMs + elementwise — `X=HD`, `Y=DX`).
-- [ ] `SolveKind::{Eigen, Purify}` opt-in dispatch + equal-accuracy
+- [x] Warm start — **DMM commutator descent** (sparse Phase-G3 recipe,
+      `sparse_system.rs::dmm_descend`): seed = K in place (δK0-shift and
+      XL-extrapolation both measured-refuted — §7.6.1) → 16 DMM steps
+      `K ← sym(K) − s·(T+Tᵀ−2Y)`, T=H′K, Y=K·T, s=min(η/Δε, cap/‖G‖),
+      η=1 (sparse's η=8 diverges at SCC-scale ΔH) → McWeeny retract
+      every 2 → optional 4-step TC2 tail → **R_H certificate**
+      (`comm_gate_batched`, rh≈2e-7/solve). Verified: E0=−44.918315 =
+      Jacobi exactly on GC at batch 1/100/400; H2O failed=0.
+      Knobs `PURIFY_DMM_{STEPS,ETA,CAP,RETRACT}`, `PURIFY_TC2_TAIL`.
+      Perf currently NEGATIVE on GC b400: warm-DMM 23.6 ms per SCC iter
+      vs Jacobi 2.77 ms (~8.5× slower; ~47 generic tiled GEMMs/iter at
+      ~0.45 ms each vs the dedicated 0.05 ms sq-GEMM — swapping the GEMM
+      interior is the lever). GC also needs finite-T parity (T=0 map
+      leaves 236/400 unconverged, same regime as Jacobi at kT=0).
+      Full A/B table: design doc §7.6.7.
+- [x] `SolveKind::{Eigen, Purify}` opt-in dispatch + equal-accuracy
       SCC bench vs Jacobi on real GC Hamiltonians.
+
+### 17.6 Purify-inside-SCC integration (2026-09-19 — measure the real loop)
+
+Goal: run the production chunked SCC loop with purification replacing
+the eigensolve block, profile where the time goes (design doc §7.3.3
+baseline: jacobi 76 % of dev, diis 8 %, ortho-GEMMs 8 %, launch-gap
+~13 %).
+
+- [x] `EigKind::Purify` via `RUST_DFTB_EIGSOLVER=purify` — plan-level
+      opt-in; Jacobi untouched and remains default.
+- [x] Persistent `PurifyScc` block in `GpuSccPlan::new` (buffers
+      d_a/d_b ping-pong, nocc/traces/errs/done, `tc2_init_batched` +
+      `tc2_step_batched` kernels, back-transform GEMM handles
+      `temp=X·K`, `d=temp·Xᵀ` via `x_t`) — zero allocs/builds in loop.
+      + DMM machinery: t_buf/y_buf/spans/rh, 4 generic-GEMM handles,
+      spec_span/dmm_update/mcweeny_combine/comm_gate kernels.
+- [x] `purify_solve_enq` in `scc_step_diis_enq` (+ `scc_step`):
+      Xᵀ·H_scc·X → warm DMM descent on K in place (or cold Palser+TC2)
+      → R_H cert → D=X·K·Xᵀ → `mulliken_charges_batched`.
+- [x] Step-count knobs: `RUST_DFTB_PURIFY_COLD_STEPS` (60),
+      `RUST_DFTB_PURIFY_TOL`, DMM knobs above.
+- [ ] `set_geometry` invalidates the warm seed (`seeded=false` →
+      Palser re-init; the δK0 shift is the later refinement).
+- [ ] eval/finalize stays on the Jacobi path (certified energy/forces);
+      EDM-from-purify is future work.
+- [ ] Bench: `gpu_scc_bench::test_gpu_scc_scan400` under
+      `RUST_DFTB_EIGSOLVER=purify` + `RUST_DFTB_PROF=evt` — per-stage
+      dev times, sync counts, convergence vs steps.
+- [ ] Caveats to report: purify ignores kT smearing (T=0 projector —
+      production runs kT=0.002; finite-T FOE needed for parity);
+      purify launches are full-domain (no active/work_ids gating yet);
+      SCC-converged replicas still burn purify WGs.
