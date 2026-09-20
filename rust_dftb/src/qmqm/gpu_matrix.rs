@@ -1204,6 +1204,290 @@ pub fn extract_diagonal_batched(
     Ok(())
 }
 
+// ==================================================================
+// LNV reference solver — Li–Nunes–Vanderbilt auxiliary-matrix steepest
+// descent (canonical baseline for the minimize+retract density-matrix
+// family; design doc Alternative_Dense_Multi_Eigensolve.chat.md §15).
+//
+//   Ω(L) = Tr[f(L)·F],  f(x)=3x²−2x³,  D=f(L),  F=(H−μI)/Δε
+//   G = ∇_L Ω = [L,[L,F]] + 3[(L−L²)F + F(L−L²)]     (FP32 residual form)
+//
+// Unlike the learned-Λ relax path there is NO constraint-force state:
+// the gradient is assembled exactly each step (1 symmetric square +
+// 3 general GEMMs), so the fixed point is provably [D,H]=0 — G at a
+// clean projector is the exact tangent force T_P(H). μ is the Fermi
+// level with a per-step projection ⟨R,G⟩/(6⟨R,R⟩) (R=L−L²) that cancels
+// the trace-changing component of the next step, plus a small
+// kmu·(nocc−TrD) steering term.
+//
+// Reference implementation: correctness first (naive batched_gemm,
+// one-workgroup elementwise kernels) — the optimized regtile variant
+// comes only after this baseline is validated against eigensolvers.
+// ==================================================================
+
+/// Per-solve diagnostics from `lnv_solve_batched`.
+pub struct LnvDiag {
+    /// ‖∇_L Ω‖_F per system at the last reported iteration.
+    pub gnorms: Vec<f32>,
+    /// Tr f(L) per system (should equal nocc).
+    pub trds: Vec<f32>,
+    /// Final Fermi level μ per system (H units).
+    pub mus: Vec<f32>,
+    /// Stationarity certificate ‖HD−DH‖_F/(2‖HD‖_F) on the final D.
+    pub comms: Vec<f32>,
+    /// Iterations actually run.
+    pub iters: usize,
+    /// All systems reached gnorm<tol with trace in tolerance.
+    pub converged: bool,
+}
+
+/// Batched LNV steepest descent.
+///
+/// * `l_io` — in/out auxiliary matrix, caller-initialized. Warm start:
+///   `L = D_prev` (f(P)=P for a clean projector). Cold start: any
+///   symmetric L with eigenvalues in (0,1), e.g. linear in H.
+/// * `d_out` — receives the final density D = 3L²−2L³.
+/// * `mu0` — initial Fermi estimate per system (H units); a Gershgorin
+///   quantile `λmin + (nocc/n)·Δε` works well.
+/// * `spans` — Gershgorin Δε per system (used to normalize F; the
+///   dimensionless step is α = eta).
+///
+/// Knobs (`RUST_DFTB_LNV_*`): ETA (α, default 0.2), KMU (trace steering
+/// gain, default 0.02), CHUNK (host check granularity, default 4),
+/// DEBUG (per-chunk diag dump).
+pub fn lnv_solve_batched(
+    rt: &mut GpuRuntime,
+    h_buf: &Buffer<f32>,
+    l_io: &Buffer<f32>,
+    d_out: &Buffer<f32>,
+    n: usize,
+    batch: usize,
+    nocc: &[f32],
+    mu0: &[f32],
+    spans: &[f32],
+    max_iter: usize,
+    tol: f32,
+) -> Result<LnvDiag> {
+    if nocc.len() != batch || mu0.len() != batch || spans.len() != batch {
+        return Err(DftbError::InvalidInput(format!(
+            "lnv_solve_batched: nocc/mu0/spans lens {}/{}/{} != batch {batch}",
+            nocc.len(), mu0.len(), spans.len()
+        )));
+    }
+    if batch == 0 {
+        return Ok(LnvDiag { gnorms: vec![], trds: vec![], mus: vec![], comms: vec![], iters: 0, converged: true });
+    }
+    let eta: f32 = std::env::var("RUST_DFTB_LNV_ETA")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(0.6);
+    let kmu: f32 = std::env::var("RUST_DFTB_LNV_KMU")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(0.02);
+    // Heavy-ball momentum — the canonical accelerator for the flat
+    // near-degenerate Fermi-edge modes that dominate bare SD
+    // (CPU-f64 validated: 3882→188 iters at α=0.6, β=0.9). 0 = off.
+    let mom: f32 = std::env::var("RUST_DFTB_LNV_MOM")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(0.9);
+    // Step cap ‖α·V‖ ≤ smax — the divergence-prevention bound
+    // (CPU-validated: uncapped diverges at Δ=0.5, capped 8/8).
+    let smax: f32 = std::env::var("RUST_DFTB_LNV_SMAX")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(1.0);
+    let chunk: usize = std::env::var("RUST_DFTB_LNV_CHUNK")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(4);
+    let dbg = std::env::var_os("RUST_DFTB_LNV_DEBUG").is_some();
+
+    let source = MATRIX_KERNEL_TEMPLATE;
+    let program = rt.build_program(source)?;
+
+    const TILE_M: usize = 16;
+    const TILE_N: usize = 16;
+    const TILE_K: usize = 32;
+    const EW_WG: usize = 256; // elementwise/reduction kernels: one WG/system
+    let row_groups = div_ceil(n, TILE_M);
+    let col_groups = div_ceil(n, TILE_N);
+    let gws = ocl::SpatialDims::Three(col_groups * TILE_N, row_groups * TILE_M, batch);
+    let lws = ocl::SpatialDims::Two(TILE_N, TILE_M);
+    let a_local = TILE_M * TILE_K;
+    let b_local = TILE_N * (TILE_K + 1); // padded Bs (trans-B layout max)
+
+    let nn = n * n;
+    let s_buf = rt.zero_buffer::<f32>(batch * nn)?;   // S = L²
+    let f_buf = rt.zero_buffer::<f32>(batch * nn)?;   // F = (H−μI)/Δε
+    let a_buf = rt.zero_buffer::<f32>(batch * nn)?;   // A = L·F
+    let b_buf = rt.zero_buffer::<f32>(batch * nn)?;   // B = S·F = L²F
+    let c_buf = rt.zero_buffer::<f32>(batch * nn)?;   // C = A·L = LFL
+    let t_buf = rt.zero_buffer::<f32>(batch * nn)?;   // T: S·L then H·D
+    let g_buf = rt.zero_buffer::<f32>(batch * nn)?;   // G_prev (BB step)
+    let v_buf = rt.zero_buffer::<f32>(batch * nn)?;   // momentum velocity
+    let alpha_b = rt.buffer_from_slice(&vec![eta; batch])?; // per-sys α
+    let nocc_b = rt.buffer_from_slice(nocc)?;
+    let mu_b = rt.buffer_from_slice(mu0)?;
+    let spans_b = rt.buffer_from_slice(spans)?;
+    let trd_b = rt.zero_buffer::<f32>(batch)?;
+    let diag_b = rt.zero_buffer::<f32>(batch * 4)?;
+    let done_b = rt.zero_buffer::<i32>(batch)?;
+    let wids = identity_work_ids(rt, batch)?;
+
+    // One persistent Kernel object per product — nothing is built or
+    // allocated inside the iteration loop.
+    let mk_gemm = |a: &Buffer<f32>, b: &Buffer<f32>, c: &Buffer<f32>| -> Result<Kernel> {
+        Kernel::builder()
+            .program(&program)
+            .name("batched_gemm")
+            .queue(rt.queue().clone())
+            .global_work_size(gws)
+            .local_work_size(lws)
+            .arg(n as i32)
+            .arg(batch as i32)
+            .arg(0i32) // trans_a
+            .arg(0i32) // trans_b
+            .arg(1.0f32)
+            .arg(0.0f32)
+            .arg(a)
+            .arg(b)
+            .arg(c)
+            .arg_local::<f32>(a_local)
+            .arg_local::<f32>(b_local)
+            .arg(&wids)
+            .build()
+            .map_err(map_ocl_err)
+    };
+    let k_s = mk_gemm(l_io, l_io, &s_buf)?;      // S = L·L
+    let k_a = mk_gemm(l_io, &f_buf, &a_buf)?;    // A = L·F
+    let k_b = mk_gemm(&s_buf, &f_buf, &b_buf)?;  // B = S·F
+    let k_c = mk_gemm(&a_buf, l_io, &c_buf)?;    // C = (LF)·L = LFL
+    let k_t = mk_gemm(&s_buf, l_io, &t_buf)?;    // T = S·L = L³ (final D)
+    let k_hd = mk_gemm(h_buf, d_out, &t_buf)?;   // T = H·D (certificate)
+
+    let k_scal = Kernel::builder()
+        .program(&program)
+        .name("lnv_scal_batched")
+        .queue(rt.queue().clone())
+        .global_work_size(batch * EW_WG)
+        .local_work_size(EW_WG)
+        .arg(n as i32)
+        .arg(batch as i32)
+        .arg(l_io)
+        .arg(&s_buf)
+        .arg(h_buf)
+        .arg(&f_buf)
+        .arg(&mu_b)
+        .arg(&spans_b)
+        .arg(&trd_b)
+        .arg(&done_b)
+        .arg_local::<f32>(4 * EW_WG)
+        .build()
+        .map_err(map_ocl_err)?;
+    let k_fin = Kernel::builder()
+        .program(&program)
+        .name("lnv_finish_batched")
+        .queue(rt.queue().clone())
+        .global_work_size(batch * EW_WG)
+        .local_work_size(EW_WG)
+        .arg(n as i32)
+        .arg(batch as i32)
+        .arg(l_io)
+        .arg(&s_buf)
+        .arg(&a_buf)
+        .arg(&b_buf)
+        .arg(&c_buf)
+        .arg(&g_buf)
+        .arg(&v_buf)
+        .arg(&alpha_b)
+        .arg(&mu_b)
+        .arg(&spans_b)
+        .arg(&nocc_b)
+        .arg(&trd_b)
+        .arg(kmu)
+        .arg(mom)
+        .arg(smax)
+        .arg(tol)
+        .arg(2.0e-5f32) // tol_tr as a fraction of nocc (floor 1e-4 abs)
+        .arg(&diag_b)
+        .arg(&done_b)
+        .arg_local::<f32>(4 * EW_WG)
+        .build()
+        .map_err(map_ocl_err)?;
+    let k_comb = Kernel::builder()
+        .program(&program)
+        .name("lnv_combine_batched")
+        .queue(rt.queue().clone())
+        .global_work_size(batch * nn)
+        .arg(n as i32)
+        .arg(batch as i32)
+        .arg(&s_buf)
+        .arg(&t_buf)
+        .arg(d_out)
+        .build()
+        .map_err(map_ocl_err)?;
+
+    let mut iters = 0usize;
+    let mut converged = false;
+    let mut done_h = vec![0i32; batch];
+    let mut diag_h = vec![0.0f32; batch * 4];
+    while iters < max_iter && !converged {
+        for _ in 0..chunk.min(max_iter - iters) {
+            unsafe {
+                k_s.enq().map_err(map_ocl_err)?;
+                k_scal.enq().map_err(map_ocl_err)?;
+                k_a.enq().map_err(map_ocl_err)?;
+                k_b.enq().map_err(map_ocl_err)?;
+                k_c.enq().map_err(map_ocl_err)?;
+                k_fin.enq().map_err(map_ocl_err)?;
+            }
+            iters += 1;
+        }
+        rt.read_buffer(&done_b, &mut done_h)?;
+        rt.read_buffer(&diag_b, &mut diag_h)?;
+        if dbg {
+            let mut alpha_h = vec![0.0f32; batch];
+            rt.read_buffer(&alpha_b, &mut alpha_h)?;
+            let worst = (0..batch).map(|s| diag_h[4 * s]).fold(0.0f32, f32::max);
+            let wsys = (0..batch).max_by(|&a, &b| diag_h[4 * a].partial_cmp(&diag_h[4 * b]).unwrap()).unwrap_or(0);
+            let ndone = done_h.iter().filter(|&&d| d != 0).count();
+            eprintln!(
+                "[lnv-dbg] it={iters} sys0: g={:.3e} tr={:.4} α={:.3} | worst(sys{wsys}): g={worst:.3e} r2={:.2e} mu={:.3e} tr={:.2} done={ndone}/{batch}",
+                diag_h[0], diag_h[1], alpha_h[0], diag_h[4 * wsys + 2], diag_h[4 * wsys + 3], diag_h[4 * wsys + 1]
+            );
+        }
+        converged = done_h.iter().all(|&d| d != 0);
+    }
+
+    // Final density D = 3L²−2L³ = 3S − 2(S·L), then the stationarity
+    // certificate T = H·D → ‖T−Tᵀ‖/(2‖T‖) computed on host (one solve-
+    // end GEMM + one buffer read — no per-iteration cost).
+    unsafe {
+        k_s.enq().map_err(map_ocl_err)?;
+        k_t.enq().map_err(map_ocl_err)?;
+        k_comb.enq().map_err(map_ocl_err)?;
+        k_hd.enq().map_err(map_ocl_err)?;
+    }
+    let mut t_h = vec![0.0f32; batch * nn];
+    rt.read_buffer(&t_buf, &mut t_h)?;
+    let mut mus = vec![0.0f32; batch];
+    rt.read_buffer(&mu_b, &mut mus)?;
+    let comms: Vec<f32> = (0..batch)
+        .map(|s| {
+            let tb = &t_h[s * nn..(s + 1) * nn];
+            let (mut num, mut den) = (0.0f64, 0.0f64);
+            for i in 0..n {
+                for j in 0..n {
+                    num += (tb[i * n + j] as f64 - tb[j * n + i] as f64).powi(2);
+                    den += (tb[i * n + j] as f64).powi(2);
+                }
+            }
+            (num.sqrt() / (2.0 * den.sqrt() + 1e-30)) as f32
+        })
+        .collect();
+
+    Ok(LnvDiag {
+        gnorms: (0..batch).map(|s| diag_h[4 * s]).collect(),
+        trds: (0..batch).map(|s| diag_h[4 * s + 1]).collect(),
+        mus,
+        comms,
+        iters,
+        converged,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

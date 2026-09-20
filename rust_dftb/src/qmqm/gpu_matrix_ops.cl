@@ -2315,3 +2315,226 @@ __kernel void lowdin_accept_batched(
     const size_t base = (size_t)sid * n * n;
     for (int idx = lid; idx < n * n; idx += lsz) X[base + idx] = X1[base + idx];
 }
+
+// ==================================================================
+// LNV reference solver — Li–Nunes–Vanderbilt auxiliary-matrix steepest
+// descent (canonical baseline for the minimize+retract density-matrix
+// family; design doc Alternative_Dense_Multi_Eigensolve.chat.md §15).
+//
+//   Ω(L) = Tr[f(L)·F],   f(x) = 3x²−2x³,  D = f(L),  F = (H−μI)/Δε
+//   ∇_L Ω = 3(LF+FL) − 2(L²F + LFL + FL²)
+//         = [L,[L,F]] + 3[(L−L²)F + F(L−L²)]     ← FP32 residual form
+//
+// The residual form builds the gradient from the small commutator and
+// idempotency residuals instead of subtracting large products — no
+// catastrophic cancellation in f32. At a clean projector L=P (f(P)=P):
+//   G = PF+FP−2PFP = T_P(H) = [P,[P,H]]   — the exact tangent force,
+// so the fixed point is exactly [D,H]=0 with no learned constraint
+// state. Per iteration: S=L² (sym square) + A=LF, B=SF, C=A·L=LFL
+// (3 general GEMMs) + the two elementwise kernels below.
+//
+// μ is the Fermi level (trace channel): G(μ+δμ) = G − 6(δμ/Δε)·R with
+// R = L−L², so δμ = Δε·⟨R,G⟩/(6⟨R,R⟩) cancels the trace-changing
+// component of the next step to first order; a small kmu·(nocc−TrD)
+// term steers TrD→nocc from a cold start.
+// ==================================================================
+
+// 4-way local reduction helper (same tree pattern as the scratch
+// reductions above, packed float4 to keep one local array).
+static float4 mo_reduce4(__local float4* red, float4 v, int lid, int lsz)
+{
+    red[lid] = v;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int off = lsz >> 1; off > 0; off >>= 1) {
+        if (lid < off) red[lid] += red[lid + off];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    return red[0];
+}
+
+// lnv_scal_batched — per-iteration scalar pass:
+//   F = (H − μI)/Δε        (written in the same strided sweep)
+//   trd[sys] = Tr f(L) = 3·Tr(L²) − 2·Tr(L³) = 3⟨L,L⟩ − 2⟨S,L⟩
+// One workgroup per system; early-outs on done[sys].
+__kernel void lnv_scal_batched(
+    const int n,
+    const int batch,
+    __global const float* L,
+    __global const float* S,
+    __global const float* H,
+    __global float*       F,
+    __global const float* mu,
+    __global const float* spans,
+    __global float*       trd,
+    __global const int*   done,
+    __local float4*       scratch)
+{
+    const int sys = get_group_id(0);
+    if (sys >= batch || done[sys]) return;
+    const int lid = get_local_id(0);
+    const int lsz = get_local_size(0);
+    const int nn = n * n;
+    const size_t base = (size_t)sys * nn;
+    const float mu_s = mu[sys];
+    const float isp = 1.0f / spans[sys];
+    float ll = 0.0f, sl = 0.0f;
+    for (int idx = lid; idx < nn; idx += lsz) {
+        const float l = L[base + idx];
+        const float s = S[base + idx];
+        const int i = idx / n, j = idx - i * n;
+        ll = fma(l, l, ll);
+        sl = fma(s, l, sl);
+        F[base + idx] = (H[base + idx] - (i == j ? mu_s : 0.0f)) * isp;
+    }
+    const float4 rr = mo_reduce4(scratch, (float4)(ll, sl, 0.0f, 0.0f), lid, lsz);
+    if (lid == 0) trd[sys] = 3.0f * rr.x - 2.0f * rr.y;
+}
+
+// lnv_finish_batched — gradient assembly + descent step + μ feedback:
+//   G = (B + Bᵀ − 2C) + 3·[(A−B) + (A−B)ᵀ]      (stored to Gbuf)
+//   L ← L − α_s·G                                α_s = per-system step
+//   μ += Δε·⟨R,G⟩/(6⟨R,R⟩) + kmu·Δε·(nocc−trd)
+//   α_s ← BB1 = ⟨s,y⟩/⟨y,y⟩   s = −α_s·G_prev, y = G − G_prev
+//   diag[2*sys] = ‖G‖_F, diag[2*sys+1] = trd
+//   done[sys] = ‖G‖<tol && |trd−nocc|≤tol_tr
+// The Barzilai–Borwein scalar step adapts α to the local curvature —
+// bare fixed-α SD is rate-limited by the Hessian spread (measured
+// ~40%/100 iters at α=0.2; α≥1.0 diverges). α is clamped to
+// [0.02, 0.9] — the stability limit measured on this problem is ~0.7.
+// Transposed reads hit A/B only (read-only); L is read+written at the
+// same element → race-free. Iteration 0 (G_prev=0) yields sy=0 →
+// α stays at its init value.
+__kernel void lnv_finish_batched(
+    const int n,
+    const int batch,
+    __global float*       L,
+    __global const float* S,
+    __global const float* A,
+    __global const float* B,
+    __global const float* C,
+    __global float*       Gbuf,
+    __global float*       V,
+    __global float*       alpha_b,
+    __global float*       mu,
+    __global const float* spans,
+    __global const float* nocc,
+    __global const float* trd,
+    const float           kmu,
+    const float           mom,
+    const float           smax,
+    const float           tol,
+    const float           tol_tr,
+    __global float*       diag,
+    __global int*         done,
+    __local float4*       scratch)
+{
+    const int sys = get_group_id(0);
+    if (sys >= batch || done[sys]) return;
+    const int lid = get_local_id(0);
+    const int lsz = get_local_size(0);
+    const int nn = n * n;
+    const size_t base = (size_t)sys * nn;
+    const float a_cur = alpha_b[sys];
+    __local float l_meff;   // effective momentum (0 on O'Donoghue restart)
+    __local float l_sscale; // step-cap scale
+    // pass 1: assemble the residual-form gradient, store to Gbuf,
+    // accumulate the reductions needed for μ/restart/cap decisions.
+    float g2 = 0.0f, rg = 0.0f, r2 = 0.0f, ggp = 0.0f;
+    float gp2 = 0.0f, gv = 0.0f, vv = 0.0f;
+    for (int idx = lid; idx < nn; idx += lsz) {
+        const int i = idx / n, j = idx - i * n;
+        const float a  = A[base + idx];
+        const float b  = B[base + idx];
+        const float c  = C[base + idx];
+        const float aT = A[base + j * n + i];
+        const float bT = B[base + j * n + i];
+        const float g = (b + bT - 2.0f * c) + 3.0f * ((a - b) + (aT - bT));
+        const float gp = Gbuf[base + idx];
+        const float r  = L[base + idx] - S[base + idx];
+        const float vp = V[base + idx];
+        Gbuf[base + idx] = g;
+        g2  = fma(g, g, g2);
+        rg  = fma(r, g, rg);
+        r2  = fma(r, r, r2);
+        ggp = fma(g, gp, ggp);
+        gp2 = fma(gp, gp, gp2);
+        gv  = fma(g, vp, gv);
+        vv  = fma(vp, vp, vv);
+    }
+    const float4 rr = mo_reduce4(scratch, (float4)(g2, rg, r2, ggp), lid, lsz);
+    const float4 rp = mo_reduce4(scratch, (float4)(gp2, gv, vv, 0.0f), lid, lsz);
+    if (lid == 0) {
+        const float gnorm = sqrt(rr.x);
+        const float sp = spans[sys];
+        const float cap = 0.02f * sp;
+        // μ channel — failure modes found by CPU-f64 bisection:
+        //  (a) R→0 (warm start): ⟨R,G⟩/⟨R,R⟩ is 0/0 → exploded μ to −2e9
+        //      in ONE step. Lower gate: ‖R‖² > 1e-4.
+        //  (b) far off-manifold: the linear trace model is wrong → the
+        //      projection drove a μ↔L exponential resonance (δμ = +10 →
+        //      −115 → +2198, g doubling every ~20 iters). Upper gate:
+        //      project ONLY while ‖R‖² < 0.5·n (near-manifold); farther
+        //      out the capped steering alone restores the trace.
+        //      CPU-validated: this window alone gives 8/8 at Δ=0.5;
+        //      panic-reset instead loops forever (1345 resets).
+        //  Both δμ terms are capped at 0.02·span — a chemical potential
+        //  never needs to jump further per step.
+        if (rr.z > 1.0e-4f && rr.z < 0.5f * n) {
+            mu[sys] += clamp(sp * rr.y / (6.0f * rr.z), -cap, cap);
+        }
+        mu[sys] += clamp(kmu * sp * (nocc[sys] - trd[sys]), -cap, cap);
+        // Momentum is gated to the SAME near-manifold window as the
+        // μ-projection: the divergence is a coupled V↔μ resonance that
+        // needs both drivers active while far off-manifold. Outside
+        // ‖R‖² < 0.5·n take a pure damped SD step — CPU-validated:
+        // momentum-gating gives 8/8 at Δ=0.02 AND Δ=0.5 (ungated: sys3
+        // exponential blow-up ~it=970). Plus O'Donoghue restart
+        // (⟨G,V⟩>0 → uphill → pure SD step, before overshoot).
+        const float meff = (rp.y > 0.0f || rr.z > 0.5f * n) ? 0.0f : mom;
+        // step cap: ‖v_new‖ ≤ meff·‖V‖ + ‖G‖ (bound, tight when V ∥ −G
+        // which is the unstable case). CPU-validated: smax=1.0 gives
+        // 8/8 convergence at Δ=0.02 AND Δ=0.5 (uncapped: 0/8 at 0.5).
+        const float vbound = meff * sqrt(rp.z) + gnorm;
+        l_meff = meff;
+        l_sscale = (a_cur * vbound > smax) ? smax / (a_cur * vbound) : 1.0f;
+        // BB1 for bare SD only — with momentum the displacement is
+        // a_cur·V, not −a_cur·G_prev, so the secant estimate is invalid.
+        const float gp2r = rp.x;
+        const float y2 = rr.x - 2.0f * rr.w + gp2r;
+        const float sy = a_cur * (gp2r - rr.w);
+        if (mom <= 0.0f && y2 > 1.0e-30f && sy > 0.0f) {
+            alpha_b[sys] = clamp(sy / y2, 0.02f, 0.9f);
+        }
+        diag[4 * sys]     = gnorm;
+        diag[4 * sys + 1] = trd[sys];
+        diag[4 * sys + 2] = rr.z;      // ‖R‖² — off-manifold measure
+        diag[4 * sys + 3] = mu[sys];
+        done[sys] = (gnorm < tol
+            && fabs(trd[sys] - nocc[sys]) <= fmax(tol_tr * nocc[sys], 1.0e-4f));
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    // pass 2: momentum + L update. v = meff·V_prev − G (meff=0 on
+    // restart → pure SD), L += α·s·v. All same-element → race-free.
+    const float meff = l_meff;
+    const float ss = l_sscale * a_cur;
+    for (int idx = lid; idx < nn; idx += lsz) {
+        const float g = Gbuf[base + idx];
+        const float v = fma(meff, V[base + idx], -g);
+        V[base + idx] = v;
+        L[base + idx] = fma(ss, v, L[base + idx]);
+    }
+}
+
+// lnv_combine_batched — final density D = 3S − 2·(S·L) = 3L² − 2L³.
+// One thread per element across all systems (T = S·L from a GEMM).
+__kernel void lnv_combine_batched(
+    const int n,
+    const int batch,
+    __global const float* S,
+    __global const float* T,
+    __global float*       D)
+{
+    const int gid = get_global_id(0);
+    if (gid >= batch * n * n) return;
+    D[gid] = 3.0f * S[gid] - 2.0f * T[gid];
+}

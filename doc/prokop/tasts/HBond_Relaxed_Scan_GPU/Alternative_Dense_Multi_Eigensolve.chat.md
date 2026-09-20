@@ -1405,3 +1405,4996 @@ the r8x8 resident kernel. Diminishing returns confirmed for this microkernel
 family; the remaining wins are at the SCC-loop level (warm-start, reduce
 frequency, resident tc2_step integration).
 
+
+
+
+
+
+
+---
+
+# USER
+
+Now bigger picture about solving SCC/SCF by density matrix purification. We maybe of stupid thing. We focus on purification itself but the critical part is minimize energy wrt hessian and overlap matrix. DM-purifucation is there just to ensure Pauli exclusion principle (right). We had problem that warm-start of purifier fix occupied and unoccupied subspace but that is exactly because we miss the charge relaxation step (downhill energy minimize). We can even afford initially relaxed porufier (violat Pauli exclusion slightly) and increase the tighten convergence criteria only as we reach close to minimum 
+
+
+---
+
+# Chat GPT 56. sol
+
+Yes. I think this changes the whole way we should formulate the solver.
+
+And I assume by “Hessian” you mean the **Hamiltonian \(H\)** together with overlap \(S\).
+
+What we have been doing so far is essentially the **spectral-projection use of purification**:
+
+$$
+H \longrightarrow D_0(H)\longrightarrow
+D_1\longrightarrow D_2\longrightarrow\cdots
+$$
+
+where TC2/McWeeny is expected to turn a function of \(H\) into the occupied projector.
+
+But purification has another, older use: **as the constraint-maintenance part of direct density-matrix energy minimization**. The literature explicitly distinguishes these two uses. LNV, CG density-matrix search, and hybrid purification/minimization schemes do essentially what you are now suggesting. ([Wiley Online Library][1])
+
+And for SCC-DFTB I think that formulation is much more natural.
+
+## The key conceptual decomposition
+
+Write, for the moment, in an orthogonal basis:
+
+$$
+D = U\,{\rm diag}(f_i)\,U^T.
+$$
+
+There are really **two independent things that have to relax**:
+
+1. **Eigenvectors \(U\)** — rotate the occupied subspace toward the low-energy eigenspace of the current Hamiltonian.
+2. **Occupations \(f_i\)** — push them toward the allowed occupation pattern.
+
+Purification,
+
+$$
+D\rightarrow 3D^2-2D^3
+$$
+
+or TC2,
+
+does essentially **only #2**.
+
+It changes the eigenvalues \(f_i\), but it leaves the eigenvectors of \(D\) unchanged.
+
+That is exactly why the old converged \(D\) is such a bad warm start for pure TC2 after \(H\) changes: **we were asking an eigenvalue operation to perform an eigenvector rotation. It mathematically cannot do it.**
+
+The missing operation is an **energy-descending subspace rotation**.
+
+---
+
+# The natural density-matrix gradient
+
+For an exactly idempotent projector,
+
+$$
+D^2=D,
+$$
+
+the tangent-space gradient of
+
+$$
+E_{\rm band}=\operatorname{Tr}(DH)
+$$
+
+is the double commutator.
+
+A downhill flow is
+
+$$
+\boxed{
+\dot D=-[D,[D,H]]
+}
+$$
+
+or equivalently
+
+$$
+\dot D =
+2DHD-DH-HD.
+$$
+
+This is very beautiful for our purpose.
+
+Define
+
+$$
+C=[D,H].
+$$
+
+Then
+
+$$
+\frac{dE}{dt}
+=
+-\|[D,H]\|_F^2\le0.
+$$
+
+So it is genuinely downhill, and convergence is simply
+
+$$
+[D,H]\rightarrow0.
+$$
+
+Moreover, the continuous flow can be written as
+
+$$
+\dot D=[[D,H],D],
+$$
+
+which is an **isospectral rotation**. It rotates the eigenvectors of \(D\) but preserves its eigenvalues.
+
+So we get almost a perfect complementary pair:
+
+$$
+\boxed{\text{double-commutator descent}}
+\qquad
+\text{rotates eigenvectors, preserves occupations}
+$$
+
+while
+
+$$
+\boxed{\text{purification}}
+\qquad
+\text{changes occupations, preserves eigenvectors.}
+$$
+
+This is, I think, the conceptual piece we had been missing.
+
+---
+
+## And yes: we absolutely do not need tight idempotency early
+
+There is actually a subtle correction here which makes your idea stronger.
+
+Pauli exclusion does **not** require
+
+$$
+D^2=D.
+$$
+
+It requires, per spin,
+
+$$
+0\le f_i\le1,
+$$
+
+plus
+
+$$
+\operatorname{Tr}D=N_{\rm occ}.
+$$
+
+Idempotency
+
+$$
+f_i\in\{0,1\}
+$$
+
+is the stronger condition for a zero-temperature pure Slater determinant.
+
+So an early density matrix with, for example,
+
+$$
+f=(0.99,0.95,0.76,0.24,0.05,0.01)
+$$
+
+is not “violating Pauli”. It is simply an ensemble/fractionally occupied density matrix.
+
+Only things such as
+
+$$
+f_i<0
+\quad\text{or}\quad
+f_i>1
+$$
+
+violate the admissible occupation bounds.
+
+That strongly suggests exactly your proposed strategy:
+
+> **early iterations:** concentrate on lowering the actual electronic energy; keep the density merely well behaved / weakly purified
+> **late iterations:** progressively enforce idempotency to the final tolerance.
+
+At finite electronic temperature we should not even drive idempotency to zero; fractional Fermi occupations are the correct solution.
+
+---
+
+# This is even more important for SCC-DFTB
+
+For SCC-DFTB the relevant energy is not merely
+
+$$
+\operatorname{Tr}(D H)
+$$
+
+with a fixed \(H\).
+
+Schematically,
+
+$$
+E[D]
+=
+2\operatorname{Tr}(D H^0)
++
+\frac12\Delta q[D]^T\gamma\,\Delta q[D]
++
+E_{\rm rep}.
+$$
+
+Here the Mulliken charges are linear functions of the density matrix.
+
+Therefore
+
+$$
+\frac{\delta E}{\delta D}
+$$
+
+is precisely the SCC Hamiltonian \(H_{\rm SCC}[D]\), modulo the usual factors/conventions.
+
+So instead of doing the traditional nested process
+
+$$
+D_n
+\rightarrow H[D_n]
+\rightarrow
+\boxed{\text{solve }H[D_n]\text{ accurately}}
+\rightarrow D_{n+1}
+\rightarrow\text{mix}
+$$
+
+we can conceptually do
+
+$$
+\boxed{
+D_{n+1}=D_n+\text{downhill step using }H[D_n]
+}
+$$
+
+and continue.
+
+That simultaneously relaxes:
+
+* orbital/subspace orientation,
+* charge distribution,
+* SCC Hamiltonian,
+* and eventually occupations/idempotency.
+
+In other words, **we may not need an “inner eigensolve/purification until convergence” at every SCC iteration at all.**
+
+That inner solve is probably massive oversolving far away from self-consistency.
+
+The literature's direct density-matrix minimization methods are precisely based on this viewpoint; LNV treats purification as part of the representation/constraint rather than as the whole electronic solver. ([PubMed][2])
+
+---
+
+# There is already a very useful stationarity condition
+
+In a nonorthogonal AO basis, the desired final density \(K\) satisfies three conceptually separate conditions:
+
+$$
+\boxed{\operatorname{Tr}(KS)=N_{\rm occ}}
+$$
+
+electron count,
+
+$$
+\boxed{KSK=K}
+$$
+
+zero-temperature idempotency,
+
+and
+
+$$
+\boxed{HKS-SKH=0}
+$$
+
+energy stationarity / occupied–virtual decoupling.
+
+The last one is the nonorthogonal analogue of
+
+$$
+[H,D]=0.
+$$
+
+This exact `HKS − SKH` condition is also the standard AO SCF commutator criterion. ([Heidelberg University Archive][3])
+
+Notice what TC2 addresses:
+
+$$
+KSK-K\rightarrow0.
+$$
+
+It does **nothing directly** to make
+
+$$
+HKS-SKH\rightarrow0
+$$
+
+if the eigenvectors are wrong.
+
+So we had indeed been focusing heavily on only one of the two residuals.
+
+---
+
+# A very simple prototype algorithm
+
+Before implementing full LNV, I would make an extremely simple orthogonal-basis experiment.
+
+Start with a reasonably valid \(D\).
+
+For each electronic iteration:
+
+$$
+H=H[D].
+$$
+
+Compute
+
+$$
+A=DH
+$$
+
+and then
+
+$$
+B=DHD=A D.
+$$
+
+Because \(D,H\) are symmetric,
+
+$$
+HD=A^T.
+$$
+
+Then the downhill direction is just
+
+$$
+\boxed{
+G=2B-A-A^T.
+}
+$$
+
+Update
+
+$$
+D\leftarrow D+\alpha G.
+$$
+
+That is only **two dense GEMMs per relaxation step**.
+
+Then, not necessarily every time:
+
+$$
+D\leftarrow {\cal P}(D),
+$$
+
+where \({\cal P}\) is one McWeeny/TC2 correction.
+
+Conceptually:
+
+```text
+repeat:
+    H = build_H(D)
+
+    A = D H
+    B = A D
+
+    G = 2 B - A - A^T       # downhill subspace rotation
+    D += α G
+
+    occasionally:
+        weak purification / occupation correction
+
+    gradually tighten:
+        ||H D - D H||
+        ||D² - D||
+        charge residual
+```
+
+That is already enough to test the central hypothesis.
+
+---
+
+## An especially nice diagnostic
+
+We should separately monitor
+
+$$
+r_{\rm orbital}=\|HD-DH\|_F
+$$
+
+and
+
+$$
+r_{\rm idem}=\|D^2-D\|_F.
+$$
+
+They tell us **different things**.
+
+For example after moving geometry:
+
+```text
+old converged projector:
+    r_idem    ≈ 1e-6      excellent
+    r_orbital ≈ 1e-2      bad
+```
+
+Pure TC2 does approximately:
+
+```text
+r_idem    ↓
+r_orbital unchanged / poorly addressed
+```
+
+while the double-commutator step should do:
+
+```text
+r_orbital ↓↓↓
+r_idem    slightly perturbed by finite step
+```
+
+Then an occasional McWeeny step repairs the latter.
+
+I would very much like to see these two curves plotted independently. They should make the problem visually obvious.
+
+---
+
+# Your idea of progressive purification tolerance makes sense
+
+I would go even further than changing a convergence tolerance.
+
+I would change the **relative number of the two operations** during convergence.
+
+For example, early:
+
+```text
+4–8 energy-descent steps
+1 weak McWeeny correction
+```
+
+middle:
+
+```text
+2–4 descent steps
+1 purification
+```
+
+late:
+
+```text
+1 descent
+1–2 purification
+```
+
+and finally certify
+
+$$
+r_{\rm orbital}<\epsilon_H,
+\qquad
+r_{\rm idem}<\epsilon_P,
+\qquad
+|\operatorname{Tr}D-N|<\epsilon_N.
+$$
+
+The exact schedule should probably be residual-driven rather than hard-coded.
+
+For example,
+
+$$
+\eta=
+\frac{r_{\rm idem}}
+     {r_{\rm orbital}+r_{\rm idem}}
+$$
+
+could determine whether the next operation should spend work on purification or energy descent.
+
+If
+
+$$
+r_{\rm orbital}\gg r_{\rm idem},
+$$
+
+purifying harder is clearly wasted work.
+
+---
+
+# This is very close to LNV
+
+What you have independently arrived at is essentially the motivation behind **Li–Nunes–Vanderbilt density-matrix minimization**.
+
+LNV introduces an auxiliary matrix \(L\) and defines the physical density through McWeeny purification. In a nonorthogonal basis:
+
+$$
+\boxed{
+K=3LSL-2LSLSL
+}
+$$
+
+and then minimizes the energy **with respect to \(L\)**.
+
+So purification is built into the parameterization, but the actual search direction comes from **energy minimization**, not repeated spectral projection. The nonorthogonal generalization was explicitly constructed so that only \(S\), rather than \(S^{-1}\), appears in the variational functional. ([Rutgers University][4])
+
+There is even old work comparing pure purification and LNV that concludes they have complementary strengths and proposes a **hybrid**, exactly the direction we are discussing. ([ScienceDirect][5])
+
+And Challacombe later derived a simplified density-matrix minimization scheme specifically to reduce matrix multiplications and shift more work to quadratically convergent McWeeny purification. ([CiNii Research][6])
+
+So this isn't merely plausible; there is a fairly deep body of algorithms here that we should now mine rather than invent everything ourselves.
+
+---
+
+# One potentially very nice property specific to DFTB
+
+DFTB may actually be unusually friendly to direct minimization.
+
+For fixed nuclei,
+
+$$
+E[D]
+=
+E_0[D]+\frac12\Delta q[D]^T\gamma\Delta q[D].
+$$
+
+Since \(q[D]\) is linear in \(D\), along a **linear trial direction**
+
+$$
+D(\alpha)=D+\alpha G,
+$$
+
+the SCC energy is essentially a quadratic polynomial:
+
+$$
+E(\alpha)
+=
+E(0)+a\alpha+\frac12b\alpha^2.
+$$
+
+That means we may be able to get an **analytic or nearly analytic optimal step length** rather than doing an expensive line search.
+
+This deserves a careful derivation because the projector constraint/retraction complicates it slightly, but it could be extremely useful on GPU: determine a per-system \(\alpha\) from a handful of scalar contractions, update all 400 replicas independently.
+
+That is much more attractive than a generic conjugate-gradient line search with host intervention.
+
+---
+
+## The one caution
+
+I would not let \(D\) become arbitrarily non-idempotent.
+
+Without constraints, minimizing a linear band energy is ill-posed: occupations can go outside their physical range and collapse into the lowest state.
+
+So “loose purification” should mean something like
+
+$$
+0-\delta \lesssim f_i \lesssim1+\delta
+$$
+
+with the correct trace, not “ignore representability entirely.”
+
+LNV handles this carefully using the auxiliary matrix/purification functional; that's one reason I think we should study its exact functional before designing our final implementation.
+
+But the broad idea is exactly right.
+
+### I now think the right architecture is
+
+$$
+\boxed{
+\text{energy minimizer}
++
+\text{weak/adaptive N-representability enforcement}
+}
+$$
+
+rather than
+
+$$
+\boxed{
+\text{purifier pretending to be the electronic minimizer}.
+}
+$$
+
+And the cleanest first test is probably **double-commutator descent + occasional McWeeny**, because it will tell us very quickly whether the real GC/DTH warm-SCC problem collapses from “5–15 purification GEMMs” to perhaps only a couple of subspace-relaxation steps plus one final purification.
+
+[1]: https://onlinelibrary.wiley.com/doi/10.1002/qua.25048?utm_source=chatgpt.com "A perspective on the density matrix purification for linear scaling electronic structure calculations - Kim - 2016 - International Journal of Quantum Chemistry - Wiley Online Library"
+[2]: https://pubmed.ncbi.nlm.nih.gov/10005210/?utm_source=chatgpt.com "Density-matrix electronic-structure method with linear system-size scaling."
+[3]: https://archiv.ub.uni-heidelberg.de/volltextserver/30839/1/Maximilien_Ambroise_Dissertation.pdf?utm_source=chatgpt.com "Inaugural - Dissertation"
+[4]: https://www.researchwithrutgers.org/en/publications/generalization-of-the-density-matrix-method-to-a-nonorthogonal-ba/?utm_source=chatgpt.com "Generalization of the density-matrix method to a nonorthogonal basis - Rutgers, The State University of New Jersey"
+[5]: https://www.sciencedirect.com/science/article/abs/pii/S0010465599002210?utm_source=chatgpt.com "Density matrices in O(N) electronic structure calculations: theory and applications - ScienceDirect"
+[6]: https://cir.nii.ac.jp/crid/1363107370478897536?utm_source=chatgpt.com "A simplified density matrix minimization for linear scaling self-consistent field theory | CiNii Research"
+
+
+
+---
+
+# USER
+
+Ok, now we should think about computational efficiency. How to minimize number of matrix multiplications which we spent effort optimizing. Is the commutator [D,H] really the best way to implement minimizer? I understand the advantage it is tangential and approximately preserve the idempotency? Because if we just make derivative of Energy Tr(H.D) wrt density matrix elements ignoring any orthogonality constraints it would be perhaps faster just the idempotency preservation would require more steps. Than it is about what is more numerical work the nice tangential down hill step or restoration of idempotency. Can you analyse this thoroughly?
+
+
+---
+
+# Chat GPT 56. sol
+
+Yes. Once we count **matrix multiplications rather than conceptual elegance**, the answer changes. The double-commutator is an excellent geometric minimizer, but I don't think it is obviously the fastest implementation for your GPU. There is a particularly attractive alternative: **take the cheap unconstrained energy-gradient step, then use a very cheap resident polynomial retraction back toward the projector manifold**.
+
+This is close in spirit to the old density-matrix-minimization literature: purification and variational minimization have complementary roles, and hybrid schemes were explicitly found useful; Challacombe's simplified DMM was motivated specifically by reducing matrix multiplications and shifting more work toward quadratically convergent McWeeny purification. ([CiNii Research][1])
+
+## 1. What the double commutator is buying us
+
+For clarity, first use an orthogonal basis and an exact rank-\(N\) projector
+
+$$
+P^2=P,\qquad P^T=P.
+$$
+
+For fixed \(H\),
+
+$$
+E[P]=\operatorname{Tr}(PH).
+$$
+
+The unconstrained derivative is trivially
+
+$$
+\nabla E=H.
+$$
+
+But an allowed infinitesimal variation of a projector must satisfy
+
+$$
+P\,\delta P+\delta P\,P=\delta P.
+$$
+
+The tangent projection of \(H\) is
+
+$$
+G=[P,[P,H]]
+  =PH+HP-2PHP.
+$$
+
+So steepest descent is
+
+$$
+P' = P-\alpha G.
+$$
+
+This has two major numerical virtues.
+
+First, it preserves particle number to first order because
+
+$$
+\operatorname{Tr}G=0.
+$$
+
+More importantly, since \(G\) is tangent,
+
+$$
+P'^2-P'
+=\alpha^2G^2.
+$$
+
+**There is no \(O(\alpha)\) idempotency error.**
+
+That is the real reason the commutator is attractive. You can rotate the occupied subspace significantly while only damaging idempotency at second order.
+
+And the continuous equation
+
+$$
+\dot P=-[P,[P,H]]
+$$
+
+is actually isospectral: it rotates the eigenvectors without changing occupation eigenvalues at all.
+
+### Cost
+
+Using symmetry you need only two full matrix multiplications:
+
+$$
+A=PH,
+$$
+
+then either
+
+$$
+B=AP=PHP,
+$$
+
+and
+
+$$
+G=A+A^T-2B.
+$$
+
+So:
+
+$$
+\boxed{\text{double commutator}=2\ {\rm general\ GEMMs}}
+$$
+
+per minimization step.
+
+That's mathematically clean. But your **general GEMM is much more expensive than the extremely optimized resident symmetric square** \(D^2\).
+
+That changes the engineering tradeoff.
+
+---
+
+# 2. What happens with the stupidly cheap raw gradient?
+
+Suppose instead we simply do
+
+$$
+X=P-\alpha(H-\mu I).
+$$
+
+No GEMM at all. H is already available.
+
+Write the perturbation as
+
+$$
+X=P+\alpha E.
+$$
+
+Then
+
+$$
+X^2-X
+=
+\alpha(PE+EP-E)+O(\alpha^2).
+$$
+
+In the basis defined by the current occupied/unoccupied subspaces,
+
+$$
+P=
+\begin{pmatrix}
+I&0\\
+0&0
+\end{pmatrix},
+\qquad
+H=
+\begin{pmatrix}
+H_{oo}&H_{ov}\\
+H_{vo}&H_{vv}
+\end{pmatrix}.
+$$
+
+The raw step gives
+
+$$
+\delta P=
+-\alpha
+\begin{pmatrix}
+H_{oo}-\mu I&H_{ov}\\
+H_{vo}&H_{vv}-\mu I
+\end{pmatrix}.
+$$
+
+Only
+
+$$
+-\alpha
+\begin{pmatrix}
+0&H_{ov}\\
+H_{vo}&0
+\end{pmatrix}
+$$
+
+is useful physical subspace rotation.
+
+The \(oo\) and \(vv\) pieces merely destroy the occupations.
+
+So raw gradient is computationally free, but **a large part of the step points normal to the projector manifold**.
+
+Consequently,
+
+$$
+X^2-X=O(\alpha),
+$$
+
+rather than \(O(\alpha^2)\).
+
+This is exactly the tradeoff you described.
+
+---
+
+# 3. But here is the important observation: purification can project that raw gradient onto the correct tangent direction
+
+Take the McWeeny map
+
+$$
+M(X)=3X^2-2X^3.
+$$
+
+Linearize it around an exact projector:
+
+$$
+X=P+\epsilon E.
+$$
+
+One obtains
+
+$$
+M(P+\epsilon E)
+=
+P+
+\epsilon
+\left(
+PE(1-P)+(1-P)EP
+\right)
++O(\epsilon^2).
+$$
+
+In words:
+
+**McWeeny deletes the occupied–occupied and virtual–virtual parts of the perturbation to first order, while preserving the occupied–virtual part.**
+
+Therefore start with
+
+$$
+E=-(H-\mu I).
+$$
+
+Then
+
+$$
+M\!\left(P-\alpha(H-\mu I)\right)
+=
+P
+-\alpha
+\left[
+PH(1-P)+(1-P)HP
+\right]
++O(\alpha^2).
+$$
+
+But
+
+$$
+PH(1-P)+(1-P)HP
+=
+[P,[P,H]].
+$$
+
+Therefore
+
+$$
+\boxed{
+\text{raw gradient + McWeeny}
+=
+\text{double-commutator descent}
++O(\alpha^2).
+}
+$$
+
+This is the crucial result.
+
+The raw-gradient approach is not fundamentally a worse descent direction if you retract it properly. **To first order it produces exactly the same constrained gradient.**
+
+So now it becomes purely a question of which implementation makes the retraction cheaper.
+
+---
+
+# 4. Unfortunately ordinary McWeeny still needs two multiplications
+
+McWeeny requires
+
+$$
+X^2
+$$
+
+and
+
+$$
+X^3=X^2X.
+$$
+
+Thus it is still
+
+$$
+\boxed{2\ {\rm matrix\ multiplies}}.
+$$
+
+Nominally that ties the double commutator.
+
+But they're not equivalent on your GPU:
+
+| Scheme                   | Products         |
+| ------------------------ | ---------------- |
+| Double commutator        | \(PH,\;(PH)P\)   |
+| McWeeny retraction       | \(X^2,\;(X^2)X\) |
+| Your optimized primitive | **\(X^2\)**      |
+
+The first McWeeny multiply is exactly the operation for which you've just built that exceptional ~0.05-ms resident kernel.
+
+The second one, unfortunately, is again a general multiplication.
+
+But we can do better.
+
+---
+
+# 5. Two quadratic purifier steps give a proper retraction using only **squares**
+
+Define the two TC2-like quadratic maps
+
+$$
+q_0(x)=x^2
+$$
+
+and
+
+$$
+q_1(x)=2x-x^2.
+$$
+
+A single one cannot properly stabilize both 0 and 1.
+
+But compose them:
+
+$$
+R_1(x)
+=
+q_0(q_1(x))
+=
+(2x-x^2)^2,
+$$
+
+or in the opposite order,
+
+$$
+R_2(x)
+=
+q_1(q_0(x))
+=
+2x^2-x^4.
+$$
+
+Both satisfy
+
+$$
+R(0)=0,\qquad R(1)=1
+$$
+
+and, critically,
+
+$$
+R'(0)=R'(1)=0.
+$$
+
+Therefore around a projector they have the same first-order retraction property as McWeeny:
+
+$$
+R(P+\epsilon E)
+=
+P+
+\epsilon
+\left(
+PEQ+QEP
+\right)
++O(\epsilon^2),
+\qquad Q=I-P.
+$$
+
+So we can do
+
+$$
+\boxed{
+X=P-\alpha(H-\mu I)
+}
+$$
+
+followed by
+
+$$
+\boxed{
+X\leftarrow 2X-X^2
+}
+$$
+
+and
+
+$$
+\boxed{
+P'\leftarrow X^2
+}
+$$
+
+for example.
+
+And that is **two symmetric squares and nothing else**.
+
+This maps beautifully onto what you have just optimized.
+
+---
+
+# 6. On your GPU this could be substantially faster than the commutator
+
+Imagine one resident kernel:
+
+```text
+load X = D - α(H - μI) into local memory
+
+X = 2X - X²
+X = X²
+
+write Dnew
+```
+
+The raw energy step is just during the load:
+
+```c
+Ls[i] = D[i] - alpha * H[i];
+```
+
+The two expensive operations are exactly your resident `sq_iter`.
+
+No generic \(D H\).
+
+No generic \(DHD\).
+
+No global ping-pong between the two purification operations.
+
+Given your measured resident square of roughly
+
+$$
+0.05\ {\rm ms}
+$$
+
+per \(86\times86\) batched operation, the core of one properly retracted gradient step might be roughly
+
+$$
+\sim 0.10\ {\rm ms}
+$$
+
+plus one load/write.
+
+That should be directly compared with **two general \(86^3\) GEMMs** required by the exact double commutator.
+
+I would not be surprised if the raw-gradient + two-square retraction wins substantially in wall time despite having nominally the same count of matrix products.
+
+This is probably the first experiment I'd do.
+
+---
+
+# 7. Can we get down to only ONE square per energy-minimization step?
+
+This is exactly where your “don't enforce Pauli/idempotency tightly early” idea becomes interesting.
+
+There is a mathematical obstacle to doing a proper retraction in one square.
+
+Suppose a quadratic polynomial
+
+$$
+p(x)=ax^2+bx+c
+$$
+
+should preserve the fixed points
+
+$$
+p(0)=0,\qquad p(1)=1.
+$$
+
+For both endpoints to be attractive to first order we would want
+
+$$
+|p'(0)|<1,\qquad |p'(1)|<1.
+$$
+
+Since \(c=0\) and \(a+b=1\),
+
+$$
+p'(0)=b,
+\qquad
+p'(1)=2-b.
+$$
+
+You cannot simultaneously have
+
+$$
+|b|<1
+$$
+
+and
+
+$$
+|2-b|<1.
+$$
+
+They only meet at the marginal case \(b=1\), which is just \(p(x)=x\).
+
+So:
+
+$$
+\boxed{\text{one matrix square cannot contract occupations toward both 0 and 1.}}
+$$
+
+You need at least a cubic map or a composition of two quadratics for a true local retraction.
+
+That explains something fundamental about TC2: one branch repairs one side of the spectrum and worsens the other side.
+
+---
+
+# 8. But alternating one-square steps may be exactly the relaxed solver you want
+
+We do not necessarily need a full retraction after **every SCC step**.
+
+We could do
+
+$$
+X_n=D_n-\alpha H_n
+$$
+
+then on iteration \(n\),
+
+$$
+D_{n+1}=X_n^2,
+$$
+
+and next iteration
+
+$$
+D_{n+2}=2X_{n+1}-X_{n+1}^2.
+$$
+
+Or choose the branch from the trace as TC2 already does.
+
+Over two iterations the combination has the proper stable 0/1 endpoints.
+
+This would give approximately
+
+$$
+\boxed{1\ {\rm resident\ square/SCC\ iteration}}
+$$
+
+during the loose phase.
+
+That is extremely attractive.
+
+The price is that after every individual iteration one side of the occupation spectrum is imperfect and can actually move away from its endpoint.
+
+But perhaps that simply doesn't matter early in SCF.
+
+Then as the energy/charge residual becomes small:
+
+```text
+early:   raw descent + 1 TC2 square
+middle:  raw descent + 2-square retraction
+late:    full idempotency purification / certification
+```
+
+That is much closer to what I think you had in mind.
+
+And because \(H[D]\) changes between those iterations, it isn't mathematically identical to composing two quadratic maps on the same matrix. So this one definitely needs empirical testing.
+
+But the reward is large enough—potentially **half the matrix-multiply count**—that it is worth trying.
+
+---
+
+# 9. What if we do several completely raw \(D-\alpha H\) steps before purification?
+
+I am less enthusiastic about that.
+
+The normal error is \(O(\alpha)\) every step, so after \(k\) unrestricted steps you generically accumulate something like
+
+$$
+O(k\alpha)
+$$
+
+occupation distortion.
+
+Meanwhile the physically useful subspace rotation also scales \(O(k\alpha)\).
+
+So you aren't gaining a favorable asymptotic ratio.
+
+Worse, once eigenvalues cross the basin boundary between occupied and virtual states, purification can restore the **wrong projector**.
+
+I would therefore prefer **one cheap quadratic correction every iteration**, rather than completely unconstrained descent for five iterations followed by a big cleanup.
+
+---
+
+# 10. There is a useful middle ground requiring one general GEMM
+
+Instead of the completely raw gradient, compute only
+
+$$
+A=DH.
+$$
+
+Then take
+
+$$
+G_\mu
+=
+-(A+A^T-2\mu D).
+$$
+
+Cost:
+
+$$
+\boxed{1\ {\rm general\ GEMM}}.
+$$
+
+For an exact projector this has blocks
+
+$$
+G_\mu
+=
+-\begin{pmatrix}
+2(H_{oo}-\mu I)&H_{ov}\\
+H_{vo}&0
+\end{pmatrix}.
+$$
+
+Compared with raw \(-H\), it completely removes the virtual–virtual pollution.
+
+Only the occupied–occupied normal component remains.
+
+So this is a reasonable halfway point:
+
+```text
+raw gradient:          0 GEMM, lots of normal pollution
+semi-tangent:          1 GEMM, less normal pollution
+exact tangent:         2 GEMM, zero O(α) pollution
+```
+
+Whether the one-GEMM version is worthwhile depends on the occupied bandwidth. A single scalar \(\mu\) cannot remove \(H_{oo}-\mu I\), so if occupied eigenvalues span several eV the first-order idempotency drift may still be substantial.
+
+I would test it only after the zero-GEMM + square-retraction approach.
+
+---
+
+# 11. A very important benchmark: count **wall time**, not GEMMs
+
+Because for your kernel these are hugely different units:
+
+$$
+D^2
+$$
+
+is now a special operation that can keep an entire matrix resident in local memory and reuse the same matrix as both operands.
+
+Whereas
+
+$$
+DH
+$$
+
+has two independent operands.
+
+You cannot resident-store both full \(88\times88\) matrices in 48 KB:
+
+$$
+2\times88^2\times4
+\approx 62\ {\rm KB}.
+$$
+
+So the double-commutator's two products can never exploit the exact same trick.
+
+Thus the correct cost model isn't
+
+```text
+2 MM versus 2 MM
+```
+
+but more like
+
+```text
+2 resident symmetric squares
+versus
+2 ordinary GEMMs.
+```
+
+That could easily be a factor approaching two in actual time.
+
+---
+
+# 12. There may be an even better representation than D
+
+There is one more possibility I think we should seriously keep in mind.
+
+If the objective is simply to find the occupied subspace, represent it by
+
+$$
+C\in\mathbb R^{n\times m},
+\qquad
+C^TC=I,
+\qquad m=N_{\rm occ},
+$$
+
+instead of the full projector
+
+$$
+D=CC^T.
+$$
+
+Then
+
+$$
+E=\operatorname{Tr}(C^THC).
+$$
+
+The Grassmann gradient is
+
+$$
+R=HC-C(C^THC).
+$$
+
+For \(m\simeq n/2\), its arithmetic is approximately:
+
+$$
+HC:\quad 2n^2m\approx n^3,
+$$
+
+$$
+C^T(HC):\quad 2nm^2\approx\frac12 n^3,
+$$
+
+$$
+C(C^THC):\quad2nm^2\approx\frac12 n^3.
+$$
+
+Total:
+
+$$
+2n^3
+$$
+
+FLOPs.
+
+That is equivalent to **one full \(n\times n\) GEMM**, whereas density-matrix double-commutator descent costs approximately two.
+
+Moreover,
+
+$$
+C' = C-\alpha R
+$$
+
+violates orthonormality only at
+
+$$
+O(\alpha^2),
+$$
+
+because \(C^TR=0\).
+
+So you can again orthonormalize only periodically.
+
+And your current SCC code already has the conceptual advantage that Mulliken populations can be evaluated directly from \(C\) and \(SC\), without ever building the full density during the SCC loop.
+
+So if we are truly asking:
+
+> “What is the minimum linear-algebra work necessary to rotate the occupied subspace?”
+
+then **occupied-subspace minimization may ultimately beat density-matrix minimization.**
+
+The old DMM literature was mostly motivated by linear scaling/sparsity, which changes that tradeoff. Your regime is rather unusual: tiny dense \(n\sim86\) matrices, hundreds of replicas, very fast custom GPU kernels.
+
+---
+
+## What I would benchmark now
+
+1. **Exact reference:** double commutator, 2 general GEMMs/step. This tells us the number of true energy-descent iterations needed and gives the cleanest physics baseline.
+2. **Projected raw step:** \(X=D-\alpha(H-\mu I)\), followed by **two resident quadratic squares** \(q_0\circ q_1\). This should have the same first-order direction as the commutator but be much better matched to your GPU.
+3. **Aggressive loose mode:** raw step + **one TC2 square per SCC iteration**, alternating/trace-selecting the branch; switch to two-square retraction near convergence.
+4. Only if those disappoint, test the one-general-GEMM semi-tangent form.
+5. In parallel, make a small CPU/GPU prototype of occupied-subspace \(C\)-minimization, because its theoretical arithmetic count is roughly half that of the full-density tangent method.
+
+The key thing I would **not** do now is assume “double commutator = best because it respects the manifold.” Geometrically it is best. Computationally, your newly discovered **resident matrix-square primitive is so disproportionately cheap** that it makes a deliberately unconstrained gradient followed by polynomial retraction potentially the better algorithm.
+
+And there is literature precedent for precisely this philosophy: direct minimization and purification were developed as complementary approaches, with hybrid methods often outperforming either alone. ([arXiv][2]) The recent semiempirical GPU work also reinforces that dense purification becomes attractive specifically when matrix-matrix operations map exceptionally well to consumer GPUs, although that work uses purification mainly as the density build from a fixed Hamiltonian rather than the variational hybrid we're considering here. ([cambridge.org][3])
+
+[1]: https://cir.nii.ac.jp/crid/1363107370478897536?utm_source=chatgpt.com "A simplified density matrix minimization for linear scaling self-consistent field theory | CiNii Research"
+[2]: https://arxiv.org/abs/cond-mat/9810042?utm_source=chatgpt.com "Density matrices in O(N) electronic structure calculations: theory and applications"
+[3]: https://www.cambridge.org/engage/chemrxiv/article-details/68076154927d1c2e663240c7?utm_source=chatgpt.com "Acceleration of semi-empirical electronic structure theory calculations on consumer-grade GPUs using mixed precision density matrix purification | Theoretical and Computational Chemistry | Cambridge Open Engage"
+
+
+---
+
+# USER
+
+Ok do you think it make sense to merge into one kernel (do the stupid unconstrained gradient and immediately constraint\project back to tangent space at least approximately?) also think about numerical error. Remember we work in f32 accuracy (f64 is costly on gaming GPUs), and I think if we do unconstrained step and then subtract radial part we introduce large numerical noise. Therefore it would be better to do some noise-aware approximately tangential descent step inside single kernel and the correct it by one or two purification steps.
+
+
+---
+
+# Chat GPT 5.6 sol
+
+
+Yes. I think merging it into **one resident kernel** makes a lot of sense, but I would change one thing in the formulation:
+
+> I would **not** use the literal unconstrained gradient \(-H\) and rely on purification to remove a large radial component every time.
+>
+> Instead I would maintain a **cheap approximation to the normal/constraint force**, subtract that *before* taking the step, and let one or two resident purification squares clean up only the remaining small error.
+
+That is both computationally attractive and much better behaved in FP32.
+
+The general idea is consistent with density-matrix-minimization work: purification and variational minimization have complementary roles, and hybrid schemes were explicitly proposed; simplified DMM formulations were developed specifically to reduce the matrix-multiply count and shift work toward efficient purification. ([ScienceDirect][1])
+
+## 1. Why I would avoid `D -= α H; purify(D)` literally
+
+Suppose \(D=P\) is already a perfect projector. In the basis of its occupied/unoccupied subspaces,
+
+$$
+P=
+\begin{pmatrix}
+I&0\\0&0
+\end{pmatrix},
+\qquad
+H=
+\begin{pmatrix}
+H_{oo}&H_{ov}\\
+H_{vo}&H_{vv}
+\end{pmatrix}.
+$$
+
+Only
+
+$$
+H_{\rm tan}=
+\begin{pmatrix}
+0&H_{ov}\\
+H_{vo}&0
+\end{pmatrix}
+$$
+
+actually rotates the occupied subspace.
+
+The raw step
+
+$$
+X=P-\alpha H
+$$
+
+also introduces the much larger components
+
+$$
+-\alpha H_{oo},\qquad-\alpha H_{vv}.
+$$
+
+Near convergence this is particularly bad: \(H_{ov}\) may be tiny, while \(H_{oo},H_{vv}\) remain of ordinary electronic-energy magnitude.
+
+Then we deliberately create a large error only to cancel it with purification.
+
+Mathematically that works. Numerically in FP32 it is unattractive.
+
+---
+
+# 2. Your FP32 concern about exact tangent projection is also valid
+
+The exact projector tangent is
+
+$$
+T_P(H)
+=
+[P,[P,H]]
+=
+PH+HP-2PHP.
+$$
+
+Geometrically this is beautiful.
+
+Numerically, near convergence, it is something like
+
+$$
+\text{small}
+=
+\text{large}
++\text{large}
+-\text{large}.
+$$
+
+And the large terms themselves came from length-86 FP32 dot products.
+
+A crude error scale for a naive FP32 dot product is
+
+$$
+\gamma_{86}\sim 86\,\epsilon_{\rm f32}\sim5\times10^{-6}
+$$
+
+before considering cancellation.
+
+That is already roughly the same regime as the projector/idempotency floors you have actually observed.
+
+So the exact formula can paradoxically be **less useful numerically near convergence than a slightly approximate tangent direction constructed without large cancellation**.
+
+And it costs two ordinary GEMMs.
+
+So I would not make it the production method.
+
+---
+
+# 3. Think in terms of the **normal constraint force**
+
+For an exact projector, decompose \(H\) into tangent and normal pieces:
+
+$$
+H=T+N,
+$$
+
+with
+
+$$
+T=PHQ+QHP,
+\qquad Q=I-P,
+$$
+
+and
+
+$$
+N=PHP+QHQ.
+$$
+
+Notice:
+
+$$
+[P,N]=0.
+$$
+
+At the solution,
+
+$$
+[P,H]=0,
+$$
+
+therefore
+
+$$
+T=0,\qquad N=H.
+$$
+
+So instead of recomputing the expensive projection \(T_P(H)\), maintain an estimate
+
+$$
+\Lambda\approx N.
+$$
+
+Then simply use
+
+$$
+\boxed{F=H-\Lambda}
+$$
+
+as the descent force.
+
+If \(\Lambda\) is good,
+
+$$
+F\simeq T.
+$$
+
+Then your cheap raw step
+
+$$
+X=D-\alpha F
+$$
+
+is **already approximately tangential**.
+
+This is much more attractive.
+
+---
+
+# 4. The beautiful thing is that purification tells us the constraint force almost for free
+
+Suppose
+
+$$
+F=H-\Lambda
+$$
+
+and make the trial
+
+$$
+X=D-\alpha F.
+$$
+
+Then retract/purify it:
+
+$$
+D'=R(X).
+$$
+
+For a near-projector and small step,
+
+$$
+D'
+=
+D-\alpha T_D(F)+O(\alpha^2).
+$$
+
+Therefore the amount removed by the retraction is
+
+$$
+D'-X
+=
+\alpha N_D(F)+O(\alpha^2).
+$$
+
+So the purification step itself gives us an estimate of the normal part of the force:
+
+$$
+N_D(F)
+\approx
+\frac{D'-X}{\alpha}.
+$$
+
+Therefore update
+
+$$
+\boxed{
+\Lambda'
+=
+\Lambda+
+\frac{D'-X}{\alpha}.
+}
+$$
+
+This is the really interesting algorithmic loop.
+
+We do **not** explicitly calculate the tangent projector.
+
+We learn the constraint force from what purification had to remove.
+
+---
+
+## 5. There is an even simpler equivalent update
+
+Because
+
+$$
+X=D-\alpha(H-\Lambda),
+$$
+
+the previous equation becomes
+
+$$
+\Lambda'
+=
+H+\frac{D'-D}{\alpha}.
+$$
+
+So, approximately,
+
+$$
+\boxed{
+\Lambda_{n+1}
+=
+H_n+\frac{D_{n+1}-D_n}{\alpha}.
+}
+$$
+
+This is reminiscent of recovering a Lagrange/constraint force from the difference between unconstrained and constrained motion.
+
+And look at the fixed point:
+
+if
+
+$$
+D'=D,
+$$
+
+then
+
+$$
+\Lambda'=H,
+$$
+
+and consequently
+
+$$
+F=H-\Lambda=0.
+$$
+
+That is extremely important numerically.
+
+The naive
+
+$$
+D-\alpha H\rightarrow\text{purify}
+$$
+
+scheme continues making a huge radial excursion **even at the exact solution**.
+
+This scheme does not.
+
+At convergence the force that enters the update actually goes to zero.
+
+That is exactly what we want in FP32.
+
+---
+
+# 6. Warm start becomes exceptionally natural
+
+Suppose geometry \(R_0\) was converged:
+
+$$
+D_0,\quad H_0,
+\qquad [D_0,H_0]\simeq0.
+$$
+
+Then
+
+$$
+H_0
+$$
+
+is almost entirely normal with respect to \(D_0\).
+
+So simply initialize
+
+$$
+\boxed{\Lambda_0=H_0.}
+$$
+
+At the new geometry / SCC state,
+
+$$
+F_1=H_1-H_0.
+$$
+
+That is exactly the small perturbation we intuitively wanted.
+
+No subtraction of orbital energies inside GEMMs.
+
+Just one elementwise FP32 subtraction.
+
+So instead of feeding purification
+
+$$
+D-\alpha H_1,
+$$
+
+we feed it roughly
+
+$$
+D-\alpha(H_1-H_0).
+$$
+
+But unlike the naïve "`ΔH` forever" idea, \(\Lambda\) is subsequently **updated from the constraint correction**, so the solver doesn't stall merely because \(H\) stops changing.
+
+I like this formulation much more.
+
+---
+
+# 7. We can improve the approximate tangent further for essentially zero cost
+
+Even if \(\Lambda\) is imperfect, subtract from
+
+$$
+F_0=H-\Lambda
+$$
+
+any matrix that is a polynomial in \(D\), because it commutes with \(D\) and therefore has no true tangent component.
+
+The simplest is
+
+$$
+aI+bD.
+$$
+
+Choose \(a,b\) to minimize
+
+$$
+\|F_0-aI-bD\|_F^2.
+$$
+
+This only needs four scalar reductions:
+
+$$
+s_1=\operatorname{Tr}D,
+$$
+
+$$
+s_2=\langle D,D\rangle_F,
+$$
+
+$$
+h_0=\operatorname{Tr}F_0,
+$$
+
+$$
+h_1=\langle D,F_0\rangle_F.
+$$
+
+Then solve
+
+$$
+\begin{pmatrix}
+n&s_1\\
+s_1&s_2
+\end{pmatrix}
+\begin{pmatrix}a\\b\end{pmatrix}
+=
+\begin{pmatrix}h_0\\h_1\end{pmatrix}.
+$$
+
+For an exact rank-\(m\) projector,
+
+$$
+s_1=s_2=m
+$$
+
+and the determinant is
+
+$$
+m(n-m),
+$$
+
+so for your roughly half-filled \(n=86,m\sim43\) problem this is very well conditioned.
+
+Then use
+
+$$
+\boxed{
+F=F_0-aI-bD.
+}
+$$
+
+This guarantees
+
+$$
+\operatorname{Tr}F=0
+$$
+
+and
+
+$$
+\langle D,F\rangle_F=0.
+$$
+
+So you've cheaply removed the two largest obvious normal modes.
+
+No matrix multiplication.
+
+Just reductions and elementwise operations.
+
+I would call this **commuting-gauge removal**.
+
+---
+
+# 8. This now gives exactly the single kernel I think you want
+
+Something conceptually like:
+
+```text
+resident_relax(D, H, Lambda):
+
+    # O(n²), global -> local
+    F0 = H - Lambda
+
+    reduce:
+        Tr(F0)
+        <D,F0>
+        Tr(D)
+        <D,D>
+
+    solve tiny 2×2 system for a,b
+
+    # approximate tangent step
+    X = D - α [F0 - a I - b D]
+
+    # D is now resident in local memory
+    one or two polynomial purification steps
+
+    D_out = X
+
+    update Lambda from constraint correction
+```
+
+Everything expensive after the initial loads operates on one resident 88×88 matrix.
+
+No general GEMM.
+
+No global intermediate matrix.
+
+No double commutator.
+
+---
+
+# 9. If the force is approximately tangent, idempotency violation is only second order
+
+This is the other big advantage.
+
+For exact projector \(P\), let \(T\) be tangent.
+
+Set
+
+$$
+X=P-\alpha T.
+$$
+
+Because
+
+$$
+PT+TP=T,
+$$
+
+we have
+
+$$
+X^2-X
+=
+\alpha^2T^2.
+$$
+
+So the defect is
+
+$$
+\boxed{O(\alpha^2)}
+$$
+
+rather than
+
+$$
+O(\alpha)
+$$
+
+for a generic unconstrained gradient.
+
+That means if our learned \(\Lambda\) is reasonably good, purification no longer has to do heavy lifting.
+
+It is just a small retraction.
+
+This is exactly where **one square per iteration** becomes plausible.
+
+---
+
+# 10. One purification square may genuinely be enough most of the time
+
+Suppose the approximate tangent error is \(\epsilon_N\).
+
+Then roughly
+
+$$
+\|X^2-X\|
+\sim
+O(\alpha\epsilon_N)
++
+O(\alpha^2\|T\|^2).
+$$
+
+If \(\Lambda\) tracks the normal force, \(\epsilon_N\) should rapidly become small.
+
+Then a single quadratic correction can keep the defect bounded while the system moves downhill.
+
+Occasionally run the complementary correction to clean both sides of the occupation spectrum.
+
+So I would consider:
+
+### Fast iteration
+
+$$
+X=D-\alpha F
+$$
+
+then one resident quadratic polynomial.
+
+### Cleanup iteration
+
+Same descent followed by **two complementary quadratic maps**.
+
+---
+
+# 11. I would use the two-square SP2 pair rather than McWeeny on your GPU
+
+The two simple maps are
+
+$$
+q_-(X)=X^2
+$$
+
+and
+
+$$
+q_+(X)=2X-X^2.
+$$
+
+Each needs exactly one of your extremely fast resident symmetric squares.
+
+The composition
+
+$$
+q_-\circ q_+
+$$
+
+or
+
+$$
+q_+\circ q_-
+$$
+
+has
+
+$$
+R(0)=0,\qquad R(1)=1
+$$
+
+and zero derivative at both fixed points.
+
+Thus it eliminates first-order normal errors, like a proper retraction.
+
+And unlike McWeeny,
+
+$$
+3X^2-2X^3,
+$$
+
+it uses **only matrix squares**.
+
+That is perfectly matched to the kernel you've just optimized.
+
+---
+
+# 12. A softer version is possible, but I suspect the hard SP2 pair is actually better in FP32
+
+Consider
+
+$$
+p_a(X)
+=
+X+a(X-X^2)
+=
+(1+a)X-aX^2.
+$$
+
+Its endpoint derivatives are
+
+$$
+p_a'(0)=1+a,
+\qquad
+p_a'(1)=1-a.
+$$
+
+Then applying \(p_a\) followed by \(p_{-a}\) gives endpoint contraction
+
+$$
+1-a^2
+$$
+
+on both sides.
+
+So \(a<1\) gives a gentler purifier.
+
+That sounds attractive numerically.
+
+But your \(a=1\) maps are simply
+
+$$
+X^2
+$$
+
+and
+
+$$
+2X-X^2,
+$$
+
+whose coefficients are exactly representable and require minimal arithmetic.
+
+The temporary amplification is only ×2.
+
+If our force is already almost tangent, the radial error being doubled is tiny anyway.
+
+So my first implementation would actually use the standard hard pair.
+
+---
+
+# 13. Important FP32 point: don't purify below the arithmetic floor
+
+Your measured purification already tells us the FP32 floor is around
+
+$$
+10^{-6}
+$$
+
+in the relevant norms.
+
+An 86-term FP32 GEMM also naturally has arithmetic errors in roughly this range.
+
+Therefore if
+
+$$
+\|D^2-D\|
+\sim10^{-6},
+$$
+
+performing three more purification rounds is not “making it more physical.”
+
+It is mostly manipulating rounding noise.
+
+So the control logic should be something like:
+
+```text
+idempotency bad     -> two square corrections
+idempotency moderate -> one correction
+idempotency near FP32 floor -> no correction
+```
+
+This fits your original intuition that constraint enforcement should be adaptive.
+
+---
+
+# 14. Updating Λ without storing the original trial matrix
+
+There's a practical problem:
+
+$$
+\Lambda'
+=
+\Lambda+\frac{D'-X}{\alpha}
+$$
+
+looks as though we'd have to retain \(X\), another 31 kB.
+
+We don't.
+
+During each polynomial transformation,
+
+$$
+Y=p(X),
+$$
+
+the thread responsible for \(Y_{ij}\) already has:
+
+```text
+old = X_ij
+new = Y_ij
+```
+
+at the moment it overwrites local storage.
+
+Therefore it can simultaneously do
+
+```c
+lambda[idx] += beta * (new - old) / alpha;
+```
+
+before overwriting `old`.
+
+For two purification steps:
+
+```text
+Lambda += β (Y-X)/α
+Lambda += β (Z-Y)/α
+```
+
+which sums to
+
+$$
+\Lambda
++
+\beta\frac{Z-X}{\alpha}.
+$$
+
+No second full matrix resident.
+
+No extra GEMM.
+
+No need to reread \(D_{\rm old}\).
+
+This is a very natural fusion into your resident square kernel.
+
+---
+
+# 15. I would damp the constraint-force update
+
+I wouldn't initially use
+
+$$
+\beta=1.
+$$
+
+Because the quantity
+
+$$
+D'-X
+$$
+
+contains:
+
+* real constraint correction;
+* finite-step \(O(\alpha^2)\) error;
+* FP32 GEMM error.
+
+I'd use something like
+
+$$
+\Lambda_{n+1}
+=
+\Lambda_n
++
+\beta\frac{D'-X}{\alpha},
+\qquad
+\beta\sim0.3-0.7.
+$$
+
+Then experiment.
+
+When
+
+$$
+|D'-X|
+$$
+
+approaches the FP32 floor, stop updating \(\Lambda\), because division by \(\alpha\) would merely amplify numerical noise.
+
+This is another reason I prefer a **fixed reasonable \(\alpha\)** rather than reducing \(\alpha\rightarrow0\) near convergence.
+
+---
+
+# 16. Step size should be tied to spectral width
+
+For a small occupied–virtual rotation involving states \(i,a\),
+
+$$
+E(\theta)
+\simeq
+E_0+
+(\epsilon_a-\epsilon_i)\theta^2.
+$$
+
+Gradient descent behaves roughly like
+
+$$
+\theta_{n+1}
+\simeq
+[1-\alpha(\epsilon_a-\epsilon_i)]
+\theta_n.
+$$
+
+So stability suggests
+
+$$
+0<\alpha\Delta\epsilon_{\max}<2.
+$$
+
+A very sensible starting point is therefore
+
+$$
+\boxed{
+\alpha \sim \frac{0.5-1}{\epsilon_{\max}-\epsilon_{\min}}.
+}
+$$
+
+You already have machinery for estimating spectral bounds.
+
+That also keeps the initial trial matrix safely within the basin where the polynomial correction behaves well.
+
+No line search required initially.
+
+---
+
+# 17. Why this is much better numerically than the double commutator
+
+I'd rank them like this.
+
+| Method                                      | general GEMMs | squares | FP32 behavior near solution                             |
+| ------------------------------------------- | ------------: | ------: | ------------------------------------------------------- |
+| raw \(-H\) + purification                   |             0 |     1–2 | **bad:** large artificial radial excursion remains      |
+| exact double commutator                     |             2 |       0 | geometrically perfect, but subtracts large GEMM results |
+| \(H-aI-bD\) + purification                  |             0 |     1–2 | better, but block-energy dispersion remains             |
+| **\(H-\Lambda\) recycled constraint force** |         **0** | **1–2** | **good:** force itself tends to zero                    |
+| \(H-\Lambda-aI-bD\)                         |         **0** | **1–2** | probably best candidate                                 |
+
+The last one is what I would implement.
+
+---
+
+## The resulting picture
+
+We no longer treat purification as the solver.
+
+Nor do we explicitly calculate the expensive projector gradient.
+
+Instead:
+
+$$
+\boxed{
+\begin{aligned}
+F &= H-\Lambda\\
+F &\leftarrow F-\operatorname{proj}_{\{I,D\}}F\\
+X &= D-\alpha F\\
+D' &= \text{1–2 resident-square retractions}(X)\\
+\Lambda' &=
+\Lambda+\beta\,\frac{D'-X}{\alpha}.
+\end{aligned}}
+$$
+
+The interpretation is quite clean:
+
+* \(H\) says where energy wants to go;
+* \(\Lambda\) learns the part forbidden by the Pauli/projector constraint;
+* \(H-\Lambda\) becomes an increasingly tangent force;
+* purification handles only the remaining small constraint error;
+* the correction made by purification feeds back into \(\Lambda\).
+
+At convergence,
+
+$$
+D'=D,\qquad \Lambda=H,\qquad H-\Lambda=0,
+$$
+
+so unlike raw-gradient + purification, **there is no large cancellation cycle left running at the FP32 floor**.
+
+I think this is sufficiently promising that I would test it **before implementing the exact double-commutator minimizer at all**. The double commutator is useful as a CPU/f64 reference to verify the direction, but computationally this learned-constraint-force formulation fits your highly optimized resident-square GPU primitive much better.
+
+[1]: https://www.sciencedirect.com/science/article/abs/pii/S0010465599002210?utm_source=chatgpt.com "Density matrices in O(N) electronic structure calculations: theory and applications - ScienceDirect"
+
+
+
+---
+
+# USER
+
+This is very good I like it a lot! But you wrote the merged kernel very abstract pseudocode and it seems to me like multiple matrix multiplication. Can you write it really as one kernel efficiently using shared memory (which is limited we should store like small tiles 8x8 or so not whole matrix because that would allow fit only one workgroup in 48kb per compute unit Budget)?
+
+
+---
+
+# Chat GPT 5.6 sol
+
+Yes. And with your constraint **“small local tiles, several WGs resident per SM”**, the fused kernel should look quite different from the resident-whole-matrix prototype.
+
+The key realization is:
+
+> **One WG should own one whole system, but it does not need to store the whole matrix locally.**
+> It can stream \(K\)-slabs through ~8–12 kB of local memory, exactly like your successful `r8x4/tk22` GEMM.
+
+That still allows several independent systems/WGs per SM.
+
+More importantly, we can do the complete
+
+$$
+D\rightarrow X\rightarrow{\rm purification}\rightarrow D'
+$$
+
+**in place**, with no second \(N^2\) scratch matrix.
+
+---
+
+# 1. Concrete operation we want
+
+Start from
+
+$$
+F_0=H-\Lambda.
+$$
+
+Cheaply remove the obvious commuting/normal components,
+
+$$
+F=F_0-aI-bD,
+$$
+
+where \(a,b\) come from the \(2\times2\) least-squares projection.
+
+Then
+
+$$
+X=D-\alpha F.
+$$
+
+Equivalently,
+
+$$
+X=(1+\alpha b)D-\alpha(H-\Lambda)+\alpha aI.
+$$
+
+That is important computationally: **constructing \(X\) is just an elementwise fused expression.**
+
+Then either one cheap purification:
+
+$$
+D'\equiv q_\pm(X)
+$$
+
+or the stronger complementary pair
+
+$$
+Y=q_\pm(X),
+\qquad
+D'=q_\mp(Y),
+$$
+
+with
+
+$$
+q_-(X)=X^2,
+\qquad
+q_+(X)=2X-X^2.
+$$
+
+The latter costs **two symmetric squares**, but they occur inside the same kernel.
+
+---
+
+# 2. No full matrix in local memory
+
+For \(N=86\), keep your successful geometry approximately:
+
+```text
+N    = 86
+LN   = 88
+
+TX   = 22
+TY   = 11
+RTX  = 4
+RTY  = 8
+
+WG   = 242 threads
+TK   = 22
+```
+
+One thread owns an \(8\times4\) register tile.
+
+The entire output coverage is
+
+$$
+(11\times8)\times(22\times4)
+=
+88\times88.
+$$
+
+But local memory is only
+
+$$
+22\times88\times4
+=
+7744\ {\rm bytes}
+$$
+
+for the staged symmetric operand.
+
+Add perhaps
+
+```text
+242 × float4 = 3872 bytes
+```
+
+for one temporary reduction buffer.
+
+Total:
+
+$$
+\approx11.6\ {\rm kB/WG}.
+$$
+
+So a 48-kB SM can fit **four WGs by shared-memory budget**. Register/thread limits may reduce that, but local memory certainly doesn't force one WG/SM.
+
+That is exactly the regime you wanted.
+
+---
+
+# 3. The nice trick: transform `D → X` while loading the first GEMM
+
+Normally we might do:
+
+```text
+kernel 1: X = D - αF
+kernel 2: T = X²
+```
+
+Absolutely unnecessary.
+
+While staging each element into the local \(K\)-slab:
+
+```c
+float d   = D[idx];
+float f0  = H[idx] - Lambda[idx];
+
+float x = (1 + alpha*b)*d - alpha*f0;
+if (i == j) x += alpha*a;
+
+Ls[kk*LN + i] = x;
+```
+
+The same thread can also do
+
+```c
+D[idx] = x;
+```
+
+at that moment.
+
+Each matrix element is staged exactly once during the complete square, so this is safe.
+
+Thus by the time \(X^2\) has finished,
+
+```text
+register accumulators = X²
+global D               = X
+```
+
+with **no separate X-building pass**.
+
+That is the central fusion.
+
+---
+
+# 4. Then overwrite `D = Y` in place
+
+After the first square, every thread has its \(8\times4\) part of
+
+$$
+T=X^2.
+$$
+
+Because all reads of the original \(D\) are finished, we can safely do:
+
+```c
+x = D[idx];        // D now contains X
+
+if (expand)
+    y = 2*x - t;
+else
+    y = t;
+
+D[idx] = y;
+```
+
+At exactly the same point we learn how much the constraint operation removed:
+
+```c
+Lambda[idx] += beta * (y - x) / alpha;
+```
+
+Then:
+
+```c
+barrier(CLK_GLOBAL_MEM_FENCE);
+```
+
+Now the same global `D` buffer contains the complete \(Y\).
+
+No temporary matrix.
+
+---
+
+# 5. If we want the second purifier, square `D=Y` immediately
+
+Reuse exactly the same local slab:
+
+```text
+global D=Y
+   ↓
+small local K slab
+   ↓
+register GEMM
+   ↓
+Y²
+```
+
+Then apply the opposite TC2 branch:
+
+```c
+y = D[idx];
+
+if (second_expand)
+    z = 2*y - y2;
+else
+    z = y2;
+
+Lambda[idx] += beta * (z - y) / alpha;
+D[idx] = z;
+```
+
+The two Lambda updates sum to
+
+$$
+\Lambda'
+=
+\Lambda+
+\beta\frac{Y-X}{\alpha}
++
+\beta\frac{Z-Y}{\alpha}
+=
+\Lambda+
+\beta\frac{Z-X}{\alpha}.
+$$
+
+So **we never need to keep \(X\)**.
+
+That is particularly neat.
+
+---
+
+# 6. Near-real OpenCL kernel
+
+This is close to how I would actually implement the experiment.
+
+I am omitting only mundane bounds/debug plumbing.
+
+```c
+#define N    86
+#define LN   88
+
+#define TX   22
+#define TY   11
+#define RTX   4
+#define RTY   8
+
+#define TK   22
+#define WG   (TX*TY)
+
+// WG = 242
+
+inline float4 reduce4(
+    __local float4* buf,
+    float4 v,
+    int lid
+){
+    buf[lid] = v;
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    int s = WG;
+    while(s > 1){
+        // ceil(s/2), important for WG=242
+        int h = (s + 1) >> 1;
+
+        if(lid < s-h){
+            buf[lid] += buf[lid+h];
+        }
+
+        barrier(CLK_LOCAL_MEM_FENCE);
+        s = h;
+    }
+
+    // avoid the race you already found
+    float4 out = buf[0];
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    return out;
+}
+
+
+__kernel
+__attribute__((reqd_work_group_size(WG,1,1)))
+void relax_purify_batched(
+    __global float*       D,          // IN/OUT
+    __global const float* H,
+    __global float*       Lambda,     // IN/OUT
+    __global const float* nocc,
+    const float alpha,
+    const float beta,
+    const int   two_step              // 0 or 1
+){
+    const int sys = get_group_id(0);
+    const int lid = get_local_id(0);
+
+    const int tx = lid % TX;
+    const int ty = lid / TX;
+
+    const int r0 = ty * RTY;
+    const int c0 = tx * RTX;
+
+    const int NN = N*N;
+
+    __global float*       Dg = D      + sys*NN;
+    __global const float* Hg = H      + sys*NN;
+    __global float*       Lg = Lambda + sys*NN;
+
+    // symmetric K-slab, NOT whole matrix
+    __local float Ls[TK*LN];
+
+    // scalar-reduction scratch
+    __local float4 red[WG];
+
+    __local float l_a;
+    __local float l_b;
+    __local float l_cD;
+    __local float l_trX;
+    __local int   l_expand1;
+
+
+    // ------------------------------------------------------------
+    // 0. Cheap O(N²) projection:
+    //
+    // F0 = H - Lambda
+    //
+    // choose a,b minimizing
+    // || F0 - a I - b D ||²
+    //
+    // reductions:
+    //   s1 = Tr(D)
+    //   s2 = <D,D>
+    //   h0 = Tr(F0)
+    //   h1 = <D,F0>
+    // ------------------------------------------------------------
+
+    float trD = 0.0f;
+    float dd  = 0.0f;
+    float trF = 0.0f;
+    float dF  = 0.0f;
+
+    for(int idx=lid; idx<NN; idx+=WG){
+
+        int i = idx / N;
+        int j = idx - i*N;
+
+        float d  = Dg[idx];
+        float f0 = Hg[idx] - Lg[idx];
+
+        dd = fma(d,d,dd);
+        dF = fma(d,f0,dF);
+
+        if(i==j){
+            trD += d;
+            trF += f0;
+        }
+    }
+
+    float4 rr = reduce4(
+        red,
+        (float4)(trD,dd,trF,dF),
+        lid
+    );
+
+    if(lid==0){
+
+        const float s1 = rr.x;
+        const float s2 = rr.y;
+        const float h0 = rr.z;
+        const float h1 = rr.w;
+
+        const float det = (float)N*s2 - s1*s1;
+
+        // [N   s1][a] = [h0]
+        // [s1  s2][b]   [h1]
+
+        const float invdet = 1.0f / det;
+
+        const float a =
+            (h0*s2 - h1*s1) * invdet;
+
+        const float b =
+            ((float)N*h1 - s1*h0) * invdet;
+
+        l_a  = a;
+        l_b  = b;
+
+        // X = cD*D - alpha*(H-Lambda) + alpha*a*I
+        l_cD = fma(alpha,b,1.0f);
+
+        // actual first-order trace after projected step
+        float trFp =
+            h0
+          - a*(float)N
+          - b*s1;
+
+        l_trX = s1 - alpha*trFp;
+
+        // TC2 ordering:
+        // too many electrons -> contract first
+        l_expand1 = (l_trX <= nocc[sys]);
+    }
+
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+
+    // ============================================================
+    // 1. FIRST SQUARE
+    //
+    // Construct X ON THE FLY while loading the K slabs.
+    //
+    // At completion:
+    //
+    //     registers : T = X²
+    //     global D  : X
+    //
+    // ============================================================
+
+    float4 acc0 = (float4)(0.0f);
+    float4 acc1 = (float4)(0.0f);
+    float4 acc2 = (float4)(0.0f);
+    float4 acc3 = (float4)(0.0f);
+    float4 acc4 = (float4)(0.0f);
+    float4 acc5 = (float4)(0.0f);
+    float4 acc6 = (float4)(0.0f);
+    float4 acc7 = (float4)(0.0f);
+
+    #pragma unroll
+    for(int k0=0; k0<LN; k0+=TK){
+
+        // ---------------------------------------------
+        // Cooperative staging.
+        //
+        // Every real matrix element is transformed
+        // old D -> X exactly once.
+        // ---------------------------------------------
+
+        for(int e=lid; e<TK*LN; e+=WG){
+
+            int m  = e / TK;
+            int kk = e - m*TK;
+
+            int k = k0 + kk;
+
+            float x = 0.0f;
+
+            if(m < N && k < N){
+
+                int idx = m*N + k;
+
+                float d  = Dg[idx];
+                float f0 = Hg[idx] - Lg[idx];
+
+                x = fma(l_cD,d,-alpha*f0);
+
+                if(m==k)
+                    x += alpha*l_a;
+
+                // turn D into X in-place
+                Dg[idx] = x;
+            }
+
+            // transposed staging:
+            // Ls[k][row]
+            Ls[kk*LN + m] = x;
+        }
+
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        // ---------------------------------------------
+        // X² microkernel
+        // ---------------------------------------------
+
+        #pragma unroll
+        for(int kk=0; kk<TK; ++kk){
+
+            float8 av =
+                vload8(0,&Ls[kk*LN + r0]);
+
+            float4 bv =
+                vload4(0,&Ls[kk*LN + c0]);
+
+            acc0 = fma((float4)(av.s0),bv,acc0);
+            acc1 = fma((float4)(av.s1),bv,acc1);
+            acc2 = fma((float4)(av.s2),bv,acc2);
+            acc3 = fma((float4)(av.s3),bv,acc3);
+            acc4 = fma((float4)(av.s4),bv,acc4);
+            acc5 = fma((float4)(av.s5),bv,acc5);
+            acc6 = fma((float4)(av.s6),bv,acc6);
+            acc7 = fma((float4)(av.s7),bv,acc7);
+        }
+
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    // All writes old-D -> X must now be visible to this WG.
+    barrier(
+        CLK_LOCAL_MEM_FENCE |
+        CLK_GLOBAL_MEM_FENCE
+    );
+
+
+    // ------------------------------------------------------------
+    // 2. Apply first quadratic retraction:
+    //
+    // expand:   Y = 2 X - X²
+    // contract: Y = X²
+    //
+    // simultaneously learn Lambda correction.
+    //
+    // global D becomes Y.
+    // ------------------------------------------------------------
+
+    #define WRITE_ROW(R,ACC)                                      \
+    {                                                             \
+        int i = r0 + (R);                                         \
+        if(i < N){                                                \
+            float4 tv = (ACC);                                    \
+            for(int cc=0; cc<RTX; ++cc){                          \
+                int j = c0 + cc;                                  \
+                if(j < N){                                        \
+                    int idx = i*N+j;                              \
+                    float x = Dg[idx];                             \
+                    float t = tv[cc];                              \
+                    float y = l_expand1 ?                          \
+                        fma(2.0f,x,-t) : t;                        \
+                                                                  \
+                    float dl = beta*(y-x)/alpha;                   \
+                    Lg[idx] += dl;                                 \
+                    Dg[idx]  = y;                                  \
+                }                                                 \
+            }                                                     \
+        }                                                         \
+    }
+
+    WRITE_ROW(0,acc0);
+    WRITE_ROW(1,acc1);
+    WRITE_ROW(2,acc2);
+    WRITE_ROW(3,acc3);
+    WRITE_ROW(4,acc4);
+    WRITE_ROW(5,acc5);
+    WRITE_ROW(6,acc6);
+    WRITE_ROW(7,acc7);
+
+    #undef WRITE_ROW
+
+
+    if(!two_step)
+        return;
+
+
+    // All threads must see complete Y before Y².
+    barrier(
+        CLK_GLOBAL_MEM_FENCE |
+        CLK_LOCAL_MEM_FENCE
+    );
+
+
+    // ============================================================
+    // 3. SECOND SQUARE
+    //
+    // D already IS Y.
+    // Reuse the same 7.7 kB local slab.
+    // ============================================================
+
+    acc0 = (float4)(0.0f);
+    acc1 = (float4)(0.0f);
+    acc2 = (float4)(0.0f);
+    acc3 = (float4)(0.0f);
+    acc4 = (float4)(0.0f);
+    acc5 = (float4)(0.0f);
+    acc6 = (float4)(0.0f);
+    acc7 = (float4)(0.0f);
+
+    #pragma unroll
+    for(int k0=0; k0<LN; k0+=TK){
+
+        for(int e=lid; e<TK*LN; e+=WG){
+
+            int m  = e / TK;
+            int kk = e - m*TK;
+            int k  = k0 + kk;
+
+            float y = 0.0f;
+
+            if(m < N && k < N)
+                y = Dg[m*N+k];
+
+            Ls[kk*LN+m] = y;
+        }
+
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        #pragma unroll
+        for(int kk=0; kk<TK; ++kk){
+
+            float8 av =
+                vload8(0,&Ls[kk*LN+r0]);
+
+            float4 bv =
+                vload4(0,&Ls[kk*LN+c0]);
+
+            acc0 = fma((float4)(av.s0),bv,acc0);
+            acc1 = fma((float4)(av.s1),bv,acc1);
+            acc2 = fma((float4)(av.s2),bv,acc2);
+            acc3 = fma((float4)(av.s3),bv,acc3);
+            acc4 = fma((float4)(av.s4),bv,acc4);
+            acc5 = fma((float4)(av.s5),bv,acc5);
+            acc6 = fma((float4)(av.s6),bv,acc6);
+            acc7 = fma((float4)(av.s7),bv,acc7);
+        }
+
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+
+    // ------------------------------------------------------------
+    // 4. Complementary branch
+    //
+    // first expand  -> second contract
+    // first contract -> second expand
+    //
+    // global D becomes final Z.
+    // ------------------------------------------------------------
+
+    const int expand2 = !l_expand1;
+
+    #define WRITE_FINAL(R,ACC)                                    \
+    {                                                             \
+        int i = r0 + (R);                                         \
+        if(i < N){                                                \
+            float4 tv = (ACC);                                    \
+            for(int cc=0; cc<RTX; ++cc){                          \
+                int j = c0 + cc;                                  \
+                if(j < N){                                        \
+                    int idx = i*N+j;                              \
+                    float y = Dg[idx];                             \
+                    float t = tv[cc];                              \
+                    float z = expand2 ?                            \
+                        fma(2.0f,y,-t) : t;                        \
+                                                                  \
+                    Lg[idx] += beta*(z-y)/alpha;                   \
+                    Dg[idx]  = z;                                  \
+                }                                                 \
+            }                                                     \
+        }                                                         \
+    }
+
+    WRITE_FINAL(0,acc0);
+    WRITE_FINAL(1,acc1);
+    WRITE_FINAL(2,acc2);
+    WRITE_FINAL(3,acc3);
+    WRITE_FINAL(4,acc4);
+    WRITE_FINAL(5,acc5);
+    WRITE_FINAL(6,acc6);
+    WRITE_FINAL(7,acc7);
+
+    #undef WRITE_FINAL
+}
+```
+
+That is essentially the full algorithm.
+
+---
+
+# 7. Notice how few genuinely expensive operations it contains
+
+For the **one-purification-step** variant:
+
+```text
+O(N²):
+    reduction for a,b
+    construct X while loading
+
+O(N³):
+    one symmetric X²
+
+O(N²):
+    TC2 combination
+    Lambda update
+```
+
+There is exactly:
+
+$$
+\boxed{1\ {\rm matrix\ square}}
+$$
+
+and **zero general matrix multiplications**.
+
+For the strong two-step version:
+
+```text
+one symmetric X²
+one symmetric Y²
+```
+
+so:
+
+$$
+\boxed{2\ {\rm matrix\ squares}}
+$$
+
+again with zero generic products.
+
+---
+
+# 8. Why the in-place sequence is safe
+
+This deserves emphasis because initially it looks suspicious.
+
+During the first GEMM we convert
+
+$$
+D_{\rm old}\rightarrow X
+$$
+
+as elements are staged.
+
+This works because calculating an individual \(X_{ij}\) needs only
+
+$$
+D_{ij},\;H_{ij},\;\Lambda_{ij},
+$$
+
+not another element of \(D\).
+
+And each \(D_{ij}\) is staged exactly once.
+
+So there is no situation like
+
+```text
+thread A overwrites D[i,j]
+thread B later needed old D[i,j]
+```
+
+The square uses the staged `Ls`, not global transpose loads.
+
+After the complete \(X^2\) calculation, all reads of old \(D\) are finished permanently.
+
+Then `D` can become \(Y\).
+
+Likewise, after the complete \(Y^2\), all reads of \(Y\) are finished and `D` can become \(Z\).
+
+---
+
+# 9. Why one WG/system is necessary, but one WG/CU is not
+
+These are very different requirements.
+
+We need
+
+```text
+1 WG owns 1 matrix/system
+```
+
+because after
+
+```text
+D = Y
+```
+
+we need a global-memory synchronization before computing \(Y^2\).
+
+OpenCL gives us a barrier only **within a workgroup**.
+
+So if four WGs cooperated on one matrix, we could not safely do
+
+```text
+first square
+global synchronization
+second square
+```
+
+inside one kernel.
+
+But nothing prevents:
+
+```text
+SM:
+    WG system 13
+    WG system 27
+    WG system 94
+    WG system 115
+```
+
+all being resident simultaneously.
+
+And with ~12 kB local/WG, local-memory budget allows roughly four.
+
+That's exactly the occupancy pattern we want.
+
+---
+
+# 10. `TK=22` is still a good choice here
+
+I would actually **not** reduce it automatically to 8×8 local tiles.
+
+Your measured standalone fixed-N result already says `TK=22` is excellent.
+
+The local-memory footprint remains small:
+
+$$
+22\times88\times4=7.6\ {\rm kB}.
+$$
+
+Going to `TK=8` reduces that to
+
+$$
+2.8\ {\rm kB},
+$$
+
+but increases the number of K phases from 4 to 11 and therefore almost triples the staging barriers.
+
+Since 7.6 kB already permits multiple WGs/SM, I would start with:
+
+```text
+TK=22
+```
+
+and only benchmark `TK=8/11/16` if register pressure causes the actual occupancy to differ.
+
+---
+
+# 11. One optimization I'd make immediately: separate fast and strong kernels at compile time
+
+I wouldn't actually pass
+
+```c
+two_step
+```
+
+as runtime state in production.
+
+Compile:
+
+```text
+relax_purify1
+relax_purify2
+```
+
+or use
+
+```c
+#define NPUR 1
+#define NPUR 2
+```
+
+so the compiler completely removes the unused half.
+
+Then your algorithm can select:
+
+```text
+far from convergence:
+    relax_purify1
+
+near convergence / idempotency drifting:
+    relax_purify2
+```
+
+Same source template, two specialized kernels.
+
+---
+
+# 12. We can probably merge the \(a,b\) reduction with useful diagnostics
+
+That initial `float4` is currently:
+
+```text
+Tr(D)
+<D,D>
+Tr(H-Lambda)
+<D,H-Lambda>
+```
+
+We could use `float8` and simultaneously calculate things like
+
+$$
+\|D^2-D\|
+$$
+
+only if a square result exists later, not initially.
+
+But after the square, each thread has
+
+$$
+X^2
+$$
+
+and \(X\), so it can accumulate
+
+$$
+e_{\rm idem}
+=
+\sum_{ij}(X^2_{ij}-X_{ij})^2
+$$
+
+before writing \(Y\).
+
+That is essentially free arithmetic.
+
+Likewise after the final square.
+
+Therefore the kernel can output per system:
+
+```text
+idempotency_before
+idempotency_after
+trace
+||purification correction||
+```
+
+with one merged reduction.
+
+Your previous measurements indicate reductions are not the important cost anyway.
+
+---
+
+# 13. An important numerical refinement
+
+I would **not update \(\Lambda\)** if
+
+$$
+|z-y|
+$$
+
+or
+
+$$
+|y-x|
+$$
+
+is at the FP32 noise floor.
+
+Something like:
+
+```c
+float corr = z-y;
+
+if (fabs(corr) > corr_floor)
+    Lambda[idx] += beta*corr/alpha;
+```
+
+Maybe don't do this per-element with a discontinuous threshold immediately; a better production criterion is per-system:
+
+$$
+\|D'-X\|_F > c\,\epsilon_{\rm fp32}.
+$$
+
+Otherwise stop learning \(\Lambda\).
+
+Because near convergence,
+
+$$
+\frac{\text{roundoff}}{\alpha}
+$$
+
+would contaminate the learned constraint force.
+
+---
+
+## The resulting kernel architecture is actually very compact
+
+Conceptually it is just:
+
+```text
+                 global D(old), H, Lambda
+                           │
+                           │ O(N²) reduction
+                           ▼
+                    determine a,b
+                           │
+                           ▼
+        ┌──── stage small X K-slab ────┐
+        │       and D <- X             │
+        │                              │
+        └──────── X² in regs ──────────┘
+                           │
+                           ▼
+                 D <- q1(X)
+                 Lambda correction
+                           │
+                      WG barrier
+                           │
+             [optional strong cleanup]
+                           │
+                           ▼
+        ┌──── stage small D K-slab ────┐
+        │                              │
+        └──────── D² in regs ──────────┘
+                           │
+                           ▼
+                 D <- q2(D)
+                 Lambda correction
+```
+
+Local storage never exceeds roughly one `TK×88` slab plus reduction scratch.
+
+So I think this gives you what you were asking for: **a genuinely single OpenCL kernel implementing approximate tangential energy descent + one/two constraint-restoration steps, while preserving the high-occupancy small-local-memory philosophy of the existing tuned GEMM.**
+
+
+
+---
+
+# USER
+
+we tested it and it does not seem to work at all.Plese figure out if the problem is conceptual, or my coding agent just does not understand the pricniple and implemented somehting stupid with wrong assumtions. 
+
+---
+
+# Chat GPT 5.6 sol
+
+I think the coding agent has mostly understood and implemented the proposed scheme correctly. **The major failure is conceptual: the learned matrix \(\Lambda\) was a bad idea in the form I proposed it.** Your agent has actually diagnosed the core problem rather well. The fact that the cold calculation converges to the correct variational minimum while warm starts converge to clean, idempotent, wrong projectors is almost a fingerprint of this failure mode. 
+
+## 1. The fatal problem with learned \(\Lambda\)
+
+Let \(P\) be an exact projector and \(Q=I-P\). Any symmetric matrix \(A\) decomposes into
+
+$$
+A=T_P(A)+N_P(A),
+$$
+
+where the tangent part is
+
+$$
+T_P(A)=PAQ+QAP
+      =PA+AP-2PAP
+$$
+
+and the normal part is
+
+$$
+N_P(A)=PAP+QAQ.
+$$
+
+For a proper polynomial retraction \(R\), including your complementary two-square SP2 map, locally
+
+$$
+R(P+\epsilon A)
+=
+P+\epsilon T_P(A)+O(\epsilon^2).
+$$
+
+Your algorithm sets
+
+$$
+F=H-\Lambda-\text{gauge},
+\qquad
+X=P-\alpha F,
+\qquad
+P'=R(X).
+$$
+
+Therefore
+
+$$
+P'
+=
+P-\alpha T_P(F)+O(\alpha^2),
+$$
+
+while the part removed by purification is
+
+$$
+P'-X
+=
+\alpha N_P(F)+O(\alpha^2).
+$$
+
+The proposed learning rule was
+
+$$
+\Lambda'=
+\Lambda+\beta\frac{P'-X}{\alpha}.
+$$
+
+Thus, to first order,
+
+$$
+\boxed{
+\Lambda'=\Lambda+\beta N_P(H-\Lambda)
+}
+$$
+
+and therefore
+
+$$
+\boxed{
+T_P(\Lambda')=T_P(\Lambda).
+}
+$$
+
+That is the bug in the *mathematics*.
+
+**The learning channel is completely blind to tangent contamination already present in \(\Lambda\).**
+
+Your notes identify exactly this problem: deposits are normal in the frame where they are generated, but as \(D\) rotates those old deposits acquire a tangent component; nothing in the update removes it. 
+
+I missed this in the earlier proposal.
+
+---
+
+# 2. There is an even stronger proof: every projector can become an exact fixed point
+
+This makes the problem unambiguously fatal for a standalone solver.
+
+Take **any** clean rank-\(N_{\rm occ}\) projector \(P_*\), even a completely wrong one.
+
+Choose
+
+$$
+\Lambda_*
+=
+H-aI-bP_*.
+$$
+
+Then
+
+$$
+F_0=H-\Lambda_*
+=aI+bP_*.
+$$
+
+Your \(\{I,D\}\) removal finds exactly those \(a,b\), so
+
+$$
+F=0.
+$$
+
+Therefore
+
+$$
+X=P_*.
+$$
+
+And because it is already a projector,
+
+$$
+q_+(P_*)=P_*,
+\qquad
+q_-(P_*)=P_*.
+$$
+
+Consequently
+
+$$
+D'=P_*,
+\qquad
+D'-X=0,
+\qquad
+\Lambda'=\Lambda_*.
+$$
+
+So
+
+$$
+\boxed{\text{every rank-}N_{\rm occ}\text{ projector can be a fixed point}}
+$$
+
+regardless of whether
+
+$$
+[P_*,H]=0,
+$$
+
+and regardless of its energy.
+
+Your notes derive the same degeneracy explicitly. 
+
+That is not an implementation detail.
+
+It means the iteration is solving
+
+$$
+T_D(H-\Lambda)=0
+$$
+
+rather than the physical condition
+
+$$
+\boxed{T_D(H)=0.}
+$$
+
+---
+
+# 3. This explains the bizarre warm-start behavior perfectly
+
+Suppose
+
+$$
+P_0
+$$
+
+is the converged ground-state projector of \(H_0\), so
+
+$$
+[P_0,H_0]=0.
+$$
+
+Then initialize, as I suggested,
+
+$$
+\Lambda_0=H_0.
+$$
+
+For
+
+$$
+H_1=H_0+\Delta H,
+$$
+
+the first force is
+
+$$
+F_0=\Delta H.
+$$
+
+That initially looks excellent. Its off-diagonal part indeed contains the perturbation which should rotate the occupied space.
+
+But then \(P\) starts rotating.
+
+While \(H_0\) was normal/block-diagonal in the frame of \(P_0\), it is **not** normal in the frame of the rotated \(P_1\).
+
+It develops a tangent component
+
+$$
+T_{P_1}(H_0)\ne0.
+$$
+
+But \(\Lambda=H_0\) still contains it.
+
+Therefore the physical force becomes
+
+$$
+T_P(H_1-\Lambda)
+\approx
+T_P(H_1-H_0)
+=
+T_P(\Delta H),
+$$
+
+rather than
+
+$$
+T_P(H_1).
+$$
+
+So the iteration tends toward an invariant subspace of \(\Delta H\), exactly as your agent observed numerically.
+
+The measured warm run where canonicalization makes \(\Lambda\approx H_1\) and the dynamics drift catastrophically is therefore not mysterious at all. 
+
+The agent's explanation:
+
+> "`ΔH` forever"
+
+is essentially correct.
+
+---
+
+# 4. The canonicalization kernel cannot repair this
+
+`relax_canon_batched` adds
+
+$$
+aI+bD
+$$
+
+to \(\Lambda\).
+
+But those matrices commute with \(D\), so they are purely normal:
+
+$$
+T_D(aI+bD)=0.
+$$
+
+Therefore this operation can change the **gauge** of \(\Lambda\), but it cannot remove the problematic quantity
+
+$$
+T_D(\Lambda).
+$$
+
+So canonicalization cannot cure the fundamental issue.
+
+Likewise, simple decay
+
+$$
+\Lambda\leftarrow(1-\gamma)\Lambda
+$$
+
+doesn't distinguish:
+
+* useful normal \(\Lambda\),
+* harmful tangent \(\Lambda\).
+
+It destroys both. The residual floor your agent observed with decay is therefore unsurprising. 
+
+---
+
+# 5. Could we salvage \(\Lambda\) by projecting it?
+
+Yes, mathematically:
+
+$$
+\Lambda\leftarrow N_D(\Lambda)
+$$
+
+each iteration.
+
+Equivalently remove
+
+$$
+T_D(\Lambda)
+=
+D\Lambda+\Lambda D-2D\Lambda D.
+$$
+
+Then by construction
+
+$$
+T_D(\Lambda)=0
+$$
+
+and hence
+
+$$
+T_D(H-\Lambda)=T_D(H).
+$$
+
+That would make the method correct.
+
+Unfortunately this requires precisely the operations we were trying to avoid:
+
+$$
+D\Lambda
+$$
+
+and
+
+$$
+D\Lambda D.
+$$
+
+That's **two general matrix products**, not symmetric squares.
+
+And I don't see a square-only shortcut. The information you need is specifically the *relative orientation* of \(D\) and \(\Lambda\); \(D^2\) and \(\Lambda^2\) cannot tell you their cross block \(D\Lambda Q\).
+
+So I would **not salvage learned \(\Lambda\)**. It defeats the computational motivation.
+
+---
+
+# 6. Fortunately, we don't actually need \(\Lambda\)
+
+This is the most important practical conclusion.
+
+Keep the good part:
+
+$$
+\boxed{
+F=H-aI-bD
+}
+$$
+
+but make it **stateless**.
+
+Recompute \(a,b\) from the current \(D,H\) every iteration.
+
+Then
+
+$$
+X=D-\alpha(H-aI-bD)
+$$
+
+and retract:
+
+$$
+D'=R(X).
+$$
+
+For an exact projector,
+
+$$
+T_D(aI+bD)=0,
+$$
+
+so
+
+$$
+T_D(H-aI-bD)=T_D(H).
+$$
+
+Thus
+
+$$
+\boxed{
+D'
+=
+D-\alpha T_D(H)+O(\alpha^2).
+}
+$$
+
+This is exactly the correct constrained gradient descent to first order.
+
+And it still uses:
+
+* zero general GEMMs;
+* O(\(N^2\)) reduction for \(a,b\);
+* one or two of your optimized symmetric squares.
+
+This was actually the essential useful idea. **The persistent learned matrix was unnecessary and poisonous.**
+
+---
+
+# 7. The \(aI+bD\) subtraction is still valuable for FP32
+
+This part I would retain.
+
+For an exact rank-\(m\) projector, minimizing
+
+$$
+\|H-aI-bD\|_F
+$$
+
+over \(a,b\) gives approximately
+
+$$
+a = \bar\epsilon_{\rm virt},
+$$
+
+$$
+a+b = \bar\epsilon_{\rm occ}.
+$$
+
+So rather than stepping with the full \(H\), you're stepping with something whose normal blocks are approximately
+
+$$
+H_{vv}-\bar\epsilon_v I
+$$
+
+and
+
+$$
+H_{oo}-\bar\epsilon_o I.
+$$
+
+The large absolute energy offset and much of the occupied/virtual block average have disappeared.
+
+That directly addresses your original FP32 concern without introducing state.
+
+This is a much cleaner interpretation:
+
+> \(aI+bD\) is a **fresh, cheap approximate normal-force removal**, not a learned Lagrange multiplier.
+
+---
+
+# 8. Why the agent's `β=0 cold fails` does NOT disprove this
+
+This is quite important.
+
+The mathematical argument
+
+$$
+R(D-\alpha H)
+=
+D-\alpha T_D(H)+O(\alpha^2)
+$$
+
+assumes \(D\) is already near the projector manifold.
+
+Your cold Palser density is not necessarily close enough.
+
+So the fact that the no-\(\Lambda\) cold calculation fails says almost nothing about the use case we actually care about:
+
+> **warm relaxation from a previously converged projector.**
+
+We already have an excellent cold solver: TC2 purification from \(H\). Its test explicitly verifies that the returned density reaches the variational minimum, not merely idempotency. 
+
+Therefore I wouldn't force one algorithm to do both jobs.
+
+Use:
+
+```text
+first electronic solve / genuinely cold:
+    ordinary TC2 / Jacobi
+```
+
+then:
+
+```text
+warm SCC iterations / nearby geometry:
+    stateless energy descent + polynomial retraction
+```
+
+That's likely the sensible architecture.
+
+---
+
+# 9. There ARE two important coding/testing mistakes
+
+They aren't responsible for the fundamental failure, but I would fix them immediately.
+
+### A. `done` does not test physical stationarity
+
+The fused kernel declares convergence based on essentially
+
+```text
+step small
+purification correction small
+trace correct
+```
+
+but does **not** require
+
+$$
+[H,D]\approx0.
+$$
+
+So once \(\Lambda\) has successfully cancelled the force at a wrong \(D\), the code says “converged.”
+
+That is precisely why you can obtain
+
+```text
+idempotency ≈ 1e-6
+Tr = 43
+comm ≈ 0.31
+```
+
+and still report success. 
+
+For an experimental solver, convergence must ultimately include either
+
+$$
+\|HD-DH\|
+$$
+
+or an equivalent physical gradient criterion.
+
+It doesn't have to be evaluated every iteration; every 4–8 iterations or at apparent convergence would suffice.
+
+### B. The warm unit test calculates failure but doesn't assert it
+
+The test computes
+
+```rust
+bad2 += 1;
+```
+
+for wrong warm densities.
+
+But after the warm test there is no
+
+```rust
+assert_eq!(bad2, 0)
+```
+
+before it proceeds to the polish experiment.
+
+At the end it only does:
+
+```rust
+assert!(diag2.converged)
+```
+
+which is exactly the biased internal convergence criterion.
+
+So currently the test can report a successful warm solver even though its own energy/projector certification says the answer is wrong. 
+
+That should definitely be fixed.
+
+---
+
+# 10. There is one actual inconsistency in the `ldecay` experiment
+
+I noticed this in the kernel.
+
+Pass 0 computes \(a,b\) from
+
+$$
+F_0=H-\Lambda.
+$$
+
+Then during staging you do
+
+```c
+if (ldecay > 0)
+    Lambda *= 1-ldecay;
+```
+
+and only afterward construct \(X\) using the **decayed** \(\Lambda\).
+
+Therefore the \(a,b\) coefficients and trace pin were computed from a different force than the one actually used to construct \(X\).
+
+So with `ldecay>0`:
+
+$$
+\operatorname{Tr}X=N_{\rm occ}
+$$
+
+is no longer actually guaranteed.
+
+That's a real implementation error in that experimental branch.
+
+It doesn't explain the default `ldecay=0` warm failure, but I would not interpret any decay experiments quantitatively until that is fixed.
+
+---
+
+# 11. One more semantic oddity: trace pin + branch selection
+
+You pin
+
+$$
+\operatorname{Tr}X=N_{\rm occ},
+$$
+
+but choose the first TC2 branch from
+
+$$
+\operatorname{Tr}D
+$$
+
+before the step.
+
+Once \(D\) has the correct trace—which is almost always after the pin—
+
+```c
+l_expand1 = (Tr(D) <= Nocc)
+```
+
+will nearly always choose the same ordering:
+
+$$
+q_+\quad\text{then}\quad q_-.
+$$
+
+If the intent is **a complementary polynomial retraction**, that's fine: just make the order explicit and stop calling it a TC2 branch decision.
+
+If the intent is actual trace-correcting TC2 semantics, then it isn't doing that.
+
+I don't think this causes the warm bias, but cleaning up the conceptual semantics will make debugging easier.
+
+---
+
+# 12. The decisive next experiment is now very simple
+
+I would stop changing \(\Lambda\). Remove it completely for one test.
+
+Start from a **correct clean projector** \(D_0\) of \(H_0\).
+
+Perturb:
+
+$$
+H_1=H_0+\delta H.
+$$
+
+Then iterate only:
+
+$$
+F=H_1-aI-bD,
+$$
+
+$$
+X=D-\alpha F,
+$$
+
+$$
+D'=q_-\!\left(q_+(X)\right)
+$$
+
+(or the opposite fixed complementary order).
+
+Absolutely no \(\Lambda\).
+
+Track every iteration:
+
+$$
+E=\operatorname{Tr}(DH),
+$$
+
+$$
+r_H=\|HD-DH\|_F,
+$$
+
+$$
+r_P=\|D^2-D\|_F,
+$$
+
+$$
+\operatorname{Tr}D.
+$$
+
+What I predict is:
+
+```text
+energy      ↓
+commutator  ↓
+idempotency remains controlled
+D → true new projector
+```
+
+If this fails even for small \(\delta H\), **then the retraction/minimization concept itself needs reconsideration**.
+
+If it works—and mathematically I expect it to—then we've isolated the culprit cleanly:
+
+$$
+\boxed{\text{persistent learned }\Lambda\text{ was the mistake}.}
+$$
+
+---
+
+## 13. We can still exploit \(H_{\rm old}\), but only as a one-step predictor
+
+There was a good idea hidden in
+
+$$
+\Lambda_0=H_{\rm old}.
+$$
+
+The first force
+
+$$
+H_{\rm new}-H_{\rm old}
+$$
+
+is indeed a very nice small predictor.
+
+The mistake was **keeping \(H_{\rm old}\) inside a persistent learned multiplier**.
+
+Instead I would test:
+
+```text
+first warm step only:
+    F = H_new - H_old
+    remove aI+bD
+    retract
+
+all following steps:
+    F = H_new
+    remove aI+bD
+    retract
+```
+
+No stateful \(\Lambda\).
+
+That gives the FP32-friendly small first displacement we wanted without the “ΔH forever” pathology.
+
+For an actual SCC loop, it may be even simpler: one such relaxation step, then recompute \(H[D]\). That is much closer to your original insight that **we should jointly relax \(D\) and SCC charge, rather than fully solve an inner fixed-\(H\) problem every time**. Your notes correctly identify that as a separate and potentially more appropriate regime. 
+
+### So my verdict
+
+**The agent did not implement something stupid.** The fused-square kernel appears faithful enough that the cold success is meaningful. The warm failure exposed a real flaw in my learned-\(\Lambda\) proposal.
+
+I would now **delete persistent \(\Lambda\) from the algorithmic core**, retain the stateless \(aI+bD\) gauge removal, and test warm `raw gradient → 2-square retraction` directly. That version has the property we actually need:
+
+$$
+\boxed{\text{its first-order fixed-point condition is }[D,H]=0,}
+$$
+
+instead of
+
+$$
+[D,H-\Lambda]=0.
+$$
+
+That is the conceptual correction I would make before doing any more GPU optimization.
+
+
+---
+
+# USER
+
+OK, so lets step back to the stanrad approach used in literature for Density matrixminimization (resp minimization of Tr(H*D), we should first implement the canonical method and only then try to invent our special speedup and hack for local memory and f32 accuracy. Standard method use the comutator [H,D]? Or what? 
+
+Can we implement the standrd method efficiently on our GPU? minimizing the f32 noise before it emerge?
+
+
+---
+
+# Chat GPT 56. sol
+
+Yes. I would now implement a **boringly canonical reference method first**, with no learned \(\Lambda\), no trace pinning hacks, and initially even no SCC feedback: hold \(H\) fixed and verify that the algorithm finds its lowest-\(N\) projector. Your current experimental code was explicitly trying to replace the eigensolver with a special 1–2-square minimizer, so resetting the mathematical baseline before optimizing it is sensible. 
+
+The important distinction is:
+
+**\([H,D]\) is the canonical stationarity residual, but it is not itself the density-matrix gradient you add to \(D\).** For an idempotent projector, the constrained steepest-descent direction is the **double commutator**. The classical LNV density-matrix-minimization method instead minimizes a McWeeny-transformed cubic functional; at an idempotent \(D\), its gradient reduces exactly to that same double commutator.
+
+## 1. What is the actual mathematical problem?
+
+In an orthogonal basis, at \(T=0\),
+
+$$
+D^2=D,\qquad D^T=D,\qquad \operatorname{Tr}D=N_{\rm occ},
+$$
+
+and we minimize
+
+$$
+E=\operatorname{Tr}(HD).
+$$
+
+The correct solution satisfies
+
+$$
+\boxed{[H,D]=HD-DH=0}.
+$$
+
+Together with idempotency and the correct rank, this means \(D\) projects onto an invariant subspace of \(H\); energy minimization selects the lowest \(N_{\rm occ}\) states. McWeeny already described idempotency plus commutation with the Hamiltonian as the necessary/sufficient SCF conditions. ([APS Journals][1])
+
+But \([H,D]\) is antisymmetric for real symmetric \(H,D\), so you cannot simply do
+
+$$
+D\leftarrow D-\alpha[H,D].
+$$
+
+That would destroy symmetry.
+
+---
+
+# 2. The canonical constrained gradient is the double commutator
+
+On the manifold of rank-\(N\) projectors, the projected gradient is
+
+$$
+G=[D,[D,H]].
+$$
+
+For \(D^2=D\),
+
+$$
+G=DH+HD-2DHD.
+$$
+
+The downhill equation is
+
+$$
+\boxed{
+\dot D=-[D,[D,H]]
+}
+$$
+
+or equivalently
+
+$$
+\boxed{
+\dot D=[D,[H,D]].
+}
+$$
+
+This has the properties we wanted all along:
+
+$$
+\operatorname{Tr}\dot D=0,
+$$
+
+and it is tangent to the projector manifold,
+
+$$
+D\dot D+\dot D D=\dot D.
+$$
+
+Therefore an Euler step damages idempotency only at second order:
+
+$$
+(D+\alpha\dot D)^2-(D+\alpha\dot D)
+=O(\alpha^2).
+$$
+
+So yes: **the commutator is fundamental**, but the actual symmetric gradient is the double commutator.
+
+---
+
+# 3. Classical LNV density-matrix minimization is slightly different
+
+The canonical Li–Nunes–Vanderbilt approach introduces an auxiliary symmetric matrix \(L\) and defines the physical density as the McWeeny polynomial
+
+$$
+D(L)=3L^2-2L^3.
+$$
+
+Then minimize the grand potential
+
+$$
+\boxed{
+\Omega[L]
+=
+\operatorname{Tr}
+\left[
+(3L^2-2L^3)(H-\mu I)
+\right].
+}
+$$
+
+This is the classic 1993 LNV density-matrix-minimization method. Later implementations commonly use conjugate gradients; the literature explicitly distinguishes this direct minimization use of McWeeny purification from FOE purification of a fixed Hamiltonian. ([PubMed][2])
+
+Let
+
+$$
+F=H-\mu I.
+$$
+
+Its exact matrix gradient is
+
+$$
+\boxed{
+\nabla_L\Omega
+=
+3(LF+FL)
+-
+2(L^2F+LFL+FL^2).
+}
+$$
+
+This is the formula standard CG-DMS/LNV implementations minimize. Conjugate-gradient implementations with analytic line minimization were developed precisely as alternatives to diagonalization. ([scuseria.rice.edu][3])
+
+Now the nice connection:
+
+if \(L=P\) is already idempotent,
+
+$$
+P^2=P,
+$$
+
+then
+
+$$
+\nabla\Omega
+=
+PH+HP-2PHP
+=
+[P,[P,H]].
+$$
+
+The chemical-potential term disappears from the tangent gradient.
+
+So:
+
+$$
+\boxed{
+\text{LNV gradient}
+\;\xrightarrow{L^2=L}\;
+\text{double-commutator gradient}.
+}
+$$
+
+That explains why both viewpoints keep reappearing.
+
+---
+
+# 4. Which should we implement first?
+
+I would actually implement **two reference modes**, but in this order:
+
+1. **Exact LNV steepest descent** for fixed \(H\). This is the canonical literature DMM baseline.
+2. **Double-commutator descent** starting from an idempotent warm projector. This is the canonical projector-manifold baseline.
+
+They should converge to the same \(D_{\rm ref}\).
+
+Do **not** initially use CG, DIIS, SCC feedback, learned multipliers, adaptive purification, etc. First establish that the gradient is correct.
+
+Once steepest descent works reliably, replace it by nonlinear CG.
+
+---
+
+# 5. There is a very good FP32 form of the LNV gradient
+
+This is where I think we can already design the implementation intelligently without changing the mathematics.
+
+Do **not** evaluate
+
+$$
+3(LF+FL)-2(L^2F+LFL+FL^2)
+$$
+
+literally near convergence.
+
+That is exactly your FP32 nightmare:
+
+$$
+\text{small gradient}
+=
+\text{several large matrices}
+-
+\text{several large matrices}.
+$$
+
+Instead algebraically rewrite the exact same gradient as
+
+$$
+\boxed{
+\nabla\Omega
+=
+[L,[L,F]]
++
+3\left[
+(L-L^2)F
++
+F(L-L^2)
+\right].
+}
+$$
+
+This identity is exact.
+
+Check it:
+
+$$
+[L,[L,F]]
+=
+L^2F+FL^2-2LFL
+$$
+
+and
+
+$$
+3[(L-L^2)F+F(L-L^2)]
+=
+3LF+3FL-3L^2F-3FL^2.
+$$
+
+Adding gives exactly the LNV gradient.
+
+### Why this is ideal for FP32
+
+Near the answer there are two physically small residuals:
+
+$$
+C=[L,F]
+$$
+
+— failure to commute —
+
+and
+
+$$
+R=L-L^2
+$$
+
+— failure of idempotency.
+
+Then the gradient is built **from those small residuals**, instead of creating large terms and hoping they cancel.
+
+That is exactly the numerical philosophy you asked for:
+
+> minimize the noise **before it emerges**, rather than calculate noisy large quantities and subtract them afterward.
+
+---
+
+# 6. Very concrete GPU evaluation
+
+For each system:
+
+### A. Idempotency residual
+
+Use your optimized symmetric square:
+
+$$
+L_2=L^2.
+$$
+
+Then elementwise
+
+$$
+R=L-L_2.
+$$
+
+Cost:
+
+$$
+\boxed{1\text{ symmetric square}}
+$$
+
+and \(O(n^2)\).
+
+### B. Commutator
+
+Compute only
+
+$$
+A=LF.
+$$
+
+One general GEMM.
+
+Since \(L,F\) are symmetric,
+
+$$
+FL=A^T.
+$$
+
+Therefore construct
+
+$$
+\boxed{
+C=A-A^T.
+}
+$$
+
+No second GEMM.
+
+And importantly, construct it explicitly antisymmetric:
+
+```c
+C[i,j] = A[i,j] - A[j,i];
+C[j,i] = -C[i,j];
+C[i,i] = 0;
+```
+
+So FP32 cannot gradually introduce a spurious symmetric part.
+
+### C. Double commutator
+
+Compute
+
+$$
+B=LC.
+$$
+
+One general GEMM.
+
+Because \(L^T=L\) and \(C^T=-C\),
+
+$$
+(LC)^T=-CL.
+$$
+
+Therefore
+
+$$
+\boxed{
+[L,C]=LC-CL=B+B^T.
+}
+$$
+
+Again no second product.
+
+Construct it explicitly symmetric:
+
+```c
+Kij = B[i,j] + B[j,i];
+Kji = Kij;
+```
+
+### D. Non-idempotency correction
+
+Compute
+
+$$
+M=RF.
+$$
+
+One general GEMM.
+
+Since \(R,F\) are symmetric,
+
+$$
+FR=M^T.
+$$
+
+Therefore
+
+$$
+3(RF+FR)
+=
+3(M+M^T).
+$$
+
+Finally,
+
+$$
+\boxed{
+G=(B+B^T)+3(M+M^T).
+}
+$$
+
+So exact canonical LNV gradient costs
+
+$$
+\boxed{
+1\ {\rm symmetric\ square}
++
+3\ {\rm general\ GEMMs}.
+}
+$$
+
+No approximation.
+
+---
+
+# 7. This form should be substantially quieter in FP32 than the textbook formula
+
+Compare the naive evaluation near convergence:
+
+```text
+A = L F               ~ O(H)
+B = L² F              ~ O(H)
+C = L F L             ~ O(H)
+
+G = 3(A+Aᵀ)-2(B+Bᵀ+C)
+```
+
+You are subtracting quantities of ordinary electronic-energy magnitude.
+
+Instead:
+
+```text
+Ccomm = [L,F]          small
+Ridem = L-L²           small
+
+B = L*Ccomm            small
+M = Ridem*F            small
+
+G = B+Bᵀ + 3(M+Mᵀ)    small
+```
+
+There is still **one unavoidable cancellation**
+
+$$
+C=A-A^T,
+$$
+
+because physically the commutator itself is a small difference.
+
+But after that, everything operates on the small residual.
+
+This is much better than having three separate \(O(H)\) cancellations.
+
+---
+
+# 8. Shift and scale \(H\) before doing anything
+
+I think this is essential for FP32.
+
+Set
+
+$$
+F=
+\frac{H-\mu I}{\Delta},
+$$
+
+where \(\Delta\) is roughly the spectral width.
+
+Positive scaling does not change the minimizer, and \(\mu\) should lie in the HOMO-LUMO gap for the desired occupation.
+
+Then eigenvalues of \(F\) are roughly \(O(1)\), ideally something like
+
+$$
+[-0.5,+0.5]
+$$
+
+or
+
+$$
+[-1,+1].
+$$
+
+Advantages:
+
+* GEMM operands stay around unity;
+* gradient magnitudes have predictable scale;
+* step size becomes dimensionless;
+* absolute orbital-energy offsets don't contaminate FP32;
+* the commutator is completely invariant to the identity shift anyway:
+
+$$
+[H-\mu I,D]=[H,D].
+$$
+
+For the first reference test I would **cheat deliberately** and obtain \(\mu\) from the CPU/Jacobi reference:
+
+$$
+\mu=\frac{\epsilon_{\rm HOMO}+\epsilon_{\rm LUMO}}2.
+$$
+
+We are testing DMM correctness, not chemical-potential estimation.
+
+Only after it works should we replace that with the practical estimator.
+
+---
+
+# 9. Use an orthogonal basis first
+
+This is also important.
+
+A nonorthogonal LNV formulation exists; Nunes and Vanderbilt explicitly generalized it so only \(S\), not \(S^{-1}\), appears in the functional. ([APS Journals][4])
+
+But CG-DMS implementations commonly transform Fock and density matrices to an orthonormal representation, and Challacombe's later work reported the nonorthogonal minimization as uncompetitive with minimization in the orthogonal representation. ([SciSpace][5])
+
+For us that also improves numerical cleanliness enormously.
+
+So initially:
+
+$$
+\tilde H=X^THX,\qquad X^TSX=I,
+$$
+
+do the entire DMM in the orthogonal basis, and only transform the final density back.
+
+Do **not** mix the \(S\)-metric into the first debugging exercise.
+
+---
+
+# 10. Canonical update: start with steepest descent
+
+After computing
+
+$$
+G=\nabla_L\Omega,
+$$
+
+just do
+
+$$
+L_{k+1}=L_k-\alpha G.
+$$
+
+Because we've scaled \(F\) to order unity, start conservatively, e.g.
+
+$$
+\alpha\sim0.1-0.25.
+$$
+
+For a scalar eigenvalue \(l\), the LNV gradient is
+
+$$
+\frac{d\Omega}{dl}
+=
+6 f\,l(1-l).
+$$
+
+Near \(l=0\) or \(1\), stability is controlled by approximately \(6\alpha|f|\). So if
+
+$$
+|f|\lesssim1,
+$$
+
+then
+
+$$
+\alpha<\frac13
+$$
+
+is a sensible conservative range.
+
+I would initially use a fixed value like
+
+$$
+\boxed{\alpha=0.2}.
+$$
+
+No line search.
+
+No momentum.
+
+No conjugate gradient.
+
+If that cannot converge for a fixed random symmetric \(H\), something is wrong with the implementation.
+
+---
+
+# 11. Then add the actual standard acceleration: nonlinear CG
+
+Once steepest descent is verified, use Polak–Ribière:
+
+$$
+P_k=-G_k+\beta_kP_{k-1},
+$$
+
+with
+
+$$
+\beta_k=
+\max\left(
+0,
+\frac{\langle G_k,G_k-G_{k-1}\rangle}
+     {\langle G_{k-1},G_{k-1}\rangle}
+\right).
+$$
+
+Historical CG-DMS implementations use nonlinear conjugate gradient and exploit the fact that the LNV functional along a line is cubic, so an analytic line minimum reduces to solving a quadratic. ([sma.epfl.ch][6])
+
+But that's **phase two**.
+
+I'd first establish correct SD behavior.
+
+---
+
+# 12. Scalars can cheaply be more accurate than matrices
+
+You are absolutely right that full FP64 matrix algebra is unacceptable on a 3090.
+
+But that does **not** imply every scalar reduction must be FP32.
+
+The \(O(n^3)\) work remains FP32.
+
+For quantities such as
+
+$$
+\operatorname{Tr}D,
+\quad
+E,
+\quad
+\|G\|^2,
+\quad
+\langle G_k,G_{k-1}\rangle,
+$$
+
+there are only \(O(n^2)\) terms.
+
+Three sensible possibilities are:
+
+1. FP32 pairwise tree reduction;
+2. compensated FP32 (`float2`: sum + correction);
+3. FP64 only in the final reduction.
+
+Even on an RTX 3090, the third is likely negligible next to three \(86^3\) GEMMs because you're doing thousands rather than millions of FP64 operations.
+
+So I'd happily use:
+
+```text
+matrix products     FP32
+matrix storage      FP32
+elementwise update  FP32
+scalar diagnostics  compensated FP32 or FP64
+```
+
+That is a very different proposition from FP64 GEMM.
+
+---
+
+# 13. The commutator implementation itself can be made exceptionally clean
+
+This is worth emphasizing.
+
+Never calculate separately
+
+$$
+HD
+$$
+
+and
+
+$$
+DH.
+$$
+
+For symmetric \(H,D\), compute only
+
+$$
+A=HD.
+$$
+
+Then
+
+$$
+DH=A^T.
+$$
+
+Thus
+
+$$
+[H,D]=A-A^T.
+$$
+
+This gives three advantages:
+
+* one GEMM instead of two;
+* both terms originate from exactly the same GEMM implementation;
+* you can enforce perfect antisymmetry.
+
+Likewise, to make the double commutator:
+
+$$
+C=[H,D],
+$$
+
+compute
+
+$$
+B=DC
+$$
+
+once.
+
+Then
+
+$$
+CD=-B^T,
+$$
+
+so
+
+$$
+[D,C]=B+B^T.
+$$
+
+Thus the canonical projector gradient needs just
+
+$$
+\boxed{2\ {\rm general\ GEMMs}}
+$$
+
+rather than four.
+
+And numerically its entire implementation is:
+
+```text
+A = H D
+C = A - Aᵀ            # exact antisymmetry
+
+B = D C
+G = B + Bᵀ            # exact symmetry
+```
+
+This is probably the **cleanest possible FP32 implementation of the tangent gradient**.
+
+---
+
+# 14. This gives us an excellent cross-check against LNV
+
+Take exactly idempotent \(D\).
+
+Compute independently:
+
+### Method A — LNV gradient
+
+$$
+G_{\rm LNV}
+=
+3(DH+HD)
+-
+2(D^2H+DHD+HD^2).
+$$
+
+### Method B — commutator route
+
+$$
+C=DH-HD,
+$$
+
+$$
+G_{\rm comm}=[D,C].
+$$
+
+Since \(D^2=D\),
+
+$$
+\boxed{
+G_{\rm LNV}=G_{\rm comm}.
+}
+$$
+
+That is a fantastic unit test.
+
+Generate random symmetric \(H\), make an exact rank-43 projector \(D=VV^T\), and compare both in CPU f64 and GPU f32.
+
+That should catch sign/transposition/layout bugs immediately.
+
+---
+
+## 15. The baseline test sequence I would give the coding agent
+
+I would now stop modifying the existing `relax_step_batched` and create a **separate clean reference implementation**.
+
+1. Fixed random symmetric \(H\), \(n=86\), \(N_{\rm occ}=43\). CPU eigensolver supplies exact \(D_{\rm ref}\), \(\mu\), spectral width.
+2. Orthogonal basis only.
+3. Implement **`lndv_grad_batched`** using the exact residual-based identity
+
+$$
+G=[L,[L,F]]
++3[(L-L^2)F+F(L-L^2)].
+$$
+
+4. Validate every intermediate against CPU f64:
+
+   * \(L^2\),
+   * \(C=[L,F]\),
+   * \(R=L-L^2\),
+   * double-commutator term,
+   * idempotency term,
+   * full gradient.
+5. Fixed-step steepest descent, say \(\alpha=0.2\) after scaling \(F\).
+6. Certify every few iterations with
+
+$$
+\Delta E,\quad
+\|D-D_{\rm ref}\|,\quad
+\|D^2-D\|,\quad
+\|[H,D]\|.
+$$
+
+7. Separately implement the simpler projector-gradient reference
+
+$$
+A=HD,\quad
+C=A-A^T,\quad
+B=DC,\quad
+G=B+B^T.
+$$
+
+8. Starting from an exact projector, verify LNV and double-commutator gradients agree to FP32 tolerance.
+9. Only after both work: nonlinear CG / analytic line search.
+10. Only after **that**: SCC \(H[D]\), warm starts, kernel fusion, square-specialization tricks.
+
+The literature's standard LNV method is variational and was specifically designed to impose the idempotency constraint during density-matrix minimization; later work found purification and minimization complementary and developed hybrids, so after the canonical baseline works we can safely revisit your extremely fast square primitive. ([ScienceDirect][7])
+
+The part I am most optimistic about for FP32 is the exact identity
+
+$$
+\boxed{
+\nabla\Omega
+=
+[L,[L,F]]
++
+3[(L-L^2)F+F(L-L^2)].
+}
+$$
+
+It is **not a new algorithm or approximation**. It is simply the textbook LNV gradient rearranged so that the GPU works on the two quantities that should physically go to zero—commutation error and idempotency error—rather than manufacturing them by cancellation of several large \(O(H)\) matrices. That is where I would start.
+
+[1]: https://journals.aps.org/pr/abstract/10.1103/PhysRev.126.1028?utm_source=chatgpt.com "Perturbation Theory for the Fock-Dirac Density Matrix | Phys. Rev."
+[2]: https://pubmed.ncbi.nlm.nih.gov/10005210/?utm_source=chatgpt.com "Density-matrix electronic-structure method with linear system-size scaling."
+[3]: https://scuseria.rice.edu/list.html?utm_source=chatgpt.com "List of Publications"
+[4]: https://journals.aps.org/prb/abstract/10.1103/PhysRevB.50.17611?utm_source=chatgpt.com "Generalization of the density-matrix method to a nonorthogonal basis | Phys. Rev. B"
+[5]: https://scispace.com/topics/state-transition-matrix-4n4n3ris/1997?utm_source=chatgpt.com "Top 59 papers published in the topic of State-transition matrix in 1997"
+[6]: https://sma.epfl.ch/~anchpcommon/students/bolliger.pdf?utm_source=chatgpt.com "mcweeny.tex"
+[7]: https://www.sciencedirect.com/science/article/abs/pii/S0010465599002210?utm_source=chatgpt.com "Density matrices in O(N) electronic structure calculations: theory and applications - ScienceDirect"

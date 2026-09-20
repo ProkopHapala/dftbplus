@@ -53,6 +53,11 @@
 #endif
 #define PURIFY_WM (PURIFY_TY * PURIFY_RTY)
 #define PURIFY_WN (PURIFY_TX * PURIFY_RTX)
+// relax_step_batched: retraction count — 1 = loose mode (single
+// quadratic map per step), 2 = proper retraction pair q∓∘q±.
+#ifndef PURIFY_NPUR
+#define PURIFY_NPUR 2
+#endif
 
 // Fold-then-halve workgroup reduce — correct for arbitrary (non-PoT) lsz.
 // For odd s the fold MUST use h = ceil(s/2): pairs (i, i+h) for i < s−h
@@ -538,6 +543,419 @@ __kernel void mcweeny_combine_batched(
     }
 }
 
+// float4 workgroup reduce — same fold-then-halve semantics as
+// pur_reduce (ceil-half fold, correct for non-PoT lsz, trailing
+// barrier before return).
+static inline float4 pur_reduce4(__local float4* red, float4 v, const int lid, const int lsz) {
+    red[lid] = v;
+    barrier(CLK_LOCAL_MEM_FENCE);
+    for (int s = lsz; s > 1; s = (s + 1) >> 1) {
+        const int h = (s + 1) >> 1;
+        if (lid < s - h) red[lid] += red[lid + h];
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    const float4 out = red[0];
+    barrier(CLK_LOCAL_MEM_FENCE);
+    return out;
+}
+
+// ------------------------------------------------------------------
+// relax_step_batched — fused energy-descent + constraint retraction:
+// purification is NOT the solver here, it is the retraction of a
+// density-matrix energy minimizer min_D Tr(D·H) (design: chat doc §17,
+// "learned constraint force" scheme). One step:
+//
+//   F0 = H − Λ                    Λ = learned constraint force (≈N, the
+//                                 part of H forbidden by the projector
+//                                 constraint; → H at the fixed point)
+//   F  = F0 − a·I − b·D           b = LS removal of the D-mode
+//                                 (⟨D,F⟩ = 0); a is NOT the LS value —
+//                                 it pins Tr(X) = nocc exactly, i.e.
+//                                 the I-component is the particle-number
+//                                 feedback channel (chemical potential).
+//                                 This prevents the wrong-rank clean-
+//                                 projector fixed point of the bare
+//                                 scheme: a stalled Tr error keeps
+//                                 injecting a global shift every step.
+//   X  = D − αF = cD·D − α(H−Λ) + αa·I     (cD = 1+αb, α = η/Δε)
+//   D' = q∓(q±(X))                1 (PURIFY_NPUR=1) or 2 (NPUR=2)
+//                                 symmetric-square retractions
+//   Λ += β(D'−X)/α                constraint force learned from what
+//                                 the retraction had to remove (fused
+//                                 elementwise into the write passes).
+//                                 Gauge canonicalization (Λ += aI+bD ⇒
+//                                 Λ ≈ H) is done ONCE per warm solve by
+//                                 relax_canon_batched — per-step folding
+//                                 degenerates the {I,D} solve and lands
+//                                 on excited projectors (measured).
+//
+// Retraction pair (TC2 quadratic maps): q₋(X)=X², q₊(X)=2X−X². The
+// composed pair has R'(0)=R'(1)=0 — a proper retraction killing the
+// first-order normal error of the raw step. Branch of the FIRST map is
+// the TC2 trace steer: Tr(X) ≤ nocc → expand first (q₊), else contract
+// (q₋); the second map (NPUR=2) is always the complement.
+//
+// In-place layout (no ping-pong, no second n² scratch):
+//   * X is constructed ON THE FLY while staging each K-slab of the
+//     first symmetric square — every real element of D is staged
+//     exactly once, so overwriting D←X during staging is race-free and
+//     the square needs only the local slab.
+//   * write pass applies the quadratic combine to the register acc
+//     (no raw-T global round-trip), updates Λ, leaves D = Y.
+//   * NPUR=2: WG global-fence barrier, then the SAME slab machinery
+//     squares D=Y in place → D = Z.
+// Requires lsz = PURIFY_TX·PURIFY_TY (regtile interior — host-enforced).
+//
+// Diagnostics per launch → diag[4*sys + {0,1,2,3}]:
+//   step = ‖X−D‖_F = α·‖F_proj‖    residual force → 0 at the fixed pt
+//   corr = retraction work         (NPUR1: ‖Y−X‖; NPUR2: √(‖Y−X‖²+‖Z−Y‖²))
+//   tr   = Tr(D')
+//   er   = ‖M²−M‖ of the last pre-combination square (idem defect of
+//          the intermediate — the post-combination D' is O(·²) better)
+// done[sys]: in/out freeze flag — set when step,corr < tol and trace
+// ok; a done WG early-returns (in-place D needs no mirror). Unlike the
+// TC2 fixed point this map's fixed point is *attracting* (F→0), so
+// freeze is an optimization, not a stability requirement.
+// ------------------------------------------------------------------
+// ------------------------------------------------------------------
+// relax_canon_batched — canonicalize the learned constraint force once
+// at a warm-solve boundary. At a converged fixed point
+//     Λ = H − aI − bD  (gauge freedom: any aI+bD shift is invisible
+// to the dynamics). Carried into the next solve, the b·D_old term is a
+// FIXED matrix that becomes tangent as D rotates toward the new
+// solution — it biases the fixed point (measured: comm ≈ b·‖ΔD‖).
+// Folding the {I,D}-components of F0 back into Λ removes that gauge:
+//     Λ += a_ls·I + b_ls·D   ⇒   F0' = H−Λ = F (the projected residual)
+// so the next solve starts from F0 ≈ ΔH with Λ ≈ H and no stale
+// tangent content. One launch per solve, never inside the loop.
+// ------------------------------------------------------------------
+__kernel void relax_canon_batched(
+    __global const float* D,      // [batch][n*n]
+    __global const float* H,      // [batch][n*n]
+    __global float*       Lambda, // [batch][n*n] — in/out
+    const int n,
+    const int batch)
+{
+    const int sys = get_group_id(0);
+    if (sys >= batch) return;
+    const int lid = get_local_id(0);
+    const int lsz = get_local_size(0);
+    const int nn = n * n;
+    __global const float* Dg = D      + (size_t)sys * nn;
+    __global const float* Hg = H      + (size_t)sys * nn;
+    __global float*       Lg = Lambda + (size_t)sys * nn;
+    __local float4 red4[PURIFY_WG];
+    __local float l_a, l_b;
+
+    float s1 = 0.0f, s2 = 0.0f, h0 = 0.0f, h1 = 0.0f;
+    for (int idx = lid; idx < nn; idx += lsz) {
+        const int i = idx / n;
+        const float d = Dg[idx];
+        const float f0 = Hg[idx] - Lg[idx];
+        s2 = fma(d, d, s2);
+        h1 = fma(d, f0, h1);
+        if (i == idx - i * n) { s1 += d; h0 += f0; }
+    }
+    {
+        const float4 rr = pur_reduce4(red4, (float4)(s1, s2, h0, h1), lid, lsz);
+        if (lid == 0) {
+            const float det = (float)n * rr.y - rr.x * rr.x;
+            float a = rr.z / (float)n, b = 0.0f;
+            if (fabs(det) > 1.0e-20f) {
+                a = (rr.z * rr.y - rr.w * rr.x) / det;
+                b = ((float)n * rr.w - rr.x * rr.z) / det;
+            }
+            l_a = a; l_b = b;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    for (int idx = lid; idx < nn; idx += lsz) {
+        const int i = idx / n;
+        Lg[idx] += l_b * Dg[idx] + (i == idx - i * n ? l_a : 0.0f);
+    }
+}
+
+__kernel void relax_step_batched(
+    __global float*       D,      // [batch][n*n] — in/out density (ortho basis)
+    __global const float* H,      // [batch][n*n] — H̃ (orthogonal basis)
+    __global float*       Lambda, // [batch][n*n] — in/out learned constraint force
+    __global const float* nocc,   // [batch]      — Tr target
+    __global const float* spans,  // [batch]      — Gershgorin Δε of H
+    __global float*       diag,   // [batch*4]    — {step, corr, tr, er}
+    __global int*         done,   // [batch]      — in/out freeze flags
+    const float           eta,    // α = η/Δε (stability: α·Δε ≲ 2)
+    const float           beta,   // Λ learning rate (~0.3–0.7)
+    const float           tol,    // freeze threshold on step/corr
+    const float           ldecay, // Λ forgetting rate per step (0..1):
+                                  // increments β(Y−X)/α deposit block-
+                                  // diagonal content in the CURRENT D
+                                  // frame — as D rotates, old deposits
+                                  // become stale *tangent* content that
+                                  // no later increment can remove →
+                                  // biased fixed point [D,H−Λ_tan]=0.
+                                  // ldecay>0 lets it wash out. Drive it
+                                  // ∝ residual: 0 near convergence (the
+                                  // true fixed point is unaffected).
+    const int n,
+    const int batch)
+{
+    const int sys = get_group_id(0);
+    if (sys >= batch) return;
+    if (done[sys]) return;
+    const int lid = get_local_id(0);
+    const int lsz = get_local_size(0);
+    const int tx = lid % PURIFY_TX;
+    const int ty = lid / PURIFY_TX;
+    const int nn = n * n;
+    __global float*       Dg = D      + (size_t)sys * nn;
+    __global const float* Hg = H      + (size_t)sys * nn;
+    __global float*       Lg = Lambda + (size_t)sys * nn;
+
+    __local float  As_t[PURIFY_TK * PURIFY_WM];
+    __local float4 red4[PURIFY_WG];
+    __local float  l_a, l_b, l_cD, l_alpha;
+    __local int    l_expand1;
+
+    // ---- pass 0: D-mode removal + trace pin -----------------------
+    // b = LS coefficient killing the D-parallel (scaling) mode of F0
+    //     (⟨D,F⟩ = 0). For an exact rank-m projector det = m(n−m) —
+    //     well conditioned at half filling.
+    // a = NOT the LS coefficient — chosen so the trial lands exactly on
+    //     the particle-number plane:
+    //         Tr(X) = cD·s1 − α·h0 + α·a·n  :=  nocc
+    //     ⇒ a = (nocc − s1 − α·b·s1 + α·h0)/(α·n).
+    //     The residual I-component of F is then the integral feedback
+    //     on Tr(D) — a clean wrong-rank projector (fixed point of both
+    //     quadratic folds with F = 0 under the LS gauge) can no longer
+    //     stall: each step keeps injecting a global shift that the
+    //     expand fold amplifies near the 0.5 boundary until the rank
+    //     is restored.
+    float s1 = 0.0f, s2 = 0.0f, h0 = 0.0f, h1 = 0.0f;
+    for (int idx = lid; idx < nn; idx += lsz) {
+        const int i = idx / n;
+        const float d = Dg[idx];
+        // Λ forgetting must happen HERE, before the a,b/pin reductions:
+        // decaying it later (in the staging loop) would make X use a
+        // different force than the coefficients were computed from and
+        // the Tr(X)=nocc pin would no longer hold (measured bug).
+        // Each element is visited exactly once in this pass → race-free.
+        float lam = Lg[idx];
+        if (ldecay > 0.0f) { lam *= 1.0f - ldecay; Lg[idx] = lam; }
+        const float f0 = Hg[idx] - lam;
+        s2 = fma(d, d, s2);
+        h1 = fma(d, f0, h1);
+        if (i == idx - i * n) { s1 += d; h0 += f0; }
+    }
+    {
+        const float4 rr = pur_reduce4(red4, (float4)(s1, s2, h0, h1), lid, lsz);
+        if (lid == 0) {
+            const float alpha = eta / spans[sys];
+            const float noc = nocc[sys];
+            const float det = (float)n * rr.y - rr.x * rr.x;
+            const float b = (fabs(det) > 1.0e-20f)
+                ? ((float)n * rr.w - rr.x * rr.z) / det
+                : 0.0f;      // degenerate D ∝ I: no D-mode to remove
+            // pin Tr(X) = nocc (exact, by construction of X)
+            const float a = (noc - rr.x - alpha * (b * rr.x - rr.z))
+                            / (alpha * (float)n);
+            l_a = a;
+            l_b = b;
+            l_cD = fma(alpha, b, 1.0f);
+            l_alpha = alpha;
+            // underfilled → expand first (q₊), overfilled → contract
+            l_expand1 = (rr.x <= noc);
+        }
+        // GLOBAL fence: decayed-Λ writes (pass 0, other threads) must be
+        // visible to the staging reads of Lg below.
+        barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
+    }
+    const float alpha = l_alpha;
+
+    // ---- square 1: acc = X²; D converted to X during staging -------
+    float acc[PURIFY_RTY][PURIFY_RTX];
+    for (int i = 0; i < PURIFY_RTY; ++i)
+        for (int j = 0; j < PURIFY_RTX; ++j) acc[i][j] = 0.0f;
+    float step2 = 0.0f;
+    for (int k0 = 0; k0 < n; k0 += PURIFY_TK) {
+        // stage X[0..WM)[k0..k0+TK) transposed; D[m][k] → X[m][k] in
+        // place — each real element is staged exactly once (race-free).
+        for (int e = lid; e < PURIFY_TK * PURIFY_WM; e += lsz) {
+            const int m = e / PURIFY_TK, kk = e - m * PURIFY_TK;
+            const int gk = k0 + kk;
+            float x = 0.0f;
+            if (m < n && gk < n) {
+                const int idx = m * n + gk;
+                const float d = Dg[idx];
+                const float f0 = Hg[idx] - Lg[idx];
+                // NOTE: the aI+bD gauge must NOT be folded into Λ here
+                // — folding it every step degenerates the {I,D} solve
+                // (b→0, the D-rescaling term of X vanishes) and the
+                // dynamics lands on excited eigenprojectors (measured
+                // ΔE ≈ +43 on all 16 test systems). Canonicalization
+                // happens ONCE per solve in relax_canon_batched.
+                x = fma(l_cD, d, -alpha * f0);
+                if (m == gk) x += alpha * l_a;
+                const float dx = x - d;
+                step2 = fma(dx, dx, step2);
+                Dg[idx] = x;
+            }
+            As_t[kk * PURIFY_WM + m] = x;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        const int kend = min(PURIFY_TK, n - k0);
+        for (int kk = 0; kk < kend; ++kk) {
+#if PURIFY_RTY == 8
+            const float8 av = vload8(0, &As_t[kk * PURIFY_WM + ty * PURIFY_RTY]);
+            const float af[PURIFY_RTY] = {av.s0, av.s1, av.s2, av.s3,
+                                          av.s4, av.s5, av.s6, av.s7};
+#elif PURIFY_RTY == 4
+            const float4 av = vload4(0, &As_t[kk * PURIFY_WM + ty * PURIFY_RTY]);
+            const float af[PURIFY_RTY] = {av.s0, av.s1, av.s2, av.s3};
+#else
+            float af[PURIFY_RTY];
+            for (int i = 0; i < PURIFY_RTY; ++i)
+                af[i] = As_t[kk * PURIFY_WM + ty * PURIFY_RTY + i];
+#endif
+#if PURIFY_RTX == 8
+            const float8 bv = vload8(0, &As_t[kk * PURIFY_WM + tx * PURIFY_RTX]);
+            const float bf[PURIFY_RTX] = {bv.s0, bv.s1, bv.s2, bv.s3,
+                                          bv.s4, bv.s5, bv.s6, bv.s7};
+#elif PURIFY_RTX == 4
+            const float4 bv = vload4(0, &As_t[kk * PURIFY_WM + tx * PURIFY_RTX]);
+            const float bf[PURIFY_RTX] = {bv.s0, bv.s1, bv.s2, bv.s3};
+#else
+            float bf[PURIFY_RTX];
+            for (int j = 0; j < PURIFY_RTX; ++j)
+                bf[j] = As_t[kk * PURIFY_WM + tx * PURIFY_RTX + j];
+#endif
+            for (int i = 0; i < PURIFY_RTY; ++i)
+                for (int j = 0; j < PURIFY_RTX; ++j)
+                    acc[i][j] = fma(af[i], bf[j], acc[i][j]);
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+    // all staging writes D→X must be visible to the whole WG before the
+    // write pass reads back its own X elements.
+    barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
+
+    // ---- write pass 1: Y = q±(X), Λ update, diagnostics ------------
+    float er1 = 0.0f, tr1 = 0.0f;
+    for (int i = 0; i < PURIFY_RTY; ++i) {
+        const int gi = ty * PURIFY_RTY + i;
+        if (gi < n) {
+            for (int j = 0; j < PURIFY_RTX; ++j) {
+                const int gj = tx * PURIFY_RTX + j;
+                if (gj < n) {
+                    const int idx = gi * n + gj;
+                    const float x = Dg[idx];
+                    const float t = acc[i][j];
+                    const float y = l_expand1 ? fma(2.0f, x, -t) : t;
+                    const float dd = t - x;
+                    er1 = fma(dd, dd, er1);
+                    Lg[idx] += beta * (y - x) / alpha;
+                    Dg[idx] = y;
+                    if (gi == gj) tr1 += y;
+                }
+            }
+        }
+    }
+    float4 rr = pur_reduce4(red4, (float4)(step2, er1, tr1, 0.0f), lid, lsz);
+    const float stepn = sqrt(rr.x);
+    const float corrn1 = sqrt(rr.y);
+
+#if PURIFY_NPUR == 2
+    // ---- square 2: acc = Y² on D=Y (re-staged) ---------------------
+    barrier(CLK_LOCAL_MEM_FENCE | CLK_GLOBAL_MEM_FENCE);
+    for (int i = 0; i < PURIFY_RTY; ++i)
+        for (int j = 0; j < PURIFY_RTX; ++j) acc[i][j] = 0.0f;
+    for (int k0 = 0; k0 < n; k0 += PURIFY_TK) {
+        for (int e = lid; e < PURIFY_TK * PURIFY_WM; e += lsz) {
+            const int m = e / PURIFY_TK, kk = e - m * PURIFY_TK;
+            const int gk = k0 + kk;
+            As_t[kk * PURIFY_WM + m] = (m < n && gk < n) ? Dg[m * n + gk] : 0.0f;
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+        const int kend = min(PURIFY_TK, n - k0);
+        for (int kk = 0; kk < kend; ++kk) {
+#if PURIFY_RTY == 8
+            const float8 av = vload8(0, &As_t[kk * PURIFY_WM + ty * PURIFY_RTY]);
+            const float af[PURIFY_RTY] = {av.s0, av.s1, av.s2, av.s3,
+                                          av.s4, av.s5, av.s6, av.s7};
+#elif PURIFY_RTY == 4
+            const float4 av = vload4(0, &As_t[kk * PURIFY_WM + ty * PURIFY_RTY]);
+            const float af[PURIFY_RTY] = {av.s0, av.s1, av.s2, av.s3};
+#else
+            float af[PURIFY_RTY];
+            for (int i = 0; i < PURIFY_RTY; ++i)
+                af[i] = As_t[kk * PURIFY_WM + ty * PURIFY_RTY + i];
+#endif
+#if PURIFY_RTX == 8
+            const float8 bv = vload8(0, &As_t[kk * PURIFY_WM + tx * PURIFY_RTX]);
+            const float bf[PURIFY_RTX] = {bv.s0, bv.s1, bv.s2, bv.s3,
+                                          bv.s4, bv.s5, bv.s6, bv.s7};
+#elif PURIFY_RTX == 4
+            const float4 bv = vload4(0, &As_t[kk * PURIFY_WM + tx * PURIFY_RTX]);
+            const float bf[PURIFY_RTX] = {bv.s0, bv.s1, bv.s2, bv.s3};
+#else
+            float bf[PURIFY_RTX];
+            for (int j = 0; j < PURIFY_RTX; ++j)
+                bf[j] = As_t[kk * PURIFY_WM + tx * PURIFY_RTX + j];
+#endif
+            for (int i = 0; i < PURIFY_RTY; ++i)
+                for (int j = 0; j < PURIFY_RTX; ++j)
+                    acc[i][j] = fma(af[i], bf[j], acc[i][j]);
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    // ---- write pass 2: Z = q∓(Y) — the complementary branch --------
+    const int expand2 = !l_expand1;
+    float er2 = 0.0f, tr2 = 0.0f, co2 = 0.0f;
+    for (int i = 0; i < PURIFY_RTY; ++i) {
+        const int gi = ty * PURIFY_RTY + i;
+        if (gi < n) {
+            for (int j = 0; j < PURIFY_RTX; ++j) {
+                const int gj = tx * PURIFY_RTX + j;
+                if (gj < n) {
+                    const int idx = gi * n + gj;
+                    const float y = Dg[idx];
+                    const float t = acc[i][j];
+                    const float z = expand2 ? fma(2.0f, y, -t) : t;
+                    const float dd = t - y;
+                    const float dz = z - y;
+                    er2 = fma(dd, dd, er2);
+                    co2 = fma(dz, dz, co2);
+                    Lg[idx] += beta * dz / alpha;
+                    Dg[idx] = z;
+                    if (gi == gj) tr2 += z;
+                }
+            }
+        }
+    }
+    rr = pur_reduce4(red4, (float4)(co2, er2, tr2, 0.0f), lid, lsz);
+    if (lid == 0) {
+        const float corrn = sqrt(corrn1 * corrn1 + rr.x);
+        const float tr = rr.z;
+        diag[4 * sys + 0] = stepn;
+        diag[4 * sys + 1] = corrn;
+        diag[4 * sys + 2] = tr;
+        diag[4 * sys + 3] = sqrt(rr.y);
+        const float tol_tr = fmax(2e-5f * nocc[sys], 1e-4f);
+        done[sys] = (stepn < tol && corrn < tol && fabs(tr - nocc[sys]) <= tol_tr);
+    }
+#else
+    if (lid == 0) {
+        const float tr = rr.z;
+        diag[4 * sys + 0] = stepn;
+        diag[4 * sys + 1] = corrn1;
+        diag[4 * sys + 2] = tr;
+        diag[4 * sys + 3] = corrn1;   // NPUR=1: corr ≡ ‖X²−X‖
+        const float tol_tr = fmax(2e-5f * nocc[sys], 1e-4f);
+        done[sys] = (stepn < tol && corrn1 < tol && fabs(tr - nocc[sys]) <= tol_tr);
+    }
+#endif
+}
+
 // ------------------------------------------------------------------
 // comm_gate_batched — the R_H stationarity certificate (same quantity
 // as sparse rh_stationarity, orthogonal basis):
@@ -571,4 +989,34 @@ __kernel void comm_gate_batched(
     na = pur_reduce(red, na, lid, lsz);
     nd = pur_reduce(red, nd, lid, lsz);
     if (lid == 0) rh[sys] = sqrt(nd) / (2.0f * sqrt(na) + 1.0e-30f);
+}
+
+// ------------------------------------------------------------------
+// gemm_nn_batched — occasional-use GENERAL product T = A·B (the
+// regtile square interior only computes A·A). Naive row·col dots, one
+// WG per system; launched once per solve to build T = H·D for the
+// comm_gate stationarity certificate — never inside the iteration
+// loop, so no tile machinery is warranted.
+// ------------------------------------------------------------------
+__kernel void gemm_nn_batched(
+    __global const float* A,   // [batch][n*n]
+    __global const float* B,   // [batch][n*n]
+    __global float*       T,   // [batch][n*n] — out
+    const int n,
+    const int batch)
+{
+    const int sys = get_group_id(0);
+    if (sys >= batch) return;
+    const int lid = get_local_id(0);
+    const int lsz = get_local_size(0);
+    __global const float* ag = A + (size_t)sys * n * n;
+    __global const float* bg = B + (size_t)sys * n * n;
+    __global float*       tg = T + (size_t)sys * n * n;
+    for (int idx = lid; idx < n * n; idx += lsz) {
+        const int i = idx / n;
+        const int j = idx - i * n;
+        float s = 0.0f;
+        for (int k = 0; k < n; ++k) s = fma(ag[i * n + k], bg[k * n + j], s);
+        tg[idx] = s;
+    }
 }
