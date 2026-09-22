@@ -26,8 +26,8 @@ use rust_dftb::methods::sparse::gpu_sparse::{
     GpuBsrMatrix, GpuBsrStructure, SparsePurifyWorkspace,
 };
 use rust_dftb::methods::sparse::{
-    build_full_mask, build_geometric_mask, Bsr4Matrix, SparseBsr4Config, SparseBsr4Gpu, SparseDftb,
-    SparseDftbConfig, SparsePerfStats,
+    build_full_mask, build_geometric_mask, Bsr4Matrix, GeomStep, SparseBsr4Config, SparseBsr4Gpu,
+    SparseDftb, SparseDftbConfig, SparsePerfStats,
 };
 use rust_dftb::qmqm::{GpuDftb, GpuDftbEval};
 use rust_dftb::{
@@ -1409,6 +1409,30 @@ fn rhai_sparse_new_budget(
     r_z_ang: f64,
     max_deg: f64,
 ) -> INT {
+    rhai_sparse_new_mask(
+        name,
+        sk_dir,
+        r_trunc_ang,
+        taper_w_ang,
+        r_k_ang,
+        r_z_ang,
+        0.0,
+        max_deg,
+    )
+}
+
+/// `sparse_new_mask(name, sk, r_trunc, taper, r_k, r_z, r_skin, max_deg)`.
+/// `r_skin <= 0` keeps the config default. `max_deg <= 0` keeps the budgets.
+fn rhai_sparse_new_mask(
+    name: &str,
+    sk_dir: &str,
+    r_trunc_ang: f64,
+    taper_w_ang: f64,
+    r_k_ang: f64,
+    r_z_ang: f64,
+    r_skin_ang: f64,
+    max_deg: f64,
+) -> INT {
     let (species, coords) = geom_species_coords(name, "sparse_new");
     let n_atom = species.len();
     eprintln!("[sparse] sparse_new '{name}' n_atom={n_atom} sk={sk_dir} r_trunc={r_trunc_ang} taper_w={taper_w_ang} r_k={r_k_ang} r_z={r_z_ang} max_deg={max_deg}");
@@ -1426,6 +1450,9 @@ fn rhai_sparse_new_budget(
     }
     if r_z_ang > 0.0 {
         cfg.r_z_ang = Some(r_z_ang);
+    }
+    if r_skin_ang > 0.0 {
+        cfg.r_skin_ang = r_skin_ang;
     }
     if max_deg > 0.0 {
         let d = max_deg as u32;
@@ -1725,6 +1752,233 @@ fn rhai_sparse_relax(name: &str, max_steps: INT, f_tol: f64, scc_tol: f64) -> f6
         eprintln!("[sparse] sparse_relax '{name}' steps={n} max|F|={max_f:.4e} rms0={rms0:.3e}");
         max_f
     })
+}
+
+fn rhai_sparse_geom_mode(name: &str, mode: &str) {
+    let step = match mode {
+        "bold" | "b3" => GeomStep::BoldXtrDmm,
+        "legacy" => GeomStep::LegacyDmm,
+        other => panic!("sparse_geom_mode '{name}': unknown mode '{other}' (bold|legacy)"),
+    };
+    with_sparse(|g| {
+        g.get_mut(name)
+            .unwrap_or_else(|| panic!("sparse_geom_mode '{name}': no engine"))
+            .eng
+            .set_geom_step(step);
+    });
+    eprintln!("[sparse] geom_mode '{name}' = {mode}");
+}
+
+fn rhai_sparse_fire_dt(name: &str, dt: f64) {
+    if !dt.is_finite() || dt <= 0.0 {
+        panic!("sparse_fire_dt '{name}': dt={dt}");
+    }
+    with_sparse(|g| {
+        g.get_mut(name)
+            .unwrap_or_else(|| panic!("sparse_fire_dt '{name}': no engine"))
+            .eng
+            .set_fire_dt(dt);
+    });
+    eprintln!("[sparse] fire_dt '{name}' = {dt}");
+}
+
+/// Move every atom `amp` Å along a deterministic direction.
+fn rhai_sparse_jitter(name: &str, amp: f64, seed: INT) -> INT {
+    if !(amp > 0.0) || !amp.is_finite() {
+        panic!("sparse_jitter '{name}': amp={amp}");
+    }
+    let mut s = seed as u64;
+    let mut rnd = || {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        (s as f64) / (u64::MAX as f64)
+    };
+    with_sparse(|g| {
+        let h = g
+            .get_mut(name)
+            .unwrap_or_else(|| panic!("sparse_jitter '{name}': no engine"));
+        let jittered: Vec<[f64; 3]> = h
+            .eng
+            .coords()
+            .iter()
+            .map(|c| {
+                let u = rnd() * 2.0 - 1.0;
+                let v = rnd() * 2.0 - 1.0;
+                let w = rnd() * 2.0 - 1.0;
+                let nrm = (u * u + v * v + w * w).sqrt().max(1e-15);
+                [c[0] + amp * u / nrm, c[1] + amp * v / nrm, c[2] + amp * w / nrm]
+            })
+            .collect();
+        h.eng
+            .set_coords(&jittered)
+            .unwrap_or_else(|e| panic!("sparse_jitter '{name}': {e}"));
+        sync_geom_coords(name, h.eng.coords());
+        eprintln!("[sparse] jitter '{name}' {amp} Å/atom  seed={seed}");
+        h.eng.n_atom() as INT
+    })
+}
+
+/// FIRE until `f_tol`, `max_steps`, `RUST_DFTB_WALL_SECS` (default 40), or 40
+/// steps with no new low in max|F|. Appends one XYZ frame and one CSV row per step.
+fn rhai_sparse_relax_traj(
+    name: &str,
+    max_steps: INT,
+    f_tol: f64,
+    scc_tol: f64,
+    traj_path: &str,
+    hist_path: &str,
+) -> INT {
+    let wall_s: f64 = std::env::var("RUST_DFTB_WALL_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(40.0);
+    let (species, _) = geom_species_coords(name, "sparse_relax_traj");
+    if let Some(parent) = std::path::Path::new(traj_path).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let frame0 = std::fs::read_to_string(traj_path)
+        .map(|t| {
+            t.lines()
+                .filter(|l| {
+                    l.starts_with("frame=") || l.starts_with("step=") || l.starts_with("floor=")
+                })
+                .count()
+        })
+        .unwrap_or(0);
+    let hist_new = !std::path::Path::new(hist_path).exists();
+    let mut hist = std::io::BufWriter::new(
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(hist_path)
+            .unwrap_or_else(|e| panic!("history {hist_path}: {e}")),
+    );
+    let mut traj = std::io::BufWriter::new(
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(traj_path)
+            .unwrap_or_else(|e| panic!("traj {traj_path}: {e}")),
+    );
+    use std::io::Write;
+    if hist_new {
+        writeln!(hist, "step,E_Ha,maxAbsF,ms,rms,TrKS,R_H,note").unwrap();
+    }
+    let t_wall = std::time::Instant::now();
+    let mut best_f = f64::MAX;
+    let mut since_best = 0usize;
+    let mut n_done: i64 = frame0 as i64;
+    let mut stopped = String::from("max_steps");
+    for step in 0..=max_steps as usize {
+        if t_wall.elapsed().as_secs_f64() > wall_s {
+            stopped = format!("wall {wall_s} s before step {step}");
+            eprintln!("[sparse] relax_traj '{name}' {stopped}");
+            break;
+        }
+        let t = std::time::Instant::now();
+        let note = if step == 0 { "cold" } else { "" };
+        if step > 0 {
+            let mf = with_sparse(|g| {
+                let h = g
+                    .get_mut(name)
+                    .unwrap_or_else(|| panic!("sparse_relax_traj '{name}': no engine"));
+                let mf = h
+                    .eng
+                    .fire_step(f_tol)
+                    .unwrap_or_else(|e| panic!("sparse_relax_traj '{name}' FIRE {step}: {e}"));
+                sync_geom_coords(name, h.eng.coords());
+                mf
+            });
+            if mf < f_tol {
+                stopped = format!("max|F|={mf:.3e} < {f_tol:.1e} before move {step}");
+                eprintln!("[sparse] relax_traj '{name}' {stopped}");
+                break;
+            }
+        }
+        let scc = with_sparse(|g| {
+            g.get_mut(name)
+                .unwrap_or_else(|| panic!("sparse_relax_traj '{name}': no engine"))
+                .eng
+                .scc(80, scc_tol)
+                .unwrap_or_else(|e| panic!("sparse_relax_traj '{name}' SCC {step}: {e}"))
+        });
+        let e_tot = with_sparse(|g| {
+            g.get_mut(name)
+                .unwrap()
+                .eng
+                .energy()
+                .unwrap_or_else(|e| panic!("sparse_relax_traj '{name}' energy: {e}"))
+        });
+        let max_f = with_sparse(|g| {
+            let h = g.get_mut(name).unwrap();
+            let f = h
+                .eng
+                .forces()
+                .unwrap_or_else(|e| panic!("sparse_relax_traj '{name}' forces: {e}"));
+            let mut max_f = 0.0f64;
+            for fi in &f.forces {
+                for c in fi {
+                    max_f = max_f.max(c.abs());
+                }
+            }
+            h.last_fmax = max_f;
+            h.have_forces = true;
+            h.last_rms = scc.rms;
+            max_f
+        });
+        let ms = t.elapsed().as_secs_f64() * 1e3;
+        let frame = frame0 + step;
+        let coords = with_sparse(|g| g.get(name).unwrap().eng.coords().to_vec());
+        writeln!(traj, "{}", species.len()).unwrap();
+        writeln!(
+            traj,
+            "frame={frame} E={e_tot:.8} max|F|={max_f:.6e} {note}"
+        )
+        .unwrap();
+        for (sp, c) in species.iter().zip(coords.iter()) {
+            writeln!(traj, "{sp:2} {:14.8} {:14.8} {:14.8}", c[0], c[1], c[2]).unwrap();
+        }
+        traj.flush().unwrap();
+        writeln!(
+            hist,
+            "{frame},{e_tot:.8},{max_f:.6e},{ms:.1},{:.6e},{:.6},{:.6e},{note}",
+            scc.rms, scc.tr_ks, scc.r_h
+        )
+        .unwrap();
+        hist.flush().unwrap();
+        if max_f < best_f * 0.98 {
+            best_f = max_f;
+            since_best = 0;
+        } else if step > 0 {
+            since_best += 1;
+        }
+        eprintln!(
+            "[sparse] step {frame}: E={e_tot:.6} max|F|={max_f:.4e} best={best_f:.4e} stale={since_best} Tr={:.5} {ms:.0} ms {note}",
+            scc.tr_ks
+        );
+        n_done = frame as i64 + 1;
+        if step > 0 && max_f < f_tol {
+            stopped = format!("max|F|={max_f:.3e} < {f_tol:.1e}");
+            break;
+        }
+        if step > 20 && since_best >= 40 {
+            stopped = format!("plateau best max|F|={best_f:.3e}");
+            break;
+        }
+    }
+    let after = std::path::Path::new(traj_path).with_file_name("after.xyz");
+    let coords = with_sparse(|g| g.get(name).unwrap().eng.coords().to_vec());
+    let mut w = std::io::BufWriter::new(
+        std::fs::File::create(&after).unwrap_or_else(|e| panic!("after.xyz: {e}")),
+    );
+    writeln!(w, "{}", species.len()).unwrap();
+    writeln!(w, "{stopped}").unwrap();
+    for (sp, c) in species.iter().zip(coords.iter()) {
+        writeln!(w, "{sp:2} {:14.8} {:14.8} {:14.8}", c[0], c[1], c[2]).unwrap();
+    }
+    eprintln!("[sparse] relax_traj '{name}' {stopped}  next_frame={n_done}  {traj_path}");
+    n_done
 }
 
 fn rhai_sparse_set_coords(name: &str, xyz: Array) -> INT {
@@ -2183,8 +2437,15 @@ fn rhai_sparse_vibrations(name: &str, h: f64, scc_tol: f64, path: &str) -> Strin
             }
         }
         let dm = nalgebra::DMatrix::from_row_slice(n3, n3, &mw);
-        let eig = nalgebra::SymmetricEigen::new(dm);
-        let mut vals: Vec<f64> = eig.eigenvalues.iter().copied().collect();
+        let t_eig = std::time::Instant::now();
+        let (evals, evecs) = rust_dftb::core::eigh::symmetric_eigh(dm).unwrap_or_else(|e| {
+            panic!("vibrations '{name}' symmetric_eigh n3={n3}: {e}")
+        });
+        eprintln!(
+            "[sparse] vibrations '{name}': eigh n3={n3} in {:.3}s (dsyevd)",
+            t_eig.elapsed().as_secs_f64()
+        );
+        let mut vals: Vec<f64> = evals.iter().copied().collect();
         vals.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let mut freqs: Vec<f64> = Vec::with_capacity(n3);
         let mut n_imag = 0usize;
@@ -2204,14 +2465,14 @@ fn rhai_sparse_vibrations(name: &str, h: f64, scc_tol: f64, path: &str) -> Strin
             out.push_str(&format!("{k} {f:.4}\n"));
         }
         let mut order: Vec<usize> = (0..n3).collect();
-        order.sort_by(|&a, &b| eig.eigenvalues[a].partial_cmp(&eig.eigenvalues[b]).unwrap());
+        order.sort_by(|&a, &b| evals[a].partial_cmp(&evals[b]).unwrap());
         for (k, &col) in order.iter().enumerate() {
             out.push_str(&format!("mode {k} freq {:.4}\n", freqs[k]));
             // Mass-weighted eigenvector → real-space displacement, unit-normed.
             let mut un = 0.0f64;
             let mut u = vec![0.0f64; n3];
             for c in 0..n3 {
-                u[c] = eig.eigenvectors[(c, col)] * inv[c] * ANG2BOHR;
+                u[c] = evecs[(c, col)] * inv[c] * ANG2BOHR;
                 un += u[c] * u[c];
             }
             let un = un.sqrt().max(1e-30);
@@ -3475,6 +3736,11 @@ fn main() {
     engine.register_fn("sparse_fire_step", rhai_sparse_fire_step);
     engine.register_fn("sparse_md_step", rhai_sparse_md_step);
     engine.register_fn("sparse_relax", rhai_sparse_relax);
+    engine.register_fn("sparse_new_mask", rhai_sparse_new_mask);
+    engine.register_fn("sparse_geom_mode", rhai_sparse_geom_mode);
+    engine.register_fn("sparse_fire_dt", rhai_sparse_fire_dt);
+    engine.register_fn("sparse_jitter", rhai_sparse_jitter);
+    engine.register_fn("sparse_relax_traj", rhai_sparse_relax_traj);
     engine.register_fn("sparse_set_coords", rhai_sparse_set_coords);
     engine.register_fn("sparse_n_atoms", rhai_sparse_n_atoms);
     engine.register_fn("sparse_n_orbs", rhai_sparse_n_orbs);

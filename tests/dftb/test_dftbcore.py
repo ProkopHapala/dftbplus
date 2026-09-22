@@ -85,10 +85,6 @@ Options {{
   WriteResultsTag = Yes
   WriteDetailedOut = Yes
 }}
-
-Analysis {{
-  CalculateForces = Yes
-}}
 """
     
     with open('h2o.hsd', 'w') as f:

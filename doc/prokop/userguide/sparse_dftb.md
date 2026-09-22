@@ -149,7 +149,12 @@ Geometry first, then the engine. Geometry helpers are shared with dense DFTB.
 | `sparse_set_coords(name, xyz_flat)` | n_atoms | Move atoms. Rebuilds H0/S values; **fails** if the frozen mask no longer covers neighbors. |
 | `sparse_fire_step(name, f_tol)` | max \|F\| | One FIRE displacement, then H0/S refresh. Call `sparse_scc` after. |
 | `sparse_md_step(name, dt)` | max \|F\| | One velocity-Verlet step (mass = 1, disp capped at 0.1 Å). Call `sparse_scc` after. |
-| `sparse_relax(name, max_steps, f_tol, scc_tol)` | max \|F\| | SCC + FIRE loop until max\|F\| < `f_tol` or `max_steps`. |
+| `sparse_relax(name, max_steps, f_tol, scc_tol)` | max \|F\| | SCC + FIRE loop until max\|F\| < `f_tol` or `max_steps`. Does not write a trajectory. |
+| `sparse_new_mask(name, sk, r_trunc, taper, r_k, r_z, r_skin, max_deg)` | n_orbs | Same as `sparse_new`, plus the Verlet skin (Å) and one degree budget for every mask. |
+| `sparse_geom_mode(name, "bold"\|"legacy")` | — | `"bold"` is the geometry step that reuses K (two commutator steps, one McWeeny). `"legacy"` is the old four-step commutator. |
+| `sparse_fire_dt(name, dt)` | — | Initial FIRE timestep. Mass = 1. Displacement still capped at 0.1 Å. |
+| `sparse_jitter(name, amp, seed)` | n_atoms | Move every atom `amp` Å on a fixed random direction. Call after `sparse_new`, before the first SCC. |
+| `sparse_relax_traj(name, max_steps, f_tol, scc_tol, traj.xyz, history.csv)` | next frame index | The same loop, appending one XYZ frame and one CSV row per step. Stops on the force tolerance, on 40 steps with no new low in max\|F\|, or at `RUST_DFTB_WALL_SECS` (default 40). Writes `after.xyz` beside the trajectory. |
 | `sparse_tc2_tol(name, tol)` | — | Purification residual target; set one decade above the measured f32 `R_I` floor. |
 | `sparse_vibrations(name, h_ang, scc_tol, out_path)` | summary | Central-difference Hessian of the analytic forces → mass-weighted eigen → cm⁻¹ + mode vectors. See [sparse_vibrations.md](sparse_vibrations.md). |
 | `sparse_n_atoms` / `sparse_n_orbs` / `sparse_scc_iters` | int | |
@@ -193,6 +198,8 @@ assert_close(e1, e2, 1e-5, "reuse SCC");
 ```
 
 FIRE / MD change coordinates and invalidate Z (overlap changed). The engine runs Newton–Schulz again on the next `sparse_scc`. Displacement per step is capped; a step that jumps Si–H out of a physical window is a bug, not a licence to clamp.
+
+The bold step does not form the full projector certificate on every geometry. It measures `Tr(KS)` once, after McWeeny, because that is the electron count Mulliken has to match. `R_H` of the extrapolant `2K₁−K₀` is one sparse product, on the first extrapolant and then every 8 extrapolations (`RUST_DFTB_GEOM_RH_EVERY`, `0` never). A sample above `RUST_DFTB_GEOM_RH_MAX` (default `1e-2`) is dropped and the step continues from `K₁`. `RUST_DFTB_GEOM_CERT=1` turns the per-step `Tr` / `R_I` / `R_H` lines back on; that is the diagnostic, and it is what dominated the profiled step time.
 
 `sparse_relax` prints unbuffered FIRE progress. Use it for a short local relax, not as a substitute for looking at the numbers.
 

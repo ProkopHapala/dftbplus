@@ -27,6 +27,7 @@ DFTB+ fork: upstream Fortran reference (`src/dftbp/`) + from-scratch Rust reimpl
 - Never delete/rearrange existing code or make unrelated aesthetic edits without explicit permission; comment out, don't delete.
 - Never apply quick-fixes that hide root causes (hard-coded outputs, clamping divergence).
 - Never reinvent existing functionality — inventory first (`CODEMAP.md`, Fortran `src/dftbp/`, reference repos: SPAMMM, FireCore, tblite).
+- **HARD RULE — no oversized runs.** Never run a test, benchmark, or script that can freeze the machine, exhaust memory, or take more than **1 minute**. Details: GUIDELINES.md §7.
 - Never copy-paste between modules — extract a shared function in `rust_dftb/src/core/`.
 - **Ask, don't Guess** — when unsure, ask the user.
 

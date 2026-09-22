@@ -1,5 +1,12 @@
 # Sparse FD-Hessian per-eval bottleneck — measured breakdown
 
+**Update 2026-09-22.** The batching lever this note ends on was measured.
+Frozen columns reached 0.27 ms/eval and stopped moving the spectrum
+(the host eigensolve is ~72% of the R18 wall). DMM-lite batching
+saturated at ~1.24× because the SpGEMM is bandwidth-bound. Standing
+order: [`Sparse_Performance.md`](../tasts/Sparse_Nanocrystal_Vibrations/Sparse_Performance.md).
+The tables below remain the record of why a cold column cost seconds.
+
 **Question:** why does a single displaced force evaluation (one ±h FD
 Hessian column) on `si_sphere_R10` (330 Si, pbc-0-3, BSR4 sparse GPU
 engine) cost ~3.5–7 s when the displaced Hamiltonian/density matrix are

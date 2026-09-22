@@ -436,6 +436,116 @@ class DFTBplusGridProjector(GridProjector):
         # This is a placeholder - full implementation would handle cell images and phases
         return self.project_orbital(coeffs, atoms_dict, grid_spec, norb_total, nMaxAtom=nMaxAtom)
 
+    def project_bloch_points(self, points, atoms_dict, cell_cart, cell_n, coeffs, k_frac, weights,
+                             write_psi=False):
+        """Project Bloch states from a DFTBcore coefficient matrix onto explicit points.
+
+        One work-item per point. Home-cell atoms are repeated over ``cell_n`` (integer
+        lattice shifts). The kernel applies exp(-i 2π k·n) itself, so ``coeffs`` are the
+        raw home-cell eigenvectors.
+
+        Args:
+            points: (npoints, 3) Angstrom
+            atoms_dict: from prepare_atoms_dftb (home cell only)
+            cell_cart: (ncell, 3) Cartesian shift of each image, Angstrom
+            cell_n: (ncell, 3) integer cell index of each image
+            coeffs: (nstate, norb) complex. One row is one (MO, k) pair, AO order.
+            k_frac: (nstate, 3) fractional k of each row
+            weights: (nstate,) real weight in the |ψ|² sum (k-weight, occupation, or 1)
+            write_psi: also return the complex wavefunction of every state
+
+        Returns:
+            rho (npoints,) float32 = Σ_s w_s |ψ_s|²
+            psi (nstate, npoints) complex64 if write_psi else None
+        """
+        if not hasattr(self, 'd_basis'):
+            raise RuntimeError("load_basis_dftb() must be called before project_bloch_points")
+        points = np.asarray(points, dtype=np.float32)
+        if points.ndim != 2 or points.shape[1] != 3:
+            raise ValueError(f"points must be (n,3), got {points.shape}")
+        coeffs = np.asarray(coeffs)
+        k_frac = np.asarray(k_frac, dtype=np.float64)
+        weights = np.asarray(weights, dtype=np.float64)
+        cell_cart = np.asarray(cell_cart, dtype=np.float64)
+        cell_n = np.asarray(cell_n, dtype=np.float64)
+        npoints = points.shape[0]
+        nstate, norb = coeffs.shape
+        ncell = cell_cart.shape[0]
+        if k_frac.shape != (nstate, 3) or weights.shape != (nstate,):
+            raise ValueError(f"k_frac {k_frac.shape} / weights {weights.shape} incompatible with nstate={nstate}")
+        if cell_n.shape != (ncell, 3):
+            raise ValueError(f"cell_n {cell_n.shape} incompatible with cell_cart {cell_cart.shape}")
+        norb_atoms = int(atoms_dict['i0orb'][-1] + atoms_dict['norb'][-1])
+        if norb != norb_atoms:
+            raise ValueError(f"coeffs norb={norb} but atoms span {norb_atoms} orbitals")
+        if np.any(atoms_dict['norb'] > 4):
+            raise RuntimeError(
+                f"project_bloch_points supports s+p only (norb<=4 per atom), got {atoms_dict['norb']}")
+
+        natoms = len(atoms_dict['pos'])
+        atom_dtype = np.dtype([
+            ('pos_rcut', np.float32, 4),
+            ('type', np.int32),
+            ('i0orb', np.int32),
+            ('norb', np.int32),
+            ('pad', np.int32),
+        ])
+        atoms = np.zeros(natoms, dtype=atom_dtype)
+        atoms['pos_rcut'][:, 0:3] = np.asarray(atoms_dict['pos'], dtype=np.float32)
+        atoms['pos_rcut'][:, 3] = np.asarray(atoms_dict['Rcut'], dtype=np.float32)
+        atoms['type'] = np.asarray(atoms_dict['type'], dtype=np.int32)
+        atoms['i0orb'] = np.asarray(atoms_dict['i0orb'], dtype=np.int32)
+        atoms['norb'] = np.asarray(atoms_dict['norb'], dtype=np.int32)
+        if atoms.dtype.itemsize != 32:
+            raise RuntimeError(f"AtomData numpy size {atoms.dtype.itemsize} != OpenCL struct size 32")
+
+        pts = np.zeros((npoints, 4), dtype=np.float32)
+        pts[:, 0:3] = points
+        c2 = np.zeros((nstate, norb, 2), dtype=np.float32)
+        c2[:, :, 0] = np.real(coeffs).astype(np.float32)
+        c2[:, :, 1] = np.imag(coeffs).astype(np.float32)
+        kw = np.zeros((nstate, 4), dtype=np.float32)
+        kw[:, 0:3] = k_frac.astype(np.float32)
+        kw[:, 3] = weights.astype(np.float32)
+        cc = np.zeros((ncell, 4), dtype=np.float32)
+        cc[:, 0:3] = cell_cart.astype(np.float32)
+        cn = np.zeros((ncell, 4), dtype=np.float32)
+        cn[:, 0:3] = cell_n.astype(np.float32)
+
+        mf = cl.mem_flags
+        d_pts = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=pts)
+        d_atoms = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=atoms)
+        d_cc = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=cc)
+        d_cn = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=cn)
+        d_c = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=c2)
+        d_kw = cl.Buffer(self.ctx, mf.READ_ONLY | mf.COPY_HOST_PTR, hostbuf=kw)
+        rho = np.zeros(npoints, dtype=np.float32)
+        d_rho = cl.Buffer(self.ctx, mf.WRITE_ONLY | mf.COPY_HOST_PTR, hostbuf=rho)
+        npsi = nstate * npoints if write_psi else 1
+        psi_buf = np.zeros((npsi, 2), dtype=np.float32)
+        d_psi = cl.Buffer(self.ctx, mf.WRITE_ONLY | mf.COPY_HOST_PTR, hostbuf=psi_buf)
+
+        meta = self.basis_meta
+        ls = 64
+        gs = ((npoints + ls - 1) // ls) * ls
+        self.prg.project_bloch_points(
+            self.queue, (gs,), (ls,),
+            np.int32(npoints), d_pts,
+            np.int32(natoms), d_atoms,
+            np.int32(ncell), d_cc, d_cn,
+            np.int32(nstate), np.int32(norb), d_c, d_kw,
+            self.d_basis,
+            np.int32(meta['n_nodes']), np.float32(meta['dr']), np.int32(meta['max_shells']),
+            np.int32(1 if write_psi else 0),
+            d_rho, d_psi,
+        )
+        cl.enqueue_copy(self.queue, rho, d_rho)
+        psi = None
+        if write_psi:
+            cl.enqueue_copy(self.queue, psi_buf, d_psi)
+            psi = (psi_buf[:, 0] + 1j * psi_buf[:, 1]).astype(np.complex64).reshape(nstate, npoints)
+        return rho, psi
+
 
 class DFTBplusWaveplotRunner:
     """

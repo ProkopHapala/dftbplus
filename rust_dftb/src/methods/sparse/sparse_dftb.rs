@@ -371,11 +371,23 @@ pub struct SparseDftb {
     /// warm-start NS with cold fallback (R6 physics: Z changes slowly).
     z_warm: bool,
     /// The device K buffer holds a converged projector from a previous
-    /// purify (earlier mix iter or earlier ±h geometry). Enables the
-    /// `RUST_DFTB_WARM_K` path: TC2 tightens the stored K instead of
-    /// rebuilding K0 = (emax·Z − ZHZ)/Δε and re-descending ~50 iters.
+    /// purify. A geometry step (Z invalidated by `set_coords`) updates it
+    /// with a short DMM descent instead of rebuilding K0 and running TC2.
     /// False until the first successful K-path purify.
     k_warm: bool,
+    /// Geometry-step recipe. Default is the fixed four-step DMM, which
+    /// failed as a relaxation. The Warm_Geometry_DM variants are opt-in.
+    geom_step: GeomStep,
+    /// Extrapolations since the last R_H sample of `2K₁−K₀`.
+    geom_since_rh: u32,
+    /// The next extrapolant is sampled even if the interval has not elapsed
+    /// (the previous sample was above the ceiling).
+    geom_force_rh: bool,
+    /// False until the first extrapolant has been sampled.
+    geom_rh_seen: bool,
+    /// How the last `scc` obtained K. A restart is a cold TC2 after the
+    /// variant's certificate failed.
+    geom_outcome: GeomOutcome,
     /// Central electronic state snapshot (Phase G1) — set by
     /// `snapshot_electronic_state`, used by `restore_central_state` and
     /// the δK0 seed in `scc_fixedq`/`scc` (Phase G3).
@@ -401,6 +413,47 @@ pub struct SparseDftb {
     fire_dt: f64,
     fire_alpha: f64,
     fire_n_pos: usize,
+}
+
+/// Geometry-step density update. `LegacyDmm` is the fixed four-step
+/// commutator that lost orbital count when chained. The other four are
+/// `Warm_Geometry_DM.md` V1–V4.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GeomStep {
+    LegacyDmm,
+    /// V1: `K ← 2K₁−K₀`, one McWeeny, certificate.
+    XtrMcWeeny,
+    /// V2: `K ← 2K₁−K₀`, certificate, no purification.
+    Xtr,
+    /// V3: trust-region commutator from K₁, then one checkpointed McWeeny.
+    TrustDmm,
+    /// V4: V1's predictor; V3 only if that predictor fails the certificate.
+    XtrThenTrust,
+    /// 0.1 Å step: `2K₁−K₀`, one McWeeny, keep it. No cold restart.
+    BoldXtr,
+    /// 0.1 Å step: two commutator steps at η = 8, one McWeeny, keep it.
+    BoldDmm,
+    /// 0.1 Å step: extrapolate, then the two big commutator steps, one McWeeny.
+    BoldXtrDmm,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GeomCert {
+    tr: f64,
+    tau: f64,
+    r_h: f64,
+    r_i: f32,
+}
+
+/// How the last successful `scc` produced the stored kernel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GeomOutcome {
+    /// Cold TC2, including the first geometry.
+    Cold,
+    /// Variant certificate passed. The previous kernel was reused.
+    Accept,
+    /// Variant certificate failed. K was discarded and cold TC2 ran.
+    Restart,
 }
 
 impl SparseDftb {
@@ -839,6 +892,11 @@ impl SparseDftb {
             z_valid: false,
             z_warm: false,
             k_warm: false,
+            geom_step: GeomStep::LegacyDmm,
+            geom_since_rh: 0,
+            geom_force_rh: false,
+            geom_rh_seen: false,
+            geom_outcome: GeomOutcome::Cold,
             central: None,
             central_dev: None,
             dense_diag,
@@ -998,6 +1056,17 @@ impl SparseDftb {
     /// Restart the stage clock (e.g. before a measured region).
     pub fn prof_reset(&self) {
         self.ws.gpu().prof_reset();
+    }
+
+    /// `scc` / `set_coords` restart the stage clock so one call stays one
+    /// report. `RUST_DFTB_PROF_ACCUM=1` keeps the sum across a relaxation.
+    fn prof_restart_unless_accum(&self) {
+        let accum = std::env::var("RUST_DFTB_PROF_ACCUM")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if !accum {
+            self.ws.gpu().prof_reset();
+        }
     }
 
     /// DIAGNOSTIC: inject host K values (structure must be exactly M_K) —
@@ -1360,7 +1429,7 @@ impl SparseDftb {
             }
         }
         self.coords.copy_from_slice(coords);
-        self.ws.gpu().prof_reset();
+        self.prof_restart_unless_accum();
         // Packed (x,y,z,u) FIRST — the tiled n-body γ/γ′ kernels AND the
         // R17 pair kernels (H/S assembly, repulsive) all read xyzu_buf.
         for i in 0..self.n_atom {
@@ -1526,25 +1595,83 @@ impl SparseDftb {
     /// serve a non-converged or mixed-provenance state).
     pub fn scc(&mut self, max_iter: usize, rms_tol: f64) -> Result<SparseDftbScc> {
         let r = self.scc_inner(max_iter, rms_tol);
-        if r.is_err() {
-            self.last.n_scc = 0;
-            self.last.purify_status = PurifyStatus::Failed;
+        match r {
+            Ok(info) => {
+                self.ws.commit_k_history()?;
+                Ok(info)
+            }
+            Err(e) => {
+                self.last.n_scc = 0;
+                self.last.purify_status = PurifyStatus::Failed;
+                Err(e)
+            }
         }
-        r
+    }
+
+    /// Select the geometry-step recipe. The first `scc` of a run is always
+    /// cold: there is no previous kernel.
+    pub fn set_geom_step(&mut self, step: GeomStep) {
+        self.geom_step = step;
+    }
+
+    pub fn geom_outcome(&self) -> GeomOutcome {
+        self.geom_outcome
+    }
+
+    /// Next `scc` rebuilds K from K0 even if a projector is stored.
+    /// The cold reference engine uses this so it does not take the warm path.
+    pub fn forget_projector(&mut self) {
+        self.k_warm = false;
     }
 
     fn scc_inner(&mut self, max_iter: usize, rms_tol: f64) -> Result<SparseDftbScc> {
         let cap = max_iter.min(self.cfg.max_scc).min(SCC_MAX);
-        self.ws.gpu().prof_reset();
-        if !self.z_valid {
-            // Warm-start NS from the previous geometry's Z when available —
-            // cold fallback on stall/non-finite is built into compute_z.
-            let (rz, z_iters) =
-                self.ws
-                    .compute_z(self.cfg.ns_max, self.cfg.ns_tol, 5, self.z_warm)?;
+        self.prof_restart_unless_accum();
+        let env_flag = |name: &str| {
+            std::env::var(name)
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false)
+        };
+        let use_trs = self
+            .cfg
+            .purifier_trs
+            .unwrap_or_else(|| env_flag("RUST_DFTB_TRS"));
+        let use_p = self
+            .cfg
+            .purifier_p
+            .unwrap_or_else(|| env_flag("RUST_DFTB_P_TC2"));
+        let warm_k_tc2 = env_flag("RUST_DFTB_WARM_K");
+        // Captured before NS sets z_valid. A geometry change with a stored
+        // projector takes the short DMM update, not a fresh TC2.
+        let geom_moved = !self.z_valid;
+        self.geom_outcome = GeomOutcome::Cold;
+        if geom_moved {
+            // One or two Newton updates of Z are the measured tier. A
+            // geometry step must not spend the cold ns_max=50 budget.
+            let warm_step = self.z_warm && self.k_warm && !use_trs && !use_p;
+            let (ns_max, ns_tol) = if warm_step {
+                (4usize, 1e-4)
+            } else {
+                (self.cfg.ns_max, self.cfg.ns_tol)
+            };
+            let (rz, z_iters) = self.ws.compute_z(ns_max, ns_tol, 5, self.z_warm)?;
             eprintln!("  [SparseDftb] NS (once per geometry, warm={}): {z_iters} iters, R_Z={rz:.3e} (device ||I−T||_F/√N)", self.z_warm);
             self.z_valid = true;
             self.z_warm = true;
+            if warm_step {
+                self.ws.gpu().prof_tick("ns");
+                match self.geom_step {
+                    GeomStep::LegacyDmm => return self.scc_warm_geometry(rms_tol),
+                    step => {
+                        if let Some(info) = self.try_geom_step(step)? {
+                            return Ok(info);
+                        }
+                        self.geom_outcome = GeomOutcome::Restart;
+                        self.ws.mark_k_stale();
+                        eprintln!("  [geom] RESTART cold TC2 — certificate rejected the warm kernel");
+                    }
+                }
+            }
         }
         self.ws.gpu().prof_tick("ns");
         let mix = self.cfg.mix;
@@ -1564,25 +1691,10 @@ impl SparseDftb {
             self.ws.gpu().prof_tick("scc.v");
             self.ws.build_hscc_from_v(&self.v_f32)?;
             self.ws.gpu().prof_tick("scc.hscc");
-            let env_flag = |name: &str| {
-                std::env::var(name)
-                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-                    .unwrap_or(false)
-            };
-            let use_trs = self
-                .cfg
-                .purifier_trs
-                .unwrap_or_else(|| env_flag("RUST_DFTB_TRS"));
-            let use_p = self
-                .cfg
-                .purifier_p
-                .unwrap_or_else(|| env_flag("RUST_DFTB_P_TC2"));
-            // Warm-K TC2 (K path only): the stored K is the converged
-            // projector of the previous mix iter / ±h geometry. Opt-in —
-            // convergence of a seeded projector is only sound near the
-            // fixed point. NO cold fallback: a warm-seed failure is a
-            // hard error — fix the update, don't silently re-solve.
-            let warm = env_flag("RUST_DFTB_WARM_K") && self.k_warm && !use_trs && !use_p;
+            // Warm-K TC2 is opt-in and refuted as a geometry update (the
+            // masked fixed point is repelling). Kept for the study flag.
+            // A geometry change with a stored K does not reach this loop.
+            let warm = warm_k_tc2 && self.k_warm && !use_trs && !use_p;
             self.ws.set_tc2_hiacc(self.cfg.tc2_hiacc.unwrap_or(false));
             let r = if warm {
                 self.ws.purify_hscc_warm(self.cfg.tc2_max, self.cfg.tc2_tol)
@@ -1699,6 +1811,553 @@ impl SparseDftb {
             "SparseDftb SCC did not converge in {cap} iters, last rms={:.3e} E_tot={:.8}",
             last_info.rms, self.last.e_tot
         )))
+    }
+
+    fn rh_gate() -> f64 {
+        std::env::var("RUST_DFTB_SCC_RHGATE")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(5e-4)
+    }
+
+    /// Full Tr / R_I / R_H after every commutator and after McWeeny, plus the
+    /// log lines. Default off. Those calls do not change the bold update.
+    fn geom_diag() -> bool {
+        match std::env::var("RUST_DFTB_GEOM_CERT") {
+            Ok(v) => !v.is_empty() && v != "0",
+            Err(_) => false,
+        }
+    }
+
+    /// Extrapolations between single R_H samples. 0 never samples.
+    /// Default 8. The first extrapolant is always sampled.
+    fn geom_rh_every() -> u32 {
+        std::env::var("RUST_DFTB_GEOM_RH_EVERY")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8)
+    }
+
+    /// Drop `2K₁−K₀` when its R_H exceeds this. A correct truncated projector
+    /// sits near a few 10⁻³; a reversed FIRE step was measured at 0.04–0.06.
+    fn geom_rh_max() -> f64 {
+        std::env::var("RUST_DFTB_GEOM_RH_MAX")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1e-2)
+    }
+
+    fn geom_pass(c: &GeomCert) -> bool {
+        c.tau < 0.02 && c.r_h < Self::rh_gate()
+    }
+
+    fn geom_log(&self, tag: &str, what: &str, c: &GeomCert, extra: &str) {
+        eprintln!(
+            "  [geom {tag}] {what}  Tr={:.6} τ={:.4e} R_H={:.3e} R_I={:.3e} hist={} {extra}",
+            c.tr,
+            c.tau,
+            c.r_h,
+            c.r_i,
+            self.ws.n_k_hist()
+        );
+    }
+
+    fn prepare_hscc(&mut self) -> Result<()> {
+        self.compute_v()?;
+        self.ws.build_hscc_from_v(&self.v_f32)?;
+        self.ws.refresh_b_zh()?;
+        Ok(())
+    }
+
+    fn geom_cert(&mut self) -> Result<GeomCert> {
+        let (r_i, tr) = self.ws.measure_projector_state()?;
+        let r_h = self.ws.rh_stationarity()?;
+        if !tr.is_finite() || !r_h.is_finite() || !r_i.is_finite() {
+            return Err(DftbError::InvalidInput(format!(
+                "geom certificate non-finite: Tr={tr} R_H={r_h} R_I={r_i}"
+            )));
+        }
+        self.ws.gpu().prof_tick("cert");
+        Ok(GeomCert {
+            tr,
+            tau: (tr - self.nocc as f64).abs(),
+            r_h,
+            r_i,
+        })
+    }
+
+    /// One McWeeny, kept only when it does not increase τ or R_H.
+    fn checkpointed_mcweeny(&mut self, before: GeomCert) -> Result<GeomCert> {
+        self.ws.checkpoint_k()?;
+        self.ws.mcweeny_polish_planned(1)?;
+        let c = self.geom_cert()?;
+        if c.tau > before.tau || c.r_h > before.r_h {
+            self.ws.restore_k()?;
+            eprintln!(
+                "  [geom] McWeeny worsened the certificate (τ {:.4e}→{:.4e}, R_H {:.3e}→{:.3e}) — restored",
+                before.tau, c.tau, before.r_h, c.r_h
+            );
+            return Ok(before);
+        }
+        Ok(c)
+    }
+
+    /// At most four commutator steps. A step that moves the raw trace by
+    /// ≥ 0.02 or increases R_H is restored and η is halved. η starts at 1
+    /// and is the dimensionless scale (`dmm_descend` divides by Δε).
+    fn trust_dmm(&mut self, tag: &str) -> Result<(Option<GeomCert>, usize, usize)> {
+        let (emin, emax) = self.ws.spectral_bounds()?;
+        let mut eta = 1.0f32;
+        let mut before = self.geom_cert()?;
+        self.geom_log(tag, "trust-seed", &before, &format!("η={eta:.3}"));
+        let mut accepted: Option<GeomCert> = None;
+        let mut n_dmm = 0usize;
+        for _ in 0..4 {
+            self.ws.checkpoint_k()?;
+            self.ws.dmm_descend(emin, emax, 1, eta, 0)?;
+            n_dmm += 1;
+            let c = self.geom_cert()?;
+            self.geom_log(tag, "trust-step", &c, &format!("η={eta:.3}"));
+            if c.tau >= 0.02 || c.r_h > before.r_h {
+                self.ws.restore_k()?;
+                eta *= 0.5;
+                eprintln!("  [geom {tag}] reject step  η→{eta:.4}");
+                if eta < 1.0 / 16.0 {
+                    return Ok((None, n_dmm, 0));
+                }
+            } else {
+                accepted = Some(c);
+                before = c;
+                eta = (eta * 2.0).min(4.0);
+            }
+        }
+        let Some(c) = accepted else {
+            return Ok((None, n_dmm, 0));
+        };
+        if !Self::geom_pass(&c) {
+            eprintln!(
+                "  [geom {tag}] trust improved the step but R_H={:.3e} is still above the gate {:.3e}",
+                c.r_h,
+                Self::rh_gate()
+            );
+            return Ok((None, n_dmm, 0));
+        }
+        let c2 = self.checkpointed_mcweeny(c)?;
+        if Self::geom_pass(&c2) {
+            Ok((Some(c2), n_dmm, 1))
+        } else {
+            Ok((None, n_dmm, 1))
+        }
+    }
+
+    /// One geometry step of V1–V4. `None` means the certificate failed and
+    /// the caller must run cold TC2. Does not rescale K.
+    fn try_geom_step(&mut self, step: GeomStep) -> Result<Option<SparseDftbScc>> {
+        if matches!(step, GeomStep::BoldXtr | GeomStep::BoldDmm | GeomStep::BoldXtrDmm) {
+            return Ok(Some(self.bold_geom(step)?));
+        }
+        self.prepare_hscc()?;
+        let tag = match step {
+            GeomStep::XtrMcWeeny => "V1",
+            GeomStep::Xtr => "V2",
+            GeomStep::TrustDmm => "V3",
+            GeomStep::XtrThenTrust => "V4",
+            GeomStep::BoldXtr | GeomStep::BoldDmm | GeomStep::BoldXtrDmm => unreachable!(),
+            GeomStep::LegacyDmm => {
+                return Err(DftbError::InvalidInput(
+                    "try_geom_step called on LegacyDmm".into(),
+                ));
+            }
+        };
+        let extrapolated = match step {
+            GeomStep::XtrMcWeeny | GeomStep::Xtr | GeomStep::XtrThenTrust => {
+                self.ws.extrapolate_k_hist()?
+            }
+            GeomStep::TrustDmm | GeomStep::LegacyDmm | GeomStep::BoldXtr | GeomStep::BoldDmm | GeomStep::BoldXtrDmm => false,
+        };
+        let (cert, n_dmm, n_mcw) = match step {
+            GeomStep::Xtr => {
+                let c = self.geom_cert()?;
+                self.geom_log(tag, if extrapolated { "xtr" } else { "K1" }, &c, "no McWeeny");
+                if Self::geom_pass(&c) {
+                    (Some(c), 0, 0)
+                } else {
+                    (None, 0, 0)
+                }
+            }
+            GeomStep::XtrMcWeeny => {
+                self.ws.mcweeny_polish_planned(1)?;
+                let c = self.geom_cert()?;
+                self.geom_log(
+                    tag,
+                    if extrapolated { "xtr+McW" } else { "K1+McW" },
+                    &c,
+                    "",
+                );
+                if Self::geom_pass(&c) {
+                    (Some(c), 0, 1)
+                } else {
+                    (None, 0, 1)
+                }
+            }
+            GeomStep::TrustDmm => self.trust_dmm(tag)?,
+            GeomStep::XtrThenTrust => {
+                let c = self.geom_cert()?;
+                self.geom_log(tag, if extrapolated { "xtr" } else { "K1" }, &c, "");
+                if Self::geom_pass(&c) {
+                    let c2 = self.checkpointed_mcweeny(c)?;
+                    if Self::geom_pass(&c2) {
+                        (Some(c2), 0, 1)
+                    } else {
+                        (None, 0, 1)
+                    }
+                } else {
+                    self.ws.load_k_hist1()?;
+                    eprintln!("  [geom V4] predictor rejected — trust region from K₁");
+                    self.trust_dmm(tag)?
+                }
+            }
+            GeomStep::LegacyDmm | GeomStep::BoldXtr | GeomStep::BoldDmm | GeomStep::BoldXtrDmm => (None, 0, 0),
+        };
+        match cert {
+            Some(c) => Ok(Some(self.accept_geom(tag, c, n_dmm, n_mcw)?)),
+            None => Ok(None),
+        }
+    }
+
+    fn accept_geom(
+        &mut self,
+        tag: &str,
+        c: GeomCert,
+        n_dmm: usize,
+        n_mcw: usize,
+    ) -> Result<SparseDftbScc> {
+        let q_new = self.mulliken_checked(c.tr, 0)?;
+        let mut rms = 0.0;
+        for a in 0..self.n_atom {
+            let d = q_new[a] - self.q[a];
+            rms += d * d;
+        }
+        rms = (rms / self.n_atom as f64).sqrt();
+        self.k_warm = true;
+        self.geom_outcome = GeomOutcome::Accept;
+        // Energy at q_in, the charges that built H. Mulliken q is carried
+        // afterwards for the next geometry.
+        self.store_energy(
+            c.tr,
+            c.r_i,
+            1,
+            n_dmm,
+            rms,
+            c.r_h as f32,
+            PurifyStatus::Converged,
+        )?;
+        let info = SparseDftbScc {
+            n_iters: 1,
+            rms,
+            r_scc: rms,
+            tr_ks: c.tr as f32,
+            r_i: c.r_i,
+            r_h: c.r_h as f32,
+            purify_status: PurifyStatus::Converged,
+        };
+        let info = self.finalize_scc(&q_new, info)?;
+        self.q.copy_from_slice(&q_new);
+        eprintln!(
+            "  [geom {tag}] ACCEPT  dmm={n_dmm} mcw={n_mcw} rms={rms:.3e} Tr={:.6} R_H={:.3e}",
+            c.tr, c.r_h
+        );
+        Ok(info)
+    }
+
+    /// Tr(KS) only. Mulliken reads the same K·S. No R_H, no R_I.
+    fn geom_trace(&mut self) -> Result<GeomCert> {
+        let tr = self.ws.trace_of_ks()?;
+        if !tr.is_finite() {
+            return Err(DftbError::InvalidInput(format!(
+                "geom trace non-finite: Tr={tr}"
+            )));
+        }
+        self.ws.gpu().prof_tick("tr");
+        Ok(GeomCert {
+            tr,
+            tau: (tr - self.nocc as f64).abs(),
+            r_h: f64::NAN,
+            r_i: f32::NAN,
+        })
+    }
+
+    /// Apply `K ← 2K₁−K₀` when two kernels exist. Sample R_H of that
+    /// predictor on the first extrapolant and then every `geom_rh_every`
+    /// extrapolations — one product, not a before/after pair. A sample
+    /// above the ceiling restores K₁ and arms the next extrapolant.
+    fn extrapolate_sampled(&mut self) -> Result<()> {
+        if !self.ws.extrapolate_k_hist()? {
+            return Ok(());
+        }
+        let every = Self::geom_rh_every();
+        self.geom_since_rh = self.geom_since_rh.saturating_add(1);
+        let due = every > 0
+            && (!self.geom_rh_seen || self.geom_force_rh || self.geom_since_rh >= every);
+        if !due {
+            return Ok(());
+        }
+        self.geom_rh_seen = true;
+        self.geom_since_rh = 0;
+        self.geom_force_rh = false;
+        let r_h = self.ws.rh_stationarity()?;
+        self.ws.gpu().prof_tick("cert");
+        if !r_h.is_finite() {
+            return Err(DftbError::InvalidInput(format!(
+                "extrapolant R_H non-finite: {r_h}"
+            )));
+        }
+        let max = Self::geom_rh_max();
+        if r_h > max {
+            self.ws.load_k_hist1()?;
+            self.geom_force_rh = true;
+            eprintln!(
+                "  [geom B3] extrapolation R_H={r_h:.3e} > {max:.3e} — staying on K₁"
+            );
+        }
+        Ok(())
+    }
+
+    /// A 0.1 Å geometry step that keeps the kernel. Two products-worth of
+    /// rotation at most, then one McWeeny to pull occupations back. No
+    /// reject, no trace rescaling, no cold restart. `η = 8` is the
+    /// coefficient in `K ← K − (η/Δε) G`.
+    ///
+    /// Production (`RUST_DFTB_GEOM_CERT` unset) measures Tr(KS) once at the
+    /// end and samples the extrapolant's R_H every few steps. The per-step
+    /// certificates are the diagnostic gate.
+    fn bold_geom(&mut self, step: GeomStep) -> Result<SparseDftbScc> {
+        self.prepare_hscc()?;
+        self.ws.gpu().prof_tick("hscc");
+        let (emin, emax) = self.ws.spectral_bounds()?;
+        let diag = Self::geom_diag();
+        let (tag, n_dmm) = match step {
+            GeomStep::BoldXtr => {
+                let x = self.ws.extrapolate_k_hist()?;
+                if diag {
+                    let raw = self.geom_cert()?;
+                    self.geom_log("B1", if x { "xtr raw" } else { "K1 raw" }, &raw, "");
+                }
+                ("B1", 0)
+            }
+            GeomStep::BoldDmm => {
+                if diag {
+                    let raw = self.geom_cert()?;
+                    self.geom_log("B2", "K1 raw", &raw, "");
+                }
+                for i in 0..2 {
+                    self.ws.dmm_descend(emin, emax, 1, 8.0, 0)?;
+                    if diag {
+                        let c = self.geom_cert()?;
+                        self.geom_log("B2", "dmm", &c, &format!("step {i} η=8"));
+                    }
+                }
+                ("B2", 2)
+            }
+            GeomStep::BoldXtrDmm => {
+                if diag {
+                    let raw = self.geom_cert()?;
+                    self.geom_log("B3", "K1 raw", &raw, "");
+                    if self.ws.extrapolate_k_hist()? {
+                        let xp = self.geom_cert()?;
+                        self.geom_log("B3", "xtr raw", &xp, "");
+                        // A reversed FIRE step makes 2K₁−K₀ point the wrong way.
+                        // Keep K₁. Still a warm step, not a cold solve.
+                        if xp.r_h > raw.r_h {
+                            self.ws.load_k_hist1()?;
+                            eprintln!("  [geom B3] extrapolation raised R_H — staying on K₁");
+                        }
+                    }
+                } else {
+                    self.extrapolate_sampled()?;
+                }
+                for i in 0..2 {
+                    self.ws.dmm_descend(emin, emax, 1, 8.0, 0)?;
+                    if diag {
+                        let c = self.geom_cert()?;
+                        self.geom_log("B3", "dmm", &c, &format!("step {i} η=8"));
+                    }
+                }
+                ("B3", 2)
+            }
+            _ => {
+                return Err(DftbError::InvalidInput(
+                    "bold_geom called on a certified variant".into(),
+                ));
+            }
+        };
+        self.ws.mcweeny_polish_planned(1)?;
+        let c = if diag {
+            let c = self.geom_cert()?;
+            self.geom_log(tag, "McW", &c, "");
+            c
+        } else {
+            self.geom_trace()?
+        };
+        if !c.tr.is_finite() || (diag && !c.r_h.is_finite()) {
+            return Err(DftbError::InvalidInput(format!(
+                "{tag}: non-finite after McWeeny Tr={} R_H={}",
+                c.tr, c.r_h
+            )));
+        }
+        self.accept_geom_keep(tag, c, n_dmm, 1)
+    }
+
+    /// Same bookkeeping as `accept_geom`, without the R_H gate. The gate
+    /// was turning a 0.02 Å step into a cold solve.
+    fn accept_geom_keep(
+        &mut self,
+        tag: &str,
+        c: GeomCert,
+        n_dmm: usize,
+        n_mcw: usize,
+    ) -> Result<SparseDftbScc> {
+        let q_new = self.mulliken_checked(c.tr, 0)?;
+        self.ws.gpu().prof_tick("mull");
+        let mut rms = 0.0;
+        for a in 0..self.n_atom {
+            let d = q_new[a] - self.q[a];
+            rms += d * d;
+        }
+        rms = (rms / self.n_atom as f64).sqrt();
+        self.k_warm = true;
+        self.geom_outcome = GeomOutcome::Accept;
+        self.store_energy(
+            c.tr,
+            c.r_i,
+            1,
+            n_dmm,
+            rms,
+            c.r_h as f32,
+            PurifyStatus::Converged,
+        )?;
+        // One damped charge step. α = 1 rewrites H from a Mulliken
+        // distribution the kernel was not self-consistent with, and on a
+        // truncated mask that residual runs away. α = 0.2 tracks the
+        // charge without feeding the slosh.
+        for a in 0..self.n_atom {
+            self.q[a] += 0.2 * (q_new[a] - self.q[a]);
+        }
+        if c.r_h.is_finite() {
+            eprintln!(
+                "  [geom {tag}] KEEP  dmm={n_dmm} mcw={n_mcw} rms={rms:.3e} Tr={:.6} τ={:.4e} R_H={:.3e}",
+                c.tr, c.tau, c.r_h
+            );
+        } else {
+            eprintln!(
+                "  [geom {tag}] KEEP  dmm={n_dmm} mcw={n_mcw} rms={rms:.3e} Tr={:.6} τ={:.4e}",
+                c.tr, c.tau
+            );
+        }
+        Ok(SparseDftbScc {
+            n_iters: 1,
+            rms,
+            r_scc: rms,
+            tr_ks: c.tr as f32,
+            r_i: c.r_i,
+            r_h: c.r_h as f32,
+            purify_status: PurifyStatus::Converged,
+        })
+    }
+
+    /// Geometry step that already holds a projector. One short Newton update
+    /// of Z was done by the caller. Then commutator steps at the incoming
+    /// charges, the electron count restored, and a damped charge mix.
+    /// Replacing `q` by the raw Mulliken output each geometry (α = 1) sloshed
+    /// on R10: the residual grew ~4× per step until one commutator created
+    /// several electrons. Does not fall back to TC2.
+    fn scc_warm_geometry(&mut self, rms_tol: f64) -> Result<SparseDftbScc> {
+        const N_DMM: usize = 4;
+        // eta_scale = 8 is the single-displacement column recipe. Chained
+        // across a relaxation it makes η ≈ 1.7 on this spectrum, and each
+        // block then creates ~0.5 e⁻. Scaling them back moves E_band by
+        // ~0.3 Ha, so the reported energy climbs while the nuclei follow
+        // the force. Cap the step at half a Lipschitz step.
+        const ETA_CAP: f32 = 0.5;
+        const MAX_MIX: usize = 3;
+        // Qualitative charge agreement for a geometry step. Tighter than a
+        // slosh, looser than a cold SCF.
+        const RMS_OK: f64 = 1e-3;
+        let (emin, emax) = self.ws.spectral_bounds()?;
+        let width = (emax - emin).max(1e-6);
+        let eta = ETA_CAP * width;
+        let nocc = self.nocc as f64;
+        let t0 = std::time::Instant::now();
+        eprintln!(
+            "  [SparseDftb] warm DMM bounds emin={emin:.4} emax={emax:.4} η={ETA_CAP:.2} (scale {eta:.3})"
+        );
+        let mut tr = 0.0f64;
+        let mut tr_raw = 0.0f64;
+        let mut rms = f64::MAX;
+        let mut q_new = vec![0.0; self.n_atom];
+        let mut n_mix = 0usize;
+        for it in 0..MAX_MIX {
+            self.compute_v()?;
+            self.ws.build_hscc_from_v(&self.v_f32)?;
+            self.ws.refresh_b_zh()?;
+            let n_step = if it == 0 { N_DMM } else { 2 };
+            self.ws.dmm_descend(emin, emax, n_step, eta, 0)?;
+            tr_raw = self.ws.trace_of_ks()?;
+            tr = self.ws.restore_trace()?;
+            q_new = self.mulliken_checked(tr, it)?;
+            rms = 0.0;
+            for a in 0..self.n_atom {
+                let d = q_new[a] - self.q[a];
+                self.q_res[a] = d;
+                rms += d * d;
+            }
+            rms = (rms / self.n_atom as f64).sqrt();
+            n_mix = it + 1;
+            if !rms.is_finite() {
+                return Err(DftbError::InvalidInput(format!(
+                    "warm DMM mix {it}: non-finite charge rms={rms}"
+                )));
+            }
+            if rms < RMS_OK || rms < rms_tol {
+                self.q.copy_from_slice(&q_new);
+                break;
+            }
+            if it + 1 == MAX_MIX {
+                if rms > 2e-2 {
+                    return Err(DftbError::InvalidInput(format!(
+                        "warm DMM: charge rms={rms:.3e} after {MAX_MIX} mixes (Tr {tr_raw:.4}→{tr:.4}, Nocc={nocc}) — density is not following the charges"
+                    )));
+                }
+                // Still a fraction of an electron off. Take the damped step
+                // and let the next geometry continue; do not replace q outright.
+            }
+            if let Some(m) = &mut self.mixer {
+                m.mix(&mut self.q, &q_new, &self.q_res);
+            } else {
+                for a in 0..self.n_atom {
+                    self.q[a] += 0.5 * self.q_res[a];
+                }
+            }
+        }
+        self.k_warm = true;
+        self.store_energy(tr, 0.0, n_mix, N_DMM, rms, f32::NAN, PurifyStatus::Converged)?;
+        let info = SparseDftbScc {
+            n_iters: n_mix,
+            rms,
+            r_scc: rms,
+            tr_ks: tr as f32,
+            r_i: 0.0,
+            r_h: f32::NAN,
+            purify_status: PurifyStatus::Converged,
+        };
+        let info = self.finalize_scc(&q_new, info)?;
+        eprintln!(
+            "  [SparseDftb] warm DMM: {n_mix} mixes  rms={:.3e} (asked {rms_tol:.1e})  Tr {tr_raw:.6}→{tr:.6} (Nocc={nocc})  R_H={:.3e}  {:.1} ms",
+            info.rms,
+            info.r_h,
+            t0.elapsed().as_secs_f64() * 1e3
+        );
+        Ok(info)
     }
 
     /// Stationary finalization (F4): the reported state is
@@ -2690,6 +3349,12 @@ impl SparseDftb {
         let (kb, wb) =
             kw.unwrap_or_else(|| (self.ws.k().values.clone(), self.dw_ws.w().values.clone()));
         self.ws.pair_forces_dev(&kb, &wb)
+    }
+
+    /// Initial FIRE timestep (Å, mass = 1). The default 0.1 overshoots a
+    /// stiff Si–H well in a few steps.
+    pub fn set_fire_dt(&mut self, dt: f64) {
+        self.fire_dt = dt;
     }
 
     /// One FIRE step. Call `scc` first. Returns max |F|.

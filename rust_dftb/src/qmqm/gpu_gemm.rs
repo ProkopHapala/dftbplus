@@ -198,6 +198,68 @@ pub fn gemm_kernel(
     kb.build().map_err(map_ocl_err)
 }
 
+/// Warm-path DMM product for the SCC purify loop.
+///
+/// Shape is the measured general-GEMM winner at n=86, batch=400
+/// (11×11 threads × 8×8 register tile, k-stage 16, one workgroup per
+/// system — 0.138 ms, 3.68 TFLOPS). The workgroup tile is 88×88 and
+/// loops over the matrix, so the same kernel covers smaller and larger n.
+/// `active[work_ids[group]]==0` returns before any barrier.
+///
+/// Compile once (`dmm_regtile_program`), then one kernel per (A,B,C)
+/// binding (`dmm_regtile_kernel`). Threads per replica is `DMM_REGTILE_WG`.
+pub const DMM_REGTILE_WG: usize = 11 * 11;
+
+pub fn dmm_regtile_program(rt: &mut GpuRuntime) -> Result<ocl::Program> {
+    const TX: usize = 11;
+    const TY: usize = 11;
+    const RTX: usize = 8;
+    const RTY: usize = 8;
+    const TK: usize = 16;
+    let src = GPU_GEMM_TEMPLATE
+        .replace("#define GEMM_TX 8", &format!("#define GEMM_TX {TX}"))
+        .replace("#define GEMM_TY 8", &format!("#define GEMM_TY {TY}"))
+        .replace("#define GEMM_RTX 8", &format!("#define GEMM_RTX {RTX}"))
+        .replace("#define GEMM_RTY 8", &format!("#define GEMM_RTY {RTY}"))
+        .replace("#define GEMM_TK 16", &format!("#define GEMM_TK {TK}"))
+        .replace("#define GEMM_MASK 0", "#define GEMM_MASK 1");
+    rt.build_program(&src)
+}
+
+pub fn dmm_regtile_kernel(
+    rt: &GpuRuntime,
+    program: &ocl::Program,
+    n: usize,
+    batch: usize,
+    a: &Buffer<f32>,
+    b: &Buffer<f32>,
+    c: &Buffer<f32>,
+    active: &Buffer<i32>,
+    work_ids: &Buffer<i32>,
+) -> Result<Kernel> {
+    const TK: usize = 16;
+    const WM: usize = 11 * 8;
+    const WN: usize = 11 * 8;
+    let wg = DMM_REGTILE_WG;
+    Kernel::builder()
+        .program(program)
+        .name("gemm_regtile_masked")
+        .queue(rt.queue().clone())
+        .global_work_size(batch * wg)
+        .local_work_size(wg)
+        .arg(n as i32)
+        .arg(batch as i32)
+        .arg(a)
+        .arg(b)
+        .arg(c)
+        .arg_local::<f32>(TK * WM)
+        .arg_local::<f32>(TK * WN)
+        .arg(active)
+        .arg(work_ids)
+        .build()
+        .map_err(map_ocl_err)
+}
+
 /// Build the iterated symmetric-square kernel (`gemm_sq_iter`,
 /// GemmVariant::SqIter): D ← scl·D² for `niter` rounds in one launch.
 /// `b`/`c` are the global ping-pong pair (result lands in `c`); `errs`,

@@ -8,11 +8,14 @@ tags: [topic, wavefunction, grid, opencl, sto, visualization, cross-language]
 
 ## Summary
 
-Projects molecular orbital coefficients (from the LCAO eigenvector matrix) onto a
-real-space 3D grid or 2D plane using Slater-type orbital (STO) basis functions.
-The OpenCL GPU kernel evaluates `ψ(r) = Σ_i c_i · φ_i(r)` for each MO at each
-grid point, where `φ_i` are the atomic STO basis functions. Used to visualize
-HOMO, LUMO, and frontier orbitals after SCC convergence.
+Projects LCAO coefficients onto real-space points with Slater-type orbitals.
+Two kernels must not be mixed. `Grid.cl` is Γ-only and packs Fireball
+`[px, py, pz, s]`. `DFTBplusGrid.cl` `project_bloch_points` takes complex
+`C(k)` from DFTBcore in DFTB+ order (`s`, `py`, `pz`, `px`), repeats the home
+cell over an explicit image list, and applies `exp(−i 2π k·n)` itself.
+A density map is `Σ w |ψ|²` (Tersoff–Hamann), not a sum of the complex waves
+and not a density-matrix contraction, so the Bloch phase does not appear in `ρ`.
+How to run it: `doc/prokop/userguide/bloch_slice.md`.
 
 ## Implementations
 
@@ -25,7 +28,11 @@ HOMO, LUMO, and frontier orbitals after SCC convergence.
 | OpenCL | `pyBall/OCL/cl/Grid.cl` | active | GPU kernels for STO evaluation and projection. |
 | Python | `scripts/plot_wavefunctions.py` | active | End-to-end: reads Rust eigenvector TSV → GridProjector → 2D contour plot. |
 | Python | `tests/grid/test_waveplot_dftbcore.py` | reference | DFTBcore library → eigenvectors → GridProjector. The reference workflow. |
-| Fortran | `src/dftbp/waveplot/` | reference | Upstream waveplot (Fortran) — writes cube files. |
+| Fortran | `src/dftbp/waveplot/` | reference | Upstream waveplot (Fortran) — writes cube files. Phase convention matched by `project_bloch_points` (`exp(−ikr)` after the Fortran `dot_product`). |
+| OpenCL | `pyBall/OCL/cl/DFTBplusGrid.cl` `project_bloch_points` | active | k-resolved. One work-item per point. s+p only (`norb ≤ 4` per atom). |
+| Python | `pyBall/OCL/DFTBplusGridProjector.py` `project_bloch_points` | active | Host side. `C` is `(nstate, norb)` complex, raw home-cell eigenvectors. |
+| Python | `tests/grid/test_graphene_bloch2d.py` | active | 2-atom graphene, 3ob-3-1. CPU spline parity, K Bloch check, band-window maps. |
+| Python | `tests/grid/test_ribbon_bloch.py` | active | SPAMMM vacuum ribbons, mio-1-1. Near-EF |\ψ|² and one-state hue plots. Orthogonal cells only. |
 
 ## Data flow
 
@@ -42,13 +49,17 @@ Rust SCC → SccResult.eigenvectors (norb × norb, columns = MOs)
 
 ## Orbital ordering (critical)
 
-Both Rust and DFTB+ use tesseral/real spherical harmonics ordered by magnetic
-quantum number m:
-- l=0 (s): `[s]`
-- l=1 (p): `[py (m=-1), pz (m=0), px (m=+1)]` — NOT px,py,pz!
+DFTB+ and the Rust solver store real spherical harmonics as:
 
-This is documented in `rust_dftb/src/methods/dftb/rotation.rs:29-33` and handled
-by `evec_to_kernel_coeffs()` in `DFTBplusParser.py:1052-1084`.
+- l=0 (s): `[s]`
+- l=1 (p): `[py (m=-1), pz (m=0), px (m=+1)]`
+
+`project_bloch_points` consumes that order directly. Hydrogen is `s` only.
+
+`Grid.cl` does **not**. `evec_to_kernel_coeffs()` (`DFTBplusParser.py`)
+repacks a DFTB+ eigenvector into Fireball `[px, py, pz, s]` for that older
+kernel. Sending the repacked vector to `project_bloch_points`, or the raw
+DFTB+ vector to `Grid.cl`, swaps every p lobe.
 
 ## Parity Status
 
@@ -69,14 +80,27 @@ The sparse Chebyshev+Ritz eigensolver achieves machine-precision parity with
 dense diagonalization for benzene and coronene, and ~1e-5 for circumcoronene
 (with 30 filter iterations, Chebyshev degree 40).
 
+## Parity — k-resolved slice
+
+`test_graphene_bloch2d.py`, 3ob-3-1, plane at z = 1 Å:
+
+- GPU `project_bloch_points` vs an independent float32 CPU spline sum: max |\Δψ| ~ 1e-8 (Γ π, and a sum of occupied π states).
+- Bloch theorem at K = (2/3, 1/3), shifts of 1, 2, 3 cells along `a1`: max |ψ(r+ma1) − exp(−i 2π k_x m) ψ(r)| is 2e-8, 6e-8, 2e-7. |\ψ|² repeats to ~1e-8. The step of ψ across the cell edge is smaller than the interior steps.
+- Ribbon mirror pairs `1H-p` / `1H-d` match in total energy (Hamiltonian check, not a grid check): C −30.944143 Ha, N −33.075399 Ha, O −56.864447 Ha.
+
 ## Open Issues
 
+- **No cube-file comparison for the k-resolved kernel.** The check above is against a CPU copy of the same sum, not against `app/waveplot` cube output.
 - **No DFTB+ cube file comparison** — the Fortran waveplot writes `.cube` files;
   we could compare the Rust-projected grid against those for numerical parity.
 - **STO basis only** — the GridProjector uses STO basis from `wfc.mio-1-1.hsd`.
   For non-mio SK sets, the corresponding wfc file must be provided.
 - **2D only** — currently only 2D plane projections. 3D grid projection is
   supported by `project_orbital_dense()` but not wired into the plotting script.
+- **`project_bloch_points` is s+p only.** An atom with d orbitals raises. The point list is arbitrary, so a 3D sample is possible, but the drivers only cut a plane.
+- **`project_orbital_periodic` is a stub.** It ignores k. The k-resolved entry point is `project_bloch_points`.
+- **Ribbon driver is orthogonal vacuum cells.** Tilted self-junction stacks (`enumsj_*`) are refused. Complex eigenvectors are stored on the serial dense DFTBcore path only.
+- **SPAMMM `compute_stm` is a different STM.** Γ-only, optional exponential tail, no k-phase. Do not treat those maps as this projector.
 - **H atoms rejected by BSR4** — the sparse TC2 path requires 4 orbitals/atom,
   so H-containing systems can only use the dense eigenvector path for
   wavefunction projection.
@@ -92,4 +116,6 @@ dense diagonalization for benzene and coronene, and ~1e-5 for circumcoronene
 - `/scripts/plot_wavefunctions.py` — the plotting script.
 - `/rust_dftb/src/methods/dftb/hamiltonian.rs::SccResult` — eigenvectors field.
 - `/rust_dftb/src/bin/dftb_engine.rs::rhai_save_eigenvectors` — Rhai export.
-- `/tests/grid/test_waveplot_dftbcore.py` — reference workflow (DFTBcore lib).
+- `/tests/grid/test_waveplot_dftbcore.py` — Γ-only reference workflow (DFTBcore lib, `Grid.cl`).
+- `/doc/prokop/userguide/bloch_slice.md` — how to run the k-resolved slice.
+- `/tests/grid/test_graphene_bloch2d.py`, `/tests/grid/test_ribbon_bloch.py` — the two drivers.

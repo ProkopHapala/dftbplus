@@ -39,5 +39,7 @@ pub use scc::{
     apply_shift_padded, apply_shift_padded_into, energy_non_scc, eval_sparse_energy_forces,
     run_sparse_scc, SparseDftbEnergy,
 };
-pub use sparse_dftb::{valence_q0, SparseDftb, SparseDftbConfig, SparseDftbScc};
+pub use sparse_dftb::{
+    valence_q0, GeomOutcome, GeomStep, SparseDftb, SparseDftbConfig, SparseDftbScc,
+};
 pub use sparse_forces::{dw_from_k_padded, sparse_analytic_forces, unpad_to_physical};

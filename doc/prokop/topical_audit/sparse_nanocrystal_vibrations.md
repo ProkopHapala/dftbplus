@@ -6,6 +6,16 @@ tags: [topic, sparse, bsr4, vibrations, hessian, forces, gpu, nanocrystal, si, h
 
 # Sparse Nanocrystal Vibrations (Si/H)
 
+**Standing order (2026-09-22):**
+[`tasts/Sparse_Nanocrystal_Vibrations/Sparse_Performance.md`](../tasts/Sparse_Nanocrystal_Vibrations/Sparse_Performance.md)
+**§0**. The clock is the warm electronic solve: reuse `H,S,D` on the
+next FIRE/L-BFGS step, and measure it with a few finite-difference
+elements. A full Hessian and its diagonalization are not the job.
+The relaxation that uses that solve is
+[`Warm_Geometry_DM.md`](../tasts/Sparse_Nanocrystal_Vibrations/Warm_Geometry_DM.md)
+**§9** (R10, 2026-09-22: energy −311 → −314 Ha, ~180 ms/step, force
+still moving below 10⁻³).
+
 ## Summary
 
 Sparse GPU DFTB for Si/H nanocrystal vibrations (300–1000 atoms): BSR4,

@@ -18,6 +18,17 @@ use rust_dftb::methods::dftb::forces::{parse_all_repulsive, repulsive_energy};
 use rust_dftb::qmqm::gpu_dftb::GpuDftb;
 use rust_dftb::qmqm::gpu_dftb::SccStatus;
 
+extern "C" {
+    fn openblas_set_num_threads(n: i32);
+    fn openblas_get_num_threads() -> i32;
+    fn openblas_get_num_procs() -> i32;
+    fn openblas_get_parallel() -> i32;
+    fn openblas_get_config() -> *const libc_char;
+}
+// Avoid a libc dependency for one C string.
+#[allow(non_camel_case_types)]
+type libc_char = i8;
+
 const N_RUNS: usize = 3;
 
 fn bench_dftb(
@@ -186,7 +197,6 @@ const SCAN_SYSTEMS: &[ScanSystem] = &[
     },
 ];
 
-const NP: usize = 20; // 20x20 grid → batch 400
 const SCAN_D0: f64 = 1.0; // Å
 const SCAN_DSTEP: f64 = 0.05; // Å
 
@@ -203,16 +213,21 @@ fn xyz_file(name: &str) -> rust_dftb::io::XyzMolecule {
     panic!("cannot load {name}");
 }
 
-fn scan_geoms(base: &[[f64; 3]], j1: Junction, j2: Junction) -> Vec<[f64; 3]> {
-    let mut all = Vec::with_capacity(NP * NP * base.len());
-    for i1 in 0..NP {
-        for i2 in 0..NP {
+fn scan_geoms(base: &[[f64; 3]], j1: Junction, j2: Junction, np: usize) -> Vec<[f64; 3]> {
+    let mut all = Vec::with_capacity(np * np * base.len());
+    for i1 in 0..np {
+        for i2 in 0..np {
             let mut g = base.to_vec();
             for &(moved, donor, acc) in &[j1, j2] {
-                let d = if (moved, donor, acc) == j1 {
-                    SCAN_D0 + i1 as f64 * SCAN_DSTEP
+                // Same physical window as the original 20×20 grid (d ∈ [1.0, 1.95] Å).
+            // A larger np only densifies that window — stretching d past ~2 Å
+            // drives overlap eigenvalues negative on these junctions.
+            let span = 19.0 * SCAN_DSTEP;
+            let step = if np <= 1 { 0.0 } else { span / (np - 1) as f64 };
+            let d = if (moved, donor, acc) == j1 {
+                    SCAN_D0 + i1 as f64 * step
                 } else {
-                    SCAN_D0 + i2 as f64 * SCAN_DSTEP
+                    SCAN_D0 + i2 as f64 * step
                 };
                 let mut u = [0.0f64; 3];
                 for c in 0..3 {
@@ -231,12 +246,15 @@ fn scan_geoms(base: &[[f64; 3]], j1: Junction, j2: Junction) -> Vec<[f64; 3]> {
 
 /// Time one CPU f64 point (SCC + repulsive + forces) — the sequential
 /// baseline the GPU batch replaces.
-fn cpu_point_ms(
+/// Equilibrium single point at the same kT as the GPU run.
+/// Returns (wall ms, electronic+repulsive energy, Mulliken charges).
+fn cpu_point(
     sk: &rust_dftb::SkData,
     sk_dir: &str,
     species: &[String],
     coords: &[[f64; 3]],
-) -> f64 {
+    kt: f64,
+) -> (f64, f64, Vec<f64>) {
     let mut unique: Vec<String> = Vec::new();
     for s in species {
         if !unique.contains(s) {
@@ -246,15 +264,64 @@ fn cpu_point_ms(
     let repulsive = parse_all_repulsive(sk_dir, &unique, unique.len()).unwrap();
     let mut cpu = DftbCpu::new(sk.clone(), species.to_vec()).unwrap();
     cpu.update_geometry(coords).unwrap();
-    cpu.set_smearing(0.002);
+    cpu.set_smearing(kt);
     let t0 = std::time::Instant::now();
     cpu.reset_charges();
     cpu.solve_scc(200, 1e-8).unwrap();
     let scc = cpu.build_result();
     let e = scc.energy + repulsive_energy(sk_dir, species, coords).unwrap();
     let _f = cpu.compute_forces(&scc, &repulsive).unwrap();
-    eprintln!("  CPU ref: E={e:.6} q={:?}", scc.charges);
-    t0.elapsed().as_secs_f64() * 1e3
+    let ms = t0.elapsed().as_secs_f64() * 1e3;
+    eprintln!("  CPU ref: E={e:.6} Ha  kT={kt}  {ms:.1} ms  q={:?}", scc.charges);
+    (ms, e, scc.charges)
+}
+
+/// `nthreads` operating-system threads, each with its own `DftbCpu`.
+/// `blas_threads` is process-global and must be set only while no BLAS
+/// call is in flight — OpenBLAS's pthread build has one pool, and
+/// calling the setter from inside a worker restarts that pool.
+fn cpu_batch_ms(
+    sk: &rust_dftb::SkData,
+    species: &[String],
+    coords: &[[f64; 3]],
+    batch: usize,
+    kt: f64,
+    nthreads: usize,
+    blas_threads: i32,
+) -> f64 {
+    let nthreads = nthreads.max(1).min(batch);
+    let coords = coords.to_vec();
+    unsafe { openblas_set_num_threads(blas_threads) };
+    let blas_now = unsafe { openblas_get_num_threads() };
+    let t0 = std::time::Instant::now();
+    std::thread::scope(|scope| {
+        for t in 0..nthreads {
+            let sk = sk.clone();
+            let species = species.to_vec();
+            let coords = coords.clone();
+            scope.spawn(move || {
+                let mut cpu = DftbCpu::new(sk, species).unwrap_or_else(|e| {
+                    panic!("DftbCpu::new thread {t}: {e}")
+                });
+                cpu.set_smearing(kt);
+                for s in (t..batch).step_by(nthreads) {
+                    cpu.update_geometry(&coords).unwrap_or_else(|e| {
+                        panic!("update_geometry thread {t} sys {s}: {e}")
+                    });
+                    cpu.reset_charges();
+                    cpu.solve_scc(200, 1e-8).unwrap_or_else(|e| {
+                        panic!("solve_scc thread {t} sys {s}: {e}")
+                    });
+                }
+            });
+        }
+    });
+    let ms = t0.elapsed().as_secs_f64() * 1e3;
+    eprintln!(
+        "  CPU os={nthreads} blas={blas_now}: {batch}× equilibrium  {ms:.1} ms  {:.1} sys/s",
+        batch as f64 / (ms / 1e3)
+    );
+    ms
 }
 
 #[test]
@@ -265,10 +332,17 @@ fn test_gpu_scc_scan400_benchmark() {
         return;
     };
 
-    eprintln!(
-        "=== 20x20 scan benchmark (batch={}): production GpuDftb, kT=0.002, tol=1e-6 ===",
-        NP * NP
-    );
+    unsafe {
+        let cfg = openblas_get_config();
+        let cfg = std::ffi::CStr::from_ptr(cfg as *const std::ffi::c_char);
+        eprintln!(
+            "OpenBLAS config={} parallel={} (0=serial,1=OpenMP,2=pthread) procs={}",
+            cfg.to_string_lossy(),
+            openblas_get_parallel(),
+            openblas_get_num_procs()
+        );
+    }
+    eprintln!("=== scan benchmark: production GpuDftb, tol=1e-6 ===");
     // §16.D: optional subset filter for A/B runs (comma list of names).
     let only: Option<Vec<String>> = std::env::var("RUST_DFTB_BENCH_SYSTEMS")
         .ok()
@@ -297,25 +371,80 @@ fn test_gpu_scc_scan400_benchmark() {
         let sp = xyz.species.clone();
         let base = xyz.coords.clone();
         let sk = load_sk_for_species(&sk_dir, &sp).unwrap();
-        let geoms = scan_geoms(&base, sys.j1, sys.j2);
+        let kt: f32 = std::env::var("RUST_DFTB_BENCH_KT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.002);
+        let batches: Vec<usize> = std::env::var("RUST_DFTB_BENCH_BATCHES")
+            .ok()
+            .map(|s| {
+                s.split(',')
+                    .filter_map(|x| x.trim().parse().ok())
+                    .collect()
+            })
+            .filter(|v: &Vec<usize>| !v.is_empty())
+            .unwrap_or_else(|| vec![1, 100, 400]);
+        let n_runs: usize = std::env::var("RUST_DFTB_BENCH_RUNS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(N_RUNS);
+        let np = batches.iter().copied().max().unwrap_or(400).max(400);
+        let np = (np as f64).sqrt().ceil() as usize;
+        let geoms = scan_geoms(&base, sys.j1, sys.j2, np);
         let n_atoms = sp.len();
 
-        // CPU single-point baseline (base geometry).
-        let cpu_ms = cpu_point_ms(&sk, &sk_dir, &sp, &base);
+        // CPU single-point baseline — equilibrium geometry, same kT.
+        let (cpu_ms, cpu_e, cpu_q) = cpu_point(&sk, &sk_dir, &sp, &base, kt as f64);
+        {
+            let mut eng = GpuDftb::new(sk.clone(), &sk_dir, sp.clone(), base.clone(), 1)
+                .unwrap_or_else(|e| panic!("GpuDftb::new {} accuracy: {e}", sys.name));
+            eng.set_smearing(kt as f32);
+            let s = eng
+                .scc(100, 1e-6)
+                .unwrap_or_else(|e| panic!("scc {} accuracy: {e}", sys.name));
+            let q = eng.plan.read_charges(&eng.rt).unwrap();
+            let mut dq = 0.0f64;
+            for (a, &qc) in cpu_q.iter().enumerate() {
+                dq = dq.max((q[a] as f64 - qc).abs());
+            }
+            eprintln!(
+                "  ACCURACY {} equilibrium kT={kt}: max|Δq|={dq:.3e} e   SCC rms={:.3e} iters={} status={:?}   CPU E={cpu_e:.6} Ha  (Mulliken of the SCC density, before finalize)",
+                sys.name, s.rms, s.n_iters, s.statuses.first()
+            );
+        }
 
-        for &batch in &[1usize, 100, NP * NP] {
+        // Eight copies: one per physical core. Three layouts —
+        //   os=1 blas=1   one core, the denominator
+        //   os=1 blas=8   one diagonalization, OpenBLAS spreads it
+        //   os=8 blas=1   eight independent diagonalizations
+        let cpu_n = 8usize;
+        let one_ms = cpu_batch_ms(&sk, &sp, &base, cpu_n, kt as f64, 1, 1) / cpu_n as f64;
+        let wide = cpu_batch_ms(&sk, &sp, &base, cpu_n, kt as f64, 1, 8) / cpu_n as f64;
+        let indep = cpu_batch_ms(&sk, &sp, &base, cpu_n, kt as f64, 8, 1) / cpu_n as f64;
+        eprintln!(
+            "  CPU layouts {}  1×blas1 {:.1} ms/sys | 1×blas8 {:.1} ms/sys ({:.1}×) | 8×blas1 {:.1} ms/sys ({:.1}×)",
+            sys.name,
+            one_ms,
+            wide,
+            one_ms / wide,
+            indep,
+            one_ms / indep
+        );
+        let _ = cpu_ms;
+
+        for &batch in &batches {
+            if batch * n_atoms > geoms.len() {
+                eprintln!("  skip {batch}: grid has {} geometries", geoms.len() / n_atoms);
+                continue;
+            }
             let coords = &geoms[..batch * n_atoms];
             let mut eng = GpuDftb::new(sk.clone(), &sk_dir, sp.clone(), coords.to_vec(), batch)
                 .unwrap_or_else(|e| panic!("GpuDftb::new {} batch={batch}: {e}", sys.name));
-            let kt: f32 = std::env::var("RUST_DFTB_BENCH_KT")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0.002);
-            eng.set_smearing(kt);
+            eng.set_smearing(kt as f32);
             let mut total = 0.0f64;
             let mut iters = 0usize;
             let mut n_failed = 0usize;
-            for _ in 0..N_RUNS {
+            for _ in 0..n_runs {
                 eng.reset_q0().unwrap();
                 let t0 = std::time::Instant::now();
                 let s = eng
@@ -331,8 +460,8 @@ fn test_gpu_scc_scan400_benchmark() {
                     .filter(|st| **st == SccStatus::Failed)
                     .count();
             }
-            if std::env::var("RUST_DFTB_PROF").is_ok() && batch == NP * NP {
-                eng.prof_report("scan400");
+            if std::env::var("RUST_DFTB_PROF").is_ok() {
+                eng.prof_report(&format!("batch={batch}"));
             }
             let t0 = std::time::Instant::now();
             let ev = eng.eval(true).unwrap();
@@ -342,13 +471,885 @@ fn test_gpu_scc_scan400_benchmark() {
                 eng.rt.read_buffer(&eng.plan.q_gpu, &mut q).unwrap();
                 eprintln!("  q0(replica0): {q:?}");
             }
-            let scc_ms = total / N_RUNS as f64;
+            let scc_ms = total / n_runs as f64;
             let speedup = cpu_ms * batch as f64 / scc_ms;
             let n_orbs = eng.n();
             eprintln!("{:>11} {:>5} {:>5} {:>7} | {:>9.2} {:>5} {:>8.3} {:>9.1} | {:>8.2} | {:>9.2} {:>7.1}x  failed={n_failed} E0={:.6}",
                 sys.name, n_atoms, n_orbs, batch, scc_ms, iters,
                 scc_ms / iters.max(1) as f64, batch as f64 / (scc_ms / 1e3), eval_ms,
                 cpu_ms, speedup, ev.energy[0]);
+        }
+    }
+}
+
+/// One small step along the forces of the optimized geometry.
+/// rms(|δr|) = `rms_ang` Å. Direction is the Cartesian force.
+fn step_along_forces(coords: &[[f64; 3]], forces: &[[f64; 3]], rms_ang: f64) -> Vec<[f64; 3]> {
+    assert_eq!(coords.len(), forces.len());
+    let na = coords.len() as f64;
+    let mut n2 = 0.0f64;
+    for f in forces {
+        n2 += f[0] * f[0] + f[1] * f[1] + f[2] * f[2];
+    }
+    let n = n2.sqrt().max(1e-30);
+    let scale = rms_ang * na.sqrt() / n;
+    coords
+        .iter()
+        .zip(forces)
+        .map(|(r, f)| [r[0] + scale * f[0], r[1] + scale * f[1], r[2] + scale * f[2]])
+        .collect()
+}
+
+fn replicate(coords: &[[f64; 3]], batch: usize) -> Vec<[f64; 3]> {
+    let mut all = Vec::with_capacity(batch * coords.len());
+    for _ in 0..batch {
+        all.extend_from_slice(coords);
+    }
+    all
+}
+
+/// Eight independent `dsyevd`s, one BLAS thread each.
+/// `seed` Some = warm charges from the G0 solution; None = atomic q0.
+/// Returns (wall ms, iters on thread 0's last system).
+fn cpu_geom_step_ms(
+    sk: &rust_dftb::SkData,
+    species: &[String],
+    g1: &[[f64; 3]],
+    batch: usize,
+    kt: f64,
+    nthreads: usize,
+    seed: Option<&[f64]>,
+) -> (f64, usize) {
+    let nthreads = nthreads.max(1).min(batch);
+    let g1 = g1.to_vec();
+    let seed = seed.map(|q| q.to_vec());
+    unsafe { openblas_set_num_threads(1) };
+    let iters = std::sync::Mutex::new(0usize);
+    let t0 = std::time::Instant::now();
+    std::thread::scope(|scope| {
+        for t in 0..nthreads {
+            let sk = sk.clone();
+            let species = species.to_vec();
+            let g1 = g1.clone();
+            let seed = seed.clone();
+            let iters = &iters;
+            scope.spawn(move || {
+                let mut cpu = DftbCpu::new(sk, species).unwrap_or_else(|e| {
+                    panic!("DftbCpu::new thread {t}: {e}")
+                });
+                cpu.set_smearing(kt);
+                let mut last = 0usize;
+                for s in (t..batch).step_by(nthreads) {
+                    cpu.update_geometry(&g1).unwrap_or_else(|e| {
+                        panic!("update_geometry thread {t} sys {s}: {e}")
+                    });
+                    if let Some(q) = &seed {
+                        cpu.set_charges(q);
+                    } else {
+                        cpu.reset_charges();
+                    }
+                    cpu.solve_scc(200, 1e-8).unwrap_or_else(|e| {
+                        panic!("solve_scc thread {t} sys {s}: {e}")
+                    });
+                    last = cpu.n_scc_iter;
+                }
+                if t == 0 {
+                    *iters.lock().unwrap() = last;
+                }
+            });
+        }
+    });
+    let n_iter = *iters.lock().unwrap();
+    (t0.elapsed().as_secs_f64() * 1e3, n_iter)
+}
+
+struct WarmRow {
+    sys: String,
+    n: usize,
+    method: &'static str,
+    ms: f64,
+    iters: usize,
+    failed: usize,
+    dq: f64,
+}
+
+fn q_delta(eng: &mut GpuDftb, q_ref: &[f64], n_atoms: usize) -> f64 {
+    let mut q = vec![0.0f32; n_atoms];
+    eng.rt.read_buffer(&eng.plan.q_gpu, &mut q).unwrap();
+    let mut m = 0.0f64;
+    for a in 0..n_atoms {
+        m = m.max((q[a] as f64 - q_ref[a]).abs());
+    }
+    m
+}
+
+fn gpu_scc_timed(eng: &mut GpuDftb, rms_tol: f32) -> (f64, usize, usize) {
+    let t0 = std::time::Instant::now();
+    let s = eng.scc(100, rms_tol).unwrap_or_else(|e| panic!("scc: {e}"));
+    let ms = t0.elapsed().as_secs_f64() * 1e3;
+    let failed = s.statuses.iter().filter(|st| **st == SccStatus::Failed).count();
+    (ms, s.n_iters, failed)
+}
+
+/// Geometry-step comparison. Converge at the xyz geometry, take one
+/// 0.02 Å-rms step along the forces, time the next SCC. Every method
+/// sees the same G1. Warm rows carry that method's own converged
+/// charges (and, for purify, K). Cold rows start from atomic charges.
+/// CPU is 8 OS threads × 1 BLAS thread. Not a random matrix.
+#[test]
+#[ignore]
+fn test_gpu_warm_step_benchmark() {
+    let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else {
+        eprintln!("Skipping: RUST_DFTB_SK_DIR not set");
+        return;
+    };
+    unsafe {
+        let cfg = openblas_get_config();
+        let cfg = std::ffi::CStr::from_ptr(cfg as *const std::ffi::c_char);
+        eprintln!(
+            "OpenBLAS config={} parallel={} procs={}",
+            cfg.to_string_lossy(),
+            openblas_get_parallel(),
+            openblas_get_num_procs()
+        );
+    }
+    let batch: usize = std::env::var("RUST_DFTB_WARM_BATCH")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8);
+    let kt = 0.0;
+    let only: Option<Vec<String>> = std::env::var("RUST_DFTB_BENCH_SYSTEMS")
+        .ok()
+        .map(|s| s.split(',').map(|x| x.trim().to_string()).collect());
+    let want = ["formic", "GC", "diazaphen", "DTH"];
+    let mut rows: Vec<WarmRow> = Vec::new();
+    eprintln!("=== warm geometry step: batch={batch} kT=0 rms=0.02 Å ===");
+    for sys in SCAN_SYSTEMS {
+        if !want.contains(&sys.name) {
+            continue;
+        }
+        if let Some(o) = &only {
+            if !o.iter().any(|x| x == sys.name) {
+                continue;
+            }
+        }
+        let xyz = xyz_file(sys.file);
+        let sp = xyz.species.clone();
+        let g0 = xyz.coords.clone();
+        let n_atoms = g0.len();
+        let sk = load_sk_for_species(&sk_dir, &sp).unwrap();
+        let mut unique: Vec<String> = Vec::new();
+        for s in &sp {
+            if !unique.contains(s) {
+                unique.push(s.clone());
+            }
+        }
+        let repulsive = parse_all_repulsive(&sk_dir, &unique, unique.len()).unwrap();
+        let mut cpu = DftbCpu::new(sk.clone(), sp.clone()).unwrap();
+        cpu.update_geometry(&g0).unwrap();
+        cpu.set_smearing(kt);
+        cpu.reset_charges();
+        cpu.solve_scc(200, 1e-8).unwrap_or_else(|e| panic!("G0 {}: {e}", sys.name));
+        let scc = cpu.build_result();
+        let q_g0 = scc.charges.clone();
+        let forces = cpu.compute_forces(&scc, &repulsive).unwrap();
+        let g1 = step_along_forces(&g0, &forces.forces, 0.02);
+        let mut d2 = 0.0f64;
+        for a in 0..n_atoms {
+            for c in 0..3 {
+                let d = g1[a][c] - g0[a][c];
+                d2 += d * d;
+            }
+        }
+        eprintln!(
+            "-- {} atoms={n_atoms} step_rms={:.4} Å  G0 iters={}",
+            sys.name,
+            (d2 / n_atoms as f64).sqrt(),
+            cpu.n_scc_iter
+        );
+        let mut cpu_w = DftbCpu::new(sk.clone(), sp.clone()).unwrap();
+        cpu_w.update_geometry(&g1).unwrap();
+        cpu_w.set_smearing(kt);
+        cpu_w.set_charges(&q_g0);
+        cpu_w.solve_scc(200, 1e-8).unwrap_or_else(|e| panic!("CPU warm q {}: {e}", sys.name));
+        let q_ref = cpu_w.charges.clone();
+
+        let (ms, iters) = cpu_geom_step_ms(&sk, &sp, &g1, batch, kt, 8, None);
+        rows.push(WarmRow { sys: sys.name.into(), n: 0, method: "cpu 8×1 cold", ms, iters, failed: 0, dq: 0.0 });
+        let (ms, iters) = cpu_geom_step_ms(&sk, &sp, &g1, batch, kt, 8, Some(&q_g0));
+        rows.push(WarmRow { sys: sys.name.into(), n: 0, method: "cpu 8×1 warm", ms, iters, failed: 0, dq: 0.0 });
+
+        unsafe { std::env::remove_var("RUST_DFTB_EIGSOLVER") };
+        let mut eng = GpuDftb::new(sk.clone(), &sk_dir, sp.clone(), replicate(&g1, batch), batch)
+            .unwrap_or_else(|e| panic!("jacobi cold {}: {e}", sys.name));
+        eng.set_smearing(kt as f32);
+        let (ms, iters, failed) = gpu_scc_timed(&mut eng, 1e-6);
+        let dq = q_delta(&mut eng, &q_ref, n_atoms);
+        let n_orbs = eng.n();
+        rows.push(WarmRow { sys: sys.name.into(), n: n_orbs, method: "gpu jacobi cold", ms, iters, failed, dq });
+        drop(eng);
+
+        let mut eng = GpuDftb::new(sk.clone(), &sk_dir, sp.clone(), replicate(&g0, batch), batch)
+            .unwrap_or_else(|e| panic!("jacobi warm {}: {e}", sys.name));
+        eng.set_smearing(kt as f32);
+        eng.scc(100, 1e-6).unwrap_or_else(|e| panic!("jacobi G0 {}: {e}", sys.name));
+        let t0 = std::time::Instant::now();
+        eng.set_coords(&replicate(&g1, batch)).unwrap();
+        let geom_ms = t0.elapsed().as_secs_f64() * 1e3;
+        let (ms, iters, failed) = gpu_scc_timed(&mut eng, 1e-3);
+        eprintln!("  jacobi warm geom={geom_ms:.1} ms  scc={ms:.1} ms");
+        let dq = q_delta(&mut eng, &q_ref, n_atoms);
+        rows.push(WarmRow { sys: sys.name.into(), n: n_orbs, method: "gpu jacobi warm", ms, iters, failed, dq });
+        drop(eng);
+
+        unsafe { std::env::set_var("RUST_DFTB_EIGSOLVER", "purify") };
+        let mut eng = GpuDftb::new(sk.clone(), &sk_dir, sp.clone(), replicate(&g0, batch), batch)
+            .unwrap_or_else(|e| panic!("purify {}: {e}", sys.name));
+        eng.set_smearing(kt as f32);
+        eng.scc(100, 1e-6).unwrap_or_else(|e| panic!("purify G0 {}: {e}", sys.name));
+        let t0 = std::time::Instant::now();
+        eng.set_coords_keep_k(&replicate(&g1, batch)).unwrap();
+        let geom_ms = t0.elapsed().as_secs_f64() * 1e3;
+        let (ms, iters, failed) = gpu_scc_timed(&mut eng, 1e-6);
+        eprintln!("  purify warm geom={geom_ms:.1} ms  scc={ms:.1} ms");
+        let dq = q_delta(&mut eng, &q_ref, n_atoms);
+        rows.push(WarmRow { sys: sys.name.into(), n: n_orbs, method: "gpu purify warm", ms, iters, failed, dq });
+        eng.reset_q0().unwrap();
+        let (ms, iters, failed) = gpu_scc_timed(&mut eng, 1e-6);
+        let dq = q_delta(&mut eng, &q_ref, n_atoms);
+        rows.push(WarmRow { sys: sys.name.into(), n: n_orbs, method: "gpu purify cold", ms, iters, failed, dq });
+        drop(eng);
+        for r in rows.iter_mut().rev() {
+            if r.sys != sys.name {
+                break;
+            }
+            if r.n == 0 {
+                r.n = n_orbs;
+            }
+        }
+    }
+    eprintln!("\n| system | n | method | wall ms | iters | sys/s | failed | max\\|Δq\\| vs CPU warm |");
+    eprintln!("|---|---|---|---|---|---|---|---|");
+    for r in &rows {
+        let rate = batch as f64 / (r.ms / 1e3);
+        eprintln!(
+            "| {} | {} | {} | {:.1} | {} | {:.1} | {} | {:.3e} |",
+            r.sys, r.n, r.method, r.ms, r.iters, rate, r.failed, r.dq
+        );
+    }
+}
+
+fn csv_throughput(system: &str, n: usize, batch: usize, method: &str, ms: f64, iters: usize, failed: usize, dq: f64) {
+    if std::env::var_os("RUST_DFTB_SWEEP_NOCSV").is_some() {
+        eprintln!("  {system} n={n} batch={batch}  {method}  {ms:.1} ms  {iters} iters  failed={failed}  dq={dq:.3e}");
+        return;
+    }
+    let dir = "/home/prokop/git/dftbplus/debug/dense_multi";
+    std::fs::create_dir_all(dir).unwrap();
+    let path = format!("{dir}/throughput.csv");
+    let new = !std::path::Path::new(&path).exists();
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&path).unwrap();
+    if new {
+        use std::io::Write;
+        writeln!(f, "system,n,batch,method,wall_ms,iters,sys_per_s,failed,dq").unwrap();
+    }
+    use std::io::Write;
+    let rate = batch as f64 / (ms / 1e3);
+    writeln!(f, "{system},{n},{batch},{method},{ms:.3},{iters},{rate:.2},{failed},{dq:.6e}").unwrap();
+    eprintln!("  {system} n={n} batch={batch}  {method}  {ms:.1} ms  {iters} iters  {rate:.1} sys/s  failed={failed}  dq={dq:.3e}");
+}
+
+fn time_masked(eng: &mut GpuDftb, b: usize, bmax: usize, cold: bool, rms_tol: f32) -> (f64, usize, usize) {
+    if cold {
+        eng.plan.set_basis_warm(false);
+        eng.reset_q0().unwrap();
+    }
+    eng.rt.finish().unwrap();
+    let mask: Vec<bool> = (0..bmax).map(|i| i < b).collect();
+    let t0 = std::time::Instant::now();
+    let s = eng.scc_masked(100, rms_tol, &mask).unwrap_or_else(|e| panic!("scc_masked b={b}: {e}"));
+    let ms = t0.elapsed().as_secs_f64() * 1e3;
+    let failed = s.statuses.iter().take(b).filter(|st| **st == SccStatus::Failed).count();
+    (ms, s.n_iters, failed)
+}
+
+/// Throughput vs batch. One engine at Bmax; smaller batches are the first
+/// B replicas with the launch domain shrunk to B. The density guess is
+/// restored before every warm point, so each batch starts from the same
+/// G0 solution at the perturbed geometry. CPU "8 threads" is 8 OS threads
+/// × 1 BLAS thread. CPU "1 thread" is a single dsyevd.
+#[test]
+#[ignore]
+fn test_gpu_throughput_sweep() {
+    let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else {
+        eprintln!("Skipping: RUST_DFTB_SK_DIR not set");
+        return;
+    };
+    let bmax: usize = std::env::var("RUST_DFTB_SWEEP_BMAX").ok().and_then(|s| s.parse().ok()).unwrap_or(400);
+    let batches: Vec<usize> = std::env::var("RUST_DFTB_SWEEP_BATCHES")
+        .ok()
+        .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).filter(|&b| b >= 1 && b <= bmax).collect())
+        .unwrap_or_else(|| vec![8, 16, 32, 64, 128, 256, 400].into_iter().filter(|&b| b <= bmax).collect());
+    let only = std::env::var("RUST_DFTB_BENCH_SYSTEMS").unwrap_or_else(|_| "formic".into());
+    let sys = SCAN_SYSTEMS.iter().find(|s| s.name == only).unwrap_or_else(|| panic!("unknown system {only}"));
+    let kt = 0.0f64;
+    unsafe {
+        openblas_set_num_threads(1);
+        std::env::set_var("RUST_DFTB_SCC_QUIET", "1");
+    }
+    let xyz = xyz_file(sys.file);
+    let sp = xyz.species.clone();
+    let g0 = xyz.coords.clone();
+    let n_atoms = g0.len();
+    let sk = load_sk_for_species(&sk_dir, &sp).unwrap();
+    let mut unique: Vec<String> = Vec::new();
+    for s in &sp {
+        if !unique.contains(s) { unique.push(s.clone()); }
+    }
+    let repulsive = parse_all_repulsive(&sk_dir, &unique, unique.len()).unwrap();
+    let mut cpu = DftbCpu::new(sk.clone(), sp.clone()).unwrap();
+    cpu.update_geometry(&g0).unwrap();
+    cpu.set_smearing(kt);
+    cpu.reset_charges();
+    cpu.solve_scc(200, 1e-8).unwrap_or_else(|e| panic!("G0 {}: {e}", sys.name));
+    let scc = cpu.build_result();
+    let q_g0 = scc.charges.clone();
+    let forces = cpu.compute_forces(&scc, &repulsive).unwrap();
+    let g1 = step_along_forces(&g0, &forces.forces, 0.02);
+    let mut cpu_w = DftbCpu::new(sk.clone(), sp.clone()).unwrap();
+    cpu_w.update_geometry(&g1).unwrap();
+    cpu_w.set_smearing(kt);
+    cpu_w.set_charges(&q_g0);
+    cpu_w.solve_scc(200, 1e-8).unwrap();
+    let q_ref = cpu_w.charges.clone();
+    eprintln!("=== throughput sweep {} bmax={bmax} batches={batches:?} ===", sys.name);
+
+    let (ms, iters) = cpu_geom_step_ms(&sk, &sp, &g1, 8, kt, 1, Some(&q_g0));
+    csv_throughput(sys.name, 0, 8, "cpu 1 thread, warm", ms, iters, 0, 0.0);
+    if ms < 800.0 {
+        let (ms2, iters2) = cpu_geom_step_ms(&sk, &sp, &g1, 32, kt, 1, Some(&q_g0));
+        csv_throughput(sys.name, 0, 32, "cpu 1 thread, warm", ms2, iters2, 0, 0.0);
+    }
+    let cpu_max: usize = std::env::var("RUST_DFTB_SWEEP_CPU_MAX").ok().and_then(|s| s.parse().ok()).unwrap_or(usize::MAX);
+    let mut last_cpu = 0.0f64;
+    for &b in &batches {
+        if b < 8 || b > cpu_max { continue; }
+        if last_cpu > 2000.0 { break; }
+        let (ms, iters) = cpu_geom_step_ms(&sk, &sp, &g1, b, kt, 8, Some(&q_g0));
+        csv_throughput(sys.name, 0, b, "cpu 8 threads, warm", ms, iters, 0, 0.0);
+        let (ms_c, iters_c) = cpu_geom_step_ms(&sk, &sp, &g1, b, kt, 8, None);
+        csv_throughput(sys.name, 0, b, "cpu 8 threads, cold", ms_c, iters_c, 0, 0.0);
+        last_cpu = ms.max(ms_c);
+    }
+
+    if std::env::var("RUST_DFTB_SWEEP_SKIP_GPU").is_ok() { return; }
+    let started = std::time::Instant::now();
+    for (solver, label_w, label_c) in [("jacobi", "gpu jacobi warm", "gpu jacobi cold"), ("purify", "gpu purify warm", "gpu purify cold")] {
+        if solver == "jacobi" {
+            unsafe { std::env::remove_var("RUST_DFTB_EIGSOLVER") };
+        } else {
+            unsafe { std::env::set_var("RUST_DFTB_EIGSOLVER", "purify") };
+        }
+        let mut eng = GpuDftb::new(sk.clone(), &sk_dir, sp.clone(), replicate(&g0, bmax), bmax)
+            .unwrap_or_else(|e| panic!("{solver} new: {e}"));
+        eng.set_smearing(kt as f32);
+        eng.scc(100, 1e-6).unwrap_or_else(|e| panic!("{solver} G0: {e}"));
+        eng.set_coords_keep_k(&replicate(&g1, bmax)).unwrap();
+        let guess = eng.plan.capture_density(&eng.rt).unwrap();
+        let n_orbs = eng.n();
+        for &b in &batches {
+            if started.elapsed().as_secs() > 45 {
+                eprintln!("sweep budget: stop before {solver} batch={b}");
+                break;
+            }
+            eng.plan.restore_density(&eng.rt, &guess).unwrap();
+            eng.plan.reset_diis(&eng.rt).unwrap();
+            let prof = std::env::var_os("RUST_DFTB_SWEEP_PROF").is_some();
+            let ktime = std::env::var("RUST_DFTB_KTIME").ok().as_deref() == Some("1");
+            if prof { eng.prof_reset(); }
+            if ktime { eng.plan.ktime_begin(); }
+            // Jacobi warm 1e-3: |ΔE| ≤ 0.07 meV vs 1e-6 on formic/GC/diazaphen/DTH
+            // (test_scc_rms_stop). Purify stays at 1e-6 — 1e-3 fails DTH.
+            // Published throughput curves are still the 1e-6 grid.
+            let warm_tol = if solver == "jacobi" { 1e-3 } else { 1e-6 };
+            let (ms, iters, failed) = time_masked(&mut eng, b, bmax, false, warm_tol);
+            if ktime { eng.plan.ktime_report(&format!("{label_w} wall={ms:.1} ms iters={iters}")); }
+            if prof { eng.prof_report(&format!("{label_w} iters={iters}")); }
+            let dq = q_delta(&mut eng, &q_ref, n_atoms);
+            csv_throughput(sys.name, n_orbs, b, label_w, ms, iters, failed, dq);
+            if prof { eng.prof_reset(); }
+            if ktime { eng.plan.ktime_begin(); }
+            let (ms, iters, failed) = time_masked(&mut eng, b, bmax, true, 1e-6);
+            if ktime { eng.plan.ktime_report(&format!("{label_c} wall={ms:.1} ms iters={iters}")); }
+            if prof { eng.prof_report(&format!("{label_c} iters={iters}")); }
+            let dq = q_delta(&mut eng, &q_ref, n_atoms);
+            csv_throughput(sys.name, n_orbs, b, label_c, ms, iters, failed, dq);
+        }
+        drop(eng);
+    }
+}
+
+/// Same 0.02 Å force step as the throughput sweep, batch 8 (every copy is
+/// the same molecule, so the iteration count matches the large-batch trace).
+/// G0 is always converged to 1e-6. Only the geometry step uses the looser
+/// charge RMS. Energy is one finalize after the solve, not a kernel inside
+/// the SCC loop. ΔE is versus that method's own 1e-6 step.
+#[test]
+#[ignore]
+fn test_scc_rms_stop() {
+    let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else {
+        eprintln!("Skipping: RUST_DFTB_SK_DIR not set");
+        return;
+    };
+    unsafe { std::env::set_var("RUST_DFTB_SCC_QUIET", "1"); }
+    let kt = 0.0f64;
+    let batch = 8usize;
+    let tols = [1e-6f32, 1e-3, 3e-3];
+    let want = ["formic", "GC", "diazaphen", "DTH"];
+    eprintln!("=== SCC stop: batch={batch} kT=0 step=0.02 Å  tols={tols:?} ===");
+    eprintln!("method system tol iters rms dq_vs_cpu dE_meV_vs_1e-6 failed");
+    for sys in SCAN_SYSTEMS {
+        if !want.contains(&sys.name) {
+            continue;
+        }
+        let xyz = xyz_file(sys.file);
+        let sp = xyz.species.clone();
+        let g0 = xyz.coords.clone();
+        let n_atoms = g0.len();
+        let sk = load_sk_for_species(&sk_dir, &sp).unwrap();
+        let mut unique: Vec<String> = Vec::new();
+        for s in &sp {
+            if !unique.contains(s) {
+                unique.push(s.clone());
+            }
+        }
+        let repulsive = parse_all_repulsive(&sk_dir, &unique, unique.len()).unwrap();
+        let mut cpu = DftbCpu::new(sk.clone(), sp.clone()).unwrap();
+        cpu.update_geometry(&g0).unwrap();
+        cpu.set_smearing(kt);
+        cpu.reset_charges();
+        cpu.solve_scc(200, 1e-8).unwrap_or_else(|e| panic!("G0 {}: {e}", sys.name));
+        let scc = cpu.build_result();
+        let q_g0 = scc.charges.clone();
+        let forces = cpu.compute_forces(&scc, &repulsive).unwrap();
+        let g1 = step_along_forces(&g0, &forces.forces, 0.02);
+        let mut cpu_w = DftbCpu::new(sk.clone(), sp.clone()).unwrap();
+        cpu_w.update_geometry(&g1).unwrap();
+        cpu_w.set_smearing(kt);
+        cpu_w.set_charges(&q_g0);
+        cpu_w.solve_scc(200, 1e-8).unwrap_or_else(|e| panic!("CPU warm {}: {e}", sys.name));
+        let q_ref = cpu_w.charges.clone();
+        let e_cpu = cpu_w.build_result().energy;
+        eprintln!("-- {} E_cpu={e_cpu:.8} Ha", sys.name);
+
+        for (solver, keep_k) in [("jacobi", false), ("purify", true)] {
+            if solver == "jacobi" {
+                unsafe { std::env::remove_var("RUST_DFTB_EIGSOLVER") };
+            } else {
+                unsafe { std::env::set_var("RUST_DFTB_EIGSOLVER", "purify") };
+            }
+            let mut eng = GpuDftb::new(sk.clone(), &sk_dir, sp.clone(), replicate(&g0, batch), batch)
+                .unwrap_or_else(|e| panic!("{solver} new {}: {e}", sys.name));
+            eng.set_smearing(kt as f32);
+            eng.scc(100, 1e-6).unwrap_or_else(|e| panic!("{solver} G0 {}: {e}", sys.name));
+            if keep_k {
+                eng.set_coords_keep_k(&replicate(&g1, batch)).unwrap();
+            } else {
+                eng.set_coords(&replicate(&g1, batch)).unwrap();
+            }
+            let guess = eng.plan.capture_density(&eng.rt).unwrap();
+            let mut e_tight = 0.0f64;
+            for (i, &tol) in tols.iter().enumerate() {
+                eng.plan.restore_density(&eng.rt, &guess).unwrap();
+                eng.plan.reset_diis(&eng.rt).unwrap();
+                let s = eng.scc(100, tol).unwrap_or_else(|e| panic!("{solver} tol={tol}: {e}"));
+                let dq = q_delta(&mut eng, &q_ref, n_atoms);
+                let failed = s.statuses.iter().filter(|st| **st == SccStatus::Failed).count();
+                let ev = eng.energy().unwrap_or_else(|e| panic!("{solver} energy: {e}"));
+                let e = ev[0];
+                if i == 0 {
+                    e_tight = e;
+                }
+                let de_mev = (e - e_tight) * 27211.386;
+                eprintln!(
+                    "  {solver:7} tol={tol:.0e} iters={} rms={:.3e} dq={dq:.3e} dE={de_mev:+.4} meV failed={failed}",
+                    s.n_iters, s.rms
+                );
+            }
+            drop(eng);
+        }
+    }
+}
+
+/// Sparse B2 on the dense solver: up to two accepted commutator steps
+/// (η starts at 8, halved when R_H rises), one McWeeny, no SCC loop.
+/// G0 is a real purify solve. Energy and forces are a Jacobi finalize
+/// at the bold step's own Mulliken charges.
+#[test]
+#[ignore]
+fn test_geom_bold_dmm() {
+    let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else {
+        eprintln!("Skipping: RUST_DFTB_SK_DIR not set");
+        return;
+    };
+    unsafe { std::env::set_var("RUST_DFTB_SCC_QUIET", "1"); }
+    unsafe { std::env::set_var("RUST_DFTB_EIGSOLVER", "purify"); }
+    let want = ["formic", "GC"];
+    eprintln!("=== geom bold: 2×DMM η=8 + 1 McWeeny, then stop ===");
+    for sys in SCAN_SYSTEMS {
+        if !want.contains(&sys.name) {
+            continue;
+        }
+        let xyz = xyz_file(sys.file);
+        let sp = xyz.species.clone();
+        let g0 = xyz.coords.clone();
+        let n_atoms = g0.len();
+        let sk = load_sk_for_species(&sk_dir, &sp).unwrap();
+        let mut unique: Vec<String> = Vec::new();
+        for s in &sp {
+            if !unique.contains(s) {
+                unique.push(s.clone());
+            }
+        }
+        let repulsive = parse_all_repulsive(&sk_dir, &unique, unique.len()).unwrap();
+        let mut cpu = DftbCpu::new(sk.clone(), sp.clone()).unwrap();
+        cpu.update_geometry(&g0).unwrap();
+        cpu.reset_charges();
+        cpu.solve_scc(200, 1e-8).unwrap_or_else(|e| panic!("G0 {}: {e}", sys.name));
+        let scc = cpu.build_result();
+        let forces = cpu.compute_forces(&scc, &repulsive).unwrap();
+        let moves: Vec<(&str, Vec<[f64; 3]>)> = vec![
+            ("0.02Å-force", step_along_forces(&g0, &forces.forces, 0.02)),
+            ("0.10Å-atom0", {
+                let mut g = g0.clone();
+                g[0][0] += 0.1;
+                g
+            }),
+        ];
+        for (tag, g1) in moves {
+            let mut eng = GpuDftb::new(sk.clone(), &sk_dir, sp.clone(), replicate(&g0, 1), 1)
+                .unwrap_or_else(|e| panic!("new {}: {e}", sys.name));
+            eng.set_smearing(0.0);
+            eng.scc(100, 1e-6).unwrap_or_else(|e| panic!("G0 scc {}: {e}", sys.name));
+            eng.set_coords_keep_k(&g1).unwrap();
+            let t0 = std::time::Instant::now();
+            let (rh0, rh, tr, eta, n_acc) = eng.geom_bold_dmm().unwrap_or_else(|e| panic!("bold {tag}: {e}"));
+            let ms = t0.elapsed().as_secs_f64() * 1e3;
+            let q_new = eng.read_q_new().unwrap();
+            let (e_cpu, f_cpu, q_cpu) = eng.cpu_ref().unwrap_or_else(|e| panic!("cpu_ref: {e}"));
+            let mut dq = 0.0f64;
+            for a in 0..n_atoms {
+                dq = dq.max((q_new[a] as f64 - q_cpu[a]).abs());
+            }
+            eng.stage_mulliken().unwrap();
+            let ev = eng.eval(true).unwrap_or_else(|e| panic!("eval: {e}"));
+            let de_mev = (ev.energy[0] - e_cpu) * 27211.386;
+            let f = ev.forces.as_ref().unwrap();
+            let mut df = 0.0f64;
+            let mut fmax = 0.0f64;
+            for a in 0..n_atoms {
+                for c in 0..3 {
+                    let d = f[3 * a + c] as f64 - f_cpu[a][c];
+                    df = df.max(d.abs());
+                    fmax = fmax.max(f_cpu[a][c].abs());
+                }
+            }
+            let tau = (tr as f64 - eng.n_occ() as f64).abs();
+            eprintln!(
+                "  {sys} {tag}  acc={n_acc} η={eta:.3}  R_H {rh0:.3e} → {rh:.3e}  Tr={tr:.4} τ={tau:.3e}  max|Δq|={dq:.3e}  dE={de_mev:+.3} meV  max|dF|={df:.3e}  max|F|={fmax:.3e}  {ms:.1} ms",
+                sys = sys.name
+            );
+            assert!(tau < 0.05, "{} {tag} trace left Nocc: τ={tau:.4e}", sys.name);
+            assert!(dq < 0.05, "{} {tag} Mulliken left the CPU charges: max|Δq|={dq:.3e}", sys.name);
+        }
+    }
+}
+
+/// One extra geometry step rebuilds H at the mixed charges and rotates
+/// again. α is the mix between steps. The last step is scored at its
+/// own Mulliken charges, same as the single-step test.
+#[test]
+#[ignore]
+fn test_geom_bold_passes() {
+    let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else {
+        eprintln!("Skipping: RUST_DFTB_SK_DIR not set");
+        return;
+    };
+    unsafe { std::env::set_var("RUST_DFTB_SCC_QUIET", "1"); }
+    unsafe { std::env::set_var("RUST_DFTB_EIGSOLVER", "purify"); }
+    let recipes: &[(&str, usize, f32)] = &[
+        ("1×  α=0.2", 1, 0.2),
+        ("2×  α=0.2", 2, 0.2),
+        ("3×  α=0.2", 3, 0.2),
+        ("2×  α=1", 2, 1.0),
+    ];
+    eprintln!("=== bold passes: extra H rebuild + rotation, formic and GC ===");
+    for sys in SCAN_SYSTEMS {
+        if sys.name != "formic" && sys.name != "GC" {
+            continue;
+        }
+        let xyz = xyz_file(sys.file);
+        let sp = xyz.species.clone();
+        let g0 = xyz.coords.clone();
+        let n_atoms = g0.len();
+        let sk = load_sk_for_species(&sk_dir, &sp).unwrap();
+        let mut unique: Vec<String> = Vec::new();
+        for s in &sp {
+            if !unique.contains(s) { unique.push(s.clone()); }
+        }
+        let repulsive = parse_all_repulsive(&sk_dir, &unique, unique.len()).unwrap();
+        let mut cpu = DftbCpu::new(sk.clone(), sp.clone()).unwrap();
+        cpu.update_geometry(&g0).unwrap();
+        cpu.reset_charges();
+        cpu.solve_scc(200, 1e-8).unwrap_or_else(|e| panic!("G0 {}: {e}", sys.name));
+        let scc = cpu.build_result();
+        let forces = cpu.compute_forces(&scc, &repulsive).unwrap();
+        let moves = [
+            ("0.02Å", step_along_forces(&g0, &forces.forces, 0.02)),
+            ("0.10Å", { let mut g = g0.clone(); g[0][0] += 0.1; g }),
+        ];
+        for (tag, g1) in moves {
+            let mut eng = GpuDftb::new(sk.clone(), &sk_dir, sp.clone(), replicate(&g0, 1), 1)
+                .unwrap_or_else(|e| panic!("new {}: {e}", sys.name));
+            eng.set_smearing(0.0);
+            eng.scc(100, 1e-6).unwrap_or_else(|e| panic!("G0 {}: {e}", sys.name));
+            eng.set_coords_keep_k(&g1).unwrap();
+            let guess = eng.plan.capture_density(&eng.rt).unwrap();
+            let (e_cpu, f_cpu, q_cpu) = eng.cpu_ref().unwrap();
+            for &(label, npass, alpha) in recipes {
+                eng.plan.restore_density(&eng.rt, &guess).unwrap();
+                let t0 = std::time::Instant::now();
+                let mut rh0 = 0.0f32;
+                let mut rh = 0.0f32;
+                let mut tr = 0.0f32;
+                let mut n_acc = 0usize;
+                for p in 0..npass {
+                    let a = if p + 1 == npass { 0.0 } else { alpha };
+                    let rep = eng.geom_bold_on_domain(a).unwrap_or_else(|e| panic!("{label}: {e}"));
+                    if p == 0 { rh0 = rep.0; }
+                    rh = rep.1;
+                    tr = rep.2;
+                    n_acc += rep.4;
+                }
+                let ms = t0.elapsed().as_secs_f64() * 1e3;
+                let q_new = eng.read_q_new().unwrap();
+                let mut dq = 0.0f64;
+                for a in 0..n_atoms {
+                    dq = dq.max((q_new[a] as f64 - q_cpu[a]).abs());
+                }
+                eng.stage_mulliken().unwrap();
+                let ev = eng.eval(true).unwrap();
+                let de_mev = (ev.energy[0] - e_cpu) * 27211.386;
+                let f = ev.forces.as_ref().unwrap();
+                let mut df = 0.0f64;
+                let mut fmax = 0.0f64;
+                for a in 0..n_atoms {
+                    for c in 0..3 {
+                        df = df.max((f[3 * a + c] as f64 - f_cpu[a][c]).abs());
+                        fmax = fmax.max(f_cpu[a][c].abs());
+                    }
+                }
+                let pct = 100.0 * df / fmax.max(1e-12);
+                eprintln!(
+                    "  {} {tag} {label}  dmm={n_acc}  R_H {rh0:.3e}→{rh:.3e}  Tr={tr:.4}  dq={dq:.3e}  dE={de_mev:+.3} meV  dF={pct:.2}%  {ms:.2} ms",
+                    sys.name
+                );
+                let _ = (tr, n_acc);
+            }
+        }
+    }
+}
+
+/// Throughput of the bold geometry step only. Jacobi and CPU rows already
+/// live in throughput.csv. One purify G0, then the step at each batch.
+#[test]
+#[ignore]
+fn test_gpu_bold_sweep() {
+    let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else {
+        eprintln!("Skipping: RUST_DFTB_SK_DIR not set");
+        return;
+    };
+    let bmax: usize = std::env::var("RUST_DFTB_SWEEP_BMAX").ok().and_then(|s| s.parse().ok()).unwrap_or(1024);
+    let batches: Vec<usize> = std::env::var("RUST_DFTB_SWEEP_BATCHES")
+        .ok()
+        .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).filter(|&b| b >= 1 && b <= bmax).collect())
+        .unwrap_or_else(|| vec![8, 16, 32, 64, 128, 256, 512, 1024].into_iter().filter(|&b| b <= bmax).collect());
+    let only = std::env::var("RUST_DFTB_BENCH_SYSTEMS").unwrap_or_else(|_| "formic".into());
+    // 1× is the step as measured. 2× takes the Mulliken charges (α = 1)
+    // and rotates once more. α = 0.2 on the second pass made the 0.02 Å
+    // forces worse, so that mix is not on the graph.
+    let sys = SCAN_SYSTEMS.iter().find(|s| s.name == only).unwrap_or_else(|| panic!("unknown system {only}"));
+    unsafe {
+        openblas_set_num_threads(1);
+        std::env::set_var("RUST_DFTB_SCC_QUIET", "1");
+        std::env::set_var("RUST_DFTB_EIGSOLVER", "purify");
+    }
+    let xyz = xyz_file(sys.file);
+    let sp = xyz.species.clone();
+    let g0 = xyz.coords.clone();
+    let n_atoms = g0.len();
+    let sk = load_sk_for_species(&sk_dir, &sp).unwrap();
+    let mut unique: Vec<String> = Vec::new();
+    for s in &sp {
+        if !unique.contains(s) { unique.push(s.clone()); }
+    }
+    let repulsive = parse_all_repulsive(&sk_dir, &unique, unique.len()).unwrap();
+    let mut cpu = DftbCpu::new(sk.clone(), sp.clone()).unwrap();
+    cpu.update_geometry(&g0).unwrap();
+    cpu.reset_charges();
+    cpu.solve_scc(200, 1e-8).unwrap();
+    let scc = cpu.build_result();
+    let q_g0 = scc.charges.clone();
+    let forces = cpu.compute_forces(&scc, &repulsive).unwrap();
+    let g1 = step_along_forces(&g0, &forces.forces, 0.02);
+    let mut cpu_w = DftbCpu::new(sk.clone(), sp.clone()).unwrap();
+    cpu_w.update_geometry(&g1).unwrap();
+    cpu_w.set_charges(&q_g0);
+    cpu_w.solve_scc(200, 1e-8).unwrap();
+    let q_ref = cpu_w.charges.clone();
+    let recipes: &[(&str, usize, f32)] = &[("gpu bold", 1, 0.2), ("gpu bold x2", 2, 1.0)];
+    eprintln!("=== bold sweep {} bmax={bmax} batches={batches:?} ===", sys.name);
+    let mut eng = GpuDftb::new(sk.clone(), &sk_dir, sp.clone(), replicate(&g0, bmax), bmax)
+        .unwrap_or_else(|e| panic!("new: {e}"));
+    eng.set_smearing(0.0);
+    let t_g0 = std::time::Instant::now();
+    eng.scc(100, 1e-6).unwrap_or_else(|e| panic!("G0: {e}"));
+    eprintln!("  G0 {:.1} ms", t_g0.elapsed().as_secs_f64() * 1e3);
+    eng.set_coords_keep_k(&replicate(&g1, bmax)).unwrap();
+    let guess = eng.plan.capture_density(&eng.rt).unwrap();
+    let n_orbs = eng.n();
+    let started = std::time::Instant::now();
+    for &b in &batches {
+        if started.elapsed().as_secs() > 40 {
+            eprintln!("bold sweep budget: stop before batch={b}");
+            break;
+        }
+        let ids: Vec<i32> = (0..b as i32).collect();
+        for &(label, npass, alpha) in recipes {
+            // Sub-millisecond steps jitter. Five repeats, median wall.
+            let mut samples = Vec::with_capacity(5);
+            let mut q_new = Vec::new();
+            for _ in 0..5 {
+                eng.plan.restore_density(&eng.rt, &guess).unwrap();
+                eng.plan.set_work_domain(&eng.rt, &ids).unwrap();
+                eng.rt.finish().unwrap();
+                let t0 = std::time::Instant::now();
+                for p in 0..npass {
+                    let a = if p + 1 == npass { 0.0 } else { alpha };
+                    eng.geom_bold_on_domain(a).unwrap_or_else(|e| panic!("{label} b={b}: {e}"));
+                }
+                eng.rt.finish().unwrap();
+                samples.push(t0.elapsed().as_secs_f64() * 1e3);
+                q_new = eng.read_q_new().unwrap();
+            }
+            samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let ms = samples[2];
+            let mut dq = 0.0f64;
+            for a in 0..n_atoms {
+                dq = dq.max((q_new[a] as f64 - q_ref[a]).abs());
+            }
+            eng.plan.restore_work_domain(&eng.rt).unwrap();
+            csv_throughput(sys.name, n_orbs, b, label, ms, npass, 0, dq);
+        }
+    }
+}
+
+/// Fixed cap on accepted commutator steps, one Hamiltonian (the charges
+/// carried from the previous geometry). Batch 256. Each N is the same
+/// rotation stopped after N accepted steps, then one McWeeny.
+/// `dq_H` is against one Jacobi diagonalization of that same H.
+/// `dq_scc`, energy and forces are against a Jacobi SCC at the new geometry.
+#[test]
+#[ignore]
+fn test_geom_bold_nacc() {
+    let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else {
+        eprintln!("Skipping: RUST_DFTB_SK_DIR not set");
+        return;
+    };
+    unsafe { std::env::set_var("RUST_DFTB_SCC_QUIET", "1"); }
+    let batch = 256usize;
+    let want = ["formic", "GC", "diazaphen", "DTH"];
+    eprintln!("=== bold N=1..8 at batch {batch}, one H, then one McWeeny ===");
+    eprintln!("system N acc R_H Tr dq_H dq_scc dE_meV dF%");
+    let started = std::time::Instant::now();
+    for sys in SCAN_SYSTEMS {
+        if !want.contains(&sys.name) {
+            continue;
+        }
+        if started.elapsed().as_secs() > 45 {
+            eprintln!("nacc budget: skip {}", sys.name);
+            break;
+        }
+        let xyz = xyz_file(sys.file);
+        let sp = xyz.species.clone();
+        let g0 = xyz.coords.clone();
+        let n_atoms = g0.len();
+        let sk = load_sk_for_species(&sk_dir, &sp).unwrap();
+        let mut unique: Vec<String> = Vec::new();
+        for s in &sp {
+            if !unique.contains(s) { unique.push(s.clone()); }
+        }
+        let repulsive = parse_all_repulsive(&sk_dir, &unique, unique.len()).unwrap();
+        let mut cpu = DftbCpu::new(sk.clone(), sp.clone()).unwrap();
+        cpu.update_geometry(&g0).unwrap();
+        cpu.reset_charges();
+        cpu.solve_scc(200, 1e-8).unwrap();
+        let scc = cpu.build_result();
+        let forces = cpu.compute_forces(&scc, &repulsive).unwrap();
+        let g1 = step_along_forces(&g0, &forces.forces, 0.02);
+        let g1b = replicate(&g1, batch);
+
+        unsafe { std::env::remove_var("RUST_DFTB_EIGSOLVER") };
+        let mut jac = GpuDftb::new(sk.clone(), &sk_dir, sp.clone(), replicate(&g0, batch), batch)
+            .unwrap_or_else(|e| panic!("jacobi {}: {e}", sys.name));
+        jac.set_smearing(0.0);
+        jac.scc(100, 1e-6).unwrap_or_else(|e| panic!("jacobi G0 {}: {e}", sys.name));
+        jac.set_coords(&g1b).unwrap();
+        jac.eval(false).unwrap_or_else(|e| panic!("jacobi same-H {}: {e}", sys.name));
+        let q_h = jac.read_q_new().unwrap();
+        jac.scc(100, 1e-6).unwrap_or_else(|e| panic!("jacobi SCC {}: {e}", sys.name));
+        let ev_j = jac.eval(true).unwrap_or_else(|e| panic!("jacobi eval {}: {e}", sys.name));
+        let q_scc = jac.read_q_new().unwrap();
+        let e_scc = ev_j.energy[0];
+        let f_scc = ev_j.forces.unwrap();
+        drop(jac);
+
+        unsafe { std::env::set_var("RUST_DFTB_EIGSOLVER", "purify") };
+        let mut eng = GpuDftb::new(sk.clone(), &sk_dir, sp.clone(), replicate(&g0, batch), batch)
+            .unwrap_or_else(|e| panic!("purify {}: {e}", sys.name));
+        eng.set_smearing(0.0);
+        eng.scc(100, 1e-6).unwrap_or_else(|e| panic!("purify G0 {}: {e}", sys.name));
+        eng.set_coords_keep_k(&g1b).unwrap();
+        let guess = eng.plan.capture_density(&eng.rt).unwrap();
+        for n in 1..=8 {
+            eng.plan.restore_density(&eng.rt, &guess).unwrap();
+            let (rh0, rh, tr, eta, n_acc) = eng.geom_bold_capped(n).unwrap_or_else(|e| panic!("N={n}: {e}"));
+            let q_new = eng.read_q_new().unwrap();
+            let mut dq_h = 0.0f64;
+            let mut dq_scc = 0.0f64;
+            for a in 0..n_atoms {
+                dq_h = dq_h.max((q_new[a] as f64 - q_h[a] as f64).abs());
+                dq_scc = dq_scc.max((q_new[a] as f64 - q_scc[a] as f64).abs());
+            }
+            eng.stage_mulliken().unwrap();
+            let ev = eng.eval(true).unwrap_or_else(|e| panic!("eval N={n}: {e}"));
+            let de_mev = (ev.energy[0] - e_scc) * 27211.386;
+            let f = ev.forces.as_ref().unwrap();
+            let mut df = 0.0f64;
+            let mut fmax = 0.0f64;
+            for i in 0..3 * n_atoms {
+                df = df.max((f[i] as f64 - f_scc[i] as f64).abs());
+                fmax = fmax.max(f_scc[i].abs() as f64);
+            }
+            let pct = 100.0 * df / fmax.max(1e-12);
+            eprintln!(
+                "  {}  N={n} acc={n_acc} η={eta:.3}  R_H {rh0:.3e}→{rh:.3e}  Tr={tr:.4}  dq_H={dq_h:.3e}  dq_scc={dq_scc:.3e}  dE={de_mev:+.3} meV  dF={pct:.2}%",
+                sys.name
+            );
+            if n_acc < n {
+                eprintln!("  {}  trust region stopped at {n_acc} accepted steps", sys.name);
+                break;
+            }
         }
     }
 }

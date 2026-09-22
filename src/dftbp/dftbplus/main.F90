@@ -33,7 +33,9 @@ module dftbp_dftbplus_main
   use dftbp_dftb_hamiltonian, only : addBlockChargePotentials, addChargePotentials,&
       & constrainSccHamiltonian, getSccHamiltonian, mergeExternalPotentials,&
       & resetExternalPotentials, resetInternalPotentials
-  use dftbp_dftbplus_hamiltonian_store, only : store_hamiltonian, store_overlap, store_dm, store_eigvecs
+  use dftbp_dftbplus_hamiltonian_store, only : store_hamiltonian, store_overlap, store_dm,&
+      & store_eigvecs, store_hamiltonian_cplx, store_overlap_cplx, store_dm_cplx,&
+      & store_eigvecs_cplx
   use dftbp_dftb_hybridxc, only : hybridXcAlgo, THybridXcFunc
   use dftbp_dftb_mdftb, only : TMdftb
   use dftbp_dftb_nonscc, only : buildH0, buildS, TNonSccDiff
@@ -50,7 +52,7 @@ module dftbp_dftbplus_main
       & skewMulliken
   use dftbp_dftb_potentials, only : TPotentials
   use dftbp_dftb_repulsive_repulsive, only : TRepulsive
-  use dftbp_dftb_scc, only : TScc
+  use dftbp_dftb_scc, only : TScc, exportSccDebug
   use dftbp_dftb_shift, only : addAtomicMultipoleShift, addShift
   use dftbp_dftb_slakocont, only : TSlakoCont
   use dftbp_dftb_sparse2dense, only : getSparseDescriptor, iPackHS, packerho, packHelicalHS,&
@@ -1463,7 +1465,7 @@ contains
             block
               character(len=64) :: fname
               write(fname, '(A,I0,A)') 'scc_debug_', iSccIter, '.txt'
-              call this%scc%exportSccDebug(trim(fname))
+              call exportSccDebug(this%scc, trim(fname))
             end block
           end if
 
@@ -3403,8 +3405,9 @@ contains
         end if
       endif
 
-      ! Store Hamiltonian before diagonalization (if enabled)
-      call store_hamiltonian(HSqrReal, size(HSqrReal, 1))
+      ! Store Hamiltonian before diagonalization (if enabled); iKS=1 channel only so
+      ! stored H/S are consistent with the stored (iKS=1) eigenvectors
+      if (iKS == 1) call store_hamiltonian(HSqrReal, size(HSqrReal, 1))
 
       ! Warning: SSqrReal gets overwritten here
       call diagDenseMtxBlacs(electronicSolver, 1, 'V', denseDesc%blacsOrbSqr, HSqrReal, SSqrReal,&
@@ -3444,9 +3447,12 @@ contains
         end if
       end if
 
-      ! Store H and S before diagonalization (SSqrReal gets overwritten below)
-      call store_hamiltonian(HSqrReal, size(HSqrReal, 1))
-      call store_overlap(SSqrReal, size(SSqrReal, 1))
+      ! Store H and S before diagonalization (SSqrReal gets overwritten below);
+      ! iKS=1 channel only so stored H/S are consistent with stored eigenvectors
+      if (iKS == 1) then
+        call store_hamiltonian(HSqrReal, size(HSqrReal, 1))
+        call store_overlap(SSqrReal, size(SSqrReal, 1))
+      end if
 
       ! Warning: SSqrReal gets overwritten here
       call diagDenseMtx(env, electronicSolver, 'V', HSqrReal, SSqrReal, eigen(:, iSpin),&
@@ -3692,10 +3698,18 @@ contains
         end if
       endif
 
+      ! Store H(k) and S(k) before diagonalization (SSqrCplx gets overwritten below)
+      call store_hamiltonian_cplx(HSqrCplx, iK, iSpin, size(kPoint, dim=2),&
+          & size(ints%hamiltonian, dim=2))
+      call store_overlap_cplx(SSqrCplx, iK, iSpin, size(kPoint, dim=2),&
+          & size(ints%hamiltonian, dim=2))
+
       call diagDenseMtx(env, electronicSolver, 'V', HSqrCplx, SSqrCplx, eigen(:, iK, iSpin),&
           & errStatus)
       @:PROPAGATE_ERROR(errStatus)
       eigvecsCplx(:,:, iKS) = HSqrCplx
+      call store_eigvecs_cplx(HSqrCplx, eigen(:, iK, iSpin), iK, iSpin, size(kPoint, dim=2),&
+          & size(ints%hamiltonian, dim=2))
     #:endif
     end do
 
@@ -3950,6 +3964,10 @@ contains
 
     integer :: iKS, iK, iSpin
 
+    !> Total (spin-summed) dense density matrix for hamiltonian_store export;
+    !> allocated on first use in the serial branch, fresh each SCF iteration
+    real(dp), allocatable :: dmSum(:,:)
+
     rhoPrim(:,:) = 0.0_dp
 
     do iKS = 1, parallelKS%nLocalKS
@@ -3991,8 +4009,9 @@ contains
       if (.not. allocated(densityMatrix%deltaRhoOut)) then
         call densityMatrix%getDensityMatrix(work, eigvecs(:,:,iKS), filling(:,iSpin), errStatus)
         @:PROPAGATE_ERROR(errStatus)
-        ! Store dense DM at the point it is valid (before packing to sparse)
-        call store_dm(work, size(work, 1))
+        ! Accumulate spin channels into the total DM; stored once after the iKS loop
+        if (.not. allocated(dmSum)) allocate(dmSum(size(work,1), size(work,2)), source=0.0_dp)
+        dmSum = dmSum + work
         call env%globalTimer%startTimer(globalTimers%denseToSparse)
         if (tHelical) then
           call packHelicalHS(rhoPrim(:,iSpin), work, neighbourlist%iNeighbour, nNeighbourSK,&
@@ -4045,6 +4064,9 @@ contains
       end if
 
     end do
+
+    ! Store total dense DM at the point it is valid (before it was packed to sparse)
+    if (allocated(dmSum)) call store_dm(dmSum, size(dmSum, 1))
 
   #:if WITH_SCALAPACK
     if (allocated(hybridXc)) then
@@ -4168,6 +4190,8 @@ contains
     #:else
       call densityMatrix%getDensityMatrix(work, eigvecs(:,:,iKS), filling(:,iK,iSpin), errStatus)
       @:PROPAGATE_ERROR(errStatus)
+      ! Store dense k-space DM at the point it is valid (before packing to sparse)
+      call store_dm_cplx(work, iK, iSpin, size(kPoint, dim=2), size(rhoPrim, dim=2))
       call env%globalTimer%startTimer(globalTimers%denseToSparse)
       if (tHelical) then
         call packHelicalHS(rhoPrim(:,iSpin), work, kPoint(:,iK), kWeight(iK),&

@@ -302,6 +302,12 @@ impl GpuRuntime {
         if !self.prof.enabled {
             return;
         }
+        self.prof.stages.borrow_mut().clear();
+        self.prof.dev.borrow_mut().clear();
+        self.prof.marks.borrow_mut().clear();
+        self.prof.prev_ok.set(false);
+        self.prof.n_finish.set(0);
+        self.prof.n_read.set(0);
         if self.prof.evt {
             // Baseline marker: the next stage's device time is measured
             // from here (empty name = anchor only, not accumulated).

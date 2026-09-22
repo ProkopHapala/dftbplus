@@ -16,9 +16,11 @@
 //! owns all working buffers; the caller only provides the persistent inputs
 //! (H0, S, gamma, q0, orb_atom) and receives the result.
 
+use std::cell::{Cell, RefCell};
+
 use crate::core::error::{DftbError, Result};
 use crate::qmqm::gpu_runtime::{map_ocl_err, GpuRuntime};
-use ocl::{Buffer, Kernel, Program};
+use ocl::{Buffer, Event, Kernel, Program};
 
 // ---- Matrix kernel source (same as gpu_matrix.rs) ----
 const MATRIX_KERNEL_TEMPLATE: &str = include_str!("gpu_matrix_ops.cl");
@@ -176,13 +178,20 @@ struct PurifyScc {
     k_txd: Kernel,         // batched_gemm_active: d = temp·x_t (D = X·K·Xᵀ)
     // ---- DMM warm update (sparse-proven recipe, §7.6.4) ----
     k_span: Kernel,        // spec_span_batched — Gershgorin Δε of hp → spans
-    g_hk: Kernel,          // batched_gemm_active: t_buf = hp·K  (B arg 7 = K side)
-    g_kx: Kernel,          // batched_gemm_active: y_buf = K·t_buf (A arg 6 = K side)
-    g_kk: Kernel,          // batched_gemm_active: t_buf = K·K   (A,B = K side; retract)
-    g_tk: Kernel,          // batched_gemm_active: y_buf = t_buf·K (B arg 7 = K side)
+    g_hk: Kernel,          // t_buf = hp·K. regtile: B is arg 3; tiled: B is arg 7
+    g_kx: Kernel,          // y_buf = K·t_buf. regtile: A is arg 2; tiled: A is arg 6
+    g_kk: Kernel,          // t_buf = K·K
+    g_tk: Kernel,          // y_buf = t_buf·K
+    /// Threads per replica for the 1-D regtile launch. 0 → the 16×16
+    /// `batched_gemm_active` path (`enq3` + arg indices 6/7).
+    dmm_wg: usize,
+    /// Workgroup size of the 1-D purify kernels (one group per replica).
+    pur_wg: usize,
+    /// `(arg index of A, arg index of B)` on g_hk/g_kx/g_kk/g_tk.
+    dmm_ab: (u32, u32),
     k_dmm_upd: Kernel,     // dmm_update_batched — K ← sym(K) − (η/Δε)(T+Tᵀ−2Y)
     k_mcweeny: Kernel,     // mcweeny_combine_batched — K ← 3·t_buf − 2·y_buf
-    k_comm: Kernel,        // comm_gate_batched — rh = ‖T−Tᵀ‖/2‖T‖ on final T=hp·K
+    k_comm: Kernel,        // comm_gate_batched — rh cert → done/pend flags
     d_a: Buffer<f32>,      // K ping-pong A [batch*nn]
     d_b: Buffer<f32>,      // K ping-pong B [batch*nn]
     #[allow(dead_code)]    // bound into kernel args at build; keep-alive only
@@ -192,22 +201,29 @@ struct PurifyScc {
     #[allow(dead_code)]
     spans: Buffer<f32>,    // per-replica Gershgorin Δε of hp [batch]
     rh: Buffer<f32>,       // per-replica commutator certificate [batch]
+    rh_host: Vec<f32>,     // host mirror — read once per SCC chunk (allowed sync)
     nocc: Buffer<f32>,     // per-system occ count (Tr target)
     nocc_host: Vec<f32>,
     #[allow(dead_code)]    // device-only for now; read when convergence is host-checked
     traces: Buffer<f32>,
     #[allow(dead_code)]
     errs: Buffer<f32>,
-    done: Buffer<i32>,     // per-replica TC2-converged flags — cleared per SCC iter
+    done: Buffer<i32>,     // per-replica converged flags — cleared per SCC iter
+    pend: Buffer<i32>,     // per-replica "needs work" mask (1=pending): armed
+                         // from `active` each iter; comm_gate clears it on
+                         // certification → the DMM/certificate GEMMs early-out.
     swapped: bool,         // false → current K in d_a; true → d_b
     seeded: bool,          // K holds last iter's state vs needs Palser init
     warm: bool,            // RUST_DFTB_PURIFY_WARM=0 → cold-init every iter
-    dmm_steps: usize,      // DMM descent steps per warm solve (sparse: ~6)
-    dmm_retract: usize,    // McWeeny retract every k-th DMM step (sparse: 2)
-    #[allow(dead_code)]    // baked into the dmm_update kernel arg at build
-    dmm_eta: f32,          // η_scale — s = η/Δε per replica (sparse: 8)
-    tc2_tail: usize,       // optional TC2 steps after DMM (sparse: 0 — degrades R_H)
-    steps_cold: usize,     // TC2 steps right after Palser init
+    corr_rounds: usize,    // DMM+McWeeny rounds per warm SCC iter (co-iteration)
+    cert_tol: f32,         // rh acceptance — SCC may not stop while rh exceeds this
+    fb_pending: bool,      // chunk-end: some ACTIVE replica still has rh > cert_tol
+    fallback: bool,        // RUST_DFTB_PURIFY_FALLBACK=1 → old 60-step TC2
+                         // after every warm iter. Default off: that block
+                         // was the whole per-iter cost and lost to Jacobi.
+    dmm_eta: f32,          // η_scale baked into dmm_update — SCC path, not the geometry step
+    dmm_cap: f32,          // trust cap baked into dmm_update; the geometry step lifts it
+    steps_cold: usize,     // TC2 steps for the unseeded (first) solve only
     gxy: (usize, usize),   // tiled-GEMM (x, y) extents for the back-transform
 }
 
@@ -303,6 +319,13 @@ pub struct GpuSccPlan {
     /// attached, `enq_dq_v_hscc` enqueues `cdft_hscc_shift_batched`
     /// after every h_scc rebuild. `None` → literally zero cost.
     pub cdft: Option<crate::qmqm::gpu_cdft::GpuCdft>,
+
+    /// `RUST_DFTB_KTIME=1`: record a profiling event per kernel launch.
+    /// Armed only around the measured solve so construction and the
+    /// untimed G0 pass stay out of the table.
+    ktime: bool,
+    kt_arm: Cell<bool>,
+    kt_ev: RefCell<Vec<(&'static str, Event)>>,
 
     // Pre-built kernels (R8: no Kernel::builder() in hot loops)
     // SCC step kernels:
@@ -437,6 +460,18 @@ pub struct GpuSccPlan {
     rep_spline_data: Option<Buffer<f32>>, // flat buffer with all spline coefficients
     rep_e_rep: Option<Buffer<f32>>, // [batch] repulsive energy output
     rep_n_species: usize,
+}
+
+/// Device copy of the SCC guess (charges, Jacobi eigenvectors, purified K)
+/// so a batch sweep can repeat the same geometry step.
+pub struct DensityGuess {
+    q: Buffer<f32>,
+    c: Buffer<f32>,
+    d_a: Option<Buffer<f32>>,
+    d_b: Option<Buffer<f32>>,
+    seeded: bool,
+    swapped: bool,
+    b_warm: bool,
 }
 
 impl GpuSccPlan {
@@ -1357,7 +1392,7 @@ impl GpuSccPlan {
         let purify = if eig_kind == crate::qmqm::gpu_eigen::EigKind::Purify {
             let (pwg, ptile, pgemm, pshape) =
                 crate::qmqm::gpu_purify::purify_shape_config(n)?;
-            let psrc = crate::qmqm::gpu_purify::render_purify_source(pwg, ptile, pgemm, pshape);
+            let psrc = crate::qmqm::gpu_purify::render_purify_source(n, pwg, ptile, pgemm, pshape);
             let pprog = rt.build_program(&psrc)?;
             let d_a = rt.zero_buffer::<f32>(batch * nn)?;
             let d_b = rt.zero_buffer::<f32>(batch * nn)?;
@@ -1365,6 +1400,7 @@ impl GpuSccPlan {
             let traces = rt.zero_buffer::<f32>(batch)?;
             let errs = rt.zero_buffer::<f32>(batch)?;
             let done = rt.zero_buffer::<i32>(batch)?;
+            let pend = rt.zero_buffer::<i32>(batch)?;
             let ptol: f32 = std::env::var("RUST_DFTB_PURIFY_TOL")
                 .ok().and_then(|s| s.parse().ok()).unwrap_or(1e-5);
             let steps_cold: usize = std::env::var("RUST_DFTB_PURIFY_COLD_STEPS")
@@ -1380,6 +1416,7 @@ impl GpuSccPlan {
                 .arg(&traces)
                 .arg(n as i32)
                 .arg(batch as i32)
+                .arg(&done) // warm fallback: certified replicas keep their K
                 .build()
                 .map_err(map_ocl_err)?;
             // DMM warm-update scratch + knobs (sparse-proven recipe —
@@ -1388,19 +1425,21 @@ impl GpuSccPlan {
             let y_buf = rt.zero_buffer::<f32>(batch * nn)?;
             let spans = rt.zero_buffer::<f32>(batch)?;
             let rh = rt.zero_buffer::<f32>(batch)?;
-            // Defaults verified on GC/H2O (2026-09): η=1/Δε is the stable
-            // descent step (sparse's η=8/Δε diverges at SCC-scale ΔH —
-            // measured comm 5e-7→0.72→NaN); cap=10 is inactive except on
-            // pathological gradients. 16 steps + 4-step TC2 tail →
-            // failed=0 on H2O, E0 exact on GC.
-            let dmm_steps: usize = std::env::var("RUST_DFTB_PURIFY_DMM_STEPS")
-                .ok().and_then(|s| s.parse().ok()).unwrap_or(16);
-            let dmm_retract: usize = std::env::var("RUST_DFTB_PURIFY_DMM_RETRACT")
+            // Warm solve = certificate-gated schedule (chat doc §17 option
+            // A — a predetermined SMALL count with a device convergence
+            // flag; NOT the old fixed 16×DMM+8×McWeeny+4×TC2, ~57 launches
+            // regardless of seed quality). Round 0 certifies the carried
+            // projector; each round = DMM + McWeeny retract + re-cert, all
+            // gated on the device `pend` mask so certified replicas pay
+            // launch overhead only. Replicas still above cert_tol keep the updated K and continue
+            // next SCC iteration (co-iteration). A full Palser+TC2 rerun
+            // after every warm iter is RUST_DFTB_PURIFY_FALLBACK=1 only.
+            let corr_rounds: usize = std::env::var("RUST_DFTB_PURIFY_CORR")
                 .ok().and_then(|s| s.parse().ok()).unwrap_or(2);
+            let cert_tol: f32 = std::env::var("RUST_DFTB_PURIFY_RTOL")
+                .ok().and_then(|s| s.parse().ok()).unwrap_or(1e-3);
             let dmm_eta: f32 = std::env::var("RUST_DFTB_PURIFY_DMM_ETA")
                 .ok().and_then(|s| s.parse().ok()).unwrap_or(1.0);
-            let tc2_tail: usize = std::env::var("RUST_DFTB_PURIFY_TC2_TAIL")
-                .ok().and_then(|s| s.parse().ok()).unwrap_or(4);
             // Trust region per DMM step: s_eff = min(η/Δε, cap/‖G‖_F).
             let dmm_cap: f32 = std::env::var("RUST_DFTB_PURIFY_DMM_CAP")
                 .ok().and_then(|s| s.parse().ok()).unwrap_or(10.0);
@@ -1419,6 +1458,7 @@ impl GpuSccPlan {
                 .arg(ptol)
                 .arg(n as i32)
                 .arg(batch as i32)
+                .arg(1i32) // mirror_done — keep ping-pong parity per replica
                 .build()
                 .map_err(map_ocl_err)?;
             // Back-transform GEMM handles — batched_gemm_active honours
@@ -1433,7 +1473,7 @@ impl GpuSccPlan {
             let plws = ocl::SpatialDims::Two(MAT_TILE_N, MAT_TILE_M);
             let pa_loc = MAT_TILE_M * PT_K;
             let pb_loc = MAT_TILE_N * (PT_K + 1);
-            let mut mk_pg = |a: &Buffer<f32>, b: &Buffer<f32>, co: &Buffer<f32>, alpha: f32| {
+            let mut mk_pg = |a: &Buffer<f32>, b: &Buffer<f32>, co: &Buffer<f32>, alpha: f32, mask: &Buffer<i32>| {
                 Kernel::builder()
                     .program(&mat_prog)
                     .name("batched_gemm_active")
@@ -1451,7 +1491,7 @@ impl GpuSccPlan {
                     .arg(co)
                     .arg_local::<f32>(pa_loc)
                     .arg_local::<f32>(pb_loc)
-                    .arg(&active)
+                    .arg(mask)
                     .arg(&work_ids)
                     .build()
                     .map_err(map_ocl_err)
@@ -1459,18 +1499,45 @@ impl GpuSccPlan {
             // D = 2·X·K·Xᵀ — the production density convention carries the
             // closed-shell ×2 (build_density_occ_batched folds it in);
             // mulliken(D,S) then yields Ne electrons, not nocc.
-            let k_xk_a = mk_pg(&x_buf, &d_a, &temp, 2.0)?;
-            let k_xk_b = mk_pg(&x_buf, &d_b, &temp, 2.0)?;
-            let k_txd = mk_pg(&temp, &x_t, &d, 1.0)?;
+            let k_xk_a = mk_pg(&x_buf, &d_a, &temp, 2.0, &active)?;
+            let k_xk_b = mk_pg(&x_buf, &d_b, &temp, 2.0, &active)?;
+            let k_txd = mk_pg(&temp, &x_t, &d, 1.0, &active)?;
             // DMM GEMM handles — the K operand sits on the solve-time
             // ping-pong side, so those args are rebound per solve via
-            // set_arg (built against d_a as the placeholder).
+            // set_arg (built against d_a as the placeholder). These gate on
+            // `pend` (not `active`): comm_gate clears pend[sid] the moment a
+            // replica certifies → its GEMM workgroups exit immediately.
             //   T = hp·K → t_buf      Y = K·T → y_buf
             //   K² = K·K → t_buf      K³ = t_buf·K → y_buf   (retract)
-            let g_hk = mk_pg(&hp, &d_a, &t_buf, 1.0)?;
-            let g_kx = mk_pg(&d_a, &t_buf, &y_buf, 1.0)?;
-            let g_kk = mk_pg(&d_a, &d_a, &t_buf, 1.0)?;
-            let g_tk = mk_pg(&t_buf, &d_a, &y_buf, 1.0)?;
+            // Default for n≥64 is the measured general-GEMM winner
+            // (11×11 × 8×8 regs, 88-wide tile). At n=28 that tile is
+            // mostly padding and lost to 16×16 (formic 0.30 → 0.34 ms/iter).
+            // RUST_DFTB_PURIFY_MM=tiled|regtile forces either kernel.
+            let regtile = match std::env::var("RUST_DFTB_PURIFY_MM").ok().as_deref() {
+                Some("tiled") => false,
+                Some("regtile") => true,
+                _ => n >= 64,
+            };
+            let (g_hk, g_kx, g_kk, g_tk, dmm_wg, dmm_ab) = if regtile {
+                let prog = crate::qmqm::gpu_gemm::dmm_regtile_program(rt)?;
+                let wg = crate::qmqm::gpu_gemm::DMM_REGTILE_WG;
+                let mk = |a: &Buffer<f32>, b: &Buffer<f32>, c: &Buffer<f32>| {
+                    crate::qmqm::gpu_gemm::dmm_regtile_kernel(
+                        rt, &prog, n, batch, a, b, c, &pend, &work_ids,
+                    )
+                };
+                let g_hk = mk(&hp, &d_a, &t_buf)?;
+                let g_kx = mk(&d_a, &t_buf, &y_buf)?;
+                let g_kk = mk(&d_a, &d_a, &t_buf)?;
+                let g_tk = mk(&t_buf, &d_a, &y_buf)?;
+                (g_hk, g_kx, g_kk, g_tk, wg, (2u32, 3u32))
+            } else {
+                let g_hk = mk_pg(&hp, &d_a, &t_buf, 1.0, &pend)?;
+                let g_kx = mk_pg(&d_a, &t_buf, &y_buf, 1.0, &pend)?;
+                let g_kk = mk_pg(&d_a, &d_a, &t_buf, 1.0, &pend)?;
+                let g_tk = mk_pg(&t_buf, &d_a, &y_buf, 1.0, &pend)?;
+                (g_hk, g_kx, g_kk, g_tk, 0usize, (6u32, 7u32))
+            };
             let k_span = Kernel::builder()
                 .program(&pprog).name("spec_span_batched")
                 .queue(rt.queue().clone())
@@ -1483,18 +1550,21 @@ impl GpuSccPlan {
                 .global_work_size(batch * pwg).local_work_size(pwg)
                 .arg(&d_a).arg(&t_buf).arg(&y_buf).arg(&spans)
                 .arg(dmm_eta).arg(dmm_cap).arg(n as i32).arg(batch as i32)
+                .arg(&pend)
                 .build().map_err(map_ocl_err)?;
             let k_mcweeny = Kernel::builder()
                 .program(&pprog).name("mcweeny_combine_batched")
                 .queue(rt.queue().clone())
                 .global_work_size(batch * pwg).local_work_size(pwg)
                 .arg(&d_a).arg(&t_buf).arg(&y_buf).arg(n as i32).arg(batch as i32)
+                .arg(&pend)
                 .build().map_err(map_ocl_err)?;
             let k_comm = Kernel::builder()
                 .program(&pprog).name("comm_gate_batched")
                 .queue(rt.queue().clone())
                 .global_work_size(batch * pwg).local_work_size(pwg)
                 .arg(&t_buf).arg(&rh).arg(n as i32).arg(batch as i32)
+                .arg(&done).arg(&pend).arg(cert_tol)
                 .build().map_err(map_ocl_err)?;
             Some(PurifyScc {
                 k_init_a,
@@ -1507,6 +1577,9 @@ impl GpuSccPlan {
                 g_kx,
                 g_kk,
                 g_tk,
+                dmm_wg,
+                pur_wg: pwg,
+                dmm_ab,
                 k_dmm_upd,
                 k_mcweeny,
                 k_comm,
@@ -1516,18 +1589,22 @@ impl GpuSccPlan {
                 y_buf,
                 spans,
                 rh,
+                rh_host: vec![0.0; batch],
                 nocc,
                 nocc_host: vec![0.0; batch],
                 traces,
                 errs,
                 done,
+                pend,
                 swapped: false,
                 seeded: false,
                 warm: std::env::var("RUST_DFTB_PURIFY_WARM").ok().as_deref() != Some("0"),
-                dmm_steps,
-                dmm_retract,
+                corr_rounds,
+                cert_tol,
+                fb_pending: true,
+                fallback: std::env::var("RUST_DFTB_PURIFY_FALLBACK").ok().as_deref() == Some("1"),
                 dmm_eta,
-                tc2_tail,
+                dmm_cap,
                 steps_cold,
                 gxy: (
                     ((n + MAT_TILE_N - 1) / MAT_TILE_N) * MAT_TILE_N,
@@ -1664,10 +1741,34 @@ impl GpuSccPlan {
             rep_e_rep: None,
             rep_n_species: 0,
             cdft: None,
+            ktime: std::env::var("RUST_DFTB_KTIME").ok().as_deref() == Some("1"),
+            kt_arm: Cell::new(false),
+            kt_ev: RefCell::new(Vec::new()),
         };
         plan.set_geometry(rt, s_buf).map_err(|e| {
             DftbError::InvalidInput(format!("GpuSccPlan::new initial S^{{-1/2}}+repair: {e}"))
         })?;
+        if std::env::var_os("RUST_DFTB_KINFO").is_some() {
+            use ocl::enums::KernelWorkGroupInfo::{LocalMemSize, PrivateMemSize, WorkGroupSize};
+            let dev = *rt.device();
+            let show = |name: &str, k: &Kernel| {
+                eprintln!(
+                    "[kinfo] n={} batch={} {name}: local={:?} private={:?} max_wg={:?}",
+                    n,
+                    batch,
+                    k.wg_info(dev, LocalMemSize).ok(),
+                    k.wg_info(dev, PrivateMemSize).ok(),
+                    k.wg_info(dev, WorkGroupSize).ok()
+                );
+            };
+            show("batched_gemm_active", &plan.k_matmul_xh);
+            show("jacobi", &plan.k_jacobi);
+            if let Some(p) = &plan.purify {
+                show("tc2_step", &p.k_step);
+                show(if p.dmm_wg > 0 { "dmm_regtile" } else { "dmm_gemm" }, &p.g_hk);
+                show("dmm_update", &p.k_dmm_upd);
+            }
+        }
         Ok(plan)
     }
 
@@ -1750,31 +1851,95 @@ impl GpuSccPlan {
     // index → physical slot, so compact launches touch only active slots.
 
     /// 1D kernels: build grid is `batch × fac` → launch `work_n × fac`.
-    fn enq1(&self, k: &Kernel, fac: usize) -> Result<()> {
+    fn enq1(&self, k: &Kernel, fac: usize, name: &'static str) -> Result<()> {
         unsafe {
-            k.cmd()
-                .global_work_size(self.work_n * fac)
-                .enq()
-                .map_err(map_ocl_err)
+            if self.ktime && self.kt_arm.get() {
+                let mut ev = Event::empty();
+                k.cmd()
+                    .global_work_size(self.work_n * fac)
+                    .enew(&mut ev)
+                    .enq()
+                    .map_err(map_ocl_err)?;
+                self.kt_ev.borrow_mut().push((name, ev));
+            } else {
+                k.cmd()
+                    .global_work_size(self.work_n * fac)
+                    .enq()
+                    .map_err(map_ocl_err)?;
+            }
+            Ok(())
         }
     }
 
     /// 3D GEMM launches: fixed (x, y) extents; replica axis = `work_n`.
-    fn enq3(&self, k: &Kernel, xy: (usize, usize)) -> Result<()> {
+    fn enq3(&self, k: &Kernel, xy: (usize, usize), name: &'static str) -> Result<()> {
         unsafe {
-            k.cmd()
-                .global_work_size(ocl::SpatialDims::Three(xy.0, xy.1, self.work_n))
-                .enq()
-                .map_err(map_ocl_err)
+            if self.ktime && self.kt_arm.get() {
+                let mut ev = Event::empty();
+                k.cmd()
+                    .global_work_size(ocl::SpatialDims::Three(xy.0, xy.1, self.work_n))
+                    .enew(&mut ev)
+                    .enq()
+                    .map_err(map_ocl_err)?;
+                self.kt_ev.borrow_mut().push((name, ev));
+            } else {
+                k.cmd()
+                    .global_work_size(ocl::SpatialDims::Three(xy.0, xy.1, self.work_n))
+                    .enq()
+                    .map_err(map_ocl_err)?;
+            }
+            Ok(())
         }
     }
 
     /// Matmul handle: 1D full-local kernel for n≤64, tiled 3D otherwise.
-    fn enq_mm(&self, k: &Kernel) -> Result<()> {
+    fn enq_mm(&self, k: &Kernel, name: &'static str) -> Result<()> {
         if self.lg.mm_1d > 0 {
-            self.enq1(k, self.lg.mm_1d)
+            self.enq1(k, self.lg.mm_1d, name)
         } else {
-            self.enq3(k, self.lg.mm)
+            self.enq3(k, self.lg.mm, name)
+        }
+    }
+
+    /// Start recording kernel events. No-op unless `RUST_DFTB_KTIME=1`.
+    pub fn ktime_begin(&self) {
+        self.kt_ev.borrow_mut().clear();
+        self.kt_arm.set(self.ktime);
+    }
+
+    /// Drain recorded launches. Device time is CL_PROFILING START→END,
+    /// summed per kernel. Disarms so the following readback is not counted.
+    pub fn ktime_report(&self, title: &str) {
+        self.kt_arm.set(false);
+        if !self.ktime {
+            return;
+        }
+        use ocl::enums::{ProfilingInfo, ProfilingInfoResult};
+        use std::collections::BTreeMap;
+        let evs = std::mem::take(&mut *self.kt_ev.borrow_mut());
+        let mut acc: BTreeMap<&'static str, (u64, f64)> = BTreeMap::new();
+        for (name, ev) in evs {
+            let _ = ev.wait_for();
+            if let (Ok(ProfilingInfoResult::Start(t0)), Ok(ProfilingInfoResult::End(t1))) = (
+                ev.profiling_info(ProfilingInfo::Start),
+                ev.profiling_info(ProfilingInfo::End),
+            ) {
+                let slot = acc.entry(name).or_insert((0, 0.0));
+                slot.0 += 1;
+                slot.1 += (t1 - t0) as f64 * 1e-6;
+            }
+        }
+        let mut rows: Vec<(&str, u64, f64)> = acc.into_iter().map(|(n, (c, ms))| (n, c, ms)).collect();
+        rows.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+        let total: f64 = rows.iter().map(|r| r.2).sum();
+        eprintln!("[ktime] {title}: kernel-exec {total:.2} ms");
+        eprintln!("[ktime]   {:<42} {:>7} {:>10} {:>10} {:>6}", "kernel", "calls", "ms", "ms/call", "%");
+        for (name, n, ms) in rows {
+            eprintln!(
+                "[ktime]   {name:<42} {n:>7} {ms:10.3} {:10.4} {:5.1}%",
+                if n > 0 { ms / n as f64 } else { 0.0 },
+                if total > 0.0 { 100.0 * ms / total } else { 0.0 }
+            );
         }
     }
 
@@ -1836,8 +2001,8 @@ impl GpuSccPlan {
     fn purify_solve_enq(&mut self, rt: &mut GpuRuntime) -> Result<()> {
         // Orthogonalize: hp = Xᵀ·H_scc·X — cold GEMM handles are always
         // geometry-current (x_buf/x_t refreshed by set_geometry).
-        self.enq_mm(&self.k_matmul_xh)?;
-        self.enq_mm(&self.k_matmul_tx)?;
+        self.enq_mm(&self.k_matmul_xh, "batched_gemm_active  Xᵀ·H")?;
+        self.enq_mm(&self.k_matmul_tx, "batched_gemm_active  (XᵀH)·X")?;
         rt.prof_tick("scc.pur_ortho");
         let work_n = self.work_n;
         let swapped = {
@@ -1846,56 +2011,125 @@ impl GpuSccPlan {
             })?;
             // Re-arm the freeze flags EVERY iteration — a latched done[s]=1
             // makes tc2_step a no-op for that replica (both cold and warm).
+            // `pend` mirrors the SCC `active` mask: the DMM/certificate
+            // GEMMs gate on it so a replica stops paying GEMMs the moment
+            // the certificate passes (comm_gate clears pend on-device).
             pur.done.cmd().fill(0i32, None).enq().map_err(map_ocl_err)?;
             let gxy = pur.gxy;
-            let g3 = |k: &Kernel| unsafe {
-                k.cmd()
-                    .global_work_size(ocl::SpatialDims::Three(gxy.0, gxy.1, work_n))
+            unsafe {
+                self.active
+                    .cmd()
+                    .queue(rt.queue())
+                    .copy(&pur.pend, None, Some(self.batch))
                     .enq()
-                    .map_err(map_ocl_err)
+                    .map_err(map_ocl_err)?;
+            }
+            let dmm_wg = pur.dmm_wg;
+            let (arg_a, arg_b) = pur.dmm_ab;
+            let (n_hk, n_kx, n_kk, n_tk) = if dmm_wg > 0 {
+                (
+                    "gemm_regtile_masked  H'·K",
+                    "gemm_regtile_masked  K·T",
+                    "gemm_regtile_masked  K·K",
+                    "gemm_regtile_masked  (K·K)·K",
+                )
+            } else {
+                (
+                    "batched_gemm_active  H'·K",
+                    "batched_gemm_active  K·T",
+                    "batched_gemm_active  K·K",
+                    "batched_gemm_active  (K·K)·K",
+                )
             };
+            let g3 = |k: &Kernel, name: &'static str| -> Result<()> { unsafe {
+                if self.ktime && self.kt_arm.get() {
+                    let mut ev = Event::empty();
+                    let cmd = k.cmd();
+                    let r = if dmm_wg > 0 {
+                        cmd.global_work_size(work_n * dmm_wg).enew(&mut ev).enq()
+                    } else {
+                        cmd.global_work_size(ocl::SpatialDims::Three(gxy.0, gxy.1, work_n)).enew(&mut ev).enq()
+                    };
+                    r.map_err(map_ocl_err)?;
+                    self.kt_ev.borrow_mut().push((name, ev));
+                } else {
+                    let cmd = k.cmd();
+                    if dmm_wg > 0 {
+                        cmd.global_work_size(work_n * dmm_wg).enq()
+                    } else {
+                        cmd.global_work_size(ocl::SpatialDims::Three(gxy.0, gxy.1, work_n)).enq()
+                    }
+                    .map_err(map_ocl_err)?;
+                }
+                Ok(())
+            } };
+            let built = |k: &Kernel, name: &'static str| -> Result<()> { unsafe {
+                if self.ktime && self.kt_arm.get() {
+                    let mut ev = Event::empty();
+                    k.cmd().enew(&mut ev).enq().map_err(map_ocl_err)?;
+                    self.kt_ev.borrow_mut().push((name, ev));
+                } else {
+                    k.cmd().enq().map_err(map_ocl_err)?;
+                }
+                Ok(())
+            } };
             if pur.seeded && pur.warm {
-                // ---- warm: DMM commutator descent (§7.6.4) ----
-                // Seed = last converged K IN PLACE (no δK0 shift, no
-                // extrapolation — both measured to drift/diverge). Each
-                // step: T=H′K, Y=KT, K ← sym(K)−(η/Δε)(T+Tᵀ−2Y) — the
-                // occ–virt coupling rotates the subspace downhill on
-                // Tr(KH′); McWeeny retracts hold idempotency.
-                unsafe { pur.k_span.enq().map_err(map_ocl_err)?; }
+                // ---- warm: cert-gated correction (chat §17 option A) ----
+                // Seed = last converged K IN PLACE. Round 0 = certificate
+                // only: a good carry needs zero corrections. Each round:
+                // Y = K·T (T=H′K fresh from the cert), DMM subspace step,
+                // McWeeny retract, re-certify. All launches are enqueued
+                // unconditionally but every kernel/GEMM gates on the
+                // device `pend` mask — certified replicas early-out.
+                built(&pur.k_span, "spec_span_batched")?;
                 let kbuf = if pur.swapped { &pur.d_b } else { &pur.d_a };
-                pur.g_hk.set_arg(7u32, kbuf).map_err(map_ocl_err)?;
-                pur.g_kx.set_arg(6u32, kbuf).map_err(map_ocl_err)?;
-                pur.g_kk.set_arg(6u32, kbuf).map_err(map_ocl_err)?;
-                pur.g_kk.set_arg(7u32, kbuf).map_err(map_ocl_err)?;
-                pur.g_tk.set_arg(7u32, kbuf).map_err(map_ocl_err)?;
+                pur.g_hk.set_arg(arg_b, kbuf).map_err(map_ocl_err)?;
+                pur.g_kx.set_arg(arg_a, kbuf).map_err(map_ocl_err)?;
+                pur.g_kk.set_arg(arg_a, kbuf).map_err(map_ocl_err)?;
+                pur.g_kk.set_arg(arg_b, kbuf).map_err(map_ocl_err)?;
+                pur.g_tk.set_arg(arg_b, kbuf).map_err(map_ocl_err)?;
                 pur.k_dmm_upd.set_arg(0u32, kbuf).map_err(map_ocl_err)?;
                 pur.k_mcweeny.set_arg(0u32, kbuf).map_err(map_ocl_err)?;
-                for st in 0..pur.dmm_steps {
-                    g3(&pur.g_hk)?;   // T = H′·K
-                    g3(&pur.g_kx)?;   // Y = K·T
-                    unsafe { pur.k_dmm_upd.enq().map_err(map_ocl_err)?; }
-                    if pur.dmm_retract > 0 && (st + 1) % pur.dmm_retract == 0 {
-                        g3(&pur.g_kk)?;   // t_buf = K·K
-                        g3(&pur.g_tk)?;   // y_buf = t_buf·K
-                        unsafe { pur.k_mcweeny.enq().map_err(map_ocl_err)?; }
-                    }
+                g3(&pur.g_hk, n_hk)?;   // T = H′·K (seed certificate input)
+                built(&pur.k_comm, "comm_gate_batched")?;
+                rt.prof_tick("scc.pur_seedcert");
+                for _ in 0..pur.corr_rounds {
+                    g3(&pur.g_kx, n_kx)?;   // Y = K·T
+                    built(&pur.k_dmm_upd, "dmm_update_batched")?;
+                    g3(&pur.g_kk, n_kk)?;   // t_buf = K·K
+                    g3(&pur.g_tk, n_tk)?;   // y_buf = t_buf·K
+                    built(&pur.k_mcweeny, "mcweeny_combine_batched")?;
+                    g3(&pur.g_hk, n_hk)?;   // T = H′·K (re-certify)
+                    built(&pur.k_comm, "comm_gate_batched")?;
                 }
-                // Optional TC2 tail (sparse default 0 — post-DMM TC2 can
-                // degrade R_H; knob kept for trace enforcement).
-                for _ in 0..pur.tc2_tail {
-                    if pur.swapped {
-                        pur.k_step.set_arg(0u32, &pur.d_b).map_err(map_ocl_err)?;
-                        pur.k_step.set_arg(1u32, &pur.d_a).map_err(map_ocl_err)?;
-                    } else {
-                        pur.k_step.set_arg(0u32, &pur.d_a).map_err(map_ocl_err)?;
-                        pur.k_step.set_arg(1u32, &pur.d_b).map_err(map_ocl_err)?;
+                rt.prof_tick("scc.pur_corr");
+                // Full Palser+TC2 after the short update. Off by default:
+                // it turned every SCC iteration into a cold purify (~6 ms
+                // at n=86, batch=400) and lost to warm Jacobi. Set
+                // RUST_DFTB_PURIFY_FALLBACK=1 to restore that schedule.
+                // mirror_done=0 + even step count keeps final K on the
+                // start side so `swapped` stays valid.
+                if pur.fallback {
+                    pur.k_init_a.set_arg(1u32, kbuf).map_err(map_ocl_err)?;
+                    built(&pur.k_init_a, "tc2_init_batched")?;
+                    pur.k_step.set_arg(9u32, 0i32).map_err(map_ocl_err)?; // mirror_done=0
+                    let cur = pur.swapped;
+                    let steps_fb = pur.steps_cold + (pur.steps_cold & 1); // force even
+                    for i in 0..steps_fb {
+                        let (din, dout) = if (i & 1) == (cur as usize) {
+                            (&pur.d_a, &pur.d_b)
+                        } else {
+                            (&pur.d_b, &pur.d_a)
+                        };
+                        pur.k_step.set_arg(0u32, din).map_err(map_ocl_err)?;
+                        pur.k_step.set_arg(1u32, dout).map_err(map_ocl_err)?;
+                        built(&pur.k_step, "tc2_step_batched")?;
                     }
-                    unsafe { pur.k_step.enq().map_err(map_ocl_err)?; }
-                    pur.swapped = !pur.swapped;
+                    pur.k_step.set_arg(9u32, 1i32).map_err(map_ocl_err)?; // restore mirror
                 }
             } else {
                 // Cold: Palser–Gershgorin init hp → d_a, then TC2.
-                unsafe { pur.k_init_a.enq().map_err(map_ocl_err)?; }
+                built(&pur.k_init_a, "tc2_init_batched")?;
                 pur.swapped = false;
                 pur.seeded = true;
                 for _ in 0..pur.steps_cold {
@@ -1906,9 +2140,10 @@ impl GpuSccPlan {
                         pur.k_step.set_arg(0u32, &pur.d_a).map_err(map_ocl_err)?;
                         pur.k_step.set_arg(1u32, &pur.d_b).map_err(map_ocl_err)?;
                     }
-                    unsafe { pur.k_step.enq().map_err(map_ocl_err)?; }
+                    built(&pur.k_step, "tc2_step_batched")?;
                     pur.swapped = !pur.swapped;
                 }
+                rt.prof_tick("scc.pur_tc2");
             }
             // ---- R_H certificate on the FINAL K (both paths) ----
             // T = H′·K → t_buf, then rh = ‖T−Tᵀ‖_F/(2‖T‖_F). One extra
@@ -1916,9 +2151,9 @@ impl GpuSccPlan {
             // idempotency alone accept wrong-subspace projectors).
             {
                 let kbuf = if pur.swapped { &pur.d_b } else { &pur.d_a };
-                pur.g_hk.set_arg(7u32, kbuf).map_err(map_ocl_err)?;
-                g3(&pur.g_hk)?;
-                unsafe { pur.k_comm.enq().map_err(map_ocl_err)?; }
+                pur.g_hk.set_arg(arg_b, kbuf).map_err(map_ocl_err)?;
+                g3(&pur.g_hk, n_hk)?;
+                built(&pur.k_comm, "comm_gate_batched")?;
             }
             if std::env::var_os("RUST_DFTB_PURIFY_DEBUG").is_some() {
                 let mut tr_h = vec![0.0f32; self.batch.min(4)];
@@ -1953,15 +2188,15 @@ impl GpuSccPlan {
             }
             pur.swapped
         };
-        rt.prof_tick("scc.purify");
+        rt.prof_tick("scc.pur_cert");
         // D = X·K·Xᵀ — `swapped` mirrors purify_tc2_batched: the newest K
         // lives in d_b when swapped. These handles are batched_gemm_active
         // → enq3 with the tiled extents honours the compact work domain.
         let pur = self.purify.as_ref().unwrap();
-        self.enq3(if swapped { &pur.k_xk_b } else { &pur.k_xk_a }, pur.gxy)?;
-        self.enq3(&pur.k_txd, pur.gxy)?;
+        self.enq3(if swapped { &pur.k_xk_b } else { &pur.k_xk_a }, pur.gxy, "batched_gemm_active  X·K")?;
+        self.enq3(&pur.k_txd, pur.gxy, "batched_gemm_active  (XK)·Xᵀ")?;
         rt.prof_tick("scc.pur_back");
-        self.enq1(&self.k_mulliken, self.lg.mull)?;
+        self.enq1(&self.k_mulliken, self.lg.mull, "mulliken_charges_batched")?;
         rt.prof_tick("scc.mulliken");
         if std::env::var_os("RUST_DFTB_PURIFY_DEBUG").is_some() {
             let mut q_h = vec![0.0f32; self.n_atoms.min(4)];
@@ -1973,11 +2208,225 @@ impl GpuSccPlan {
         Ok(())
     }
 
+    /// One geometry step from the carried orthogonal K. Up to two
+    /// accepted commutator steps, then one McWeeny. η starts at 8. A
+    /// step that raises R_H is restored and η is halved — fixed η = 8
+    /// climbed on the dense 0.02 Å step (2.3e-2 → 6.0e-2). No charge
+    /// mixer, no TC2. Returns (R_H before, R_H after McWeeny, Tr(K) of
+    /// replica 0, η of the last accepted step, number accepted).
+    pub fn geom_bold_dmm(&mut self, rt: &mut GpuRuntime) -> Result<(f32, f32, f32, f32, usize)> {
+        self.geom_bold_dmm_capped(rt, 2)
+    }
+
+    /// Same step with a fixed cap on accepted commutator steps. The
+    /// Hamiltonian is not rebuilt. `max_acc` is the only difference from
+    /// `geom_bold_dmm` (which uses 2).
+    pub fn geom_bold_dmm_capped(
+        &mut self,
+        rt: &mut GpuRuntime,
+        max_acc: usize,
+    ) -> Result<(f32, f32, f32, f32, usize)> {
+        if max_acc == 0 || max_acc > 32 {
+            return Err(DftbError::InvalidInput(format!(
+                "geom_bold_dmm_capped: max_acc={max_acc} outside 1..=32"
+            )));
+        }
+        if self.n_occ == 0 {
+            return Err(DftbError::InvalidInput(
+                "geom_bold_dmm: n_occ is 0 — SCC has not bound the occupation".into(),
+            ));
+        }
+        {
+            let pur = self.purify.as_ref().ok_or_else(|| {
+                DftbError::InvalidInput("geom_bold_dmm: purify plan was not built".into())
+            })?;
+            if !pur.seeded {
+                return Err(DftbError::InvalidInput(
+                    "geom_bold_dmm: K is not seeded — refuse to invent a Palser density".into(),
+                ));
+            }
+        }
+        if self.work_ids_host.len() != self.work_n
+            || self.work_ids_host.iter().enumerate().any(|(i, &s)| s != i as i32)
+        {
+            return Err(DftbError::InvalidInput(format!(
+                "geom_bold_dmm: work domain is not replicas 0..{} — the checkpoint copies that prefix",
+                self.work_n
+            )));
+        }
+        self.activate_all(rt)?;
+        self.enq_dq_v_hscc()?;
+        self.enq_mm(&self.k_matmul_xh, "batched_gemm_active  Xᵀ·H")?;
+        self.enq_mm(&self.k_matmul_tx, "batched_gemm_active  (XᵀH)·X")?;
+        let (rh_raw, rh, tr, eta_acc, n_acc) = {
+            let pur = self.purify.as_mut().unwrap();
+            let work_n = self.work_n;
+            let pwg = pur.pur_wg;
+            let dmm_wg = pur.dmm_wg;
+            let gxy = pur.gxy;
+            let (arg_a, arg_b) = pur.dmm_ab;
+            let (n_hk, n_kx, n_kk, n_tk) = if dmm_wg > 0 {
+                (
+                    "gemm_regtile_masked  H'·K",
+                    "gemm_regtile_masked  K·T",
+                    "gemm_regtile_masked  K·K",
+                    "gemm_regtile_masked  (K·K)·K",
+                )
+            } else {
+                (
+                    "batched_gemm_active  H'·K",
+                    "batched_gemm_active  K·T",
+                    "batched_gemm_active  K·K",
+                    "batched_gemm_active  (K·K)·K",
+                )
+            };
+            let g3 = |k: &Kernel, name: &'static str| -> Result<()> { unsafe {
+                if self.ktime && self.kt_arm.get() {
+                    let mut ev = Event::empty();
+                    let cmd = k.cmd();
+                    let r = if dmm_wg > 0 {
+                        cmd.global_work_size(work_n * dmm_wg).enew(&mut ev).enq()
+                    } else {
+                        cmd.global_work_size(ocl::SpatialDims::Three(gxy.0, gxy.1, work_n)).enew(&mut ev).enq()
+                    };
+                    r.map_err(map_ocl_err)?;
+                    self.kt_ev.borrow_mut().push((name, ev));
+                } else {
+                    let cmd = k.cmd();
+                    if dmm_wg > 0 {
+                        cmd.global_work_size(work_n * dmm_wg).enq()
+                    } else {
+                        cmd.global_work_size(ocl::SpatialDims::Three(gxy.0, gxy.1, work_n)).enq()
+                    }
+                    .map_err(map_ocl_err)?;
+                }
+                Ok(())
+            } };
+            let built = |k: &Kernel, name: &'static str| -> Result<()> { unsafe {
+                let gws = work_n * pwg;
+                if self.ktime && self.kt_arm.get() {
+                    let mut ev = Event::empty();
+                    k.cmd().global_work_size(gws).enew(&mut ev).enq().map_err(map_ocl_err)?;
+                    self.kt_ev.borrow_mut().push((name, ev));
+                } else {
+                    k.cmd().global_work_size(gws).enq().map_err(map_ocl_err)?;
+                }
+                Ok(())
+            } };
+            let arm = |pur: &mut PurifyScc| -> Result<()> {
+                pur.pend.cmd().fill(1i32, None).enq().map_err(map_ocl_err)?;
+                pur.done.cmd().fill(0i32, None).enq().map_err(map_ocl_err)?;
+                Ok(())
+            };
+            arm(pur)?;
+            built(&pur.k_span, "spec_span_batched")?;
+            let kbuf_is_b = pur.swapped;
+            let kbuf = if kbuf_is_b { &pur.d_b } else { &pur.d_a };
+            pur.g_hk.set_arg(arg_b, kbuf).map_err(map_ocl_err)?;
+            pur.g_kx.set_arg(arg_a, kbuf).map_err(map_ocl_err)?;
+            pur.g_kk.set_arg(arg_a, kbuf).map_err(map_ocl_err)?;
+            pur.g_kk.set_arg(arg_b, kbuf).map_err(map_ocl_err)?;
+            pur.g_tk.set_arg(arg_b, kbuf).map_err(map_ocl_err)?;
+            pur.k_dmm_upd.set_arg(0u32, kbuf).map_err(map_ocl_err)?;
+            pur.k_mcweeny.set_arg(0u32, kbuf).map_err(map_ocl_err)?;
+            // Certificate of the carried K, before any rotation.
+            g3(&pur.g_hk, n_hk)?;
+            built(&pur.k_comm, "comm_gate_batched")?;
+            rt.read_buffer(&pur.rh, &mut pur.rh_host)?;
+            let rh_raw = pur.rh_host[0];
+            if !rh_raw.is_finite() {
+                return Err(DftbError::InvalidInput(format!(
+                    "geom_bold_dmm: R_H(raw)={rh_raw} non-finite"
+                )));
+            }
+            arm(pur)?;
+            // η starts at 8 with the trust cap lifted. A step that
+            // raises R_H is put back and retried at half η. The cap
+            // stays off: it would hide the step the trust region is
+            // judging. Below η = 1/16 the carried K is kept as-is.
+            pur.k_dmm_upd.set_arg(5u32, 1.0e6f32).map_err(map_ocl_err)?;
+            let nn = self.work_n * self.n * self.n;
+            let mut eta = 8.0f32;
+            let mut rh_now = rh_raw;
+            let mut n_acc = 0usize;
+            while n_acc < max_acc && eta >= 1.0 / 16.0 {
+                unsafe {
+                    let (src, dst) = if kbuf_is_b {
+                        (&pur.d_b, &pur.d_a)
+                    } else {
+                        (&pur.d_a, &pur.d_b)
+                    };
+                    src.cmd().queue(rt.queue()).copy(dst, None, Some(nn)).enq().map_err(map_ocl_err)?;
+                }
+                pur.k_dmm_upd.set_arg(4u32, eta).map_err(map_ocl_err)?;
+                arm(pur)?;
+                g3(&pur.g_hk, n_hk)?;
+                g3(&pur.g_kx, n_kx)?;
+                built(&pur.k_dmm_upd, "dmm_update_batched")?;
+                arm(pur)?;
+                g3(&pur.g_hk, n_hk)?;
+                built(&pur.k_comm, "comm_gate_batched")?;
+                rt.read_buffer(&pur.rh, &mut pur.rh_host)?;
+                let rh_try = pur.rh_host[0];
+                if !rh_try.is_finite() {
+                    return Err(DftbError::InvalidInput(format!(
+                        "geom_bold_dmm: R_H={rh_try} non-finite at η={eta}"
+                    )));
+                }
+                if rh_try > rh_now {
+                    unsafe {
+                        let (src, dst) = if kbuf_is_b {
+                            (&pur.d_a, &pur.d_b)
+                        } else {
+                            (&pur.d_b, &pur.d_a)
+                        };
+                        src.cmd().queue(rt.queue()).copy(dst, None, Some(nn)).enq().map_err(map_ocl_err)?;
+                    }
+                    eta *= 0.5;
+                } else {
+                    rh_now = rh_try;
+                    n_acc += 1;
+                }
+            }
+            let eta_acc = if n_acc == 0 { 0.0 } else { eta };
+            pur.k_dmm_upd.set_arg(4u32, pur.dmm_eta).map_err(map_ocl_err)?;
+            pur.k_dmm_upd.set_arg(5u32, pur.dmm_cap).map_err(map_ocl_err)?;
+            g3(&pur.g_kk, n_kk)?;
+            g3(&pur.g_tk, n_tk)?;
+            built(&pur.k_mcweeny, "mcweeny_combine_batched")?;
+            arm(pur)?;
+            g3(&pur.g_hk, n_hk)?;
+            built(&pur.k_comm, "comm_gate_batched")?;
+            rt.read_buffer(&pur.rh, &mut pur.rh_host)?;
+            let rh = pur.rh_host[0];
+            let n = self.n;
+            let mut k_h = vec![0.0f32; n * n];
+            let kbuf = if kbuf_is_b { &pur.d_b } else { &pur.d_a };
+            rt.read_buffer(kbuf, &mut k_h)?;
+            let mut tr = 0.0f32;
+            for i in 0..n {
+                tr += k_h[i * n + i];
+            }
+            if !rh.is_finite() || !tr.is_finite() {
+                return Err(DftbError::InvalidInput(format!(
+                    "geom_bold_dmm: R_H={rh} Tr(K)={tr} non-finite"
+                )));
+            }
+            (rh_raw, rh, tr, eta_acc, n_acc)
+        };
+        let swapped = self.purify.as_ref().unwrap().swapped;
+        let pur = self.purify.as_ref().unwrap();
+        self.enq3(if swapped { &pur.k_xk_b } else { &pur.k_xk_a }, pur.gxy, "batched_gemm_active  X·K")?;
+        self.enq3(&pur.k_txd, pur.gxy, "batched_gemm_active  (XK)·Xᵀ")?;
+        self.enq1(&self.k_mulliken, self.lg.mull, "mulliken_charges_batched")?;
+        Ok((rh_raw, rh, tr, eta_acc, n_acc))
+    }
+
     /// D10/R18: one fused launch for Δq → V=γΔq → H_scc. Replaces the
     /// delta_q + gamma_matvec + h_scc_update sequence (3 launches, and the
     /// dq/v global round-trip between them). All args bound at construction.
     fn enq_dq_v_hscc(&mut self) -> Result<()> {
-        self.enq1(&self.k_dq_v_hscc, self.lg.fuse)?;
+        self.enq1(&self.k_dq_v_hscc, self.lg.fuse, "fused_dq_v_hscc_batched")?;
         // Dense_Multi_CDFT: λ_F·½S(w_μ+w_ν) constraint shift on top of the
         // freshly built H_scc — every rebuild (SCC iter, finalize, eval).
         if let Some(c) = &self.cdft {
@@ -2018,25 +2467,25 @@ impl GpuSccPlan {
                     DftbError::InvalidInput("warm Jacobi handle missing for n>64".into())
                 })?
             };
-            self.enq_mm(k_xh)?; // temp = cᵀ·H_scc
+            self.enq_mm(k_xh, "batched_gemm_active  cᵀ·H")?;
             rt.prof_tick("scc.gemm_th");
-            self.enq_mm(k_tx)?; // hp = temp·c
+            self.enq_mm(k_tx, "batched_gemm_active  (cᵀH)·c")?;
             rt.prof_tick("scc.gemm_th2");
             let jfac = if self.block_mode {
                 self.lg.bjac
             } else {
                 self.lg.jac
             };
-            self.enq1(k_j, jfac)?; // rotate c in place
+            self.enq1(k_j, jfac, if self.block_mode { "block_jacobi_1wg" } else { "jacobi_resident_batched" })?;
             rt.prof_tick("scc.jacobi");
             // W1 (§14): NO report_jacobi here — read_buffer → queue.finish()
             // drained the whole pipeline mid-iteration, once per SCC iter.
             // Diag stays on device; the host certifies once at solve end
             // via check_jacobi().
         } else {
-            self.enq_mm(&self.k_matmul_xh)?; // temp = Xᵀ·H_scc
+            self.enq_mm(&self.k_matmul_xh, "batched_gemm_active  Xᵀ·H")?;
             rt.prof_tick("scc.gemm_th");
-            self.enq_mm(&self.k_matmul_tx)?; // hp = temp·X
+            self.enq_mm(&self.k_matmul_tx, "batched_gemm_active  (XᵀH)·X")?;
             rt.prof_tick("scc.gemm_th2");
             let k_j = if self.block_mode {
                 self.k_bjacobi
@@ -2050,7 +2499,7 @@ impl GpuSccPlan {
             } else {
                 self.lg.jac
             };
-            self.enq1(k_j, jfac)?; // V=I → cp
+            self.enq1(k_j, jfac, if self.block_mode { "block_jacobi_1wg" } else { "jacobi_resident_batched" })?;
             rt.prof_tick("scc.jacobi");
             // W1: deferred to check_jacobi() at solve end (see above).
         }
@@ -2068,11 +2517,13 @@ impl GpuSccPlan {
             // diag output index remap through work_ids.
             let g = ((self.work_n * self.n + 63) / 64) * 64;
             unsafe {
-                self.k_extract_diag
-                    .cmd()
-                    .global_work_size(g)
-                    .enq()
-                    .map_err(map_ocl_err)?;
+                if self.ktime && self.kt_arm.get() {
+                    let mut ev = Event::empty();
+                    self.k_extract_diag.cmd().global_work_size(g).enew(&mut ev).enq().map_err(map_ocl_err)?;
+                    self.kt_ev.borrow_mut().push(("extract_diagonal_batched", ev));
+                } else {
+                    self.k_extract_diag.cmd().global_work_size(g).enq().map_err(map_ocl_err)?;
+                }
             }
         }
         rt.prof_tick("scc.extract_diag");
@@ -2090,14 +2541,14 @@ impl GpuSccPlan {
             // snormalize's per-column S streaming is redundant there.
             if renorm && !self.direct_pop {
                 unsafe {
-                    self.enq1(&self.k_occ_snorm, self.lg.sn)?;
+                    self.enq1(&self.k_occ_snorm, self.lg.sn, "snormalize_batched")?;
                 }
             }
         } else {
             if renorm {
-                self.enq1(&self.k_occ_renorm, self.lg.ren)?;
+                self.enq1(&self.k_occ_renorm, self.lg.ren, "occ_normalize_batched")?;
             }
-            self.enq_mm(&self.k_matmul_xc)?; // c = X·cp
+            self.enq_mm(&self.k_matmul_xc, "batched_gemm_active  X·C′")?;
             self.b_warm = self.n > 64;
         }
         Ok(())
@@ -2110,16 +2561,16 @@ impl GpuSccPlan {
     /// Legacy path (`direct_pop=false`): D build + Mulliken(D,S).
     fn populations(&mut self, rt: &mut GpuRuntime, renorm: bool) -> Result<()> {
         if self.direct_pop {
-            self.enq3(&self.k_sc_gemm, self.lg.sc)?;
+            self.enq3(&self.k_sc_gemm, self.lg.sc, "batched_gemm_active  S·C")?;
             rt.prof_tick("scc.sc_gemm");
             if renorm {
-                self.enq1(&self.k_csnorm, self.lg.cs)?;
+                self.enq1(&self.k_csnorm, self.lg.cs, "cs_normalize_batched")?;
             }
-            self.enq1(&self.k_mulliken_cs, self.lg.mull)?;
+            self.enq1(&self.k_mulliken_cs, self.lg.mull, "mulliken_cs_batched")?;
         } else {
-            self.enq1(&self.k_density, self.lg.den)?;
+            self.enq1(&self.k_density, self.lg.den, "density_batched")?;
             rt.prof_tick("scc.density");
-            self.enq1(&self.k_mulliken, self.lg.mull)?;
+            self.enq1(&self.k_mulliken, self.lg.mull, "mulliken_charges_batched")?;
             rt.prof_tick("scc.mulliken");
         }
         Ok(())
@@ -2256,6 +2707,23 @@ impl GpuSccPlan {
     const LOWDIN_REUSE_MAX: usize = 3;
 
     pub fn set_geometry(&mut self, rt: &mut GpuRuntime, s_buf: &Buffer<f32>) -> Result<()> {
+        self.set_geometry_inner(rt, s_buf, false)
+    }
+
+    /// Geometry update that keeps the purified projector. For a small
+    /// move the previous K is the SCC guess in the new orthogonal basis
+    /// (X is Newton-repaired in this same call). A charge reset still
+    /// goes through `reset_purify`.
+    pub fn set_geometry_keep_k(&mut self, rt: &mut GpuRuntime, s_buf: &Buffer<f32>) -> Result<()> {
+        self.set_geometry_inner(rt, s_buf, true)
+    }
+
+    fn set_geometry_inner(
+        &mut self,
+        rt: &mut GpuRuntime,
+        s_buf: &Buffer<f32>,
+        keep_purify: bool,
+    ) -> Result<()> {
         // Lazy-X (2026-09-13): repair the warm AO basis B (=c) FIRST — when it
         // certifies (the common FIRE-step case), the whole Löwdin X path
         // (≤3 Newton iters of GEMMs+readbacks, possibly a cold Jacobi(S),
@@ -2264,10 +2732,15 @@ impl GpuSccPlan {
         // i.e. when B repair fails or was never warm. This is not a silent
         // fallback: the cold path is the certified primary route; the warm
         // basis is an accelerator that must pass the same metric check.
-        // §17.6: geometry changed ⇒ the purifier's K lives in the OLD X
-        // basis — next purify solve re-inits from Palser.
-        if let Some(pur) = self.purify.as_mut() {
-            pur.seeded = false;
+        // §17.6: K is expressed in the previous orthogonal basis. The
+        // default drops it and the next solve starts from Palser.
+        // `keep_purify` leaves it as the guess after a small move; X is
+        // still repaired below.
+        if !keep_purify {
+            if let Some(pur) = self.purify.as_mut() {
+                pur.seeded = false;
+                pur.fb_pending = true;
+            }
         }
         let mut b_ok = false;
         if self.b_warm {
@@ -2601,10 +3074,10 @@ impl GpuSccPlan {
         // the state stale anyway (state_fresh=false → eval re-finalizes).
 
         // 10. residual + mix → q_next (host commits to q_gpu only for active replicas)
-        self.enq1(&self.k_residual_mix, self.lg.res)?;
+        self.enq1(&self.k_residual_mix, self.lg.res, "residual_mix_batched")?;
         // Synchronous single-step API commits the mixed iterate — the
         // chunked hot loop is the only path that defers commits.
-        self.enq1(&self.k_commit, self.lg.res)?;
+        self.enq1(&self.k_commit, self.lg.res, "commit_q_batched")?;
 
         // Read RMS and return max
         rt.read_buffer(&self.rms, &mut self.rms_host)?;
@@ -2621,7 +3094,7 @@ impl GpuSccPlan {
         }
         // Block mode (§16.D): no fused tail — block_jacobi_1wg wrote
         // eig_diag; the standalone W5 kernels produce occ_mask + occ_w+mu.
-        self.enq1(&self.k_select_occ, self.lg.occ)?;
+        self.enq1(&self.k_select_occ, self.lg.occ, "select_occupation_batched")?;
         rt.prof_tick("scc.select_occ");
         if self.kT <= 0.0 {
             return Ok(());
@@ -2629,7 +3102,7 @@ impl GpuSccPlan {
         // W5 smearing (reference mode / n≤64): fermi_occ_batched solves μ
         // per replica on device (f64 bracketed bisection on eig_diag) and
         // writes occ_w — no host sync.
-        self.enq1(&self.k_fermi_occ, self.lg.occ)?;
+        self.enq1(&self.k_fermi_occ, self.lg.occ, "fermi_occ_batched")?;
         rt.prof_tick("scc.fermi_occ");
         Ok(())
     }
@@ -2687,6 +3160,7 @@ impl GpuSccPlan {
 
             // T03: populations — direct path builds no density matrix.
             self.populations(rt, self.occ_repair_scc)?;
+            rt.prof_tick("scc.pop");
             if std::env::var_os("RUST_DFTB_PURIFY_DEBUG").is_some() {
                 let mut q_h = vec![0.0f32; self.n_atoms.min(4)];
                 rt.read_buffer(&self.q_new, &mut q_h)?;
@@ -2701,7 +3175,7 @@ impl GpuSccPlan {
 
         // 10. GPU-side DIIS mixing (R9b + D9: Δq-anchored, drop-oldest retry)
         unsafe {
-            self.enq1(&self.k_diis, self.lg.diis)?;
+            self.enq1(&self.k_diis, self.lg.diis, "diis_step_batched")?;
         }
         rt.prof_tick("scc.diis");
         Ok(())
@@ -2713,8 +3187,99 @@ impl GpuSccPlan {
     pub fn read_chunk_status(&mut self, rt: &GpuRuntime) -> Result<()> {
         rt.read_buffer(&self.rms, &mut self.rms_host)?;
         rt.read_buffer(&self.active, &mut self.active_host)?;
+        // Purify: certificate readback at the SAME chunk-end sync.
+        // A replica whose charge residual already met tol is not done
+        // while its subspace commutator is still above cert_tol — DIIS
+        // cleared `active` on rms alone; put it back so the next chunk
+        // keeps tracking K. NaN residuals stay stopped.
+        let mut rearm = false;
+        if let Some(pur) = self.purify.as_mut() {
+            rt.read_buffer(&pur.rh, &mut pur.rh_host)?;
+            for b in 0..self.batch {
+                if self.active_host[b] == 0
+                    && self.rms_host[b].is_finite()
+                    && pur.rh_host[b] > pur.cert_tol
+                {
+                    self.active_host[b] = 1;
+                    rearm = true;
+                }
+            }
+            pur.fb_pending = (0..self.batch)
+                .any(|b| self.active_host[b] != 0 && pur.rh_host[b] > pur.cert_tol);
+            if std::env::var_os("RUST_DFTB_PURIFY_DEBUG").is_some() {
+                let mut mx = 0.0f32;
+                let mut n_bad = 0usize;
+                for b in 0..self.batch {
+                    if self.active_host[b] == 0 {
+                        continue;
+                    }
+                    mx = mx.max(pur.rh_host[b]);
+                    if pur.rh_host[b] > pur.cert_tol {
+                        n_bad += 1;
+                    }
+                }
+                let mut rms_mx = 0.0f32;
+                let mut n_charge_done = 0usize;
+                for b in 0..self.batch {
+                    if self.active_host[b] == 0 {
+                        continue;
+                    }
+                    rms_mx = rms_mx.max(self.rms_host[b]);
+                    if pur.rh_host[b] > pur.cert_tol && self.rms_host[b] < 1e-6 {
+                        n_charge_done += 1;
+                    }
+                }
+                eprintln!("[purify] chunk-end: active_uncertified={n_bad} (charge rms already <1e-6: {n_charge_done}) max_rh={mx:.3e} max_rms={rms_mx:.3e} fb={}", pur.fb_pending);
+                if n_bad > 0 {
+                    let bad: Vec<String> = (0..self.batch)
+                        .filter(|&b| self.active_host[b] != 0 && pur.rh_host[b] > pur.cert_tol)
+                        .take(8)
+                        .map(|b| format!("{b}:{:.2e}", pur.rh_host[b]))
+                        .collect();
+                    eprintln!("[purify]   worst: {}", bad.join(" "));
+                }
+            }
+        }
+        if rearm {
+            self.set_active(rt)?;
+        }
         max_finite_f32(&self.rms_host, "DIIS rms (chunk end)")?;
         Ok(())
+    }
+
+    /// Purify path: subspace commutator still above the acceptance
+    /// threshold. Charge RMS alone is not convergence. Jacobi path
+    /// always returns false.
+    /// Chunk-end snapshot: active count, max charge RMS, max commutator,
+    /// and how many active replicas still fail the commutator tolerance.
+    pub fn chunk_diag(&self) -> (usize, f32, f32, usize) {
+        let mut n_act = 0usize;
+        let mut max_rms = 0.0f32;
+        let mut max_rh = 0.0f32;
+        let mut n_rh = 0usize;
+        let tol = self.purify.as_ref().map(|p| p.cert_tol).unwrap_or(0.0);
+        for b in 0..self.batch {
+            if self.active_host[b] == 0 {
+                continue;
+            }
+            n_act += 1;
+            max_rms = max_rms.max(self.rms_host[b]);
+            if let Some(pur) = &self.purify {
+                let rh = pur.rh_host[b];
+                max_rh = max_rh.max(rh);
+                if rh > tol {
+                    n_rh += 1;
+                }
+            }
+        }
+        (n_act, max_rms, max_rh, n_rh)
+    }
+
+    pub fn purify_lagging(&self, sid: usize) -> bool {
+        match &self.purify {
+            Some(pur) => pur.rh_host.get(sid).copied().unwrap_or(0.0) > pur.cert_tol,
+            None => false,
+        }
     }
 
     /// Upload `active_host` to the `active` device mask. 1 = still iterating,
@@ -2757,7 +3322,7 @@ impl GpuSccPlan {
     /// just-solved input charge so the device state (C,D,H_scc,Δq,V) stays
     /// consistent with q_gpu after the SCC loop exits.
     pub fn commit_q_next(&mut self, rt: &GpuRuntime) -> Result<()> {
-        self.enq1(&self.k_commit, self.lg.res)?;
+        self.enq1(&self.k_commit, self.lg.res, "commit_q_batched")?;
         Ok(())
     }
 
@@ -2782,12 +3347,62 @@ impl GpuSccPlan {
         Ok(())
     }
 
+    /// Snapshot the current charges, eigenvectors and (if purifying) K.
+    pub fn capture_density(&mut self, rt: &GpuRuntime) -> Result<DensityGuess> {
+        let q = rt.copy_buffer(&self.q_gpu, self.q_gpu.len())?;
+        let c = rt.copy_buffer(&self.c, self.c.len())?;
+        let (d_a, d_b, seeded, swapped) = if let Some(pur) = &self.purify {
+            (
+                Some(rt.copy_buffer(&pur.d_a, pur.d_a.len())?),
+                Some(rt.copy_buffer(&pur.d_b, pur.d_b.len())?),
+                pur.seeded,
+                pur.swapped,
+            )
+        } else {
+            (None, None, false, false)
+        };
+        rt.finish()?;
+        Ok(DensityGuess {
+            q,
+            c,
+            d_a,
+            d_b,
+            seeded,
+            swapped,
+            b_warm: self.b_warm,
+        })
+    }
+
+    /// Put a captured guess back. Does not touch the geometry or X.
+    pub fn restore_density(&mut self, rt: &GpuRuntime, g: &DensityGuess) -> Result<()> {
+        rt.copy_into(&g.q, &self.q_gpu, g.q.len())?;
+        rt.copy_into(&g.c, &self.c, g.c.len())?;
+        if let Some(pur) = self.purify.as_mut() {
+            if let (Some(a), Some(b)) = (&g.d_a, &g.d_b) {
+                rt.copy_into(a, &pur.d_a, a.len())?;
+                rt.copy_into(b, &pur.d_b, b.len())?;
+            }
+            pur.seeded = g.seeded;
+            pur.swapped = g.swapped;
+        }
+        self.b_warm = g.b_warm;
+        rt.finish()?;
+        Ok(())
+    }
+
+    /// Jacobi warm-orbital flag. Cold throughput sets this false so the
+    /// next solve is not started from the previous eigenvectors.
+    pub fn set_basis_warm(&mut self, warm: bool) {
+        self.b_warm = warm;
+    }
+
     /// §17.6: a fresh SCC solve (reset_q0) must start the purifier cold —
     /// warm-seeding a converged K is a no-op that freezes the projector
     /// regardless of the new q0 (the original warm-seed bug).
     pub fn reset_purify(&mut self) {
         if let Some(pur) = self.purify.as_mut() {
             pur.seeded = false;
+            pur.fb_pending = true;
         }
     }
 

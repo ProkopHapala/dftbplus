@@ -1,5 +1,11 @@
 # Alternative dense multi-system eigensolvers — beyond Jacobi
 
+> **Standing order (2026-09-22):** [`Dense_Multi_Performance.md`](Dense_Multi_Performance.md).
+> This note’s §0 (Jacobi at ~5 % of peak) and §7 (fused TC2 timings)
+> still hold. The production conclusion — short warm schedule, not a
+> cold purification every SCC iteration — is in the mandate and in
+> `TrDH_minimization_purification_Notes.md` Parts VI–VIII.
+
 Status: design/analysis note (2026-09-18). Companion to
 `Dense_Multi_GPU_Optimization.tasks.md` (T08) and
 `Measured_Facts_Jacobi_Sweeps.md` §8.

@@ -36,6 +36,7 @@
 #define GEMM_ITER_RED 0
 #define GEMM_KU 1
 #define GEMM_VEC 0
+#define GEMM_MASK 0
 #define FULLA_TK 8
 #define FULLA_MAXELEM 116
 #endif
@@ -153,6 +154,21 @@ __kernel void gemm_1elem(
 //   Bs[kk][col]    — B row-major, LDB = WN
 // Zero-padding outside the matrix contributes nothing to the sums.
 // ------------------------------------------------------------------
+#if GEMM_MASK
+// SCC warm path: launch index → physical slot, and a replica whose
+// mask entry is 0 returns before any barrier (the decision is uniform
+// across the workgroup). Same arithmetic as gemm_regtile.
+__kernel void gemm_regtile_masked(
+    const int n,
+    const int batch,
+    __global const float* A,
+    __global const float* B,
+    __global float* C,
+    __local float* As_t,
+    __local float* Bs,
+    __global const int* active,
+    __global const int* work_ids)
+#else
 __kernel void gemm_regtile(
     const int n,
     const int batch,
@@ -161,14 +177,21 @@ __kernel void gemm_regtile(
     __global float* C,
     __local float* As_t,
     __local float* Bs)
+#endif
 {
     // GEMM_SPLIT_M×GEMM_SPLIT_N workgroups per system: each takes an
     // interleaved subset of the WG output tiles (more resident WGs →
     // higher occupancy at small batch — the n=86/400-system regime is
     // thread-starved: 400 WGs ≪ SM thread slots).
     const int wg_idx = get_group_id(0) % (GEMM_SPLIT_M * GEMM_SPLIT_N);
+#if GEMM_MASK
+    const int slot = get_group_id(0) / (GEMM_SPLIT_M * GEMM_SPLIT_N);
+    const int sys = work_ids[slot];
+    if (sys < 0 || sys >= batch || active[sys] == 0) return;
+#else
     const int sys = get_group_id(0) / (GEMM_SPLIT_M * GEMM_SPLIT_N);
     if (sys >= batch) return;
+#endif
     const int part_m = wg_idx % GEMM_SPLIT_M;
     const int part_n = wg_idx / GEMM_SPLIT_M;
     // 1-D launch: thread grid derived from the flat local id so the WG

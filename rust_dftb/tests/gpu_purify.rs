@@ -829,3 +829,137 @@ fn test_lnv_solve_parity() {
     assert_eq!(bad, 0, "cold LNV: {bad}/{batch} systems failed parity");
     assert!(dg.converged, "cold LNV did not converge");
 }
+
+// ----------------------------------------------------------------
+// warm_extrap_solve — XL-BOMD trajectory warm start on a CONTROLLED
+// GAPPED system. H = U·diag(ε)·Uᵀ with an explicit HOMO–LUMO gap
+// (gap/span ≈ 0.15 — a realistic molecular regime, not the random
+// half-filled adversarial matrices). The trajectory rotates the
+// eigenbasis by a fixed angle θ per step in a random 2-plane, so
+// P_k = R(kθ)·P·R(kθ)ᵀ exactly and the target P* = R(2θ) P R(2θ)ᵀ is
+// known analytically. This is the production regime: stored converged
+// projectors from the previous two SCC/geometry iterations, small
+// per-step subspace rotation.
+// ----------------------------------------------------------------
+
+/// Occupied projector of the first `nocc` columns of `u`.
+fn occ_projector(u: &DMatrix<f64>, nocc: usize) -> Vec<f32> {
+    let n = u.nrows();
+    let mut p = vec![0.0f32; n * n];
+    for i in 0..n {
+        for j in 0..n {
+            let mut s = 0.0f64;
+            for k in 0..nocc {
+                s += u[(i, k)] * u[(j, k)];
+            }
+            p[i * n + j] = s as f32;
+        }
+    }
+    p
+}
+
+/// R(θ) = I + sinθ·W + (cosθ−1)·Q  for the 2-plane with
+/// W = u vᵀ − v uᵀ, Q = u uᵀ + v vᵀ (u,v orthonormal) — exact rotation.
+fn rot2(u: &DMatrix<f64>, w: &DMatrix<f64>, q: &DMatrix<f64>, theta: f64) -> DMatrix<f64> {
+    let n = u.nrows();
+    (DMatrix::<f64>::identity(n, n) + theta.sin() * w + (1.0 - theta.cos()) * q) * u
+}
+
+#[test]
+fn test_warm_extrap_gapped() {
+    let mut rt = match GpuRuntime::new() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[warm-xtr] no GPU: {e}");
+            return;
+        }
+    };
+    let n = 48usize;
+    let nocc = 16usize;
+    let batch = 6usize;
+    // Per-step subspace rotation angle — covers realistic SCC /
+    // geometry-update magnitudes (‖ΔP‖/step ≈ θ·√(2·nocc)).
+    let thetas = [0.03f64, 0.05, 0.08, 0.12, 0.16, 0.20];
+
+    let mut h = Vec::with_capacity(batch * n * n);
+    let mut p1 = Vec::with_capacity(batch * n * n);
+    let mut p2 = Vec::with_capacity(batch * n * n);
+    for b in 0..batch {
+        let theta = thetas[b];
+        // Random eigenbasis from a dense symmetric matrix.
+        let m = random_symmetric(n, 5000 + b as u64);
+        let (_e, u) = cpu_eig(&m, n);
+        // Gapped spectrum: occupied in [−1,−0.15], virtual in [0.15,1].
+        let mut eps = DMatrix::<f64>::zeros(n, n);
+        for k in 0..n {
+            eps[(k, k)] = if k < nocc {
+                -1.0 + 0.85 * k as f64 / (nocc - 1) as f64
+            } else {
+                0.15 + 0.85 * (k - nocc) as f64 / (n - nocc - 1) as f64
+            };
+        }
+        let h0 = &u * &eps * u.transpose();
+        // Random orthonormal u,v in R^n (Gram–Schmidt on two random
+        // columns of another random eigenbasis — cheap orthogonal
+        // vectors).
+        let m2 = random_symmetric(n, 9000 + b as u64);
+        let (_e2, uv) = cpu_eig(&m2, n);
+        let uv1 = uv.column(0).clone_owned();
+        let uv2 = uv.column(1).clone_owned();
+        let w = &uv1 * uv2.transpose() - &uv2 * uv1.transpose();
+        let q = &uv1 * uv1.transpose() + &uv2 * uv2.transpose();
+        // Projector history: P_k = proj(R(kθ)·U); target basis R(2θ)U.
+        let u1 = rot2(&u, &w, &q, theta);
+        let u2 = rot2(&u, &w, &q, 2.0 * theta);
+        let h_new = &u2 * &eps * u2.transpose();
+        p2.extend_from_slice(&occ_projector(&u, nocc));
+        p1.extend_from_slice(&occ_projector(&u1, nocc));
+        for i in 0..n {
+            for j in 0..n {
+                h.push(h_new[(i, j)] as f32);
+            }
+        }
+    }
+
+    let h_buf = rt.buffer_from_slice(&h).unwrap();
+    let p1_buf = rt.buffer_from_slice(&p1).unwrap();
+    let p2_buf = rt.buffer_from_slice(&p2).unwrap();
+    let d_buf = rt.zero_buffer::<f32>(batch * n * n).unwrap();
+
+    // Warm solve: extrapolate γ=1, retract, up to 6 DMM corrections
+    // (adaptive-η trust region — a rejected round costs a restore+retry),
+    // certify ‖HD−DH‖/2‖HD‖ < 1e-3 (same gate as the relax path).
+    let wdiag = rust_dftb::qmqm::gpu_purify::warm_extrap_solve(
+        &mut rt, &h_buf, &p1_buf, &p2_buf, &d_buf, n, batch,
+        1.0, 6, 1e-3,
+    )
+    .unwrap();
+
+    // Cold baseline on the same H_new for the product-count comparison.
+    let nocc_v = vec![nocc as f32; batch];
+    let mut d_cold = vec![0.0f32; batch * n * n];
+    let pdiag = purify_tc2_batched(&mut rt, &h_buf, &mut d_cold, n, batch, &nocc_v, 200, 1e-5)
+        .unwrap();
+
+    let mut d_warm = vec![0.0f32; batch * n * n];
+    rt.read_buffer(&d_buf, &mut d_warm).unwrap();
+
+    eprintln!("[warm-xtr] corrs={} products={} (cold TC2 iters={} ≈ {} products)",
+        wdiag.corrs, wdiag.products, pdiag.iters, pdiag.iters);
+    let mut bad = 0;
+    for b in 0..batch {
+        let hb = &h[b * n * n..(b + 1) * n * n];
+        let db = &d_warm[b * n * n..(b + 1) * n * n];
+        let (de, dp, di, da, dc) = certify_d(hb, db, n, nocc);
+        eprintln!(
+            "[warm-xtr] sys{b} θ={:.2}: ΔE={de:.3e} ‖D−Dref‖={dp:.3e} ‖D²−D‖={di:.3e} asym={da:.3e} ‖HD−DH‖={dc:.3e} rh={:.3e}",
+            thetas[b], wdiag.comms[b]
+        );
+        if de > 1e-3 || dp > 0.05 || di > 1e-3 || da > 1e-4 {
+            bad += 1;
+        }
+    }
+    eprintln!("[warm-xtr] {bad}/{batch} failed physical certification");
+    assert!(wdiag.converged, "warm extrapolation certificate failed: comms={:?}", wdiag.comms);
+    assert_eq!(bad, 0, "warm extrapolation: {bad}/{batch} systems failed parity");
+}

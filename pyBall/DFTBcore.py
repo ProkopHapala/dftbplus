@@ -102,7 +102,15 @@ class DFTBcore:
         
         if not os.path.exists(libpath):
             raise FileNotFoundError(f"libdftbcore.so not found at: {libpath}")
-        
+
+        # If using a build-tree library, preload its sibling libdftbplus.so so the
+        # fresh build wins over a stale installed copy resolved via rpath.
+        if '_build' in os.path.normpath(libpath).split(os.sep):
+            pre = os.path.normpath(os.path.join(
+                os.path.dirname(libpath), '..', '..', 'src', 'dftbp', 'libdftbplus.so'))
+            if os.path.exists(pre):
+                ctypes.CDLL(pre, mode=ctypes.RTLD_GLOBAL)
+
         self._lib = ctypes.CDLL(libpath, mode=ctypes.RTLD_LOCAL)
         self._basis_size = 0
         self._setup_signatures()
@@ -171,7 +179,27 @@ class DFTBcore:
         # dftbcore_get_eigvecs_dense(eigvecs(*), eigvals(*), n)  -- flat Fortran column-major buffer
         lib.dftbcore_get_eigvecs_dense.restype = None
         lib.dftbcore_get_eigvecs_dense.argtypes = [c_double_p, c_double_p, c_int]
-        
+
+        # ---- complex (k-point) getters for periodic systems ----
+        # dftbcore_get_cplx_dims(norb, nks, nkpts, nspin)
+        lib.dftbcore_get_cplx_dims.restype = None
+        lib.dftbcore_get_cplx_dims.argtypes = [c_int_p, c_int_p, c_int_p, c_int_p]
+
+        # dftbcore_get_kpoints(kpts(3,nk), weights(nk), nk)
+        lib.dftbcore_get_kpoints.restype = None
+        lib.dftbcore_get_kpoints.argtypes = [c_double_p, c_double_p, c_int]
+
+        # dftbcore_get_{h,s,dm}_cplx(buf(norb,norb,nks) complex, norb, nks)
+        # complex(c_double_complex) buffers are passed as plain double pointers
+        for name in ('dftbcore_get_h_cplx', 'dftbcore_get_s_cplx', 'dftbcore_get_dm_cplx'):
+            f = getattr(lib, name)
+            f.restype = None
+            f.argtypes = [c_double_p, c_int, c_int]
+
+        # dftbcore_get_eigvecs_cplx(cbuf(norb,norb,nks) complex, ebuf(norb,nks), norb, nks)
+        lib.dftbcore_get_eigvecs_cplx.restype = None
+        lib.dftbcore_get_eigvecs_cplx.argtypes = [c_double_p, c_double_p, c_int, c_int]
+
         # dftbcore_get_h_dense(h(*), n)
         lib.dftbcore_get_h_dense.restype = None
         lib.dftbcore_get_h_dense.argtypes = [c_double_p, c_int]
@@ -365,6 +393,93 @@ class DFTBcore:
     def get_dm_dense(self):   return self._get_matrix('dftbcore_get_dm_dense')
     def get_h_dense(self):    return self._get_matrix('dftbcore_get_h_dense')
     def get_s_dense(self):    return self._get_matrix('dftbcore_get_s_dense')
+
+    # ---- Complex (k-point) getters for periodic systems ----
+    # Slot convention: iks = ik + ispin*nkpts (k-point index runs fastest).
+
+    def get_cplx_dims(self):
+        """
+        Return (norb, nks, nkpts, nspin) for the complex k-point store.
+        nks == 0 means no k-point data was stored (cluster or Gamma-only run).
+        """
+        norb, nks, nk, ns = c_int(), c_int(), c_int(), c_int()
+        self._lib.dftbcore_get_cplx_dims(ctypes.byref(norb), ctypes.byref(nks),
+                                         ctypes.byref(nk), ctypes.byref(ns))
+        return norb.value, nks.value, nk.value, ns.value
+
+    def is_periodic_kpoints(self):
+        """True if complex k-point data (non-Gamma periodic run) is available."""
+        return self.get_cplx_dims()[1] > 0
+
+    def get_kpoints(self):
+        """
+        Return (kpts[nk,3], weights[nk]) where kpts are in fractions of the
+        reciprocal lattice vectors.
+        """
+        nk = self.get_cplx_dims()[2]
+        if nk == 0:
+            return np.zeros((0, 3)), np.zeros(0)
+        kpts = np.zeros((3, nk), dtype=np.float64, order='F')
+        w = np.zeros(nk, dtype=np.float64)
+        self._lib.dftbcore_get_kpoints(kpts.ctypes.data_as(c_double_p),
+                                       w.ctypes.data_as(c_double_p), c_int(nk))
+        return kpts.T.copy(), w
+
+    def _get_cplx3d(self, func_name):
+        """Helper: complex Fortran-order (norb,norb,nks) buffer -> [iks, i, j] complex128."""
+        norb, nks, _, _ = self.get_cplx_dims()
+        if nks == 0:
+            raise RuntimeError(
+                "No k-point data stored (cluster/Gamma-only run or collection disabled)")
+        buf = np.zeros(norb * norb * nks, dtype=np.complex128)
+        getattr(self._lib, func_name)(buf.ctypes.data_as(c_double_p),
+                                      c_int(norb), c_int(nks))
+        return buf.reshape(norb, norb, nks, order='F').transpose(2, 0, 1).copy()
+
+    def get_h_cplx(self):
+        """Return H(k)[iks, i, j] = <i|H|j> complex128, slot iks = ik + ispin*nk."""
+        return self._get_cplx3d('dftbcore_get_h_cplx')
+
+    def get_s_cplx(self):
+        """Return S(k)[iks, i, j] = <i|j> complex128, slot iks = ik + ispin*nk."""
+        return self._get_cplx3d('dftbcore_get_s_cplx')
+
+    def get_dm_cplx(self):
+        """Return k-space density matrix P(k)[iks, i, j] complex128
+        (without k-point weights; weights applied separately).
+
+        NOTE: slots are PER-SPIN-CHANNEL for spin-polarized runs
+        (iks = ik + ispin*nkpts). Sum channels via get_dm_cplx_total()
+        for the physical density / bond orders."""
+        return self._get_cplx3d('dftbcore_get_dm_cplx')
+
+    def get_dm_cplx_total(self):
+        """Spin-summed k-space density matrix -> (nkpts, norb, norb).
+        For unpolarized runs identical to get_dm_cplx()."""
+        P = self.get_dm_cplx()
+        norb, nks, nk, ns = self.get_cplx_dims()
+        if ns <= 1:
+            return P
+        # iks = ik + ispin*nkpts -> reshape (nspin, nkpts, norb, norb)
+        return P.reshape(ns, nk, norb, norb).sum(axis=0)
+
+    def get_eigvecs_cplx(self):
+        """
+        Return (C[iks, mo, orb] complex128, E[iks, mo] float64) where columns of the
+        Fortran eigvec matrix are MOs; slot iks = ik + ispin*nk.
+        """
+        norb, nks, _, _ = self.get_cplx_dims()
+        if nks == 0:
+            raise RuntimeError(
+                "No k-point data stored (cluster/Gamma-only run or collection disabled)")
+        cbuf = np.zeros(norb * norb * nks, dtype=np.complex128)
+        ebuf = np.zeros(norb * nks, dtype=np.float64)
+        self._lib.dftbcore_get_eigvecs_cplx(cbuf.ctypes.data_as(c_double_p),
+                                            ebuf.ctypes.data_as(c_double_p),
+                                            c_int(norb), c_int(nks))
+        C = cbuf.reshape(norb, norb, nks, order='F').transpose(2, 1, 0).copy()
+        E = ebuf.reshape(norb, nks, order='F').T.copy()
+        return C, E
 
     def write_debug_matrices(self):
         """

@@ -6,7 +6,7 @@
 
 use rust_dftb::load_sk_for_species;
 use rust_dftb::methods::sparse::harness::require_sih_sk_dir;
-use rust_dftb::methods::sparse::{SparseDftb, SparseDftbConfig};
+use rust_dftb::methods::sparse::{GeomOutcome, GeomStep, SparseDftb, SparseDftbConfig};
 
 fn sih4() -> (Vec<String>, Vec<[f64; 3]>) {
     let species = vec!["Si".into(), "H".into(), "H".into(), "H".into(), "H".into()];
@@ -406,4 +406,426 @@ fn test_sparse_dmm_batch_parity() {
         assert_eq!(d, 0.0, "subset eval {e}: max|dF|={d:.3e}");
     }
     eprintln!("[dmm batch] subset reuse (7 evals): bit-identical");
+}
+
+/// One 0.02 Å geometry step must reuse the stored projector (short DMM),
+/// and the resulting energy and forces must match a cold SCC at the same
+/// geometry. SiH4 is a complete mask, so this is a wiring check, not the
+/// R10 truncation floor.
+#[test]
+fn test_sparse_dftb_sih4_warm_step_vs_cold() {
+    let dir = require_sih_sk_dir();
+    let (sp, xyz) = sih4();
+    let sk = load_sk_for_species(&dir, &sp).unwrap_or_else(|e| panic!("load SK: {e}"));
+    let mut warm =
+        SparseDftb::new(sk, &dir, sp.clone(), xyz.clone()).unwrap_or_else(|e| panic!("warm new: {e}"));
+    let t0 = std::time::Instant::now();
+    let s0 = warm.scc(80, 1e-5).unwrap_or_else(|e| panic!("cold SCC: {e}"));
+    eprintln!(
+        "SiH4 cold SCC: iters={} rms={:.3e} Tr={:.6} {:.1} ms",
+        s0.n_iters,
+        s0.rms,
+        s0.tr_ks,
+        t0.elapsed().as_secs_f64() * 1e3
+    );
+
+    let mut xyz2 = xyz.clone();
+    xyz2[1][0] += 0.02;
+    let t1 = std::time::Instant::now();
+    warm.set_coords(&xyz2).unwrap_or_else(|e| panic!("set_coords: {e}"));
+    let sw = warm
+        .scc(80, 1e-5)
+        .unwrap_or_else(|e| panic!("warm SCC: {e}"));
+    let ms_w = t1.elapsed().as_secs_f64() * 1e3;
+    let ew = warm.energy().unwrap();
+    let fw = warm.forces().unwrap_or_else(|e| panic!("warm forces: {e}"));
+    eprintln!(
+        "SiH4 warm step: mixes={} rms={:.3e} Tr={:.6} R_H={:.3e} E={ew:.8} {ms_w:.1} ms",
+        sw.n_iters, sw.rms, sw.tr_ks, sw.r_h
+    );
+    assert!(sw.n_iters <= 3, "warm step expanded: mixes={}", sw.n_iters);
+    assert!((sw.tr_ks - 4.0).abs() < 0.05, "Tr(KS)={}", sw.tr_ks);
+    assert!(sw.r_h.is_finite() && sw.r_h < 5e-4, "R_H={:.3e}", sw.r_h);
+
+    let sk2 = load_sk_for_species(&dir, &sp).unwrap_or_else(|e| panic!("load SK2: {e}"));
+    let mut cold =
+        SparseDftb::new(sk2, &dir, sp, xyz2).unwrap_or_else(|e| panic!("cold new: {e}"));
+    let t2 = std::time::Instant::now();
+    let sc = cold.scc(80, 1e-5).unwrap_or_else(|e| panic!("cold displaced SCC: {e}"));
+    let ec = cold.energy().unwrap();
+    let fc = cold.forces().unwrap_or_else(|e| panic!("cold forces: {e}"));
+    eprintln!(
+        "SiH4 cold displaced: iters={} rms={:.3e} E={ec:.8} {:.1} ms",
+        sc.n_iters,
+        sc.rms,
+        t2.elapsed().as_secs_f64() * 1e3
+    );
+    let de = (ew - ec).abs();
+    let mut df = 0.0f64;
+    let mut fmax = 0.0f64;
+    for (a, b) in fw.forces.iter().zip(fc.forces.iter()) {
+        for c in 0..3 {
+            df = df.max((a[c] - b[c]).abs());
+            fmax = fmax.max(b[c].abs());
+        }
+    }
+    eprintln!("SiH4 warm vs cold: |dE|={de:.3e} Ha  max|dF|={df:.3e}  cold max|F|={fmax:.3e}");
+    // One 4-step block on a complete mask. Measured 2026-09-22: |dE|≈5e-3 Ha,
+    // max|dF|≈1e-3. These bounds catch a wrong subspace, not the f32 floor.
+    assert!(de < 1e-2, "|dE|={de:.3e} Ha");
+    assert!(df < 2e-3, "max|dF|={df:.3e}");
+
+    // FIRE from a converged state. Steps are much smaller than the 0.02 Å
+    // probe; each one must stay a single DMM block with a stable trace.
+    for k in 0..3 {
+        let t = std::time::Instant::now();
+        let mf = cold.fire_step(1e-8).unwrap_or_else(|e| panic!("FIRE {k}: {e}"));
+        let s = cold.scc(80, 1e-5).unwrap_or_else(|e| panic!("FIRE SCC {k}: {e}"));
+        eprintln!(
+            "SiH4 FIRE {k}: max|F|={mf:.3e} mixes={} rms={:.3e} Tr={:.6} R_H={:.3e} {:.1} ms",
+            s.n_iters,
+            s.rms,
+            s.tr_ks,
+            s.r_h,
+            t.elapsed().as_secs_f64() * 1e3
+        );
+        assert!(s.n_iters <= 3, "FIRE {k} expanded: mixes={}", s.n_iters);
+        assert!((s.tr_ks - 4.0).abs() < 2e-3, "FIRE {k} Tr={}", s.tr_ks);
+        assert!(s.r_h < 5e-4, "FIRE {k} R_H={:.3e}", s.r_h);
+    }
+}
+
+/// Five FIRE steps of each Warm_Geometry_DM variant against a cold SCC
+/// of the same geometry. A restart that matches the cold solve passes.
+/// An accepted step that misses the energy or the force does not.
+fn run_sih4_geom_variant(step: GeomStep, name: &str) -> (usize, usize) {
+    let dir = require_sih_sk_dir();
+    let (sp, xyz) = sih4();
+    let sk = load_sk_for_species(&dir, &sp).unwrap_or_else(|e| panic!("{name} SK: {e}"));
+    let mut warm =
+        SparseDftb::new(sk, &dir, sp.clone(), xyz.clone()).unwrap_or_else(|e| panic!("{name} warm: {e}"));
+    warm.set_geom_step(step);
+    // dt = 0.02 from rest moves an atom by ~2e-5 Å (½ F dt²), which
+    // leaves the old kernel inside the certificate and tests nothing.
+    // 0.5 Å gives a first step of ~0.01 Å, the dense geometry-step scale.
+    warm.set_fire_dt(0.5);
+    warm.scc(80, 1e-5).unwrap_or_else(|e| panic!("{name} warm init: {e}"));
+    let sk2 = load_sk_for_species(&dir, &sp).unwrap_or_else(|e| panic!("{name} SK2: {e}"));
+    let mut cold =
+        SparseDftb::new(sk2, &dir, sp, xyz).unwrap_or_else(|e| panic!("{name} cold: {e}"));
+    cold.scc(80, 1e-5).unwrap_or_else(|e| panic!("{name} cold init: {e}"));
+    let mut n_acc = 0usize;
+    let mut n_restart = 0usize;
+    for k in 0..5 {
+        let t = std::time::Instant::now();
+        let xyz_before = warm.coords().to_vec();
+        let mf = warm.fire_step(1e-8).unwrap_or_else(|e| panic!("{name} FIRE {k}: {e}"));
+        let mut d_r = 0.0f64;
+        for (a, b) in xyz_before.iter().zip(warm.coords().iter()) {
+            let dx = a[0] - b[0];
+            let dy = a[1] - b[1];
+            let dz = a[2] - b[2];
+            d_r = d_r.max((dx * dx + dy * dy + dz * dz).sqrt());
+        }
+        let xyz_k = warm.coords().to_vec();
+        let sw = warm.scc(80, 1e-5).unwrap_or_else(|e| panic!("{name} warm scc {k}: {e}"));
+        let ms = t.elapsed().as_secs_f64() * 1e3;
+        let outcome = warm.geom_outcome();
+        match outcome {
+            GeomOutcome::Accept => n_acc += 1,
+            GeomOutcome::Restart => n_restart += 1,
+            GeomOutcome::Cold => {}
+        }
+        let ew = warm.energy().unwrap_or_else(|e| panic!("{name} Ew {k}: {e}"));
+        let fw = warm.forces().unwrap_or_else(|e| panic!("{name} Fw {k}: {e}"));
+        cold.set_coords(&xyz_k).unwrap_or_else(|e| panic!("{name} cold coords {k}: {e}"));
+        cold.forget_projector();
+        let sc = cold.scc(80, 1e-5).unwrap_or_else(|e| panic!("{name} cold scc {k}: {e}"));
+        let ec = cold.energy().unwrap_or_else(|e| panic!("{name} Ec {k}: {e}"));
+        let fc = cold.forces().unwrap_or_else(|e| panic!("{name} Fc {k}: {e}"));
+        let de = (ew - ec).abs();
+        let mut df = 0.0f64;
+        let mut fmax = 0.0f64;
+        for (a, b) in fw.forces.iter().zip(fc.forces.iter()) {
+            for c in 0..3 {
+                df = df.max((a[c] - b[c]).abs());
+                fmax = fmax.max(b[c].abs());
+            }
+        }
+        let how = match outcome {
+            GeomOutcome::Accept => "accept",
+            GeomOutcome::Restart => "restart",
+            GeomOutcome::Cold => "cold",
+        };
+        eprintln!(
+            "{name}  step {k}  {how}  |dR|={d_r:.4}  E={ew:.8}  Eref={ec:.8}  dE={de:.3e}  max|F|={mf:.3e}  max|dF|={df:.3e}  Fref={fmax:.3e}  Tr={:.6}  R_H={:.3e}  {ms:.1} ms",
+            sw.tr_ks, sw.r_h
+        );
+        let tau = (sw.tr_ks as f64 - 4.0).abs();
+        assert!(tau < 0.02, "{name} step {k} τ={tau:.4e}");
+        assert!(de < 1e-3, "{name} step {k} |dE|={de:.3e} Ha");
+        let f_tol = (0.02 * fmax).max(5e-4);
+        assert!(df < f_tol, "{name} step {k} max|dF|={df:.3e} tol={f_tol:.3e} Fref={fmax:.3e}");
+        let _ = sc;
+    }
+    eprintln!("{name}  summary  accept={n_acc}  restart={n_restart}  of 5");
+    (n_acc, n_restart)
+}
+
+fn report_geom(name: &str, n_acc: usize, n_restart: usize) {
+    if n_acc >= 3 {
+        eprintln!("{name}  USEFUL  {n_acc} accepted steps");
+    } else {
+        eprintln!("{name}  NOT USEFUL  accept={n_acc} restart={n_restart}");
+    }
+}
+
+#[test]
+fn test_sparse_dftb_sih4_geom_v2() {
+    let (a, r) = run_sih4_geom_variant(GeomStep::Xtr, "V2");
+    report_geom("V2", a, r);
+}
+
+#[test]
+fn test_sparse_dftb_sih4_geom_v1() {
+    let (a, r) = run_sih4_geom_variant(GeomStep::XtrMcWeeny, "V1");
+    report_geom("V1", a, r);
+}
+
+#[test]
+fn test_sparse_dftb_sih4_geom_v3() {
+    let (a, r) = run_sih4_geom_variant(GeomStep::TrustDmm, "V3");
+    report_geom("V3", a, r);
+}
+
+#[test]
+fn test_sparse_dftb_sih4_geom_v4() {
+    let (a, r) = run_sih4_geom_variant(GeomStep::XtrThenTrust, "V4");
+    report_geom("V4", a, r);
+}
+
+/// Three successive 0.1 Å moves of one hydrogen. The warm step is kept
+/// even when R_H is above the cold gate. It has to be faster than a cold
+/// SCC of the same geometry, and the trace after one McWeeny has to stay
+/// within 0.05 of Nocc.
+fn run_sih4_bold(step: GeomStep, name: &str) {
+    let dir = require_sih_sk_dir();
+    let (sp, xyz0) = sih4();
+    let sk = load_sk_for_species(&dir, &sp).unwrap_or_else(|e| panic!("{name} SK: {e}"));
+    let mut warm = SparseDftb::new(sk, &dir, sp.clone(), xyz0.clone())
+        .unwrap_or_else(|e| panic!("{name} warm: {e}"));
+    warm.set_geom_step(step);
+    warm.scc(80, 1e-5).unwrap_or_else(|e| panic!("{name} warm init: {e}"));
+    let sk2 = load_sk_for_species(&dir, &sp).unwrap_or_else(|e| panic!("{name} SK2: {e}"));
+    let mut cold = SparseDftb::new(sk2, &dir, sp, xyz0.clone())
+        .unwrap_or_else(|e| panic!("{name} cold: {e}"));
+    cold.scc(80, 1e-5).unwrap_or_else(|e| panic!("{name} cold init: {e}"));
+    let mut xyz = xyz0;
+    for k in 0..3 {
+        xyz[1][0] += 0.1;
+        let t_w = std::time::Instant::now();
+        warm.set_coords(&xyz).unwrap_or_else(|e| panic!("{name} set {k}: {e}"));
+        let sw = warm.scc(80, 1e-5).unwrap_or_else(|e| panic!("{name} warm {k}: {e}"));
+        let ms_w = t_w.elapsed().as_secs_f64() * 1e3;
+        let ew = warm.energy().unwrap_or_else(|e| panic!("{name} Ew {k}: {e}"));
+        let fw = warm.forces().unwrap_or_else(|e| panic!("{name} Fw {k}: {e}"));
+        let t_c = std::time::Instant::now();
+        cold.set_coords(&xyz).unwrap_or_else(|e| panic!("{name} cold set {k}: {e}"));
+        cold.forget_projector();
+        cold.scc(80, 1e-5).unwrap_or_else(|e| panic!("{name} cold {k}: {e}"));
+        let ms_c = t_c.elapsed().as_secs_f64() * 1e3;
+        let ec = cold.energy().unwrap_or_else(|e| panic!("{name} Ec {k}: {e}"));
+        let fc = cold.forces().unwrap_or_else(|e| panic!("{name} Fc {k}: {e}"));
+        let de = (ew - ec).abs();
+        let mut df = 0.0f64;
+        let mut fmax = 0.0f64;
+        for (a, b) in fw.forces.iter().zip(fc.forces.iter()) {
+            for c in 0..3 {
+                df = df.max((a[c] - b[c]).abs());
+                fmax = fmax.max(b[c].abs());
+            }
+        }
+        let tau = (sw.tr_ks as f64 - 4.0).abs();
+        eprintln!(
+            "{name}  step {k}  |dR|=0.10  E={ew:.6}  Eref={ec:.6}  dE={de:.3e}  max|dF|={df:.3e}  Fref={fmax:.3e}  τ={tau:.4e}  R_H={:.3e}  warm {ms_w:.1} ms  cold {ms_c:.1} ms",
+            sw.r_h
+        );
+        assert!(tau < 0.05, "{name} step {k} trace not repaired: τ={tau:.4e}");
+        assert!(de.is_finite() && df.is_finite(), "{name} step {k} non-finite");
+        assert!(ms_w < ms_c, "{name} step {k} warm {ms_w:.1} ms not faster than cold {ms_c:.1} ms");
+    }
+}
+
+#[test]
+fn test_sparse_dftb_sih4_bold_xtr() {
+    run_sih4_bold(GeomStep::BoldXtr, "B1");
+}
+
+#[test]
+fn test_sparse_dftb_sih4_bold_dmm() {
+    run_sih4_bold(GeomStep::BoldDmm, "B2");
+}
+
+#[test]
+fn test_sparse_dftb_sih4_bold_xtr_dmm() {
+    run_sih4_bold(GeomStep::BoldXtrDmm, "B3");
+}
+
+/// FIRE with the kept kernel (extrapolate, two η=8 commutator steps, one
+/// McWeeny). Energy must fall, Tr(KS) must stay on Nocc, and a step must
+/// be cheaper than a cold SCC.
+#[test]
+fn test_sparse_dftb_sih4_bold_fire() {
+    let dir = require_sih_sk_dir();
+    let (sp, xyz) = sih4();
+    let sk = load_sk_for_species(&dir, &sp).unwrap_or_else(|e| panic!("SK: {e}"));
+    let mut eng = SparseDftb::new(sk, &dir, sp.clone(), xyz.clone()).unwrap_or_else(|e| panic!("new: {e}"));
+    eng.set_geom_step(GeomStep::BoldXtrDmm);
+    // First step from rest is ½|F|dt². dt=1 reaches ~0.04 Å and later
+    // steps hit the 0.1 Å cap as the velocity builds.
+    eng.set_fire_dt(1.0);
+    let s0 = eng.scc(80, 1e-5).unwrap_or_else(|e| panic!("init SCC: {e}"));
+    let e0 = eng.energy().unwrap();
+    eprintln!(
+        "FIRE start  E={e0:.8}  Tr={:.6}  R_H={:.3e}  <SiH>={:.4}",
+        s0.tr_ks, s0.r_h, mean_sih(eng.coords())
+    );
+    let mut e_prev = e0;
+    let mut e_min = e0;
+    let mut ms_sum = 0.0;
+    let n_fire = 12;
+    for k in 0..n_fire {
+        let xyz_before = eng.coords().to_vec();
+        let t = std::time::Instant::now();
+        let mf = eng.fire_step(1e-6).unwrap_or_else(|e| panic!("FIRE {k}: {e}"));
+        let mut d_r = 0.0f64;
+        for (a, b) in xyz_before.iter().zip(eng.coords().iter()) {
+            let dx = a[0] - b[0];
+            let dy = a[1] - b[1];
+            let dz = a[2] - b[2];
+            d_r = d_r.max((dx * dx + dy * dy + dz * dz).sqrt());
+        }
+        let s = eng.scc(80, 1e-5).unwrap_or_else(|e| panic!("SCC {k}: {e}"));
+        let ms = t.elapsed().as_secs_f64() * 1e3;
+        ms_sum += ms;
+        let e = eng.energy().unwrap_or_else(|err| panic!("E {k}: {err}"));
+        let tau = (s.tr_ks as f64 - 4.0).abs();
+        eprintln!(
+            "FIRE {k:2}  |dR|={d_r:.4}  E={e:.8}  dE={:+.3e}  max|F|={mf:.4e}  Tr={:.6}  τ={tau:.3e}  R_H={:.3e}  <SiH>={:.4}  {ms:.1} ms  {:?}",
+            e - e_prev,
+            s.tr_ks,
+            s.r_h,
+            mean_sih(eng.coords()),
+            eng.geom_outcome()
+        );
+        assert!(tau < 0.05, "FIRE {k} charge left Nocc: τ={tau:.4e}");
+        assert!(e.is_finite() && mf.is_finite(), "FIRE {k} non-finite");
+        assert!(
+            e < e_min + 0.02,
+            "FIRE {k} energy jumped: E={e:.6} min={e_min:.6}"
+        );
+        e_min = e_min.min(e);
+        e_prev = e;
+    }
+    let e_end = eng.energy().unwrap();
+    eprintln!(
+        "FIRE done  E {e0:.8} → {e_end:.8}  dE={:.4e}  mean step {:.1} ms",
+        e_end - e0,
+        ms_sum / n_fire as f64
+    );
+    assert!(e_end < e0, "energy did not fall: {e0:.8} → {e_end:.8}");
+
+    let xyz_end = eng.coords().to_vec();
+    let sk2 = load_sk_for_species(&dir, &sp).unwrap_or_else(|e| panic!("SK2: {e}"));
+    let mut cold = SparseDftb::new(sk2, &dir, sp, xyz_end).unwrap_or_else(|e| panic!("cold: {e}"));
+    let t_c = std::time::Instant::now();
+    cold.scc(80, 1e-5).unwrap_or_else(|e| panic!("cold final: {e}"));
+    let ms_c = t_c.elapsed().as_secs_f64() * 1e3;
+    let e_c = cold.energy().unwrap();
+    let de_cold = (e_end - e_c).abs();
+    eprintln!(
+        "FIRE vs cold final  dE={de_cold:.3e}  cold {ms_c:.1} ms  warm mean {:.1} ms",
+        ms_sum / n_fire as f64
+    );
+    assert!(
+        de_cold < 5e-3,
+        "final energy off the cold solve by {de_cold:.3e} Ha"
+    );
+}
+
+fn write_xyz(path: &std::path::Path, species: &[String], coords: &[[f64; 3]], comment: &str) {
+    let mut s = format!("{}\n{comment}\n", species.len());
+    for (sp, c) in species.iter().zip(coords.iter()) {
+        s.push_str(&format!("{sp:2} {:14.8} {:14.8} {:14.8}\n", c[0], c[1], c[2]));
+    }
+    std::fs::write(path, s).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+}
+
+/// FIRE until max|F| < 1e-3 Ha/Å. Writes the input and the relaxed geometry.
+#[test]
+fn test_sparse_dftb_sih4_bold_fire_minimum() {
+    let dir = require_sih_sk_dir();
+    let (sp, xyz) = sih4();
+    let out = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../debug/sparse_relax");
+    std::fs::create_dir_all(&out).unwrap();
+    write_xyz(&out.join("sih4_initial.xyz"), &sp, &xyz, "SiH4 initial");
+    let sk = load_sk_for_species(&dir, &sp).unwrap_or_else(|e| panic!("SK: {e}"));
+    let mut eng = SparseDftb::new(sk, &dir, sp.clone(), xyz).unwrap_or_else(|e| panic!("new: {e}"));
+    eng.set_geom_step(GeomStep::BoldXtrDmm);
+    eng.set_fire_dt(0.3);
+    let s0 = eng.scc(80, 1e-5).unwrap_or_else(|e| panic!("init: {e}"));
+    let e0 = eng.energy().unwrap();
+    let f_tol = 1e-3;
+    let mut max_f = {
+        let f = eng.forces().unwrap();
+        f.forces.iter().flatten().fold(0.0f64, |m, c| m.max(c.abs()))
+    };
+    eprintln!(
+        "MIN start  E={e0:.8}  max|F|={max_f:.4e}  Tr={:.6}  <SiH>={:.4}",
+        s0.tr_ks,
+        mean_sih(eng.coords())
+    );
+    let mut e_prev = e0;
+    let mut n = 0usize;
+    let mut ms_sum = 0.0;
+    for k in 0..60 {
+        if max_f < f_tol {
+            break;
+        }
+        n = k + 1;
+        let t = std::time::Instant::now();
+        eng.fire_step(f_tol).unwrap_or_else(|e| panic!("FIRE {k}: {e}"));
+        let s = eng.scc(80, 1e-5).unwrap_or_else(|e| panic!("SCC {k}: {e}"));
+        let ms = t.elapsed().as_secs_f64() * 1e3;
+        ms_sum += ms;
+        let e = eng.energy().unwrap();
+        let f = eng.forces().unwrap();
+        max_f = f.forces.iter().flatten().fold(0.0f64, |m, c| m.max(c.abs()));
+        let tau = (s.tr_ks as f64 - 4.0).abs();
+        eprintln!(
+            "MIN {k:2}  E={e:.8}  dE={:+.3e}  max|F|={max_f:.4e}  Tr={:.6}  τ={tau:.3e}  <SiH>={:.4}  {ms:.1} ms",
+            e - e_prev,
+            s.tr_ks,
+            mean_sih(eng.coords())
+        );
+        assert!(tau < 0.05, "MIN {k} τ={tau:.4e}");
+        assert!(e.is_finite(), "MIN {k} non-finite energy");
+        e_prev = e;
+    }
+    let e_end = eng.energy().unwrap();
+    write_xyz(
+        &out.join("sih4_final.xyz"),
+        &sp,
+        eng.coords(),
+        &format!("SiH4 FIRE  E={e_end:.8}  max|F|={max_f:.4e}  steps={n}"),
+    );
+    eprintln!(
+        "MIN done  steps={n}  E {e0:.8} → {e_end:.8}  max|F|={max_f:.4e}  <SiH>={:.4}  mean {:.1} ms  xyz {}",
+        mean_sih(eng.coords()),
+        if n > 0 { ms_sum / n as f64 } else { 0.0 },
+        out.display()
+    );
+    assert!(n > 0 && n < 60, "did not reach max|F|<{f_tol:.1e} in {n} steps (F={max_f:.3e})");
+    assert!(max_f < f_tol, "max|F|={max_f:.3e}");
+    assert!(e_end < e0, "energy rose: {e0:.8} → {e_end:.8}");
 }

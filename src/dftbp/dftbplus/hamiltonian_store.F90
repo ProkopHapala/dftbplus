@@ -9,12 +9,25 @@ module dftbp_dftbplus_hamiltonian_store
   public :: store_dm, get_stored_dm
   public :: store_eigvecs, get_stored_eigvecs
   public :: clear_stored_matrices
+  public :: store_hamiltonian_cplx, store_overlap_cplx, store_dm_cplx, store_eigvecs_cplx
+  public :: get_stored_hamiltonian_cplx, get_stored_overlap_cplx, get_stored_dm_cplx
+  public :: get_stored_eigvecs_cplx, get_cplx_store_dims
 
   real(dp), allocatable, save :: storedH(:,:)
   real(dp), allocatable, save :: storedS(:,:)
   real(dp), allocatable, save :: storedDM(:,:)
   real(dp), allocatable, save :: storedEigvecs(:,:)   ! (norb, nstates) for iKS=1, iSpin=1
   real(dp), allocatable, save :: storedEigenvals(:)   ! (nstates) for iKS=1, iSpin=1
+
+  ! Complex (k-point) storage. Slot index iKS = iK + (iSpin-1)*nKPoint (global (k,s) composite).
+  complex(dp), allocatable, save :: storedHCplx(:,:,:)      ! (norb, norb, iKS)
+  complex(dp), allocatable, save :: storedSCplx(:,:,:)
+  complex(dp), allocatable, save :: storedDMCplx(:,:,:)
+  complex(dp), allocatable, save :: storedEigvecsCplx(:,:,:) ! (norb, nstates, iKS)
+  real(dp),    allocatable, save :: storedEigvalsCplx(:,:)   ! (nstates, iKS)
+  logical,     allocatable, save :: cplxSlotFilled(:)
+  integer, save :: nOrbCplx = 0, nKScplx = 0
+
   logical,  save :: tStoreMatrices = .false.
   integer,  save :: storedSize = 0
 
@@ -128,13 +141,153 @@ contains
     end if
   end subroutine
 
+  ! ---- Complex (k-point) storage ----
+  ! Slot convention: iKS = iK + (iSpin-1)*nKPoint, matching (iS-1)*nKpoint + iK in
+  ! TParallelKS_init. All matrices stored fully Hermitian (lower triangle from
+  ! unpackHS/herk is mirrored to the upper triangle with conjugation).
+
+  !> Ensure complex storage arrays are allocated with the right dimensions.
+  subroutine ensure_cplx_store(nOrb, nKS)
+    integer, intent(in) :: nOrb, nKS
+    if (nOrbCplx == nOrb .and. nKScplx == nKS .and. allocated(storedHCplx)) return
+    if (allocated(storedHCplx))       deallocate(storedHCplx)
+    if (allocated(storedSCplx))       deallocate(storedSCplx)
+    if (allocated(storedDMCplx))      deallocate(storedDMCplx)
+    if (allocated(storedEigvecsCplx)) deallocate(storedEigvecsCplx)
+    if (allocated(storedEigvalsCplx)) deallocate(storedEigvalsCplx)
+    if (allocated(cplxSlotFilled))    deallocate(cplxSlotFilled)
+    allocate(storedHCplx(nOrb, nOrb, nKS),       source=cmplx(0.0_dp, 0.0_dp, dp))
+    allocate(storedSCplx(nOrb, nOrb, nKS),       source=cmplx(0.0_dp, 0.0_dp, dp))
+    allocate(storedDMCplx(nOrb, nOrb, nKS),      source=cmplx(0.0_dp, 0.0_dp, dp))
+    allocate(storedEigvecsCplx(nOrb, nOrb, nKS), source=cmplx(0.0_dp, 0.0_dp, dp))
+    allocate(storedEigvalsCplx(nOrb, nKS),       source=0.0_dp)
+    allocate(cplxSlotFilled(nKS),                source=.false.)
+    nOrbCplx = nOrb
+    nKScplx = nKS
+  end subroutine ensure_cplx_store
+
+  !> Store complex Hamiltonian H(k) for (iK, iSpin); lower triangle from unpackHS is
+  !> mirrored to upper with conjugation (Hermitian).
+  subroutine store_hamiltonian_cplx(H, iK, iSpin, nK, nSpin)
+    complex(dp), intent(in) :: H(:,:)
+    integer, intent(in) :: iK, iSpin, nK, nSpin
+    integer :: i, j, iKS, n
+    if (.not. tStoreMatrices) return
+    n = size(H, dim=1)
+    call ensure_cplx_store(n, nK * nSpin)
+    iKS = iK + (iSpin - 1) * nK
+    do j = 1, n
+      do i = j, n
+        storedHCplx(i,j,iKS) = H(i,j)
+        storedHCplx(j,i,iKS) = conjg(H(i,j))
+      end do
+    end do
+    cplxSlotFilled(iKS) = .true.
+  end subroutine store_hamiltonian_cplx
+
+  subroutine store_overlap_cplx(S, iK, iSpin, nK, nSpin)
+    complex(dp), intent(in) :: S(:,:)
+    integer, intent(in) :: iK, iSpin, nK, nSpin
+    integer :: i, j, iKS, n
+    if (.not. tStoreMatrices) return
+    n = size(S, dim=1)
+    call ensure_cplx_store(n, nK * nSpin)
+    iKS = iK + (iSpin - 1) * nK
+    do j = 1, n
+      do i = j, n
+        storedSCplx(i,j,iKS) = S(i,j)
+        storedSCplx(j,i,iKS) = conjg(S(i,j))
+      end do
+    end do
+  end subroutine store_overlap_cplx
+
+  !> Store complex k-space density matrix (lower triangle from herk, mirrored Hermitian).
+  subroutine store_dm_cplx(DM, iK, iSpin, nK, nSpin)
+    complex(dp), intent(in) :: DM(:,:)
+    integer, intent(in) :: iK, iSpin, nK, nSpin
+    integer :: i, j, iKS, n
+    if (.not. tStoreMatrices) return
+    n = size(DM, dim=1)
+    call ensure_cplx_store(n, nK * nSpin)
+    iKS = iK + (iSpin - 1) * nK
+    do j = 1, n
+      do i = j, n
+        storedDMCplx(i,j,iKS) = DM(i,j)
+        storedDMCplx(j,i,iKS) = conjg(DM(i,j))
+      end do
+    end do
+  end subroutine store_dm_cplx
+
+  !> Store complex eigenvectors (columns are MOs) and eigenvalues for (iK, iSpin).
+  subroutine store_eigvecs_cplx(C, evals, iK, iSpin, nK, nSpin)
+    complex(dp), intent(in) :: C(:,:)
+    real(dp), intent(in) :: evals(:)
+    integer, intent(in) :: iK, iSpin, nK, nSpin
+    integer :: iKS, n
+    if (.not. tStoreMatrices) return
+    n = size(C, dim=1)
+    call ensure_cplx_store(n, nK * nSpin)
+    iKS = iK + (iSpin - 1) * nK
+    storedEigvecsCplx(:,:,iKS) = C(1:n, 1:n)
+    storedEigvalsCplx(:,iKS)   = evals(1:n)
+  end subroutine store_eigvecs_cplx
+
+  !> Query dimensions of the complex store; nKS=0 means no k-point data stored.
+  subroutine get_cplx_store_dims(nOrb, nKS)
+    integer, intent(out) :: nOrb, nKS
+    if (allocated(storedHCplx)) then
+      nOrb = nOrbCplx; nKS = nKScplx
+    else
+      nOrb = 0; nKS = 0
+    end if
+  end subroutine get_cplx_store_dims
+
+  subroutine get_stored_hamiltonian_cplx(H)
+    complex(dp), intent(out) :: H(:,:,:)
+    if (allocated(storedHCplx)) then; H = storedHCplx
+    else;                             H = cmplx(0.0_dp, 0.0_dp, dp)
+    end if
+  end subroutine get_stored_hamiltonian_cplx
+
+  subroutine get_stored_overlap_cplx(S)
+    complex(dp), intent(out) :: S(:,:,:)
+    if (allocated(storedSCplx)) then; S = storedSCplx
+    else;                             S = cmplx(0.0_dp, 0.0_dp, dp)
+    end if
+  end subroutine get_stored_overlap_cplx
+
+  subroutine get_stored_dm_cplx(DM)
+    complex(dp), intent(out) :: DM(:,:,:)
+    if (allocated(storedDMCplx)) then; DM = storedDMCplx
+    else;                              DM = cmplx(0.0_dp, 0.0_dp, dp)
+    end if
+  end subroutine get_stored_dm_cplx
+
+  subroutine get_stored_eigvecs_cplx(C, evals)
+    complex(dp), intent(out) :: C(:,:,:)
+    real(dp), intent(out) :: evals(:,:)
+    if (allocated(storedEigvecsCplx)) then
+      C = storedEigvecsCplx; evals = storedEigvalsCplx
+    else
+      C = cmplx(0.0_dp, 0.0_dp, dp); evals = 0.0_dp
+    end if
+  end subroutine get_stored_eigvecs_cplx
+
   subroutine clear_stored_matrices()
     if (allocated(storedH))        deallocate(storedH)
     if (allocated(storedS))        deallocate(storedS)
     if (allocated(storedDM))       deallocate(storedDM)
     if (allocated(storedEigvecs))  deallocate(storedEigvecs)
     if (allocated(storedEigenvals)) deallocate(storedEigenvals)
+    if (allocated(storedHCplx))       deallocate(storedHCplx)
+    if (allocated(storedSCplx))       deallocate(storedSCplx)
+    if (allocated(storedDMCplx))      deallocate(storedDMCplx)
+    if (allocated(storedEigvecsCplx)) deallocate(storedEigvecsCplx)
+    if (allocated(storedEigvalsCplx)) deallocate(storedEigvalsCplx)
+    if (allocated(cplxSlotFilled))    deallocate(cplxSlotFilled)
     storedSize = 0
+    nOrbCplx = 0
+    nKScplx = 0
   end subroutine
 
 end module dftbp_dftbplus_hamiltonian_store

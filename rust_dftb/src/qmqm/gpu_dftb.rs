@@ -886,6 +886,96 @@ impl GpuDftb {
     /// SET is frozen at `new` (all i<j, per template); the SK tail is ~0 for
     /// pairs beyond cutoff, so far pairs contribute exactly zero.
     pub fn set_coords(&mut self, coords: &[[f64; 3]]) -> Result<()> {
+        self.set_coords_inner(coords, false)
+    }
+
+    /// Same as `set_coords`, but the purified density is kept as the SCC
+    /// guess. Charges already on the device are kept either way; this only
+    /// stops the geometry update from forcing a Palser restart.
+    pub fn set_coords_keep_k(&mut self, coords: &[[f64; 3]]) -> Result<()> {
+        self.set_coords_inner(coords, true)
+    }
+
+    /// One geometry step on the full batch. `alpha` is the charge mix
+    /// `q ← q + α (q_Mulliken − q)` after the step. α = 0 leaves the
+    /// incoming charges; the Mulliken vector stays in `q_new`.
+    /// Returns `(R_H before, R_H after, Tr(K), η accepted, steps accepted)` for replica 0.
+    pub fn geom_bold_dmm(&mut self) -> Result<(f32, f32, f32, f32, usize)> {
+        self.plan.restore_work_domain(&self.rt)?;
+        self.geom_bold_on_domain(0.2)
+    }
+
+    /// Same step, on whatever launch domain the caller set. The throughput
+    /// sweep uses this so a batch of 8 on a 1024-wide engine does not
+    /// purify the other 1016 copies.
+    pub fn geom_bold_on_domain(&mut self, alpha: f32) -> Result<(f32, f32, f32, f32, usize)> {
+        if !(0.0..=1.0).contains(&alpha) {
+            return Err(DftbError::InvalidInput(format!(
+                "geom_bold_on_domain: alpha={alpha} outside [0, 1]"
+            )));
+        }
+        let rep = self.plan.geom_bold_dmm_capped(&mut self.rt, 2)?;
+        if alpha != 0.0 {
+            self.rt.read_buffer(&self.plan.q_gpu, &mut self.scratch_q)?;
+            self.rt.read_buffer(&self.plan.q_new, &mut self.scratch_qd)?;
+            let n = self.plan.work_n() * self.n_atoms;
+            if self.scratch_q.len() < n {
+                return Err(DftbError::InvalidInput(format!(
+                    "geom_bold_on_domain: charge scratch {} < work_n*n_atoms {n}",
+                    self.scratch_q.len()
+                )));
+            }
+            for i in 0..n {
+                let q0 = self.scratch_q[i];
+                let q1 = self.scratch_qd[i];
+                if !q0.is_finite() || !q1.is_finite() {
+                    return Err(DftbError::InvalidInput(format!(
+                        "geom_bold_on_domain: q[{i}] in={q0} mulliken={q1} non-finite"
+                    )));
+                }
+                self.scratch_q[i] = q0 + alpha * (q1 - q0);
+            }
+            self.rt.write_buffer(&self.plan.q_gpu, &self.scratch_q)?;
+        }
+        self.state_fresh = false;
+        Ok(rep)
+    }
+
+    /// One geometry step, full batch, charge mix left alone (`α = 0`).
+    /// `max_acc` accepted commutator steps, then one McWeeny.
+    pub fn geom_bold_capped(&mut self, max_acc: usize) -> Result<(f32, f32, f32, f32, usize)> {
+        self.plan.restore_work_domain(&self.rt)?;
+        let rep = self.plan.geom_bold_dmm_capped(&mut self.rt, max_acc)?;
+        self.state_fresh = false;
+        Ok(rep)
+    }
+
+    /// Mulliken charges of the density just built. Not the mixed `q_gpu`.
+    pub fn read_q_new(&mut self) -> Result<Vec<f32>> {
+        let mut q = vec![0.0f32; self.batch * self.n_atoms];
+        self.rt.read_buffer(&self.plan.q_new, &mut q)?;
+        Ok(q)
+    }
+
+    /// Replace the stored charges with that Mulliken vector, so a following
+    /// `eval` diagonalizes H at the density's own charges. The damped mix
+    /// from `geom_bold_dmm` is what a chained step would keep; this is the
+    /// one-step score of the kernel itself.
+    pub fn stage_mulliken(&mut self) -> Result<()> {
+        self.rt.read_buffer(&self.plan.q_new, &mut self.scratch_qd)?;
+        for q in &self.scratch_qd {
+            if !q.is_finite() {
+                return Err(DftbError::InvalidInput(format!(
+                    "stage_mulliken: q={q} non-finite"
+                )));
+            }
+        }
+        self.rt.write_buffer(&self.plan.q_gpu, &self.scratch_qd)?;
+        self.state_fresh = false;
+        Ok(())
+    }
+
+    fn set_coords_inner(&mut self, coords: &[[f64; 3]], keep_k: bool) -> Result<()> {
         if coords.len() != self.batch * self.n_atoms {
             return Err(DftbError::InvalidInput(format!(
                 "set_coords: len {} != batch*n_atoms {}*{}",
@@ -905,7 +995,11 @@ impl GpuDftb {
         self.scc_ok = vec![true; self.batch];
         self.sync_park()?;
         self.assemble()?;
-        self.plan.set_geometry(&mut self.rt, &self.buf_s)?;
+        if keep_k {
+            self.plan.set_geometry_keep_k(&mut self.rt, &self.buf_s)?;
+        } else {
+            self.plan.set_geometry(&mut self.rt, &self.buf_s)?;
+        }
         self.plan.reset_diis(&self.rt)?;
         self.state_fresh = false;
         Ok(())
@@ -1242,6 +1336,13 @@ impl GpuDftb {
                 n_iters = it;
                 self.plan.read_chunk_status(&self.rt)?; // one finish covers both reads
                 self.rt.prof_tick("scc.chunkend");
+                if std::env::var_os("RUST_DFTB_SCC_TRACE").is_some() {
+                    let (n_act, max_rms, max_rh, n_rh) = self.plan.chunk_diag();
+                    eprintln!(
+                        "[scc.trace] it={it} active={n_act}/{} max_rms={max_rms:.3e} max_rh={max_rh:.3e} rh_above_tol={n_rh}",
+                        self.batch
+                    );
+                }
                 self.state_fresh = false; // commits advanced q_gpu past the solved state
                 let mut host_dirty = false;
                 for b in 0..self.batch {
@@ -1265,7 +1366,7 @@ impl GpuDftb {
                         host_dirty = true;
                         continue;
                     }
-                    if samples[b] >= 8 {
+                    if samples[b] >= 8 && !self.plan.purify_lagging(b) {
                         let (mut rmin, mut rmax) = (f32::INFINITY, 0.0f32);
                         for &r in &hist[b] {
                             rmin = rmin.min(r);
@@ -1395,7 +1496,7 @@ impl GpuDftb {
                         n_active -= 1;
                         continue;
                     } // Failed — stop iterating it
-                    if n_iters >= 25 {
+                    if n_iters >= 25 && !self.plan.purify_lagging(b) {
                         let (mut rmin, mut rmax) = (f32::INFINITY, 0.0f32);
                         for &r in &hist[b] {
                             rmin = rmin.min(r);
@@ -1473,7 +1574,8 @@ impl GpuDftb {
                 } else {
                     self.plan.rms_host.get(sid).copied().unwrap_or(f32::NAN)
                 };
-                if !r.is_finite() || !j_ok[sid] {
+                let lag = self.plan.purify_lagging(sid);
+                if !r.is_finite() || !j_ok[sid] || lag {
                     SccStatus::Failed
                 } else if r < rms_tol {
                     SccStatus::Converged
@@ -1484,7 +1586,11 @@ impl GpuDftb {
                 }
             })
             .collect();
-        if self.batch > 1 || statuses.first() != Some(&SccStatus::Converged) {
+        // RUST_DFTB_SCC_QUIET=1 skips the per-replica dump. It is inside
+        // the timed SCC return, and at batch 400–900 the format alone is
+        // several milliseconds — enough to fake the small-batch throughput.
+        let quiet = std::env::var_os("RUST_DFTB_SCC_QUIET").is_some();
+        if !quiet && (self.batch > 1 || statuses.first() != Some(&SccStatus::Converged)) {
             // per-replica rms — the diagnostic that shows WHO failed/plateaued
             let rms_str: Vec<String> = (0..self.batch)
                 .map(|sid| {
@@ -2378,6 +2484,10 @@ impl GpuDftb {
             out[b] -= s;
         }
         Ok(out)
+    }
+
+    pub fn prof_reset(&self) {
+        self.rt.prof_reset();
     }
 
     pub fn prof_report(&self, ctx: &str) {

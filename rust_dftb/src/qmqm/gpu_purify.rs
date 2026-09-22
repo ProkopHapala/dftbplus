@@ -43,9 +43,22 @@ pub enum PurifyGemm {
 /// or None when infeasible (tx·ty > 1024 → needs a bigger micro-tile or
 /// the split path — fail loud, pick RowRow).
 fn regtile_shape(n: usize) -> Option<(usize, usize, usize, usize, usize)> {
-    let (rtx, rty) = (4usize, 8usize);
-    let tx = n.div_ceil(rtx);
-    let ty = n.div_ceil(rty);
+    // 4×8 is the n≈86 winner (32 accumulators, one workgroup covers n).
+    // Past ~128 orbitals that grid exceeds 1024 threads — n=246 is
+    // 62×31 = 1922. An 8×8 full-cover grid is 31×31 = 961 threads and
+    // 64 accumulators, which the register file rejects
+    // (CL_OUT_OF_RESOURCES). Use the warm-path tile instead: 11×11
+    // threads × 8×8 regs = 121 threads, and the kernel loops 88×88
+    // output tiles (PURIFY_TILELOOP).
+    let (tx, ty, rtx, rty) = {
+        let (rtx, rty) = (4usize, 8usize);
+        let (tx, ty) = (n.div_ceil(rtx), n.div_ceil(rty));
+        if tx * ty <= 1024 {
+            (tx, ty, rtx, rty)
+        } else {
+            (11usize, 11usize, 8usize, 8usize)
+        }
+    };
     if tx * ty > 1024 {
         return None;
     }
@@ -53,6 +66,11 @@ fn regtile_shape(n: usize) -> Option<(usize, usize, usize, usize, usize)> {
     // costs 4× the local memory of tk=8 for ~equal perf → prefer tk=8;
     // local = tk·WM·4 B must stay small for WG residency.
     let tk = if 8 * ty * rty * 4 <= 48 * 1024 { 8 } else { 4 };
+    if ty * rty < n || tx * rtx < n {
+        eprintln!(
+            "[purify] n={n} square walks {ty}×{tx} threads × {rty}×{rtx} regs, 88-wide tiles (a full-cover workgroup does not fit)"
+        );
+    }
     Some((tx, ty, rtx, rty, tk))
 }
 
@@ -96,6 +114,7 @@ pub fn purify_shape_config(
 /// Render the purify source with the given workgroup size, GEMM
 /// interior, and (for RegTileSq) register-tile shape.
 pub fn render_purify_source(
+    n: usize,
     wg: usize,
     tile: usize,
     gemm: usize,
@@ -106,12 +125,14 @@ pub fn render_purify_source(
         .replace("#define PURIFY_TILE 0", &format!("#define PURIFY_TILE {tile}"))
         .replace("#define PURIFY_GEMM 0", &format!("#define PURIFY_GEMM {gemm}"));
     if let Some((tx, ty, rtx, rty, tk)) = shape {
+        let tileloop = if ty * rty < n || tx * rtx < n { 1 } else { 0 };
         src = src
             .replace("#define PURIFY_TX 22", &format!("#define PURIFY_TX {tx}"))
             .replace("#define PURIFY_TY 11", &format!("#define PURIFY_TY {ty}"))
             .replace("#define PURIFY_RTX 4", &format!("#define PURIFY_RTX {rtx}"))
             .replace("#define PURIFY_RTY 8", &format!("#define PURIFY_RTY {rty}"))
-            .replace("#define PURIFY_TK 8", &format!("#define PURIFY_TK {tk}"));
+            .replace("#define PURIFY_TK 8", &format!("#define PURIFY_TK {tk}"))
+            .replace("#define PURIFY_TILELOOP 0", &format!("#define PURIFY_TILELOOP {tileloop}"));
     }
     src
 }
@@ -163,7 +184,7 @@ pub fn purify_tc2_batched(
     //   RUST_DFTB_PURIFY_TILE  local tile size for GEMM 1 only.
     //   RUST_DFTB_PURIFY_TK    k-staging depth for GEMM 2 (default 8).
     let (wg, tile, gemm, shape) = purify_shape_config(n)?;
-    let source = render_purify_source(wg, tile, gemm, shape);
+    let source = render_purify_source(n, wg, tile, gemm, shape);
     let program = rt.build_program(&source)?;
     let d_a = rt.zero_buffer::<f32>(batch * n * n)?;
     let d_b = rt.zero_buffer::<f32>(batch * n * n)?;
@@ -183,6 +204,7 @@ pub fn purify_tc2_batched(
         .arg(&traces)
         .arg(n as i32)
         .arg(batch as i32)
+        .arg(&done) // zeroed — cold init always runs
         .build()
         .map_err(map_ocl_err)?;
     let k_step = Kernel::builder()
@@ -200,6 +222,7 @@ pub fn purify_tc2_batched(
         .arg(tol)
         .arg(n as i32)
         .arg(batch as i32)
+        .arg(1i32) // mirror_done — host loop reads whichever side via swapped
         .build()
         .map_err(map_ocl_err)?;
 
@@ -386,6 +409,10 @@ pub fn relax_purify_batched(
     let pre_tc2: usize = std::env::var("RUST_DFTB_RELAX_PRE_TC2")
         .ok().and_then(|s| s.parse().ok()).unwrap_or(0);
     let dbg = std::env::var_os("RUST_DFTB_RELAX_DEBUG").is_some();
+    // Relative comm_gate threshold: ‖HD−DH‖/(2‖HD‖) — fp32 floor is
+    // ~1e-6 at n=86; a biased fixed point sits at ~0.02. Default 1e-3.
+    let comm_tol: f32 = std::env::var("RUST_DFTB_RELAX_COMM_TOL")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(1e-3);
 
     // The relax kernel is self-contained regtile-sq (the fusion needs
     // the As_t slab structure); the shape comes from the same
@@ -395,8 +422,13 @@ pub fn relax_purify_batched(
             "relax regtile shape infeasible for n={n} (thread grid > 1024)"
         ))
     })?;
+    if sh.0 * sh.2 < n || sh.1 * sh.3 < n {
+        return Err(DftbError::InvalidInput(format!(
+            "relax square needs one full-cover workgroup; n={n} does not fit (TC2 uses the tiled loop instead)"
+        )));
+    }
     let wg = sh.0 * sh.1;
-    let source = render_purify_source(wg, 0, 2, Some(sh))
+    let source = render_purify_source(n, wg, 0, 2, Some(sh))
         .replace("#define PURIFY_NPUR 2", &format!("#define PURIFY_NPUR {npur}"));
     let program = rt.build_program(&source)?;
 
@@ -411,6 +443,7 @@ pub fn relax_purify_batched(
     // likely but the certificate is cheap insurance — one launch each).
     let t_buf = rt.zero_buffer::<f32>(batch * n * n)?;
     let rh_buf = rt.zero_buffer::<f32>(batch)?;
+    let pend = rt.zero_buffer::<i32>(batch)?; // comm_gate freeze-mask scratch (unused here)
 
     let k_span = Kernel::builder()
         .program(&program)
@@ -468,6 +501,9 @@ pub fn relax_purify_batched(
         .arg(&rh_buf)
         .arg(n as i32)
         .arg(batch as i32)
+        .arg(&done)
+        .arg(&pend)
+        .arg(comm_tol)
         .build()
         .map_err(map_ocl_err)?;
 
@@ -487,6 +523,7 @@ pub fn relax_purify_batched(
             .arg(&trc)
             .arg(n as i32)
             .arg(batch as i32)
+            .arg(&done) // zeroed — init always runs
             .build()
             .map_err(map_ocl_err)?;
         unsafe { k_init.enq().map_err(map_ocl_err)?; }
@@ -510,6 +547,7 @@ pub fn relax_purify_batched(
                 .arg(tol)
                 .arg(n as i32)
                 .arg(batch as i32)
+                .arg(1i32) // mirror_done — swapped parity read below
                 .build()
                 .map_err(map_ocl_err)?;
             let mut swapped = false;
@@ -596,10 +634,6 @@ pub fn relax_purify_batched(
     let theta = beta_gate * tol;
     let mut ldecay = 0.0f32;
     let mut beta_eff = beta;
-    // Relative comm_gate threshold: ‖HD−DH‖/(2‖HD‖) — fp32 floor is
-    // ~1e-6 at n=86; a biased fixed point sits at ~0.02. Default 1e-3.
-    let comm_tol: f32 = std::env::var("RUST_DFTB_RELAX_COMM_TOL")
-        .ok().and_then(|s| s.parse().ok()).unwrap_or(1e-3);
 
     let mut iters = 0usize;
     let mut converged = false;
@@ -670,6 +704,253 @@ pub fn relax_purify_batched(
         errs: (0..batch).map(|s| diag_h[4 * s + 3]).collect(),
         comms: rh_h,
         iters,
+        converged,
+    })
+}
+
+/// Per-system result of the trajectory-extrapolated warm solve.
+pub struct WarmExtrapDiag {
+    /// ‖HD−DH‖_F/(2‖HD‖_F) per system at acceptance (or at max_corr).
+    pub comms: Vec<f32>,
+    /// DMM correction rounds actually launched (uniform over the batch —
+    /// dmm_update_batched has no per-system freeze).
+    pub corrs: usize,
+    /// Matrix-product count: extrap(0) + McWeeny(2) + certificate(1)
+    /// + 4 per DMM round (D·T, D², D²·D, H·D-cert).
+    pub products: usize,
+    /// True iff every system certified comm < comm_tol.
+    pub converged: bool,
+}
+
+/// warm_extrap_solve — XL-BOMD trajectory warm start for a batch whose
+/// previous two converged projectors are available:
+///     S = K1 + γ(K1 − K2)        (extrapolation carries the subspace rotation)
+///     D ← 3S² − 2S³              (McWeeny retract: R'(0)=R'(1)=0 → radial
+///                                 overshoot killed quadratically, rotation kept)
+///     certificate ‖HD−DH‖/2‖HD‖; on failure 0..max_corr rounds of
+///     DMM correction + McWeeny, re-certified each round.
+/// Product count: 3 for the bare retract+check, +4 per correction round —
+/// vs ~30 for cold TC2 (CPU f64 prototype: γ=1, gap/span≈0.3,
+/// ‖ΔP‖/iter≈0.05–0.15 → 0–2 corrections suffice). On `converged=false`
+/// the caller must fall back to purify_tc2_batched explicitly — no
+/// silent acceptance of an uncertified projector.
+pub fn warm_extrap_solve(
+    rt: &mut GpuRuntime,
+    h_buf: &Buffer<f32>,     // [batch][n*n] H′ (orthogonal basis)
+    p1_buf: &Buffer<f32>,    // [batch][n*n] latest converged projector
+    p2_buf: &Buffer<f32>,    // [batch][n*n] previous converged projector
+    d_io: &Buffer<f32>,      // [batch][n*n] out (persistent caller buffer)
+    n: usize,
+    batch: usize,
+    gamma: f32,
+    max_corr: usize,
+    comm_tol: f32,
+) -> Result<WarmExtrapDiag> {
+    if batch == 0 {
+        return Ok(WarmExtrapDiag {
+            comms: vec![],
+            corrs: 0,
+            products: 0,
+            converged: true,
+        });
+    }
+    // Correction step size is ADAPTIVE: each DMM round is accepted only
+    // if the comm certificate decreased (accept → η×2, reject → restore
+    // D and η/2). Measured: synthetic gapped systems want η≈4 (×0.5/round
+    // convergence), real DFTB H′ diverges at η=4 but converges ×0.6/round
+    // at η=1 — a fixed η cannot serve both, so the certificate decides.
+    let eta: f32 = std::env::var("RUST_DFTB_WARM_ETA")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(1.0);
+    let cap: f32 = std::env::var("RUST_DFTB_WARM_CAP")
+        .ok().and_then(|s| s.parse().ok()).unwrap_or(10.0);
+    let dbg = std::env::var_os("RUST_DFTB_WARM_DEBUG").is_some();
+
+    let sh = regtile_shape(n).ok_or_else(|| {
+        DftbError::InvalidInput(format!(
+            "warm_extrap regtile shape infeasible for n={n}"
+        ))
+    })?;
+    if sh.0 * sh.2 < n || sh.1 * sh.3 < n {
+        return Err(DftbError::InvalidInput(format!(
+            "warm_extrap square needs one full-cover workgroup; n={n} does not fit"
+        )));
+    }
+    let wg = sh.0 * sh.1;
+    let source = render_purify_source(n, wg, 0, 2, Some(sh));
+    let program = rt.build_program(&source)?;
+
+    let spans = rt.zero_buffer::<f32>(batch)?;
+    let t_buf = rt.zero_buffer::<f32>(batch * n * n)?;
+    let y_buf = rt.zero_buffer::<f32>(batch * n * n)?;
+    let rh_buf = rt.zero_buffer::<f32>(batch)?;
+    let d_prev = rt.zero_buffer::<f32>(batch * n * n)?; // accept/reject checkpoint
+    let pend = rt.buffer_from_slice(&vec![1i32; batch])?; // cert freeze mask
+    let done_s = rt.zero_buffer::<i32>(batch)?;            // comm_gate out (unused)
+
+    let k_span = Kernel::builder()
+        .program(&program)
+        .name("spec_span_batched")
+        .queue(rt.queue().clone())
+        .global_work_size(batch * wg)
+        .local_work_size(wg)
+        .arg(h_buf)
+        .arg(&spans)
+        .arg(n as i32)
+        .arg(batch as i32)
+        .build()
+        .map_err(map_ocl_err)?;
+    let k_xtr = Kernel::builder()
+        .program(&program)
+        .name("tc2_extrap_batched")
+        .queue(rt.queue().clone())
+        .global_work_size(batch * wg)
+        .local_work_size(wg)
+        .arg(d_io)
+        .arg(p1_buf)
+        .arg(p2_buf)
+        .arg(gamma)
+        .arg(n as i32)
+        .arg(batch as i32)
+        .build()
+        .map_err(map_ocl_err)?;
+    // gemm_nn_batched(A,B→T) — args 0..2 rebound per launch.
+    let k_gemm = Kernel::builder()
+        .program(&program)
+        .name("gemm_nn_batched")
+        .queue(rt.queue().clone())
+        .global_work_size(batch * wg)
+        .local_work_size(wg)
+        .arg(d_io)
+        .arg(d_io)
+        .arg(&t_buf)
+        .arg(n as i32)
+        .arg(batch as i32)
+        .build()
+        .map_err(map_ocl_err)?;
+    let k_mw = Kernel::builder()
+        .program(&program)
+        .name("mcweeny_combine_batched")
+        .queue(rt.queue().clone())
+        .global_work_size(batch * wg)
+        .local_work_size(wg)
+        .arg(d_io)
+        .arg(&t_buf)
+        .arg(&y_buf)
+        .arg(n as i32)
+        .arg(batch as i32)
+        .arg(&pend)
+        .build()
+        .map_err(map_ocl_err)?;
+    let k_dmm = Kernel::builder()
+        .program(&program)
+        .name("dmm_update_batched")
+        .queue(rt.queue().clone())
+        .global_work_size(batch * wg)
+        .local_work_size(wg)
+        .arg(d_io)
+        .arg(&t_buf)
+        .arg(&y_buf)
+        .arg(&spans)
+        .arg(eta)
+        .arg(cap)
+        .arg(n as i32)
+        .arg(batch as i32)
+        .arg(&pend)
+        .build()
+        .map_err(map_ocl_err)?;
+    let k_comm = Kernel::builder()
+        .program(&program)
+        .name("comm_gate_batched")
+        .queue(rt.queue().clone())
+        .global_work_size(batch * wg)
+        .local_work_size(wg)
+        .arg(&t_buf)
+        .arg(&rh_buf)
+        .arg(n as i32)
+        .arg(batch as i32)
+        .arg(&done_s)
+        .arg(&pend)
+        .arg(comm_tol)
+        .build()
+        .map_err(map_ocl_err)?;
+
+    // gemm(A,B→T) helper — rebinds args 0..2 then enqueues.
+    let gemm = |a: &Buffer<f32>, b: &Buffer<f32>, t: &Buffer<f32>| -> Result<()> {
+        k_gemm.set_arg(0u32, a).map_err(map_ocl_err)?;
+        k_gemm.set_arg(1u32, b).map_err(map_ocl_err)?;
+        k_gemm.set_arg(2u32, t).map_err(map_ocl_err)?;
+        unsafe { k_gemm.enq().map_err(map_ocl_err)?; }
+        Ok(())
+    };
+    // McWeeny retract: T2 = D·D, Y = T2·D, D ← 3T2 − 2Y (2 products).
+    let retract = || -> Result<()> {
+        gemm(d_io, d_io, &t_buf)?;
+        gemm(&t_buf, d_io, &y_buf)?;
+        unsafe { k_mw.enq().map_err(map_ocl_err)?; }
+        Ok(())
+    };
+    // Stationarity certificate: T = H·D (1 product) → rh.
+    let certify = || -> Result<Vec<f32>> {
+        gemm(h_buf, d_io, &t_buf)?;
+        unsafe { k_comm.enq().map_err(map_ocl_err)?; }
+        let mut rh = vec![0.0f32; batch];
+        rt.read_buffer(&rh_buf, &mut rh)?;
+        Ok(rh)
+    };
+
+    unsafe {
+        k_span.enq().map_err(map_ocl_err)?;
+        k_xtr.enq().map_err(map_ocl_err)?;
+    }
+    retract()?;
+    let mut products = 3usize;
+    let mut rh = certify()?;
+    let mut corrs = 0usize;
+    let mut retries = 0usize;
+    let mut eta_cur = eta;
+    if dbg {
+        eprintln!(
+            "[warm-xtr] retract+1MW: max_rh={:.3e} (tol={comm_tol:.1e})",
+            rh.iter().cloned().fold(0.0f32, f32::max)
+        );
+    }
+    // Accept/reject trust region on the certificate: a DMM round is kept
+    // only if max rh decreased (then η×2); otherwise the checkpoint is
+    // restored and η halved. Guards against the η>span overshoot measured
+    // on real DFTB spectra without needing a-priori step calibration.
+    while rh.iter().any(|&r| r > comm_tol) && corrs < max_corr && retries < 6 {
+        let prev_max = rh.iter().cloned().fold(0.0f32, f32::max);
+        rt.copy_into(d_io, &d_prev, batch * n * n)?;    // checkpoint
+        // t_buf already holds H·D from the certificate.
+        gemm(d_io, &t_buf, &y_buf)?;                    // Y = D·T
+        k_dmm.set_arg(4u32, eta_cur).map_err(map_ocl_err)?;
+        unsafe { k_dmm.enq().map_err(map_ocl_err)?; }   // D ← ½(D+Dᵀ) − s·G
+        retract()?;
+        rh = certify()?;
+        products += 4;
+        let new_max = rh.iter().cloned().fold(0.0f32, f32::max);
+        if new_max > prev_max * 0.95 {
+            rt.copy_into(&d_prev, d_io, batch * n * n)?; // reject: restore
+            rh = certify()?;                             // refresh t_buf for D
+            products += 1;
+            eta_cur *= 0.5;
+            retries += 1;
+            if dbg {
+                eprintln!("[warm-xtr] REJECT rh {prev_max:.3e}→{new_max:.3e} η→{eta_cur:.2}");
+            }
+            continue;
+        }
+        eta_cur = (eta_cur * 2.0).min(8.0);
+        corrs += 1;
+        if dbg {
+            eprintln!("[warm-xtr] corr {corrs}: max_rh={new_max:.3e} η→{eta_cur:.2}");
+        }
+    }
+    let converged = rh.iter().all(|&r| r <= comm_tol);
+    Ok(WarmExtrapDiag {
+        comms: rh,
+        corrs,
+        products,
         converged,
     })
 }

@@ -1,4 +1,10 @@
 
+> **Read [`Dense_Multi_Performance.md`](Dense_Multi_Performance.md) first.**
+> Later turns of this chat override earlier ones. The part that still
+> steers the solver starts at the learned-Λ autopsy and the
+> extrapolation repair; the opening GEMM-microkernel turns are already
+> measured (`gemm_sq_iter`).
+
 https://chatgpt.com/share/6aae6101-84d4-83eb-93e4-94ff83b2d4a1
 
 ---
@@ -6398,3 +6404,1377 @@ It is **not a new algorithm or approximation**. It is simply the textbook LNV gr
 [5]: https://scispace.com/topics/state-transition-matrix-4n4n3ris/1997?utm_source=chatgpt.com "Top 59 papers published in the topic of State-transition matrix in 1997"
 [6]: https://sma.epfl.ch/~anchpcommon/students/bolliger.pdf?utm_source=chatgpt.com "mcweeny.tex"
 [7]: https://www.sciencedirect.com/science/article/abs/pii/S0010465599002210?utm_source=chatgpt.com "Density matrices in O(N) electronic structure calculations: theory and applications - ScienceDirect"
+
+
+
+
+---
+
+# USER
+
+please review this commit
+https://github.com/ProkopHapala/dftbplus/commits/main/
+and ttched report 
+
+my coding agnt tried to impement your instruction but it found it either not working at all or super inefficient (require hundertsn or thousands iterations wich make is slower than jacobi and much slower than doing purification from scratch (from radnom DM)
+
+I refuse to accept this as final results, the information sotred in density matrix from previous similar configuration (if atoms move by 0.1A, charges does not change almost) must be usefull starting point for warmstart, I suspect we do something totally silly conceptually aporach it from wrong direction
+
+either my coding agent iterpreted your ideas in stupid way, or your ideas were stupid, reinvestigate this problem deepely again with open mind.
+
+
+---
+
+# Chat GPT 5.6 sol
+
+I reviewed the latest commit, `359ee76cec82baefcc309bb26c6473ce33d447d5`, including the new LNV implementation, the pre-existing DMM path, `tc2_extrap_batched`, and the attached report.
+
+I think your objection is justified. **The experiments do not show that a previous density matrix is useless. They show that “take the old projector and minimize \(\mathrm{Tr}(HD)\) by first-order gradient descent” is the wrong way to exploit it.** We were using the warm information in the weakest possible form.
+
+There are also two important things the current report misses: one concrete problem in the extrapolation implementation, and a standard matrix-only Newton/response formulation that directly supplies the missing inverse-gap information.
+
+## 1. The LNV result is real — I would stop working on it
+
+Here I do **not** think the coding agent made a stupid implementation.
+
+The new GPU LNV gradient was compared against an independent CPU/f64 implementation and agrees to roughly \(10^{-6}\) relative accuracy. The independent CPU implementation reproduces the thousands-of-iterations behavior. The earlier product-order bug was also found and fixed. 
+
+So the conclusion
+
+$$
+\text{LNV steepest descent from }P_{\rm old}
+$$
+
+is a bad warm solver for these small dense systems is credible.
+
+Likewise the exact tangent descent
+
+$$
+G=[P,[P,H]]
+$$
+
+is mathematically correct, but its convergence mode-by-mode is
+
+$$
+\theta_{ia}^{(k+1)}
+\approx
+\left[1-\alpha(\epsilon_a-\epsilon_i)\right]\theta_{ia}^{(k)}.
+$$
+
+If
+
+$$
+\kappa\sim
+\frac{\Delta\epsilon_{\rm spectrum}}
+     {\Delta\epsilon_{\rm HOMO-LUMO}},
+$$
+
+then plain first-order descent requires \(O(\kappa)\) iterations. The report's dense random half-filled systems deliberately generate \(\kappa\sim300-4000\), so hundreds or thousands of steps are entirely plausible. 
+
+No GPU optimization fixes that.
+
+So **my previous suggestion to make tangent/LNV minimization the main warm solver was conceptually poor.**
+
+---
+
+# 2. But the comparison to “cold purification” is misleading
+
+This is the crucial point.
+
+Cold TC2 is not starting from a random density matrix.
+
+You initialize with
+
+$$
+X_0=
+\frac{\lambda_{\max}I-H_{\rm new}}
+     {\lambda_{\max}-\lambda_{\min}}.
+$$
+
+Therefore
+
+$$
+[X_0,H_{\rm new}]=0
+$$
+
+**exactly**.
+
+So from iteration zero, \(X_0\) already has the exact eigenvectors of the **new Hamiltonian**.
+
+TC2 never has to find the new occupied subspace. It only performs scalar operations
+
+$$
+x_i\rightarrow 0\ \text{or}\ 1
+$$
+
+on eigenvalues whose eigenvectors are already correct.
+
+That is why 20–40 ridiculously cheap matrix squares beat warm gradient descent.
+
+The report recognizes this later. 
+
+So we have actually been comparing:
+
+$$
+\boxed{\text{exact new eigenbasis + eigenvalue cleanup}}
+$$
+
+against
+
+$$
+\boxed{\text{old eigenbasis + slow first-order rotation}}.
+$$
+
+No surprise the supposedly “cold” method wins.
+
+The question is therefore not:
+
+> How do we minimize from \(P_{\rm old}\) faster?
+
+It is:
+
+> **How do we predict the rotation of the occupied subspace before purification?**
+
+That is a very different problem.
+
+---
+
+# 3. The report goes too far when it says the density matrix has thrown away the gap information
+
+This statement in the report is only half true:
+
+> the density matrix alone does not contain the denominators \(1/(\epsilon_a-\epsilon_i)\). 
+
+A projector \(P\) alone indeed contains only the occupied subspace.
+
+But we do **not** have only \(P\). We also have the previous Hamiltonian \(H_0\).
+
+And because
+
+$$
+[P,H_0]=0,
+$$
+
+the pair
+
+$$
+\boxed{(P,H_0)}
+$$
+
+contains all of the occupied and virtual Hamiltonian blocks:
+
+$$
+H_{oo}=PH_0P,
+$$
+
+$$
+H_{vv}=QH_0Q,
+\qquad Q=I-P.
+$$
+
+The first-order response to
+
+$$
+H_1=H_0+\Delta H
+$$
+
+is obtained from the **Sylvester equation**
+
+$$
+\boxed{
+H_{vv}X-XH_{oo}
+=
+-Q\,\Delta H\,P
+}
+$$
+
+and
+
+$$
+\delta P=X+X^T.
+$$
+
+In the eigenbasis this becomes simply
+
+$$
+(\epsilon_a-\epsilon_i)X_{ai}
+=
+-\Delta H_{ai},
+$$
+
+hence
+
+$$
+X_{ai}
+=
+-\frac{\Delta H_{ai}}
+       {\epsilon_a-\epsilon_i}.
+$$
+
+There are our missing denominators.
+
+**No eigenvectors are required to formulate or solve this.**
+
+This is not speculative. Density-matrix perturbation theory has been developed specifically to obtain density response without sum-over-states/eigenvectors; both recursive purification formulations and Sylvester-equation formulations exist. ([APS Journals][1])
+
+So one major branch that the current campaign has simply not tested is:
+
+$$
+\boxed{\text{matrix-only Newton / Sylvester response}}
+$$
+
+rather than gradient descent.
+
+---
+
+# 4. And I found a concrete problem with the extrapolation experiment
+
+This is potentially very significant.
+
+Current `gpu_purify.cl::tc2_extrap_batched` does
+
+$$
+S=2P_1-P_0
+$$
+
+which is actually a good idea.
+
+But then it computes **Gershgorin bounds of \(S\)** and, whenever they escape approximately \([0,1]\), affinely rescales the whole matrix into that interval.
+
+For a dense projector, Gershgorin bounds are completely inappropriate for this decision.
+
+Take a perfectly exact random rank-43 projector of size 86:
+
+$$
+P^2=P,
+\qquad
+\sigma(P)=\{0,1\}.
+$$
+
+As a representative numerical check, I get Gershgorin bounds around
+
+$$
+[-3.4,\;4.4]
+$$
+
+despite the exact spectrum being only 0 and 1.
+
+So your condition
+
+```text
+lmin < -0.02 || lmax > 1.02
+```
+
+will trigger on an **absolutely perfect projector** in a dense representation.
+
+The affine rescaling would then turn true eigenvalues roughly
+
+$$
+0\rightarrow0.44,
+\qquad
+1\rightarrow0.56.
+$$
+
+You have just destroyed the thing that made the warm seed valuable!
+
+The report says this renormalization “preserves eigenvectors/ordering,” which is true, but it destroys the near-idempotency and forces purification to redo almost the whole spectral separation.
+
+That is already bad.
+
+But there is a second issue.
+
+---
+
+# 5. TC2 is the wrong retraction for an extrapolated projector
+
+Consider two nearby projectors:
+
+$$
+P_{k-1},P_k.
+$$
+
+The natural linear extrapolation is
+
+$$
+S=2P_k-P_{k-1}.
+$$
+
+For smooth motion,
+
+$$
+P_{k-1}
+=
+P_k-h\dot P+\frac12h^2\ddot P+\cdots,
+$$
+
+so
+
+$$
+S
+=
+P_k+h\dot P-\frac12h^2\ddot P+\cdots.
+$$
+
+The true next projector is
+
+$$
+P_{k+1}
+=
+P_k+h\dot P+\frac12h^2\ddot P+\cdots.
+$$
+
+Therefore
+
+$$
+\boxed{S-P_{k+1}=O(h^2).}
+$$
+
+This is already a **second-order prediction** of the occupied-subspace motion.
+
+But because \(\dot P\) is tangent, \(S\)'s eigenvalues naturally overshoot slightly:
+
+$$
+\lambda_{\rm occ}=1+O(h^2),
+\qquad
+\lambda_{\rm virt}=0-O(h^2).
+$$
+
+And that is completely harmless.
+
+In fact **McWeeny is almost ideal for exactly this situation**:
+
+$$
+R(x)=3x^2-2x^3.
+$$
+
+Around both endpoints,
+
+$$
+R'(0)=R'(1)=0,
+$$
+
+so the radial \(O(h^2)\) eigenvalue errors get suppressed quadratically.
+
+But on a tangent perturbation the Fréchet derivative is identity:
+
+$$
+DR_P[\delta P_{\rm tangent}]
+=
+\delta P_{\rm tangent}.
+$$
+
+So McWeeny:
+
+> **kills the radial extrapolation error while preserving the predicted subspace rotation to first order.**
+
+That is exactly what we need.
+
+TC2 is not like that. One TC2 branch has derivative 2 at one endpoint:
+
+$$
+x^2:
+\quad
+q'(1)=2,
+$$
+
+while
+
+$$
+2x-x^2:
+\quad
+q'(0)=2.
+$$
+
+So if extrapolation produces one eigenvalue slightly above 1 and another slightly below 0—which it naturally does—whichever TC2 branch you pick repairs one side and makes the other worse.
+
+That explains the report's observation that extrapolation followed by TC2 drifts or branch-misfires. 
+
+I would therefore **reopen extrapolation immediately**. Its current failure does not falsify the idea.
+
+---
+
+# 6. The most promising architecture now looks like predictor → retraction → tiny correction
+
+This is, I think, the fundamental change.
+
+Do **not** ask DMM to generate the entire rotation from a stale \(P\).
+
+Make history generate almost all of it.
+
+Suppose we have
+
+$$
+P_{k-2},P_{k-1}
+$$
+
+and now know \(H_k\).
+
+For a uniform trajectory use
+
+$$
+S=2P_{k-1}-P_{k-2}.
+$$
+
+Even better, adapt the extrapolation coefficient to the actual Hamiltonian movement:
+
+$$
+\Delta H_k=H_k-H_{k-1},
+$$
+
+$$
+\Delta H_{k-1}=H_{k-1}-H_{k-2},
+$$
+
+$$
+\gamma=
+\frac{\langle\Delta H_k,\Delta H_{k-1}\rangle}
+{\|\Delta H_{k-1}\|^2},
+$$
+
+then
+
+$$
+\boxed{
+S=P_{k-1}+
+\gamma(P_{k-1}-P_{k-2}).
+}
+$$
+
+For constant motion, \(\gamma\simeq1\).
+
+Then:
+
+$$
+P_{\rm pred}=3S^2-2S^3.
+$$
+
+Now calculate
+
+$$
+R_H=[H_k,P_{\rm pred}].
+$$
+
+If the predictor worked, perhaps **zero or one DMM correction** is enough.
+
+This is exactly the kind of previous-density extrapolation that has been shown useful in geometry optimization and molecular dynamics. Niklasson et al. explicitly developed trace-correcting density-matrix extrapolation to accelerate self-consistency, and modern Grassmann extrapolation methods are based on the same observation that previous converged densities contain valuable trajectory information. ([DOI][2])
+
+---
+
+# 7. DFTB gives you an even better version almost for free
+
+At fixed geometry, your SCC Hamiltonian is affine in charges:
+
+$$
+H(q)=H_0+Bq.
+$$
+
+And you already have DIIS/mixing machinery for the charge trajectory.
+
+Suppose DIIS predicts
+
+$$
+q_{\rm next}
+=
+\sum_i c_i q_i,
+\qquad
+\sum_i c_i=1.
+$$
+
+Then exactly,
+
+$$
+H(q_{\rm next})
+=
+\sum_i c_i H(q_i).
+$$
+
+For nearby solutions, to first order,
+
+$$
+P(H_{\rm next})
+\approx
+\sum_i c_i P_i.
+$$
+
+So instead of inventing an unrelated density predictor, use **the same DIIS coefficients**:
+
+$$
+\boxed{
+S=\sum_i c_i P_i
+}
+$$
+
+and then retract \(S\) to the Grassmann/projector manifold.
+
+That is almost free:
+
+* you already computed the DIIS coefficients;
+* combining 3–6 old matrices is \(O(n^2)\);
+* one McWeeny retraction;
+* one commutator certificate;
+* perhaps one DMM correction.
+
+This is much closer to the mathematics of the SCC trajectory than “16 fixed DMM steps from the previous projector.”
+
+I think this deserves very high priority.
+
+---
+
+# 8. Product accounting becomes completely different
+
+The report currently talks about roughly five matrix products per tangent-descent iteration. That is also slightly pessimistic.
+
+Your actual `dmm_update_batched` is:
+
+$$
+T=HP
+$$
+
+and
+
+$$
+Y=PT=PHP,
+$$
+
+then
+
+$$
+G=T+T^T-2Y.
+$$
+
+That's **two general products**, not three.
+
+McWeeny adds:
+
+$$
+P^2,
+\qquad
+P^3=P^2P,
+$$
+
+two more products.
+
+If you retract every second DMM step, that's
+
+$$
+\frac{2+2+2}{2}
+=
+3
+$$
+
+matrix products per DMM step on average, not five.
+
+Still too expensive for 30–300 steps, yes.
+
+But predictor-corrector could look like:
+
+| operation                    | matrix products |
+| ---------------------------- | --------------: |
+| extrapolate history          |               0 |
+| McWeeny retract              |               2 |
+| one DMM correction           |               2 |
+| final commutator certificate |               1 |
+| **total**                    |           **5** |
+
+Now we are finally in the regime that can plausibly beat a ~30-square cold TC2.
+
+That is the correct target: **0–2 correction steps, not 30–300 minimization steps.**
+
+---
+
+# 9. If one old projector is all we have, use a Newton response — not gradient descent
+
+For the first geometry step, or when trajectory history is unavailable, the Sylvester formulation is the principled method.
+
+At the old converged solution:
+
+$$
+[P,H_0]=0.
+$$
+
+For \(H_1=H_0+\Delta H\), solve
+
+$$
+\mathcal A(X)
+=
+-[P,[P,\Delta H]]
+$$
+
+where
+
+$$
+\boxed{
+\mathcal A(X)
+=
+[P,[X,H_0]].
+}
+$$
+
+For a tangent \(X\), in the unknown eigenbasis:
+
+$$
+\mathcal A(X)_{ia}
+=
+(\epsilon_a-\epsilon_i)X_{ia}.
+$$
+
+So this operator **is exactly the orbital-energy-gap Hessian** we have been missing.
+
+This is Newton/PT1 expressed without eigenvectors.
+
+And it is cheap to apply with your existing generic GEMM.
+
+Given symmetric \(X,H_0,P\):
+
+$$
+M=H_0X
+$$
+
+one GEMM.
+
+Then
+
+$$
+C=XH_0-H_0X=M^T-M.
+$$
+
+Then
+
+$$
+N=PC
+$$
+
+second GEMM.
+
+Because \(C^T=-C\),
+
+$$
+\boxed{
+\mathcal A(X)=N+N^T.
+}
+$$
+
+So one Hessian-vector application costs exactly
+
+$$
+\boxed{2\text{ general GEMMs}.}
+$$
+
+Solve with CG in the tangent space.
+
+Gradient descent convergence is \(O(\kappa)\).
+
+CG/Sylvester convergence is roughly \(O(\sqrt\kappa)\).
+
+For the pathological random systems with \(\kappa=1000\), this may still need tens of iterations. For a realistic gapped DFTB system with a much smaller effective condition number, it might require only 2–5.
+
+The literature explicitly contains density-matrix-only Sylvester formulations of perturbation theory, so this is not a speculative construction. ([UCL Discovery][3])
+
+And the older recursive DMPT work provides another matrix-only route using perturbed purification with quadratic recursions. ([arXiv][4])
+
+I would prototype the Sylvester version in CPU/f64 before GPU optimization.
+
+---
+
+# 10. There is another route I now think may be even better: stop storing only \(P\)
+
+This doesn't mean going back to eigenvectors.
+
+The physical information you need is the **occupied subspace**, not individual canonical eigenvectors.
+
+Represent it by any orthonormal matrix
+
+$$
+C\in\mathbb R^{n\times m},
+\qquad
+C^TC=I,
+$$
+
+with
+
+$$
+P=CC^T.
+$$
+
+There is no requirement that columns of \(C\) diagonalize \(H\).
+
+Now use the previous \(C\) and apply a polynomial filter of the new Hamiltonian:
+
+$$
+C'\sim p_k(H_{\rm new})C.
+$$
+
+Then orthonormalize its columns.
+
+This is **Chebyshev-filtered subspace iteration**.
+
+And this is exactly an established solution to almost exactly your problem: in SCF calculations, keep the previously converged occupied subspace and refine it with polynomial filtering instead of solving a fresh eigenproblem. The original CheFSI work reports subspace updates substantially cheaper than repeated eigenvalue solves. ([ScienceDirect][5])
+
+For your dimensions,
+
+$$
+n=86,\qquad m\approx43,
+$$
+
+one multiplication
+
+$$
+H C
+$$
+
+costs only about half a full \(86\times86\) GEMM.
+
+A degree-4 filter therefore costs roughly two full-GEMM equivalents.
+
+Then orthogonalizing an \(86\times43\) matrix is also much cheaper than a full eigensolve.
+
+And here's the particularly attractive part for your existing SCC code:
+
+**you do not necessarily have to rebuild \(P\) at all.**
+
+You already have direct population machinery based on occupied coefficients \(C\) and \(SC\).
+
+So a future architecture could be
+
+$$
+\boxed{
+C_{\rm old}
+\rightarrow
+p(H_{\rm new})C_{\rm old}
+\rightarrow
+\text{orthonormalize}
+\rightarrow
+\text{Mulliken charges directly}.
+}
+$$
+
+No diagonalization.
+
+No \(P^2=P\) purification.
+
+No DMM.
+
+No density matrix unless some downstream operation explicitly needs it.
+
+This is a much more serious candidate than the `C`-gradient method discussed in the report. The report's Q7 only considers
+
+$$
+HC-C(C^THC),
+$$
+
+which is again first-order gradient descent and suffers the same condition-number problem. 
+
+**Polynomial-filtered subspace iteration was not tested.**
+
+---
+
+# 11. We can obtain \(C\) from your purified density without diagonalizing it
+
+If the first calculation is TC2 and gives only \(P\), that's fine.
+
+Choose a fixed random matrix
+
+$$
+\Omega\in\mathbb R^{n\times m}.
+$$
+
+Compute
+
+$$
+Y=P\Omega.
+$$
+
+Since \(P\) is rank \(m\),
+
+$$
+\operatorname{range}(Y)
+=
+\operatorname{range}(P)
+$$
+
+with probability one.
+
+Then orthonormalize \(Y\):
+
+$$
+C=\operatorname{orth}(Y).
+$$
+
+That's a rectangular multiplication plus a small QR/CholeskyQR.
+
+No eigensolver.
+
+From then on carry \(C\), not just \(P\).
+
+This is probably worth a completely separate prototype.
+
+---
+
+# 12. Geometry changes need another correction to the report
+
+The report says, roughly,
+
+$$
+K_{\rm new}=B K_{\rm old}B^T,
+\qquad
+B=X_{\rm new}^{-1}X_{\rm old},
+$$
+
+“preserves the physical density.” 
+
+That statement is not quite correct when atoms move.
+
+The AO basis functions themselves move.
+
+If we want to project the **old physical orbitals** onto the new AO basis, the natural transport includes the old–new cross overlap
+
+$$
+S_{\rm cross}
+=
+\langle\phi^{\rm new}_\mu|
+\phi^{\rm old}_\nu\rangle.
+$$
+
+In orthogonal coordinates the transport is approximately
+
+$$
+\boxed{
+B
+=
+X_{\rm new}^T
+S_{\rm cross}
+X_{\rm old}.
+}
+$$
+
+Then
+
+$$
+K_{\rm new}^{\rm guess}
+=
+B K_{\rm old}B^T.
+$$
+
+The simple \(X_{\rm new}^{-1}X_{\rm old}\) formula preserves an AO **coefficient representation** under a particular identification of old/new AO labels; it does not literally preserve the physical orbital functions when those basis functions have moved.
+
+For a 0.1 Å displacement this may matter.
+
+Nonorthogonal DMPT was developed specifically to deal with perturbation-dependent bases and nuclear displacement, so there is established theory here too. ([PubMed][6])
+
+Within one SCC loop at fixed geometry this issue disappears because \(X\) is fixed.
+
+---
+
+# 13. The dense-random benchmark should no longer be the performance judge
+
+Keep it as an adversarial correctness test.
+
+But it is almost maximally hostile to warm subspace methods:
+
+* random dense spectrum;
+* exact half filling;
+* almost guaranteed tiny Fermi gaps;
+* perturbation independent of physical DFTB structure.
+
+The report itself notices that the hardest case has
+
+$$
+\mathrm{gap}/\mathrm{span}\approx2.7\times10^{-4},
+$$
+
+and explicitly asks whether real DFTB spectra are much kinder. 
+
+That needs answering empirically.
+
+For production performance, I would benchmark actual sequences:
+
+* successive SCC Hamiltonians for H\(_2\)O / GC / your real molecular systems;
+* geometry displacements 0.01, 0.05, 0.1 Å;
+* perhaps frozen-deflection sequences relevant to the force/Hessian calculations.
+
+Measure
+
+$$
+\|P_k-P_{k-1}\|,
+$$
+
+$$
+\|[H_k,P_{k-1}]\|,
+$$
+
+$$
+\|[H_k,P_{\rm pred}]\|,
+$$
+
+Fermi gap/span, and number of corrections required.
+
+That will tell us whether the actual warm problem is easy.
+
+---
+
+## What I would do next
+
+I would stop all LNV/momentum parameter work and run four very targeted experiments:
+
+1. **Repair the existing extrapolation experiment first.** Use \(S=P_1+\gamma(P_1-P_2)\); remove the Gershgorin rescaling entirely; do **one McWeeny retraction**, not TC2; then one commutator certificate. Start with \(\gamma=1\), then try the \(\Delta H\)- or SCC-DIIS-derived coefficient. Only if the certificate is insufficient, add 1–2 existing `dmm_update_batched` steps. This is the cheapest and most likely immediate win.
+
+2. **Test it on a real SCC trajectory**, not random \(H+\delta R\). In particular, try applying the **same DIIS coefficients to stored \(P_i\)** that you already use for charge/H extrapolation. If the predicted projector needs only one correction, we are essentially done.
+
+3. **Prototype the Sylvester/Newton response in CPU f64.** Solve
+
+   $$
+   [P,[X,H_0]]=-[P,[P,\Delta H]]
+   $$
+
+   with CG. Count CG iterations on real DFTB perturbations. If it is 2–5, GPU implementation is highly promising; if it is 20+, don't bother.
+
+4. **Prototype occupied-subspace CheFSI.** Extract \(C=\mathrm{orth}(P\Omega)\) once, then test degree 2/4/6 polynomial filtering of \(H_{\rm new}C\) plus orthonormalization. This is the candidate I would take most seriously for a new production architecture because it directly preserves and updates the useful object—the occupied subspace—without asking a density-matrix gradient to rediscover it.
+
+So the revised conceptual picture is:
+
+$$
+\boxed{
+\text{cold: }H\rightarrow\text{Palser+TC2}
+}
+$$
+
+but for warm updates,
+
+$$
+\boxed{
+\text{predict the subspace motion}
+\rightarrow
+\text{cheap retraction/filter}
+\rightarrow
+\text{at most tiny correction}.
+}
+$$
+
+The mistake was treating a previous converged density as merely an **initial point for another optimization**. It is much more valuable as a point on a **smooth trajectory of occupied subspaces**. That is the information we should exploit.
+
+[1]: https://journals.aps.org/prl/abstract/10.1103/PhysRevLett.92.193001 "https://journals.aps.org/prl/abstract/10.1103/PhysRevLett.92.193001"
+[2]: https://doi.org/10.1063/1.3351785 "https://doi.org/10.1063/1.3351785"
+[3]: https://discovery.ucl.ac.uk/id/eprint/10114096/ "https://discovery.ucl.ac.uk/id/eprint/10114096/"
+[4]: https://arxiv.org/abs/cond-mat/0311591 "https://arxiv.org/abs/cond-mat/0311591"
+[5]: https://www.sciencedirect.com/science/article/abs/pii/S002199910600146X "https://www.sciencedirect.com/science/article/abs/pii/S002199910600146X"
+[6]: https://pubmed.ncbi.nlm.nih.gov/16095346/ "https://pubmed.ncbi.nlm.nih.gov/16095346/"
+
+
+---
+
+# USER
+
+I think you ideas are very good but I noticed something which I see as big problem:
+
+"""
+If
+then plain first-order descent requires � iterations. The report's dense random half-filled systems deliberately generate �, so hundreds or thousands of steps are entirely plausible.
+""X
+
+This is total nonsense! Why the hell we are testing it on something which doesn't have bandgap? Half-filled state? This seem to me like sabotage! The method is ment to work for System with decent gap and very good starting guess, that is the whole point! 
+
+
+---
+
+# Chat GPT 5.6 sol
+
+Yes. I agree strongly: **the performance conclusion drawn from that benchmark is not valid for the problem you actually care about.** The random half-filled matrices are useful as an adversarial correctness/stability test, but they are a very poor warm-start benchmark.
+
+The report itself effectively admits this: the difficult systems have `gap/span ≈ 2.7×10⁻⁴`, and it says dense random matrices at exact half filling practically guarantee near-degenerate frontier levels.  It later explicitly questions whether this has anything to do with real DFTB spectra. 
+
+### The real error is worse than just “small gap”
+
+The important small parameter for a warm start is **not**
+
+$$
+\Delta=0.02
+$$
+
+in the code.
+
+It is approximately
+
+$$
+\boxed{
+\eta_{\rm warm}
+=
+\frac{\|Q_0\,\Delta H\,P_0\|}
+     {\Delta_{\rm gap}}
+}
+$$
+
+where
+
+$$
+P_0=D_{\rm old},\qquad Q_0=I-P_0.
+$$
+
+This follows directly from first-order perturbation theory:
+
+$$
+\delta P_{ai}
+\sim
+\frac{\Delta H_{ai}}
+     {\epsilon_i-\epsilon_a}.
+$$
+
+If the denominator is absurdly tiny, a numerically “small”
+
+$$
+H_1=H_0+0.02R
+$$
+
+can correspond to an **order-one rotation of the occupied subspace**.
+
+Then it isn't a warm-start problem anymore!
+
+For the reported pathological case,
+
+$$
+\frac{\mathrm{gap}}{\mathrm{span}}
+\simeq2.7\times10^{-4}.
+$$
+
+A perturbation of even a percent of the spectral scale can therefore be **tens of times the gap**. The old projector may have very little predictive value for the new one.
+
+So asking
+
+> “why doesn't the old density converge in five iterations?”
+
+under those conditions is unfair to the method.
+
+---
+
+## Half filling itself isn't the sin
+
+One nuance: \(N_{\rm occ}=43\) for \(N=86\) does not inherently mean a metallic or gapless system.
+
+The problem is:
+
+> **random dense symmetric matrix + choose the middle 43 eigenvalues**
+
+There is no mechanism creating a HOMO-LUMO gap. You are cutting through the dense middle of a random spectrum, exactly where neighboring levels are plentiful.
+
+For our target systems we expect something qualitatively more like
+
+```text
+occupied band
+xxxxxxxxxxxxxxxx
+
+        GAP
+
+                    xxxxxxxxxxxxxxxx
+                    virtual band
+```
+
+not
+
+```text
+x x xx x x xxx x xx x xx x xxx x x
+                   ^
+                 Nocc
+```
+
+So yes: that synthetic test was almost designed to destroy the assumption on which warm starting is based.
+
+---
+
+# This changes my interpretation of the 30–300 iterations
+
+I would **not accept those numbers as evidence against DMM warm starting**.
+
+For tangent descent, each occupied–virtual rotation behaves approximately as
+
+$$
+\theta_{ia}^{(k+1)}
+=
+\left[
+1-\alpha(\epsilon_a-\epsilon_i)
+\right]\theta_{ia}^{(k)}.
+$$
+
+If the relevant gaps range from
+
+$$
+g_{\min}
+$$
+
+to
+
+$$
+g_{\max},
+$$
+
+the condition number is roughly
+
+$$
+\kappa_{\rm eff}
+=
+\frac{g_{\max}}{g_{\min}}.
+$$
+
+The random benchmark constructed
+
+$$
+\kappa_{\rm eff}\gg100
+$$
+
+or even thousands.
+
+But imagine instead that the modes actually excited by a 0.1 Å geometry/SCC perturbation have gaps clustered around, say,
+
+$$
+2-6\ {\rm eV}.
+$$
+
+Then
+
+$$
+\kappa_{\rm eff}\sim3,
+$$
+
+not 3000.
+
+A sensible step or momentum/quasi-Newton correction could then remove the error in **a handful of iterations**.
+
+That is precisely the regime worth testing.
+
+---
+
+# More importantly: the initial error is also tiny
+
+There are two independent advantages of a genuine warm start:
+
+1. good conditioning because there is a real gap;
+2. small starting error because \(\Delta H\) is small compared with that gap.
+
+First-order theory gives roughly
+
+$$
+\|P_1-P_0\|
+\sim
+\frac{\|Q_0\Delta H P_0\|}
+     {g}.
+$$
+
+If atoms move only \(0.1\) Å and SCC charges barely change, this might already be, say,
+
+$$
+10^{-2}
+$$
+
+or less.
+
+Then we aren't asking the minimizer to rotate the subspace from scratch.
+
+We are asking it to remove a **1% error**.
+
+That is exactly where extrapolation, quasi-Newton DMM, or even simple tangent descent could be extremely competitive.
+
+---
+
+# We need to redesign the benchmark before doing anything else
+
+I would use three benchmark classes.
+
+### A. Actual production trajectories — the decisive benchmark
+
+Save consecutive Hamiltonians/densities from:
+
+* real SCC iterations;
+* geometry steps of \(0.01,\ 0.05,\ 0.1\) Å;
+* your frozen deflection / response calculations.
+
+For every transition measure:
+
+$$
+g=\epsilon_{\rm LUMO}-\epsilon_{\rm HOMO},
+$$
+
+$$
+g/\mathrm{span}(H),
+$$
+
+$$
+\|P_{\rm new}-P_{\rm old}\|_F,
+$$
+
+$$
+\|[H_{\rm new},P_{\rm old}]\|_F,
+$$
+
+and particularly
+
+$$
+\boxed{
+r=
+\frac{\|Q_{\rm old}\Delta H P_{\rm old}\|_F}{g}.
+}
+$$
+
+That last number tells us whether this is actually a warm problem.
+
+---
+
+### B. Controlled synthetic **gapped** benchmark
+
+Instead of `random_symmetric()`, explicitly generate
+
+$$
+H_0=U\,\mathrm{diag}(\epsilon)\,U^T
+$$
+
+with something like
+
+```text
+43 occupied states:   [-1.0 ... -0.3]
+GAP
+43 virtual states:    [+0.3 ... +1.0]
+```
+
+so
+
+$$
+g/\mathrm{span}\approx0.3.
+$$
+
+Then also test harder controlled cases:
+
+$$
+g/\mathrm{span}
+=
+0.2,\ 0.1,\ 0.05,\ 0.02.
+$$
+
+Now make \(H_1\) by a **controlled small subspace rotation**, rather than adding arbitrary dense noise.
+
+For example,
+
+$$
+U_1=e^A U_0,
+$$
+
+where \(A\) has only occupied–virtual blocks and produces
+
+$$
+\|P_1-P_0\|_F
+=
+0.001,\ 0.01,\ 0.05,\ 0.1.
+$$
+
+Then
+
+$$
+H_1=U_1\,\mathrm{diag}(\epsilon+\delta\epsilon)\,U_1^T.
+$$
+
+We know the exact answer and exactly how warm the starting point is.
+
+That is an excellent algorithmic benchmark.
+
+---
+
+### C. Keep the current random matrices
+
+But label them correctly:
+
+> **adversarial near-metallic stress test**
+
+Use them for:
+
+* NaN/divergence detection;
+* correctness;
+* convergence certification;
+* near-degeneracy robustness.
+
+Do **not** use them to decide whether a warm-start algorithm is worthwhile for gapped molecules.
+
+---
+
+# And this makes the extrapolation idea much more attractive
+
+For a smooth sequence,
+
+$$
+P_{k+1}
+=
+P_k+\dot P\,h+O(h^2).
+$$
+
+Then
+
+$$
+2P_k-P_{k-1}
+=
+P_{k+1}+O(h^2).
+$$
+
+If the actual projector changes only by
+
+$$
+\|P_{k+1}-P_k\|\sim10^{-2},
+$$
+
+the extrapolation error can naturally be on the order of
+
+$$
+10^{-4}.
+$$
+
+Then one McWeeny retraction plus perhaps **one tangent correction** might genuinely be sufficient.
+
+Testing that on a random matrix where the occupied projector jumps dramatically because the HOMO/LUMO are nearly degenerate tells us essentially nothing.
+
+---
+
+# Same for the quasi-Newton mean-gap idea
+
+The report suggested
+
+$$
+\bar\Delta
+=
+\frac{\operatorname{Tr}(HQ)}{n_v}
+-
+\frac{\operatorname{Tr}(HP)}{n_o}.
+$$
+
+Then approximately
+
+$$
+\delta P
+\approx
+-\frac{1}{\bar\Delta}[P,[P,H]].
+$$
+
+On the random benchmark this is poor because relevant gaps range almost from zero to the entire bandwidth.
+
+But on a molecular system where the coupled occupied–virtual transitions lie in a relatively narrow energy range, this can be a perfectly sensible preconditioner.
+
+Again: **we have not actually tested the regime where the approximation is supposed to work.**
+
+---
+
+## So I would revise the current conclusion substantially
+
+The report currently reaches, at one point, something close to:
+
+> D-only warm starts are fundamentally slow because they have lost inverse-gap information. 
+
+I would replace that with:
+
+> **Unpreconditioned D-only gradient descent is slow on nearly gapless random matrices. Its performance for the intended regime—gapped systems with a genuinely nearby previous density—has not yet been established.**
+
+That is a much narrower conclusion.
+
+And I would not spend another hour tuning algorithms before collecting a table like:
+
+| system/step     | gap/span | \(\|P_1-P_0\|\) | \(\|Q\Delta HP\|/g\) | cold TC2 squares | DMM steps | extrap+DMM steps |
+| --------------- | -------: | --------------: | -------------------: | ---------------: | --------: | ---------------: |
+| real SCC 1→2    |        … |               … |                    … |                … |         … |                … |
+| real SCC 5→6    |        … |               … |                    … |                … |         … |                … |
+| geometry 0.01 Å |        … |               … |                    … |                … |         … |                … |
+| geometry 0.05 Å |        … |               … |                    … |                … |         … |                … |
+| geometry 0.10 Å |        … |               … |                    … |                … |         … |                … |
+
+I suspect that table will change the whole discussion. The current `Δ=0.02 random matrix` benchmark may well turn out to be **far more violent than a real 0.1 Å molecular displacement**, despite the innocent-looking `0.02` coefficient.

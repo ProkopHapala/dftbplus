@@ -14,11 +14,15 @@ module libdftbcore
   use dftbp_common_globalenv, only: initGlobalEnv, destructGlobalEnv
   use dftbp_dftbplus_inputdata, only: TInputData
   use dftbp_dftbplus_initprogram, only: TDftbPlusMain
-  use dftbp_dftbplus_hsdhelpers, only: parseHsdInput
+  use dftbp_dftbplus_hsdhelpers, only: doPostParseJobs
+  use dftbp_dftbplus_parser, only: parseHsdTree, readHsdFile, TParserFlags
+  use dftbp_extlibs_xmlf90, only: destroyNode, fnode
   use dftbp_dftbplus_main, only: runDftbPlus
   use dftbp_io_formatout, only: printDftbHeader
   use dftbp_dftbplus_hamiltonian_store, only: set_store_hamiltonian, get_stored_hamiltonian,&
-      & get_stored_overlap, get_stored_dm, get_stored_eigvecs, clear_stored_matrices
+      & get_stored_overlap, get_stored_dm, get_stored_eigvecs, clear_stored_matrices,&
+      & get_stored_hamiltonian_cplx, get_stored_overlap_cplx, get_stored_dm_cplx,&
+      & get_stored_eigvecs_cplx, get_cplx_store_dims
   implicit none
   private
 
@@ -52,6 +56,9 @@ module libdftbcore
   public :: dftbcore_get_dm_dense, dftbcore_get_h_dense, dftbcore_get_s_dense
   public :: dftbcore_get_energy
   public :: dftbcore_get_eigvecs_dense
+  public :: dftbcore_get_cplx_dims, dftbcore_get_kpoints
+  public :: dftbcore_get_h_cplx, dftbcore_get_s_cplx, dftbcore_get_dm_cplx
+  public :: dftbcore_get_eigvecs_cplx
 
 contains
 
@@ -72,24 +79,34 @@ contains
     character(c_char), intent(in) :: inputFile(*)
     character(c_char), intent(in), optional :: outputFile(*)
     character(256) :: hsdPath
-    integer :: iErr
-    
+    type(fnode), pointer :: hsdTree
+    type(TParserFlags) :: parserFlags
+    logical :: tExist
+
     print *, '[DFTBcore] Initializing DFTB+...'
-    
+
     ! Convert C string to Fortran
     call c_to_f_string(inputFile, hsdPath)
     print *, '[DFTBcore] Input file: ', trim(hsdPath)
-    
+
     ! Initialize global environment (MPI, etc.)
     call initGlobalEnv()
-    
+
     ! Allocate state
     allocate(env)
     allocate(input)
     allocate(main)
-    
-    ! Parse HSD input
-    call parseHsdInput(input)
+
+    ! Parse the HSD input file given by the caller
+    inquire(file=trim(hsdPath), exist=tExist)
+    if (.not. tExist) then
+      print *, '[DFTBcore] ERROR: input file not found: ', trim(hsdPath)
+      error stop
+    end if
+    call readHsdFile(trim(hsdPath), hsdTree)
+    call parseHsdTree(hsdTree, input, parserFlags)
+    call doPostParseJobs(hsdTree, parserFlags)
+    call destroyNode(hsdTree)
     
     ! Initialize environment
     call TEnvironment_init(env)
@@ -186,6 +203,11 @@ contains
     ! Get basis size from the main object
     basisSize = main%nOrb
     
+    if (.not. main%tRealHS) then
+      print *, '[DFTBcore] Periodic k-point run: H(k)/S(k)/DM(k)/eigvecs stored as complex;'
+      print *, '[DFTBcore]   use dftbcore_get_*_cplx getters (dense real getters return zeros).'
+    end if
+
     ! Always extract eigenvectors (stored in hamiltonian_store during SCF via store_eigvecs)
     if (allocated(storedEigvecs))  deallocate(storedEigvecs)
     if (allocated(storedEigenvals)) deallocate(storedEigenvals)
@@ -294,6 +316,65 @@ contains
       dm = 0.0_dp; print *, '[DFTBcore] WARNING: DM not available'
     end if
   end subroutine
+
+  ! ---- Complex (k-point) getters for periodic systems ----
+  ! Slot index iKS = iK + (iSpin-1)*nKPoint, i.e. k-point index runs fastest.
+
+  !> Query dimensions of the complex (k-point) data store.
+  !> nks = 0 means no k-point data was stored (cluster or Gamma-only run).
+  subroutine dftbcore_get_cplx_dims(norb, nks, nkpts, nspin) &
+      & bind(c, name='dftbcore_get_cplx_dims')
+    integer(c_int), intent(out) :: norb, nks, nkpts, nspin
+    call get_cplx_store_dims(norb, nks)
+    if (allocated(main) .and. allocated(main%kPoint)) then
+      nkpts = main%nKPoint
+      nspin = main%nIndepSpin
+    else
+      nkpts = 0
+      nspin = 0
+    end if
+  end subroutine dftbcore_get_cplx_dims
+
+  !> K-points (in fractions of reciprocal lattice vectors) and their weights.
+  subroutine dftbcore_get_kpoints(kpts, weights, nk) bind(c, name='dftbcore_get_kpoints')
+    integer(c_int), value, intent(in) :: nk
+    real(c_double), intent(out) :: kpts(3, nk)
+    real(c_double), intent(out) :: weights(nk)
+    if (allocated(main) .and. allocated(main%kPoint)) then
+      kpts(:, 1:nk) = main%kPoint(:, 1:nk)
+      weights(1:nk) = main%kWeight(1:nk)
+    else
+      kpts = 0.0_dp
+      weights = 0.0_dp
+    end if
+  end subroutine dftbcore_get_kpoints
+
+  subroutine dftbcore_get_h_cplx(hbuf, norb, nks) bind(c, name='dftbcore_get_h_cplx')
+    integer(c_int), value, intent(in) :: norb, nks
+    complex(c_double_complex), intent(out) :: hbuf(norb, norb, nks)
+    call get_stored_hamiltonian_cplx(hbuf)
+  end subroutine dftbcore_get_h_cplx
+
+  subroutine dftbcore_get_s_cplx(sbuf, norb, nks) bind(c, name='dftbcore_get_s_cplx')
+    integer(c_int), value, intent(in) :: norb, nks
+    complex(c_double_complex), intent(out) :: sbuf(norb, norb, nks)
+    call get_stored_overlap_cplx(sbuf)
+  end subroutine dftbcore_get_s_cplx
+
+  subroutine dftbcore_get_dm_cplx(dbuf, norb, nks) bind(c, name='dftbcore_get_dm_cplx')
+    integer(c_int), value, intent(in) :: norb, nks
+    complex(c_double_complex), intent(out) :: dbuf(norb, norb, nks)
+    call get_stored_dm_cplx(dbuf)
+  end subroutine dftbcore_get_dm_cplx
+
+  !> Complex eigenvectors (columns are MOs) and real eigenvalues per (k, spin) slot.
+  subroutine dftbcore_get_eigvecs_cplx(cbuf, ebuf, norb, nks) &
+      & bind(c, name='dftbcore_get_eigvecs_cplx')
+    integer(c_int), value, intent(in) :: norb, nks
+    complex(c_double_complex), intent(out) :: cbuf(norb, norb, nks)
+    real(c_double), intent(out) :: ebuf(norb, nks)
+    call get_stored_eigvecs_cplx(cbuf, ebuf)
+  end subroutine dftbcore_get_eigvecs_cplx
 
   subroutine dftbcore_finalize() bind(c, name='dftbcore_finalize')
     print *, '[DFTBcore] Finalizing...'

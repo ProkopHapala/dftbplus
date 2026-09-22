@@ -42,7 +42,7 @@ Cargo.lock
 *.helper
 
 # Generated/scratch dirs — never commit, at any level (crate sanity)
-debug/
+#debug/
 work/
 waveplot_output/
 
@@ -51,3 +51,7 @@ tests/dftb/*.hsd
 tests/dftb/*.xyz
 tests/grid/*.hsd
 tests/grid/**/*_pin.hsd
+
+# *.png above hides plots from the editor; keep this output folder visible
+!debug/graphene_bloch/*.png
+!debug/ribbon_bloch/*.png

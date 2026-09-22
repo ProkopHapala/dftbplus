@@ -28,7 +28,9 @@ implementations of the same concept across Rust, Fortran, Python, and OpenCL.
   warm-start, best-effort mode. 1D/2D formic dimer scan validation. Analytic GPU
   forces in `qmqm/gpu_forces.rs`/`.cl` (1×4 crash fixed by `vload2`).
 - **wavefunction_projection.md** — projecting MOs onto a real-space grid using
-  pyBall OpenCL GridProjector + STO basis. Rust eigenvectors → 2D contour plots.
+  pyBall OpenCL + STO basis. Two packings: Γ-only Fireball order in `Grid.cl`,
+  and k-resolved DFTB+ order in `DFTBplusGrid.cl` (`project_bloch_points`).
+  User guide: `userguide/bloch_slice.md`.
 - **sk_interpolation.md** — SK radial interpolation. Production is C² cubic
   B-spline (CPU f64 reference, GPU f32). 2026-09-09: Neville `poly5_to_zero`
   tail removed (it exploded on H–H). Stopgap = blunt extra zero *samples* on

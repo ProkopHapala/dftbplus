@@ -793,12 +793,29 @@ f"""
 #   Orbital comparison plotting   #
 #############################
 
-def plot_2d_array(values, extent, atom_coords, title, output_path, dpi=150, cmap='viridis', symmetric=False):
+_ELEM_COLOR = {'H': '#f2f2f2', 'C': '#101010', 'N': '#3050e0', 'O': '#d01818'}
+
+
+def scatter_atoms(ax, coords, enames=None, s=14):
+    """Atom overlay. enames colors H/C/N/O; otherwise one black marker."""
+    coords = np.asarray(coords)
+    if coords.size == 0:
+        return
+    if enames is None:
+        ax.scatter(coords[:, 0], coords[:, 1], c='black', marker='.', s=s, alpha=0.7, zorder=10)
+        return
+    cols = [_ELEM_COLOR.get(e, '#888888') for e in enames]
+    ax.scatter(coords[:, 0], coords[:, 1], c=cols, edgecolors='white',
+               marker='o', s=s, linewidths=0.45, zorder=10)
+
+
+def plot_2d_array(values, extent, atom_coords, title, output_path, dpi=150, cmap='viridis', symmetric=False,
+                  enames=None, figsize=(8, 8)):
     """
     Plot a single 2D array (density or orbital) with atoms overlay.
     
     Args:
-        values: (nx, ny) array of values
+        values: (ny, nx) array. Row 0 is y = extent bottom (meshgrid indexing='xy', no transpose).
         extent: [xmin, xmax, ymin, ymax] for imshow
         atom_coords: (natoms, 3) array in Angstrom
         title: plot title
@@ -808,24 +825,128 @@ def plot_2d_array(values, extent, atom_coords, title, output_path, dpi=150, cmap
         symmetric: if True, set vmin=-vmax to center zero
     """
     import matplotlib.pyplot as plt
-    fig, ax = plt.subplots(figsize=(8, 8))
-    
+    fig, ax = plt.subplots(figsize=figsize)
+
     if symmetric:
         vmax = np.max(np.abs(values))
         vmin = -vmax
     else:
         vmin, vmax = None, None
-    
+
     im = ax.imshow(values, origin='lower', cmap=cmap, extent=extent, vmin=vmin, vmax=vmax)
     ax.set_title(title)
     plt.colorbar(im, ax=ax)
-    
-    # Add atoms
-    ax.scatter(atom_coords[:, 0], atom_coords[:, 1], c='black', marker='.', s=10, alpha=0.5, zorder=10)
-    
+    scatter_atoms(ax, atom_coords, enames, s=10 if enames is None else 14)
+    ax.set_aspect('equal')
+
     plt.tight_layout()
     plt.savefig(output_path, dpi=dpi)
     plt.close()
+
+
+def complex_to_rgb(psi):
+    """Hue = arg(ψ), brightness = |ψ| / max|ψ|. A node is black; a π phase flip is the opposite hue."""
+    from matplotlib.colors import hsv_to_rgb
+    psi = np.asarray(psi)
+    mag = np.abs(psi)
+    peak = float(mag.max()) if mag.size else 0.0
+    hue = (np.angle(psi) + np.pi) / (2.0 * np.pi)
+    val = mag / peak if peak > 0.0 else np.zeros_like(mag)
+    hsv = np.stack([hue, np.ones_like(hue), val], axis=-1)
+    return hsv_to_rgb(hsv)
+
+
+def plot_complex_hsv(psi, extent, atom_coords, title, output_path, dpi=150, enames=None, figsize=(8, 8)):
+    """Phase-colored orbital. psi is (ny, nx) complex, row 0 is y = extent bottom (no transpose)."""
+    import matplotlib.pyplot as plt
+    rgb = complex_to_rgb(psi)
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.imshow(rgb, origin='lower', extent=extent, interpolation='nearest')
+    if enames is None:
+        ax.scatter(atom_coords[:, 0], atom_coords[:, 1], c='white', edgecolors='black',
+                   marker='o', s=18, linewidths=0.4, zorder=10)
+    else:
+        scatter_atoms(ax, atom_coords, enames, s=16)
+    ax.set_title(title)
+    ax.set_xlabel('x [Å]')
+    ax.set_ylabel('y [Å]')
+    ax.set_aspect('equal')
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=dpi)
+    plt.close()
+
+
+def plot_ldos_row(panels, output_path, suptitle, dpi=140):
+    """One |ψ|² map per panel, each scaled to its own maximum.
+
+    panels: list of dicts with rho (ny, nx), extent, atoms (n, 3), enames, title.
+    rho row 0 is y = extent bottom.
+    """
+    import matplotlib.pyplot as plt
+    n = len(panels)
+    if n == 0:
+        raise ValueError('plot_ldos_row: no panels')
+    fig, axes = plt.subplots(1, n, figsize=(2.7 * n, 3.8), squeeze=False)
+    for ax, p in zip(axes[0], panels):
+        rho = np.asarray(p['rho'])
+        vmax = float(np.max(rho))
+        if not np.isfinite(vmax) or vmax <= 0.0:
+            raise RuntimeError(f"plot_ldos_row: empty map in '{p['title']}' max={vmax}")
+        ax.imshow(rho, origin='lower', cmap='viridis', extent=p['extent'], vmin=0.0, vmax=vmax)
+        scatter_atoms(ax, p['atoms'], p['enames'], s=8)
+        if p.get('marks') is not None and len(p['marks']):
+            m = np.asarray(p['marks'])
+            ax.plot(m[:, 0], m[:, 1], '+', color='lime', ms=5, mew=1.0, zorder=11)
+        ax.set_title(f"{p['title']}\nmax {vmax:.3g}", fontsize=8)
+        ax.set_aspect('equal')
+        ax.tick_params(labelsize=7)
+    fig.suptitle(suptitle, fontsize=11)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=dpi)
+    plt.close(fig)
+
+
+def plot_bands_and_maps(kdist, evals_ev, tick_pos, tick_labels, windows, extent, atom_coords,
+                        output_path, dpi=140):
+    """Band structure with energy windows, and one |ψ|² map per window.
+
+    evals_ev: (nk, nband) in eV, already ordered along kdist.
+    windows: list of dicts with keys elo, ehi, rho (ny, nx), nstate, color.
+    rho row 0 is y = extent bottom.
+    """
+    import matplotlib.pyplot as plt
+    nwin = len(windows)
+    fig = plt.figure(figsize=(3.4 * max(nwin, 2), 8.2))
+    gs = fig.add_gridspec(2, nwin, height_ratios=[1.0, 1.15], hspace=0.28, wspace=0.18)
+    axb = fig.add_subplot(gs[0, :])
+    for ib in range(evals_ev.shape[1]):
+        axb.plot(kdist, evals_ev[:, ib], color='0.15', lw=1.0)
+    for w in windows:
+        axb.axhspan(w['elo'], w['ehi'], color=w['color'], alpha=0.28, lw=0)
+    axb.set_xticks(tick_pos)
+    axb.set_xticklabels(tick_labels)
+    axb.set_xlim(kdist[0], kdist[-1])
+    axb.set_ylim(float(evals_ev.min()) - 1.5, float(evals_ev.max()) + 1.5)
+    axb.set_ylabel('E [eV]')
+    axb.set_title('graphene bands — each shaded interval has its own map')
+    for x in tick_pos:
+        axb.axvline(x, color='0.75', lw=0.6)
+    for iw, w in enumerate(windows):
+        ax = fig.add_subplot(gs[1, iw])
+        peak = float(np.max(w['rho']))
+        ax.imshow(w['rho'], origin='lower', extent=extent, cmap='viridis',
+                  vmin=0.0, vmax=max(peak, 1e-12), interpolation='nearest')
+        ax.scatter(atom_coords[:, 0], atom_coords[:, 1], c='white', edgecolors='black',
+                   marker='o', s=8, linewidths=0.3, zorder=10)
+        ax.set_title(f"{w['elo']:.1f} … {w['ehi']:.1f} eV\n{w['nstate']} states,  max {peak:.3f}",
+                     color=w['color'], fontsize=9)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        for spine in ax.spines.values():
+            spine.set_color(w['color'])
+            spine.set_linewidth(2.0)
+    fig.savefig(output_path, dpi=dpi)
+    plt.close(fig)
 
 def plot_comparison_2d(wp_vals, ocl_vals, diff_vals, extent, title_prefix, plane_desc, 
                       method_tag, mo_indices, energies, homo, output_path, dpi=150, 

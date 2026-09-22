@@ -116,6 +116,9 @@ pub struct DftbCpu {
     pub eigenvectors: DMatrix<f64>,
     mixer: MixerKind,
     pub n_scc_iter: usize,
+    /// Per-iteration (H′, eigensolution) capture — populated only when
+    /// RUST_DFTB_SCC_TRACE is set; for warm-start benchmarking.
+    pub scc_trace: Vec<SccIterSnapshot>,
 
     // ─── Fermi smearing (B2: f64 CPU reference for the GPU path) ──────
     pub kT: f64,           // 0 = integer occupation
@@ -197,6 +200,18 @@ impl SystemContextStatic {
             pair_tables: self.pair_tables.iter().collect(),
         }
     }
+}
+
+/// One captured SCC iteration (RUST_DFTB_SCC_TRACE): the matrix actually
+/// diagonalized and its exact eigensolution, all in the orthonormal
+/// Cholesky basis (H′ = L⁻¹HL⁻ᵀ, Y = eigenvectors of H′). The exact
+/// projector is K = Y[:, :nocc]·Y[:, :nocc]ᵀ (kT=0).
+pub struct SccIterSnapshot {
+    pub h_prime: DMatrix<f64>,
+    pub eigvals: DVector<f64>,
+    pub eigvecs: DMatrix<f64>,
+    /// Charge residual ‖q_out − q_in‖_rms measured AFTER this iteration.
+    pub rms: f64,
 }
 
 /// Result of a single SCC solve — what the caller needs for forces/energy.
@@ -335,6 +350,7 @@ impl DftbCpu {
             eigenvectors: DMatrix::zeros(n_orbs, n_orbs),
             mixer: MixerKind::Diis(DiisMixer::new(10, n_atoms)),
             n_scc_iter: 0,
+            scc_trace: Vec::new(),
             kT: 0.0,
             mu: 0.0,
             occ_w: vec![0.0; n_orbs],
@@ -552,6 +568,10 @@ impl DftbCpu {
         let mut t_mull = 0.0f64;
         let mut t_mix = 0.0f64;
 
+        // RUST_DFTB_SCC_TRACE: capture (H′, exact eigensolution) per
+        // iteration — the real warm-start trajectory for benchmarks.
+        let trace = std::env::var_os("RUST_DFTB_SCC_TRACE").is_some();
+
         for iter in 0..max_iter {
             let t0 = if timing {
                 Some(std::time::Instant::now())
@@ -735,6 +755,15 @@ impl DftbCpu {
             }
             let rms: f64 = (self.residual.iter().map(|x| x * x).sum::<f64>() / nat as f64).sqrt();
             self.n_scc_iter = iter + 1;
+
+            if trace {
+                self.scc_trace.push(SccIterSnapshot {
+                    h_prime: self.h_prime.clone(),
+                    eigvals: self.eigenvalues.clone(),
+                    eigvecs: y_full.clone(),
+                    rms,
+                });
+            }
 
             if verbose {
                 eprintln!("    [scc] iter {:>3}  RMS={:.3e}", iter, rms);

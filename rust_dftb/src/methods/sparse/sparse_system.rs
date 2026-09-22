@@ -90,6 +90,12 @@ pub struct SparseSystemWorkspace {
     k: GpuBsrMatrix,      // K on M_K
     knew: GpuBsrMatrix,   // Knew scratch on M_K
     k_best: Buffer<f32>,  // best-K snapshot for TC2 plateau recovery
+    /// Accepted kernels at the previous two geometries (K₁, K₀). Same mask.
+    /// Warm_Geometry_DM.md. Allocated here; the step only copies values.
+    k_hist0: GpuBsrMatrix,
+    k_hist1: GpuBsrMatrix,
+    /// Checkpoint of K before one commutator or McWeeny trial.
+    k_ckpt: Buffer<f32>,
     q: GpuBsrMatrix,      // Q = T·K = KSK on M_K (TC2)
     a_zhz: GpuBsrMatrix,  // A = (Z·H)·Z restricted to M_K (K0)
     z_on_k: GpuBsrMatrix, // Z restricted to M_K (K0 axpby — R8b)
@@ -153,6 +159,13 @@ pub struct SparseSystemWorkspace {
     k_host: Vec<f32>,
     a_ht_host: Vec<f32>, // R_H download scratch (once per SCC)
     s_inf: f32,
+    /// Padded Gershgorin bounds from the last K0 build. The warm geometry
+    /// step reuses them for the DMM step length and must not call K0 again
+    /// (that overwrites the stored projector).
+    last_emin: f32,
+    last_emax: f32,
+    /// 0, 1, or 2 accepted kernels in `k_hist1` / `k_hist0`.
+    n_k_hist: u8,
 
     // ── System parameters ──
     nocc: f32,
@@ -429,6 +442,9 @@ impl SparseSystemWorkspace {
         let k = GpuBsrMatrix::zero(&gpu, &k_struct)?;
         let knew = GpuBsrMatrix::zero(&gpu, &k_struct)?;
         let k_best = gpu.zero_f32(k_struct.nblock * BS2)?; // best-K snapshot for TC2 plateau
+        let k_hist0 = GpuBsrMatrix::zero(&gpu, &k_struct)?;
+        let k_hist1 = GpuBsrMatrix::zero(&gpu, &k_struct)?;
+        let k_ckpt = gpu.zero_f32(k_struct.nblock * BS2)?;
                                                            // FF32-POLISH: lo parts of the float-float intermediates.
         let ff_t_lo = gpu.zero_f32(t_ks_struct.nblock * BS2)?;
         let ff_q_lo = gpu.zero_f32(k_struct.nblock * BS2)?;
@@ -626,6 +642,9 @@ impl SparseSystemWorkspace {
             k,
             knew,
             k_best,
+            k_hist0,
+            k_hist1,
+            k_ckpt,
             q,
             a_zhz,
             z_on_k,
@@ -664,6 +683,9 @@ impl SparseSystemWorkspace {
             k_host,
             a_ht_host,
             s_inf,
+            last_emin: f32::NAN,
+            last_emax: f32::NAN,
+            n_k_hist: 0,
             nocc,
             t_ks_valid: false,
             ktime_on: std::env::var("RUST_DFTB_KTIME")
@@ -2264,7 +2286,74 @@ impl SparseSystemWorkspace {
             &self.k.values,
         )?;
         self.t_ks_valid = false;
+        self.last_emin = emin;
+        self.last_emax = emax;
         Ok((emin, emax))
+    }
+
+    /// Spectral bounds cached by the last K0. The warm geometry step needs
+    /// them for η and must not rebuild K0.
+    pub fn spectral_bounds(&self) -> Result<(f32, f32)> {
+        if !self.last_emin.is_finite()
+            || !self.last_emax.is_finite()
+            || !(self.last_emax > self.last_emin)
+        {
+            return Err(DftbError::InvalidInput(format!(
+                "spectral_bounds: no cached (emin, emax) — cold K0 has not run (emin={} emax={})",
+                self.last_emin, self.last_emax
+            )));
+        }
+        Ok((self.last_emin, self.last_emax))
+    }
+
+    /// Tr(KS) for the current K. Rebuilds T when the last product is stale
+    /// (DMM clears `t_ks_valid` because it updates K after forming T).
+    pub fn trace_of_ks(&mut self) -> Result<f64> {
+        if !self.t_ks_valid {
+            self.spgemm_ks()?;
+            self.t_ks_valid = true;
+        }
+        self.gpu.trace_ks_f64(
+            &self.t_ks_struct,
+            &self.t_ks.values,
+            &self.n_orb_buf,
+            &self.trace_atom,
+            &mut self.trace_atom_host,
+        )
+    }
+
+    /// Put Tr(KS) back on Nocc. A finite commutator step is tangent to the
+    /// trace manifold only to first order; the truncated step creates or
+    /// destroys electrons. The scale is the same restore the TC2 guard uses.
+    /// Returns the remeasured trace. Fails if one step moved the trace by
+    /// more than one electron — that is not a truncation remainder.
+    pub fn restore_trace(&mut self) -> Result<f64> {
+        let nocc = self.nocc as f64;
+        let tr = self.trace_of_ks()?;
+        if !tr.is_finite() || tr <= 0.0 {
+            return Err(DftbError::InvalidInput(format!(
+                "restore_trace: Tr(KS)={tr} is not a positive electron count (Nocc={nocc})"
+            )));
+        }
+        if (tr - nocc).abs() > 1.0 {
+            return Err(DftbError::InvalidInput(format!(
+                "restore_trace: one update moved Tr(KS)={tr} by {:.3} e⁻ from Nocc={nocc} — not a remainder, the step left the manifold",
+                tr - nocc
+            )));
+        }
+        let alpha = (nocc / tr) as f32;
+        if (alpha as f64 - 1.0).abs() > 1e-7 {
+            self.gpu.scale_dev(self.k.struct_.nblock, alpha, &self.k.values)?;
+            self.gpu.scale_dev(self.t_ks.struct_.nblock, alpha, &self.t_ks.values)?;
+            self.t_ks_valid = true;
+        }
+        let tr2 = self.trace_of_ks()?;
+        if !tr2.is_finite() || (tr2 - nocc).abs() > 1e-2 {
+            return Err(DftbError::InvalidInput(format!(
+                "restore_trace: Tr {tr} scaled by {alpha} remeasured as {tr2}, Nocc={nocc}"
+            )));
+        }
+        Ok(tr2)
     }
 
     /// K₀ from H0. Returns (emin, emax) — the padded spectral bounds.
@@ -3988,6 +4077,7 @@ impl SparseSystemWorkspace {
             &self.k.values,
         )?;
         self.t_ks_valid = false;
+        self.gpu.prof_tick("mcw");
         Ok(())
     }
 
@@ -4043,6 +4133,73 @@ impl SparseSystemWorkspace {
             &mut self.reduce_tail_host,
         )?;
         Ok(((ri_sq.sqrt() as f32) / (ksq.sqrt() as f32).max(1e-30), tr))
+    }
+
+    pub fn n_k_hist(&self) -> u8 {
+        self.n_k_hist
+    }
+
+    /// Rotate the accepted kernel into the geometry history. Call only
+    /// after a successful solve. `k_hist0` ← previous `k_hist1`, `k_hist1` ← K.
+    pub fn commit_k_history(&mut self) -> Result<()> {
+        let n = self.k_struct.nblock * BS2;
+        if self.n_k_hist >= 1 {
+            self.gpu
+                .copy_f32(&self.k_hist1.values, &self.k_hist0.values, n)?;
+        }
+        self.gpu.copy_f32(&self.k.values, &self.k_hist1.values, n)?;
+        self.n_k_hist = (self.n_k_hist + 1).min(2);
+        Ok(())
+    }
+
+    /// `K ← 2 K₁ − K₀` on the common mask. False when only one geometry
+    /// has been accepted: K is left as K₁.
+    pub fn extrapolate_k_hist(&mut self) -> Result<bool> {
+        if self.n_k_hist < 2 {
+            return Ok(false);
+        }
+        let nb = self.k_struct.nblock;
+        self.gpu.axpby_dev(
+            nb,
+            2.0,
+            &self.k_hist1.values,
+            -1.0,
+            &self.k_hist0.values,
+            &self.k.values,
+        )?;
+        self.gpu
+            .symmetrize_dev(nb, &self.k_struct.transpose_block(), &self.k.values)?;
+        self.t_ks_valid = false;
+        Ok(true)
+    }
+
+    /// Discard a predictor and put the previous accepted kernel back.
+    pub fn load_k_hist1(&mut self) -> Result<()> {
+        if self.n_k_hist < 1 {
+            return Err(DftbError::InvalidInput(
+                "load_k_hist1: no accepted kernel yet".into(),
+            ));
+        }
+        let n = self.k_struct.nblock * BS2;
+        self.gpu.copy_f32(&self.k_hist1.values, &self.k.values, n)?;
+        self.t_ks_valid = false;
+        Ok(())
+    }
+
+    pub fn checkpoint_k(&mut self) -> Result<()> {
+        let n = self.k_struct.nblock * BS2;
+        self.gpu.copy_f32(&self.k.values, &self.k_ckpt, n)
+    }
+
+    pub fn restore_k(&mut self) -> Result<()> {
+        let n = self.k_struct.nblock * BS2;
+        self.gpu.copy_f32(&self.k_ckpt, &self.k.values, n)?;
+        self.t_ks_valid = false;
+        Ok(())
+    }
+
+    pub fn mark_k_stale(&mut self) {
+        self.t_ks_valid = false;
     }
 
     /// DMM/LNV commutator energy-descent (Phase G3 — the missing

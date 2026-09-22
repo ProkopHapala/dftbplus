@@ -212,3 +212,110 @@ __kernel void project_orbital_dftb(
         out_grid[g_idx] = psi;
     }
 }
+
+// ============================================================================
+// Bloch orbital / Tersoff-Hamann slice on an explicit list of points.
+// One work-item = one point.
+//
+// psi_s(r) = sum_{mu, cell n} C_s,mu * phi_mu(r - tau - R_n) * exp(-i * 2*pi * k_s · n)
+// rho(r)   = sum_s  weight_s * |psi_s(r)|^2
+//
+// C is the home-cell MO matrix from DFTBcore, packed [state, orb] as float2 (re, im).
+// A state is one (molecular orbital, k-point) pair. Orbital order per atom is the
+// DFTB+ order: s, then py, pz, px. Cell shifts n are fractional (integer) lattice indices;
+// cell_cart is the same shift in Angstrom. Phase sign matches waveplot (dot_product
+// conjugates exp(+ikr) down to exp(-ikr)).
+// ============================================================================
+inline float2 cmul(float2 a, float2 b) {
+    return (float2)(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
+}
+
+__kernel void project_bloch_points(
+    const int n_points,
+    __global const float4* points,
+    const int natoms,
+    __global const AtomData* atoms,
+    const int ncells,
+    __global const float4* cell_cart,
+    __global const float4* cell_n,
+    const int nstate,
+    const int norb,
+    __global const float2* coeffs,
+    __global const float4* k_weight,
+    __global const float* basis_data,
+    const int n_nodes,
+    const float dr_basis,
+    const int max_shells,
+    const int write_psi,
+    __global float* out_rho,
+    __global float2* out_psi
+) {
+    const int ip = get_global_id(0);
+    if (ip >= n_points) return;
+
+    const float3 p = points[ip].xyz;
+    const float TWOPI = 6.28318530718f;
+    float rho = 0.0f;
+
+    for (int ist = 0; ist < nstate; ++ist) {
+        const float4 kw = k_weight[ist];
+        const __global float2* cstate = coeffs + ist * norb;
+        float2 psi = (float2)(0.0f, 0.0f);
+
+        for (int ic = 0; ic < ncells; ++ic) {
+            const float th = TWOPI * dot(kw.xyz, cell_n[ic].xyz);
+            const float2 phase = (float2)(cos(th), -sin(th));
+            const float3 R = cell_cart[ic].xyz;
+
+            for (int ia = 0; ia < natoms; ++ia) {
+                const AtomData ad = atoms[ia];
+                const float3 dri = p - (ad.pos_rcut.xyz + R);
+                const float ri2 = dot(dri, dri);
+                const float rcut = ad.pos_rcut.w;
+                if (ri2 >= rcut * rcut) continue;
+                const float ri = sqrt(ri2);
+
+                const int i0 = ad.i0orb;
+                const int naorb = ad.norb;
+                int orb = i0;
+                int ish = 0;
+
+                if (naorb > 0) {
+                    const float Rs = evaluate_radial_sto(ri, ad.type, ish, basis_data, n_nodes, dr_basis, max_shells);
+                    const float Ys = real_spherical_harmonic(0, 0, dri, ri);
+                    const float2 cp = cmul(cstate[orb], phase);
+                    psi.x += cp.x * Rs * Ys;
+                    psi.y += cp.y * Rs * Ys;
+                    orb++;
+                    ish++;
+                }
+                if (naorb > 1) {
+                    const float Rp = evaluate_radial_sto(ri, ad.type, ish, basis_data, n_nodes, dr_basis, max_shells);
+                    const float Ypy = real_spherical_harmonic(1, -1, dri, ri);
+                    const float Ypz = real_spherical_harmonic(1,  0, dri, ri);
+                    const float Ypx = real_spherical_harmonic(1,  1, dri, ri);
+                    if (orb < i0 + naorb) {
+                        const float2 cp = cmul(cstate[orb], phase);
+                        psi.x += cp.x * Rp * Ypy;
+                        psi.y += cp.y * Rp * Ypy;
+                    }
+                    orb++;
+                    if (orb < i0 + naorb) {
+                        const float2 cp = cmul(cstate[orb], phase);
+                        psi.x += cp.x * Rp * Ypz;
+                        psi.y += cp.y * Rp * Ypz;
+                    }
+                    orb++;
+                    if (orb < i0 + naorb) {
+                        const float2 cp = cmul(cstate[orb], phase);
+                        psi.x += cp.x * Rp * Ypx;
+                        psi.y += cp.y * Rp * Ypx;
+                    }
+                }
+            }
+        }
+        rho += kw.w * (psi.x * psi.x + psi.y * psi.y);
+        if (write_psi) out_psi[ist * n_points + ip] = psi;
+    }
+    out_rho[ip] = rho;
+}

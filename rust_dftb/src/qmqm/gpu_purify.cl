@@ -50,6 +50,7 @@
 #define PURIFY_RTX 4
 #define PURIFY_RTY 8
 #define PURIFY_TK 8
+#define PURIFY_TILELOOP 0
 #endif
 #define PURIFY_WM (PURIFY_TY * PURIFY_RTY)
 #define PURIFY_WN (PURIFY_TX * PURIFY_RTX)
@@ -118,9 +119,11 @@ __kernel void tc2_init_batched(
     __global float*       D,      // [batch][n*n] — out: D0
     __global float*       traces, // [batch]      — out: Tr(D0)
     const int n,
-    const int batch)
+    const int batch,
+    __global const int* done)     // [batch] — 1 = skip (warm fallback keeps certified K)
 {
     const int sys = get_group_id(0);
+    if (done[sys]) return;
     const int lid = get_local_id(0);
     const int lsz = get_local_size(0);
     __global const float* h = H + (size_t)sys * n * n;
@@ -154,21 +157,25 @@ __kernel void tc2_init_batched(
 
 // ------------------------------------------------------------------
 // tc2_extrap_batched — trajectory-extrapolation warm seed (XL-BOMD /
-// Niklasson):  Out = 2·K1 − K2, where K1,K2 are the converged
-// projectors of the previous two SCC iterations. A converged projector
-// is a HARD fixed point of the TC2 map (K²=K — polynomials never
-// rotate the subspace), so re-purifying K1 is a no-op, and the Palser-
-// delta shift K1+(D0'−D0) drifts to a wrong-but-idempotent subspace
-// (measured: ‖HK−KH‖=0.24 at "convergence"). The difference K1−K2
-// carries the ACTUAL occupied-subspace motion — a first-order rotation
-// — and vanishes at the SCC fixed point → no residual floor.
-// Gershgorin guard: if the extrapolated spectrum escapes [0,1] the seed
-// is renormalized (eigenvectors/ordering preserved), else identity.
+// Niklasson):  Out = K1 + γ·(K1 − K2), where K1,K2 are the converged
+// projectors of the previous two iterations. A converged projector is a
+// HARD fixed point of any polynomial map (it never rotates the
+// subspace), so re-purifying K1 is a no-op — but the difference K1−K2
+// carries the ACTUAL occupied-subspace motion: for a small rotation
+// K2 = e^R·K1·e^{-R} ≈ K1+[R,K1], the seed K1−γ[R,K1] has eigenvectors
+// rotated by γR to first order. Follow with a McWeeny fold 3S²−2S³
+// (R'(0)=R'(1)=0 — kills the O(h²) radial overshoot, DR[tangent]=id
+// preserves the predicted rotation). NO Gershgorin renorm here: bounds
+// of a dense projector are ~[−4,5] even for an exact {0,1} spectrum, so
+// the old rescale always fired and destroyed the seed's near-
+// idempotency (mapped λ→0.44/0.56) — the measured "extrapolation
+// drift" was this bug + TC2 branch amplification, not the idea.
 // ------------------------------------------------------------------
 __kernel void tc2_extrap_batched(
     __global float*       Out, // [batch][n*n] — out: warm seed
     __global const float* H1,  // [batch][n*n] — latest converged projector
     __global const float* H2,  // [batch][n*n] — previous converged projector
+    const float           gamma, // extrapolation coefficient (1 = 2K1−K2)
     const int n,
     const int batch)
 {
@@ -178,33 +185,8 @@ __kernel void tc2_extrap_batched(
     __global float*       o  = Out + (size_t)sys * n * n;
     __global const float* h1 = H1  + (size_t)sys * n * n;
     __global const float* h2 = H2  + (size_t)sys * n * n;
-    __local float red[PURIFY_WG];
-
-    // Pass 1 — Gershgorin bounds of the extrapolated seed S = 2·K1 − K2.
-    // Extrapolation overshoot can push eigenvalues outside [0,1], where
-    // the TC2 branch map diverges (observed: Tr → −2e5 → NaN).
-    float rmax = -1.0e30f, rmin = 1.0e30f;
-    for (int i = lid; i < n; i += lsz) {
-        float s = 0.0f;
-        for (int j = 0; j < n; ++j)
-            s += fabs(2.0f * h1[i * n + j] - h2[i * n + j]);
-        const float dg = 2.0f * h1[i * n + i] - h2[i * n + i];
-        rmax = fmax(rmax, dg + (s - fabs(dg)));
-        rmin = fmin(rmin, dg - (s - fabs(dg)));
-    }
-    const float lmax = pur_reduce_max(red, rmax, lid, lsz);
-    const float lmin = pur_reduce_min(red, rmin, lid, lsz);
-    const bool renorm = (lmin < -0.02f) || (lmax > 1.02f);
-    const float inv = renorm ? 1.0f / fmax(lmax - lmin, 1.0e-30f) : 1.0f;
-    const float off = renorm ? lmin : 0.0f;
-
-    // Pass 2 — Out ← (S − off·I)·inv — affine map preserves eigenvectors
-    // and ordering → the tracked occupied subspace survives.
-    for (int idx = lid; idx < n * n; idx += lsz) {
-        const int i = idx / n;
-        const float v = 2.0f * h1[idx] - h2[idx];
-        o[idx] = (v - (i == idx - i * n ? off : 0.0f)) * inv;
-    }
+    for (int idx = lid; idx < n * n; idx += lsz)
+        o[idx] = h1[idx] + gamma * (h1[idx] - h2[idx]);
 }
 
 // ------------------------------------------------------------------
@@ -223,7 +205,12 @@ __kernel void tc2_step_batched(
     __global int*         done,     // in/out: per-system converged flag
     const float           tol,      // idempotency tolerance
     const int n,
-    const int batch)
+    const int batch,
+    const int             mirror_done) // 1 = copy Din→Dout for frozen systems
+                                       // (ping-pong parity); 0 = skip entirely —
+                                       // used when the caller guarantees an even
+                                       // step count so all results end on the
+                                       // same side (production warm fallback).
 {
     const int sys = get_group_id(0);
     const int lid = get_local_id(0);
@@ -241,11 +228,88 @@ __kernel void tc2_step_batched(
     // in f32 — dust eigenvalues regrow ×2/step under the wrong branch, so
     // iterating a converged system destroys it while others finish.
     if (done[sys]) {
-        for (int idx = lid; idx < n * n; idx += lsz) C[idx] = A[idx];
+        if (mirror_done) {
+            for (int idx = lid; idx < n * n; idx += lsz) C[idx] = A[idx];
+        }
         return;
     }
 
-#if PURIFY_GEMM == 2
+#if PURIFY_GEMM == 2 && PURIFY_TILELOOP
+    // n does not fit in one ≤1024-thread full-cover square (n=246 would
+    // be 1922 threads at the 4×8 micro-tile, and 961 threads at 8×8
+    // spills the register file: CL_OUT_OF_RESOURCES). Same 11×11 × 8×8
+    // tile as the warm GEMM: 121 threads, both operands staged, the
+    // workgroup walks 88×88 output tiles. T is written to C; the branch
+    // below reads it back.
+    __local float As_t[PURIFY_TK * PURIFY_WM];
+    __local float Bs[PURIFY_TK * PURIFY_WN];
+    const int tx = lid % PURIFY_TX;
+    const int ty = lid / PURIFY_TX;
+    for (int m0 = 0; m0 < n; m0 += PURIFY_WM) {
+        for (int n0 = 0; n0 < n; n0 += PURIFY_WN) {
+            float acc[PURIFY_RTY][PURIFY_RTX];
+            for (int i = 0; i < PURIFY_RTY; ++i)
+                for (int j = 0; j < PURIFY_RTX; ++j) acc[i][j] = 0.0f;
+            for (int k0 = 0; k0 < n; k0 += PURIFY_TK) {
+                for (int e = lid; e < PURIFY_TK * PURIFY_WM; e += lsz) {
+                    const int r = e / PURIFY_TK, kk = e - r * PURIFY_TK;
+                    const int gr = m0 + r, gk = k0 + kk;
+                    As_t[kk * PURIFY_WM + r] = (gr < n && gk < n) ? A[gr * n + gk] : 0.0f;
+                }
+                for (int e = lid; e < PURIFY_TK * PURIFY_WN; e += lsz) {
+                    const int kk = e / PURIFY_WN, c = e - kk * PURIFY_WN;
+                    const int gk = k0 + kk, gc = n0 + c;
+                    Bs[kk * PURIFY_WN + c] = (gk < n && gc < n) ? A[gk * n + gc] : 0.0f;
+                }
+                barrier(CLK_LOCAL_MEM_FENCE);
+                const int kend = min(PURIFY_TK, n - k0);
+                for (int kk = 0; kk < kend; ++kk) {
+#if PURIFY_RTY == 8
+                    const float8 av = vload8(0, &As_t[kk * PURIFY_WM + ty * PURIFY_RTY]);
+                    const float af[PURIFY_RTY] = {av.s0, av.s1, av.s2, av.s3,
+                                                  av.s4, av.s5, av.s6, av.s7};
+#elif PURIFY_RTY == 4
+                    const float4 av = vload4(0, &As_t[kk * PURIFY_WM + ty * PURIFY_RTY]);
+                    const float af[PURIFY_RTY] = {av.s0, av.s1, av.s2, av.s3};
+#else
+                    float af[PURIFY_RTY];
+                    for (int i = 0; i < PURIFY_RTY; ++i)
+                        af[i] = As_t[kk * PURIFY_WM + ty * PURIFY_RTY + i];
+#endif
+#if PURIFY_RTX == 8
+                    const float8 bv = vload8(0, &Bs[kk * PURIFY_WN + tx * PURIFY_RTX]);
+                    const float bf[PURIFY_RTX] = {bv.s0, bv.s1, bv.s2, bv.s3,
+                                                  bv.s4, bv.s5, bv.s6, bv.s7};
+#elif PURIFY_RTX == 4
+                    const float4 bv = vload4(0, &Bs[kk * PURIFY_WN + tx * PURIFY_RTX]);
+                    const float bf[PURIFY_RTX] = {bv.s0, bv.s1, bv.s2, bv.s3};
+#else
+                    float bf[PURIFY_RTX];
+                    for (int j = 0; j < PURIFY_RTX; ++j)
+                        bf[j] = Bs[kk * PURIFY_WN + tx * PURIFY_RTX + j];
+#endif
+                    for (int i = 0; i < PURIFY_RTY; ++i)
+                        for (int j = 0; j < PURIFY_RTX; ++j)
+                            acc[i][j] = fma(af[i], bf[j], acc[i][j]);
+                }
+                barrier(CLK_LOCAL_MEM_FENCE);
+            }
+            for (int i = 0; i < PURIFY_RTY; ++i) {
+                const int gi = m0 + ty * PURIFY_RTY + i;
+                if (gi < n) {
+                    for (int j = 0; j < PURIFY_RTX; ++j) {
+                        const int gj = n0 + tx * PURIFY_RTX + j;
+                        if (gj < n) {
+                            C[gi * n + gj] = acc[i][j];
+                            const float dd = acc[i][j] - A[gi * n + gj];
+                            er += dd * dd;
+                        }
+                    }
+                }
+            }
+        }
+    }
+#elif PURIFY_GEMM == 2
     // ---- register-tiled symmetric-square GEMM: T = D·D, D symmetric ----
     // Ported from gpu_gemm.cl gemm_regtile/GEMM_SQ (measured best
     // 22×11thr × 8×4regs = 88×88 tile, 6.7 TFLOPS at n=86/b400). One
@@ -376,7 +440,7 @@ __kernel void tc2_step_batched(
 
     const int contract = (l_trd > nocc[sys]);
     float trn = 0.0f;
-#if PURIFY_GEMM == 2
+#if PURIFY_GEMM == 2 && !PURIFY_TILELOOP
     // fused write — acc[] registers still hold T_ij; apply branch/freeze
     // here (no raw-T global round-trip).
     for (int i = 0; i < PURIFY_RTY; ++i) {
@@ -458,10 +522,11 @@ __kernel void dmm_update_batched(
     const float eta,             // η_scale (sparse used ≈8)
     const float cap,             // trust region: ‖δK‖_F ≤ cap per step
     const int n,
-    const int batch)
+    const int batch,
+    __global const int* pend)    // [batch] — 1 = still unconverged (0 = frozen)
 {
     const int sys = get_group_id(0);
-    if (sys >= batch) return;
+    if (sys >= batch || !pend[sys]) return;
     const int lid = get_local_id(0);
     const int lsz = get_local_size(0);
     __global float*       kg = K + (size_t)sys * n * n;
@@ -519,10 +584,11 @@ __kernel void mcweeny_combine_batched(
     __global const float* A,   // [batch][n*n] — K²
     __global const float* B,   // [batch][n*n] — K²·K
     const int n,
-    const int batch)
+    const int batch,
+    __global const int* pend) // [batch] — 1 = still unconverged (0 = frozen)
 {
     const int sys = get_group_id(0);
-    if (sys >= batch) return;
+    if (sys >= batch || !pend[sys]) return;
     const int lid = get_local_id(0);
     const int lsz = get_local_size(0);
     __global float*       kg = K + (size_t)sys * n * n;
@@ -969,7 +1035,11 @@ __kernel void comm_gate_batched(
     __global const float* T,   // [batch][n*n] — H′·K final
     __global float*       rh,  // [batch]      — out
     const int n,
-    const int batch)
+    const int batch,
+    __global int*         done, // [batch] — out: 1 = certified (rh < tol)
+    __global int*         pend, // [batch] — out: cleared on certification —
+                                //             the batched_gemm_active freeze mask
+    const float           tol)  // rh acceptance threshold
 {
     const int sys = get_group_id(0);
     if (sys >= batch) return;
@@ -988,7 +1058,14 @@ __kernel void comm_gate_batched(
     }
     na = pur_reduce(red, na, lid, lsz);
     nd = pur_reduce(red, nd, lid, lsz);
-    if (lid == 0) rh[sys] = sqrt(nd) / (2.0f * sqrt(na) + 1.0e-30f);
+    if (lid == 0) {
+        const float r = sqrt(nd) / (2.0f * sqrt(na) + 1.0e-30f);
+        rh[sys] = r;
+        // Unlatched write: a replica whose K regressed (or was rebuilt by
+        // the cold fallback since the last cert) must re-certify.
+        done[sys] = (r < tol) ? 1 : 0;
+        if (r < tol) pend[sys] = 0;
+    }
 }
 
 // ------------------------------------------------------------------
