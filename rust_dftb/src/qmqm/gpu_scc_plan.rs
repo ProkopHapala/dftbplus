@@ -77,7 +77,10 @@ fn eigen_render_source(n: usize) -> String {
         .replace("#define PPG 8", &format!("#define PPG {}", EIGEN_PPG))
         .replace(
             "#define MAX_SWEEPS 20",
-            &format!("#define MAX_SWEEPS {}", EIGEN_MAX_SWEEPS),
+            &format!(
+                "#define MAX_SWEEPS {}",
+                crate::qmqm::gpu_eigen::jacobi_sweeps(EIGEN_MAX_SWEEPS)
+            ),
         )
 }
 
@@ -4011,6 +4014,17 @@ impl GpuSccPlan {
             }
         }
         Ok(ok)
+    }
+
+    /// Last Jacobi record for replica 0: off, off/‖A‖, stop, sweeps.
+    /// The n≤64 full-local kernel does not write this record.
+    pub fn jacobi_diag0(&mut self, rt: &GpuRuntime) -> Result<Option<(f32, f32, f32, f32)>> {
+        if self.n <= 64 && !self.block_mode {
+            return Ok(None);
+        }
+        rt.read_buffer(&self.jacobi_diag, &mut self.jacobi_diag_h)?;
+        let h = &self.jacobi_diag_h;
+        Ok(Some((h[0], h[1], h[2], h[3])))
     }
 
     /// R5: read Jacobi stop diagnostics and report non-converged exits for

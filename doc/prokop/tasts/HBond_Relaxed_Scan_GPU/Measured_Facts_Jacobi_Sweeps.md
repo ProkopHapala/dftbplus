@@ -305,3 +305,56 @@ fill latency (the only occupancy that still matters), fewer/fatter
 rounds (impossible at element level — 43 disjoint pairs is already
 maximal), or the block-round / D&C restructure of the chat doc for n=246
 where pairs stream globally and rounds CAN be fused.
+
+## 9. Sweep cap on a production SCC — 2026-09-23
+
+Batch 1, one 0.02 Å step, cap on every Jacobi inside G0 and the geometry
+SCC. Reference is cap 40. Plot: `debug/dense_multi/jacobi_sweeps_accuracy.png`.
+
+| system | cap that matches cap 40 | what a tighter cap does |
+|---|---|---|
+| formic n=28 | 6 (0.0001 meV, 0.003% force) | cap 4 is 1.9 meV and 7% force; cap 1–3 miss the charge tolerance in 40 iterations and the energy is 0.2–39 eV off. Time does not fall. |
+| GC n=86 | 1 (0.001 meV, 0.001% force) | SCC stays 16 iterations. 6.1 ms vs 9.8 ms. The certificate flags cap 1–2 because an early iteration hit the cap; the mixer still lands on the cap-40 density. |
+| diazaphen n=120 | 2 (0.007 meV, 0.002% force) | cap 1 misses (24 iterations, +13 eV, 71% force) and is slower. |
+| DTH n=246 | 2 (0.02 meV, 0.001% force) | cap 1 misses (32 iterations, +14 eV, 32% force) and is slower (165 ms vs 117 ms). |
+
+The warm diagonalization already stops in the probe (recorded sweeps 0, off/‖A‖ ~1e-6). The 8 or 16 SCC iterations are 8 or 16 eigensolves, not 8 or 16 sweeps inside one eigensolve. Cutting the cap does not remove those iterations, and on formic a cap below 6 adds iterations. There is no purify-like speedup in this knob.
+
+### Cap 3, 12-step velocity Verlet (2026-09-23)
+
+Same kick, mass = 1, dt = 0.5, one SCC per step. Cap 3 is compared with cap 40 on the same trajectory. Forces are taken from the density the mixer left (the certificate park was cleared, otherwise a Failed step writes zero forces and the atoms do not move). Plot: `debug/dense_multi/jacobi_md_cap3.png`.
+
+| system | RMSD after 12 steps | ΔEtot at step 12 | charge residual |
+|---|---:|---:|---|
+| formic | 0.026 Å, still growing | 530 meV | usually 10⁻³–10⁻², not converged |
+| GC | 1.5×10⁻⁶ Å | 0.03 meV | stays ~10⁻⁶ after step 0 |
+| diazaphen | 1.7×10⁻⁶ Å | 0.05 meV | stays ~10⁻⁶ |
+| DTH | 1.8×10⁻⁶ Å | 0.05 meV | stays ~10⁻⁶ |
+
+Formic does not explode in 12 steps, but it is a different trajectory and the error is growing. The three larger molecules stay on the cap-40 trajectory. The Jacobi certificate still flags many of those steps (an early iteration hit the cap) even though the final charges and the motion match.
+
+### Cap 3, FIRE geometry optimization (2026-09-23)
+
+The question that matters is the minimum, not a few MD steps. FIRE from the same start, stop at max|F| < 5×10⁻⁴ Ha/Å. Plot: `debug/dense_multi/jacobi_relax.png`.
+
+| system | cap 40 | cap 3 |
+|---|---|---|
+| formic | 49 steps, \|F\|=4.7×10⁻⁴ | 80 steps, not stopped. \|F\| stays ~0.02. Final energy +130 meV, geometry 0.077 Å away. Charge residual does not stay at 10⁻⁶. |
+| GC | 59 steps, \|F\|=4.2×10⁻⁴ | same stop, ΔE +0.06 meV, RMSD 1.1×10⁻⁴ Å |
+| diazaphen | 65 steps, \|F\|=4.0×10⁻⁴ | same stop, ΔE −0.02 meV, RMSD 1.2×10⁻⁴ Å |
+| DTH | 37 steps, \|F\|=4.3×10⁻⁴ | same stop, ΔE +0.02 meV, RMSD 5×10⁻⁵ Å |
+
+GC, diazaphen, and DTH follow the cap-40 energy and force curves down to the same minimum. Formic at 3 sweeps does not.
+
+## 10. Resident workgroup, production SCC — started 2026-09-23
+
+Not a repeat of §1 (that was the streaming kernel at batch 400). This is `jacobi_resident_batched` inside a real geometry-step SCC, batch 64, the same 0.02 Å step. Energy and force match WG 512 at every size tried.
+
+| WG | GC n=86 | diazaphen n=120 |
+|---:|---:|---:|
+| 128 | 24.0 ms | 52.4 ms |
+| 256 | 12.8 ms | 33.8 ms |
+| 512 (current default) | 11.7 ms | 29.5 ms |
+| 1024 | **9.7 ms** | **24.4 ms** |
+
+1024 is 1.21× the default on both molecules, same direction as the streaming sweep. The production default is still 512. Not yet measured: batch 256/400 (where one WG of 1024 may crowd the SM), DTH’s block kernel, and the round schedule itself.

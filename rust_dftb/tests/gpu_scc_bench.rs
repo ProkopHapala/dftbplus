@@ -2719,3 +2719,497 @@ fn test_geom_shadow_perf() {
         );
     }
 }
+
+/// Accuracy of a Jacobi SCC when each diagonalization is capped at N sweeps.
+/// Reference is the same step with the cap at 40. Batch 1, the 0.02 Å step.
+/// G0 and the geometry step share the cap, so a small cap also weakens the
+/// orbital warm start.
+#[test]
+#[ignore]
+fn test_jacobi_sweep_cap() {
+    let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else {
+        eprintln!("Skipping: RUST_DFTB_SK_DIR not set");
+        return;
+    };
+    unsafe {
+        std::env::set_var("RUST_DFTB_SCC_QUIET", "1");
+        std::env::remove_var("RUST_DFTB_EIGSOLVER");
+    }
+    let caps: Vec<usize> = match std::env::var("RUST_DFTB_SWEEP_CAPS") {
+        Ok(s) if !s.is_empty() => s.split(',').map(|x| x.trim().parse::<usize>().unwrap_or_else(|_| panic!("bad sweep cap {x}"))).collect(),
+        _ => vec![40, 1, 2, 3, 4, 6, 8, 12, 20],
+    };
+    let want_env = std::env::var("RUST_DFTB_BENCH_SYSTEMS").unwrap_or_default();
+    let want: Vec<&str> = if want_env.is_empty() {
+        vec!["formic", "GC", "diazaphen", "DTH"]
+    } else {
+        want_env.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect()
+    };
+    let dir = "/home/prokop/git/dftbplus/debug/dense_multi";
+    std::fs::create_dir_all(dir).unwrap();
+    let path = format!("{dir}/jacobi_sweeps.csv");
+    let append = std::env::var("RUST_DFTB_SWEEP_APPEND").ok().as_deref() == Some("1");
+    let mut csv = std::fs::OpenOptions::new().create(true).append(append).truncate(!append).write(true).open(&path).unwrap();
+    if !append {
+        use std::io::Write;
+        writeln!(csv, "system,n,cap,scc_ms,scc_iters,failed,dE_meV,force_pct,sweeps,rel,stop").unwrap();
+    }
+    eprintln!("=== Jacobi sweep cap vs full cap 40. batch 1, 0.02 Å ===");
+    let started = std::time::Instant::now();
+    for sys in SCAN_SYSTEMS {
+        if !want.iter().any(|w| *w == sys.name) {
+            continue;
+        }
+        if started.elapsed().as_secs() > 50 {
+            eprintln!("sweep-cap budget: skip {}", sys.name);
+            break;
+        }
+        let xyz = xyz_file(sys.file);
+        let sp = xyz.species.clone();
+        let g0 = xyz.coords.clone();
+        let n_atoms = g0.len();
+        let sk = load_sk_for_species(&sk_dir, &sp).unwrap();
+        let mut unique: Vec<String> = Vec::new();
+        for s in &sp {
+            if !unique.contains(s) { unique.push(s.clone()); }
+        }
+        let repulsive = parse_all_repulsive(&sk_dir, &unique, unique.len()).unwrap();
+        let mut cpu = DftbCpu::new(sk.clone(), sp.clone()).unwrap();
+        cpu.update_geometry(&g0).unwrap();
+        cpu.reset_charges();
+        cpu.solve_scc(200, 1e-8).unwrap();
+        let scc0 = cpu.build_result();
+        let f0 = cpu.compute_forces(&scc0, &repulsive).unwrap();
+        let g1 = step_along_forces(&g0, &f0.forces, 0.02);
+
+        let mut e_ref = 0.0f64;
+        let mut f_ref: Vec<f32> = Vec::new();
+        for &cap in &caps {
+            if started.elapsed().as_secs() > 50 {
+                eprintln!("sweep-cap budget: stop {} before cap={cap}", sys.name);
+                break;
+            }
+            unsafe { std::env::set_var("RUST_DFTB_JACOBI_SWEEPS", cap.to_string()); }
+            let mut eng = GpuDftb::new(sk.clone(), &sk_dir, sp.clone(), g0.clone(), 1)
+                .unwrap_or_else(|e| panic!("cap {cap} {}: {e}", sys.name));
+            eng.set_smearing(0.0);
+            let g0s = eng.scc(40, 1e-6);
+            if let Err(e) = g0s {
+                eprintln!("  {} cap={cap} G0 failed: {e}", sys.name);
+                continue;
+            }
+            eng.set_coords_keep_k(&g1).unwrap();
+            let t0 = std::time::Instant::now();
+            let s = match eng.scc(40, 1e-6) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("  {} cap={cap} geometry SCC failed: {e}", sys.name);
+                    continue;
+                }
+            };
+            let ms = t0.elapsed().as_secs_f64() * 1e3;
+            let failed = s.statuses.iter().filter(|st| **st == SccStatus::Failed).count();
+            eng.unpark_for_measure().unwrap();
+            let ev = eng.eval(true).unwrap_or_else(|e| panic!("eval cap {cap}: {e}"));
+            let (sweeps, rel, stop) = match eng.plan.jacobi_diag0(&eng.rt).unwrap() {
+                Some((off, rel, stop, nsw)) => {
+                    if !off.is_finite() {
+                        panic!("{} cap={cap} Jacobi off={off} non-finite", sys.name);
+                    }
+                    (nsw, rel, stop)
+                }
+                None => (f32::NAN, f32::NAN, f32::NAN),
+            };
+            if cap == 40 {
+                e_ref = ev.energy[0];
+                f_ref = ev.forces.clone().unwrap();
+            }
+            if f_ref.is_empty() {
+                eprintln!("  {} cap={cap} skipped: reference cap 40 did not finish", sys.name);
+                continue;
+            }
+            let de = (ev.energy[0] - e_ref) * 27211.386;
+            let f = ev.forces.as_ref().unwrap();
+            let mut df = 0.0f64;
+            let mut fmax = 0.0f64;
+            let mut fgot = 0.0f64;
+            for i in 0..3 * n_atoms {
+                df = df.max((f[i] as f64 - f_ref[i] as f64).abs());
+                fmax = fmax.max((f_ref[i] as f64).abs());
+                fgot = fgot.max((f[i] as f64).abs());
+            }
+            let pct = 100.0 * df / fmax.max(1e-12);
+            eprintln!(
+                "  {} cap={cap}  SCC {ms:.1} ms  iters={}  failed={failed}  ΔE={de:+.4} meV  dF={pct:.3}%  |F|={fgot:.3e} |Fref|={fmax:.3e}  sweeps={sweeps:.0}  off/‖A‖={rel:.3e}  stop={stop:.0}",
+                sys.name, s.n_iters
+            );
+            use std::io::Write;
+            writeln!(
+                csv,
+                "{},{},{cap},{ms:.3},{},{failed},{de:.6},{pct:.6},{sweeps},{rel:.6e},{stop}",
+                sys.name, eng.n(), s.n_iters
+            ).unwrap();
+        }
+    }
+    unsafe { std::env::remove_var("RUST_DFTB_JACOBI_SWEEPS"); }
+}
+
+/// First Jacobi layout scan: resident-kernel workgroup size on a production
+/// SCC, not the old streaming kernel. GC n=86, batch 64, one 0.02 Å step.
+/// Reference is WG 512.
+#[test]
+#[ignore]
+fn test_jacobi_layout_wg() {
+    let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else {
+        eprintln!("Skipping: RUST_DFTB_SK_DIR not set");
+        return;
+    };
+    unsafe {
+        std::env::set_var("RUST_DFTB_SCC_QUIET", "1");
+        std::env::remove_var("RUST_DFTB_EIGSOLVER");
+        std::env::remove_var("RUST_DFTB_JACOBI_SWEEPS");
+    }
+    let name = std::env::var("RUST_DFTB_BENCH_SYSTEMS").unwrap_or_else(|_| "GC".into());
+    let sys = SCAN_SYSTEMS.iter().find(|s| s.name == name).unwrap_or_else(|| panic!("unknown system {name}"));
+    let xyz = xyz_file(sys.file);
+    let sp = xyz.species.clone();
+    let g0 = xyz.coords.clone();
+    let n_atoms = g0.len();
+    let sk = load_sk_for_species(&sk_dir, &sp).unwrap();
+    let mut unique: Vec<String> = Vec::new();
+    for s in &sp {
+        if !unique.contains(s) { unique.push(s.clone()); }
+    }
+    let repulsive = parse_all_repulsive(&sk_dir, &unique, unique.len()).unwrap();
+    let mut cpu = DftbCpu::new(sk.clone(), sp.clone()).unwrap();
+    cpu.update_geometry(&g0).unwrap();
+    cpu.reset_charges();
+    cpu.solve_scc(200, 1e-8).unwrap();
+    let scc0 = cpu.build_result();
+    let f0 = cpu.compute_forces(&scc0, &repulsive).unwrap();
+    let g1 = step_along_forces(&g0, &f0.forces, 0.02);
+    let batch = 64usize;
+    let g0b: Vec<[f64; 3]> = g0.iter().copied().cycle().take(batch * n_atoms).collect();
+    let g1b: Vec<[f64; 3]> = g1.iter().copied().cycle().take(batch * n_atoms).collect();
+    let wgs = [512usize, 128, 256, 1024];
+    let mut e_ref = 0.0f64;
+    let mut f_ref: Vec<f32> = Vec::new();
+    eprintln!("=== resident Jacobi WG scan. {} batch {batch}, 0.02 Å ===", sys.name);
+    let started = std::time::Instant::now();
+    for &wg in &wgs {
+        if started.elapsed().as_secs() > 45 {
+            eprintln!("layout budget: stop before WG={wg}");
+            break;
+        }
+        unsafe { std::env::set_var("RUST_DFTB_JACOBI_WG", wg.to_string()); }
+        let mut eng = match GpuDftb::new(sk.clone(), &sk_dir, sp.clone(), g0b.clone(), batch) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("  WG={wg}  build failed: {e}");
+                continue;
+            }
+        };
+        eng.set_smearing(0.0);
+        eng.scc(40, 1e-6).unwrap_or_else(|e| panic!("G0 WG {wg}: {e}"));
+        eng.set_coords_keep_k(&g1b).unwrap();
+        let t0 = std::time::Instant::now();
+        let s = eng.scc(40, 1e-6).unwrap_or_else(|e| panic!("SCC WG {wg}: {e}"));
+        let ms = t0.elapsed().as_secs_f64() * 1e3;
+        eng.unpark_for_measure().unwrap();
+        let ev = eng.eval(true).unwrap();
+        if wg == 512 {
+            e_ref = ev.energy[0];
+            f_ref = ev.forces.clone().unwrap();
+        }
+        let f = ev.forces.as_ref().unwrap();
+        let mut df = 0.0f64;
+        let mut fmax = 0.0f64;
+        for i in 0..3 * n_atoms {
+            df = df.max((f[i] as f64 - f_ref[i] as f64).abs());
+            fmax = fmax.max((f_ref[i] as f64).abs());
+        }
+        let pct = 100.0 * df / fmax.max(1e-12);
+        let de = (ev.energy[0] - e_ref) * 27211.386;
+        let failed = s.statuses.iter().filter(|st| **st == SccStatus::Failed).count();
+        eprintln!(
+            "  WG={wg}  SCC {ms:.1} ms  iters={}  failed={failed}  ΔE={de:+.4} meV  dF={pct:.4}%  {:.0} sys/s",
+            s.n_iters,
+            batch as f64 / (ms / 1e3)
+        );
+    }
+    unsafe { std::env::remove_var("RUST_DFTB_JACOBI_WG"); }
+}
+
+fn verlet_drift(xyz: &mut [[f64; 3]], v: &[[f64; 3]], f: &[f32], dt: f64) -> f64 {
+    const MAX_DISP: f64 = 0.1;
+    let mut max_d = 0.0f64;
+    for i in 0..xyz.len() {
+        let (fx, fy, fz) = (f[3 * i] as f64, f[3 * i + 1] as f64, f[3 * i + 2] as f64);
+        let mut dx = v[i][0] * dt + 0.5 * fx * dt * dt;
+        let mut dy = v[i][1] * dt + 0.5 * fy * dt * dt;
+        let mut dz = v[i][2] * dt + 0.5 * fz * dt * dt;
+        let d = (dx * dx + dy * dy + dz * dz).sqrt();
+        if d > MAX_DISP {
+            let s = MAX_DISP / d;
+            dx *= s;
+            dy *= s;
+            dz *= s;
+        }
+        xyz[i][0] += dx;
+        xyz[i][1] += dy;
+        xyz[i][2] += dz;
+        max_d = max_d.max(d.min(MAX_DISP));
+    }
+    max_d
+}
+
+fn kick(n: usize) -> Vec<[f64; 3]> {
+    (0..n)
+        .map(|i| {
+            let s = |k: usize| 0.008 * (((i * 3 + k) % 7) as f64 - 3.0);
+            [s(0), s(1), s(2)]
+        })
+        .collect()
+}
+
+/// Short velocity-Verlet BOMD at a Jacobi sweep cap. One SCC per step.
+/// Returns (E Ha, kinetic, max|F|, scc rms, failed count, coords) per frame,
+/// frame 0 being the start.
+fn bomd_frames(
+    eng: &mut GpuDftb,
+    xyz0: &[[f64; 3]],
+    n_steps: usize,
+    dt: f64,
+) -> Vec<(f64, f64, f64, f32, usize, Vec<[f64; 3]>)> {
+    let n = xyz0.len();
+    let mut xyz = xyz0.to_vec();
+    let mut vel = kick(n);
+    eng.set_coords_keep_k(&xyz).unwrap();
+    let s0 = eng.scc(40, 1e-6).unwrap_or_else(|e| panic!("BOMD G0: {e}"));
+    eng.unpark_for_measure().unwrap();
+    let ev0 = eng.eval(true).unwrap();
+    let mut acc = ev0.forces.unwrap();
+    let mut frames = Vec::with_capacity(n_steps + 1);
+    let failed0 = s0.statuses.iter().filter(|st| **st == SccStatus::Failed).count();
+    frames.push((ev0.energy[0], 0.0, 0.0, s0.rms, failed0, xyz.clone()));
+    for _ in 0..n_steps {
+        verlet_drift(&mut xyz, &vel, &acc, dt);
+        eng.set_coords_keep_k(&xyz).unwrap();
+        let s = eng.scc(40, 1e-6).unwrap_or_else(|e| panic!("BOMD SCC: {e}"));
+        eng.unpark_for_measure().unwrap();
+        let ev = eng.eval(true).unwrap();
+        let f = ev.forces.unwrap();
+        let mut ek = 0.0f64;
+        let mut max_f = 0.0f64;
+        for i in 0..n {
+            let a_new = [f[3 * i] as f64, f[3 * i + 1] as f64, f[3 * i + 2] as f64];
+            let a_old = [acc[3 * i] as f64, acc[3 * i + 1] as f64, acc[3 * i + 2] as f64];
+            for c in 0..3 {
+                vel[i][c] += 0.5 * (a_old[c] + a_new[c]) * dt;
+                ek += 0.5 * vel[i][c] * vel[i][c];
+                max_f = max_f.max(a_new[c].abs());
+            }
+        }
+        acc = f;
+        let failed = s.statuses.iter().filter(|st| **st == SccStatus::Failed).count();
+        frames.push((ev.energy[0], ek, max_f, s.rms, failed, xyz.clone()));
+    }
+    frames
+}
+
+/// 12-step velocity Verlet, sweep cap 3 against cap 40. Same kick, mass = 1.
+#[test]
+#[ignore]
+fn test_jacobi_sweep_md() {
+    let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else {
+        eprintln!("Skipping: RUST_DFTB_SK_DIR not set");
+        return;
+    };
+    unsafe {
+        std::env::set_var("RUST_DFTB_SCC_QUIET", "1");
+        std::env::remove_var("RUST_DFTB_EIGSOLVER");
+        std::env::remove_var("RUST_DFTB_JACOBI_WG");
+    }
+    let want = ["formic", "GC", "diazaphen", "DTH"];
+    let n_steps = 12usize;
+    let dt = 0.5f64;
+    let dir = "/home/prokop/git/dftbplus/debug/dense_multi";
+    std::fs::create_dir_all(dir).unwrap();
+    let path = format!("{dir}/jacobi_md.csv");
+    let mut csv = std::fs::File::create(&path).unwrap();
+    {
+        use std::io::Write;
+        writeln!(csv, "system,cap,step,E_Ha,ek,Etot,maxF,rms,failed,rmsd_A").unwrap();
+    }
+    eprintln!("=== BOMD {n_steps} steps dt={dt}, cap 3 vs cap 40 ===");
+    let started = std::time::Instant::now();
+    for sys in SCAN_SYSTEMS {
+        if !want.contains(&sys.name) {
+            continue;
+        }
+        if started.elapsed().as_secs() > 45 {
+            eprintln!("md budget: skip {}", sys.name);
+            break;
+        }
+        let xyz = xyz_file(sys.file);
+        let sp = xyz.species.clone();
+        let g0 = xyz.coords.clone();
+        let n_atoms = g0.len();
+        let sk = load_sk_for_species(&sk_dir, &sp).unwrap();
+        let mut ref_xyz: Vec<Vec<[f64; 3]>> = Vec::new();
+        for &cap in &[40usize, 3] {
+            if started.elapsed().as_secs() > 45 {
+                eprintln!("md budget: stop {} before cap={cap}", sys.name);
+                break;
+            }
+            unsafe { std::env::set_var("RUST_DFTB_JACOBI_SWEEPS", cap.to_string()); }
+            let mut eng = GpuDftb::new(sk.clone(), &sk_dir, sp.clone(), g0.clone(), 1)
+                .unwrap_or_else(|e| panic!("cap {cap} {}: {e}", sys.name));
+            eng.set_smearing(0.0);
+            let frames = bomd_frames(&mut eng, &g0, n_steps, dt);
+            if cap == 40 {
+                ref_xyz = frames.iter().map(|fr| fr.5.clone()).collect();
+            }
+            eprintln!("  {} cap={cap}", sys.name);
+            for (step, fr) in frames.iter().enumerate() {
+                let (e, ek, max_f, rms, failed, xyz) = fr;
+                let rmsd = if ref_xyz.len() == frames.len() {
+                    let mut s2 = 0.0f64;
+                    for i in 0..n_atoms {
+                        for c in 0..3 {
+                            let d = xyz[i][c] - ref_xyz[step][i][c];
+                            s2 += d * d;
+                        }
+                    }
+                    (s2 / n_atoms as f64).sqrt()
+                } else {
+                    f64::NAN
+                };
+                let etot = e + ek;
+                eprintln!(
+                    "    step {step:2}  E={e:.6}  Ek={ek:.6}  Etot={etot:.6}  max|F|={max_f:.3e}  rms={rms:.2e}  failed={failed}  rmsd={rmsd:.4e} Å"
+                );
+                use std::io::Write;
+                writeln!(csv, "{},{cap},{step},{e:.8},{ek:.8},{etot:.8},{max_f:.6e},{rms:.6e},{failed},{rmsd:.6e}", sys.name).unwrap();
+            }
+        }
+    }
+    unsafe { std::env::remove_var("RUST_DFTB_JACOBI_SWEEPS"); }
+}
+
+/// FIRE geometry optimization at a Jacobi sweep cap. Logs energy and max|F|
+/// at the geometry of each step. Stops at max|F| < 1e-3 Ha/Å or `max_steps`.
+/// The certificate park is cleared so a Failed flag does not zero the forces.
+fn fire_curve(eng: &mut GpuDftb, max_steps: usize, f_tol: f64) -> Vec<(f64, f64, f32, usize)> {
+    let mut curve = Vec::with_capacity(max_steps + 1);
+    for _ in 0..max_steps {
+        let s = eng.scc(40, 1e-6).unwrap_or_else(|e| panic!("FIRE SCC: {e}"));
+        eng.unpark_for_measure().unwrap();
+        let ev = eng.eval(true).unwrap();
+        let f = ev.forces.as_ref().unwrap();
+        let max_f = f.iter().fold(0.0f64, |m, &x| m.max((x as f64).abs()));
+        let failed = s.statuses.iter().filter(|st| **st == SccStatus::Failed).count();
+        curve.push((ev.energy[0], max_f, s.rms, failed));
+        if max_f < f_tol {
+            break;
+        }
+        eng.unpark_for_measure().unwrap();
+        eng.fire_step(0.0).unwrap_or_else(|e| panic!("FIRE step: {e}"));
+    }
+    curve
+}
+
+/// Geometry optimization, sweep cap 3 against cap 40. E and max|F| per FIRE step.
+#[test]
+#[ignore]
+fn test_jacobi_sweep_relax() {
+    let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else {
+        eprintln!("Skipping: RUST_DFTB_SK_DIR not set");
+        return;
+    };
+    unsafe {
+        std::env::set_var("RUST_DFTB_SCC_QUIET", "1");
+        std::env::remove_var("RUST_DFTB_EIGSOLVER");
+        std::env::remove_var("RUST_DFTB_JACOBI_WG");
+    }
+    let want_env = std::env::var("RUST_DFTB_BENCH_SYSTEMS").unwrap_or_default();
+    let want: Vec<&str> = if want_env.is_empty() {
+        vec!["formic", "GC", "diazaphen", "DTH"]
+    } else {
+        want_env.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect()
+    };
+    let max_steps = 80usize;
+    let f_tol = 5.0e-4f64;
+    let dir = "/home/prokop/git/dftbplus/debug/dense_multi";
+    std::fs::create_dir_all(dir).unwrap();
+    let path = format!("{dir}/jacobi_relax.csv");
+    let append = std::env::var("RUST_DFTB_SWEEP_APPEND").ok().as_deref() == Some("1");
+    let mut csv = std::fs::OpenOptions::new()
+        .create(true)
+        .append(append)
+        .truncate(!append)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    if !append {
+        use std::io::Write;
+        writeln!(csv, "system,cap,step,E_Ha,maxF,rms,failed").unwrap();
+    }
+    eprintln!("=== FIRE opt, cap 3 vs 40, stop at max|F|<{f_tol:.0e} or {max_steps} steps ===");
+    let started = std::time::Instant::now();
+    for sys in SCAN_SYSTEMS {
+        if !want.iter().any(|w| *w == sys.name) {
+            continue;
+        }
+        if started.elapsed().as_secs() > 50 {
+            eprintln!("relax budget: skip {}", sys.name);
+            break;
+        }
+        let xyz = xyz_file(sys.file);
+        let sp = xyz.species.clone();
+        let g0 = xyz.coords.clone();
+        let n_atoms = g0.len();
+        let sk = load_sk_for_species(&sk_dir, &sp).unwrap();
+        let mut xyz40: Vec<[f64; 3]> = Vec::new();
+        let mut e40 = 0.0f64;
+        for &cap in &[40usize, 3] {
+            if started.elapsed().as_secs() > 50 {
+                eprintln!("relax budget: stop {} before cap={cap}", sys.name);
+                break;
+            }
+            unsafe { std::env::set_var("RUST_DFTB_JACOBI_SWEEPS", cap.to_string()); }
+            let mut eng = GpuDftb::new(sk.clone(), &sk_dir, sp.clone(), g0.clone(), 1)
+                .unwrap_or_else(|e| panic!("cap {cap} {}: {e}", sys.name));
+            eng.set_smearing(0.0);
+            let curve = fire_curve(&mut eng, max_steps, f_tol);
+            eng.sync_coords_to_host().unwrap();
+            let xyz_end = eng.coords().to_vec();
+            if cap == 40 {
+                xyz40 = xyz_end.clone();
+                e40 = curve.last().map(|c| c.0).unwrap_or(f64::NAN);
+            }
+            let mut s2 = 0.0f64;
+            if xyz40.len() == n_atoms {
+                for i in 0..n_atoms {
+                    for c in 0..3 {
+                        let d = xyz_end[i][c] - xyz40[i][c];
+                        s2 += d * d;
+                    }
+                }
+            }
+            let rmsd = (s2 / n_atoms as f64).sqrt();
+            let (e, max_f, rms, failed) = curve.last().copied().unwrap();
+            let de = (e - e40) * 27211.386;
+            eprintln!(
+                "  {} cap={cap}  steps={}  E={e:.6}  ΔE={de:+.3} meV  max|F|={max_f:.3e}  rms={rms:.2e}  failed={failed}  rmsd={rmsd:.4e} Å",
+                sys.name,
+                curve.len()
+            );
+            use std::io::Write;
+            for (step, (e, max_f, rms, failed)) in curve.iter().enumerate() {
+                writeln!(csv, "{},{cap},{step},{e:.8},{max_f:.6e},{rms:.6e},{failed}", sys.name).unwrap();
+            }
+        }
+    }
+    unsafe { std::env::remove_var("RUST_DFTB_JACOBI_SWEEPS"); }
+}

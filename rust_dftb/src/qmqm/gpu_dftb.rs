@@ -2074,6 +2074,15 @@ impl GpuDftb {
         self.rt.write_buffer(&self.park, &v)
     }
 
+    /// Diagnostic only. `scc` parks a replica whose Jacobi certificate failed,
+    /// and the force kernels then write zeros. This clears that park so a
+    /// following `eval` reports the forces of the density the mixer left.
+    pub fn unpark_for_measure(&mut self) -> Result<()> {
+        self.scc_ok.fill(true);
+        self.sync_park()?;
+        self.plan.set_state_ok(&self.rt, &self.scc_ok)
+    }
+
     pub fn fire_step(&mut self, f_tol: f64) -> Result<f64> {
         // W6: N_MIN/F_INC/F_DEC/ALPHA_START/F_ALPHA/DT_MAX live in the
         // reduce tail on device (constants in gpu_forces.cl) — the host
