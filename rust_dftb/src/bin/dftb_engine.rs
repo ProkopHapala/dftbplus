@@ -1421,6 +1421,48 @@ fn rhai_sparse_new_budget(
     )
 }
 
+/// Last distance (Å) at which any H or S channel of a pair present in
+/// `name` still exceeds 1e-4. Read from the SK grids before any SCC.
+/// The kernel mask is not this number: K decays with the gap.
+fn rhai_sparse_hs_decay(name: &str, sk_dir: &str) -> f64 {
+    const THR: f64 = 1e-4;
+    let species: Vec<String> = with_state(|s| {
+        let st = s.geometries.get(name).unwrap_or_else(|| {
+            panic!("sparse_hs_decay '{name}': geometry not loaded")
+        });
+        let mut sp: Vec<String> = st.elements.iter().map(|e| e.symbol().to_string()).collect();
+        sp.sort();
+        sp.dedup();
+        sp
+    });
+    let sk = load_sk_for_species(sk_dir, &species).unwrap_or_else(|e| {
+        panic!("sparse_hs_decay '{name}' sk={sk_dir}: {e}")
+    });
+    let mut rows: Vec<(String, f64, f64)> = Vec::new();
+    for ((a, b), tab) in &sk.pairs {
+        if !species.iter().any(|s| s == a) || !species.iter().any(|s| s == b) {
+            continue;
+        }
+        let decay = tab.decay_radius_bohr(THR) / ANG2BOHR;
+        let end = tab.h.n_grid() as f64 * tab.h.dr / ANG2BOHR;
+        if !(decay > 0.0) {
+            panic!("sparse_hs_decay '{name}': {a}-{b} never exceeds {THR:e} — empty table?");
+        }
+        rows.push((format!("{a}-{b}"), decay, end));
+    }
+    if rows.is_empty() {
+        panic!("sparse_hs_decay '{name}': no SK pairs for {species:?} in {sk_dir}");
+    }
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+    let r_hs = rows.iter().fold(0.0_f64, |m, r| m.max(r.1));
+    eprintln!("[sparse] H/S decay |channel| > {THR:e}  (before SCC)");
+    for (pair, decay, end) in &rows {
+        eprintln!("  {pair:8} {decay:6.2} Å   table ends {end:6.2} Å");
+    }
+    eprintln!("  r_trunc = {r_hs:.2} Å  (longest pair; K/Z are not this radius)");
+    r_hs
+}
+
 /// `sparse_new_mask(name, sk, r_trunc, taper, r_k, r_z, r_skin, max_deg)`.
 /// `r_skin <= 0` keeps the config default. `max_deg <= 0` keeps the budgets.
 fn rhai_sparse_new_mask(
@@ -1459,6 +1501,14 @@ fn rhai_sparse_new_mask(
         cfg.max_deg_hs = Some(d);
         cfg.max_deg_k = Some(d);
         cfg.max_deg_z = Some(d);
+    }
+    // n≤64 otherwise builds a complete mask and ignores the radii. The
+    // nanoparticle jobs want the geometric H/S mask on a small molecule too.
+    if std::env::var("RUST_DFTB_FORCE_GEOM_MASK")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
+        cfg.full_mask = Some(false);
     }
     let eng = SparseDftb::with_config(sk, sk_dir, species, coords, cfg)
         .unwrap_or_else(|e| panic!("sparse_new '{name}' SparseDftb::with_config: {e}"));
@@ -2424,7 +2474,65 @@ fn rhai_sparse_vibrations(name: &str, h: f64, scc_tol: f64, path: &str) -> Strin
                 hess[c * n3 + r] = m;
             }
         }
+        // Covalent Hessian lives on the H/S pairs. Blocks between atoms that
+        // do not share an H/S pair are the long-range SCC electrostatic
+        // piece; this job drops them.
+        if env_on("RUST_DFTB_VIB_HSONLY") {
+            let mut keep = vec![false; n_atom * n_atom];
+            for i in 0..n_atom {
+                keep[i * n_atom + i] = true;
+            }
+            let mut n_pair = 0usize;
+            for p in eng.hs_pairs() {
+                let (i, j) = (p.0, p.1);
+                if !keep[i * n_atom + j] {
+                    n_pair += 1;
+                }
+                keep[i * n_atom + j] = true;
+                keep[j * n_atom + i] = true;
+            }
+            let mut n_drop = 0usize;
+            for i in 0..n_atom {
+                for j in 0..n_atom {
+                    if keep[i * n_atom + j] {
+                        continue;
+                    }
+                    n_drop += 1;
+                    for a in 0..3 {
+                        for b in 0..3 {
+                            hess[(3 * i + a) * n3 + (3 * j + b)] = 0.0;
+                        }
+                    }
+                }
+            }
+            eprintln!(
+                "[sparse] vibrations '{name}': H/S-only Hessian, kept {n_pair} pairs, zeroed {n_drop} atom-blocks"
+            );
+        }
+
         eprintln!("[sparse] vibrations '{name}': Hessian max asymmetry = {max_asym:.3e}");
+        // Cartesian Hessian actually diagonalized (Ha/Å², row-major), after
+        // symmetrization and the optional H/S-block drop.
+        if let Ok(hp) = std::env::var("RUST_DFTB_VIB_HESSOUT") {
+            use std::io::Write;
+            let f = std::fs::File::create(&hp)
+                .unwrap_or_else(|e| panic!("vibrations '{name}' Hessian create {hp}: {e}"));
+            let mut w = std::io::BufWriter::new(f);
+            writeln!(w, "# n3={n3} unit=Ha/Ang^2 row-major")
+                .unwrap_or_else(|e| panic!("vibrations '{name}' Hessian header {hp}: {e}"));
+            for r in 0..n3 {
+                for c in 0..n3 {
+                    if c > 0 {
+                        write!(w, " ").unwrap_or_else(|e| panic!("vibrations '{name}' Hessian {hp}: {e}"));
+                    }
+                    write!(w, "{:.6e}", hess[r * n3 + c])
+                        .unwrap_or_else(|e| panic!("vibrations '{name}' Hessian {hp}: {e}"));
+                }
+                writeln!(w).unwrap_or_else(|e| panic!("vibrations '{name}' Hessian {hp}: {e}"));
+            }
+            w.flush().unwrap_or_else(|e| panic!("vibrations '{name}' Hessian flush {hp}: {e}"));
+            eprintln!("[sparse] vibrations '{name}': Hessian written {hp}");
+        }
 
         // Mass-weight: M_ij = H_ij[E_h/Bohr²] / sqrt(m_i m_j), masses in amu.
         let inv: Vec<f64> = (0..n_atom)
@@ -3737,6 +3845,7 @@ fn main() {
     engine.register_fn("sparse_md_step", rhai_sparse_md_step);
     engine.register_fn("sparse_relax", rhai_sparse_relax);
     engine.register_fn("sparse_new_mask", rhai_sparse_new_mask);
+    engine.register_fn("sparse_hs_decay", rhai_sparse_hs_decay);
     engine.register_fn("sparse_geom_mode", rhai_sparse_geom_mode);
     engine.register_fn("sparse_fire_dt", rhai_sparse_fire_dt);
     engine.register_fn("sparse_jitter", rhai_sparse_jitter);

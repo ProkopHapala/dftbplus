@@ -156,8 +156,11 @@ pub struct SparseDftbConfig {
     pub tc2_tol: f32,
     /// `None` = full mask if n_atom ≤ 64, else geometric SK cutoff + `r_skin_ang`.
     pub full_mask: Option<bool>,
-    /// Verlet skin on the H/S mask (Å). Topology freezes at `new`; any atom
-    /// moving more than `r_skin_ang/2` from its build position fails loudly.
+    /// One-step Verlet margin on the H/S mask (Å). A FIRE step is capped at
+    /// 0.1 Å, and two atoms can close by twice that, so 0.2 Å is the margin
+    /// that covers one step. `set_coords` measures the displacement from the
+    /// previous accepted geometry and fails if any atom moved more than
+    /// `r_skin_ang/2`. The pair list itself stays the one built at `new`.
     pub r_skin_ang: f64,
     /// Density-kernel mask radius (Å, same convention as M_HS: this is the
     /// *mask radius*, not a physical cutoff). `None` = same as M_HS (full
@@ -937,6 +940,10 @@ impl SparseDftb {
     pub fn n_atom(&self) -> usize {
         self.n_atom
     }
+    /// Off-diagonal H/S pairs (i < j) of the frozen mask.
+    pub fn hs_pairs(&self) -> Vec<(usize, usize)> {
+        self.hs_pairs.iter().map(|p| (p.i as usize, p.j as usize)).collect()
+    }
     pub fn n_orbs(&self) -> usize {
         self.n_orbs
     }
@@ -1405,9 +1412,9 @@ impl SparseDftb {
                 )));
             }
         }
-        // Verlet-skin check (F2/R4): M_HS was built at coords_build with
-        // radius r_cut + skin. Any pair can newly enter the physical cutoff
-        // only if an atom moved > skin/2 relative to the build geometry.
+        // Verlet-skin check: one step may move an atom by at most skin/2
+        // from the previous accepted geometry. The pair list stays the one
+        // built at construction.
         // S1: the bound is on the EUCLIDEAN per-atom displacement — a
         // diagonal move has |ΔR| = √3·(max component), so checking the max
         // Cartesian component underestimates it by up to √3.
@@ -1510,6 +1517,9 @@ impl SparseDftb {
                 self.e_rep, self.n_atom
             );
         }
+        // One-step margin: the next call is measured from here, not from
+        // the geometry at which the pair list was built.
+        self.coords_build.copy_from_slice(&self.coords);
         self.z_valid = false;
         // S1 state contract: the stored energy/forces describe the OLD
         // geometry — no accepted state exists for the new one until scc()
@@ -1646,11 +1656,12 @@ impl SparseDftb {
         let geom_moved = !self.z_valid;
         self.geom_outcome = GeomOutcome::Cold;
         if geom_moved {
-            // One or two Newton updates of Z are the measured tier. A
-            // geometry step must not spend the cold ns_max=50 budget.
+            // A few Newton updates of Z. The cold path keeps ns_max (50).
+            // Four was not enough once a carbon particle had moved: R_Z was
+            // still 1.6e-4. Eight stays a geometry-step budget.
             let warm_step = self.z_warm && self.k_warm && !use_trs && !use_p;
             let (ns_max, ns_tol) = if warm_step {
-                (4usize, 1e-4)
+                (8usize, 1e-4)
             } else {
                 (self.cfg.ns_max, self.cfg.ns_tol)
             };

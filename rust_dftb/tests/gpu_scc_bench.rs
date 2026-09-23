@@ -1254,6 +1254,211 @@ fn test_gpu_bold_sweep() {
     }
 }
 
+/// Throughput of two Jacobi diagonalizations, the electronic cost of
+/// Niklasson's first-level shadow once the charge Jacobian is already known.
+/// Same batches and masked engine as the Jacobi sweep. Not a finite-difference
+/// Jacobian, and not the bold commutator.
+#[test]
+#[ignore]
+fn test_gpu_shadow_sweep() {
+    let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else {
+        eprintln!("Skipping: RUST_DFTB_SK_DIR not set");
+        return;
+    };
+    let bmax: usize = std::env::var("RUST_DFTB_SWEEP_BMAX").ok().and_then(|s| s.parse().ok()).unwrap_or(1024);
+    let batches: Vec<usize> = std::env::var("RUST_DFTB_SWEEP_BATCHES")
+        .ok()
+        .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).filter(|&b| b >= 1 && b <= bmax).collect())
+        .unwrap_or_else(|| vec![8, 16, 32, 64, 128, 256, 400, 512, 1024].into_iter().filter(|&b| b <= bmax).collect());
+    let only = std::env::var("RUST_DFTB_BENCH_SYSTEMS").unwrap_or_else(|_| "formic".into());
+    let sys = SCAN_SYSTEMS.iter().find(|s| s.name == only).unwrap_or_else(|| panic!("unknown system {only}"));
+    unsafe {
+        openblas_set_num_threads(1);
+        std::env::set_var("RUST_DFTB_SCC_QUIET", "1");
+        std::env::remove_var("RUST_DFTB_EIGSOLVER");
+    }
+    let xyz = xyz_file(sys.file);
+    let sp = xyz.species.clone();
+    let g0 = xyz.coords.clone();
+    let n_atoms = g0.len();
+    let sk = load_sk_for_species(&sk_dir, &sp).unwrap();
+    let mut unique: Vec<String> = Vec::new();
+    for s in &sp {
+        if !unique.contains(s) { unique.push(s.clone()); }
+    }
+    let repulsive = parse_all_repulsive(&sk_dir, &unique, unique.len()).unwrap();
+    let mut cpu = DftbCpu::new(sk.clone(), sp.clone()).unwrap();
+    cpu.update_geometry(&g0).unwrap();
+    cpu.reset_charges();
+    cpu.solve_scc(200, 1e-8).unwrap();
+    let scc = cpu.build_result();
+    let q_g0 = scc.charges.clone();
+    let forces = cpu.compute_forces(&scc, &repulsive).unwrap();
+    let g1 = step_along_forces(&g0, &forces.forces, 0.02);
+    let mut cpu_w = DftbCpu::new(sk.clone(), sp.clone()).unwrap();
+    cpu_w.update_geometry(&g1).unwrap();
+    cpu_w.set_charges(&q_g0);
+    cpu_w.solve_scc(200, 1e-8).unwrap();
+    let q_ref = cpu_w.charges.clone();
+    eprintln!("=== shadow sweep {} bmax={bmax} batches={batches:?} (2 Jacobi, Jacobian known) ===", sys.name);
+    let mut eng = GpuDftb::new(sk.clone(), &sk_dir, sp.clone(), replicate(&g0, bmax), bmax)
+        .unwrap_or_else(|e| panic!("new: {e}"));
+    eng.set_smearing(0.0);
+    eng.scc(100, 1e-6).unwrap_or_else(|e| panic!("G0: {e}"));
+    eng.set_coords_keep_k(&replicate(&g1, bmax)).unwrap();
+    let mut q_carried = vec![0.0f32; bmax * n_atoms];
+    eng.rt.read_buffer(&eng.plan.q_gpu, &mut q_carried).unwrap();
+    let guess = eng.plan.capture_density(&eng.rt).unwrap();
+    let n_orbs = eng.n();
+    let started = std::time::Instant::now();
+    for &b in &batches {
+        if started.elapsed().as_secs() > 40 {
+            eprintln!("shadow sweep budget: stop before batch={b}");
+            break;
+        }
+        let mask: Vec<bool> = (0..bmax).map(|i| i < b).collect();
+        let mut samples = Vec::with_capacity(5);
+        let mut n_it = 0usize;
+        for _ in 0..5 {
+            eng.plan.restore_density(&eng.rt, &guess).unwrap();
+            eng.plan.reset_diis(&eng.rt).unwrap();
+            eng.set_charges(&q_carried).unwrap();
+            eng.rt.finish().unwrap();
+            let t0 = std::time::Instant::now();
+            let s = eng.scc_masked(2, 1e-12, &mask).unwrap_or_else(|e| panic!("shadow b={b}: {e}"));
+            eng.rt.finish().unwrap();
+            samples.push(t0.elapsed().as_secs_f64() * 1e3);
+            n_it = s.n_iters;
+        }
+        samples.sort_by(|a, c| a.partial_cmp(c).unwrap());
+        let ms = samples[2];
+        let dq = q_delta(&mut eng, &q_ref, n_atoms);
+        csv_throughput(sys.name, n_orbs, b, "gpu shadow (2 Jacobi)", ms, n_it, 0, dq);
+    }
+}
+
+/// Throughput of six DIIS passes of one commutator, with a second
+/// commutator on the same H when R_H > 0.3 × the charge rms. Jacobi rows
+/// are already in throughput.csv. One system per process
+/// (`RUST_DFTB_BENCH_SYSTEMS`).
+#[test]
+#[ignore]
+fn test_gpu_bold_diis_sweep() {
+    let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else {
+        eprintln!("Skipping: RUST_DFTB_SK_DIR not set");
+        return;
+    };
+    let bmax: usize = std::env::var("RUST_DFTB_SWEEP_BMAX").ok().and_then(|s| s.parse().ok()).unwrap_or(1024);
+    let batches: Vec<usize> = std::env::var("RUST_DFTB_SWEEP_BATCHES")
+        .ok()
+        .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).filter(|&b| b >= 1 && b <= bmax).collect())
+        .unwrap_or_else(|| vec![8, 16, 32, 64, 128, 256, 512, 1024].into_iter().filter(|&b| b <= bmax).collect());
+    let only = std::env::var("RUST_DFTB_BENCH_SYSTEMS").unwrap_or_else(|_| "formic".into());
+    let sys = SCAN_SYSTEMS.iter().find(|s| s.name == only).unwrap_or_else(|| panic!("unknown system {only}"));
+    let passes = 6usize;
+    unsafe {
+        openblas_set_num_threads(1);
+        std::env::set_var("RUST_DFTB_SCC_QUIET", "1");
+        std::env::set_var("RUST_DFTB_EIGSOLVER", "purify");
+    }
+    let xyz = xyz_file(sys.file);
+    let sp = xyz.species.clone();
+    let g0 = xyz.coords.clone();
+    let n_atoms = g0.len();
+    let sk = load_sk_for_species(&sk_dir, &sp).unwrap();
+    let mut unique: Vec<String> = Vec::new();
+    for s in &sp {
+        if !unique.contains(s) { unique.push(s.clone()); }
+    }
+    let repulsive = parse_all_repulsive(&sk_dir, &unique, unique.len()).unwrap();
+    let mut cpu = DftbCpu::new(sk.clone(), sp.clone()).unwrap();
+    cpu.update_geometry(&g0).unwrap();
+    cpu.reset_charges();
+    cpu.solve_scc(200, 1e-8).unwrap();
+    let scc = cpu.build_result();
+    let q_g0 = scc.charges.clone();
+    let forces = cpu.compute_forces(&scc, &repulsive).unwrap();
+    let g1 = step_along_forces(&g0, &forces.forces, 0.02);
+    let mut cpu_w = DftbCpu::new(sk.clone(), sp.clone()).unwrap();
+    cpu_w.update_geometry(&g1).unwrap();
+    cpu_w.set_charges(&q_g0);
+    cpu_w.solve_scc(200, 1e-8).unwrap();
+    let q_ref = cpu_w.charges.clone();
+    eprintln!("=== bold+DIIS sweep {} bmax={bmax} passes={passes} batches={batches:?} ===", sys.name);
+    let mut eng = GpuDftb::new(sk.clone(), &sk_dir, sp.clone(), replicate(&g0, bmax), bmax)
+        .unwrap_or_else(|e| panic!("new: {e}"));
+    eng.set_smearing(0.0);
+    let t_g0 = std::time::Instant::now();
+    eng.scc(100, 1e-6).unwrap_or_else(|e| panic!("G0: {e}"));
+    eprintln!("  G0 {:.1} ms", t_g0.elapsed().as_secs_f64() * 1e3);
+    eng.set_coords_keep_k(&replicate(&g1, bmax)).unwrap();
+    let guess = eng.plan.capture_density(&eng.rt).unwrap();
+    let n_orbs = eng.n();
+    let started = std::time::Instant::now();
+    for &b in &batches {
+        if started.elapsed().as_secs() > 35 {
+            eprintln!("diis sweep budget: stop before batch={b}");
+            break;
+        }
+        let ids: Vec<i32> = (0..b as i32).collect();
+        let mut samples = Vec::with_capacity(3);
+        let mut q_new = Vec::new();
+        let mut comm = 0usize;
+        let mut q_in = vec![0.0f32; n_atoms];
+        let mut q_out = vec![0.0f32; n_atoms];
+        for _ in 0..3 {
+            eng.plan.restore_density(&eng.rt, &guess).unwrap();
+            eng.plan.set_work_domain(&eng.rt, &ids).unwrap();
+            eng.plan.reset_diis(&eng.rt).unwrap();
+            eng.plan.activate_all(&eng.rt).unwrap();
+            eng.rt.finish().unwrap();
+            let t0 = std::time::Instant::now();
+            let mut n_comm = 0usize;
+            for _p in 0..passes {
+                let (_rh0, mut rh, _tr, _eta, n_acc) = eng.plan.geom_bold_dmm_capped(&mut eng.rt, 1)
+                    .unwrap_or_else(|e| panic!("{} b={b}: {e}", sys.name));
+                n_comm += 1;
+                if n_acc < 1 {
+                    break;
+                }
+                eng.rt.read_buffer(&eng.plan.q_gpu, &mut q_in).unwrap();
+                eng.rt.read_buffer(&eng.plan.q_new, &mut q_out).unwrap();
+                let mut acc = 0.0f64;
+                for a in 0..n_atoms {
+                    let d = q_out[a] as f64 - q_in[a] as f64;
+                    acc += d * d;
+                }
+                let rms_q = (acc / n_atoms as f64).sqrt() as f32;
+                if rh > 0.3 * rms_q.max(1e-8) {
+                    let (_a, rh2, _b2, _c, n2) = eng.plan.geom_bold_dmm_capped(&mut eng.rt, 1)
+                        .unwrap_or_else(|e| panic!("{} extra b={b}: {e}", sys.name));
+                    rh = rh2;
+                    n_comm += 1;
+                    if n2 < 1 {
+                        break;
+                    }
+                }
+                eng.plan.diis_on_qnew(&mut eng.rt).unwrap_or_else(|e| panic!("diis b={b}: {e}"));
+                let _ = rh;
+            }
+            eng.rt.finish().unwrap();
+            samples.push(t0.elapsed().as_secs_f64() * 1e3);
+            comm = n_comm;
+            q_new = eng.read_q_new().unwrap();
+        }
+        samples.sort_by(|a, c| a.partial_cmp(c).unwrap());
+        let ms = samples[1];
+        let mut dq = 0.0f64;
+        for a in 0..n_atoms {
+            dq = dq.max((q_new[a] as f64 - q_ref[a]).abs());
+        }
+        let rate = b as f64 / (ms * 1e-3);
+        eprintln!("  {} b={b}  {ms:.2} ms  {rate:.0} sys/s  comm={comm}  dq={dq:.3e}", sys.name);
+        eng.plan.restore_work_domain(&eng.rt).unwrap();
+        csv_throughput(sys.name, n_orbs, b, "gpu bold diis", ms, passes, 0, dq);
+    }
+}
+
 /// Fixed cap on accepted commutator steps, one Hamiltonian (the charges
 /// carried from the previous geometry). Batch 256. Each N is the same
 /// rotation stopped after N accepted steps, then one McWeeny.
@@ -1351,5 +1556,1166 @@ fn test_geom_bold_nacc() {
                 break;
             }
         }
+    }
+}
+
+/// One accepted commutator and one McWeeny, then the charges replace q
+/// and the next round rebuilds H. N is the number of such rounds.
+/// N = 1 is a single round on the carried Hamiltonian. A second round
+/// is kept only when it is closer to the Jacobi SCC than the first.
+#[test]
+#[ignore]
+fn test_geom_bold_coupled() {
+    let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else {
+        eprintln!("Skipping: RUST_DFTB_SK_DIR not set");
+        return;
+    };
+    unsafe { std::env::set_var("RUST_DFTB_SCC_QUIET", "1"); }
+    let batch = 256usize;
+    let want = ["formic", "GC", "diazaphen", "DTH"];
+    eprintln!("=== coupled bold, batch {batch}: ONE commutator + McWeeny per round; between rounds q ← q + 0.5 (q_new − q) ===");
+    let started = std::time::Instant::now();
+    for sys in SCAN_SYSTEMS {
+        if !want.contains(&sys.name) {
+            continue;
+        }
+        if started.elapsed().as_secs() > 45 {
+            eprintln!("coupled budget: skip {}", sys.name);
+            break;
+        }
+        let xyz = xyz_file(sys.file);
+        let sp = xyz.species.clone();
+        let g0 = xyz.coords.clone();
+        let n_atoms = g0.len();
+        let sk = load_sk_for_species(&sk_dir, &sp).unwrap();
+        let mut unique: Vec<String> = Vec::new();
+        for s in &sp {
+            if !unique.contains(s) { unique.push(s.clone()); }
+        }
+        let repulsive = parse_all_repulsive(&sk_dir, &unique, unique.len()).unwrap();
+        let mut cpu = DftbCpu::new(sk.clone(), sp.clone()).unwrap();
+        cpu.update_geometry(&g0).unwrap();
+        cpu.reset_charges();
+        cpu.solve_scc(200, 1e-8).unwrap();
+        let scc = cpu.build_result();
+        let forces = cpu.compute_forces(&scc, &repulsive).unwrap();
+        let g1 = step_along_forces(&g0, &forces.forces, 0.02);
+        let g1b = replicate(&g1, batch);
+
+        unsafe { std::env::remove_var("RUST_DFTB_EIGSOLVER") };
+        let mut jac = GpuDftb::new(sk.clone(), &sk_dir, sp.clone(), replicate(&g0, batch), batch)
+            .unwrap_or_else(|e| panic!("jacobi {}: {e}", sys.name));
+        jac.set_smearing(0.0);
+        jac.scc(100, 1e-6).unwrap_or_else(|e| panic!("jacobi G0 {}: {e}", sys.name));
+        jac.set_coords(&g1b).unwrap();
+        jac.scc(100, 1e-6).unwrap_or_else(|e| panic!("jacobi SCC {}: {e}", sys.name));
+        let ev_j = jac.eval(true).unwrap_or_else(|e| panic!("jacobi eval {}: {e}", sys.name));
+        let q_scc = jac.read_q_new().unwrap();
+        let e_scc = ev_j.energy[0];
+        let f_scc = ev_j.forces.unwrap();
+        drop(jac);
+
+        unsafe { std::env::set_var("RUST_DFTB_EIGSOLVER", "purify") };
+        let mut eng = GpuDftb::new(sk.clone(), &sk_dir, sp.clone(), replicate(&g0, batch), batch)
+            .unwrap_or_else(|e| panic!("purify {}: {e}", sys.name));
+        eng.set_smearing(0.0);
+        eng.scc(100, 1e-6).unwrap_or_else(|e| panic!("purify G0 {}: {e}", sys.name));
+        eng.set_coords_keep_k(&g1b).unwrap();
+        let guess = eng.plan.capture_density(&eng.rt).unwrap();
+        for n in 1..=4 {
+            eng.plan.restore_density(&eng.rt, &guess).unwrap();
+            let mut rh = 0.0f32;
+            let mut tr = 0.0f32;
+            let mut eta = 0.0f32;
+            let mut stopped = false;
+            for round in 1..=n {
+                let (_rh0, rh1, tr1, eta1, n_acc) =
+                    eng.geom_bold_capped(1).unwrap_or_else(|e| panic!("{} round {round}: {e}", sys.name));
+                rh = rh1;
+                tr = tr1;
+                eta = eta1;
+                if n_acc < 1 {
+                    stopped = true;
+                    break;
+                }
+                if round < n {
+                    eng.mix_mulliken(0.5).unwrap();
+                }
+            }
+            let q_new = eng.read_q_new().unwrap();
+            let mut dq_scc = 0.0f64;
+            for a in 0..n_atoms {
+                dq_scc = dq_scc.max((q_new[a] as f64 - q_scc[a] as f64).abs());
+            }
+            eng.stage_mulliken().unwrap();
+            let ev = eng.eval(true).unwrap_or_else(|e| panic!("eval N={n}: {e}"));
+            let de_mev = (ev.energy[0] - e_scc) * 27211.386;
+            let f = ev.forces.as_ref().unwrap();
+            let mut df = 0.0f64;
+            let mut fmax = 0.0f64;
+            for i in 0..3 * n_atoms {
+                df = df.max((f[i] as f64 - f_scc[i] as f64).abs());
+                fmax = fmax.max(f_scc[i].abs() as f64);
+            }
+            let pct = 100.0 * df / fmax.max(1e-12);
+            eprintln!(
+                "  {}  rounds={n}  η={eta:.3}  R_H={rh:.3e}  Tr={tr:.4}  dq_scc={dq_scc:.3e}  dE={de_mev:+.3} meV  dF={pct:.2}%",
+                sys.name
+            );
+            if stopped {
+                eprintln!("  {}  a round accepted nothing", sys.name);
+                break;
+            }
+        }
+    }
+}
+
+/// One accepted commutator + McWeeny, then the existing charge DIIS.
+/// The first pass falls back to α = 0.3; from the second pass the mixer
+/// is DIIS. Batch 256, against a Jacobi SCC.
+#[test]
+#[ignore]
+fn test_geom_bold_diis() {
+    let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else {
+        eprintln!("Skipping: RUST_DFTB_SK_DIR not set");
+        return;
+    };
+    unsafe { std::env::set_var("RUST_DFTB_SCC_QUIET", "1"); }
+    let batch = 256usize;
+    let want = ["formic", "GC", "diazaphen", "DTH"];
+    eprintln!("=== bold + charge DIIS, batch {batch}: one commutator + McWeeny, then DIIS; a second commutator on the same H when R_H > 0.3·rms ===");
+    let started = std::time::Instant::now();
+    for sys in SCAN_SYSTEMS {
+        if !want.contains(&sys.name) {
+            continue;
+        }
+        if started.elapsed().as_secs() > 45 {
+            eprintln!("diis budget: skip {}", sys.name);
+            break;
+        }
+        let xyz = xyz_file(sys.file);
+        let sp = xyz.species.clone();
+        let g0 = xyz.coords.clone();
+        let n_atoms = g0.len();
+        let sk = load_sk_for_species(&sk_dir, &sp).unwrap();
+        let mut unique: Vec<String> = Vec::new();
+        for s in &sp {
+            if !unique.contains(s) { unique.push(s.clone()); }
+        }
+        let repulsive = parse_all_repulsive(&sk_dir, &unique, unique.len()).unwrap();
+        let mut cpu = DftbCpu::new(sk.clone(), sp.clone()).unwrap();
+        cpu.update_geometry(&g0).unwrap();
+        cpu.reset_charges();
+        cpu.solve_scc(200, 1e-8).unwrap();
+        let scc = cpu.build_result();
+        let forces = cpu.compute_forces(&scc, &repulsive).unwrap();
+        let g1 = step_along_forces(&g0, &forces.forces, 0.02);
+        let g1b = replicate(&g1, batch);
+
+        unsafe { std::env::remove_var("RUST_DFTB_EIGSOLVER") };
+        let mut jac = GpuDftb::new(sk.clone(), &sk_dir, sp.clone(), replicate(&g0, batch), batch)
+            .unwrap_or_else(|e| panic!("jacobi {}: {e}", sys.name));
+        jac.set_smearing(0.0);
+        jac.scc(100, 1e-6).unwrap_or_else(|e| panic!("jacobi G0 {}: {e}", sys.name));
+        jac.set_coords(&g1b).unwrap();
+        jac.scc(100, 1e-6).unwrap_or_else(|e| panic!("jacobi SCC {}: {e}", sys.name));
+        let ev_j = jac.eval(true).unwrap_or_else(|e| panic!("jacobi eval {}: {e}", sys.name));
+        let q_scc = jac.read_q_new().unwrap();
+        let e_scc = ev_j.energy[0];
+        let f_scc = ev_j.forces.unwrap();
+        drop(jac);
+
+        unsafe { std::env::set_var("RUST_DFTB_EIGSOLVER", "purify") };
+        let mut eng = GpuDftb::new(sk.clone(), &sk_dir, sp.clone(), replicate(&g0, batch), batch)
+            .unwrap_or_else(|e| panic!("purify {}: {e}", sys.name));
+        eng.set_smearing(0.0);
+        eng.scc(100, 1e-6).unwrap_or_else(|e| panic!("purify G0 {}: {e}", sys.name));
+        eng.set_coords_keep_k(&g1b).unwrap();
+        let guess = eng.plan.capture_density(&eng.rt).unwrap();
+        for n in 1..=6 {
+            eng.plan.restore_density(&eng.rt, &guess).unwrap();
+            eng.plan.reset_diis(&eng.rt).unwrap();
+            let mut rh = 0.0f32;
+            let mut rms = 0.0f32;
+            let mut n_comm = 0usize;
+            let mut stopped = false;
+            for _pass in 1..=n {
+                let (_rh0, rh1, _tr, _eta, n_acc) =
+                    eng.geom_bold_capped(1).unwrap_or_else(|e| panic!("{} pass: {e}", sys.name));
+                rh = rh1;
+                n_comm += 1;
+                if n_acc < 1 {
+                    stopped = true;
+                    break;
+                }
+                let q_out = eng.read_q_new().unwrap();
+                let mut q_in = vec![0.0f32; n_atoms];
+                eng.rt.read_buffer(&eng.plan.q_gpu, &mut q_in).unwrap();
+                let mut acc = 0.0f64;
+                for a in 0..n_atoms {
+                    let d = q_out[a] as f64 - q_in[a] as f64;
+                    acc += d * d;
+                }
+                let rms_q = (acc / n_atoms as f64).sqrt() as f32;
+                if rh > 0.3 * rms_q.max(1e-8) {
+                    let (_a, rh2, _b, _c, n2) =
+                        eng.geom_bold_capped(1).unwrap_or_else(|e| panic!("{} extra: {e}", sys.name));
+                    rh = rh2;
+                    n_comm += 1;
+                    if n2 < 1 {
+                        stopped = true;
+                        break;
+                    }
+                }
+                rms = eng.plan.diis_on_qnew(&mut eng.rt).unwrap_or_else(|e| panic!("diis: {e}"));
+            }
+            let q_new = eng.read_q_new().unwrap();
+            let mut dq_scc = 0.0f64;
+            for a in 0..n_atoms {
+                dq_scc = dq_scc.max((q_new[a] as f64 - q_scc[a] as f64).abs());
+            }
+            eng.stage_mulliken().unwrap();
+            let ev = eng.eval(true).unwrap_or_else(|e| panic!("eval N={n}: {e}"));
+            let de_mev = (ev.energy[0] - e_scc) * 27211.386;
+            let f = ev.forces.as_ref().unwrap();
+            let mut df = 0.0f64;
+            let mut fmax = 0.0f64;
+            for i in 0..3 * n_atoms {
+                df = df.max((f[i] as f64 - f_scc[i] as f64).abs());
+                fmax = fmax.max(f_scc[i].abs() as f64);
+            }
+            let pct = 100.0 * df / fmax.max(1e-12);
+            eprintln!(
+                "  {}  passes={n}  comm={n_comm}  rms={rms:.3e}  R_H={rh:.3e}  dq_scc={dq_scc:.3e}  dE={de_mev:+.3} meV  dF={pct:.2}%",
+                sys.name
+            );
+            if stopped {
+                eprintln!("  {}  a pass accepted nothing", sys.name);
+                break;
+            }
+        }
+    }
+}
+
+/// Two attempts to get the force down in fewer than six passes.
+/// `carry`: reuse the G0 DIIS history (the response from the previous
+/// geometry). `reject`: if a mix raises the residual, put the charges
+/// back, clear the history, and take α = 0.5 instead.
+#[test]
+#[ignore]
+fn test_geom_bold_diis_carry() {
+    let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else {
+        eprintln!("Skipping: RUST_DFTB_SK_DIR not set");
+        return;
+    };
+    unsafe { std::env::set_var("RUST_DFTB_SCC_QUIET", "1"); }
+    let batch = 256usize;
+    let want = ["formic", "GC", "diazaphen", "DTH"];
+    eprintln!("=== carry G0 DIIS history, and reject a mix that raises rms. batch {batch} ===");
+    let started = std::time::Instant::now();
+    for sys in SCAN_SYSTEMS {
+        if !want.contains(&sys.name) {
+            continue;
+        }
+        if started.elapsed().as_secs() > 45 {
+            eprintln!("carry budget: skip {}", sys.name);
+            break;
+        }
+        let xyz = xyz_file(sys.file);
+        let sp = xyz.species.clone();
+        let g0 = xyz.coords.clone();
+        let n_atoms = g0.len();
+        let sk = load_sk_for_species(&sk_dir, &sp).unwrap();
+        let mut unique: Vec<String> = Vec::new();
+        for s in &sp {
+            if !unique.contains(s) { unique.push(s.clone()); }
+        }
+        let repulsive = parse_all_repulsive(&sk_dir, &unique, unique.len()).unwrap();
+        let mut cpu = DftbCpu::new(sk.clone(), sp.clone()).unwrap();
+        cpu.update_geometry(&g0).unwrap();
+        cpu.reset_charges();
+        cpu.solve_scc(200, 1e-8).unwrap();
+        let scc = cpu.build_result();
+        let forces = cpu.compute_forces(&scc, &repulsive).unwrap();
+        let g1 = step_along_forces(&g0, &forces.forces, 0.02);
+        let g1b = replicate(&g1, batch);
+
+        unsafe { std::env::remove_var("RUST_DFTB_EIGSOLVER") };
+        let mut jac = GpuDftb::new(sk.clone(), &sk_dir, sp.clone(), replicate(&g0, batch), batch)
+            .unwrap_or_else(|e| panic!("jacobi {}: {e}", sys.name));
+        jac.set_smearing(0.0);
+        jac.scc(100, 1e-6).unwrap_or_else(|e| panic!("jacobi G0 {}: {e}", sys.name));
+        jac.set_coords(&g1b).unwrap();
+        jac.scc(100, 1e-6).unwrap_or_else(|e| panic!("jacobi SCC {}: {e}", sys.name));
+        let ev_j = jac.eval(true).unwrap_or_else(|e| panic!("jacobi eval {}: {e}", sys.name));
+        let q_scc = jac.read_q_new().unwrap();
+        let e_scc = ev_j.energy[0];
+        let f_scc = ev_j.forces.unwrap();
+        drop(jac);
+
+        unsafe { std::env::set_var("RUST_DFTB_EIGSOLVER", "purify") };
+        let mut eng = GpuDftb::new(sk.clone(), &sk_dir, sp.clone(), replicate(&g0, batch), batch)
+            .unwrap_or_else(|e| panic!("purify {}: {e}", sys.name));
+        eng.set_smearing(0.0);
+        eng.scc(100, 1e-6).unwrap_or_else(|e| panic!("purify G0 {}: {e}", sys.name));
+        let mut nf = vec![0i32; 1];
+        eng.rt.read_buffer(&eng.plan.diis_n_filled, &mut nf).unwrap();
+        let diis_g0 = eng.plan.capture_diis(&eng.rt).unwrap();
+        eprintln!("  {}  G0 DIIS n_filled={}", sys.name, nf[0]);
+        eng.set_coords_keep_k(&g1b).unwrap();
+        let guess = eng.plan.capture_density(&eng.rt).unwrap();
+        let mut q_save = vec![0.0f32; batch * n_atoms];
+        for &reject in &[false, true] {
+            let tag = if reject { "reject" } else { "carry" };
+            for n in 1..=6 {
+                eng.plan.restore_density(&eng.rt, &guess).unwrap();
+                if reject {
+                    eng.plan.reset_diis(&eng.rt).unwrap();
+                } else {
+                    eng.plan.restore_diis(&eng.rt, &diis_g0).unwrap();
+                }
+                let mut rh = 0.0f32;
+                let mut rms = 0.0f32;
+                let mut n_comm = 0usize;
+                let mut n_rej = 0usize;
+                let mut prev_rms = f32::MAX;
+                let mut stopped = false;
+                let mut q_in = vec![0.0f32; n_atoms];
+                let mut q_out = vec![0.0f32; n_atoms];
+                for _pass in 1..=n {
+                    let (_rh0, rh1, _tr, _eta, n_acc) =
+                        eng.geom_bold_capped(1).unwrap_or_else(|e| panic!("{} {tag}: {e}", sys.name));
+                    rh = rh1;
+                    n_comm += 1;
+                    if n_acc < 1 {
+                        stopped = true;
+                        break;
+                    }
+                    eng.rt.read_buffer(&eng.plan.q_gpu, &mut q_in).unwrap();
+                    eng.rt.read_buffer(&eng.plan.q_new, &mut q_out).unwrap();
+                    let mut acc = 0.0f64;
+                    for a in 0..n_atoms {
+                        let d = q_out[a] as f64 - q_in[a] as f64;
+                        acc += d * d;
+                    }
+                    let mut rms_q = (acc / n_atoms as f64).sqrt() as f32;
+                    if rh > 0.3 * rms_q.max(1e-8) {
+                        let (_a, rh2, _b, _c, n2) = eng.geom_bold_capped(1)
+                            .unwrap_or_else(|e| panic!("{} {tag} extra: {e}", sys.name));
+                        rh = rh2;
+                        n_comm += 1;
+                        if n2 < 1 {
+                            stopped = true;
+                            break;
+                        }
+                        eng.rt.read_buffer(&eng.plan.q_new, &mut q_out).unwrap();
+                        acc = 0.0;
+                        for a in 0..n_atoms {
+                            let d = q_out[a] as f64 - q_in[a] as f64;
+                            acc += d * d;
+                        }
+                        rms_q = (acc / n_atoms as f64).sqrt() as f32;
+                    }
+                    if reject {
+                        eng.rt.read_buffer(&eng.plan.q_gpu, &mut q_save).unwrap();
+                    }
+                    rms = eng.plan.diis_on_qnew(&mut eng.rt).unwrap_or_else(|e| panic!("diis: {e}"));
+                    if reject && rms > prev_rms {
+                        eng.rt.write_buffer(&eng.plan.q_gpu, &q_save).unwrap();
+                        eng.plan.reset_diis(&eng.rt).unwrap();
+                        eng.mix_mulliken(0.5).unwrap();
+                        n_rej += 1;
+                        prev_rms = 0.5 * rms_q.max(rms);
+                    } else {
+                        prev_rms = rms;
+                    }
+                }
+                let q_new = eng.read_q_new().unwrap();
+                let mut dq_scc = 0.0f64;
+                for a in 0..n_atoms {
+                    dq_scc = dq_scc.max((q_new[a] as f64 - q_scc[a] as f64).abs());
+                }
+                eng.stage_mulliken().unwrap();
+                let ev = eng.eval(true).unwrap_or_else(|e| panic!("eval: {e}"));
+                let de_mev = (ev.energy[0] - e_scc) * 27211.386;
+                let f = ev.forces.as_ref().unwrap();
+                let mut df = 0.0f64;
+                let mut fmax = 0.0f64;
+                for i in 0..3 * n_atoms {
+                    df = df.max((f[i] as f64 - f_scc[i] as f64).abs());
+                    fmax = fmax.max(f_scc[i].abs() as f64);
+                }
+                let pct = 100.0 * df / fmax.max(1e-12);
+                eprintln!(
+                    "  {}  {tag}  passes={n}  comm={n_comm}  rej={n_rej}  rms={rms:.3e}  R_H={rh:.3e}  dq={dq_scc:.3e}  dE={de_mev:+.3} meV  dF={pct:.2}%",
+                    sys.name
+                );
+                if stopped {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// DIIS only when the commutator is well below the charge residual
+/// (`R_H < 0.1 × rms`). Otherwise α = 0.5, so an inexact map is not
+/// extrapolated. Up to three commutators on the current H per pass.
+#[test]
+#[ignore]
+fn test_geom_bold_diis_gate() {
+    let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else {
+        eprintln!("Skipping: RUST_DFTB_SK_DIR not set");
+        return;
+    };
+    unsafe { std::env::set_var("RUST_DFTB_SCC_QUIET", "1"); }
+    let batch = 256usize;
+    let want = ["formic", "GC", "diazaphen", "DTH"];
+    eprintln!("=== DIIS only if R_H < 0.1·rms, else α=0.5. Up to 3 commutators per pass. batch {batch} ===");
+    let started = std::time::Instant::now();
+    for sys in SCAN_SYSTEMS {
+        if !want.contains(&sys.name) {
+            continue;
+        }
+        if started.elapsed().as_secs() > 45 {
+            eprintln!("gate budget: skip {}", sys.name);
+            break;
+        }
+        let xyz = xyz_file(sys.file);
+        let sp = xyz.species.clone();
+        let g0 = xyz.coords.clone();
+        let n_atoms = g0.len();
+        let sk = load_sk_for_species(&sk_dir, &sp).unwrap();
+        let mut unique: Vec<String> = Vec::new();
+        for s in &sp {
+            if !unique.contains(s) { unique.push(s.clone()); }
+        }
+        let repulsive = parse_all_repulsive(&sk_dir, &unique, unique.len()).unwrap();
+        let mut cpu = DftbCpu::new(sk.clone(), sp.clone()).unwrap();
+        cpu.update_geometry(&g0).unwrap();
+        cpu.reset_charges();
+        cpu.solve_scc(200, 1e-8).unwrap();
+        let scc = cpu.build_result();
+        let forces = cpu.compute_forces(&scc, &repulsive).unwrap();
+        let g1 = step_along_forces(&g0, &forces.forces, 0.02);
+        let g1b = replicate(&g1, batch);
+
+        unsafe { std::env::remove_var("RUST_DFTB_EIGSOLVER") };
+        let mut jac = GpuDftb::new(sk.clone(), &sk_dir, sp.clone(), replicate(&g0, batch), batch)
+            .unwrap_or_else(|e| panic!("jacobi {}: {e}", sys.name));
+        jac.set_smearing(0.0);
+        jac.scc(100, 1e-6).unwrap_or_else(|e| panic!("jacobi G0 {}: {e}", sys.name));
+        jac.set_coords(&g1b).unwrap();
+        jac.scc(100, 1e-6).unwrap_or_else(|e| panic!("jacobi SCC {}: {e}", sys.name));
+        let ev_j = jac.eval(true).unwrap_or_else(|e| panic!("jacobi eval {}: {e}", sys.name));
+        let q_scc = jac.read_q_new().unwrap();
+        let e_scc = ev_j.energy[0];
+        let f_scc = ev_j.forces.unwrap();
+        drop(jac);
+
+        unsafe { std::env::set_var("RUST_DFTB_EIGSOLVER", "purify") };
+        let mut eng = GpuDftb::new(sk.clone(), &sk_dir, sp.clone(), replicate(&g0, batch), batch)
+            .unwrap_or_else(|e| panic!("purify {}: {e}", sys.name));
+        eng.set_smearing(0.0);
+        eng.scc(100, 1e-6).unwrap_or_else(|e| panic!("purify G0 {}: {e}", sys.name));
+        eng.set_coords_keep_k(&g1b).unwrap();
+        let guess = eng.plan.capture_density(&eng.rt).unwrap();
+        let mut q_in = vec![0.0f32; n_atoms];
+        let mut q_out = vec![0.0f32; n_atoms];
+        for n in 1..=6 {
+            eng.plan.restore_density(&eng.rt, &guess).unwrap();
+            eng.plan.reset_diis(&eng.rt).unwrap();
+            let mut rh = 0.0f32;
+            let mut rms = 0.0f32;
+            let mut n_comm = 0usize;
+            let mut n_diis = 0usize;
+            let mut ratio = 0.0f32;
+            let mut stopped = false;
+            for _pass in 1..=n {
+                let mut rms_q = 0.0f32;
+                for _k in 0..3 {
+                    let (_a, rh1, _b, _c, n_acc) =
+                        eng.geom_bold_capped(1).unwrap_or_else(|e| panic!("{}: {e}", sys.name));
+                    rh = rh1;
+                    n_comm += 1;
+                    if n_acc < 1 {
+                        stopped = true;
+                        break;
+                    }
+                    eng.rt.read_buffer(&eng.plan.q_gpu, &mut q_in).unwrap();
+                    eng.rt.read_buffer(&eng.plan.q_new, &mut q_out).unwrap();
+                    let mut acc = 0.0f64;
+                    for a in 0..n_atoms {
+                        let d = q_out[a] as f64 - q_in[a] as f64;
+                        acc += d * d;
+                    }
+                    rms_q = (acc / n_atoms as f64).sqrt() as f32;
+                    ratio = rh / rms_q.max(1e-8);
+                    if ratio < 0.1 {
+                        break;
+                    }
+                }
+                if stopped {
+                    break;
+                }
+                if ratio < 0.1 {
+                    rms = eng.plan.diis_on_qnew(&mut eng.rt).unwrap_or_else(|e| panic!("diis: {e}"));
+                    n_diis += 1;
+                } else {
+                    eng.mix_mulliken(0.5).unwrap();
+                    rms = 0.5 * rms_q;
+                }
+            }
+            let q_new = eng.read_q_new().unwrap();
+            let mut dq_scc = 0.0f64;
+            for a in 0..n_atoms {
+                dq_scc = dq_scc.max((q_new[a] as f64 - q_scc[a] as f64).abs());
+            }
+            eng.stage_mulliken().unwrap();
+            let ev = eng.eval(true).unwrap_or_else(|e| panic!("eval: {e}"));
+            let de_mev = (ev.energy[0] - e_scc) * 27211.386;
+            let f = ev.forces.as_ref().unwrap();
+            let mut df = 0.0f64;
+            let mut fmax = 0.0f64;
+            for i in 0..3 * n_atoms {
+                df = df.max((f[i] as f64 - f_scc[i] as f64).abs());
+                fmax = fmax.max(f_scc[i].abs() as f64);
+            }
+            let pct = 100.0 * df / fmax.max(1e-12);
+            eprintln!(
+                "  {}  passes={n}  comm={n_comm}  diis={n_diis}  ratio={ratio:.2}  rms={rms:.3e}  R_H={rh:.3e}  dq={dq_scc:.3e}  dE={de_mev:+.3} meV  dF={pct:.2}%",
+                sys.name
+            );
+            if stopped {
+                break;
+            }
+        }
+    }
+}
+
+/// One-GEMM H′ (H0' + ½(M+Mᵀ), M = Xᵀ D Cᵀ) and one-GEMM Mulliken
+/// (Y = K·C, p_μ = 2 Σ_i X_μi Y_iμ) against the two-GEMM bold step.
+/// Same carried K, same 0.02 Å step, batch 256. A mismatch is a bug.
+#[test]
+#[ignore]
+fn test_geom_bold_cheap() {
+    let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else {
+        eprintln!("Skipping: RUST_DFTB_SK_DIR not set");
+        return;
+    };
+    unsafe { std::env::set_var("RUST_DFTB_SCC_QUIET", "1"); }
+    unsafe { std::env::set_var("RUST_DFTB_BOLD_DIAG", "0"); }
+    let names = std::env::var("RUST_DFTB_BENCH_SYSTEMS").unwrap_or_else(|_| "formic,GC".into());
+    let want: Vec<&str> = names.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+    let batch = 256usize;
+    eprintln!("=== one-GEMM H'/q vs two-GEMM, batch {batch}, systems {names} ===");
+    let started = std::time::Instant::now();
+    for sys in SCAN_SYSTEMS {
+        if !want.iter().any(|w| *w == sys.name) {
+            continue;
+        }
+        if started.elapsed().as_secs() > 50 {
+            eprintln!("cheap budget: skip {}", sys.name);
+            break;
+        }
+        let xyz = xyz_file(sys.file);
+        let sp = xyz.species.clone();
+        let g0 = xyz.coords.clone();
+        let n_atoms = g0.len();
+        let sk = load_sk_for_species(&sk_dir, &sp).unwrap();
+        let mut unique: Vec<String> = Vec::new();
+        for s in &sp {
+            if !unique.contains(s) { unique.push(s.clone()); }
+        }
+        let repulsive = parse_all_repulsive(&sk_dir, &unique, unique.len()).unwrap();
+        let mut cpu = DftbCpu::new(sk.clone(), sp.clone()).unwrap();
+        cpu.update_geometry(&g0).unwrap();
+        cpu.reset_charges();
+        cpu.solve_scc(200, 1e-8).unwrap();
+        let scc = cpu.build_result();
+        let forces = cpu.compute_forces(&scc, &repulsive).unwrap();
+        let g1 = step_along_forces(&g0, &forces.forces, 0.02);
+        let g1b = replicate(&g1, batch);
+
+        unsafe { std::env::set_var("RUST_DFTB_EIGSOLVER", "purify"); }
+        unsafe { std::env::set_var("RUST_DFTB_BOLD_CHEAP", "1"); }
+        let mut eng = GpuDftb::new(sk.clone(), &sk_dir, sp.clone(), replicate(&g0, batch), batch)
+            .unwrap_or_else(|e| panic!("purify {}: {e}", sys.name));
+        eng.set_smearing(0.0);
+        eng.scc(100, 1e-6).unwrap_or_else(|e| panic!("G0 {}: {e}", sys.name));
+        eng.set_coords_keep_k(&g1b).unwrap();
+        let guess = eng.plan.capture_density(&eng.rt).unwrap();
+
+        unsafe { std::env::set_var("RUST_DFTB_BOLD_CHEAP", "0"); }
+        eng.plan.restore_density(&eng.rt, &guess).unwrap();
+        let (_a0, rh0, tr0, _e0, n0) = eng.geom_bold_capped(2).unwrap_or_else(|e| panic!("two-GEMM {}: {e}", sys.name));
+        let q0 = eng.read_q_new().unwrap();
+        let ne0: f32 = q0.iter().take(n_atoms).sum();
+
+        unsafe { std::env::set_var("RUST_DFTB_BOLD_CHEAP", "1"); }
+        eng.plan.restore_density(&eng.rt, &guess).unwrap();
+        let (_a1, rh1, tr1, _e1, n1) = eng.geom_bold_capped(2).unwrap_or_else(|e| panic!("one-GEMM {}: {e}", sys.name));
+        let q1 = eng.read_q_new().unwrap();
+        let ne1: f32 = q1.iter().take(n_atoms).sum();
+        let mut dq = 0.0f32;
+        for a in 0..n_atoms {
+            dq = dq.max((q1[a] - q0[a]).abs());
+        }
+        eprintln!(
+            "  {}  parity  |Δq|={dq:.3e} e  Ne {ne0:.4}/{ne1:.4}  R_H {rh0:.3e}/{rh1:.3e}  Tr {tr0:.4}/{tr1:.4}  acc {n0}/{n1}",
+            sys.name
+        );
+        assert!(dq < 1e-3, "{} one-GEMM charges differ by {dq:.3e} e", sys.name);
+        assert!((ne1 - ne0).abs() < 1e-2, "{} electron count {ne0} vs {ne1}", sys.name);
+
+        unsafe { std::env::set_var("RUST_DFTB_BOLD_CHEAP", "1"); }
+        unsafe { std::env::set_var("RUST_DFTB_BOLD_DIAG", "1"); }
+        eng.plan.restore_density(&eng.rt, &guess).unwrap();
+        let (_ad, rhd, trd, _ed, nd) = eng.geom_bold_capped(2).unwrap_or_else(|e| panic!("diag {}: {e}", sys.name));
+        let qd = eng.read_q_new().unwrap();
+        unsafe { std::env::set_var("RUST_DFTB_BOLD_DIAG", "0"); }
+        eng.plan.restore_density(&eng.rt, &guess).unwrap();
+        let (_ap, rhp, trp, _ep, np) = eng.geom_bold_capped(2).unwrap_or_else(|e| panic!("prod {}: {e}", sys.name));
+        let qp = eng.read_q_new().unwrap();
+        let mut dq_sync = 0.0f32;
+        for a in 0..n_atoms {
+            dq_sync = dq_sync.max((qp[a] - qd[a]).abs());
+        }
+        eprintln!(
+            "  {}  diag vs prod  |Δq|={dq_sync:.3e} e  R_H {rhd:.6e}/{rhp:.6e}  Tr {trd:.4}/{trp:.4}  acc {nd}/{np}",
+            sys.name
+        );
+        assert!(dq_sync < 1e-4, "{} device trust |Δq|={dq_sync:.3e}", sys.name);
+        assert_eq!(nd, np, "{} accepted steps diag {nd} prod {np}", sys.name);
+        assert!((rhd - rhp).abs() < 1e-4, "{} R_H {rhd} vs {rhp}", sys.name);
+        assert!((trd - trp).abs() < 1e-3, "{} Tr {trd} vs {trp}", sys.name);
+
+        let time_bold = |eng: &mut GpuDftb, cheap: &str, diag: &str| -> f64 {
+            unsafe { std::env::set_var("RUST_DFTB_BOLD_CHEAP", cheap); }
+            unsafe { std::env::set_var("RUST_DFTB_BOLD_DIAG", diag); }
+            let mut secs = 0.0f64;
+            for _ in 0..5 {
+                eng.plan.restore_density(&eng.rt, &guess).unwrap();
+                let t0 = std::time::Instant::now();
+                eng.geom_bold_capped(2).unwrap();
+                secs += t0.elapsed().as_secs_f64();
+            }
+            secs / 5.0
+        };
+        let t_two = time_bold(&mut eng, "0", "0");
+        let t_one = time_bold(&mut eng, "1", "0");
+        let t_diag = time_bold(&mut eng, "1", "1");
+        eprintln!(
+            "  {}  one bold cap2  two-GEMM {:.2} ms  one-GEMM {:.2} ms  diag {:.2} ms  (prod/diag {:.2}×)",
+            sys.name, t_two * 1e3, t_one * 1e3, t_diag * 1e3, t_diag / t_one.max(1e-9)
+        );
+
+        let time_gate = |eng: &mut GpuDftb, cheap: &str| -> f64 {
+            unsafe { std::env::set_var("RUST_DFTB_BOLD_CHEAP", cheap); }
+            unsafe { std::env::set_var("RUST_DFTB_BOLD_DIAG", "0"); }
+            eng.plan.restore_density(&eng.rt, &guess).unwrap();
+            eng.plan.reset_diis(&eng.rt).unwrap();
+            let mut q_in = vec![0.0f32; n_atoms];
+            let mut q_out = vec![0.0f32; n_atoms];
+            let t0 = std::time::Instant::now();
+            for _pass in 0..6 {
+                let mut ratio = 1.0f32;
+                let mut rms_q = 0.0f32;
+                let mut stopped = false;
+                for _k in 0..3 {
+                    let (_a, rh1, _b, _c, n_acc) = eng.geom_bold_capped(1).unwrap();
+                    if n_acc < 1 {
+                        stopped = true;
+                        break;
+                    }
+                    eng.rt.read_buffer(&eng.plan.q_gpu, &mut q_in).unwrap();
+                    eng.rt.read_buffer(&eng.plan.q_new, &mut q_out).unwrap();
+                    let mut acc = 0.0f64;
+                    for a in 0..n_atoms {
+                        let d = q_out[a] as f64 - q_in[a] as f64;
+                        acc += d * d;
+                    }
+                    rms_q = (acc / n_atoms as f64).sqrt() as f32;
+                    ratio = rh1 / rms_q.max(1e-8);
+                    if ratio < 0.1 {
+                        break;
+                    }
+                }
+                if stopped {
+                    break;
+                }
+                if ratio < 0.1 {
+                    eng.plan.diis_on_qnew(&mut eng.rt).unwrap();
+                } else {
+                    eng.mix_mulliken(0.5).unwrap();
+                }
+            }
+            t0.elapsed().as_secs_f64()
+        };
+        let g_two = time_gate(&mut eng, "0");
+        let g_one = time_gate(&mut eng, "1");
+        eprintln!(
+            "  {}  gate 6-pass  two-GEMM {:.1} ms  one-GEMM {:.1} ms  ({:.2}×)",
+            sys.name, g_two * 1e3, g_one * 1e3, g_two / g_one.max(1e-9)
+        );
+    }
+    unsafe { std::env::set_var("RUST_DFTB_BOLD_CHEAP", "0"); }
+}
+
+/// Log E_SCC on accepted coupled steps. The trust test is not changed.
+/// E_dens = 2 Tr(K H'₀) + ½ ΔqᵀγΔq. E_chat drops the 2.
+/// A step where R_H falls and E_dens rises is marked DISAGREE.
+#[test]
+#[ignore]
+fn test_geom_bold_energy() {
+    let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else {
+        eprintln!("Skipping: RUST_DFTB_SK_DIR not set");
+        return;
+    };
+    unsafe { std::env::set_var("RUST_DFTB_SCC_QUIET", "1"); }
+    unsafe { std::env::set_var("RUST_DFTB_BOLD_DIAG", "0"); }
+    let batch = 256usize;
+    let want = ["formic", "GC", "diazaphen", "DTH"];
+    eprintln!("=== E_SCC on accepted coupled steps (α=1). Trust test unchanged. batch {batch} ===");
+    let started = std::time::Instant::now();
+    for sys in SCAN_SYSTEMS {
+        if !want.contains(&sys.name) {
+            continue;
+        }
+        if started.elapsed().as_secs() > 45 {
+            eprintln!("energy budget: skip {}", sys.name);
+            break;
+        }
+        let xyz = xyz_file(sys.file);
+        let sp = xyz.species.clone();
+        let g0 = xyz.coords.clone();
+        let sk = load_sk_for_species(&sk_dir, &sp).unwrap();
+        let mut unique: Vec<String> = Vec::new();
+        for s in &sp {
+            if !unique.contains(s) { unique.push(s.clone()); }
+        }
+        let repulsive = parse_all_repulsive(&sk_dir, &unique, unique.len()).unwrap();
+        let mut cpu = DftbCpu::new(sk.clone(), sp.clone()).unwrap();
+        cpu.update_geometry(&g0).unwrap();
+        cpu.reset_charges();
+        cpu.solve_scc(200, 1e-8).unwrap();
+        let scc = cpu.build_result();
+        let forces = cpu.compute_forces(&scc, &repulsive).unwrap();
+        let g1 = step_along_forces(&g0, &forces.forces, 0.02);
+        let g1b = replicate(&g1, batch);
+
+        unsafe { std::env::set_var("RUST_DFTB_EIGSOLVER", "purify"); }
+        let mut eng = GpuDftb::new(sk.clone(), &sk_dir, sp.clone(), replicate(&g0, batch), batch)
+            .unwrap_or_else(|e| panic!("purify {}: {e}", sys.name));
+        eng.set_smearing(0.0);
+        eng.scc(100, 1e-6).unwrap_or_else(|e| panic!("G0 {}: {e}", sys.name));
+        eng.set_coords_keep_k(&g1b).unwrap();
+        let (e0, chat0, _) = eng.bold_scc_energy(false).unwrap_or_else(|e| panic!("E0 {}: {e}", sys.name));
+        eprintln!("  {}  step 0  E_dens={e0:.8} Ha  E_chat={chat0:.8} Ha", sys.name);
+        let mut e_prev = e0;
+        let mut chat_prev = chat0;
+        let mut n_dis = 0usize;
+        for step in 1..=4 {
+            let (rh0, rh, _tr, eta, n_acc) = eng.geom_bold_capped(1).unwrap_or_else(|e| panic!("{} step {step}: {e}", sys.name));
+            let (e, chat, tr_h) = eng.bold_scc_energy(true).unwrap_or_else(|e| panic!("E {}: {e}", sys.name));
+            let de = (e - e_prev) * 27211.386;
+            let dc = (chat - chat_prev) * 27211.386;
+            let fell = rh < rh0;
+            let rose = e > e_prev;
+            let flag = if n_acc >= 1 && fell && rose { "DISAGREE" } else { "together" };
+            if flag == "DISAGREE" {
+                n_dis += 1;
+            }
+            eprintln!(
+                "  {}  step {step}  acc={n_acc}  η={eta:.3}  R_H {rh0:.3e} → {rh:.3e}  ΔE_dens={de:+.4} meV  ΔE_chat={dc:+.4} meV  Tr(KH')={tr_h:.6}  {flag}",
+                sys.name
+            );
+            e_prev = e;
+            chat_prev = chat;
+            if n_acc < 1 {
+                break;
+            }
+            eng.stage_mulliken().unwrap();
+        }
+        eprintln!("  {}  disagreements {n_dis}/4", sys.name);
+    }
+}
+
+/// Frozen-charge shadow: one Jacobi of H(R, q_carried), no charge update.
+/// The analytic force is compared to a finite difference of that energy,
+/// and to a full SCC Jacobi at the same geometry.
+#[test]
+#[ignore]
+fn test_geom_shadow_fd() {
+    let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else {
+        eprintln!("Skipping: RUST_DFTB_SK_DIR not set");
+        return;
+    };
+    unsafe { std::env::set_var("RUST_DFTB_SCC_QUIET", "1"); }
+    unsafe { std::env::remove_var("RUST_DFTB_EIGSOLVER"); }
+    // Force buffer is dE/dR with R in Å (kernel multiplies by ANG2BOHR).
+    let deltas = [1.0e-3f64, 2.0e-4f64];
+    let want = ["formic", "GC", "diazaphen", "DTH"];
+    eprintln!("=== frozen-q shadow: one Jacobi vs FD (Ha/Å) and vs SCC. batch 1 ===");
+    let started = std::time::Instant::now();
+    for sys in SCAN_SYSTEMS {
+        if !want.contains(&sys.name) {
+            continue;
+        }
+        if started.elapsed().as_secs() > 45 {
+            eprintln!("shadow budget: skip {}", sys.name);
+            break;
+        }
+        let xyz = xyz_file(sys.file);
+        let sp = xyz.species.clone();
+        let g0 = xyz.coords.clone();
+        let n_atoms = g0.len();
+        let sk = load_sk_for_species(&sk_dir, &sp).unwrap();
+        let mut unique: Vec<String> = Vec::new();
+        for s in &sp {
+            if !unique.contains(s) { unique.push(s.clone()); }
+        }
+        let repulsive = parse_all_repulsive(&sk_dir, &unique, unique.len()).unwrap();
+        let mut cpu = DftbCpu::new(sk.clone(), sp.clone()).unwrap();
+        cpu.update_geometry(&g0).unwrap();
+        cpu.reset_charges();
+        cpu.solve_scc(200, 1e-8).unwrap();
+        let scc0 = cpu.build_result();
+        let f0 = cpu.compute_forces(&scc0, &repulsive).unwrap();
+        let g1 = step_along_forces(&g0, &f0.forces, 0.02);
+
+        let mut eng = GpuDftb::new(sk.clone(), &sk_dir, sp.clone(), g0.clone(), 1)
+            .unwrap_or_else(|e| panic!("shadow {}: {e}", sys.name));
+        eng.set_smearing(0.0);
+        eng.scc(100, 1e-6).unwrap_or_else(|e| panic!("G0 {}: {e}", sys.name));
+        eng.set_coords(&g1).unwrap();
+        let ev = eng.eval(true).unwrap_or_else(|e| panic!("shadow eval {}: {e}", sys.name));
+        let e_sh = ev.energy[0];
+        let f_sh = ev.forces.unwrap();
+        if f_sh.len() != 3 * n_atoms {
+            panic!("{} force len {} != {}", sys.name, f_sh.len(), 3 * n_atoms);
+        }
+        let mut imax = 0usize;
+        let mut fmax = 0.0f64;
+        for (i, &f) in f_sh.iter().enumerate() {
+            if !f.is_finite() {
+                panic!("{} F_shadow[{i}]={f} non-finite", sys.name);
+            }
+            if (f as f64).abs() > fmax {
+                fmax = (f as f64).abs();
+                imax = i;
+            }
+        }
+        let atom = imax / 3;
+        let comp = imax % 3;
+        let f_an = f_sh[imax] as f64;
+        let mut rel_line = String::new();
+        for delta in deltas {
+            let mut e_side = [0.0f64; 2];
+            for (k, sign) in [1.0f64, -1.0f64].into_iter().enumerate() {
+                let mut g = g1.clone();
+                g[atom][comp] += sign * delta;
+                eng.set_coords(&g).unwrap();
+                let evs = eng.eval(false).unwrap_or_else(|e| panic!("FD {}: {e}", sys.name));
+                e_side[k] = evs.energy[0];
+                if !e_side[k].is_finite() {
+                    panic!("{} E_shadow({sign})={} non-finite", sys.name, e_side[k]);
+                }
+            }
+            let f_num = -(e_side[0] - e_side[1]) / (2.0 * delta);
+            let rel = (f_num - f_an).abs() / f_an.abs().max(1e-12);
+            rel_line.push_str(&format!("  δ={delta:.1e} F_num={f_num:.6e} |Δ|/|F|={rel:.3e}"));
+        }
+
+        eng.set_coords(&g1).unwrap();
+        eng.scc(100, 1e-6).unwrap_or_else(|e| panic!("SCC {}: {e}", sys.name));
+        let evj = eng.eval(true).unwrap_or_else(|e| panic!("SCC eval {}: {e}", sys.name));
+        let e_scc = evj.energy[0];
+        let f_scc = evj.forces.unwrap();
+        let mut df = 0.0f64;
+        let mut fscc_max = 0.0f64;
+        for i in 0..3 * n_atoms {
+            df = df.max((f_sh[i] as f64 - f_scc[i] as f64).abs());
+            fscc_max = fscc_max.max((f_scc[i] as f64).abs());
+        }
+        let pct = 100.0 * df / fscc_max.max(1e-12);
+        let de = (e_sh - e_scc) * 27211.386;
+        let axis = ["x", "y", "z"][comp];
+        eprintln!(
+            "  {}  atom {atom} {axis}  F_shadow={f_an:.6e}{rel_line}   vs SCC  dF={pct:.2}%  ΔE={de:+.3} meV",
+            sys.name
+        );
+    }
+}
+
+/// Partial-pivot solve of A x = b. A is row-major n×n.
+fn solve_ge(a: &[f64], rhs: &[f64]) -> Vec<f64> {
+    let n = rhs.len();
+    let mut m = a.to_vec();
+    let mut b = rhs.to_vec();
+    for k in 0..n {
+        let mut piv = k;
+        let mut best = m[k * n + k].abs();
+        for i in (k + 1)..n {
+            let v = m[i * n + k].abs();
+            if v > best {
+                best = v;
+                piv = i;
+            }
+        }
+        if best < 1e-14 {
+            panic!("shadow Newton: pivot {best:.3e} at column {k}/{n}");
+        }
+        if piv != k {
+            for j in 0..n {
+                m.swap(k * n + j, piv * n + j);
+            }
+            b.swap(k, piv);
+        }
+        let diag = m[k * n + k];
+        for i in (k + 1)..n {
+            let f = m[i * n + k] / diag;
+            for j in (k + 1)..n {
+                m[i * n + j] -= f * m[k * n + j];
+            }
+            b[i] -= f * b[k];
+        }
+    }
+    let mut x = vec![0.0f64; n];
+    for i in (0..n).rev() {
+        let mut s = b[i];
+        for j in (i + 1)..n {
+            s -= m[i * n + j] * x[j];
+        }
+        x[i] = s / m[i * n + i];
+        if !x[i].is_finite() {
+            panic!("shadow Newton: x[{i}] non-finite");
+        }
+    }
+    x
+}
+
+/// 1st-level shadow: one Newton step on the charge residual of a single
+/// diagonalization, then one diagonalization of H at the updated charges.
+/// The Jacobian is a central difference, a measurement, not the production step.
+#[test]
+#[ignore]
+fn test_geom_shadow_newton() {
+    let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else {
+        eprintln!("Skipping: RUST_DFTB_SK_DIR not set");
+        return;
+    };
+    unsafe { std::env::set_var("RUST_DFTB_SCC_QUIET", "1"); }
+    unsafe { std::env::remove_var("RUST_DFTB_EIGSOLVER"); }
+    let eps = 1.0e-3f64;
+    let want = ["formic", "GC", "diazaphen", "DTH"];
+    eprintln!("=== 1st-level shadow: Newton on q, then one Jacobi. ε={eps:.1e} e. batch 1 ===");
+    let started = std::time::Instant::now();
+    for sys in SCAN_SYSTEMS {
+        if !want.contains(&sys.name) {
+            continue;
+        }
+        if started.elapsed().as_secs() > 50 {
+            eprintln!("newton budget: skip {}", sys.name);
+            break;
+        }
+        let xyz = xyz_file(sys.file);
+        let sp = xyz.species.clone();
+        let g0 = xyz.coords.clone();
+        let n_atoms = g0.len();
+        let sk = load_sk_for_species(&sk_dir, &sp).unwrap();
+        let mut unique: Vec<String> = Vec::new();
+        for s in &sp {
+            if !unique.contains(s) { unique.push(s.clone()); }
+        }
+        let repulsive = parse_all_repulsive(&sk_dir, &unique, unique.len()).unwrap();
+        let mut cpu = DftbCpu::new(sk.clone(), sp.clone()).unwrap();
+        cpu.update_geometry(&g0).unwrap();
+        cpu.reset_charges();
+        cpu.solve_scc(200, 1e-8).unwrap();
+        let scc0 = cpu.build_result();
+        let f0cpu = cpu.compute_forces(&scc0, &repulsive).unwrap();
+        let g1 = step_along_forces(&g0, &f0cpu.forces, 0.02);
+
+        let mut eng = GpuDftb::new(sk.clone(), &sk_dir, sp.clone(), g0.clone(), 1)
+            .unwrap_or_else(|e| panic!("newton {}: {e}", sys.name));
+        eng.set_smearing(0.0);
+        eng.scc(100, 1e-6).unwrap_or_else(|e| panic!("G0 {}: {e}", sys.name));
+        let mut q0 = vec![0.0f32; n_atoms];
+        eng.rt.read_buffer(&eng.plan.q_gpu, &mut q0).unwrap();
+        eng.set_coords(&g1).unwrap();
+
+        let residual = |eng: &mut GpuDftb, q: &[f32]| -> (Vec<f64>, f64, Vec<f32>) {
+            eng.set_charges(q).unwrap_or_else(|e| panic!("set_charges {}: {e}", sys.name));
+            let ev = eng.eval(true).unwrap_or_else(|e| panic!("eval {}: {e}", sys.name));
+            let qn = eng.read_q_new().unwrap();
+            let mut f = vec![0.0f64; n_atoms];
+            let mut s2 = 0.0f64;
+            for a in 0..n_atoms {
+                f[a] = qn[a] as f64 - q[a] as f64;
+                if !f[a].is_finite() {
+                    panic!("{} residual[{a}] non-finite", sys.name);
+                }
+                s2 += f[a] * f[a];
+            }
+            (f, (s2 / n_atoms as f64).sqrt(), ev.forces.unwrap())
+        };
+
+        let (f_res, rms0, f_sh0) = residual(&mut eng, &q0);
+        let e0 = {
+            eng.set_charges(&q0).unwrap();
+            eng.eval(false).unwrap().energy[0]
+        };
+
+        let mut jac = vec![0.0f64; n_atoms * n_atoms];
+        let mut qp = q0.clone();
+        let mut qm = q0.clone();
+        for a in 0..n_atoms {
+            qp.copy_from_slice(&q0);
+            qm.copy_from_slice(&q0);
+            qp[a] = (q0[a] as f64 + eps) as f32;
+            qm[a] = (q0[a] as f64 - eps) as f32;
+            eng.set_charges(&qp).unwrap();
+            eng.eval(false).unwrap();
+            let q_plus = eng.read_q_new().unwrap();
+            eng.set_charges(&qm).unwrap();
+            eng.eval(false).unwrap();
+            let q_minus = eng.read_q_new().unwrap();
+            for b in 0..n_atoms {
+                let fp = q_plus[b] as f64 - qp[b] as f64;
+                let fm = q_minus[b] as f64 - qm[b] as f64;
+                jac[b * n_atoms + a] = (fp - fm) / (2.0 * eps);
+            }
+        }
+        let x = solve_ge(&jac, &f_res);
+        let mut q1 = vec![0.0f32; n_atoms];
+        let mut sum_x = 0.0f64;
+        for a in 0..n_atoms {
+            sum_x += x[a];
+            let v = q0[a] as f64 - x[a];
+            if !v.is_finite() {
+                panic!("{} q1[{a}] non-finite", sys.name);
+            }
+            q1[a] = v as f32;
+        }
+        let (_f1, rms1, f_sh1) = residual(&mut eng, &q1);
+        let e1 = {
+            eng.set_charges(&q1).unwrap();
+            eng.eval(false).unwrap().energy[0]
+        };
+
+        eng.set_charges(&q0).unwrap();
+        eng.scc(100, 1e-6).unwrap_or_else(|e| panic!("SCC {}: {e}", sys.name));
+        let evj = eng.eval(true).unwrap_or_else(|e| panic!("SCC eval {}: {e}", sys.name));
+        let e_scc = evj.energy[0];
+        let f_scc = evj.forces.unwrap();
+        let force_pct = |f: &[f32]| {
+            let mut df = 0.0f64;
+            let mut mx = 0.0f64;
+            for i in 0..3 * n_atoms {
+                df = df.max((f[i] as f64 - f_scc[i] as f64).abs());
+                mx = mx.max((f_scc[i] as f64).abs());
+            }
+            100.0 * df / mx.max(1e-12)
+        };
+        eprintln!(
+            "  {}  rms f {rms0:.3e} → {rms1:.3e}  Σx={sum_x:.3e}  ΔE0={:+.3} meV  ΔE1={:+.3} meV  dF0={:.2}%  dF1={:.2}%",
+            sys.name,
+            (e0 - e_scc) * 27211.386,
+            (e1 - e_scc) * 27211.386,
+            force_pct(&f_sh0),
+            force_pct(&f_sh1)
+        );
+    }
+}
+
+/// Wall time of a full SCC against two Jacobi diagonalizations.
+/// Two diagonalizations are the electronic cost of the 0th-level plus the
+/// 1st-level shadow once the inverse charge Jacobian is already known.
+/// The finite-difference Jacobian used in the accuracy test is not timed;
+/// its cost is estimated from the measured diagonalization time.
+#[test]
+#[ignore]
+fn test_geom_shadow_perf() {
+    let Ok(sk_dir) = std::env::var("RUST_DFTB_SK_DIR") else {
+        eprintln!("Skipping: RUST_DFTB_SK_DIR not set");
+        return;
+    };
+    unsafe { std::env::set_var("RUST_DFTB_SCC_QUIET", "1"); }
+    unsafe { std::env::remove_var("RUST_DFTB_EIGSOLVER"); }
+    let batch = 256usize;
+    let reps = 3usize;
+    let want = ["formic", "GC", "diazaphen", "DTH"];
+    eprintln!("=== shadow cost, batch {batch}: full SCC vs 2 Jacobi (Jacobian assumed known) ===");
+    let started = std::time::Instant::now();
+    for sys in SCAN_SYSTEMS {
+        if !want.contains(&sys.name) {
+            continue;
+        }
+        if started.elapsed().as_secs() > 45 {
+            eprintln!("perf budget: skip {}", sys.name);
+            break;
+        }
+        let xyz = xyz_file(sys.file);
+        let sp = xyz.species.clone();
+        let g0 = xyz.coords.clone();
+        let n_atoms = g0.len();
+        let sk = load_sk_for_species(&sk_dir, &sp).unwrap();
+        let mut unique: Vec<String> = Vec::new();
+        for s in &sp {
+            if !unique.contains(s) { unique.push(s.clone()); }
+        }
+        let repulsive = parse_all_repulsive(&sk_dir, &unique, unique.len()).unwrap();
+        let mut cpu = DftbCpu::new(sk.clone(), sp.clone()).unwrap();
+        cpu.update_geometry(&g0).unwrap();
+        cpu.reset_charges();
+        cpu.solve_scc(200, 1e-8).unwrap();
+        let scc0 = cpu.build_result();
+        let f0 = cpu.compute_forces(&scc0, &repulsive).unwrap();
+        let g1 = replicate(&step_along_forces(&g0, &f0.forces, 0.02), batch);
+
+        let mut eng = GpuDftb::new(sk.clone(), &sk_dir, sp.clone(), replicate(&g0, batch), batch)
+            .unwrap_or_else(|e| panic!("perf {}: {e}", sys.name));
+        eng.set_smearing(0.0);
+        eng.scc(100, 1e-6).unwrap_or_else(|e| panic!("G0 {}: {e}", sys.name));
+        let mut q = vec![0.0f32; batch * n_atoms];
+        eng.rt.read_buffer(&eng.plan.q_gpu, &mut q).unwrap();
+        eng.set_coords(&g1).unwrap();
+
+        let mut scc_ms = 0.0f64;
+        let mut n_it = 0usize;
+        for rep in 0..reps {
+            eng.set_charges(&q).unwrap();
+            let t = std::time::Instant::now();
+            let s = eng.scc(100, 1e-6).unwrap_or_else(|e| panic!("SCC {}: {e}", sys.name));
+            let ms = t.elapsed().as_secs_f64() * 1e3;
+            if rep == 0 {
+                n_it = s.n_iters;
+            }
+            scc_ms += ms;
+        }
+        scc_ms /= reps as f64;
+
+        eng.set_charges(&q).unwrap();
+        eng.eval(false).unwrap();
+        let mut two_ms = 0.0f64;
+        for _ in 0..reps {
+            let t = std::time::Instant::now();
+            eng.set_charges(&q).unwrap();
+            eng.eval(false).unwrap();
+            eng.set_charges(&q).unwrap();
+            eng.eval(false).unwrap();
+            two_ms += t.elapsed().as_secs_f64() * 1e3;
+        }
+        two_ms /= reps as f64;
+        let one_ms = two_ms / 2.0;
+        let fd_ms = one_ms * (2.0 * n_atoms as f64 + 2.0);
+        eprintln!(
+            "  {}  atoms={n_atoms}  SCC {n_it} iters  {scc_ms:.2} ms  {:.0} sys/s    2 Jacobi {two_ms:.2} ms  {:.0} sys/s  ({:.2}×)    FD-Jacobian estimate {fd_ms:.0} ms",
+            sys.name,
+            batch as f64 / (scc_ms / 1e3),
+            batch as f64 / (two_ms / 1e3),
+            scc_ms / two_ms
+        );
     }
 }

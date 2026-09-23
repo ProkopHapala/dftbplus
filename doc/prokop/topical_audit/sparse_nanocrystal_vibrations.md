@@ -16,6 +16,25 @@ The relaxation that uses that solve is
 **§9** (R10, 2026-09-22: energy −311 → −314 Ha, ~180 ms/step, force
 still moving below 10⁻³).
 
+**2026-09-23 — DFTB+ parity of the two Hessian columns.** User guide:
+[`userguide/sparse_vibrations.md`](../userguide/sparse_vibrations.md) §0.
+Skin in the jobs is 0.2 Å (one FIRE step of 0.1 Å). H/S radius is the
+table decay (`sparse_hs_decay`); `r_K` is chosen separately (pbc silicon
+leaks at 12 Å, holds at 14–16 Å). Carbon vibrations use `3ob-3-1`; Si–H
+vibrations use `pbc-0-3` (matsci’s Γ optical phonon is ~1250 cm⁻¹).
+
+Frozen density (`VIB_FROZEN`) plus H/S-only blocks (`VIB_HSONLY`) on the
+relaxed 330-atom carbon particle (C₁₉₆H₁₃₄, E = −385.974 Ha, max|F| =
+3.2×10⁻⁵): **0 imaginary modes**, lowest +9.6 cm⁻¹, 134 C–H stretches at
+2842–2845 cm⁻¹, 0.6 s for 990 columns. The FIRE-step column (bold: two
+commutators at η = 8, one McWeeny) was compared with a converged DFTB+
+SCC Hessian on adamantane and Si₁₀H₁₆ at the DFTB+ minimum. Si–H
+stretches: DFTB+ 2101–2158, FIRE step 2098–2163, frozen 2040–2097.
+C–H: DFTB+ 2906–2992, FIRE step 2923–3011, frozen 2768–2803. Sorted
+modes 7…78 differ by rms 40 cm⁻¹ (Si₁₀H₁₆) and 42 cm⁻¹ (adamantane).
+Negatives are a few cm⁻¹ on the rigid-body slots, on our side and on
+DFTB+. The FIRE-step column was not run for all 990 carbon columns.
+
 ## Summary
 
 Sparse GPU DFTB for Si/H nanocrystal vibrations (300–1000 atoms): BSR4,
@@ -96,7 +115,7 @@ fixed-M TC2 recipe — same plumbing, more live matrices per replica.
 | Sparse SCC (real mix loop) | `scc.rs::run_sparse_scc` + `SparseDftb::scc` | [~] G3.2 / production owner | G3 still allocating. `SparseDftb` is the persistent loop |
 | Geometry optimization | `tests/gate_f_geom_opt.rs` | [~] | FIRE 1.477 Å on NVIDIA; not marked done |
 | Hessian parity | `tests/gate_g_hessian.rs` | [~] | Unsymmetrized FD-of-F; 0.11% vs dense; not marked done |
-| Vibrational spectra | `sparse_vibrations` rhai → FD Hessian | [~] produced | si10h16/cube65/R10; ~5–15% stiff vs DFTB+ — not benchmark-grade |
+| Vibrational spectra | `sparse_vibrations` rhai → FD Hessian | [~] measured 2026-09-23 | C330 frozen: 0 imaginary, C–H at 2845. FIRE-step vs DFTB+ on adamantane and Si₁₀H₁₆: stretch bands agree, modes 7…78 rms ~40 cm⁻¹. Frozen stretches soft (C–H ~160, Si–H ~65). Guide §0. Cube65 ~5–15% stiff is the older ladder |
 | Production `SparseDftb` lifetime | `sparse_dftb.rs` | [*] production | Persistent engine; central-state snapshot per column |
 | FD-Hessian warm update | `sparse_system.rs::dmm_descend` / `linear_response`, `forces_frozen` | [*] validated | tier ladder: clamped 5.5 ms/6.3%, lite 64 ms/3.1%, 105 ms/1.0% |
 | GPU pair physics (frozen eval) | `sparse_hs.cl::hs_contract`, `sparse_gamma.cl`, `rep_eval`, `force_gather` | [*] production | all-pairs device path, gather-only; CPU explicit ref; parity 1.2e-6 |
@@ -113,7 +132,7 @@ fixed-M TC2 recipe — same plumbing, more live matrices per replica.
 | E | Determinism, arithmetic sensitivity, Hessian h plateau | [ ] false positive — redo with analytic forces (task D2) |
 | F | Geometry optimization | [~] investigating — FIRE 1.477 Å; not done |
 | G | Same-geometry Hessian parity | [~] investigating — 0.11% vs dense; FD columns validated 0.3% ΔF vs cold fixq |
-| H | Spectra at each method's own minimum | [~] produced — cube65 ~5–15% stiff vs DFTB+ reference |
+| H | Spectra at each method's own minimum | [~] 2026-09-23 cages are at the DFTB+ minimum, not each method's own. FIRE-step stretches match; frozen is soft. C330 frozen spectrum has no imaginary mode. Cube65 ~5–15% stiff is the older ladder |
 | I | Scaling and whole-program profile | [~] frozen + lite-DMM columns batched (B=16 → 0.27 / 208 ms/eval @R18); wall now ~72% dense host eigensolve — eigensolve replacement or F2 column-local next |
 
 ## Remaining split (do not treat GPT-5.6 2026-09-09 list as current)

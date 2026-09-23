@@ -96,6 +96,30 @@ impl SkTableSp {
         self.h.r_max()
     }
 
+    /// Largest pair distance (Bohr) at which any stored H or S channel
+    /// still exceeds `thr`. Grid row `i` is at `r = (i+1)·dr`. Walks in
+    /// from the table end, so the short-range `20*1.0` placeholder rows
+    /// do not set the radius. This is the H/S range the file actually
+    /// carries; it does not require a geometry or an SCC.
+    pub fn decay_radius_bohr(&self, thr: f64) -> f64 {
+        let nh = self.h.values.len();
+        let ns = self.s.values.len();
+        if nh != ns || self.h.dr != self.s.dr {
+            panic!(
+                "SK decay {}: H grid {}×{} vs S grid {}×{}",
+                self.sp1, nh, self.h.dr, ns, self.s.dr
+            );
+        }
+        for i in (0..nh).rev() {
+            let hmax = self.h.values[i].iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+            let smax = self.s.values[i].iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+            if hmax > thr || smax > thr {
+                return (i as f64 + 1.0) * self.h.dr;
+            }
+        }
+        0.0
+    }
+
     pub fn eval_shell_integrals_into(
         &self,
         ang1: i32,

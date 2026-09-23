@@ -30,7 +30,7 @@ Coordinates are **Ångström**. Energies are **Hartree**. Forces are **Hartree /
 
 GPU work is **f32** on an **NVIDIA** device. Do not treat PoCL/CPU OpenCL as a GPU run. Time only `--release` builds. Do not quote `cargo test` wall time as GPU performance.
 
-Topology (which atom pairs exist in the BSR mask) is **frozen at `sparse_new`**. Full mask if the system has ≤ 64 atoms, else a geometric cutoff plus a skin. If a neighbor appears outside that mask, the engine **stops**. Call `sparse_new` again; do not grow CSR in the MD loop.
+Topology (which atom pairs exist) is built once, at `sparse_new` / `sparse_new_mask`. The pair list is not rebuilt during FIRE. Three radii are independent and belong in the job script: H/S from `sparse_hs_decay` (where the table is already < 10⁻⁴), `r_K` for the density kernel, `r_Z` for the overlap inverse. Do not set `r_K` from the H/S radius. The skin is the one-step margin: a FIRE step is capped at 0.1 Å, so the relaxation jobs pass 0.2 Å, and `set_coords` measures that step against the previous accepted geometry. A jump larger than `skin/2` aborts. Systems with ≤ 64 atoms otherwise get a complete mask; `RUST_DFTB_FORCE_GEOM_MASK=1` forces the geometric one. Vibrational spectra and which SK pack to use: [sparse_vibrations.md](sparse_vibrations.md) §0.
 
 ---
 

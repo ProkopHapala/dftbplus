@@ -2538,3 +2538,99 @@ __kernel void lnv_combine_batched(
     if (gid >= batch * n * n) return;
     D[gid] = 3.0f * S[gid] - 2.0f * T[gid];
 }
+
+// ------------------------------------------------------------------
+// One-GEMM SCC update in the orthogonal basis (bold geometry step).
+//
+// H = H0 + ½(DS + SD) with D_μμ = V_atom(μ), so
+//   H' = Xᵀ H0 X + ½(M + Mᵀ),  M = Xᵀ D (S X).
+// C = Xᵀ S is cached per geometry. (S X) = Cᵀ, and
+//   T_μk = V_μ · C_kμ   is D·Cᵀ, then one GEMM M = Xᵀ·T.
+// Charges: Y = K·C, p_μ = 2·Σ_i X_μi Y_iμ (the 2 is the closed-shell
+// density convention D = 2 X K Xᵀ). One workgroup per system.
+// ------------------------------------------------------------------
+__kernel void orth_dv_ct_batched(
+    const int n,
+    const int n_atoms,
+    const int batch,
+    __global const float* C,
+    __global const float* V,
+    __global const int* orb_atom,
+    __global float* T,
+    __global const int* active,
+    __global const int* work_ids
+) {
+    const int sid = work_ids[get_group_id(0)];
+    const int lid = get_local_id(0);
+    const int lsz = get_local_size(0);
+    if (sid >= batch || active[sid] == 0) return;
+    const int nn = n * n;
+    __global const float* Cb = C + (size_t)sid * nn;
+    __global const float* Vb = V + (size_t)sid * n_atoms;
+    __global const int* oa = orb_atom + (size_t)sid * n;
+    __global float* Tb = T + (size_t)sid * nn;
+    for (int idx = lid; idx < nn; idx += lsz) {
+        const int mu = idx / n;
+        const int k = idx - mu * n;
+        Tb[idx] = Vb[oa[mu]] * Cb[k * n + mu];
+    }
+}
+
+__kernel void hp_from_h0_sym_batched(
+    const int n,
+    const int batch,
+    __global const float* H0p,
+    __global const float* M,
+    __global float* hp,
+    __global const int* active,
+    __global const int* work_ids
+) {
+    const int sid = work_ids[get_group_id(0)];
+    const int lid = get_local_id(0);
+    const int lsz = get_local_size(0);
+    if (sid >= batch || active[sid] == 0) return;
+    const int nn = n * n;
+    __global const float* Hb = H0p + (size_t)sid * nn;
+    __global const float* Mb = M + (size_t)sid * nn;
+    __global float* Pb = hp + (size_t)sid * nn;
+    for (int idx = lid; idx < nn; idx += lsz) {
+        const int i = idx / n;
+        const int j = idx - i * n;
+        Pb[idx] = Hb[idx] + 0.5f * (Mb[idx] + Mb[j * n + i]);
+    }
+}
+
+__kernel void mulliken_kc_batched(
+    const int n,
+    const int n_atoms,
+    const int batch,
+    __global const float* X,
+    __global const float* Y,
+    __global const int* orb_atom,
+    __global float* q,
+    __local float* diag,
+    __global const int* active,
+    __global const int* work_ids
+) {
+    const int sid = work_ids[get_group_id(0)];
+    const int lid = get_local_id(0);
+    const int lsz = get_local_size(0);
+    if (sid >= batch || active[sid] == 0) return;
+    __global const float* Xb = X + (size_t)sid * n * n;
+    __global const float* Yb = Y + (size_t)sid * n * n;
+    __global const int* oa = orb_atom + (size_t)sid * n;
+    __global float* qb = q + (size_t)sid * n_atoms;
+    for (int mu = lid; mu < n; mu += lsz) {
+        float s = 0.0f;
+        for (int i = 0; i < n; ++i) s = fma(Xb[mu * n + i], Yb[i * n + mu], s);
+        diag[mu] = 2.0f * s;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    if (lid < n_atoms) {
+        float sum = 0.0f;
+        for (int mu = 0; mu < n; ++mu) {
+            if (oa[mu] == lid) sum += diag[mu];
+        }
+        qb[lid] = sum;
+    }
+}

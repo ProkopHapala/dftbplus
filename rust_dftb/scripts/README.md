@@ -40,3 +40,11 @@ cargo run --release --bin dftb_engine -- --script scripts/<file>.rhai --sk-dir <
   See `doc/prokop/userguide/hbond_pbc_scans.md`.
 - **plot_scan2d_pbc.py** — renders the PBC scan log's `ENERGY MAP` block
   into `debug/qxhq_pbc_Emap.png`.
+- **sparse_vib_c330.rhai** — frozen-density H/S-block Hessian of the
+  relaxed 330-atom carbon particle (3ob). Guide
+  `doc/prokop/userguide/sparse_vibrations.md` §0.
+- **sparse_vib_ref.rhai** — same Hessian at a geometry given by
+  `RUST_DFTB_XYZ`. Used for the adamantane and Si₁₀H₁₆ DFTB+ comparison.
+- **plot_vib_spectrum.py** — stick spectrum of a `sparse_vibrations` file.
+- **plot_vib_parity.py** — spectrum, Hessian heatmap, and frequency
+  correlation, including a DFTB+ `hessian.out`.

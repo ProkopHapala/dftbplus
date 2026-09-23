@@ -72,7 +72,8 @@ RUST_DFTB_SCC_VERBOSE=1 cargo run --example hbond_ref -- ...
   `doc/prokop/reports/2026-09-16_sparse_dmm_warm_density_hessian.md`). See
   `doc/prokop/topical_audit/sparse_nanocrystal_vibrations.md` for the Si/H
   nanocrystal vibrations task (end-to-end FD Hessians via `sparse_vibrations`;
-  guide `doc/prokop/userguide/sparse_vibrations.md`).
+  guide `doc/prokop/userguide/sparse_vibrations.md` §0 — frozen vs FIRE-step
+  columns, DFTB+ parity 2026-09-23).
 - `src/qmqm/` — multi-fragment QM/QM solver + GPU runtime. Production
   engine `gpu_dftb.rs` (`GpuDftb`: persistent buffers, batched SCC/FIRE/MD,
   analytic forces via `gpu_forces.rs`/`.cl`). Extensions: `gpu_cdft.rs`/`.cl`

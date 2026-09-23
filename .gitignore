@@ -52,6 +52,9 @@ tests/dftb/*.xyz
 tests/grid/*.hsd
 tests/grid/**/*_pin.hsd
 
-# *.png above hides plots from the editor; keep this output folder visible
+# *.png above hides plots from the editor; keep these output folders visible
 !debug/graphene_bloch/*.png
 !debug/ribbon_bloch/*.png
+!debug/sparse_vib_c330/*.png
+!debug/vib_ref/adamantane_3ob/*.png
+!debug/vib_ref/si10h16_pbc/*.png

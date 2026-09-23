@@ -7,12 +7,172 @@ judge them yourself. Same program as in [sparse_dftb.md](sparse_dftb.md):
 one binary, one Rhai script.
 
 ```text
-dftb_engine --script my_vib.rhai --sk-dir /path/to/matsci-0-3
+dftb_engine --script my_vib.rhai --sk-dir /path/to/3ob-3-1
 ```
 
-Ready-made scripts: `rust_dftb/scripts/sparse_vibrations_si10h16.rhai`
-(26 atoms) and `sparse_vibrations_cube_si65.rhai` (65 atoms, has a full
-DFTB+ reference).
+The radii, the skin, and which Hessian column you want live in the
+`.rhai` job. `.rs` / `.cl` are the engine. Change the job, not the solver.
+
+Ready-made jobs: `rust_dftb/scripts/sparse_vib_c330.rhai` (330-atom carbon
+particle) and `sparse_vib_ref.rhai` (a geometry you pass in, used below
+for adamantane and Si₁₀H₁₆). Older scripts
+`sparse_vibrations_si10h16.rhai` and `sparse_vibrations_cube_si65.rhai`
+are the pre-2026-09-23 column ladder in §4.
+
+---
+
+## 0. Current recipe (measured 2026-09-23)
+
+Two Hessian columns, same finite-difference step `h = 0.02` Å, same
+engine.
+
+| Column | What is held fixed | When to use it |
+|--------|--------------------|----------------|
+| Frozen density | `D`, `W`, and the charges at the minimum. Only the explicit `dH/dR`, `dS/dR`, γ(R), and the repulsion move. | A full spectrum of a few hundred atoms. On the 330-atom carbon particle this is 0.1 ms/eval, 0.6 s for all 990 columns. |
+| FIRE electronic step | Nothing electronic is clamped. Each displaced geometry takes the same update as a relaxation step: two commutators at η = 8, then one McWeeny (`sparse_geom_mode(..., "bold")`). | The column that matches a converged DFTB+ SCC Hessian. On 26-atom cages it is ~0.2 s for the whole matrix. |
+
+`RUST_DFTB_VIB_FROZEN=1` selects the first. Leave it unset, with the bold
+geometry mode, for the second. `RUST_DFTB_VIB_HSONLY=1` then zeroes every
+3×3 block whose two atoms are not an H/S pair. That drops the long-range
+SCC electrostatic second derivative on purpose. Pairs inside the H/S
+cutoff are kept, including the diagonal blocks.
+
+### 0.1 Masks and the skin
+
+Three radii, set in the job, not tied to each other:
+
+- **H/S** — `sparse_hs_decay` before any SCC. That is where the table has
+  already fallen below 10⁻⁴. 3ob C–C is 5.11 Å. pbc Si–Si is 5.42 Å.
+- **Density kernel `r_K`** — follows the gap, not the Hamiltonian. On the
+  330-atom carbon particle the relaxation used 8.76 Å. On pbc silicon,
+  12 Å leaks charge; 14 Å holds `Tr(KS)` to ~0.02 electrons and 16 Å is
+  tighter. Do not set `r_K = r_trunc · 12/7`.
+- **`r_Z`** — overlap inverse. The jobs set it equal to `r_K` unless
+  `RUST_DFTB_R_Z` says otherwise.
+
+The **skin is one FIRE step**. A step is capped at 0.1 Å, two atoms can
+close by twice that, so the jobs pass **0.2 Å**. `set_coords` measures
+the step against the previous accepted geometry and does not rebuild the
+pair list. A jump larger than `skin/2` aborts. Molecules with ≤ 64 atoms
+otherwise get a complete mask and ignore the radii;
+`RUST_DFTB_FORCE_GEOM_MASK=1` keeps the geometric H/S mask so a small
+cage tests the same cutoff as the particle.
+
+`RUST_DFTB_SCC_RHGATE` defaults to 5×10⁻⁴. A truncated mask floors `R_H`
+near 10⁻³; the carbon particle and the cage jobs use `1e-2`. That is the
+gate for this mask, not a looser electron count. `|Σq − N_elec| > 0.5`
+still aborts.
+
+### 0.2 Which Slater–Koster set
+
+| System | Pack | Why |
+|--------|------|-----|
+| Carbon / adamantane / the 330-atom particle | `3ob-3-1` | C–C decay 5.11 Å. The particle minimum used here is `debug/sparse_relax/mask_c3ob/after.xyz`. |
+| Si–H vibrations | `pbc-0-3` | The set that is close on both the Si phonon and the Si–H stretch. matsci’s Γ optical mode is ~1250 cm⁻¹ and is not elemental silicon. |
+
+### 0.3 Run the 330-atom carbon spectrum
+
+```bash
+cd rust_dftb
+export CARGO_TARGET_DIR=$HOME/.cargo/shared_target   # if that is your target dir
+RUST_DFTB_VIB_FROZEN=1 RUST_DFTB_VIB_HSONLY=1 RUST_DFTB_VIB_BATCH=32 \
+RUST_DFTB_SCC_RHGATE=1e-2 \
+RUST_DFTB_VIB_HESSOUT=../debug/sparse_vib_c330/hess.txt \
+cargo run --bin dftb_engine -- \
+  --script scripts/sparse_vib_c330.rhai \
+  --sk-dir /path/to/slakos/3ob-3-1
+```
+
+The script writes `debug/sparse_vib_c330/freq.txt` (paths inside the
+script are from the repository root). At the saved minimum:
+E = −385.974 Ha, max |F| = 3.2×10⁻⁵ Ha/Å. **No imaginary frequencies.**
+Lowest mode +9.6 cm⁻¹. 134 modes at 2842–2845 cm⁻¹, one per hydrogen.
+The H/S mask (5.31 Å = 5.11 + 0.2 skin) kept 11 348 pairs and zeroed
+85 874 atom-blocks. The FIRE-step column was not run on this particle:
+one such step is ~100 ms, so 990 columns is a few minutes.
+
+From the repository root:
+
+```bash
+python3 rust_dftb/scripts/plot_vib_parity.py \
+  --title "C330 3ob, frozen density, H/S blocks only" \
+  --freq sparse=debug/sparse_vib_c330/freq.txt \
+  --hess sparse=debug/sparse_vib_c330/hess.txt \
+  --out debug/sparse_vib_c330/c330.png
+```
+
+Plots: `debug/sparse_vib_c330/c330_spectrum.png`,
+`c330_hessian.png`. `*.png` is gitignored except the folders listed at
+the bottom of `.gitignore`; these plot folders are on that list.
+
+### 0.4 Check it against DFTB+ on a cage
+
+Adamantane (C₁₀H₁₆, 3ob) and Si₁₀H₁₆ (pbc-0-3), both at the DFTB+
+conjugate-gradient minimum, `SecondDerivatives` with `Delta` = 0.02 Å
+in Bohr (0.0378). Our side is the same geometry, so a nonzero force is
+the Hamiltonian difference, not a different minimum. DFTB+ energies:
+adamantane −23.18101 Ha (our frozen/SCC center −23.18083, max |F| =
+8.8×10⁻⁵); Si₁₀H₁₆ −18.23456 Ha (ours −18.23448, max |F| = 1.3×10⁻⁴).
+
+Still in `rust_dftb/` (paths are `../debug`, so the output stays out of the crate):
+
+```bash
+RUST_DFTB_FORCE_GEOM_MASK=1 \
+RUST_DFTB_VIB_FROZEN=0 RUST_DFTB_VIB_HSONLY=0 \
+RUST_DFTB_SCC_RHGATE=1e-2 \
+RUST_DFTB_XYZ=../debug/vib_ref/si10h16_pbc/opt.xyz \
+RUST_DFTB_OUT=../debug/vib_ref/si10h16_pbc/freq_scc.txt \
+RUST_DFTB_VIB_HESSOUT=../debug/vib_ref/si10h16_pbc/hess_scc.txt \
+cargo run --bin dftb_engine -- \
+  --script scripts/sparse_vib_ref.rhai \
+  --sk-dir /path/to/slakos/pbc-0-3
+```
+
+`sparse_vib_ref.rhai` puts `r_K = r_Z = 40` Å unless you override it, so
+on these cages the kernel is complete and the approximation under test
+is the Hessian column, not a chopped density matrix. Set
+`RUST_DFTB_VIB_FROZEN=1` and `RUST_DFTB_VIB_HSONLY=1` for the fast column.
+Adamantane’s H/S cutoff already contains every pair (0 blocks dropped).
+Si₁₀H₁₆ drops 180 of 676 atom-blocks at the pbc H/S radius.
+
+Sorted frequencies, cm⁻¹:
+
+| | DFTB+ SCC | frozen density | FIRE step |
+|--|-----------|----------------|-----------|
+| adamantane, lowest | −11, −11, −3, then ~0 | −0.6, −0.4, +0.4 | −17, −13, −6 |
+| adamantane, C–H | 2906–2992 | 2768–2803 | 2923–3011 |
+| Si₁₀H₁₆, lowest | −6, −5, −4, then ~0 | +4.8, +4.8, +4.8 | −1.7, −1.2, −0.9 |
+| Si₁₀H₁₆, Si–H | 2101–2158 | 2040–2097 | 2098–2163 |
+
+The FIRE-step column is the one that tracks DFTB+. Root-mean-square of
+sorted modes 7…78 is 40 cm⁻¹ on Si₁₀H₁₆ and 42 cm⁻¹ on adamantane, and
+the stretch cluster sits on the diagonal
+(`debug/vib_ref/si10h16_pbc/scc_corr.png`,
+`debug/vib_ref/adamantane_3ob/scc_corr.png`). Frozen density is softer:
+C–H about 140–190 cm⁻¹ low, Si–H about 65 cm⁻¹ low. There is no chemical
+imaginary mode in any of these spectra. The negatives are a few cm⁻¹ on
+the rigid-body slots. DFTB+ itself has three of those, at the same size,
+because the optimization stopped at a force of 10⁻⁴ Ha/Bohr. A large
+negative (tens of cm⁻¹ and not one of the six soft modes) would be a
+saddle. Frozen density on a particle also fails to put all six rigid
+modes at zero: C330 has three near +10 cm⁻¹ and the next at +113 cm⁻¹.
+
+From the repository root:
+
+```bash
+python3 rust_dftb/scripts/plot_vib_parity.py \
+  --title "Si10H16, bold SCC step vs DFTB+" \
+  --xyz debug/vib_ref/si10h16_pbc/opt.xyz \
+  --dftb-hess debug/vib_ref/si10h16_pbc/hessian.out \
+  --freq scc=debug/vib_ref/si10h16_pbc/freq_scc.txt \
+  --hess scc=debug/vib_ref/si10h16_pbc/hess_scc.txt \
+  --out debug/vib_ref/si10h16_pbc/scc.png
+```
+
+`hessian.out` is DFTB+’s matrix in Ha/Bohr², Fortran column order,
+wrapped at four numbers per line. The plot script converts it with the
+same mass-weighting as the engine (§1.2). Our dumped Hessian
+(`RUST_DFTB_VIB_HESSOUT`) is Ha/Å², row-major.
 
 ---
 
@@ -66,13 +226,12 @@ framework modes (Si–Si ≈ 60–700 cm⁻¹) at the bottom.
 
 3 translations + 3 rotations of the whole crystal cost no energy, so a
 nonlinear molecule/cluster always has **6 modes at ν = 0**. They are not
-input to the calculation — they *emerge*. If your lowest 6 modes are not
-≈ 0 you did not relax enough or your forces are noisy. In practice, FD
-noise puts them at |ν| ≲ 15–20 cm⁻¹; treat those as zero and treat the
-**first internal mode** as the one above that band. `n_imag` in the
-summary counts negative eigenvalues: 4–6 small negatives are the
-rigid-mode noise band, a large negative (< −50 cm⁻¹) is a real
-structural instability, not noise.
+input to the calculation — they *emerge*. A converged SCC Hessian (the
+FIRE-step column, or DFTB+) puts them at |ν| ≲ 15 cm⁻¹; treat that band
+as zero. Frozen density does not: on the 330-atom carbon particle three
+modes sit near +10 cm⁻¹ and the next are near +113 cm⁻¹ (§0.4). `n_imag`
+counts every negative eigenvalue. A few cm⁻¹ on that soft band is noise.
+A large negative that is not one of those six slots is a saddle.
 
 ### 1.4 Central differences and why we SCC at every displacement
 
@@ -187,6 +346,13 @@ decade *above* the measured floor, not below it.
 ---
 
 ## 4. Making it fast
+
+The timings in this section are the 2026-09-16 column ladder (frozen
+orbital, lite DMM, cold fixq). Stretch errors quoted here (“Si–H ~240
+cm⁻¹ too soft”) are that ladder. The 2026-09-23 comparison against a
+converged DFTB+ Hessian is §0: frozen density is ~65 cm⁻¹ soft on Si–H
+and ~140–190 cm⁻¹ soft on C–H; the FIRE-step column matches the DFTB+
+stretches.
 
 The Hessian costs `6N` force evaluations — this is where all the time
 goes, so optimize the per-evaluation cost:

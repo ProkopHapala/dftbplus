@@ -225,6 +225,28 @@ struct PurifyScc {
     dmm_cap: f32,          // trust cap baked into dmm_update; the geometry step lifts it
     steps_cold: usize,     // TC2 steps for the unseeded (first) solve only
     gxy: (usize, usize),   // tiled-GEMM (x, y) extents for the back-transform
+    /// H0 handle (same device buffer the assembler writes). Geometry cache.
+    h0: Buffer<f32>,
+    /// C = Xᵀ S, refreshed in set_geometry. [batch·n·n]
+    geom_c: Buffer<f32>,
+    /// H0' = Xᵀ H0 X, refreshed in set_geometry. [batch·n·n]
+    h0_orth: Buffer<f32>,
+    k_prep: Kernel,        // T = D·Cᵀ into h_scc
+    k_hpsym: Kernel,       // hp = H0' + ½(M+Mᵀ)
+    k_kc_a: Kernel,        // y = d_a · C   (C = Xᵀ S)
+    k_kc_b: Kernel,        // y = d_b · C
+    k_mull_kc: Kernel,     // q from X and Y=K·C, factor 2
+    orth_ready: bool,
+    /// 8 floats: rh_raw, rh_now, eta, n_acc, bad, live/final R_H, restore, tr.
+    bold_state: Buffer<f32>,
+    k_bold_seed: Kernel,
+    k_bold_arm: Kernel,
+    k_bold_pend: Kernel,
+    k_bold_trust: Kernel,
+    k_bold_restore_a: Kernel, // d_b → d_a when rejected
+    k_bold_restore_b: Kernel,
+    k_dmm_veta: Kernel,       // descent, η from bold_state[2]
+    k_bold_trace: Kernel,
 }
 
 /// - The Löwdin transform `X = S^{-1/2}` (recomputed per geometry via `set_geometry`)
@@ -464,6 +486,14 @@ pub struct GpuSccPlan {
 
 /// Device copy of the SCC guess (charges, Jacobi eigenvectors, purified K)
 /// so a batch sweep can repeat the same geometry step.
+/// Charge-response history. Captured before a geometry change wipes it.
+pub struct DiisSnap {
+    q_hist: Buffer<f32>,
+    r_hist: Buffer<f32>,
+    buf_idx: Buffer<i32>,
+    n_filled: Buffer<i32>,
+}
+
 pub struct DensityGuess {
     q: Buffer<f32>,
     c: Buffer<f32>,
@@ -1502,6 +1532,13 @@ impl GpuSccPlan {
             let k_xk_a = mk_pg(&x_buf, &d_a, &temp, 2.0, &active)?;
             let k_xk_b = mk_pg(&x_buf, &d_b, &temp, 2.0, &active)?;
             let k_txd = mk_pg(&temp, &x_t, &d, 1.0, &active)?;
+            let nn_cache = batch * n * n;
+            let geom_c = rt.zero_buffer::<f32>(nn_cache)?;
+            let h0_orth = rt.zero_buffer::<f32>(nn_cache)?;
+            // Y = K·(XᵀS). Bound here, before the regtile program build
+            // mutably borrows rt (mk_pg holds the queue).
+            let k_kc_a = mk_pg(&d_a, &geom_c, &y_buf, 1.0, &active)?;
+            let k_kc_b = mk_pg(&d_b, &geom_c, &y_buf, 1.0, &active)?;
             // DMM GEMM handles — the K operand sits on the solve-time
             // ping-pong side, so those args are rebound per solve via
             // set_arg (built against d_a as the placeholder). These gate on
@@ -1566,6 +1603,87 @@ impl GpuSccPlan {
                 .arg(&t_buf).arg(&rh).arg(n as i32).arg(batch as i32)
                 .arg(&done).arg(&pend).arg(cert_tol)
                 .build().map_err(map_ocl_err)?;
+            let bold_state = rt.zero_buffer::<f32>(8)?;
+            let k_bold_seed = Kernel::builder()
+                .program(&pprog).name("bold_seed_batched")
+                .queue(rt.queue().clone())
+                .global_work_size(1).local_work_size(1)
+                .arg(&rh).arg(&bold_state)
+                .build().map_err(map_ocl_err)?;
+            let k_bold_arm = Kernel::builder()
+                .program(&pprog).name("bold_arm_flag_batched")
+                .queue(rt.queue().clone())
+                .global_work_size(1).local_work_size(1)
+                .arg(&bold_state).arg(0i32)
+                .build().map_err(map_ocl_err)?;
+            let k_bold_trust = Kernel::builder()
+                .program(&pprog).name("bold_trust_flag_batched")
+                .queue(rt.queue().clone())
+                .global_work_size(1).local_work_size(1)
+                .arg(&rh).arg(&bold_state)
+                .build().map_err(map_ocl_err)?;
+            let k_bold_pend = Kernel::builder()
+                .program(&pprog).name("bold_pend_batched")
+                .queue(rt.queue().clone())
+                .global_work_size(batch * pwg).local_work_size(pwg)
+                .arg(&bold_state).arg(&pend).arg(batch as i32)
+                .build().map_err(map_ocl_err)?;
+            let k_copy = |src: &Buffer<f32>, dst: &Buffer<f32>, gate: i32| {
+                Kernel::builder()
+                    .program(&pprog).name("bold_kcopy_batched")
+                    .queue(rt.queue().clone())
+                    .global_work_size(batch * pwg).local_work_size(pwg)
+                    .arg(src).arg(dst).arg(&bold_state).arg(gate)
+                    .arg(n as i32).arg(batch as i32)
+                    .build()
+                    .map_err(map_ocl_err)
+            };
+            let k_bold_restore_a = k_copy(&d_b, &d_a, 6)?;
+            let k_bold_restore_b = k_copy(&d_a, &d_b, 6)?;
+            let k_dmm_veta = Kernel::builder()
+                .program(&pprog).name("dmm_update_veta_batched")
+                .queue(rt.queue().clone())
+                .global_work_size(batch * pwg).local_work_size(pwg)
+                .arg(&d_a).arg(&t_buf).arg(&y_buf).arg(&spans)
+                .arg(&bold_state).arg(1.0e6f32).arg(n as i32).arg(batch as i32)
+                .arg(&pend)
+                .build().map_err(map_ocl_err)?;
+            let k_bold_trace = Kernel::builder()
+                .program(&pprog).name("bold_trace_batched")
+                .queue(rt.queue().clone())
+                .global_work_size(pwg).local_work_size(pwg)
+                .arg(&d_a).arg(&rh).arg(&bold_state).arg(n as i32)
+                .build().map_err(map_ocl_err)?;
+            if n_atoms > wg_mull {
+                return Err(DftbError::InvalidInput(format!(
+                    "mulliken_kc: n_atoms {n_atoms} exceeds workgroup {wg_mull}"
+                )));
+            }
+            let k_prep = Kernel::builder()
+                .program(&mat_prog).name("orth_dv_ct_batched")
+                .queue(rt.queue().clone())
+                .global_work_size(batch * wg_mull).local_work_size(wg_mull)
+                .arg(n as i32).arg(n_atoms as i32).arg(batch as i32)
+                .arg(&geom_c).arg(&v).arg(orb_atom_buf).arg(&h_scc)
+                .arg(&active).arg(&work_ids)
+                .build().map_err(map_ocl_err)?;
+            let k_hpsym = Kernel::builder()
+                .program(&mat_prog).name("hp_from_h0_sym_batched")
+                .queue(rt.queue().clone())
+                .global_work_size(batch * wg_mull).local_work_size(wg_mull)
+                .arg(n as i32).arg(batch as i32)
+                .arg(&h0_orth).arg(&temp).arg(&hp)
+                .arg(&active).arg(&work_ids)
+                .build().map_err(map_ocl_err)?;
+            let k_mull_kc = Kernel::builder()
+                .program(&mat_prog).name("mulliken_kc_batched")
+                .queue(rt.queue().clone())
+                .global_work_size(batch * wg_mull).local_work_size(wg_mull)
+                .arg(n as i32).arg(n_atoms as i32).arg(batch as i32)
+                .arg(&x_buf).arg(&y_buf).arg(orb_atom_buf).arg(&q_new)
+                .arg_local::<f32>(n)
+                .arg(&active).arg(&work_ids)
+                .build().map_err(map_ocl_err)?;
             Some(PurifyScc {
                 k_init_a,
                 k_step,
@@ -1610,6 +1728,24 @@ impl GpuSccPlan {
                     ((n + MAT_TILE_N - 1) / MAT_TILE_N) * MAT_TILE_N,
                     ((n + MAT_TILE_M - 1) / MAT_TILE_M) * MAT_TILE_M,
                 ),
+                h0: h0_buf.clone(),
+                geom_c,
+                h0_orth,
+                k_prep,
+                k_hpsym,
+                k_kc_a,
+                k_kc_b,
+                k_mull_kc,
+                orth_ready: false,
+                bold_state,
+                k_bold_seed,
+                k_bold_arm,
+                k_bold_pend,
+                k_bold_trust,
+                k_bold_restore_a,
+                k_bold_restore_b,
+                k_dmm_veta,
+                k_bold_trace,
             })
         } else {
             None
@@ -1851,6 +1987,18 @@ impl GpuSccPlan {
     // index → physical slot, so compact launches touch only active slots.
 
     /// 1D kernels: build grid is `batch × fac` → launch `work_n × fac`.
+    /// One-GEMM H′ and Mulliken on the bold step. `RUST_DFTB_BOLD_CHEAP=0`
+    /// keeps the two-GEMM form (Xᵀ·H·X and X·K·Xᵀ).
+    fn bold_one_gemm() -> bool {
+        std::env::var("RUST_DFTB_BOLD_CHEAP").ok().as_deref() != Some("0")
+    }
+
+    /// Host trust loop: a `read_buffer` (queue finish) on every attempt,
+    /// plus a full-matrix read for Tr(K). `RUST_DFTB_BOLD_DIAG=1`.
+    fn bold_diag() -> bool {
+        std::env::var("RUST_DFTB_BOLD_DIAG").ok().as_deref() == Some("1")
+    }
+
     fn enq1(&self, k: &Kernel, fac: usize, name: &'static str) -> Result<()> {
         unsafe {
             if self.ktime && self.kt_arm.get() {
@@ -2256,9 +2404,27 @@ impl GpuSccPlan {
         }
         self.activate_all(rt)?;
         self.enq_dq_v_hscc()?;
-        self.enq_mm(&self.k_matmul_xh, "batched_gemm_active  Xᵀ·H")?;
-        self.enq_mm(&self.k_matmul_tx, "batched_gemm_active  (XᵀH)·X")?;
-        let (rh_raw, rh, tr, eta_acc, n_acc) = {
+        if Self::bold_one_gemm() {
+            if self.cdft.is_some() {
+                return Err(DftbError::InvalidInput(
+                    "geom_bold_dmm: one-GEMM H' does not apply the CDFT shift — set RUST_DFTB_BOLD_CHEAP=0".into(),
+                ));
+            }
+            let ready = self.purify.as_ref().unwrap().orth_ready;
+            if !ready {
+                return Err(DftbError::InvalidInput(
+                    "geom_bold_dmm: orthogonal H0'/XᵀS cache is empty — set_geometry did not refresh it".into(),
+                ));
+            }
+            // V is in `v`. T = D·Cᵀ overwrites h_scc; M = Xᵀ·T lands in temp.
+            self.enq1(&self.purify.as_ref().unwrap().k_prep, self.lg.mull, "orth_dv_ct_batched")?;
+            self.enq_mm(&self.k_matmul_xh, "batched_gemm_active  Xᵀ·(D Cᵀ)")?;
+            self.enq1(&self.purify.as_ref().unwrap().k_hpsym, self.lg.mull, "hp_from_h0_sym_batched")?;
+        } else {
+            self.enq_mm(&self.k_matmul_xh, "batched_gemm_active  Xᵀ·H")?;
+            self.enq_mm(&self.k_matmul_tx, "batched_gemm_active  (XᵀH)·X")?;
+        }
+        let host_report = {
             let pur = self.purify.as_mut().unwrap();
             let work_n = self.work_n;
             let pwg = pur.pur_wg;
@@ -2329,97 +2495,207 @@ impl GpuSccPlan {
             pur.g_tk.set_arg(arg_b, kbuf).map_err(map_ocl_err)?;
             pur.k_dmm_upd.set_arg(0u32, kbuf).map_err(map_ocl_err)?;
             pur.k_mcweeny.set_arg(0u32, kbuf).map_err(map_ocl_err)?;
+            pur.k_dmm_veta.set_arg(0u32, kbuf).map_err(map_ocl_err)?;
+            pur.k_bold_trace.set_arg(0u32, kbuf).map_err(map_ocl_err)?;
+            pur.k_bold_arm.set_arg(1u32, max_acc as i32).map_err(map_ocl_err)?;
+            let one = |k: &Kernel, name: &'static str| -> Result<()> { unsafe {
+                if self.ktime && self.kt_arm.get() {
+                    let mut ev = Event::empty();
+                    k.cmd().global_work_size(1).enew(&mut ev).enq().map_err(map_ocl_err)?;
+                    self.kt_ev.borrow_mut().push((name, ev));
+                } else {
+                    k.cmd().global_work_size(1).enq().map_err(map_ocl_err)?;
+                }
+                Ok(())
+            } };
             // Certificate of the carried K, before any rotation.
             g3(&pur.g_hk, n_hk)?;
             built(&pur.k_comm, "comm_gate_batched")?;
-            rt.read_buffer(&pur.rh, &mut pur.rh_host)?;
-            let rh_raw = pur.rh_host[0];
-            if !rh_raw.is_finite() {
-                return Err(DftbError::InvalidInput(format!(
-                    "geom_bold_dmm: R_H(raw)={rh_raw} non-finite"
-                )));
-            }
-            arm(pur)?;
-            // η starts at 8 with the trust cap lifted. A step that
-            // raises R_H is put back and retried at half η. The cap
-            // stays off: it would hide the step the trust region is
-            // judging. Below η = 1/16 the carried K is kept as-is.
-            pur.k_dmm_upd.set_arg(5u32, 1.0e6f32).map_err(map_ocl_err)?;
-            let nn = self.work_n * self.n * self.n;
-            let mut eta = 8.0f32;
-            let mut rh_now = rh_raw;
-            let mut n_acc = 0usize;
-            while n_acc < max_acc && eta >= 1.0 / 16.0 {
-                unsafe {
-                    let (src, dst) = if kbuf_is_b {
-                        (&pur.d_b, &pur.d_a)
-                    } else {
-                        (&pur.d_a, &pur.d_b)
-                    };
-                    src.cmd().queue(rt.queue()).copy(dst, None, Some(nn)).enq().map_err(map_ocl_err)?;
+            let diag = Self::bold_diag();
+            let host_report = if diag {
+                rt.read_buffer(&pur.rh, &mut pur.rh_host)?;
+                let rh_raw = pur.rh_host[0];
+                if !rh_raw.is_finite() {
+                    return Err(DftbError::InvalidInput(format!(
+                        "geom_bold_dmm: R_H(raw)={rh_raw} non-finite"
+                    )));
                 }
-                pur.k_dmm_upd.set_arg(4u32, eta).map_err(map_ocl_err)?;
                 arm(pur)?;
-                g3(&pur.g_hk, n_hk)?;
-                g3(&pur.g_kx, n_kx)?;
-                built(&pur.k_dmm_upd, "dmm_update_batched")?;
+                // η starts at 8 with the trust cap lifted. A step that
+                // raises R_H is put back and retried at half η. The cap
+                // stays off: it would hide the step the trust region is
+                // judging. Below η = 1/16 the carried K is kept as-is.
+                pur.k_dmm_upd.set_arg(5u32, 1.0e6f32).map_err(map_ocl_err)?;
+                let nn = self.work_n * self.n * self.n;
+                let mut eta = 8.0f32;
+                let mut rh_now = rh_raw;
+                let mut n_acc = 0usize;
+                while n_acc < max_acc && eta >= 1.0 / 16.0 {
+                    unsafe {
+                        let (src, dst) = if kbuf_is_b {
+                            (&pur.d_b, &pur.d_a)
+                        } else {
+                            (&pur.d_a, &pur.d_b)
+                        };
+                        src.cmd().queue(rt.queue()).copy(dst, None, Some(nn)).enq().map_err(map_ocl_err)?;
+                    }
+                    pur.k_dmm_upd.set_arg(4u32, eta).map_err(map_ocl_err)?;
+                    arm(pur)?;
+                    g3(&pur.g_hk, n_hk)?;
+                    g3(&pur.g_kx, n_kx)?;
+                    built(&pur.k_dmm_upd, "dmm_update_batched")?;
+                    arm(pur)?;
+                    g3(&pur.g_hk, n_hk)?;
+                    built(&pur.k_comm, "comm_gate_batched")?;
+                    rt.read_buffer(&pur.rh, &mut pur.rh_host)?;
+                    let rh_try = pur.rh_host[0];
+                    if !rh_try.is_finite() {
+                        return Err(DftbError::InvalidInput(format!(
+                            "geom_bold_dmm: R_H={rh_try} non-finite at η={eta}"
+                        )));
+                    }
+                    if rh_try > rh_now {
+                        unsafe {
+                            let (src, dst) = if kbuf_is_b {
+                                (&pur.d_a, &pur.d_b)
+                            } else {
+                                (&pur.d_b, &pur.d_a)
+                            };
+                            src.cmd().queue(rt.queue()).copy(dst, None, Some(nn)).enq().map_err(map_ocl_err)?;
+                        }
+                        eta *= 0.5;
+                    } else {
+                        rh_now = rh_try;
+                        n_acc += 1;
+                    }
+                }
+                let eta_acc = if n_acc == 0 { 0.0 } else { eta };
+                pur.k_dmm_upd.set_arg(4u32, pur.dmm_eta).map_err(map_ocl_err)?;
+                pur.k_dmm_upd.set_arg(5u32, pur.dmm_cap).map_err(map_ocl_err)?;
+                g3(&pur.g_kk, n_kk)?;
+                g3(&pur.g_tk, n_tk)?;
+                built(&pur.k_mcweeny, "mcweeny_combine_batched")?;
                 arm(pur)?;
                 g3(&pur.g_hk, n_hk)?;
                 built(&pur.k_comm, "comm_gate_batched")?;
                 rt.read_buffer(&pur.rh, &mut pur.rh_host)?;
-                let rh_try = pur.rh_host[0];
-                if !rh_try.is_finite() {
+                let rh = pur.rh_host[0];
+                let n = self.n;
+                let mut k_h = vec![0.0f32; n * n];
+                let kbuf = if kbuf_is_b { &pur.d_b } else { &pur.d_a };
+                rt.read_buffer(kbuf, &mut k_h)?;
+                let mut tr = 0.0f32;
+                for i in 0..n {
+                    tr += k_h[i * n + i];
+                }
+                if !rh.is_finite() || !tr.is_finite() {
                     return Err(DftbError::InvalidInput(format!(
-                        "geom_bold_dmm: R_H={rh_try} non-finite at η={eta}"
+                        "geom_bold_dmm: R_H={rh} Tr(K)={tr} non-finite"
                     )));
                 }
-                if rh_try > rh_now {
+                Some((rh_raw, rh, tr, eta_acc, n_acc))
+            } else {
+                // One rejected halving plus the accepted steps. η = 8
+                // rejects once on the 0.02 Å step and η = 4 then accepts;
+                // a longer reject chain fails below rather than stopping short.
+                one(&pur.k_bold_seed, "bold_seed_batched")?;
+                let n_try = max_acc + 1;
+                for _ in 0..n_try {
+                    one(&pur.k_bold_arm, "bold_arm_flag_batched")?;
+                    built(&pur.k_bold_pend, "bold_pend_batched")?;
+                    // Queued device copy, same as the diagnostic loop. A
+                    // kernel copy of the whole prefix was slower than the sync
+                    // it replaced.
                     unsafe {
                         let (src, dst) = if kbuf_is_b {
-                            (&pur.d_a, &pur.d_b)
-                        } else {
                             (&pur.d_b, &pur.d_a)
+                        } else {
+                            (&pur.d_a, &pur.d_b)
                         };
+                        let nn = self.work_n * self.n * self.n;
                         src.cmd().queue(rt.queue()).copy(dst, None, Some(nn)).enq().map_err(map_ocl_err)?;
                     }
-                    eta *= 0.5;
-                } else {
-                    rh_now = rh_try;
-                    n_acc += 1;
+                    g3(&pur.g_hk, n_hk)?;
+                    g3(&pur.g_kx, n_kx)?;
+                    built(&pur.k_dmm_veta, "dmm_update_veta_batched")?;
+                    g3(&pur.g_hk, n_hk)?;
+                    built(&pur.k_comm, "comm_gate_batched")?;
+                    one(&pur.k_bold_trust, "bold_trust_flag_batched")?;
+                    if kbuf_is_b {
+                        built(&pur.k_bold_restore_b, "bold_kcopy_batched")?;
+                    } else {
+                        built(&pur.k_bold_restore_a, "bold_kcopy_batched")?;
+                    }
                 }
-            }
-            let eta_acc = if n_acc == 0 { 0.0 } else { eta };
-            pur.k_dmm_upd.set_arg(4u32, pur.dmm_eta).map_err(map_ocl_err)?;
-            pur.k_dmm_upd.set_arg(5u32, pur.dmm_cap).map_err(map_ocl_err)?;
-            g3(&pur.g_kk, n_kk)?;
-            g3(&pur.g_tk, n_tk)?;
-            built(&pur.k_mcweeny, "mcweeny_combine_batched")?;
-            arm(pur)?;
-            g3(&pur.g_hk, n_hk)?;
-            built(&pur.k_comm, "comm_gate_batched")?;
-            rt.read_buffer(&pur.rh, &mut pur.rh_host)?;
-            let rh = pur.rh_host[0];
-            let n = self.n;
-            let mut k_h = vec![0.0f32; n * n];
-            let kbuf = if kbuf_is_b { &pur.d_b } else { &pur.d_a };
-            rt.read_buffer(kbuf, &mut k_h)?;
-            let mut tr = 0.0f32;
-            for i in 0..n {
-                tr += k_h[i * n + i];
-            }
-            if !rh.is_finite() || !tr.is_finite() {
-                return Err(DftbError::InvalidInput(format!(
-                    "geom_bold_dmm: R_H={rh} Tr(K)={tr} non-finite"
-                )));
-            }
-            (rh_raw, rh, tr, eta_acc, n_acc)
+                arm(pur)?;
+                g3(&pur.g_kk, n_kk)?;
+                g3(&pur.g_tk, n_tk)?;
+                built(&pur.k_mcweeny, "mcweeny_combine_batched")?;
+                g3(&pur.g_hk, n_hk)?;
+                built(&pur.k_comm, "comm_gate_batched")?;
+                built(&pur.k_bold_trace, "bold_trace_batched")?;
+                None
+            };
+            host_report
         };
         let swapped = self.purify.as_ref().unwrap().swapped;
-        let pur = self.purify.as_ref().unwrap();
-        self.enq3(if swapped { &pur.k_xk_b } else { &pur.k_xk_a }, pur.gxy, "batched_gemm_active  X·K")?;
-        self.enq3(&pur.k_txd, pur.gxy, "batched_gemm_active  (XK)·Xᵀ")?;
-        self.enq1(&self.k_mulliken, self.lg.mull, "mulliken_charges_batched")?;
+        if Self::bold_one_gemm() {
+            let pur = self.purify.as_ref().unwrap();
+            self.enq3(if swapped { &pur.k_kc_b } else { &pur.k_kc_a }, pur.gxy, "batched_gemm_active  K·(XᵀS)")?;
+            self.enq1(&pur.k_mull_kc, self.lg.mull, "mulliken_kc_batched")?;
+        } else {
+            let pur = self.purify.as_ref().unwrap();
+            self.enq3(if swapped { &pur.k_xk_b } else { &pur.k_xk_a }, pur.gxy, "batched_gemm_active  X·K")?;
+            self.enq3(&pur.k_txd, pur.gxy, "batched_gemm_active  (XK)·Xᵀ")?;
+            self.enq1(&self.k_mulliken, self.lg.mull, "mulliken_charges_batched")?;
+        }
+        let (rh_raw, rh, tr, eta_acc, n_acc) = if let Some(rep) = host_report {
+            rep
+        } else {
+            let mut st = [0.0f32; 8];
+            rt.read_buffer(&self.purify.as_ref().unwrap().bold_state, &mut st)?;
+            if st[4] != 0.0 {
+                return Err(DftbError::InvalidInput(format!(
+                    "geom_bold_dmm: non-finite bold state rh_raw={} rh_now={} eta={} n_acc={} tr={}",
+                    st[0], st[1], st[2], st[3], st[7]
+                )));
+            }
+            let n_acc = st[3] as usize;
+            if n_acc < max_acc && st[2] >= 1.0 / 16.0 {
+                return Err(DftbError::InvalidInput(format!(
+                    "geom_bold_dmm: attempt budget exhausted with n_acc={n_acc} max_acc={max_acc} eta={} — set RUST_DFTB_BOLD_DIAG=1",
+                    st[2]
+                )));
+            }
+            let eta_acc = if n_acc == 0 { 0.0 } else { st[2] };
+            (st[0], st[5], st[7], eta_acc, n_acc)
+        };
         Ok((rh_raw, rh, tr, eta_acc, n_acc))
+    }
+
+    /// Replica 0 of the carried K and of the cached H'₀ = Xᵀ H0 X.
+    /// Diagnostic read for the SCC-energy log. Not used by the step itself.
+    pub fn read_bold_k_h0(&self, rt: &GpuRuntime, k: &mut [f32], h0p: &mut [f32]) -> Result<()> {
+        let n2 = self.n * self.n;
+        if k.len() != n2 || h0p.len() != n2 {
+            return Err(DftbError::InvalidInput(format!(
+                "read_bold_k_h0: K {} H0' {} != n² {n2}",
+                k.len(),
+                h0p.len()
+            )));
+        }
+        let pur = self.purify.as_ref().ok_or_else(|| {
+            DftbError::InvalidInput("read_bold_k_h0: purify plan was not built".into())
+        })?;
+        if !pur.orth_ready {
+            return Err(DftbError::InvalidInput(
+                "read_bold_k_h0: H0' cache is empty — set_geometry did not refresh it".into(),
+            ));
+        }
+        let src = if pur.swapped { &pur.d_b } else { &pur.d_a };
+        rt.read_buffer(src, k)?;
+        rt.read_buffer(&pur.h0_orth, h0p)?;
+        Ok(())
     }
 
     /// D10/R18: one fused launch for Δq → V=γΔq → H_scc. Replaces the
@@ -2796,6 +3072,37 @@ impl GpuSccPlan {
                 self.k_transpose.enq().map_err(map_ocl_err)?;
             }
         }
+        self.refresh_orth_cache(s_buf)?;
+        Ok(())
+    }
+
+    /// Cache C = XᵀS and H0' = Xᵀ H0 X for the one-GEMM bold update.
+    /// Full batch only: the Löwdin GEMM launches the construction grid.
+    fn refresh_orth_cache(&mut self, s_buf: &Buffer<f32>) -> Result<()> {
+        if self.purify.is_none() {
+            return Ok(());
+        }
+        if self.work_n != self.batch
+            || self.work_ids_host.iter().enumerate().any(|(i, &s)| s != i as i32)
+        {
+            return Err(DftbError::InvalidInput(format!(
+                "refresh_orth_cache: work domain is not replicas 0..{} — refuse a partial XᵀS",
+                self.batch
+            )));
+        }
+        let (geom_c, h0, h0_orth) = {
+            let pur = self.purify.as_ref().unwrap();
+            (pur.geom_c.clone(), pur.h0.clone(), pur.h0_orth.clone())
+        };
+        unsafe {
+            set_lowdin_gemm(&self.k_lowdin_gemm, 0, 0, &self.x_t, s_buf, &geom_c)?;
+            self.k_lowdin_gemm.enq().map_err(map_ocl_err)?;
+            set_lowdin_gemm(&self.k_lowdin_gemm, 0, 0, &self.x_t, &h0, &self.temp)?;
+            self.k_lowdin_gemm.enq().map_err(map_ocl_err)?;
+            set_lowdin_gemm(&self.k_lowdin_gemm, 0, 0, &self.temp, &self.x_buf, &h0_orth)?;
+            self.k_lowdin_gemm.enq().map_err(map_ocl_err)?;
+        }
+        self.purify.as_mut().unwrap().orth_ready = true;
         Ok(())
     }
 
@@ -3327,6 +3634,17 @@ impl GpuSccPlan {
     }
 
     /// Reset DIIS history (call when geometry changes or for warm start).
+    /// Mix `q_new` into `q_gpu` with the existing charge DIIS. Does not
+    /// rebuild H or touch K. `rms_tol = 0` so a small residual does not
+    /// freeze the replica; the caller decides when to stop.
+    pub fn diis_on_qnew(&mut self, rt: &mut GpuRuntime) -> Result<f32> {
+        self.activate_all(rt)?;
+        self.bind_mix_params(0.3, 0.0)?;
+        self.enq1(&self.k_diis, self.lg.diis, "diis_step_batched")?;
+        rt.read_buffer(&self.rms, &mut self.rms_host)?;
+        max_finite_f32(&self.rms_host, "bold DIIS rms")
+    }
+
     pub fn reset_diis(&mut self, rt: &GpuRuntime) -> Result<()> {
         let batch = self.batch;
         // Zero out buf_idx, n_filled, and the fallback status counters
@@ -3344,6 +3662,23 @@ impl GpuSccPlan {
             .write(&zeros_i)
             .enq()
             .map_err(map_ocl_err)?;
+        Ok(())
+    }
+
+    pub fn capture_diis(&mut self, rt: &GpuRuntime) -> Result<DiisSnap> {
+        Ok(DiisSnap {
+            q_hist: rt.copy_buffer(&self.diis_q_hist, self.diis_q_hist.len())?,
+            r_hist: rt.copy_buffer(&self.diis_r_hist, self.diis_r_hist.len())?,
+            buf_idx: rt.copy_buffer(&self.diis_buf_idx, self.batch)?,
+            n_filled: rt.copy_buffer(&self.diis_n_filled, self.batch)?,
+        })
+    }
+
+    pub fn restore_diis(&mut self, rt: &GpuRuntime, snap: &DiisSnap) -> Result<()> {
+        rt.copy_into(&snap.q_hist, &self.diis_q_hist, self.diis_q_hist.len())?;
+        rt.copy_into(&snap.r_hist, &self.diis_r_hist, self.diis_r_hist.len())?;
+        rt.copy_into(&snap.buf_idx, &self.diis_buf_idx, self.batch)?;
+        rt.copy_into(&snap.n_filled, &self.diis_n_filled, self.batch)?;
         Ok(())
     }
 

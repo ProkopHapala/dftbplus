@@ -2102,6 +2102,10 @@ impl SparseSystemWorkspace {
 
         for attempt in 0..n_attempts {
             let cold = attempt == n_attempts - 1 || !warm;
+            // A geometry step passes a short warm budget. The cold restart
+            // from αI is a real inverse and needs the long budget: on the
+            // carbon particle 8 steps from αI were still at R_Z≈3e-4.
+            let n_iter = if cold && warm { max_iter.max(40) } else { max_iter };
             if cold {
                 // Full-write identity: every structural entry (R6).
                 self.gpu
@@ -2113,7 +2117,7 @@ impl SparseSystemWorkspace {
             let mut rz = f32::INFINITY;
             let mut restart = false;
             self.gpu.prof_tick("ns.z0");
-            for iter in 0..max_iter {
+            for iter in 0..n_iter {
                 // T = Z·S (planned; S symmetric)
                 match &self.plan_zs {
                     Some(plan) => self
@@ -2188,13 +2192,18 @@ impl SparseSystemWorkspace {
                 std::mem::swap(&mut self.z.values, &mut self.znew.values);
                 self.gpu.prof_tick("ns.upd");
             }
-            if restart && !cold {
+            if !cold && rz.is_finite() && rz >= tol {
+                if !restart {
+                    last_err = format!(
+                        "compute_z: warm budget {n_iter} left R_Z={rz:e} (tol={tol:e})"
+                    );
+                }
                 eprintln!("  compute_z: warm start failed ({last_err}) — restarting cold from αI");
                 continue;
             }
-            if !restart && rz.is_finite() && rz >= tol {
+            if rz.is_finite() && rz >= tol {
                 last_err = format!(
-                    "compute_z: exhausted {max_iter} iters, final R_Z={rz:e} (tol={tol:e})"
+                    "compute_z: exhausted {n_iter} iters, final R_Z={rz:e} (tol={tol:e})"
                 );
             }
             return Err(DftbError::InvalidInput(last_err));

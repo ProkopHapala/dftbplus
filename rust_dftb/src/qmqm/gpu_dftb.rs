@@ -950,6 +950,59 @@ impl GpuDftb {
         Ok(rep)
     }
 
+    /// SCC energy of the carried orthogonal K, replica 0, repulsion omitted.
+    /// `from_new` uses the Mulliken vector in `q_new`; otherwise `q_gpu`.
+    ///
+    /// `E_dens = 2 Tr(K H'₀) + ½ Δqᵀ γ Δq` is the density form (`D = 2 X K Xᵀ`).
+    /// `E_chat = Tr(K H'₀) + ½ Δqᵀ γ Δq` is the review formula, without that 2.
+    /// `Tr(KH')` is the trace against the orthogonal Hamiltonian currently in `hp`.
+    pub fn bold_scc_energy(&mut self, from_new: bool) -> Result<(f64, f64, f64)> {
+        let n = self.n;
+        let na = self.n_atoms;
+        let mut k = vec![0.0f32; n * n];
+        let mut h0p = vec![0.0f32; n * n];
+        let mut hp = vec![0.0f32; n * n];
+        let mut q = vec![0.0f32; na];
+        let mut g = vec![0.0f32; na * na];
+        self.plan.read_bold_k_h0(&self.rt, &mut k, &mut h0p)?;
+        self.rt.read_buffer(&self.plan.hp, &mut hp)?;
+        let qsrc = if from_new { &self.plan.q_new } else { &self.plan.q_gpu };
+        self.rt.read_buffer(qsrc, &mut q)?;
+        self.rt.read_buffer(&self.buf_g, &mut g)?;
+        let mut dq = vec![0.0f64; na];
+        for a in 0..na {
+            dq[a] = q[a] as f64 - self.q0[a] as f64;
+            if !dq[a].is_finite() {
+                return Err(DftbError::InvalidInput(format!(
+                    "bold_scc_energy: Δq[{a}]={} non-finite",
+                    dq[a]
+                )));
+            }
+        }
+        let mut dqg = 0.0f64;
+        for a in 0..na {
+            let mut v = 0.0f64;
+            let row = a * na;
+            for b in 0..na {
+                v += g[row + b] as f64 * dq[b];
+            }
+            dqg += dq[a] * v;
+        }
+        let half = 0.5 * dqg;
+        let mut tr_h0 = 0.0f64;
+        let mut tr_h = 0.0f64;
+        for i in 0..n * n {
+            tr_h0 += k[i] as f64 * h0p[i] as f64;
+            tr_h += k[i] as f64 * hp[i] as f64;
+        }
+        if !tr_h0.is_finite() || !tr_h.is_finite() || !half.is_finite() {
+            return Err(DftbError::InvalidInput(format!(
+                "bold_scc_energy: Tr(KH0')={tr_h0} Tr(KH')={tr_h} ½ΔqγΔq={half} non-finite"
+            )));
+        }
+        Ok((2.0 * tr_h0 + half, tr_h0 + half, tr_h))
+    }
+
     /// Mulliken charges of the density just built. Not the mixed `q_gpu`.
     pub fn read_q_new(&mut self) -> Result<Vec<f32>> {
         let mut q = vec![0.0f32; self.batch * self.n_atoms];
@@ -971,6 +1024,55 @@ impl GpuDftb {
             }
         }
         self.rt.write_buffer(&self.plan.q_gpu, &self.scratch_qd)?;
+        self.state_fresh = false;
+        Ok(())
+    }
+
+    /// `q ← q + α (q_Mulliken − q)` on the stored charges. α = 1 is
+    /// `stage_mulliken`. The following Hamiltonian is built from this mix.
+    pub fn mix_mulliken(&mut self, alpha: f32) -> Result<()> {
+        if !(0.0..=1.0).contains(&alpha) {
+            return Err(DftbError::InvalidInput(format!(
+                "mix_mulliken: alpha={alpha} outside [0, 1]"
+            )));
+        }
+        self.rt.read_buffer(&self.plan.q_gpu, &mut self.scratch_q)?;
+        self.rt.read_buffer(&self.plan.q_new, &mut self.scratch_qd)?;
+        let n = self.scratch_q.len().min(self.scratch_qd.len());
+        for i in 0..n {
+            let q0 = self.scratch_q[i];
+            let q1 = self.scratch_qd[i];
+            if !q0.is_finite() || !q1.is_finite() {
+                return Err(DftbError::InvalidInput(format!(
+                    "mix_mulliken: q[{i}] in={q0} mulliken={q1} non-finite"
+                )));
+            }
+            self.scratch_q[i] = q0 + alpha * (q1 - q0);
+        }
+        self.rt.write_buffer(&self.plan.q_gpu, &self.scratch_q)?;
+        self.state_fresh = false;
+        Ok(())
+    }
+
+    /// Replace the charges the next Hamiltonian is built from.
+    /// `eval` then diagonalizes that Hamiltonian once.
+    pub fn set_charges(&mut self, q: &[f32]) -> Result<()> {
+        if q.len() != self.batch * self.n_atoms {
+            return Err(DftbError::InvalidInput(format!(
+                "set_charges: len {} != batch*n_atoms {}*{}",
+                q.len(),
+                self.batch,
+                self.n_atoms
+            )));
+        }
+        for (i, &v) in q.iter().enumerate() {
+            if !v.is_finite() {
+                return Err(DftbError::InvalidInput(format!(
+                    "set_charges: q[{i}]={v} non-finite"
+                )));
+            }
+        }
+        self.rt.write_buffer(&self.plan.q_gpu, q)?;
         self.state_fresh = false;
         Ok(())
     }

@@ -24,11 +24,13 @@ SERIES = [
     ("cpu 8 threads, warm", "black", "o", "-"),
     ("gpu jacobi cold", "#9ecae1", "D", "-"),
     ("gpu jacobi warm", "#08519c", "o", "-"),
+    ("gpu shadow (2 Jacobi)", "#238b45", "h", "-"),
     ("gpu purify cold", "#fdae6b", "s", "-"),
     ("gpu purify warm", "#d94801", "o", "-"),
     ("gpu bold", "#6a3d9a", "P", "-"),
     ("gpu bold x2", "#e7298a", "P", "--"),
     ("gpu bold x3", "#c51b8a", "X", ":"),
+    ("gpu bold diis", "#4a148c", "v", "-"),
 ]
 REF = "cpu 8 threads, warm"
 

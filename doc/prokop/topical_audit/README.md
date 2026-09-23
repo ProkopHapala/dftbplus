@@ -43,9 +43,10 @@ implementations of the same concept across Rust, Fortran, Python, and OpenCL.
 - **f32_floor_sparse.md** — sparse BSR4 Si/H: bugs (device NS N4) vs SK-q0
   misconception vs interpolator fitter vs **missing SparseDftb pipeline** vs
   measured Hessian floor (Gate G \|\|ΔH\|\|_F/\|\|H\|\|_F ≈ 0.11%). Manifest §0.
-- **sparse_nanocrystal_vibrations.md** — sparse GPU DFTB for vibrational
-  calculations on Si/H nanocrystals. See
-  `tasts/Sparse_Nanocrystal_Vibrations/Sparse_Nanocrystal_Vibrations.manifest.md` §0.
+- **sparse_nanocrystal_vibrations.md** — sparse GPU DFTB vibrations.
+  2026-09-23: frozen-density C330 spectrum (no imaginary modes) and
+  FIRE-step Hessian vs DFTB+ on adamantane and Si₁₀H₁₆. User guide
+  `userguide/sparse_vibrations.md` §0.
 - **hessian_eval_bottleneck.md** — per-eval cost breakdown of the sparse
   FD Hessian (SCC = >98%); mode ladder A (frozen) / B (fixed-q) / C (DMM
   warm update — implemented, 0.3% ΔF at ~25% vs cold); batch-parallel

@@ -24,8 +24,20 @@ let cont = env("RUST_DFTB_CONTINUE") == "1";
 let src = if cont { out + "/after.xyz" } else { xyz };
 
 load_xyz("mol", src);
-// r_trunc, taper, r_k, r_z, r_skin, max row degree. Same mask as the R10 run.
-sparse_new_mask("mol", SK_DIR, 5.45, 0.3, 12.0, 12.0, 3.0, 1024.0);
+// H/S radius from this SK set: last grid point with |H| or |S| > 1e-4.
+// The density kernel is a different mask. It follows the gap, not the
+// table. RUST_DFTB_R_K sets it; unset keeps the matsci-silicon 12 Å.
+// RUST_DFTB_R_Z is the overlap inverse, unset = same number as R_K.
+let r_auto = sparse_hs_decay("mol", SK_DIR);
+let rtxt = env("RUST_DFTB_R_TRUNC");
+let r_hs = if rtxt == "" { r_auto } else { parse_float(rtxt) };
+let ktxt = env("RUST_DFTB_R_K");
+let r_k = if ktxt == "" { 12.0 } else { parse_float(ktxt) };
+let ztxt = env("RUST_DFTB_R_Z");
+let r_z = if ztxt == "" { r_k } else { parse_float(ztxt) };
+print("mask  r_trunc=" + ftos(r_hs) + "  r_K=" + ftos(r_k) + "  r_Z=" + ftos(r_z));
+// Skin covers one FIRE step (cap 0.1 Å). Two atoms can close by 2·0.1 Å.
+sparse_new_mask("mol", SK_DIR, r_hs, 0.3, r_k, r_z, 0.2, 1024.0);
 if !cont && jitter > 0.0 {
     sparse_jitter("mol", jitter, 0x5eed);
 }

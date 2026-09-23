@@ -1097,3 +1097,166 @@ __kernel void gemm_nn_batched(
         tg[idx] = s;
     }
 }
+
+// ------------------------------------------------------------------
+// Production bold trust region. Replica 0's R_H decides for the whole
+// prefix (identical replicas — the same rule as the host loop). The
+// host enqueues every attempt and reads `state` once, after the step.
+//
+// state[8]:
+//   0 rh_raw   1 rh_now   2 eta   3 n_acc
+//   4 bad      5 live     6 restore   7 tr
+// After the final certificate, slot 5 is overwritten with post-McWeeny R_H
+// so one 8-float read returns the report.
+// RUST_DFTB_BOLD_DIAG=1 keeps the host loop instead.
+// ------------------------------------------------------------------
+__kernel void bold_seed_batched(
+    __global const float* rh,
+    __global float* state)
+{
+    if (get_global_id(0) != 0) return;
+    const float r = rh[0];
+    state[0] = r;
+    state[1] = r;
+    state[2] = 8.0f;
+    state[3] = 0.0f;
+    state[4] = isfinite(r) ? 0.0f : 1.0f;
+    state[5] = 0.0f;
+    state[6] = 0.0f;
+    state[7] = 0.0f;
+}
+
+__kernel void bold_arm_flag_batched(
+    __global float* state,
+    const int max_acc)
+{
+    if (get_global_id(0) != 0) return;
+    float live = 0.0f;
+    if (state[4] == 0.0f && state[3] < (float)max_acc && state[2] >= (1.0f / 16.0f))
+        live = 1.0f;
+    state[5] = live;
+    state[6] = 0.0f;
+}
+
+__kernel void bold_pend_batched(
+    __global const float* state,
+    __global int* pend,
+    const int batch)
+{
+    const int sys = get_group_id(0);
+    if (sys >= batch || get_local_id(0) != 0) return;
+    pend[sys] = (state[5] != 0.0f) ? 1 : 0;
+}
+
+// Copy K only when state[gate] != 0. One group per replica.
+__kernel void bold_kcopy_batched(
+    __global const float* src,
+    __global float* dst,
+    __global const float* state,
+    const int gate,
+    const int n,
+    const int batch)
+{
+    const int sys = get_group_id(0);
+    if (sys >= batch || state[gate] == 0.0f) return;
+    const int lid = get_local_id(0);
+    const int lsz = get_local_size(0);
+    const int nn = n * n;
+    __global const float* s = src + (size_t)sys * nn;
+    __global float* d = dst + (size_t)sys * nn;
+    for (int i = lid; i < nn; i += lsz) d[i] = s[i];
+}
+
+__kernel void bold_trust_flag_batched(
+    __global const float* rh,
+    __global float* state)
+{
+    if (get_global_id(0) != 0) return;
+    if (state[5] == 0.0f) {
+        state[6] = 0.0f;
+        return;
+    }
+    const float r = rh[0];
+    if (!isfinite(r)) {
+        state[4] = 1.0f;
+        state[6] = 0.0f;
+        return;
+    }
+    if (r > state[1]) {
+        state[2] *= 0.5f;
+        state[6] = 1.0f;
+    } else {
+        state[1] = r;
+        state[3] += 1.0f;
+        state[6] = 0.0f;
+    }
+}
+
+// Same descent as dmm_update_batched, but η is state[2] so the trust
+// loop can halve it without a host round-trip. Cap is the geometry
+// step's lifted cap (1e6), baked by the host.
+__kernel void dmm_update_veta_batched(
+    __global float*       K,
+    __global const float* T,
+    __global const float* Y,
+    __global const float* spans,
+    __global const float* state,
+    const float cap,
+    const int n,
+    const int batch,
+    __global const int* pend)
+{
+    const int sys = get_group_id(0);
+    if (sys >= batch || !pend[sys]) return;
+    const int lid = get_local_id(0);
+    const int lsz = get_local_size(0);
+    __global float*       kg = K + (size_t)sys * n * n;
+    __global const float* tg = T + (size_t)sys * n * n;
+    __global const float* yg = Y + (size_t)sys * n * n;
+    __local float red[PURIFY_WG];
+    const float eta = state[2];
+
+    const int ntri = n * (n + 1) / 2;
+    const float two_n1 = 2.0f * n + 1.0f;
+    float g2 = 0.0f;
+    for (int e = lid; e < ntri; e += lsz) {
+        const int i = (int)floor(
+            (two_n1 - sqrt(fmax(two_n1 * two_n1 - 8.0f * e, 0.0f))) * 0.5f);
+        const int j = i + (e - i * (2 * n - i + 1) / 2);
+        const float gu = tg[i * n + j] + tg[j * n + i] - 2.0f * yg[i * n + j];
+        g2 += (j > i ? 2.0f : 1.0f) * gu * gu;
+    }
+    const float gn = sqrt(pur_reduce(red, g2, lid, lsz));
+    const float s = fmin(eta / spans[sys], cap / fmax(gn, 1.0e-30f));
+    for (int e = lid; e < ntri; e += lsz) {
+        const int i = (int)floor(
+            (two_n1 - sqrt(fmax(two_n1 * two_n1 - 8.0f * e, 0.0f))) * 0.5f);
+        const int j = i + (e - i * (2 * n - i + 1) / 2);
+        const float ks = 0.5f * (kg[i * n + j] + kg[j * n + i]);
+        const float gu = tg[i * n + j] + tg[j * n + i] - 2.0f * yg[i * n + j];
+        const float gl = tg[j * n + i] + tg[i * n + j] - 2.0f * yg[j * n + i];
+        kg[i * n + j] = ks - s * gu;
+        kg[j * n + i] = ks - s * gl;
+    }
+}
+
+// Replica 0: Tr(K) into state[7], post-McWeeny R_H into state[5].
+__kernel void bold_trace_batched(
+    __global const float* K,
+    __global const float* rh,
+    __global float* state,
+    const int n)
+{
+    if (get_group_id(0) != 0) return;
+    const int lid = get_local_id(0);
+    const int lsz = get_local_size(0);
+    __local float red[PURIFY_WG];
+    float s = 0.0f;
+    for (int i = lid; i < n; i += lsz) s += K[i * n + i];
+    s = pur_reduce(red, s, lid, lsz);
+    if (lid == 0) {
+        state[7] = s;
+        state[5] = rh[0];
+        if (!isfinite(rh[0]) || !isfinite(s)) state[4] = 1.0f;
+    }
+}

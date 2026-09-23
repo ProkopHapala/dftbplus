@@ -107,7 +107,10 @@ QM/QM fragment solver with OpenCL GPU offload. Python utilities (`pyBall/`,
     lite-DMM via `forces_dmm_batch(x0, evals, h, n_ns, n_dmm, eta)` —
     `RUST_DFTB_VIB_BATCH` (frozen or `VIB_LITE` only, else fails loud),
     bitwise vs sequential; mode knobs
-    `RUST_DFTB_VIB_*` — see `userguide/sparse_vibrations.md`). Drive with
+    `RUST_DFTB_VIB_*` — see `userguide/sparse_vibrations.md` §0: frozen
+    density vs the bold FIRE electronic step, H/S-only blocks, 0.2 Å
+    skin; 2026-09-23 DFTB+ parity on adamantane and Si₁₀H₁₆, C330
+    spectrum with no imaginary mode). Drive with
     **`dftb_engine --script rust_dftb/scripts/test_sparse_dftb_sih4.rhai`**
     (userguide `sparse_dftb.md`). Smoke: `tests/sparse_dftb.rs`. Report:
     `doc/prokop/reports/2026-09-16_sparse_dmm_warm_density_hessian.md`.
